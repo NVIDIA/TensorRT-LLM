@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import Any
@@ -10,14 +11,18 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.compilation.backend import Backend
+from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners import no_kv_cache as no_kv_cache_module
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import (
+    ModelRunner,
     PreparedInputs,
     RunnerConfig,
-    RunnerDeps,
+    ScheduledInputs,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
@@ -25,9 +30,13 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
     NoKVCacheRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm.llmapi.llm_args import (
     CudaGraphConfig,
     EncodeCudaGraphConfig,
@@ -52,27 +61,28 @@ class _AttentionBackend:
 def _make_runner(
     runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
     model: Any,
-    deps: RunnerDeps | None = None,
     config: NoKVCacheRunnerConfig | None = None,
+    *,
+    model_caller: Mock | None = None,
 ) -> PoolingRunner | MultimodalEncoderRunner:
-    return runner_type(model, deps or _deps(), config or _config())
-
-
-def _deps(*, model_forward: Mock | None = None) -> RunnerDeps:
-    if model_forward is None:
-        model_forward = Mock(return_value={"logits": torch.empty(0)})
-    return RunnerDeps(
-        dist=SimpleNamespace(),
-        mapping=SimpleNamespace(),
-        input_ids_cuda=torch.empty(16, dtype=torch.int),
-        position_ids_cuda=torch.empty(16, dtype=torch.int),
-        gather_ids_cuda=None,
-        draft_tokens_cuda=None,
-        cache_indirection=None,
-        lora=SimpleNamespace(build=Mock(return_value=None)),
-        moe_load_balancer=None,
-        model_forward=model_forward,
+    config = config or _config()
+    buffers = InputBuffers(
+        input_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
+        position_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
+        gather_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int)
+        if config.spec_config is not None
+        else None,
+        draft_tokens_cuda=torch.empty(
+            config.max_draft_loop_tokens * config.max_batch_size, dtype=torch.int
+        )
+        if config.spec_config is not None
+        else None,
     )
+    kwargs = dict(mapping=SimpleNamespace(), dist=SimpleNamespace(), moe_load_balancer=None)
+    if issubclass(runner_type, PoolingRunner):
+        kwargs["model_caller"] = model_caller or Mock(return_value={"logits": torch.empty(0)})
+    with patch.object(InputBuffers, "allocate", return_value=buffers):
+        return runner_type(model, config, **kwargs)
 
 
 def _config() -> NoKVCacheRunnerConfig:
@@ -89,11 +99,11 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
         spec_config=None,
-        is_draft_model=False,
         num_seq_slots=None,
         original_max_draft_len=0,
         original_max_total_draft_tokens=0,
         spec_dec_max_total_draft_tokens=0,
+        max_draft_loop_tokens=0,
     )
 
 
@@ -129,7 +139,7 @@ def test_resolve_runner_dispatches_startup_families(
     mm_encoder_only: bool,
     is_generation: bool,
     is_encoder_decoder: bool,
-    runner_type: type[Any] | None,
+    runner_type: type[ModelRunner] | None,
 ) -> None:
     args = SimpleNamespace(encode_only=encode_only, mm_encoder_only=mm_encoder_only)
 
@@ -168,9 +178,10 @@ def test_resolve_runner_checks_mm_encoder_before_non_generation() -> None:
     ],
 )
 def test_model_engine_initializes_runner_by_family(
-    runner_type: type[Any], initializer_name: str
+    runner_type: type[ModelRunner], initializer_name: str
 ) -> None:
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
     expected = Mock(spec=runner_type)
     initializer = Mock(return_value=expected)
     setattr(engine, initializer_name, initializer)
@@ -193,6 +204,7 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
 ) -> None:
     """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
     engine.model = object()
     engine.mapping = object()
     engine.cuda_graph_config = cuda_graph_config
@@ -211,9 +223,8 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     engine.without_logits = False
     engine.attn_backend = _AttentionBackend
     engine.attn_runtime_features = AttentionRuntimeFeatures()
-    engine.is_draft_model = False
-    deps = object()
-    engine._create_runner_deps = Mock(return_value=deps)
+    engine.dist = object()
+    engine.moe_load_balancer = None
     runner_config = object()
     expected_runner = object()
     runner_type = Mock(return_value=expected_runner)
@@ -227,7 +238,14 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     assert actual is expected_runner
     resolved = create_config.call_args.kwargs["graph_config"]
     assert resolved is (cuda_graph_config if expected_encode_config else None)
-    runner_type.assert_called_once_with(engine.model, deps, runner_config)
+    runner_type.assert_called_once_with(
+        engine.model,
+        runner_config,
+        mapping=engine.mapping,
+        dist=engine.dist,
+        moe_load_balancer=engine.moe_load_balancer,
+        model_caller=engine._model_caller,
+    )
 
 
 def test_model_engine_rejects_unregistered_runner_family() -> None:
@@ -235,6 +253,7 @@ def test_model_engine_rejects_unregistered_runner_family() -> None:
         pass
 
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
 
     with pytest.raises(TypeError, match="No runner initializer registered"):
         engine._initialize_runner(UnregisteredRunner)
@@ -246,10 +265,12 @@ def _model_engine_with_runner(
     kv_cache_manager: object | None,
 ) -> tuple[PyTorchModelEngine, Mock]:
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine._runner = runner
-    engine.cuda_graph_lora_manager = None
+    engine._fallback_to_engine = False
+    engine.enable_spec_decode = False
     engine.runtime_draft_len = 0
     engine.moe_load_balancer = None
     resource_manager = Mock()
@@ -271,28 +292,27 @@ def test_model_engine_forward_delegates_to_resolved_runner() -> None:
 
     assert actual_outputs is expected_outputs
     runner.forward.assert_called_once_with(
-        batch,
+        ScheduledInputs(batch=batch),
         resource_manager=resource_manager,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        gather_context_logits=False,
+        is_dummy=False,
     )
 
 
-def test_model_engine_rejects_kv_manager_with_no_kv_cache_runner() -> None:
-    runner = Mock(spec=NoKVCacheRunner)
-    engine, resource_manager = _model_engine_with_runner(
-        runner,
-        kv_cache_manager=object(),
-    )
+def test_no_kv_cache_runner_rejects_kv_manager_before_preparation() -> None:
+    runner = _make_runner(PoolingRunner, _model(is_generation=False))
+    runner.prepare_inputs = Mock()
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = object()
 
     with pytest.raises(
         AssertionError,
         match="no-KV-cache runner was initialized, but a KV cache manager was allocated",
     ):
-        engine.forward(ScheduledRequests(), resource_manager)
+        runner.forward(
+            ScheduledInputs(batch=ScheduledRequests()), resource_manager=resource_manager
+        )
 
-    runner.forward.assert_not_called()
+    runner.prepare_inputs.assert_not_called()
 
 
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
@@ -303,6 +323,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         "encoder_seq_lens": [2, 3],
     }
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
     engine.model = SimpleNamespace(
         model_config=SimpleNamespace(is_encoder_decoder=True),
     )
@@ -313,19 +334,18 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
     outputs = engine.forward_encoder(requests, resource_manager)
 
     assert outputs == (hidden_states, [2, 3])
-    scheduled_requests = runner.forward.call_args.args[0]
-    assert scheduled_requests.encoder_requests == requests
+    inputs = runner.forward.call_args.args[0]
+    assert inputs.batch.encoder_requests == requests
     runner.forward.assert_called_once_with(
-        scheduled_requests,
+        inputs,
         resource_manager=resource_manager,
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        gather_context_logits=False,
+        is_dummy=False,
     )
 
 
 def test_model_engine_releases_runner_owned_graphs() -> None:
     engine = object.__new__(PyTorchModelEngine)
+    engine._model_caller = Mock()
     engine._runner = Mock(spec=EncoderRunner)
     engine._torch_compile_backend = None
     engine.cuda_graph_runner = None
@@ -333,7 +353,7 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
 
     engine._release_cuda_graphs()
 
-    engine._runner.cleanup.assert_called_once_with()
+    engine._runner.release_graphs.assert_called_once_with()
 
 
 def test_prepared_inputs_is_frozen_and_preserves_kwargs_identity() -> None:
@@ -390,11 +410,9 @@ def test_no_kv_cache_runner_owns_spec_metadata_setup(
     )
     get_spec_metadata = Mock(return_value=spec_metadata)
     monkeypatch.setattr(no_kv_cache_module, "get_spec_metadata", get_spec_metadata)
-    deps = _deps()
     runner = _make_runner(
         PoolingRunner,
         _model(is_generation=False),
-        deps,
         replace(
             _config(),
             spec_config=SimpleNamespace(
@@ -444,7 +462,7 @@ def test_pooling_runner_owns_forward_output_processing(
     runner = _make_runner(
         PoolingRunner,
         _model(is_generation=False),
-        _deps(model_forward=model_forward),
+        model_caller=model_forward,
     )
     attn_metadata = SimpleNamespace(on_update_kv_lens=Mock())
     prepared = PreparedInputs(
@@ -454,11 +472,8 @@ def test_pooling_runner_owns_forward_output_processing(
     monkeypatch.setattr(runner, "prepare_inputs", Mock(return_value=prepared))
 
     outputs = runner.forward(
-        SimpleNamespace(),
-        resource_manager=SimpleNamespace(),
-        cuda_graph_lora_manager=None,
-        runtime_draft_len=0,
-        gather_context_logits=False,
+        ScheduledInputs(batch=ScheduledRequests()),
+        resource_manager=SimpleNamespace(get_resource_manager=Mock(return_value=None)),
     )
 
     torch.testing.assert_close(outputs["logits"], logits[[2, 0]])
@@ -476,8 +491,8 @@ def test_pooling_runner_returns_raw_model_outputs_when_logits_are_disabled() -> 
     runner = _make_runner(
         PoolingRunner,
         _model(is_generation=False),
-        _deps(model_forward=model_forward),
         replace(_config(), without_logits=True),
+        model_caller=model_forward,
     )
 
     outputs = runner._forward_step({}, SimpleNamespace())
@@ -486,14 +501,15 @@ def test_pooling_runner_returns_raw_model_outputs_when_logits_are_disabled() -> 
 
 
 @pytest.mark.parametrize("runner_type", [PoolingRunner, MultimodalEncoderRunner])
-def test_pooling_runner_warmup_and_capture_are_noops(
+def test_no_kv_cache_runner_default_lifecycle_with_no_kv_resources(
     runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
 ) -> None:
     runner = _make_runner(runner_type, _model(is_generation=False))
-    resource_manager = SimpleNamespace()
+    resource_manager = SimpleNamespace(get_resource_manager=Mock(return_value=None))
 
     assert runner.warmup(resource_manager) is None
-    assert runner.capture_graphs(resource_manager) is None
+    assert runner.release_graphs() is None
+    assert runner.wait_for_input_copy() is None
 
 
 def test_mm_encoder_runner_forward_step_returns_empty_result_without_multimodal_params() -> None:
@@ -603,3 +619,241 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
     torch.testing.assert_close(result["mm_embeddings"][1], embeddings[1:])
     assert result["mrope_position_ids"] == ["first-ids", "second-ids"]
     assert result["mrope_position_deltas"] == ["first-deltas", "second-deltas"]
+
+
+@pytest.mark.parametrize("effective_length", [None, 0, 3])
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_engine_consumes_optional_length_update_and_passes_call_state(effective_length, is_dummy):
+    runner = Mock(spec=NoKVCacheRunner)
+    outputs = {"logits": object()}
+    if effective_length is not None:
+        outputs["runtime_draft_len"] = effective_length
+    runner.forward.return_value = outputs
+    engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
+    engine.runtime_draft_len = 2
+    engine.enable_spec_decode = True
+    engine._is_warmup = is_dummy
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [SimpleNamespace(py_return_context_logits=True)]
+
+    assert engine.forward(batch, resources) is outputs
+
+    inputs = runner.forward.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.gather_context_logits
+    assert inputs.enable_spec_decode
+    assert inputs.runtime_draft_len == 2
+    assert runner.forward.call_args.kwargs["is_dummy"] is is_dummy
+    assert engine.runtime_draft_len == (2 if effective_length is None else effective_length)
+    assert "runtime_draft_len" not in outputs
+
+
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_decoder_fallback_passes_call_state_without_engine_writes(is_dummy):
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    # The dummy flag comes from the caller, not from the warmup scope.
+    engine._is_warmup = not is_dummy
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 5
+    inputs = ScheduledInputs(
+        batch=ScheduledRequests(), enable_spec_decode=True, runtime_draft_len=2
+    )
+    expected = {"logits": object(), "runtime_draft_len": 4}
+    engine._forward_decoder = Mock(return_value=expected)
+
+    outputs = engine._forward_scheduled(inputs, resource_manager=resources, is_dummy=is_dummy)
+
+    assert outputs is expected
+    engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=is_dummy)
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
+
+
+def test_engine_forward_keeps_call_state_when_decoder_fails():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    engine._is_warmup = False
+    engine.enable_spec_decode = True
+    engine.runtime_draft_len = 2
+    engine._forward_decoder = Mock(side_effect=RuntimeError("decoder failure"))
+
+    with pytest.raises(RuntimeError, match="decoder failure"):
+        engine.forward(ScheduledRequests(), resources)
+
+    inputs = engine._forward_decoder.call_args.args[0]
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 2)
+
+
+def test_forward_warmup_runs_local_call_state_in_forward_context():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._is_warmup = True
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 5
+    batch = ScheduledRequests()
+
+    def decoder_forward(inputs, resource_manager, *, is_dummy):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is engine.model.extra_attrs
+        return {"logits": object(), "runtime_draft_len": 3}
+
+    engine._forward_decoder = Mock(side_effect=decoder_forward)
+
+    outputs = engine._forward_warmup(batch, resources, enable_spec_decode=True, runtime_draft_len=1)
+
+    inputs = engine._forward_decoder.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.new_tensors_device is None
+    assert inputs.cache_indirection_buffer is None
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 1)
+    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": True}
+    assert outputs["runtime_draft_len"] == 3
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
+    assert get_model_extra_attrs() is None
+
+
+def test_no_kv_forward_preserves_model_output_dictionary_without_length_update():
+    outputs = {"hidden_states": object()}
+    caller = Mock(return_value=outputs)
+    runner = _make_runner(PoolingRunner, _model(is_generation=False), model_caller=caller)
+    runner.prepare_inputs = Mock(return_value=PreparedInputs({}))
+    inputs = ScheduledInputs(batch=ScheduledRequests(), runtime_draft_len=3)
+    resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
+
+    actual = runner.forward(inputs, resource_manager=resources)
+
+    assert actual is outputs
+    assert "runtime_draft_len" not in outputs
+    assert inputs.runtime_draft_len == 3
+
+
+@pytest.mark.parametrize("raw_output", [torch.tensor([1.0]), None], ids=["tensor", "none"])
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_dummy):
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    engine._is_warmup = is_dummy
+    engine.runtime_draft_len = 2
+    engine._forward_decoder = Mock(return_value=raw_output)
+
+    assert engine.forward(ScheduledRequests(), resources) is raw_output
+    assert engine.runtime_draft_len == 2
+    assert engine._forward_decoder.call_args.args[0].runtime_draft_len == 2
+    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
+
+
+def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():
+    metadata = _AttentionMetadata()
+    spec_metadata = object()
+    attrs = {}
+    outer_attrs = {"outer": True}
+    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={"model_flag": True}))
+
+    def first_forward(**kwargs):
+        assert get_model_extra_attrs() is attrs
+        assert attrs["attention_metadata"]() is metadata
+        assert attrs["spec_metadata"] is spec_metadata
+        assert attrs["model_flag"] is True
+        return "first"
+
+    model.forward = Mock(side_effect=first_forward)
+    caller = ModelCaller(model)
+    with model_extra_attrs(outer_attrs):
+        with model_extra_attrs(attrs):
+            assert caller(attn_metadata=metadata, spec_metadata=spec_metadata) == "first"
+            model.forward = Mock(return_value="replacement")
+            assert caller(attn_metadata=metadata) == "replacement"
+            assert attrs["spec_metadata"] is None
+            model.forward.side_effect = RuntimeError("model failure")
+            with pytest.raises(RuntimeError, match="model failure"):
+                caller(attn_metadata=metadata)
+        assert get_model_extra_attrs() is outer_attrs
+
+
+def test_model_caller_borrows_live_compile_streams_and_events():
+    streams = Backend.Streams()
+    backend = SimpleNamespace(events=Backend.Events())
+    metadata = _AttentionMetadata()
+    current_stream = object()
+    attrs = {}
+
+    def forward(**kwargs):
+        assert get_model_extra_attrs() is attrs
+        assert attrs["aux_streams"]() is streams
+        assert attrs["events"]() is backend.events
+        assert attrs["global_stream"] is current_stream
+        return len(attrs["aux_streams"]()), len(attrs["events"]())
+
+    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
+    caller = ModelCaller(model, compile_backend=backend, aux_streams=streams)
+    with patch("torch.cuda.current_stream", return_value=current_stream), model_extra_attrs(attrs):
+        assert caller(attn_metadata=metadata) == (0, 0)
+        streams.append(object())
+        backend.events = Backend.Events([object(), object()])
+        assert caller(attn_metadata=metadata) == (1, 2)
+
+
+def test_model_caller_requires_streams_with_compile_backend():
+    with pytest.raises(ValueError, match="requires its auxiliary stream container"):
+        ModelCaller(SimpleNamespace(), compile_backend=SimpleNamespace(events=Backend.Events()))
+
+
+def test_mm_encoder_handoff_preserves_per_item_metadata_in_sparse_batch() -> None:
+    requests = [
+        SimpleNamespace(
+            py_multimodal_data={"image": object(), "multimodal_embedding_lengths": [1]},
+            multimodal_lengths=[1],
+        ),
+        SimpleNamespace(py_multimodal_data=None),
+        SimpleNamespace(
+            py_multimodal_data={"video": object(), "multimodal_embedding_lengths": [3, 2]},
+            multimodal_lengths=[7, 6],
+        ),
+    ]
+    for request in requests:
+        request.py_result = PyResult(prompt_len=1, max_new_tokens=1)
+        request.set_finished_reason = Mock()
+    params = [
+        SimpleNamespace(multimodal_data=request.py_multimodal_data)
+        for request in requests
+        if request.py_multimodal_data is not None
+    ]
+    scheduled_requests = SimpleNamespace(
+        context_requests=requests, generation_requests=[], num_context_requests=len(requests)
+    )
+    embeddings = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+    def encode(batch_params: list[SimpleNamespace]) -> list[torch.Tensor]:
+        batch_params[1].multimodal_data["multimodal_embedding_metadata"] = [
+            {"retained_token_counts": [2, 1]},
+            {"retained_token_counts": [2, 0]},
+        ]
+        return [embeddings]
+
+    runner = _make_runner(MultimodalEncoderRunner, SimpleNamespace(forward=encode))
+    result = runner._forward_step(
+        {"multimodal_params": params},
+        scheduled_requests,
+    )
+    sampler = EarlyStopWithMMResult()
+    state = sampler.sample_async(scheduled_requests, result, [])
+    sampler.update_requests(state)
+
+    assert requests[1].py_result.mm_embedding_handles is None
+    image_handles = json.loads(json.dumps(requests[0].py_result.mm_embedding_handles))
+    assert len(image_handles) == 1
+    assert "metadata" not in image_handles[0]
+    torch.testing.assert_close(
+        SharedTensorContainer.from_dict(image_handles[0]).get_local_view(), embeddings[:1]
+    )
+    video_handles = json.loads(json.dumps(requests[2].py_result.mm_embedding_handles))
+    assert [handle["metadata"]["retained_token_counts"] for handle in video_handles] == [
+        [2, 1],
+        [2, 0],
+    ]
+    restored = [
+        SharedTensorContainer.from_dict(handle).get_local_view() for handle in video_handles
+    ]
+    assert [len(embedding) for embedding in restored] == [3, 2]
+    torch.testing.assert_close(torch.cat(restored), embeddings[1:])

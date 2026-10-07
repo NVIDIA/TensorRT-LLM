@@ -24,7 +24,6 @@ from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, MTPDecodingConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_v2_mod
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -1232,11 +1231,6 @@ def test_fp8_runtime_uses_modelopt_nvfp4_scales(tmp_path):
 
 
 def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "python")
-    with pytest.raises(ValueError, match=r"require.*C\+\+ KVCacheManagerV2"):
-        _validate_compression()
-
-    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: False)
     with pytest.raises(RuntimeError, match="requires an SM100-family device"):
         util_mod.create_kv_cache_compression_manager(
@@ -1256,9 +1250,7 @@ def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> No
     assert manager.pretrained_config is model_engine.model.model_config.pretrained_config
 
 
-def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-
+def test_speculative_admission_accepts_verified_one_model_modes() -> None:
     _validate_compression(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
     _validate_compression(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
     for mode in (
@@ -1269,9 +1261,7 @@ def test_speculative_admission_accepts_verified_one_model_modes(monkeypatch) -> 
             _validate_compression(mode)
 
 
-def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
-
+def test_qwen35_mtp3_resolves_to_supported_one_model_mode() -> None:
     spec_config = MTPDecodingConfig(max_draft_len=3)
     update_spec_config_from_model_config(
         spec_config,
@@ -1289,7 +1279,6 @@ def test_qwen35_mtp3_resolves_to_supported_one_model_mode(monkeypatch) -> None:
 
 
 def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_v2_mod, "_BACKEND", "cpp")
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
 
     def build(

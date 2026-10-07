@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,8 +87,8 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90
                              || tensorrt_llm::common::isSM100Family(mSM) || mSM == kSM_120 || mSM == kSM_121),
         "Unsupported architecture");
-    TLLM_CHECK_WITH_INFO((mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16
-                             || mFixedParams.dataType == DATA_TYPE_E4M3),
+    TLLM_CHECK_WITH_INFO(
+        (mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16 || isFp8Selected()),
         "Unsupported data type");
     if (tensorrt_llm::common::isSM100Family(mSM))
     {
@@ -194,12 +194,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (runnerParams.vStrideInBytes > 0)
-            {
-                // Caller provided the actual V stride (supports both contiguous and non-contiguous V).
-                mKernelParams.v_stride_in_bytes = runnerParams.vStrideInBytes;
-            }
-            else if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
+            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
                 // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
@@ -282,7 +277,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // 2 scales prepared for scaleBmm1 in the device memory: float scale, float (scale with log2e).
     int64_t scaleBmm1PtrOffset = (mLaunchParams.useBase2ExpTrick ? kIdxScaleSoftmaxLog2Ptr : kIdxScaleSoftmaxPtr);
     // Only fp8 kernels need to load scales from the device memory.
-    if (mFixedParams.dataType == DATA_TYPE_E4M3)
+    if (isFp8Selected())
     {
         mKernelParams.scale_bmm1_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm1Ptr + scaleBmm1PtrOffset);
         mKernelParams.scale_bmm2_d = reinterpret_cast<uint32_t const*>(runnerParams.scaleBmm2Ptr);
@@ -326,7 +321,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     mLaunchParams.enableAttnLogitSoftcapping = mFixedParams.attnLogitSoftcappingScale != 0.f;
     // BF16 FMHA only accumulates on FP32.
     // E4M3 FMHA only supports fp32 accumulation currently.
-    mLaunchParams.force_fp32_acc = mFixedParams.dataType == DATA_TYPE_BF16 || mFixedParams.dataType == DATA_TYPE_E4M3
+    mLaunchParams.force_fp32_acc = mFixedParams.dataType == DATA_TYPE_BF16 || isFp8Selected()
         || mFixedParams.forceFp32Acc || runnerParams.forceFp32Acc;
     // The attention mask type.
     mLaunchParams.attention_mask_type = mFixedParams.attentionMaskType;
@@ -387,7 +382,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     // Only warp-specialized FMHA kernels support FP8 on Hopper.
     // Separate Q + KV input layout: enable warp-specialization kernels when s > 512, otherwise use ampere-style flash
     // attention kernels.
-    if (isSm90 && (mFixedParams.dataType == DATA_TYPE_E4M3 || (separateQKvInput && runnerParams.kvSeqLen > 512)))
+    if (isSm90 && (isFp8Selected() || (separateQKvInput && runnerParams.kvSeqLen > 512)))
     {
         mLaunchParams.flash_attention = true;
         mLaunchParams.force_unroll = true;

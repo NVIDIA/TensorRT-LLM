@@ -956,13 +956,6 @@ public:
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
-            // Pass V's actual token stride so the FMHA runner handles both
-            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
-            // kv.split() view) correctly.
-            if (v_ptr != nullptr && v.has_value())
-            {
-                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
-            }
             if (is_cross && cross_kv.has_value())
             {
                 auto const& cross_kv_tensor = cross_kv.value();
@@ -971,6 +964,17 @@ public:
                 // Kept in step with maxCrossKvLength in attention(), which sizes the workspace carved here.
                 enqueue_params.cross_kv_length
                     = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+            }
+            else if (is_cross)
+            {
+                // Later chunks of a chunked decoder prefill carry no encoder K/V and must read the cross KV cache.
+                // Only the fused kernel can do that; the unfused cross path builds K and V from cross_kv and would
+                // read a null pointer here. get_attention_op exempts cross attention from its paged-context check
+                // for exactly this reason, so this is the one place the requirement is enforced.
+                TLLM_CHECK_WITH_INFO(!op.isUnfusedCrossAttention(),
+                    "Cross attention without encoder K/V input requires a fused context FMHA kernel to read the "
+                    "cached cross KV, and this build has none for this configuration. Disable chunked prefill for "
+                    "this model, or use a build whose --cuda_architectures includes this device's SM.");
             }
 
             if (op.isMLAEnabled())
@@ -1135,6 +1139,37 @@ static std::shared_ptr<AttentionOp> get_attention_op(
         "Attention op for layer %lld is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
+    // initialize() ends with mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported(), so the flag
+    // reflects the exact Q/KV/output precision, mask type and page size this op will run with. Checking here rather
+    // than inside initialize() keeps the throw out of that noexcept function.
+    //
+    // Paged-context attention exists to attend to KV already in the cache. The unfused self-attention fallback
+    // builds K and V from the current chunk alone, so it drops the cached prefix and then overwrites it: without
+    // these checks a missing kernel produces a plausible wrong answer instead of an error.
+    //
+    // Cross attention is exempt from both checks. Its unfused path builds K and V from the encoder output
+    // (params.cross_kv) rather than from a cached prefix, so it is correct whenever cross_kv is supplied. The one
+    // cross case that must read the cache (later chunks of a chunked decoder prefill, which arrive without
+    // cross_kv) is checked per call in the context-stage enqueue (the is_cross branch without cross_kv).
+    bool const needs_fused_paged_context
+        = op->mPagedContextFMHA && op->mPagedKVCache && !op->mIsMLAEnabled && !op->mCrossAttention;
+    // Relative position embedding (T5) has no fused context FMHA implementation at all: initialize() clears
+    // mEnableContextFMHA for it before the kernel table is consulted ("Fall back to unfused MHA because of relative
+    // position embedding"). Report that as an unsupported feature combination, not as a missing kernel; no
+    // --cuda_architectures list can supply one. This check runs first so its message wins.
+    TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || !op->isRelativePosition(),
+        "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported with "
+        "relative position embedding: that attention always runs unfused, and the unfused path cannot attend to "
+        "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model. "
+        "Attention configuration: %s",
+        to_string(cache_key).c_str());
+    TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || op->mEnableContextFMHA,
+        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
+        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
+        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
+        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding. "
+        "Attention configuration: %s",
+        to_string(cache_key).c_str());
     runner->prepare(*op);
     auto [iter, _] = op_cache.try_emplace(cache_key, op);
     return iter->second;
@@ -1182,14 +1217,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps, double skip_correction_threshold,
-    std::optional<bool> uses_spcompress)
+    bool sage_attn_qk_int8, bool sage_attn_smooth_k, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool trtllm_gen_jit_warmup, std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross,
+    std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
+    int64_t relative_attention_max_distance, std::optional<int64_t> spec_decoding_target_max_draft_tokens,
+    std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
+    bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
+    std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+    double skip_correction_threshold, std::optional<bool> uses_spcompress)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1323,6 +1358,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
     op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
     op->mSageAttnQkInt8 = sage_attn_qk_int8;
+    op->mSageAttnSmoothK = sage_attn_smooth_k;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
     op->mCrossAttention = is_cross;

@@ -639,15 +639,24 @@ class PyResult:
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             mm_embedding_lengths: List[int]):
+    def append_mm_embeddings(
+        self,
+        mm_embeddings: torch.Tensor,
+        mm_embedding_lengths: List[int],
+        mm_embedding_metadata: list[dict[str, list[int]]]
+        | None = None) -> None:
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
             mm_embedding_lengths: Per-item encoder-output embedding lengths.
+            mm_embedding_metadata: Optional per-item layout data for prefill.
         """
+        if mm_embedding_metadata is not None and len(
+                mm_embedding_metadata) != len(mm_embedding_lengths):
+            raise ValueError(
+                "Embedding metadata must have one entry per multimodal item")
         split_embeddings = torch.split(mm_embeddings,
                                        mm_embedding_lengths,
                                        dim=0)
@@ -656,6 +665,11 @@ class PyResult:
             SharedTensorContainer.from_tensor(emb).dump_to_dict()
             for emb in split_embeddings
         ]
+        if mm_embedding_metadata is not None:
+            for handle, metadata in zip(self._mm_embeddings,
+                                        mm_embedding_metadata,
+                                        strict=True):
+                handle["metadata"] = metadata
         self.diff.mm_embeddings = self._mm_embeddings
 
     def set_mrope_position(
@@ -907,6 +921,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logits_chunk_size: int = 8,
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
+            return_routed_experts: bool = False,
             **kwargs):
         self.py_sampling_strategy: "Strategy | None" = None
 
@@ -1018,6 +1033,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # Router Replay: attach routed_experts to this request's output.
+        self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
@@ -1050,16 +1067,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
-        # Whether the KV connector has been asked about, and told about, this
-        # request's current KV allocation. The promise is at most once per
-        # allocation, not once per request, so this is cleared in
-        # `free_resources` -- the one place an allocation dies.
+        # Destination pages are reported once per allocation. Destroying the
+        # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
-        # End of the prefix a KV connector populated for the current allocation,
-        # or 0. The cache holds those tokens but never commits them, so a context
-        # request that re-enters cannot recover the end from the cache's own
-        # reuse depth.
+        # End of the connector prefix retained by this allocation, or 0. This
+        # depth survives async parking; local reuse cannot reconstruct it.
         self.py_connector_served_position = 0
 
         self.py_result = PyResult(
@@ -1083,6 +1096,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         decoding-iteration index with the array's own length so that decoding
         past the end of the array holds its last width.
 
+        Indexed with ``py_decoding_iter``, the counter the Python sampling loop
+        advances, rather than the C++ ``decoding_iter``. Under the overlap
+        scheduler ``_handle_responses`` copies the former into the latter only
+        once the step has been sampled, so reading ``decoding_iter`` here trails
+        by one step exactly where the width is consumed: a widening schedule
+        repeats a width instead of advancing, and the run ends narrower than
+        beam_width_array asks for. The two counters are equal wherever the C++
+        side reads the width -- the micro-batch scheduler runs before the
+        sampler advances ``py_decoding_iter`` -- so the clamping formula still
+        agrees with llmRequest.cpp; test_vbws_cpp_formula_matches_past_array_end
+        pins that with the counters held in sync.
+
         The C++ implementation used to clamp with the global
         kMaxBeamWidthArrayLength constant instead, reading past the end of
         the user array and returning arbitrary widths; that is fixed in
@@ -1091,8 +1116,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         would otherwise bind to whatever libtensorrt_llm.so happens to
         provide -- including a prebuilt one from before that fix, against
         which the mismatch starves the request in the micro-batch scheduler
-        and decoding hangs. test_vbws_cpp_formula_matches_past_array_end
-        pins the agreement.
+        and decoding hangs.
 
         An empty array falls through to the base implementation rather than
         indexing it, matching the emptiness guard the C++ side checks before
@@ -1100,7 +1124,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         """
         beam_width_array = self.sampling_config.beam_width_array
         if beam_width_array:
-            iteration = self.decoding_iter + (1 if for_next_iteration else 0)
+            iteration = self.py_decoding_iter + (1 if for_next_iteration else 0)
             index = max(min(iteration, len(beam_width_array)) - 1, 0)
             return int(beam_width_array[index])
         return super().get_beam_width_by_iter(for_next_iteration)
@@ -1627,6 +1651,8 @@ def executor_request_to_llm_request(
                               LogprobMode.RAW),
         logprobs_simple_format=getattr(executor_request,
                                        "py_logprobs_simple_format", False),
+        return_routed_experts=getattr(executor_request,
+                                      "py_return_routed_experts", False),
     )
 
     # Bad-words list for the TorchSampler path, kept in its native

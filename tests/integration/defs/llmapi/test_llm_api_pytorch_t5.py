@@ -269,8 +269,7 @@ _TEST_CASES = [
         cuda_graph_batch_sizes=[2],
         feature_id="bf16-kv-v1-cuda-graph-on-beam2",
     ),
-    # Precision coverage for beam search. KVCacheManagerV2 currently requires
-    # max_beam_width == 1, so beam-search precision coverage uses v1.
+    # V1 precision coverage for beam search.
     _test_case(
         model_name="t5-small",
         torch_dtype="float16",
@@ -515,6 +514,15 @@ _MIXED_BATCH_TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
@@ -984,3 +992,51 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
         }
         assert replayed_mixed_keys
         assert replayed_mixed_keys <= captured_mixed_keys
+
+
+def test_t5_pytorch_block_reuse_is_refused_for_relative_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV block reuse with T5 must fail with a message about relative position.
+
+    Block reuse turns on paged-context attention, which needs the fused context
+    FMHA kernel to attend to cached KV. T5 self attention uses relative position
+    embedding, for which no fused kernel exists on any build, so the attention
+    op refuses the combination up front instead of silently running the unfused
+    path and dropping the cached prefix. The refusal must name the real cause
+    (relative position embedding), not a missing kernel or the build's
+    architecture list, which cannot help here.
+    """
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    # Keep the worker in-process so the C++ error message reaches pytest intact.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_t5_model_path("t5-small")
+    sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
+
+    # Warmup during construction may already run a forward, so the refusal can
+    # come from either the constructor or the first generate call.
+    with pytest.raises(Exception, match="relative position embedding"):
+        with LLM(
+            model_path,
+            backend="pytorch",
+            attn_backend="TRTLLM",
+            cuda_graph_config=None,
+            disable_overlap_scheduler=True,
+            dtype="bfloat16",
+            enable_chunked_prefill=False,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=True,
+                max_tokens=_MAX_KV_TOKENS,
+                free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+                cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            ),
+            max_batch_size=1,
+            max_beam_width=1,
+            max_input_len=_MAX_SEQUENCE_LENGTH,
+            max_num_tokens=_MAX_SEQUENCE_LENGTH,
+            max_seq_len=_MAX_SEQUENCE_LENGTH,
+            model_kwargs={"torch_dtype": "bfloat16"},
+            scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        ) as llm:
+            llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)

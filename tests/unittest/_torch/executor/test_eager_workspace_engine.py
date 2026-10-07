@@ -14,6 +14,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
@@ -173,6 +174,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
+        self.engine._torch_compile_prefill_only = False
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
@@ -181,6 +183,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
+        self.engine._model_caller = ModelCaller(self.engine.model)
         reclaimer_patch = patch(f"{_ENGINE_MODULE}.EagerWorkspaceReclaimer", autospec=True)
         self.reclaimer_class = reclaimer_patch.start()
         self.addCleanup(reclaimer_patch.stop)
@@ -191,12 +194,18 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         ):
             self.engine._freeze_eager_workspace_floor()
 
-    def call(self) -> int:
+    def call(self, *, is_dummy: bool = False) -> int:
         with (
-            patch(f"{_ENGINE_MODULE}.get_model_extra_attrs", return_value={}),
-            patch(f"{_ENGINE_MODULE}.is_trace_enabled", return_value=False),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.model_call.get_model_extra_attrs",
+                return_value={},
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor.engine.model_call.is_trace_enabled",
+                return_value=False,
+            ),
         ):
-            return self.engine.model_forward(attn_metadata=self.metadata)
+            return self.engine.model_forward(is_dummy=is_dummy, attn_metadata=self.metadata)
 
     def test_forward_scope_and_warmup_bypass(self) -> None:
         with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": "0"}):
@@ -208,10 +217,8 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.reclaimer_class.assert_called_once_with(self.metadata)
         self.assertIs(self.engine._eager_workspace_reclaimer, self.reclaimer_class.return_value)
         scope = self.reclaimer_class.return_value.forward
-        self.engine._is_warmup = True
-        self.assertEqual(self.call(), 42)
+        self.assertEqual(self.call(is_dummy=True), 42)
         scope.assert_not_called()
-        self.engine._is_warmup = False
 
         def forward(**kwargs: object) -> int:
             scope.return_value.__enter__.assert_called_once()

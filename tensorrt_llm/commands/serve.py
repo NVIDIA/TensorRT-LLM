@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import contextlib
@@ -32,7 +46,12 @@ from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
 from tensorrt_llm.commands import _telemetry as _command_telemetry
+from tensorrt_llm.commands._config_overrides import (ConfigOverride,
+                                                     ConfigOverrideError,
+                                                     apply_config_overrides,
+                                                     parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
+from tensorrt_llm.commands.mooncake import mooncake_donor, mooncake_master
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -162,7 +181,7 @@ def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
                              "Must be a class or an async function.")
 
 
-def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
+def is_non_default_or_required(param_name, value, explicit_cli_keys):
     """
     Check if a parameter should be explicitly included in llm_args.
 
@@ -198,12 +217,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "_autodeploy":
-        from tensorrt_llm._torch.auto_deploy.llm_args import \
-            LlmArgs as AutoDeployLlmArgs
-        llm_args_class = AutoDeployLlmArgs
-    else:
-        llm_args_class = TorchLlmArgs
+    llm_args_class = TorchLlmArgs
 
     field_info = llm_args_class.model_fields.get(param_name)
     if not field_info:
@@ -221,6 +235,26 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
 # CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
 # in lock-step with the args class and can't drift.
 _LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+
+
+def _parse_config_overrides(
+        assignments: Sequence[str]) -> tuple[ConfigOverride, ...]:
+    try:
+        return parse_config_overrides(
+            assignments,
+            allowed_roots=_LLM_ARGS_FIELDS,
+        )
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
+
+
+def _apply_config_overrides(
+        config: Dict[str, Any],
+        overrides: Sequence[ConfigOverride]) -> Dict[str, Any]:
+    try:
+        return apply_config_overrides(config, overrides)
+    except ConfigOverrideError as error:
+        raise click.BadParameter(str(error), param_hint="--set") from error
 
 
 def get_llm_args(
@@ -346,7 +380,7 @@ def get_llm_args(
     llm_args = {
         param: value
         for param, value in cli_maybe_overrides.items()
-        if is_non_default_or_required(param, value, backend, explicit_cli_keys)
+        if is_non_default_or_required(param, value, explicit_cli_keys)
     }
 
     return llm_args, llm_args_extra_dict
@@ -695,12 +729,6 @@ def launch_server(
         if backend == 'pytorch':
             llm_args.pop("build_config", None)
             llm = PyTorchLLM(**llm_args)
-        elif backend == '_autodeploy':
-            from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-
-            # AutoDeploy does not support build_config
-            llm_args.pop("build_config", None)
-            llm = AutoDeployLLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -815,6 +843,26 @@ def _resolve_embedding_architecture_override(
     logger.info(f"Embedding routing: overriding architecture "
                 f"{architectures[0]} -> {target}")
     return {"architectures": [target]}
+
+
+def _reject_embedding_extra_model_inputs(cuda_graph_config: Any) -> None:
+    """Reject encoder CUDA graph extra model inputs for the embeddings server.
+
+    /v1/embeddings has no field for extra model inputs, so the server calls
+    llm.encode() without them and every request would miss the declared inputs.
+    `cuda_graph_config` is the raw --config mapping or a parsed config object.
+    """
+    if isinstance(cuda_graph_config, dict):
+        specs = cuda_graph_config.get("extra_model_inputs")
+    else:
+        specs = getattr(cuda_graph_config, "extra_model_inputs", None)
+    if specs:
+        raise click.BadParameter(
+            "cuda_graph_config.extra_model_inputs is not supported by "
+            "trtllm-serve embeddings: /v1/embeddings has no field for extra "
+            "model inputs. Pass them through the Python llm.encode() API "
+            "instead.",
+            param_hint="config")
 
 
 def launch_embedding_server(
@@ -990,11 +1038,9 @@ def launch_visual_gen_server(
                   status="beta")
 @stability_option(
     "--backend",
-    type=click.Choice(["pytorch", "_autodeploy"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
-    help="The backend to use to serve the model. Default is pytorch backend. "
-    "Note: the '_autodeploy' backend is deprecated and will be discontinued "
-    "in a future release; please use the 'pytorch' backend instead.",
+    help="The backend to use to serve the model. Default is pytorch backend.",
     status="deprecated")
 @stability_option(
     "--generation-config",
@@ -1143,8 +1189,17 @@ def launch_visual_gen_server(
     type=str,
     default=None,
     help="Path to a YAML configuration file. Explicit CLI flags take precedence "
-    "over values in this file. Can be specified as either --config or "
-    "--extra_llm_api_options.",
+    "over values in this file, while --set overrides both. Can be specified "
+    "as either --config or --extra_llm_api_options.",
+    status="prototype")
+@stability_option(
+    "--set",
+    "config_overrides",
+    type=str,
+    multiple=True,
+    help="Override a canonical LlmArgs path as PATH=YAML_VALUE. Repeatable; "
+    "applied after --config and dedicated CLI flags. Not supported for "
+    "startup, telemetry, environment, server-only, or VisualGen settings.",
     status="prototype")
 @stability_option("--reasoning_parser",
                   type=click.Choice(["auto"] +
@@ -1322,6 +1377,7 @@ def serve(
     trust_remote_code: bool,
     revision: Optional[str],
     extra_llm_api_options: Optional[str],
+    config_overrides: tuple[str, ...],
     reasoning_parser: Optional[str],
     tool_parser: Optional[str],
     metadata_server_config_file: Optional[str],
@@ -1351,13 +1407,6 @@ def serve(
     MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
-
-    if backend == "_autodeploy":
-        logger.warning(
-            "The '_autodeploy' backend is deprecated and will be discontinued in a "
-            "future release. No new features or models will be added. Please migrate "
-            "to the 'pytorch' backend. See "
-            "https://github.com/NVIDIA/TensorRT-LLM/issues/15638 for details.")
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
@@ -1408,9 +1457,38 @@ def serve(
             raise e
 
     explicit_cli_keys = collect_explicit_cli_keys(
-        exclude=("extra_llm_api_options", "config"))
+        exclude=("extra_llm_api_options", "config", "config_overrides"))
+
+    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
+                     or get_is_diffusion_only_model(model))
+    # Honor YAML telemetry opt-out before --set parsing can raise an error.
+    raw_llm_args_extra_dict = {}
+    if not is_visual_gen and extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            raw_llm_args_extra_dict = yaml.safe_load(f)
+        if raw_llm_args_extra_dict is None:
+            raw_llm_args_extra_dict = {}
+        elif not isinstance(raw_llm_args_extra_dict, dict):
+            raise ValueError("Configuration file root must be a mapping.")
+    if not is_visual_gen:
+        _command_telemetry.apply_raw_config_telemetry_opt_out(
+            raw_llm_args_extra_dict,
+            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
+            component="server",
+            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
+        )
+    if config_overrides and is_visual_gen:
+        raise click.BadParameter(
+            "--set configures LlmArgs and is not supported by VisualGen.",
+            param_hint="--set")
+    parsed_config_overrides = _parse_config_overrides(config_overrides)
 
     def _serve_llm():
+        try:
+            from tensorrt_llm.usage.usage_lib import _mark_llm_startup
+            _mark_llm_startup()
+        except Exception:
+            pass
         nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
@@ -1445,30 +1523,37 @@ def serve(
             agent_types=agent_types,
             explicit_cli_keys=explicit_cli_keys)
 
-        llm_args_extra_dict = {}
-        if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-            if llm_args_extra_dict is None:
-                llm_args_extra_dict = {}
-            elif not isinstance(llm_args_extra_dict, dict):
-                raise ValueError("Configuration file root must be a mapping.")
-        _command_telemetry.apply_raw_config_telemetry_opt_out(
-            llm_args_extra_dict,
-            usage_context=_telemetry_config.UsageContext.CLI_SERVE,
-            component="server",
-            explicit_cli_telemetry="telemetry" in explicit_cli_keys,
-        )
+        llm_args_extra_dict = dict(raw_llm_args_extra_dict)
         extra_allow_request_chat_template = _pop_bool_config_option(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
         internal_disagg_auth_key = _pop_optional_str_config_option(
             llm_args_extra_dict, "internal_request_auth_key")
+        # Apply to the raw mapping first so a higher-precedence override can
+        # replace an invalid YAML value before nested config construction.
+        llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
+                                                      parsed_config_overrides)
+        set_top_level_fields = {
+            override.path[0]
+            for override in parsed_config_overrides if len(override.path) == 1
+        }
+        merge_explicit_cli_keys = explicit_cli_keys - set_top_level_fields
         llm_args = update_llm_args_with_extra_dict(
-            llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
+            llm_args,
+            llm_args_extra_dict,
+            explicit_cli_keys=merge_explicit_cli_keys)
+        # Reapply to the effective mapping so --set remains the final source
+        # even when an explicit convenience flag targets the same nested field.
+        llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        # Preserve requested settings for failures before entering the LLM constructor.
+        try:
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+            _capture_startup_context(requested=llm_args)
+        except Exception:
+            pass
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1504,7 +1589,9 @@ def serve(
             media_io_kwargs=parsed_media_io_kwargs)
 
         if grpc:
-            if num_serve_frontends != 1:
+            effective_num_serve_frontends = llm_args.get(
+                "num_serve_frontends", num_serve_frontends)
+            if effective_num_serve_frontends != 1:
                 raise click.UsageError(
                     "--num_serve_frontends must be 1 when --grpc is enabled.")
 
@@ -1555,10 +1642,8 @@ def serve(
                 except ImportError as error:
                     raise click.ClickException(
                         f"Failed to import OpenEngine support: {error}. "
-                        "Install the optional Python bindings with `python -m "
-                        "pip install --extra-index-url "
-                        "https://buf.build/gen/python "
-                        "\"tensorrt_llm[openengine]\"`.") from error
+                        "Restore the required gRPC runtime with `python -m pip "
+                        "install \"grpcio>=1.67.1,<2\"`.") from error
 
                 launch_grpc_server(host,
                                    port,
@@ -1596,8 +1681,6 @@ def serve(
         launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
                                  metadata_server_cfg, middleware)
 
-    is_visual_gen = (enable_visual_gen or visual_gen_args is not None
-                     or get_is_diffusion_only_model(model))
     # Only the OpenAI HTTP path publishes the bound address. Fail loudly rather
     # than leaving a launcher waiting forever on a file nobody writes.
     if report_addr and (grpc or is_visual_gen):
@@ -1907,6 +1990,7 @@ def serve_embedding(
             f"pipeline_parallel_size={effective_pp}, "
             f"context_parallel_size={effective_cp} from --config.",
             param_hint="config")
+    _reject_embedding_extra_model_inputs(llm_args.get("cuda_graph_config"))
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -2252,6 +2336,27 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     coord_url = f"unix:{coord_uds}" if coord_uds else \
         f"http://{public_host}:{coord_port}"
 
+    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+    # hostname, so this listener starts the same way as the standalone server and
+    # the fleet workers. uvicorn would resolve the name itself, and a hostname
+    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+    # the kernel always rejects with "invalid argument", because the scope id can
+    # only be derived from an interface name. Binding AF_INET here also surfaces a
+    # port conflict with the same diagnostics as the other two listeners.
+    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        coord_socket.bind((public_host, coord_port))
+    except OSError as e:
+        coord_socket.close()
+        holder = _diagnose_port_in_use(coord_port)
+        logger.error(f"Failed to bind coordinator socket to "
+                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
+                     f"Current port holder(s): {holder}")
+        raise RuntimeError(
+            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
+            f"Port holder(s): {holder}")
+
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
     #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
@@ -2275,7 +2380,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         disagg_cfg,
         _client_factory,
         metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout)
+        server_start_timeout_secs=server_start_timeout,
+        request_timeout_secs=request_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
                 f"(uds={coord_uds}) (fleet on public port {public_port})")
     set_lifecycle_phase("serving")
@@ -2286,7 +2392,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                 public_host,
                 coord_port,
                 uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout))
+                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                sockets=[coord_socket]))
 
         async def _monitor_fleet():
             while True:
@@ -2314,6 +2421,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
+        coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
@@ -2727,7 +2835,11 @@ main = DefaultGroup(
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
-        "embeddings": serve_embedding
+        "embeddings": serve_embedding,
+        # The parts of a Mooncake pool that cannot belong to a server, for
+        # deployments where a pool outlives or spans them.
+        "mooncake_master": mooncake_master,
+        "mooncake_donor": mooncake_donor,
     })
 
 if __name__ == "__main__":
