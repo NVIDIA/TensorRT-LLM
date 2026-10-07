@@ -889,16 +889,20 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         param = _make_keyed_image_param(item_hashes=[[0] * 8, [1] * 8, [2] * 8])
         source_image = param.multimodal_data["image"]
 
-        residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+        model = _Gemma4EncoderCacheHarness()
 
-        residual_image = residual.multimodal_data["image"]
-        torch.testing.assert_close(
-            residual_image["pixel_values"], source_image["pixel_values"][[2, 0]]
-        )
-        torch.testing.assert_close(
-            residual_image["image_position_ids"], source_image["image_position_ids"][[2, 0]]
-        )
-        self.assertEqual(residual_image["image_seq_lens"], [1, 1])
+        # The item-scheduling path passes `modality=` explicitly (base-class contract).
+        for modality_kwargs in ({}, {"modality": "image"}):
+            residual = model.build_multimodal_encoder_input(param, [2, 0], **modality_kwargs)
+
+            residual_image = residual.multimodal_data["image"]
+            torch.testing.assert_close(
+                residual_image["pixel_values"], source_image["pixel_values"][[2, 0]]
+            )
+            torch.testing.assert_close(
+                residual_image["image_position_ids"], source_image["image_position_ids"][[2, 0]]
+            )
+            self.assertEqual(residual_image["image_seq_lens"], [1, 1])
 
     def test_build_multimodal_encoder_input_slices_gemma4_audio_input(self):
         """Gemma4 audio features and their mask remain item-aligned."""
