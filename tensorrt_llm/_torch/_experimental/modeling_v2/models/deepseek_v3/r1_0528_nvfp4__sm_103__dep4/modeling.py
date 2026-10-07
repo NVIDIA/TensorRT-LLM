@@ -759,17 +759,23 @@ class PrefillTarget(Target):
         self._mla_load.bind_const(
             tokens_per_block=md.tokens_per_block, attention_window_size=md.max_seq_len
         )
+        # Explicit subsets rather than **step: the three MLA helpers' raw_calls
+        # do not take the projection's engine-bookkeeping keys.
         self._mla_gen.bind_const(
             rotary_cos_sin=rope["rotary_cos_sin"],
             tokens_per_block=md.tokens_per_block,
             attention_window_size=md.max_seq_len,
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            num_contexts=md.num_contexts,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
         )
 
         num_ctx = md.num_contexts
         tc = md.num_ctx_tokens
-        block_offsets = md.kv_cache_block_offsets
-        pool_ptrs = md.host_kv_cache_pool_pointers
-        pool_map = md.host_kv_cache_pool_mapping
 
         if inputs_embeds is None:
             h = nn.functional.embedding(input_ids, core.w["embed"])
@@ -787,9 +793,59 @@ class PrefillTarget(Target):
         ctx_kv_tokens = int(md.host_total_kv_lens[0])
         dp_rows = core._dp_rows(md, num_tokens)
         pad_rows = dp_rows - num_tokens
+        if core._cached_ctx:
+            # The ctx_* metadata fields exist only in this flavor.
+            self._mla_append.bind_const(
+                num_contexts=num_ctx,
+                cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
+                cu_seq_lens=md.ctx_kv_indptr,
+                max_input_uncached_seq_len=int(md.max_ctx_seq_len),
+                kv_cache_block_offsets=md.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            )
+            self._mla_load.bind_const(
+                out_dtype=dt,
+                num_contexts=num_ctx,
+                num_ctx_kv_tokens=ctx_kv_tokens,
+                max_ctx_kv_len=int(md.max_ctx_kv_len),
+                cu_ctx_kv_lens=md.ctx_kv_indptr,
+                kv_cache_block_offsets=md.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
+            )
 
         attn_out = torch.empty([num_tokens, heads * v_dim], dtype=dt, device=dev)
         attn_ctx, attn_gen = torch.split(attn_out, [tc, gen], 0)
+        # One set of attention scratch for all layers: every tensor here is fully
+        # rewritten by layer i's producer before layer i's consumer reads it, and
+        # the whole attention path runs on the main stream, so layer i+1 cannot
+        # overwrite what layer i still reads. 9 allocations per step, not 9 x 61.
+        # `k`'s rope half is written only in the cached-ctx flavor; the fresh
+        # flavor never reads it, in either allocation scheme.
+        tkv = ctx_kv_tokens
+        k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
+        k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
+        fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
+        fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
+        lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+        cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+        cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+        counter = torch.empty([1], dtype=torch.uint32, device=dev)
+        quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
+        bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
+        bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
+        scratch = dict(
+            cu_q_seqlens=cu_q,
+            cu_kv_seqlens=cu_kv,
+            fmha_scheduler_counter=counter,
+            mla_bmm1_scale=bmm1_scale,
+            mla_bmm2_scale=bmm2_scale,
+            quant_q_buffer=quant_q,
+            predicted_tokens_per_seq=gen_p,
+        )
+        self._mla_gen.bind_const(**scratch)
+        self._attn_gen.bind_const(**scratch)
         x = self._rms0(h)
         residual = h
         for i in range(num_layers):
@@ -802,41 +858,17 @@ class PrefillTarget(Target):
             latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
             if core._cached_ctx:
-                self._mla_append(
-                    q=q_ctx,
-                    latent_cache=latent_ctx,
-                    num_contexts=num_ctx,
-                    cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
-                    cu_seq_lens=md.ctx_kv_indptr,
-                    max_input_uncached_seq_len=int(md.max_ctx_seq_len),
-                    kv_cache_block_offsets=block_offsets,
-                    host_kv_cache_pool_pointers=pool_ptrs,
-                    host_kv_cache_pool_mapping=pool_map,
-                    layer=i,
-                )
-                ckv_full, k_pe_full = self._mla_load(
-                    out_dtype=dt,
-                    num_contexts=num_ctx,
-                    num_ctx_kv_tokens=ctx_kv_tokens,
-                    max_ctx_kv_len=int(md.max_ctx_kv_len),
-                    cu_ctx_kv_lens=md.ctx_kv_indptr,
-                    kv_cache_block_offsets=block_offsets,
-                    host_kv_cache_pool_pointers=pool_ptrs,
-                    host_kv_cache_pool_mapping=pool_map,
-                    layer=i,
-                )
+                self._mla_append(q=q_ctx, latent_cache=latent_ctx, layer=i)
+                ckv_full, k_pe_full = self._mla_load(layer=i)
                 latent_arg = None
             else:
                 ckv_full, _ = torch.split(ckv, [tc, gen], 0)
                 k_pe_full = None
                 latent_arg = latent_ctx
-            tkv = ctx_kv_tokens
             # The context FMHA hard-codes V's row stride as the full packed [k_nope | v]
             # width and reads the column block, so V must stay this split view.
             kv = self._kvb(ckv_full, layer=i)
             k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
-            k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
-            k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
             k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
             if k_pe_full is not None:
                 k_pe_dst.copy_(
@@ -854,53 +886,18 @@ class PrefillTarget(Target):
             if gen:
                 q3 = torch.reshape(q_gen, [gen, heads, qk_dim])
                 q_nope, q_pe = torch.split(q3, [nope, rope_dim], -1)
-                fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
-                fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
                 # Over an fp8 pool `_mla_gen` reads this half to build the quantized query, so
                 # this BMM must be issued first on the same stream; overlapping them is a silent
                 # race (they only write disjoint halves on a bf16 pool).
                 self._absorb(
                     a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1), layer=i
                 )
-                cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
-                cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
-                counter = torch.empty([1], dtype=torch.uint32, device=dev)
-                quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
-                bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
-                bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
-                self._mla_gen(
-                    fused_q=fused_q,
-                    q_pe=q_pe,
-                    latent_cache=latent_gen,
-                    cu_q_seqlens=cu_q,
-                    cu_kv_seqlens=cu_kv,
-                    fmha_scheduler_counter=counter,
-                    mla_bmm1_scale=bmm1_scale,
-                    mla_bmm2_scale=bmm2_scale,
-                    quant_q_buffer=quant_q,
-                    sequence_length=md.kv_lens_cuda_runtime,
-                    host_past_key_value_lengths=md.kv_lens_runtime,
-                    host_context_lengths=md.prompt_lens_cpu_runtime,
-                    num_contexts=num_ctx,
-                    kv_cache_block_offsets=block_offsets,
-                    host_kv_cache_pool_pointers=pool_ptrs,
-                    host_kv_cache_pool_mapping=pool_map,
-                    predicted_tokens_per_seq=gen_p,
-                    layer=i,
-                )
-                lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+                self._mla_gen(fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i)
                 self._attn_gen(
                     q=torch.reshape(fused_q, [gen, heads * lat_dim]),
                     output=lat_out,
                     latent_cache=latent_gen,
                     q_pe=q_pe,
-                    cu_q_seqlens=cu_q,
-                    cu_kv_seqlens=cu_kv,
-                    fmha_scheduler_counter=counter,
-                    mla_bmm1_scale=bmm1_scale,
-                    mla_bmm2_scale=bmm2_scale,
-                    quant_q_buffer=quant_q,
-                    predicted_tokens_per_seq=gen_p,
                     layer=i,
                 )
                 self._expand(
@@ -1626,14 +1623,20 @@ class DecodeTarget(Target):
 
         step = self.step_args(md)
         self._attn_gen.bind_const(**step, **rope)
+        # An explicit subset rather than **step: mla_rope_generation's raw_call
+        # does not take the projection's engine-bookkeeping keys.
         self._mla_gen.bind_const(
             rotary_cos_sin=rope["rotary_cos_sin"],
             tokens_per_block=md.tokens_per_block,
             attention_window_size=md.max_seq_len,
+            sequence_length=md.kv_lens_cuda_runtime,
+            host_past_key_value_lengths=md.kv_lens_runtime,
+            host_context_lengths=md.prompt_lens_cpu_runtime,
+            num_contexts=0,
+            kv_cache_block_offsets=md.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=md.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=md.host_kv_cache_pool_mapping,
         )
-        block_offsets = md.kv_cache_block_offsets
-        pool_ptrs = md.host_kv_cache_pool_pointers
-        pool_map = md.host_kv_cache_pool_mapping
 
         if inputs_embeds is None:
             h = nn.functional.embedding(input_ids, core.w["embed"])
@@ -1653,6 +1656,30 @@ class DecodeTarget(Target):
 
         attn_out = torch.empty([num_tokens, heads * v_dim], dtype=dt, device=dev)
         attn_gen = attn_out
+        # One set of attention scratch for all layers: every tensor here is fully
+        # rewritten by layer i's _mla_gen before layer i's _attn_gen reads it, and
+        # the whole attention path runs on the main stream, so layer i+1 cannot
+        # overwrite what layer i still reads. 8 allocations per step, not 8 x 61.
+        fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
+        fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
+        lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+        cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+        cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
+        counter = torch.empty([1], dtype=torch.uint32, device=dev)
+        quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
+        bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
+        bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
+        scratch = dict(
+            cu_q_seqlens=cu_q,
+            cu_kv_seqlens=cu_kv,
+            fmha_scheduler_counter=counter,
+            mla_bmm1_scale=bmm1_scale,
+            mla_bmm2_scale=bmm2_scale,
+            quant_q_buffer=quant_q,
+            predicted_tokens_per_seq=gen_p,
+        )
+        self._mla_gen.bind_const(**scratch)
+        self._attn_gen.bind_const(**scratch)
         x = self._rms0(h)
         residual = h
         for i in range(num_layers):
@@ -1666,53 +1693,18 @@ class DecodeTarget(Target):
 
             q3 = torch.reshape(q_gen, [gen, heads, qk_dim])
             q_nope, q_pe = torch.split(q3, [nope, rope_dim], -1)
-            fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
-            fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
             # Over an fp8 pool `_mla_gen` reads this half to build the quantized query, so
             # this BMM must be issued first on the same stream; overlapping them is a silent
             # race (they only write disjoint halves on a bf16 pool).
             self._absorb(
                 a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1), layer=i
             )
-            cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
-            cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
-            counter = torch.empty([1], dtype=torch.uint32, device=dev)
-            quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
-            bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
-            bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
-            self._mla_gen(
-                fused_q=fused_q,
-                q_pe=q_pe,
-                latent_cache=latent_gen,
-                cu_q_seqlens=cu_q,
-                cu_kv_seqlens=cu_kv,
-                fmha_scheduler_counter=counter,
-                mla_bmm1_scale=bmm1_scale,
-                mla_bmm2_scale=bmm2_scale,
-                quant_q_buffer=quant_q,
-                sequence_length=md.kv_lens_cuda_runtime,
-                host_past_key_value_lengths=md.kv_lens_runtime,
-                host_context_lengths=md.prompt_lens_cpu_runtime,
-                num_contexts=0,
-                kv_cache_block_offsets=block_offsets,
-                host_kv_cache_pool_pointers=pool_ptrs,
-                host_kv_cache_pool_mapping=pool_map,
-                predicted_tokens_per_seq=gen_p,
-                layer=i,
-            )
-            lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+            self._mla_gen(fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i)
             self._attn_gen(
                 q=torch.reshape(fused_q, [gen, heads * lat_dim]),
                 output=lat_out,
                 latent_cache=latent_gen,
                 q_pe=q_pe,
-                cu_q_seqlens=cu_q,
-                cu_kv_seqlens=cu_kv,
-                fmha_scheduler_counter=counter,
-                mla_bmm1_scale=bmm1_scale,
-                mla_bmm2_scale=bmm2_scale,
-                quant_q_buffer=quant_q,
-                predicted_tokens_per_seq=gen_p,
                 layer=i,
             )
             self._expand(
