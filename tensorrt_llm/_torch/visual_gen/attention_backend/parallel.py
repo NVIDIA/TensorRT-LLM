@@ -443,18 +443,18 @@ class UlyssesAttention(AttentionBackend):
 
         if kwargs.get("kv_cache") is not None:
             # With a cache, seq_len counts the real tokens of the whole sequence and
-            # rows past it are padding; a caller passing its own shard length would
-            # silently drop real tokens.
+            # rows past it are padding. Only the upper bound can be checked here: a
+            # heavily padded short chunk is indistinguishable from a shard length.
             rows = q.shape[1] * self.world_size
             seq_len = kwargs.get("seq_len")
             if seq_len is None:
                 raise ValueError(
                     "with a K/V cache, pass seq_len: the real token count of the chunk"
                 )
-            if self.world_size > 1 and not q.shape[1] < seq_len <= rows:
+            if not 0 < seq_len <= rows:
                 raise ValueError(
                     f"seq_len {seq_len} with a K/V cache must count the real tokens of the whole "
-                    f"sequence: more than this rank's {q.shape[1]} rows, at most {rows}"
+                    f"sequence: at least 1, at most the {rows} rows after the exchange"
                 )
         # The fused path stacks q/k/v on one axis, which needs equal head counts;
         # grouped-query models take the per-tensor path, and so does the K/V cache

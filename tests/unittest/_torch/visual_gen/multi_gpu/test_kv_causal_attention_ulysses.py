@@ -329,21 +329,6 @@ def _logic_head_count_guard(rank, world_size, backend):
         cache.shutdown()
 
 
-def _logic_per_rank_seq_len_refused(rank, world_size, backend):
-    """With a cache, seq_len counts the whole sequence's real tokens; a caller passing
-    its per-rank length would have real tokens treated as padding, so it raises."""
-    chunk = 40
-    cache = make_cache(chunk)
-    attn, _ = make_ulysses(rank, world_size, backend, chunk)
-    try:
-        cache.open()
-        q, k, v = rand_qkv(chunk)
-        with pytest.raises(ValueError, match="real tokens of the whole sequence"):
-            forward(attn, cache, q, k, v, rank, seq_len=chunk // world_size)
-    finally:
-        cache.shutdown()
-
-
 def _logic_through_the_attention_module(rank, world_size, backend):
     """The model's path: the shared Attention module builds the Ulysses wrapper and
     must hand the caller's real token count through, padding included."""
@@ -406,7 +391,6 @@ def _logic_all(rank, world_size, backend):
     _logic_causal_blocks(rank, world_size, backend, chunk=40, num_causal_blocks=4)
     _logic_padded_first_chunk(rank, world_size, backend)
     _logic_head_count_guard(rank, world_size, backend)
-    _logic_per_rank_seq_len_refused(rank, world_size, backend)
     _logic_through_the_attention_module(rank, world_size, backend)
 
 
