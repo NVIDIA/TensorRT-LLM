@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any
 
 import torch
 from torch import nn
@@ -988,7 +989,7 @@ class EncoderDecoderRunner(DecoderRunner):
         return max(1, max_encoder_output_len)
 
     def _add_cross_dummy_requests(
-        self, requests: List[LlmRequest], resource_manager: ResourceManager
+        self, requests: list[LlmRequest], resource_manager: ResourceManager
     ) -> bool:
         if not requests:
             return True
@@ -1030,7 +1031,7 @@ class EncoderDecoderRunner(DecoderRunner):
                 spec_resource_manager.free_resources(request)
         return False
 
-    def _populate_cross_kv_cache(self, inputs: Dict[str, Any]) -> None:
+    def _populate_cross_kv_cache(self, inputs: dict[str, Any]) -> None:
         encoder_hidden_states = inputs.get("encoder_hidden_states")
         cross_attn_metadata = inputs.get("cross_attn_metadata")
         if encoder_hidden_states is None or cross_attn_metadata is None:
@@ -1078,16 +1079,16 @@ class EncoderDecoderRunner(DecoderRunner):
 
     def _prepare_enc_dec_cross_attn_inputs(
         self,
-        encoder_hidden_states: List[torch.Tensor],
-        encoder_seq_lens: List[int],
-        encoder_num_cached_tokens_per_seq: List[int],
+        encoder_hidden_states: list[torch.Tensor],
+        encoder_seq_lens: list[int],
+        encoder_num_cached_tokens_per_seq: list[int],
         attn_metadata: AttentionMetadata,
-        resource_manager: Optional[ResourceManager],
-        encoder_kv_lens: Optional[torch.Tensor] = None,
+        resource_manager: ResourceManager | None,
+        encoder_kv_lens: torch.Tensor | None = None,
         context_encoder_kv_tokens: int = 0,
         generation_encoder_kv_tokens: int = 0,
         max_encoder_kv_len: int = 0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         if not encoder_seq_lens:
             return {}
 
@@ -1213,8 +1214,8 @@ class EncoderDecoderRunner(DecoderRunner):
     def _can_use_encoder_decoder_input_fast_path(
         self,
         scheduled_requests: ScheduledRequests,
-        new_tokens_device: Optional[torch.Tensor],
-        next_draft_tokens_device: Optional[torch.Tensor],
+        new_tokens_device: torch.Tensor | None,
+        next_draft_tokens_device: torch.Tensor | None,
         enable_spec_decode: bool,
     ) -> bool:
         """Return whether the TRT-like persistent input path is sufficient."""
@@ -1250,7 +1251,7 @@ class EncoderDecoderRunner(DecoderRunner):
                 return False
         return True
 
-    def _acquire_encoder_decoder_host_buffers(self) -> Dict[str, Any]:
+    def _acquire_encoder_decoder_host_buffers(self) -> dict[str, Any]:
         """Acquire pinned staging whose preceding asynchronous copies finished."""
         pool = self._encoder_decoder_host_buffer_pool
         for buffers in pool:
@@ -1292,10 +1293,10 @@ class EncoderDecoderRunner(DecoderRunner):
     def _prepare_encoder_decoder_inputs_fast(
         self,
         scheduled_requests: ScheduledRequests,
-        kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
         attn_metadata: AttentionMetadata,
         new_tokens_device: torch.Tensor,
-        resource_manager: Optional[ResourceManager],
+        resource_manager: ResourceManager | None,
     ):
         """Prepare a simple BART batch with native collation and reused buffers."""
         buffers = self._acquire_encoder_decoder_host_buffers()

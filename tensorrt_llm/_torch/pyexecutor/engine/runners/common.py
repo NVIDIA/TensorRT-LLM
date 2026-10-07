@@ -6,7 +6,7 @@
 import bisect
 import contextlib
 import math
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -237,7 +237,7 @@ def make_scheduled_inputs(
     )
 
 
-def resolve_mrope_position_deltas_cache(model: Optional[torch.nn.Module]) -> Optional[torch.Tensor]:
+def resolve_mrope_position_deltas_cache(model: torch.nn.Module | None) -> torch.Tensor | None:
     """The MRoPE delta cache held by ``model`` or by its draft model.
 
     ``None`` for every model that does not keep one, which is also how
