@@ -13,3 +13,15 @@ def test_cli_defaults_to_in_process_tools():
 def test_cli_no_mcp_tools_flag_disables_in_process_tools():
     args = cli._parse_args(["--task", "t.yaml", "--no-mcp-tools"])
     assert args.use_in_process_tools is False
+
+
+def test_cli_concurrent_defaults_off():
+    args = cli._parse_args(["--task", "t.yaml"])
+    assert args.concurrent is False
+    assert args.max_parallel == 8
+
+
+def test_cli_concurrent_flag_and_max_parallel():
+    args = cli._parse_args(["--task", "t.yaml", "--concurrent", "--max-parallel", "4"])
+    assert args.concurrent is True
+    assert args.max_parallel == 4
