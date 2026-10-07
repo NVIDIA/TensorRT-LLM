@@ -31,6 +31,7 @@ from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
@@ -394,6 +395,45 @@ class _OwnerCollective:
 
     def gather_int64(self, rank: int, values: list[int]) -> np.ndarray:
         return np.array(self.gather(rank, tuple(values)), dtype=np.int64)
+
+
+@pytest.mark.parametrize("batch_sizes", [(1, 1), (1, 0), (0, 1), (0, 0)])
+def test_batch_start_combines_readiness_with_status(batch_sizes: tuple[int, int]) -> None:
+    """Use post-prepare sizes without a third allgather or an owner-local skip."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    collective = _OwnerCollective()
+    executors = []
+    for rank in range(2):
+        executor = object.__new__(PyExecutor)
+        _configure_recovery_controls(executor)
+        executor.kv_connector_manager = _manager(rank)
+        executor.dist.tp_size = 2
+        executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
+        executors.append(executor)
+
+    def run(rank: int) -> tuple[bool, bool]:
+        executor = executors[rank]
+        batch = ScheduledRequests()
+        batch.generation_requests = [_request(10 + rank)]
+        assert executor._can_queue(batch) == (True, True)
+
+        def prepare(scheduled: ScheduledRequests) -> list["LlmRequest"]:
+            if not batch_sizes[rank]:
+                scheduled.generation_requests = []
+            return []
+
+        executor._kv_connector_prepare_batch = prepare
+        return executor._kv_connector_start_batch(batch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run, rank) for rank in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+
+    assert results == [(all(batch_sizes), bool(size)) for size in batch_sizes]
+    for executor in executors:
+        assert executor.dist.tp_allgather_int64.call_count == 2
+        executor.dist.tp_allgather.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1241,7 +1281,9 @@ def test_ready_owner_polls_save_during_peer_recovery() -> None:
     executor.kv_connector_manager.worker.get_finished.side_effect = [([], []), ([42], []), ([], [])]
     executor._release_transfer = MagicMock()
     executor._kv_connector_config.transfer_timeout_sec = 600
-    executor._kv_connector_sync_status = MagicMock(side_effect=[True, True, False])
+    executor._kv_connector_sync_status = MagicMock(
+        side_effect=[(True, False), (True, False), (False, True)]
+    )
     ready = _request(7)
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [ready]
@@ -1408,10 +1450,14 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
     def can_queue(scheduled: ScheduledRequests) -> tuple[bool, bool]:
         nonlocal queue_checks
         queue_checks += 1
-        if queue_checks == 2:
-            assert scheduled.batch_size == 1
-            raise RecoveryComplete
+        assert queue_checks == 1
         return True, True
+
+    def finalize(can_queue: bool) -> None:
+        assert can_queue
+        assert batch.batch_size == 1
+        assert queue_checks == 1
+        raise RecoveryComplete
 
     executor.device_id = 0
     executor._profiler = lambda: nullcontext(MagicMock())
@@ -1428,6 +1474,7 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
     executor._terminate_requests = MagicMock()
     executor._pause_requests = MagicMock()
     executor._can_queue = can_queue
+    executor._finalize_adp_dummy_allocation = finalize
     executor._prepare_disagg_gen_transmission_complete = MagicMock()
     executor._handle_dynamic_draft_len = MagicMock()
     executor.kv_cache_transceiver = None

@@ -4122,13 +4122,15 @@ class PyExecutor:
         } if scheduled_batch is not None else set())
         self.kv_cache_manager.release_unused_connector_reservations(accepted)
 
-    def _kv_connector_start_batch(self,
-                                  scheduled_batch: ScheduledRequests) -> None:
+    def _kv_connector_start_batch(
+            self, scheduled_batch: ScheduledRequests) -> tuple[bool, bool]:
+        """Prepare connector work and return fleet/local compute readiness."""
         if not self.kv_connector_manager:
-            return
+            # The caller already established fleet-wide readiness.
+            return True, True
         if not self.enable_attention_dp:
             self._kv_connector_prepare_batch(scheduled_batch)
-            return
+            return self._can_queue(scheduled_batch)
 
         # Every ADP owner enters this gate, including owners already ready to
         # compute. Catch arbitrary backend exceptions only at this plugin
@@ -4174,8 +4176,10 @@ class PyExecutor:
                             torch.cuda.current_stream())
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
-            if not self._kv_connector_sync_status(waiting, error):
-                return
+            waiting, can_queue = self._kv_connector_sync_status(
+                waiting, error, batch_size=scheduled_batch.batch_size)
+            if not waiting:
+                return can_queue, scheduled_batch.batch_size > 0
             self.hang_detector.checkpoint()
             time.sleep(0.001)
 
@@ -4187,8 +4191,10 @@ class PyExecutor:
 
     def _kv_connector_sync_status(self,
                                   waiting: bool,
-                                  error: Optional[str] = None) -> bool:
-        """Vote at a rank-aligned gate, including idle and dummy-only iterations."""
+                                  error: Optional[str] = None,
+                                  *,
+                                  batch_size: int = 0) -> tuple[bool, bool]:
+        """Return fleet waiting/readiness from one rank-aligned status vote."""
         assert self._kv_connector_config is not None
         pending = self.kv_connector_manager.get_pending_transfer_requests()
         now = time.monotonic()
@@ -4214,6 +4220,7 @@ class PyExecutor:
             int(bool(pending)),
             int(shutdown or bool(canceled_ids)),
             int(bool(self._pending_response_terminations)),
+            batch_size,
         ]
         statuses = (self.dist.tp_allgather_int64(local_status).tolist()
                     if self.dist.tp_size > 1 else [local_status])
@@ -4253,7 +4260,8 @@ class PyExecutor:
             # responses use the routing entries. All owners enter this gather,
             # including ready peers in the no-dummy recovery loop.
             self._flush_pending_transfer_responses()
-        return any(status[0] for status in statuses)
+        return (any(status[0] for status in statuses),
+                all(status[5] > 0 for status in statuses))
 
     def _kv_connector_prepare_batch(
             self, scheduled_batch: ScheduledRequests) -> list[LlmRequest]:
@@ -4305,7 +4313,8 @@ class PyExecutor:
             # even when no batch could run. Recovery polls use their own gate.
             waiting = (wait_for_pending and bool(
                 self.kv_connector_manager.get_pending_transfer_requests()))
-            return self._kv_connector_sync_status(waiting, error)
+            waiting, _ = self._kv_connector_sync_status(waiting, error)
+            return waiting
         return False
 
     def _kv_connector_drain_shutdown(self) -> None:
@@ -4667,7 +4676,7 @@ class PyExecutor:
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
 
-    def _executor_loop(self):
+    def _executor_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -4759,10 +4768,11 @@ class PyExecutor:
                     self.kv_connector_manager.handle_metadata()
 
                 if can_queue:
-                    self._kv_connector_start_batch(scheduled_batch)
-
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                    # Connector preparation can change the batch. Its status
+                    # vote also supplies the updated fleet queue decision.
+                    can_queue, _ = self._kv_connector_start_batch(
+                        scheduled_batch)
+                elif self.kv_connector_manager:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
@@ -5514,7 +5524,7 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
-    def _executor_loop_overlap(self):
+    def _executor_loop_overlap(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -5620,10 +5630,11 @@ class PyExecutor:
                     self.kv_connector_manager.handle_metadata()
 
                 if can_queue:
-                    self._kv_connector_start_batch(scheduled_batch)
-
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                    # Reuse the connector vote after preparation, preserving
+                    # local readiness for processing the previous batch.
+                    can_queue, can_queue_this_rank = self._kv_connector_start_batch(
+                        scheduled_batch)
+                elif self.kv_connector_manager:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 

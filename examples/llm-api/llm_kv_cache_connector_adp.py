@@ -9,21 +9,17 @@ Set both connector classes below and enable_attention_dp=True. Every owner
 must see the same CONNECTOR_CACHE_FOLDER. Use a separate folder per model,
 KV representation and block size. This example requires one full-attention
 layer group and does not support chunked prefill or attention TP sharding.
+Cache keys and file contents use the base filesystem example's format.
 """
 
-import hashlib
-import json
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Optional
 
 import torch
 from llm_kv_cache_connector import PersistentKvCacheConnectorLeader as BaseConnectorLeader
-from llm_kv_cache_connector import PersistentKvCacheConnectorMetadata
 from llm_kv_cache_connector import PersistentKvCacheConnectorWorker as BaseConnectorWorker
 
-from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import SchedulerOutput
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
@@ -62,20 +58,3 @@ class PersistentKvCacheConnectorWorker(BaseConnectorWorker):
 
 class PersistentKvCacheConnectorLeader(BaseConnectorLeader):
     supports_attention_dp = True
-
-    def build_connector_meta(
-        self, scheduler_output: SchedulerOutput
-    ) -> PersistentKvCacheConnectorMetadata:
-        # The base implements accepted prefix loads and bounds saves to the
-        # computed range. Keep the ADP content-key format below for reuse.
-        return super().build_connector_meta(scheduler_output)
-
-    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> str:
-        # cache_salt must participate in the hash so that requests carrying
-        # different salts (or no salt) cannot collide on the same cache file.
-        # Python's hash is randomized independently in different processes.
-        content = json.dumps([cache_salt, tokens], separators=(",", ":"))
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-    def _file_path(self, hash_value: str) -> Path:
-        return Path(self.cache_folder) / f"{hash_value}.pt"

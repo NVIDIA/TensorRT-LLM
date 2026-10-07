@@ -43,13 +43,18 @@ def _args() -> SimpleNamespace:
     )
 
 
+@pytest.mark.parametrize("base_role", [None, "producer", "consumer"])
 def test_restore_from_another_owner(
-    example: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    example: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_role: str | None
 ) -> None:
-    """Publish on owner 0, then restore into different block IDs on owner 1."""
+    """Restore across owners and base/ADP examples into different block IDs."""
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
     producer = example.PersistentKvCacheConnectorLeader(_args())
     consumer = example.PersistentKvCacheConnectorLeader(_args())
+    if base_role == "producer":
+        producer = example.BaseConnectorLeader(_args())
+    elif base_role == "consumer":
+        consumer = example.BaseConnectorLeader(_args())
     src_worker = example.PersistentKvCacheConnectorWorker(_args())
     dst_worker = example.PersistentKvCacheConnectorWorker(_args())
     src_cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -94,7 +99,8 @@ def test_store_does_not_publish_incomplete_files(example: ModuleType, tmp_path: 
     worker = example.PersistentKvCacheConnectorWorker(_args())
     worker.register_kv_caches(torch.ones(1, 4))
     target = tmp_path / "shared-prefix.pt"
-    worker.bind_connector_meta(example.PersistentKvCacheConnectorMetadata(save=[(target, 0)]))
+    metadata = sys.modules["llm_kv_cache_connector"].PersistentKvCacheConnectorMetadata
+    worker.bind_connector_meta(metadata(save=[(target, 0)]))
     save = torch.save
 
     def inspect_publish(tensor: torch.Tensor, temporary_path: Path) -> None:
@@ -110,9 +116,8 @@ def test_store_does_not_publish_incomplete_files(example: ModuleType, tmp_path: 
 def test_failed_store_removes_temporary_file(example: ModuleType, tmp_path: Path) -> None:
     worker = example.PersistentKvCacheConnectorWorker(_args())
     worker.register_kv_caches(torch.ones(1, 4))
-    worker.bind_connector_meta(
-        example.PersistentKvCacheConnectorMetadata(save=[(tmp_path / "shared-prefix.pt", 0)])
-    )
+    metadata = sys.modules["llm_kv_cache_connector"].PersistentKvCacheConnectorMetadata
+    worker.bind_connector_meta(metadata(save=[(tmp_path / "shared-prefix.pt", 0)]))
     with patch.object(example.torch, "save", side_effect=OSError("disk full")):
         with pytest.raises(OSError, match="disk full"):
             worker.wait_for_save(MagicMock())
