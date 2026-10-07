@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AC-3: the ladder routes each selected test to the smallest allocation that holds it.
+"""AC-3: each selected test lands on the smallest rung that holds it.
 
 Each criterion collects one module from `cases/` for one machine:
 
     selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8",
                   "--selection-out-dir={out}")
 
-    run.ids(4)    the 4-GPU allocation's published list
+    run.ids(4)    the 4-GPU rung's published list
 
     B200    8 GPUs/node, which can hold every GPU demand here
 """
@@ -27,8 +27,8 @@ Each criterion collects one module from `cases/` for one machine:
 from mocks import DeviceCases, MarkerCases
 
 
-def test_smallest_rung_that_fits(selection):
-    """1, 2 and 8 GPUs land on the 1-, 4- and 8-GPU allocations."""
+def test_one_demand_per_rung(selection):
+    """1, 2 and 8 GPUs land on the 1-, 4- and 8-GPU rungs, in collection order."""
     run = selection.run(
         DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
@@ -38,11 +38,10 @@ def test_smallest_rung_that_fits(selection):
     assert run.ids(8) == [DeviceCases.EIGHT_GPUS, DeviceCases.EIGHT_RANKS]
 
 
-def test_rungs_partition_the_selected_set(selection):
-    """One list per rung, pairwise disjoint, and together the whole selected set.
+def test_lists_partition_the_selection(selection):
+    """One list per rung, empty rungs included, pairwise disjoint, and together the selection.
 
-    A four-rung ladder over the same demands, so that rung 4 has no
-    members and an empty rung's list is observable.
+    A four-rung ladder over the same demands, so that rung 4 has no members.
     """
     ladder = (1, 2, 4, 8)
     run = selection.run(
@@ -66,11 +65,10 @@ def test_rungs_partition_the_selected_set(selection):
     assert sorted(published) == sorted(run.selected)
 
 
-def test_both_gpu_markers_are_credited(selection):
-    """Both GPU markers are read, and equal bounds credit both.
+def test_both_markers_credited(selection):
+    """Equal `skip_less_device` and `skip_less_mpi_world_size` bounds are both credited.
 
     The shape at `tests/integration/defs/examples/test_deepseek_v4_pro.py:138,140`.
-    Ranks are measured one per GPU.
     """
     run = selection.run(
         MarkerCases.MODULE,
@@ -89,26 +87,11 @@ def test_both_gpu_markers_are_credited(selection):
     ]
 
 
-def test_unmarked_lands_on_the_smallest_rung(selection):
-    """A test stating no bound is assumed to want one GPU, and the record says so."""
-    run = selection.run(
-        DeviceCases.MODULE,
-        "--machine=B200",
-        "--ladder=1,4,8",
-        "--selection-out-dir={out}",
-    )
+def test_larger_bound_wins(selection):
+    """The larger of two disagreeing bounds decides the rung, and is credited alone.
 
-    outcome = run.outcome(DeviceCases.UNMARKED)
-    assert outcome["rung"] == 1
-    assert outcome["required_gpus"] == 1
-    assert outcome["required_gpus_from"] == []
-
-
-def test_larger_bound_decides(selection):
-    """The larger of two disagreeing bounds decides, and is credited alone.
-
-    A rule probe, not an observed shape: no collected item in the repository
-    carries the two markers at different values.
+    A rule probe: no collected item in the repository carries the two markers
+    at different values.
     """
     run = selection.run(
         MarkerCases.MODULE,
@@ -122,3 +105,30 @@ def test_larger_bound_decides(selection):
     outcome = run.outcome(MarkerCases.DISAGREEING_BOUNDS)
     assert outcome["required_gpus"] == 8
     assert outcome["required_gpus_from"] == ["skip_less_mpi_world_size(8)"]
+
+
+def test_unmarked_means_one_gpu(selection):
+    """A test stating no bound lands on the smallest rung, and the record names no marker."""
+    run = selection.run(
+        DeviceCases.MODULE,
+        "--machine=B200",
+        "--ladder=1,4,8",
+        "--selection-out-dir={out}",
+    )
+
+    outcome = run.outcome(DeviceCases.UNMARKED)
+    assert outcome["rung"] == 1
+    assert outcome["required_gpus"] == 1
+    assert outcome["required_gpus_from"] == []
+
+
+def test_leftover_machine_list_is_an_orphan(selection):
+    """A leftover `<machine>.ids` is an orphan: every list a run writes names its rung."""
+    selection.out_dir.mkdir()
+    (selection.out_dir / "B200.ids").write_text("")
+
+    run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--selection-out-dir={out}")
+
+    run.result.stderr.fnmatch_lines(
+        ["*already holds B200.ids for B200*writes B200.json, B200-8gpu.ids*"]
+    )

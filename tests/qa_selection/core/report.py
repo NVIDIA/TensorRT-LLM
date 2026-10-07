@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .allocation import Assignment, GpuDemand
+from .allocation import Assignment
 from .artifacts import ArtifactNames
 from .ladder import Ladder
 from .machines import MachineProfile
@@ -129,7 +129,7 @@ class SelectionReport:
 
     machine: str
     profile: MachineProfile
-    ladder: Optional[Ladder]
+    ladder: Ladder
     target_rung: Optional[int]
     source_revision: Optional[str]
     outcomes: Tuple[Outcome, ...]
@@ -169,8 +169,6 @@ class SelectionReport:
         Every rung, not only the one a caller is running: one collection
         carries what all of them need.
         """
-        if self.ladder is None:
-            return {}
         return {
             rung: tuple(outcome for outcome in self.feasible if outcome.rung == rung)
             for rung in self.ladder
@@ -194,10 +192,10 @@ class SelectionReport:
     def unclassified_rung(self) -> int:
         """Where a consumer routes an identifier this run never collected.
 
-        The smallest rung, or one GPU without a ladder. Always empty here: a
-        collect run cannot see what it did not collect.
+        The smallest rung. Always empty here: a collect run cannot see what it
+        did not collect.
         """
-        return self.ladder.smallest if self.ladder is not None else GpuDemand.ASSUMED_GPUS
+        return self.ladder.smallest
 
     @property
     def deselected_by_reason(self) -> Dict[str, List[str]]:
@@ -236,7 +234,7 @@ class SelectionReport:
         record: Dict[str, object] = {
             "machine": self.machine,
             "max_gpu_per_node": self.profile.max_gpu_per_node,
-            "ladder": list(self.ladder) if self.ladder is not None else None,
+            "ladder": list(self.ladder),
             "target_rung": self.target_rung,
             "source_revision": self.source_revision,
             "nodeid_form": NodeIds.FORM,
@@ -245,7 +243,7 @@ class SelectionReport:
             # Named, not just counted: these appear in no `.ids` file, so the
             # record is the only place a caller can find out which they are.
             "unassignable": {
-                "largest_rung": self.ladder.largest if self.ladder is not None else None,
+                "largest_rung": self.ladder.largest,
                 "nodeids": NodeIds.of(self.unassignable),
             },
             "unclassified": {"route_to_rung": self.unclassified_rung, "nodeids": []},
@@ -321,13 +319,10 @@ class Artifacts:
     def id_lists(report: SelectionReport) -> Dict[str, List[str]]:
         """Filename -> node ids, for every list this run emits.
 
-        Without a ladder, one `<machine>.ids` of everything feasible; with one,
-        `<machine>-<rung>gpu.ids` per rung, written even when empty. The names
-        come from `ArtifactNames`, the same source the configure-time guard
-        checked the output directory against.
+        One `<machine>-<rung>gpu.ids` per rung, written even when empty. The
+        names come from `ArtifactNames`, the same source the configure-time
+        guard checked the output directory against.
         """
-        if report.ladder is None:
-            return {ArtifactNames.ids(report.machine): NodeIds.of(report.feasible)}
         return {
             ArtifactNames.rung_ids(report.machine, rung): NodeIds.of(outcomes)
             for rung, outcomes in report.rungs.items()
@@ -377,9 +372,8 @@ class TerminalSummary:
             cls.line("candidates", counts["candidates"]),
             cls.line("feasible", f"{counts['feasible']}  ({counts['deselected']} deselected)"),
             cls.line("live", f"{counts['live']}{cls.rung_note(report)}"),
+            cls.line("rungs", cls.rung_counts(report)),
         ]
-        if report.ladder is not None:
-            lines.append(cls.line("rungs", cls.rung_counts(report)))
         lines += cls.unassignable_line(report)
         lines += [cls.line("written", path) for path in output.written]
         return lines

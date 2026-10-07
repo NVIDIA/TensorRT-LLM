@@ -24,7 +24,7 @@ what is written.
 
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .ladder import Ladder
 
@@ -42,28 +42,23 @@ class ArtifactNames:
         return f"{machine}{cls.RECORD_SUFFIX}"
 
     @classmethod
-    def ids(cls, machine: str) -> str:
-        """The single identifier list written when there is no ladder."""
-        return f"{machine}{cls.IDS_SUFFIX}"
-
-    @classmethod
     def rung_ids(cls, machine: str, rung: int) -> str:
         """One rung's identifier list."""
         return f"{machine}-{rung}{cls.RUNG_UNIT}{cls.IDS_SUFFIX}"
 
     @classmethod
-    def written_by(cls, machine: str, ladder: Optional[Ladder]) -> Tuple[str, ...]:
+    def written_by(cls, machine: str, ladder: Ladder) -> Tuple[str, ...]:
         """Every file a run for `machine` on `ladder` writes."""
-        if ladder is None:
-            return (cls.record(machine), cls.ids(machine))
         return (cls.record(machine),) + tuple(cls.rung_ids(machine, r) for r in ladder)
 
     @classmethod
     def shapes_of(cls, machine: str) -> Tuple[re.Pattern, ...]:
-        """The three filename shapes a run for `machine` can produce.
+        """The filename shapes this machine's files can take in an output directory.
 
-        Anchored patterns, not a `<machine>*` glob: `B200*` would also match
-        `B200X.ids`, a different machine's file.
+        The record, a rung's list, and `<machine>.ids`, which no run writes: a
+        leftover one is therefore always an orphan. Anchored patterns, not a
+        `<machine>*` glob: `B200*` would also match `B200X.ids`, a different
+        machine's file.
         """
         name = re.escape(machine)
         return (
@@ -73,7 +68,7 @@ class ArtifactNames:
         )
 
     @classmethod
-    def orphans_in(cls, out_dir: Path, machine: str, ladder: Optional[Ladder]) -> List[str]:
+    def orphans_in(cls, out_dir: Path, machine: str, ladder: Ladder) -> List[str]:
         """This machine's files in `out_dir` that this run will not write.
 
         Other machines' files are ignored, and nothing is deleted: the answer
