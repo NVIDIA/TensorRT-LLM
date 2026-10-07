@@ -4292,11 +4292,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         (buffer, slot dimension) pairs."""
         assert self.prev_num_accepted_tokens is not None
         buffers = [(self.prev_num_accepted_tokens, 0)]
-        for replay_buffer in (self.kda_conv_q, self.kda_conv_k, self.kda_conv_v,
-                              self.kda_qkg_cache, self.kda_v_cache,
-                              self.kda_beta_cache):
+        for replay_buffer in (self.kda_conv_q, self.kda_conv_k,
+                              self.kda_conv_v):
             assert replay_buffer is not None
             buffers.append((replay_buffer, 1))
+        # The per-draft replay caches, or the verify kernels' draft records
+        # (kda_state_tok) in their place.
+        for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
+                              self.kda_beta_cache,
+                              getattr(self, "kda_state_tok", None)):
+            if replay_buffer is not None:
+                buffers.append((replay_buffer, 1))
         return buffers
 
     def _relocate_kda_replay_slots(self, old_slots: List[int],
@@ -4378,7 +4384,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         assert self.prev_num_accepted_tokens is not None
         # With the verify kernels' draft records (kda_state_tok), the accepted
-        # drafts are replayed from those instead of the caches.
+        # drafts are replayed from those, and the replay caches are not
+        # allocated.
         state_tok = getattr(self, "kda_state_tok", None)
         with self._on_kv_cache_stream():
             slots = torch.full((1, ),
@@ -4388,15 +4395,19 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
             for layer_offset, (ssm_states, conv_states) in enumerate(
                     zip(self.all_ssm_states, self.all_conv_states)):
+                qkg_cache, v_cache, beta_cache = (
+                    None if replay_cache is None else replay_cache[layer_offset]
+                    for replay_cache in (self.kda_qkg_cache, self.kda_v_cache,
+                                         self.kda_beta_cache))
                 commit_kda_pending_drafts(
                     ssm_states,
                     conv_states,
                     self.kda_conv_q[layer_offset],
                     self.kda_conv_k[layer_offset],
                     self.kda_conv_v[layer_offset],
-                    self.kda_qkg_cache[layer_offset],
-                    self.kda_v_cache[layer_offset],
-                    self.kda_beta_cache[layer_offset],
+                    qkg_cache,
+                    v_cache,
+                    beta_cache,
                     slots,
                     num_accepted,
                     state_tok=(state_tok[layer_offset]

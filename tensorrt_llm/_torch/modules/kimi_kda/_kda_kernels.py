@@ -450,9 +450,9 @@ def commit_kda_pending_drafts(
     conv_q: torch.Tensor,
     conv_k: torch.Tensor,
     conv_v: torch.Tensor,
-    qkg_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
+    qkg_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    beta_cache: Optional[torch.Tensor],
     state_indices: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
     state_tok: Optional[torch.Tensor] = None,
@@ -466,7 +466,8 @@ def commit_kda_pending_drafts(
     bit, and the caller clears the slot's count:
 
     * with the Kimi K3 verify kernels' draft records (``state_tok``), the
-      drafts are replayed from those (``replay_kda_token_records``);
+      drafts are replayed from those (``replay_kda_token_records``), and the
+      replay caches, which are then not allocated, may be None;
     * otherwise they are replayed from the replay caches by the fused verify
       kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
     """
@@ -474,6 +475,7 @@ def commit_kda_pending_drafts(
     if state_tok is not None:
         replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
     else:
+        assert qkg_cache is not None and v_cache is not None and beta_cache is not None
         _load_mtp_module().kda_mtp_commit_pending_drafts(
             recurrent_state,
             conv_q,
