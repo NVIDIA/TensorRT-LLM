@@ -111,7 +111,8 @@ class TokenShardedColumn(TokenShardedAdapter):
 
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
-        # An active LoRA (Linear.forward's lora_params) applies its adapters to the dense input.
+        # Linear.forward(input, *, lora_params=None) applies its adapters to the dense input
+        # when lora_params is truthy; the argument is keyword-only.
         gathered = tp.gather_input(self, input, prequantize=not kwargs.get("lora_params"))
         out = super().forward(gathered, *args, **kwargs)
         p = tp.plan
@@ -160,11 +161,22 @@ class TokenShardedMLP(TokenShardedAdapter):
     def forward(self, x, *args, **kwargs):
         tp = self._token_sharded_tp
         consumer = getattr(self, "up_proj", None) or getattr(self, "gate_up_proj", None)
-        # MLP.forward(x, lora_params=None) / GatedMLP.forward(..., lora_params=None): an active
-        # LoRA takes the dense input, so the FP8 pre-quantize is skipped for that call.
-        gathered = tp.gather_input(consumer, x, prequantize=not kwargs.get("lora_params"))
+        # An active LoRA takes the dense input, so the FP8 pre-quantize is skipped for exactly
+        # the calls the wrapped forward routes to its LoRA path.
+        gathered = tp.gather_input(consumer, x, prequantize=not self._lora_active(args, kwargs))
         partial = super().forward(gathered, *args, **kwargs)
         return tp.local_view(tp.reduce_scatter(partial))
+
+    def _lora_active(self, args: tuple, kwargs: dict) -> bool:
+        """Whether the wrapped ``forward`` takes its LoRA path for this call.
+
+        ``MLP.forward(x, lora_params=None)`` does when ``lora_params is not None``;
+        ``GatedMLP.forward(x, all_rank_num_tokens=None, final_all_reduce_params=None,
+        lora_params=None, **kwargs)`` when it is truthy. Either may be passed positionally.
+        """
+        if isinstance(self, GatedMLP):
+            return bool(kwargs.get("lora_params", args[2] if len(args) > 2 else None))
+        return kwargs.get("lora_params", args[0] if args else None) is not None
 
 
 _KIND_ADAPTERS = {COLUMN: TokenShardedColumn, ROW: TokenShardedRow, MLP_KIND: TokenShardedMLP}

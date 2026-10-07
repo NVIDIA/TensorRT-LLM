@@ -23,13 +23,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 from token_sharded_tp_test_utils import padded_rows, simulated_helper, swizzle_ref, unswizzle_ref
 
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.parallel import token_sharded_tp
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import TokenShardedMLP
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
     Fp8BlockScaledActivation,
     TokenShardedTP,
@@ -379,6 +383,65 @@ def test_fp8_block_scale_prequant_rule(monkeypatch):
     TokenShardedTP._check_fp8_consumer(fp8, act)
     TokenShardedTP._check_fp8_consumer(None, act)
     TokenShardedTP._check_fp8_consumer(bf16, torch.zeros(8, 256))
+
+
+class _Stop(Exception):
+    pass
+
+
+def _mlp_adapter(base):
+    """A converted MLP / GatedMLP whose gather_input records ``prequantize`` and stops."""
+    cls = type(f"TokenSharded{base.__name__}", (TokenShardedMLP, base), {})  # as the converter
+    module = cls.__new__(cls)
+    nn.Module.__init__(module)
+    seen = []
+
+    def gather_input(consumer, x, *, prequantize=True):
+        seen.append(prequantize)
+        raise _Stop
+
+    module._token_sharded_tp = SimpleNamespace(gather_input=gather_input)
+    module.up_proj = object()
+    return module, seen
+
+
+@pytest.mark.parametrize(
+    "base, calls",
+    [
+        # MLP.forward(x, lora_params=None) takes its LoRA path when lora_params is not None.
+        (
+            MLP,
+            [
+                ((), {}, True),
+                ((), {"lora_params": None}, True),
+                ((), {"lora_params": {}}, False),
+                ((), {"lora_params": {"k": 1}}, False),
+                (({},), {}, False),
+                ((None,), {}, True),
+            ],
+        ),
+        # GatedMLP.forward(x, all_rank_num_tokens, final_all_reduce_params, lora_params) when
+        # lora_params is truthy.
+        (
+            GatedMLP,
+            [
+                ((), {}, True),
+                ((), {"lora_params": {}}, True),
+                ((), {"lora_params": {"k": 1}}, False),
+                ((None, None, {"k": 1}), {}, False),
+                ((None, None, {}), {}, True),
+            ],
+        ),
+    ],
+)
+def test_mlp_adapter_prequantizes_exactly_when_the_wrapped_forward_skips_lora(base, calls):
+    """The FP8 pre-quantize is off for the calls the wrapped forward routes to its LoRA path."""
+    module, seen = _mlp_adapter(base)
+    x = torch.zeros(4, 8, dtype=torch.bfloat16)
+    for args, kwargs, prequantize in calls:
+        with pytest.raises(_Stop):
+            module.forward(x, *args, **kwargs)
+        assert seen[-1] is prequantize, (base.__name__, args, kwargs)
 
 
 # =============================================================================
