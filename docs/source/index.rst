@@ -108,6 +108,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/profiler-metadata.md
    developer-guide/workflow-profiler-regions.md
    developer-guide/kv-transfer-profiler.md
+   developer-guide/moe-routing-profiler.md
    developer-guide/nccl-profiler-metadata.md
    developer-guide/perf-benchmarking.md
    developer-guide/moe-perf-guide.md

@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._profiler import record_moe_routing
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
@@ -554,6 +555,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
             assert token_selected_experts.shape == token_final_scales.shape
             assert token_selected_experts.dtype == torch.int32
 
+            if prerouted is None:
+                record_moe_routing(
+                    moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
+                )
+
             # Backends disagree on routing-scale precision, so the requirement
             # names the dtype instead of the backend class.
             scales_dtype = moe.backend.input_requirement.routing_scales_dtype
@@ -606,6 +612,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 )
             token_selected_experts = None
             token_final_scales = None
+
+        if prerouted is not None:
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, prerouted.topk_ids, prerouted.topk_weights
+            )
 
         # ========== Step 3: EPLB - Update statistics and route ==========
         if moe.layer_load_balancer and token_selected_experts is not None:
@@ -1594,6 +1605,9 @@ class FusedCommMoEScheduler(MoEScheduler):
             route_capture = get_active_route_capture()
             if route_capture is not None:  # R3: in-graph device-buffer capture
                 route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
+            )
             if token_final_scales.dtype != torch.float32:
                 token_final_scales = token_final_scales.to(torch.float32)
         else:
@@ -1607,6 +1621,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 (0, moe.routing_method.experts_per_token),
                 dtype=torch.float32,
                 device=device,
+            )
+            record_moe_routing(
+                moe.layer_idx, moe.num_experts, token_selected_experts, token_final_scales
             )
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----

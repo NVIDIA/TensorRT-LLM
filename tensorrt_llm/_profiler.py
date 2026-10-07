@@ -48,9 +48,12 @@ __all__ = [
     "encode_metadata",
     "record_function_metadata_scope",
     "record_function_with_metadata",
+    "record_moe_routing",
+    "record_moe_routing_ids",
     "record_workflow_scope",
     "tensor_metadata",
     "warn_profiler_failure",
+    "warn_unsupported_moe_routing",
 ]
 
 _CUSTOM_REGIONS_ENV = "TLLM_PROFILE_CUSTOM_REGIONS"
@@ -132,6 +135,35 @@ def warn_profiler_failure(name: str, region: ProfilerRegion, phase: str, error: 
         pass
 
 
+def warn_unsupported_moe_routing(backend_name: str) -> None:
+    """Report standalone MoE paths that cannot provide routing observations."""
+    if not custom_region_enabled("moe"):
+        return
+    try:
+        from .logger import logger
+
+        logger.warning_once(
+            f"TLLM_PROFILE_CUSTOM_REGIONS=moe cannot record routing for {backend_name}; "
+            "routing events require a ConfigurableMoE scheduler path.",
+            key=("moe_profiler_unsupported", backend_name),
+        )
+    except (ImportError, AttributeError, TypeError, ValueError, RuntimeError, OSError):
+        pass
+
+
+class _CompletedExpertIds(list[MetadataValue]):
+    """Private values whose integer types are guaranteed by a completed CPU tensor.
+
+    Construct and consume this value within one synchronous observation; it must
+    not escape to callers that could mutate its nested lists before encoding.
+    """
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        if tensor.device.type != "cpu" or tensor.dtype != torch.int32:
+            raise ValueError("MoE routing IDs require completed int32 R3 CPU rows")
+        super().__init__(tensor.tolist())
+
+
 def _validate_metadata_value(value: MetadataValue, ancestors: set[int] | None = None) -> None:
     """Reject nonfinite values, nonstring keys, unsupported types, and cycles."""
     value_type = type(value)
@@ -142,6 +174,10 @@ def _validate_metadata_value(value: MetadataValue, ancestors: set[int] | None = 
     if value_type is float:
         if not math.isfinite(value):
             raise ValueError("Profiler metadata floats must be finite")
+        return
+    if value_type is _CompletedExpertIds:
+        # int32 CPU Tensor.tolist() yields only built-in integer rows. Avoid a
+        # second Python walk over every expert ID before the JSON encoder walk.
         return
     if value_type not in (list, tuple, dict):
         raise TypeError(f"Unsupported profiler metadata value: {value_type.__name__}")
@@ -346,3 +382,92 @@ def record_workflow_scope(
 
 # Compatibility for callers using the original workflow helper name.
 record_function_with_metadata = record_workflow_scope
+
+
+def _moe_routing_metadata(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+) -> dict[str, MetadataValue]:
+    """Describe materialized routing without reading tensor values."""
+    return {
+        "moe.layer": layer_idx,
+        "moe.num_tokens": token_selected_experts.shape[0],
+        "moe.num_experts": num_experts,
+        "moe.experts_per_token": token_selected_experts.shape[1],
+    }
+
+
+def record_moe_routing(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+) -> None:
+    """Record materialized routing shapes without copying or serializing values.
+
+    Args:
+        layer_idx: Model layer index, or None when unavailable.
+        num_experts: Logical expert count, not the EPLB slot count.
+        token_selected_experts: Integer expert IDs [num_tokens, top_k] in routing order.
+
+    Disabled, inactive, or compiling calls do not inspect tensors. Current-stream
+    CUDA capture skips this observation; existing R3 capture remains independent.
+    Python hooks do not recur on graph replay. Expected observation failures use
+    the shared fail-open boundary and tensor values are never modified.
+    """
+    if not custom_region_active("moe"):
+        return
+    try:
+        if token_selected_experts.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+    except RuntimeError as error:
+        warn_profiler_failure("trtllm::moe_routing", "moe", "capture-state query", error)
+        return
+    with record_function_metadata_scope(
+        "trtllm::moe_routing",
+        "moe",
+        lambda: _moe_routing_metadata(layer_idx, num_experts, token_selected_experts),
+    ):
+        pass
+
+
+def record_moe_routing_ids(
+    host_rows: torch.Tensor,
+    *,
+    step: int | None,
+    rank: int,
+    layer_pos: tuple[tuple[int, int], ...],
+) -> None:
+    """Record all logical IDs from an already-completed R3 CPU copy.
+
+    Args:
+        host_rows: Completed int32 CPU rows [num_tokens, num_layers, top_k].
+        step: Original executor iteration, or None when unset.
+        rank: Original engine rank.
+        layer_pos: Original (model layer index, buffer column) pairs.
+
+    Emit full completion-time payloads only while MoE profiling is active.
+    No copy or synchronization is added; copies
+    completing after profiling stops are omitted. Expected annotation failures
+    do not affect the existing R3 commit.
+    """
+    if not custom_region_active("moe"):
+        return
+    for layer, pos in layer_pos:
+
+        def metadata() -> dict[str, MetadataValue]:
+            """Serialize all completed CPU values for this layer."""
+            if host_rows.device.type != "cpu":
+                raise ValueError("MoE routing IDs require completed R3 CPU rows")
+            tokens, _, top_k = host_rows.shape
+            return {
+                "moe.layer": layer,
+                "moe.step": step,
+                "moe.rank": rank,
+                "moe.num_tokens": tokens,
+                "moe.experts_per_token": top_k,
+                "moe.selected_expert_ids": _CompletedExpertIds(host_rows[:, pos, :]),
+            }
+
+        with record_function_metadata_scope("trtllm::moe_routing_ids", "moe", metadata):
+            pass
