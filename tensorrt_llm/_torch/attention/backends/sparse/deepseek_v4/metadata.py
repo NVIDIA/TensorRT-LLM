@@ -582,15 +582,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             return None
         saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}
         for field in self._DRAFT_SPARSE_FIELDS:
-            setattr(self, field, getattr(self, f"draft_{field}"))
+            self.swap_for_draft(field, getattr(self, f"draft_{field}"))
         return saved_state
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
-        """Restore the target sparse fields after a draft forward."""
-        if saved_state is None:
-            return
-        for field in self._DRAFT_SPARSE_FIELDS:
-            setattr(self, field, saved_state[field])
+        """No-op: restore_draft_swaps() restores the sparse fields, and DSA's hook must not run."""
+        return None
 
     def validate_sparse_offload_batch(self) -> None:
         """Reject unsupported layouts on the host before any model writes.
