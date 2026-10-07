@@ -2997,20 +2997,23 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "model config (dflash_config.target_layer_ids).")
 
     context_recompute_tail: Optional[int] = Field(
-        default=None,
+        default=0,
         description=
         "Number of prompt-tail tokens to recompute through the target forward "
         "when a request takes a KV-cache prefix hit, so the drafter's "
         "hidden-state context covers them (reused tokens never pass a target "
         "forward, which otherwise degrades acceptance length exactly when "
-        "prefix caching helps most). None resolves from the draft model "
-        "config: dflash_config.swa_window_size when the drafter's context "
-        "attention is windowed (a tail of the window size reproduces the "
-        "no-reuse drafter inputs exactly), else -1. -1 forces a full "
-        "re-prefill on a hit; 0 disables the recompute. Blocks stay reused "
-        "either way, so the allocation/dedup win is kept. Enable chunked "
-        "prefill with this: the scheduler admits on estimated reuse, and "
-        "chunking absorbs batches whose recompute exceeds the token budget.")
+        "prefix caching helps most). 0 (the default) disables the recompute: "
+        "the feature is opt-in, because recomputing reused tokens trades TTFT "
+        "and prefill throughput for acceptance length and disables "
+        "KV-connector prefix loads for the recomputed span. None resolves "
+        "from the draft model config: dflash_config.swa_window_size when the "
+        "drafter's context attention is windowed (a tail of the window size "
+        "reproduces the no-reuse drafter inputs exactly), else -1. -1 forces "
+        "a full re-prefill on a hit. Blocks stay reused either way, so the "
+        "allocation/dedup win is kept. Requires chunked prefill and the "
+        "all_reusable block-reuse policy; the KV cache managers disable it "
+        "with a warning otherwise.")
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
@@ -3063,6 +3066,8 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             if mask_id is not None:
                 self.mask_token_id = mask_id
         if self.context_recompute_tail is None:
+            # Reached only when the user explicitly set None (the default is 0,
+            # recompute off): auto-resolve the tail from the drafter geometry.
             # A windowed drafter can never attend to prompt context beyond
             # the most recent swa_window_size tokens (context K/V come
             # straight from projected target hidden states, so the receptive
