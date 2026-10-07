@@ -100,7 +100,7 @@ before the plugin was run, so a test states a command line and the answer expect
 the plugin decides, and how to drive it.
 
 ```bash
-pytest tests/qa_selection/tests      # 28 tests, no GPU, no container, no wheel
+pytest tests/qa_selection/tests      # 31 tests, no GPU, no container, no wheel
 ```
 
 | | guarantee | proved by |
@@ -109,7 +109,7 @@ pytest tests/qa_selection/tests      # 28 tests, no GPU, no container, no wheel
 | **AC-2** | The ladder's **largest rung** is the GPU count: the ladder defaults to one rung of the machine's GPUs per node, and no other value states one | [`test_gpu_count.py`](tests/test_gpu_count.py) (7) |
 | **AC-3** | Each selected test lands on the **smallest rung** that holds it, and every rung publishes one `<machine>-<rung>gpu.ids` list, empty or not | [`test_ladder.py`](tests/test_ladder.py) (6) |
 | **AC-4** | A **machine and a ladder** are the whole command — the three questions above — and the tests a run keeps are exactly the tests its lists hold | [`test_options.py`](tests/test_options.py) (5) |
-| **AC-5** | A ladder **shorter than the machine** strands feasible tests audibly — named, counted and warned, never folded into the largest rung | [`test_stranded.py`](tests/test_stranded.py) (1) |
+| **AC-5** | A test **above the largest rung** is deselected, in no list, with one blocker naming its demand, its markers and that rung — the same reason for a small node and a short ladder | [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
 | **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
 
 ## Config
