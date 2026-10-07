@@ -1174,7 +1174,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
 
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            // The fat sqsh replaces the download in runLLMTestlistOnPlatformImpl, so it
+            // must bake the same build that function would have fetched.
+            def llmTarfile = boltedTarUrl(config, tarName)
             def llmPath = sh(script: "realpath .", returnStdout: true).trim()
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
             def agentJobWorkspace = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
