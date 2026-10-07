@@ -417,7 +417,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
         - KDA replay: per-slot draft-token caches consumed by the fused
           ``trtllm::kda_mtp_decode`` verify kernel, which replays accepted
-          drafts and commits states in place (kda_conv_*, kda_*_cache)
+          drafts and commits states in place (kda_conv_*, kda_*_cache); or,
+          for a verify kernel that keeps the drafts' records, kda_conv_* and
+          kda_state_tok in place of the kda_*_cache
         """
         _SHARED_FIELDS = frozenset({
             "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
@@ -444,7 +446,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         kda_conv_v: torch.Tensor | None = None
         # Post-processed per-draft quantities for replay:
         # [layers, slots, num_spec, 3, H*K] (q/k/gate), [.., num_spec, H*V],
-        # [.., num_spec, H] — all fp32.
+        # [.., num_spec, H] — all fp32. None with kda_state_tok.
         kda_qkg_cache: torch.Tensor | None = None
         kda_v_cache: torch.Tensor | None = None
         kda_beta_cache: torch.Tensor | None = None
@@ -455,8 +457,9 @@ class PythonMambaCacheManager(BaseResourceManager):
         # when the round accepted n > 0 drafts (prev_num_accepted_tokens), a
         # verify kernel starts the next round by replaying the first n
         # records onto it, S = decay * S + vn (beta * k), instead of
-        # replaying them from the caches above. A slot reset for a new
-        # request has n = 0, so a previous owner's records are never read.
+        # replaying them from the caches above, which are then not
+        # allocated. A slot reset for a new request has n = 0, so a previous
+        # owner's records are never read.
         kda_state_tok: torch.Tensor | None = None
 
         # Replay path: compact double-buffered cache
@@ -476,9 +479,11 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         @property
         def has_kda_replay_caches(self) -> bool:
-            """True when the KDA fused-verify replay caches were allocated
-            (the fused ``trtllm::kda_mtp_decode`` verify path)."""
-            return self.kda_qkg_cache is not None
+            """True on the KDA fused-verify replay path: the extended conv
+            caches are allocated, with the per-draft replay caches of the
+            fused ``trtllm::kda_mtp_decode`` verify or, in their place, the
+            drafts' records (``kda_state_tok``)."""
+            return self.kda_conv_q is not None
 
         def commit_conv_window(self, slot_indices: torch.Tensor,
                                conv_pool: torch.Tensor) -> None:
@@ -3511,39 +3516,42 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.kda_conv_q = allocate_dim_contiguous_conv_cache()
         self.kda_conv_k = allocate_dim_contiguous_conv_cache()
         self.kda_conv_v = allocate_dim_contiguous_conv_cache()
-        self.kda_qkg_cache = torch.zeros(
-            self.local_num_mamba_layers,
-            cache_size,
-            num_spec,
-            3,
-            section_dim,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.kda_v_cache = torch.zeros(
-            self.local_num_mamba_layers,
-            cache_size,
-            num_spec,
-            section_dim,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.kda_beta_cache = _allocate_kda_beta_cache(
-            (self.local_num_mamba_layers, cache_size, num_spec,
-             self.ssm_state_shape[0]),
-            device,
-        )
         if self._kda_token_states:
             # Beside the V2 pools. With the SSM pool at its live floor,
-            # _build_cache_config took these bytes out of the GPU quota.
+            # _build_cache_config took these bytes out of the GPU quota. The
+            # verify replays the accepted drafts from these records, so the
+            # per-draft replay caches are not allocated.
             self.kda_state_tok = torch.zeros(
                 (self.local_num_mamba_layers, cache_size,
                  *self._kda_draft_records_shape()),
                 dtype=torch.float32,
                 device=device,
             )
-        per_token = (", with the drafts' records"
-                     if self.kda_state_tok is not None else "")
+        else:
+            self.kda_qkg_cache = torch.zeros(
+                self.local_num_mamba_layers,
+                cache_size,
+                num_spec,
+                3,
+                section_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.kda_v_cache = torch.zeros(
+                self.local_num_mamba_layers,
+                cache_size,
+                num_spec,
+                section_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.kda_beta_cache = _allocate_kda_beta_cache(
+                (self.local_num_mamba_layers, cache_size, num_spec,
+                 self.ssm_state_shape[0]),
+                device,
+            )
+        per_token = (", with the drafts' records in place of the replay "
+                     "caches" if self.kda_state_tok is not None else "")
         logger.info("Mamba Cache (kda-replay) is allocated for "
                     f"{cache_size} state slots{per_token}")
         return True
@@ -4437,19 +4445,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         destination_slots = torch.tensor([new for _, new in moves],
                                          dtype=torch.long,
                                          device=device)
-        replay_buffers = [
-            self.kda_conv_q,
-            self.kda_conv_k,
-            self.kda_conv_v,
-            self.kda_qkg_cache,
-            self.kda_v_cache,
-            self.kda_beta_cache,
-        ]
+        replay_buffers = [self.kda_conv_q, self.kda_conv_k, self.kda_conv_v]
         assert all(replay_buffer is not None
                    for replay_buffer in replay_buffers)
-        # The drafts' records belong to the slot as well.
-        if self.kda_state_tok is not None:
-            replay_buffers.append(self.kda_state_tok)
+        # The per-draft replay caches, or the drafts' records in their place.
+        replay_buffers += [
+            replay_buffer
+            for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
+                                  self.kda_beta_cache, self.kda_state_tok)
+            if replay_buffer is not None
+        ]
         for replay_buffer in replay_buffers:
             replay_buffer.index_copy_(
                 1,
@@ -4624,10 +4629,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 replay_layer[:, :, :committed_window].index_copy_(
                     0, state_indices, section.to(replay_layer.dtype))
 
+        # The drafts' records need no reset: with no pending drafts, none of
+        # them is read.
         for replay_buffer in (self.kda_qkg_cache, self.kda_v_cache,
                               self.kda_beta_cache):
-            assert replay_buffer is not None
-            replay_buffer.index_fill_(1, state_indices, 0)
+            if replay_buffer is not None:
+                replay_buffer.index_fill_(1, state_indices, 0)
         self.prev_num_accepted_tokens[state_indices] = 0
 
     def mamba_layer_cache(
@@ -4642,20 +4649,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert self.kda_conv_q is not None
         assert self.kda_conv_k is not None
         assert self.kda_conv_v is not None
-        assert self.kda_qkg_cache is not None
-        assert self.kda_v_cache is not None
-        assert self.kda_beta_cache is not None
         spec_kwargs = {
             "prev_num_accepted_tokens": self.prev_num_accepted_tokens,
             "kda_conv_q": self.kda_conv_q[layer_offset],
             "kda_conv_k": self.kda_conv_k[layer_offset],
             "kda_conv_v": self.kda_conv_v[layer_offset],
-            "kda_qkg_cache": self.kda_qkg_cache[layer_offset],
-            "kda_v_cache": self.kda_v_cache[layer_offset],
-            "kda_beta_cache": self.kda_beta_cache[layer_offset],
         }
         if self.kda_state_tok is not None:
             spec_kwargs["kda_state_tok"] = self.kda_state_tok[layer_offset]
+        else:
+            assert self.kda_qkg_cache is not None
+            assert self.kda_v_cache is not None
+            assert self.kda_beta_cache is not None
+            spec_kwargs["kda_qkg_cache"] = self.kda_qkg_cache[layer_offset]
+            spec_kwargs["kda_v_cache"] = self.kda_v_cache[layer_offset]
+            spec_kwargs["kda_beta_cache"] = self.kda_beta_cache[layer_offset]
         if self.mamba_ssm_rand_seed is not None:
             spec_kwargs["mamba_ssm_rand_seed"] = self.mamba_ssm_rand_seed
         return PythonMambaCacheManager.SpeculativeState(
