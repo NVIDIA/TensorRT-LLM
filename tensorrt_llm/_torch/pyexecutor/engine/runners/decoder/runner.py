@@ -86,7 +86,9 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import (
+    BaseSparseAttentionConfig,
     DecodingBaseConfig,
     PrefillCudaGraphBackend,
     SeqLenAwareSparseAttentionConfig,
@@ -104,13 +106,13 @@ from ...metadata import (
 )
 from ...model_call import ModelCaller
 from ..common import (
-    _moe_a2a_steady_state_budget_for_capture,
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_padding_params,
     get_position_id_offset,
     get_top_level_model,
     make_scheduled_inputs,
+    moe_a2a_steady_state_budget_for_capture,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
     set_spec_metadata_all_rank_num_tokens,
@@ -232,12 +234,12 @@ class DecoderRunner(ScheduledModelRunner):
         model: torch.nn.Module,
         config: DecoderRunnerConfig,
         *,
-        input_processor: Any,
+        input_processor: InputProcessor | BaseMultimodalInputProcessor,
         model_caller: ModelCaller,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
-        sparse_attention_config: Any,
+        sparse_attention_config: BaseSparseAttentionConfig | None,
         torch_compile_backend: Backend | None,
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         warmup_timer: _WarmupTimer,
@@ -758,7 +760,7 @@ class DecoderRunner(ScheduledModelRunner):
         # launch argument and is baked into every later replay.
         with (
             self._warmup_timer.phase("cuda_graph_capture"),
-            _moe_a2a_steady_state_budget_for_capture(),
+            moe_a2a_steady_state_budget_for_capture(),
         ):
             with self.cuda_graph_runner.allow_capture():
                 self.cuda_graph_runner.is_warmup_only = True

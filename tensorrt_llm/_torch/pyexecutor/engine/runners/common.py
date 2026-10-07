@@ -251,21 +251,21 @@ def resolve_mrope_position_deltas_cache(model: torch.nn.Module | None) -> torch.
 
 
 @contextlib.contextmanager
-def _moe_a2a_steady_state_budget_for_capture():
+def moe_a2a_steady_state_budget_for_capture():
     """Force the steady-state MoE all-to-all budget across CUDA-graph capture.
 
     The budget is a kernel launch argument, so it is frozen into each captured
     graph. Capture happens inside the warmup window, so without this a replay
     would keep warmup's relaxed deadline for the life of the process.
     """
-    _set_moe_a2a_warmup(False)
+    set_moe_a2a_warmup(False)
     try:
         yield
     finally:
-        _set_moe_a2a_warmup(True)
+        set_moe_a2a_warmup(True)
 
 
-def _set_moe_a2a_warmup(in_warmup: bool) -> None:
+def set_moe_a2a_warmup(in_warmup: bool) -> None:
     """Select the MoE all-to-all completion-flag budget for the current phase.
 
     No-op when the op is unavailable (older bindings).

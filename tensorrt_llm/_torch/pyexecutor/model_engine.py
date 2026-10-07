@@ -29,7 +29,8 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention.backends.interface import AttentionRuntimeFeatures
+from ..attention.backends.interface import (AttentionMetadata,
+                                            AttentionRuntimeFeatures)
 from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
@@ -40,7 +41,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
-from ..speculative import update_spec_config_from_loaded_model
+from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
 from ..utils import (get_per_request_prefill_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -53,8 +54,9 @@ from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
                                 setup_mm_encoder_attn_metadata)
 from .engine.runners import resolve_runner_type
-from .engine.runners.common import (_set_moe_a2a_warmup, make_scheduled_inputs,
-                                    resolve_mrope_position_deltas_cache)
+from .engine.runners.common import (make_scheduled_inputs,
+                                    resolve_mrope_position_deltas_cache,
+                                    set_moe_a2a_warmup)
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
@@ -785,26 +787,26 @@ class PyTorchModelEngine(ModelEngine):
         )
 
     @property
-    def attn_metadata(self):
+    def attn_metadata(self) -> Optional[AttentionMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata
         return self._attn_metadata
 
     @attn_metadata.setter
-    def attn_metadata(self, value) -> None:
+    def attn_metadata(self, value: Optional[AttentionMetadata]) -> None:
         if isinstance(self._runner, DecoderRunner):
             self._runner.attn_metadata = value
         else:
             self._attn_metadata = value
 
     @property
-    def spec_metadata(self):
+    def spec_metadata(self) -> Optional[SpecMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
         return self._spec_metadata
 
     @spec_metadata.setter
-    def spec_metadata(self, value) -> None:
+    def spec_metadata(self, value: Optional[SpecMetadata]) -> None:
         if isinstance(self._runner, DecoderRunner):
             self._runner.spec_metadata = value
         else:
@@ -903,7 +905,7 @@ class PyTorchModelEngine(ModelEngine):
         # This setter is the one choke point every warmup transition passes
         # through, including PyExecutor's, so select the MoE all-to-all budget
         # here rather than in set_warmup_flag().
-        _set_moe_a2a_warmup(value)
+        set_moe_a2a_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
 

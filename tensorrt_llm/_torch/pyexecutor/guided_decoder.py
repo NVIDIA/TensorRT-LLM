@@ -563,7 +563,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
         # self.token_event.record() should be called inside CUDA graph capturing;
-        # currently, it is in PyTorchModelEngine._preprocess_inputs.
+        # currently, it is in DecoderRunner._preprocess_inputs.
 
     @hostfunc
     def fetch_batch(self) -> None:

@@ -1342,7 +1342,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         llm_model_config.pretrained_config = config.text_config
         # The LM attention modules use extra_attrs through the outer wrapper.
         # Share the dict after deepcopy so compiled LM attention lookups see
-        # the same per-layer metadata as model_engine.model_forward.
+        # the same per-layer metadata as DecoderRunner.model_forward.
         # Vision attention unregisters itself from this dict during init,
         # so it does not pollute LM lookups.
         llm_model_config.extra_attrs = model_config.extra_attrs
