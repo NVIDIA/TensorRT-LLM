@@ -54,7 +54,10 @@ import numpy as np
 import torch
 
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _gpu_alloc_granularity,
+)
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -167,8 +170,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         chunk_tokens: int,
         causal_block_sizes: Sequence[int],
     ) -> int:
-        """Device bytes the constructor allocates for this geometry: K and V of
-        every pool token in every layer."""
+        """Device bytes the constructor takes from the GPU for this geometry: K and V
+        of every pool token in every layer, rounded up to the pool allocator's
+        physical chunk size, since the pool is mapped in whole chunks."""
         tokens = CausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tokens_per_page,
             fixed_capacity=fixed_capacity,
@@ -176,7 +180,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             chunk_tokens=chunk_tokens,
             causal_block_sizes=causal_block_sizes,
         )
-        return (
+        raw = (
             tokens
             * num_layers
             * 2
@@ -184,6 +188,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             * head_dim
             * torch.tensor([], dtype=dtype).element_size()
         )
+        return ceil_div(raw, _gpu_alloc_granularity(raw)) * _gpu_alloc_granularity(raw)
 
     @property
     def pool_bytes(self) -> int:
@@ -265,6 +270,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             max_attention_window=[pool_tokens],
             enable_block_reuse=False,
             host_cache_size=0,  # nothing is ever suspended, so no host tier
+            max_util_for_resume=1.0,  # and no resume headroom: the pool is exactly the tokens
         )
         super().__init__(
             kv_cache_config,
