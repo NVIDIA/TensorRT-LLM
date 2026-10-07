@@ -68,8 +68,10 @@ static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
 // the first failure into mapped memory for non-blocking host reads. timeout_cycles is
 // zero in production (selecting the built-in deadline) and can be shortened only through
 // the explicitly test-only host op.
-// A nonzero host_status means an abort was observed, not that the whole grid has
-// quiesced; the coordinator must still synchronize the execution stream/event.
+// A nonzero host_status means an abort was observed, not that the grid or transport
+// has quiesced. The coordinator must prove that both local work and failed-peer
+// writes can no longer reach reusable resources; a stream/event drain alone is
+// insufficient for that proof. CFT abort is not yet qualified.
 //
 // This is deliberately independent from the committed EP membership generation. An
 // epoch mismatch only invalidates work already in flight; it never changes rank masks.
@@ -94,6 +96,19 @@ enum class MoeA2AAbortReason : uint8_t
     kHostRequested = 1,
     kTimeout = 2,
 };
+
+// Keep bit 63 clear for the signed Torch ABI. Nine peer bits encode a sentinel
+// plus all 256 supported ranks; the remaining 38 high bits carry the epoch.
+static constexpr uint64_t kMoeA2AExecutionEpochMask = (uint64_t{1} << 38) - 1;
+static_assert(kMaxRanks <= 511, "packed execution status cannot represent every rank");
+
+__host__ __device__ constexpr uint64_t packMoeA2AExecutionStatus(
+    uint64_t epoch, MoeA2AExecutionPhase phase, MoeA2AAbortReason reason, int peerRank)
+{
+    uint64_t const peerCode = peerRank < 0 ? 0 : static_cast<uint64_t>(peerRank + 1);
+    return ((epoch & kMoeA2AExecutionEpochMask) << 25) | ((peerCode & 0x1ff) << 16)
+        | (static_cast<uint64_t>(phase) << 8) | static_cast<uint64_t>(reason);
+}
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor

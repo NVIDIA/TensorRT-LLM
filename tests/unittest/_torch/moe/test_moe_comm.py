@@ -51,14 +51,13 @@ import os
 import pickle
 import sys
 import threading
-
 import time
 import traceback
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Set, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import pytest
@@ -314,10 +313,10 @@ def _run_nvlink_rank_mask_dispatch(
             comm.top_k,
             comm.num_experts,
             None,  # eplb_local_stats
-            enable_rank_mask,
-            active_rank_mask,
-            comm._execution_control.tensor,
-            execution_epoch,
+            enable_rank_mask=enable_rank_mask,
+            active_rank_mask=active_rank_mask,
+            execution_control=comm._execution_control.tensor,
+            expected_execution_epoch=execution_epoch,
         )
 
     recv_tensors, combine_payload_offset, _ = _dispatch()
@@ -362,10 +361,10 @@ def _run_nvlink_rank_mask_combine(
             combine_payload_offset,
             False,  # payload_in_workspace
             False,  # use_low_precision
-            enable_rank_mask,
-            active_rank_mask,
-            comm._execution_control.tensor,
-            execution_epoch,
+            enable_rank_mask=enable_rank_mask,
+            active_rank_mask=active_rank_mask,
+            execution_control=comm._execution_control.tensor,
+            expected_execution_epoch=execution_epoch,
         )
 
     return _combine()
@@ -619,16 +618,20 @@ def create_comm_object(
         NVLinkOneSided._WORKSPACE = None
         os.environ["TRTLLM_MOE_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
 
-        return NVLinkOneSided(
-            mapping=mapping,
-            num_slots=num_slots,
-            top_k=config.top_k,
-            max_num_tokens_per_rank=max_num_tokens,
-            hidden_size=config.hidden_size,
-            dtype=torch.bfloat16,
-            use_low_precision_combine=config.use_low_precision_combine,
-            ep_group_health=ep_group_health,
-        )
+        # These FT tests qualify the fence path explicitly, even on a CFT-capable
+        # worker. Ordinary communication tests retain their configured transport.
+        transport_env = {"TRTLLM_MOE_A2A_FORCE_CFT": "0"} if ep_group_health is not None else {}
+        with patch.dict(os.environ, transport_env):
+            return NVLinkOneSided(
+                mapping=mapping,
+                num_slots=num_slots,
+                top_k=config.top_k,
+                max_num_tokens_per_rank=max_num_tokens,
+                hidden_size=config.hidden_size,
+                dtype=torch.bfloat16,
+                use_low_precision_combine=config.use_low_precision_combine,
+                ep_group_health=ep_group_health,
+            )
 
     elif comm_type == COMM_NVLINK_TWO_SIDED:
         # Keep combine() output reduced to [tokens, hidden] so it matches the
@@ -1392,7 +1395,9 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
             moe_ep_size=config.ep_size,
             world_size=config.ep_size,
         )
-        comm = create_comm_object(config.comm_type, mapping, config)
+        comm = create_comm_object(
+            config.comm_type, mapping, config, ep_group_health=EPGroupHealth(config.ep_size)
+        )
 
         local_num_tokens = config.all_num_tokens[rank]
         torch.manual_seed(0xA2A + rank)
@@ -1488,7 +1493,9 @@ def _worker_rank_mask_one_rank_masked(
         )
         # All ranks must initialize the symmetric workspace before the dead rank
         # stops participating in dispatch/combine.
-        comm = create_comm_object(config.comm_type, mapping, config)
+        comm = create_comm_object(
+            config.comm_type, mapping, config, ep_group_health=EPGroupHealth(config.ep_size)
+        )
 
         if rank == dead_rank:
             MPI.COMM_WORLD.barrier()
@@ -1508,14 +1515,18 @@ def _worker_rank_mask_one_rank_masked(
             dtype=torch.int32,
             device="cuda",
         )
-        _, _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch(
-            comm,
-            masked_routes,
-            _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),
-            local_num_tokens,
-            enable_rank_mask=True,
-            active_rank_mask=mask,
+        # Dispatch and combine must stay paired in the same counter-parity bank.
+        masked_combined, masked_target_ranks, masked_send_indices = (
+            _run_nvlink_rank_mask_dispatch_combine(
+                comm,
+                masked_routes,
+                _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),
+                local_num_tokens,
+                enable_rank_mask=True,
+                active_rank_mask=mask,
+            )
         )
+        assert torch.count_nonzero(masked_combined) == 0
 
         live_expert_ids = torch.tensor(
             [
@@ -1609,7 +1620,7 @@ def _finish_running_abort(
     probe_multiplier: int,
     probe_offset: int,
 ) -> dict:
-    """Observe abort status from the CPU, quiesce CUDA, and reset the epoch."""
+    """Observe status, drain this synthetic nonissuing-peer test, and reset."""
     drain_start = time.monotonic()
     if abort_source == EXECUTION_ABORT_SOURCE_HOST:
         requested_epoch = comm.request_execution_abort()
@@ -1619,8 +1630,9 @@ def _finish_running_abort(
         raise ValueError(f"unsupported abort source: {abort_source}")
 
     status, abort_elapsed_s = _poll_execution_abort_status(comm)
-    # Status visibility is not a quiescence signal. Synchronize only after the
-    # CPU-only poll has observed the system-scope status publication.
+    # Status visibility is not a quiescence signal. The omitted participant is
+    # alive and issues no transfers in this test. This local drain does not
+    # establish transport quiescence for a real failed or still-issuing peer.
     torch.cuda.synchronize()
     drain_elapsed_s = time.monotonic() - drain_start
 
@@ -3491,6 +3503,7 @@ def _worker_mnnvl_checkpoint_failure_injection(_unused=None) -> bool:
     _FailureInjectionMnnvlMemory.allocated_map = {}
     del obj.ptr
     return True
+
 
 def _run_running_dispatch_abort_test(
     mpi_pool_executor,

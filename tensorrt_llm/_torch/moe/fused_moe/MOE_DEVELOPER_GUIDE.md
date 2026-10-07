@@ -127,6 +127,26 @@ Adaptive quantize/dispatch order (gated by comm.supports_post_quant_dispatch()):
 
 EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Multi-stream chunk overlap is enabled when `not enable_alltoall and aux_stream is not None`.
 
+### Opt-in WideEP execution abort
+
+The NVLinkOneSided rank-mask path provides cooperative, stream-independent
+execution abort for **non-CFT transport only**. Dispatch and combine share a
+workspace-owned execution epoch; host invalidation or a bounded peer wait
+records the first failure and allows supported kernels to return without a
+device trap. Ordinary, non-FT fence and CFT kernels retain their existing
+behavior. Constructing an FT communicator that can select CFT is rejected;
+select non-CFT explicitly until a separately qualified CFT abort implementation
+is available.
+
+Completion flags are progress markers, and abort status is diagnostic failure
+evidence: neither proves physical transport quiescence or authorizes membership
+removal. Before acknowledging a new epoch or releasing its workspace, a recovery
+coordinator must stop admission and prove old local work **and peer writes** can
+no longer affect reused resources. A local stream drain alone is insufficient.
+Failed-operation output must not be accepted. Survivor agreement, request
+disposition, transport quiescence, and graph-preserving recovery remain separate
+integration work; the rank-mask CUDA-capture guard remains in place.
+
 ### Fused-comm execution flow (MegaMoE-style)
 
 `FusedCommMoEScheduler._forward_chunk` runs per chunk:

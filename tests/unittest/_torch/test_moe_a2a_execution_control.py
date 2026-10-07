@@ -14,21 +14,24 @@
 # limitations under the License.
 
 from collections.abc import Callable
+from types import SimpleNamespace
+from unittest.mock import Mock
 from weakref import WeakSet
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.alltoall_watchdog import (
-    ActiveRankMaskSnapshot,
-    AlltoAllWatchdogCoordinator,
-)
-from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
-from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.alltoall_watchdog import ActiveRankMaskSnapshot
+from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm._torch.moe.fused_moe.communication.moe_alltoall import MoeAlltoAll
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
 from tensorrt_llm._torch.moe_a2a_execution_control import (
     MoeA2AExecutionAbortStatus,
     MoeA2AExecutionControl,
+    validate_execution_mode,
 )
+from tensorrt_llm.mapping import Mapping
 
 
 def _pack_status(
@@ -40,8 +43,8 @@ def _pack_status(
 ) -> int:
     peer_code = 0 if waiting_peer is None else waiting_peer + 1
     return (
-        ((execution_epoch & ((1 << 39) - 1)) << 24)
-        | ((peer_code & 0xFF) << 16)
+        ((execution_epoch & ((1 << 38) - 1)) << 25)
+        | ((peer_code & 0x1FF) << 16)
         | ((phase_code & 0xFF) << 8)
         | (reason_code & 0xFF)
     )
@@ -85,19 +88,124 @@ def test_execution_abort_status_decodes_packed_fields(
 
 def test_execution_abort_status_preserves_unknown_codes() -> None:
     raw_status = _pack_status(
-        execution_epoch=(1 << 39) - 1,
+        execution_epoch=(1 << 38) - 1,
         phase_code=17,
         reason_code=23,
-        waiting_peer=127,
+        waiting_peer=255,
     )
 
     status = MoeA2AExecutionAbortStatus.from_raw(raw_status)
 
     assert status is not None
-    assert status.execution_epoch == (1 << 39) - 1
+    assert status.execution_epoch == (1 << 38) - 1
     assert status.phase == "unknown(17)"
     assert status.reason == "unknown(23)"
-    assert status.waiting_peer == 127
+    assert status.waiting_peer == 255
+
+
+@pytest.mark.parametrize(
+    "rank_mask_enabled,can_use_cft", [(False, False), (False, True), (True, False)]
+)
+def test_execution_mode_accepts_qualified_combinations(
+    rank_mask_enabled: bool, can_use_cft: bool
+) -> None:
+    validate_execution_mode(rank_mask_enabled, can_use_cft)
+
+
+def test_execution_mode_rejects_rank_mask_with_cft() -> None:
+    with pytest.raises(RuntimeError, match="supports only non-CFT transport"):
+        validate_execution_mode(rank_mask_enabled=True, can_use_cft=True)
+
+
+@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
+def test_wrapper_rejects_resolved_cft_before_workspace_allocation(
+    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(f"{wrapper_type.__module__}.resolve_can_use_cft", lambda _requested: True)
+    monkeypatch.setattr(f"{wrapper_type.__module__}.get_force_cft", lambda: True)
+    monkeypatch.setattr(f"{wrapper_type.__module__}.MnnvlMemory.initialize", lambda: None)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, moe_ep_size=1)
+    if wrapper_type is MoeAlltoAll:
+        monkeypatch.setattr(MoeAlltoAll, "_init_constants", staticmethod(lambda: None))
+        kwargs = {"max_num_tokens": 1, "workspace_size_per_rank": 4096}
+    else:
+        monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", staticmethod(lambda: True))
+        kwargs = {"max_num_tokens_per_rank": 1}
+
+    with pytest.raises(RuntimeError, match="supports only non-CFT transport"):
+        wrapper_type(mapping=mapping, num_slots=1, top_k=1, ep_group_health=object(), **kwargs)
+
+
+@pytest.mark.parametrize("rank_mask_enabled", [False, True])
+def test_moe_alltoall_allocates_shared_execution_control_only_for_ft(
+    rank_mask_enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = torch.zeros((1, 4096), dtype=torch.uint8)
+    metainfo = torch.tensor([0, 4, 8], dtype=torch.int64)
+    controls: list[object] = []
+
+    class FakeMemory:
+        mapped = True
+
+        def __init__(self, mapping: Mapping, size: int) -> None:
+            assert mapping.moe_ep_size == 1
+            assert size == 4096
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            assert dtype == torch.uint8
+            return workspace
+
+    def create_control(workspace_arg: torch.Tensor, ep_rank: int) -> object:
+        assert workspace_arg is workspace
+        assert ep_rank == 0
+        control = object()
+        controls.append(control)
+        return control
+
+    monkeypatch.delenv("TRTLLM_MOE_A2A_WORKSPACE_MB", raising=False)
+    monkeypatch.setattr(f"{MoeAlltoAll.__module__}.MnnvlMemory", FakeMemory)
+    monkeypatch.setattr(f"{MoeAlltoAll.__module__}.resolve_can_use_cft", lambda _requested: False)
+    monkeypatch.setattr(f"{MoeAlltoAll.__module__}.get_force_cft", lambda: False)
+    monkeypatch.setattr(f"{MoeAlltoAll.__module__}.MoeA2AExecutionControl", create_control)
+    monkeypatch.setattr(MoeAlltoAll, "_WORKSPACES", {})
+    monkeypatch.setattr(MoeAlltoAll, "_init_constants", staticmethod(lambda: None))
+    monkeypatch.setattr(
+        MoeAlltoAll,
+        "_METAINFO_INDEX",
+        {
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+        },
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_initialize", lambda *_args: metainfo)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, moe_ep_size=1)
+    health = EPGroupHealth(1) if rank_mask_enabled else None
+    wrappers = []
+    try:
+        for _ in range(2):
+            wrappers.append(
+                MoeAlltoAll(
+                    mapping,
+                    max_num_tokens=1,
+                    top_k=1,
+                    num_slots=1,
+                    workspace_size_per_rank=4096,
+                    ep_group_health=health,
+                )
+            )
+        assert len(controls) == int(rank_mask_enabled)
+        expected_control = controls[0] if rank_mask_enabled else None
+        assert all(wrapper._execution_control is expected_control for wrapper in wrappers)
+        assert MoeAlltoAll._WORKSPACES[False]["execution_control"] is expected_control
+    finally:
+        for wrapper in wrappers:
+            wrapper.destroy()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
@@ -186,6 +294,7 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
     assert control.capture_epoch() == 0
     assert control.requested_epoch() == 0
     assert control.status() is None
+    assert not control.has_pending_abort()
     with pytest.raises(ValueError, match="newly requested execution epoch"):
         control.begin_epoch()
 
@@ -194,6 +303,8 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
     assert control.requested_epoch() == 1
     # An abort request invalidates running work but does not admit a new epoch.
     assert control.capture_epoch() == 0
+    assert control.status() is None
+    assert control.has_pending_abort()
 
     raw_status = _pack_status(
         execution_epoch=0,
@@ -223,6 +334,7 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
     assert execution_epoch == 1
     assert control.capture_epoch() == 1
     assert control.status() is None
+    assert not control.has_pending_abort()
 
     # A second wrapper sharing this workspace-owned control can acknowledge the
     # same already-reset epoch without issuing a duplicate device reset.
@@ -237,6 +349,7 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
         reason_code=2,
         waiting_peer=0,
     )
+    assert control.has_pending_abort()
     with pytest.raises(ValueError, match=r"call request_abort\(\) first"):
         control.begin_epoch()
     assert len(begin_calls) == 1
@@ -247,6 +360,7 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
     assert control.begin_epoch(requested_epoch) == requested_epoch
     assert len(begin_calls) == 2
     assert control.status() is None
+    assert not control.has_pending_abort()
 
     control.close()
     control.close()
@@ -254,6 +368,8 @@ def test_execution_control_lifecycle_delegates_to_host_ops(monkeypatch: pytest.M
     assert release_calls[0] is control_tensor
     with pytest.raises(RuntimeError, match="has been released"):
         control.capture_epoch()
+    with pytest.raises(RuntimeError, match="has been released"):
+        control.has_pending_abort()
 
 
 def test_nvlink_workspace_cache_closes_each_execution_control_once(
@@ -278,8 +394,9 @@ def test_nvlink_workspace_cache_closes_each_execution_control_once(
         "workspace": torch.empty(0, dtype=torch.uint8),
         "execution_control": second_control,
     }
-    watchdog_coordinator = AlltoAllWatchdogCoordinator(
+    lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
         workspace_state=first_state,
+        memory=SimpleNamespace(mapped=True),
         workspace=first_workspace,
         metainfo=torch.tensor([0, 4, 8], dtype=torch.int64),
         metainfo_index={
@@ -288,14 +405,19 @@ def test_nvlink_workspace_cache_closes_each_execution_control_once(
             "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
         },
         ep_rank=0,
-    )
-    watchdog = watchdog_coordinator.acquire_watchdog(
         ep_size=1,
-        timeout_s=1.0,
-        poll_interval_s=0.1,
+        health=None,
     )
     wrapper = object.__new__(NVLinkOneSided)
-    wrapper._alltoall_watchdog = watchdog
+    wrapper._workspace_lifecycle = lifecycle
+    lifecycle.register(
+        wrapper,
+        watchdog_timeout_s=1.0,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
+    watchdog = wrapper._alltoall_watchdog
+    assert watchdog is not None
     first_state["instances"].add(wrapper)
     monkeypatch.setattr(
         NVLinkOneSided,
@@ -329,29 +451,34 @@ def test_nvlink_workspace_cache_closes_each_execution_control_once(
 def test_wrapper_rejects_recoverable_abort_outside_rank_mask_mode(
     wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
 ) -> None:
-    class FakeExecutionControl:
-        def request_abort(self) -> int:
-            raise AssertionError("non-FT wrapper must not publish an execution abort")
-
     wrapper = object.__new__(wrapper_type)
     wrapper._rank_mask_enabled = False
-    wrapper._execution_control = FakeExecutionControl()
+    wrapper._execution_control = None
 
     with pytest.raises(RuntimeError, match="requires WideEP FT rank-mask mode"):
         wrapper.request_execution_abort()
+    with pytest.raises(RuntimeError, match="requires WideEP FT rank-mask mode"):
+        wrapper.begin_execution_epoch()
+    assert wrapper.get_execution_abort_status() is None
 
 
+@pytest.mark.parametrize("rank_mask_enabled", [False, True])
 def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
     monkeypatch: pytest.MonkeyPatch,
+    rank_mask_enabled: bool,
 ) -> None:
     control_tensor = torch.zeros(32, dtype=torch.uint64)
+    committed_mask = torch.tensor([1, 0, 0, 0], dtype=torch.uint64) if rank_mask_enabled else None
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     class FakeExecutionControl:
         def __init__(self) -> None:
             self.tensor = control_tensor
             self.begin_calls: list[int | None] = []
+            self.capture_calls = 0
 
         def capture_epoch(self) -> int:
+            self.capture_calls += 1
             return 7
 
         def begin_epoch(self, execution_epoch: int | None = None) -> int:
@@ -362,7 +489,8 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         def capture_active_rank_mask(
             self, active_rank_mask: torch.Tensor | None
         ) -> ActiveRankMaskSnapshot:
-            return ActiveRankMaskSnapshot(active_rank_mask, None)
+            assert active_rank_mask is None
+            return ActiveRankMaskSnapshot(committed_mask, None)
 
         def active_rank_mask_for_combine(
             self,
@@ -380,18 +508,24 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         ) -> None:
             assert watchdog is None
             assert phase in ("dispatch", "combine")
-            assert active_rank_mask is None
+            assert active_rank_mask is committed_mask
 
     fake_control = FakeExecutionControl()
     workspace = torch.empty((1, 256), dtype=torch.uint8)
     metainfo = torch.zeros(10, dtype=torch.int64)
     workspace_state = {"instances": WeakSet()}
-    monkeypatch.setattr(MoeAlltoAll, "_WORKSPACE", workspace_state)
+    lifecycle = SimpleNamespace(
+        metainfo=metainfo,
+        coordinator=FakeWatchdogCoordinator(),
+        watchdog_for=lambda _wrapper: None,
+    )
 
     def make_wrapper() -> MoeAlltoAll:
         wrapper = object.__new__(MoeAlltoAll)
         wrapper.workspace = workspace
-        wrapper.metainfo = metainfo
+        wrapper.mnnvl_mem = SimpleNamespace(mapped=True)
+        wrapper._workspace_state = workspace_state
+        wrapper._workspace_lifecycle = lifecycle
         wrapper.max_num_tokens = 8
         wrapper.ep_rank = 0
         wrapper.ep_size = 1
@@ -399,10 +533,12 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         wrapper.num_experts = 1
         wrapper.enable_eplb = False
         wrapper.eplb_stats_num_experts = None
-        wrapper._rank_mask_enabled = False
-        wrapper._execution_control = fake_control
-        wrapper._watchdog_coordinator = FakeWatchdogCoordinator()
-        wrapper._alltoall_watchdog = None
+        wrapper.can_use_cft_counted_writes = False
+        wrapper._force_cft = None
+        wrapper.cft_max_batch_for_dispatch = None
+        wrapper.cft_max_batch_for_combine = None
+        wrapper._rank_mask_enabled = rank_mask_enabled
+        wrapper._execution_control = fake_control if rank_mask_enabled else None
         wrapper.reset_state()
         workspace_state["instances"].add(wrapper)
         return wrapper
@@ -421,9 +557,12 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         top_k: int,
         num_experts: int,
         eplb_local_stats: torch.Tensor | None,
+        use_cft_counted_writes: bool,
+        expert_id_payload_index: int | None,
+        invalid_token_expert_id: int | None,
         enable_rank_mask: bool,
         active_rank_mask: torch.Tensor | None,
-        execution_control: torch.Tensor,
+        execution_control: torch.Tensor | None,
         expected_execution_epoch: int,
     ) -> tuple[list[torch.Tensor], int, torch.Tensor]:
         dispatch_calls.append(
@@ -438,6 +577,9 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
                 top_k,
                 num_experts,
                 eplb_local_stats,
+                use_cft_counted_writes,
+                expert_id_payload_index,
+                invalid_token_expert_id,
                 enable_rank_mask,
                 active_rank_mask,
                 execution_control,
@@ -458,9 +600,10 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
         combine_payload_offset: int,
         payload_in_workspace: bool,
         use_low_precision: bool,
+        use_cft_counted_writes: bool,
         enable_rank_mask: bool,
         active_rank_mask: torch.Tensor | None,
-        execution_control: torch.Tensor,
+        execution_control: torch.Tensor | None,
         expected_execution_epoch: int,
     ) -> torch.Tensor:
         combine_calls.append(
@@ -476,6 +619,7 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
                 combine_payload_offset,
                 payload_in_workspace,
                 use_low_precision,
+                use_cft_counted_writes,
                 enable_rank_mask,
                 active_rank_mask,
                 execution_control,
@@ -495,24 +639,118 @@ def test_moe_alltoall_wires_one_epoch_and_resets_all_shared_wrappers(
     recv_payloads = first.dispatch(token_selected_experts, [payload], 2)
     assert len(recv_payloads) == 1
     assert recv_payloads[0] is payload
-    assert first._state.execution_epoch == 7
+    expected_epoch = 7 if rank_mask_enabled else 0
+    expected_control = control_tensor if rank_mask_enabled else None
+    assert first._state.execution_epoch == expected_epoch
     first.combine(payload.view(1, 2, 4), 2)
     assert first._state.phase == "idle"
-    assert dispatch_calls[0][-4] is False
-    assert dispatch_calls[0][-3] is None
-    assert dispatch_calls[0][-2] is control_tensor
-    assert dispatch_calls[0][-1] == 7
-    assert combine_calls[0][-4] is False
-    assert combine_calls[0][-3] is None
-    assert combine_calls[0][-2] is control_tensor
-    assert combine_calls[0][-1] == 7
+    assert dispatch_calls[0][-7:-4] == (False, None, None)
+    assert dispatch_calls[0][-4] is rank_mask_enabled
+    assert dispatch_calls[0][-3] is committed_mask
+    assert dispatch_calls[0][-2] is expected_control
+    assert dispatch_calls[0][-1] == expected_epoch
+    assert combine_calls[0][-4] is rank_mask_enabled
+    assert combine_calls[0][-5] is False
+    assert combine_calls[0][-3] is committed_mask
+    assert combine_calls[0][-2] is expected_control
+    assert combine_calls[0][-1] == expected_epoch
+    assert fake_control.capture_calls == int(rank_mask_enabled)
 
     first._state.phase = "dispatched"
     second._state.phase = "dispatched"
-    assert first.begin_execution_epoch(8) == 8
-    assert fake_control.begin_calls == [8]
-    assert first._state.phase == "idle"
-    assert second._state.phase == "idle"
+    if rank_mask_enabled:
+        assert first.begin_execution_epoch(8) == 8
+        assert fake_control.begin_calls == [8]
+        assert first._state.phase == "idle"
+        assert second._state.phase == "idle"
+    else:
+        with pytest.raises(RuntimeError, match="requires WideEP FT rank-mask mode"):
+            first.begin_execution_epoch(8)
+        assert fake_control.begin_calls == []
+        assert first._state.phase == "dispatched"
+        assert second._state.phase == "dispatched"
+
+
+@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
+@pytest.mark.parametrize("phase", ["idle", "dispatched"])
+@pytest.mark.parametrize("pending_abort", [None, False, True])
+def test_checkpoint_readiness_requires_idle_frontend_without_pending_abort(
+    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
+    phase: str,
+    pending_abort: bool | None,
+) -> None:
+    wrapper = object.__new__(wrapper_type)
+    wrapper._execution_control = (
+        None if pending_abort is None else SimpleNamespace(has_pending_abort=lambda: pending_abort)
+    )
+    if wrapper_type is MoeAlltoAll:
+        wrapper._state = SimpleNamespace(phase=phase)
+    else:
+        wrapper._dispatch_state = {"phase": phase}
+
+    assert wrapper._mnnvl_checkpoint_is_idle() is (phase == "idle" and not pending_abort)
+
+
+@pytest.mark.parametrize("wrapper_type", [MoeAlltoAll, NVLinkOneSided])
+@pytest.mark.parametrize("abort_after_prepare", [False, True])
+def test_checkpoint_restore_fails_closed_on_abort_after_detachment(
+    wrapper_type: type[MoeAlltoAll] | type[NVLinkOneSided],
+    abort_after_prepare: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    control = SimpleNamespace(has_pending_abort=Mock(return_value=False))
+    wrapper = object.__new__(wrapper_type)
+    wrapper._execution_control = control
+    wrapper.reset_state()
+    state_attribute = "_state" if wrapper_type is MoeAlltoAll else "_dispatch_state"
+    initial_state = getattr(wrapper, state_attribute)
+    comm = SimpleNamespace(allgather=Mock(side_effect=lambda ready: [ready]))
+    memory = Mock(mapped=True, comm=comm)
+    memory.checkpoint_prepare.side_effect = lambda: setattr(memory, "mapped", False)
+    memory.checkpoint_restore.return_value = True
+    metainfo = torch.tensor([0, 4, 8], dtype=torch.int64)
+    lifecycle = _MnnvlAlltoAllWorkspaceLifecycle.get_or_create(
+        workspace_state={},
+        memory=memory,
+        workspace=torch.zeros((1, 32), dtype=torch.uint8),
+        metainfo=metainfo,
+        metainfo_index={
+            "FLAG_VAL_OFFSET_INDEX": 0,
+            "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX": 1,
+            "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX": 2,
+        },
+        ep_rank=0,
+        ep_size=1,
+        health=None,
+    )
+    lifecycle.register(
+        wrapper,
+        watchdog_timeout_s=None,
+        watchdog_poll_interval_s=0.1,
+        watchdog_on_timeout=None,
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    try:
+        lifecycle.checkpoint_prepare()
+        memory.checkpoint_prepare.assert_called_once_with()
+        assert not memory.mapped
+        control.has_pending_abort.return_value = abort_after_prepare
+
+        if abort_after_prepare:
+            with pytest.raises(RuntimeError, match="unacknowledged execution abort"):
+                lifecycle.checkpoint_restore(comm, lambda: metainfo)
+            memory._checkpoint_restore_failed.assert_called_once_with()
+            memory._checkpoint_restore_complete.assert_not_called()
+            assert getattr(wrapper, state_attribute) is initial_state
+        else:
+            lifecycle.checkpoint_restore(comm, lambda: metainfo)
+            memory._checkpoint_restore_complete.assert_called_once_with()
+            memory._checkpoint_restore_failed.assert_not_called()
+            assert getattr(wrapper, state_attribute) is not initial_state
+        assert comm.allgather.call_count == 2
+        comm.allgather.assert_called_with(not abort_after_prepare)
+    finally:
+        lifecycle.unregister(wrapper)
 
 
 def test_nvlink_begin_epoch_resets_all_shared_workspace_wrappers(
@@ -533,6 +771,7 @@ def test_nvlink_begin_epoch_resets_all_shared_workspace_wrappers(
 
     def make_wrapper() -> NVLinkOneSided:
         wrapper = object.__new__(NVLinkOneSided)
+        wrapper._rank_mask_enabled = True
         wrapper._workspace_key = workspace_key
         wrapper._execution_control = control
         wrapper._dispatch_state = {"phase": "dispatched"}
@@ -546,6 +785,33 @@ def test_nvlink_begin_epoch_resets_all_shared_workspace_wrappers(
     assert control.begin_calls == [3]
     assert first._dispatch_state == {"phase": "idle"}
     assert second._dispatch_state == {"phase": "idle"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "layout,message",
+    [("expanded_bytes", "byte-contiguous"), ("overlapping_rows", "rank rows must not overlap")],
+)
+def test_native_control_rejects_unsafe_workspace_layout(layout: str, message: str) -> None:
+    if layout == "expanded_bytes":
+        workspace = torch.zeros((2, 1), dtype=torch.uint8, device="cuda").expand(2, 256)
+    else:
+        workspace = torch.zeros((1, 256), dtype=torch.uint8, device="cuda").expand(2, 256)
+    with pytest.raises(RuntimeError, match=message):
+        torch.ops.trtllm.moe_a2a_create_execution_control(workspace, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_native_control_accepts_padded_workspace_rows() -> None:
+    workspace = torch.zeros((2, 512), dtype=torch.uint8, device="cuda")[:, :256]
+    assert not workspace.is_contiguous()
+    control = torch.ops.trtllm.moe_a2a_create_execution_control(workspace, 1)
+    try:
+        execution_epoch = torch.ops.trtllm.moe_a2a_request_execution_abort(control)
+        torch.ops.trtllm.moe_a2a_begin_execution_epoch(workspace, 1, control, execution_epoch)
+        assert torch.ops.trtllm.moe_a2a_get_execution_abort_state(control) == (execution_epoch, 0)
+    finally:
+        torch.ops.trtllm.moe_a2a_release_execution_control(control)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -641,7 +907,7 @@ def test_native_rank_mask_ops_reject_missing_execution_control() -> None:
     token_selected_experts = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
     payload = torch.zeros((1, 16), dtype=torch.bfloat16, device="cuda")
     combine_payload = payload.view(1, 1, 16)
-    active_rank_mask = torch.tensor([1, 0], dtype=torch.uint64)
+    active_rank_mask = torch.tensor([1, 0, 0, 0], dtype=torch.uint64)
 
     with pytest.raises(RuntimeError, match="execution_control is required"):
         torch.ops.trtllm.moe_a2a_dispatch(
@@ -654,9 +920,8 @@ def test_native_rank_mask_ops_reject_missing_execution_control() -> None:
             1,
             1,
             1,
-            None,
-            True,
-            active_rank_mask,
+            enable_rank_mask=True,
+            active_rank_mask=active_rank_mask,
         )
     with pytest.raises(RuntimeError, match="execution_control is required"):
         torch.ops.trtllm.moe_a2a_combine(
@@ -670,10 +935,117 @@ def test_native_rank_mask_ops_reject_missing_execution_control() -> None:
             1,
             0,
             False,
-            False,
-            True,
-            active_rank_mask,
+            enable_rank_mask=True,
+            active_rank_mask=active_rank_mask,
         )
+
+
+@pytest.mark.parametrize("phase", ["dispatch", "combine"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "meta",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+        ),
+    ],
+)
+def test_rank_mask_ops_reject_cft(phase: str, device: str) -> None:
+    workspace = torch.empty((1, 4096), dtype=torch.uint8, device=device)
+    metainfo = torch.empty((10,), dtype=torch.int64)
+    payload = torch.empty((1, 16), dtype=torch.bfloat16, device=device)
+    active_rank_mask = torch.tensor([1, 0, 0, 0], dtype=torch.uint64)
+    execution_control = torch.zeros(32, dtype=torch.uint64)
+
+    with pytest.raises(RuntimeError, match="supports only non-CFT transport"):
+        if phase == "dispatch":
+            torch.ops.trtllm.moe_a2a_dispatch(
+                torch.empty((1, 1), dtype=torch.int32, device=device),
+                [payload],
+                workspace,
+                metainfo,
+                1,
+                0,
+                1,
+                1,
+                1,
+                use_cft_counted_writes=True,
+                enable_rank_mask=True,
+                active_rank_mask=active_rank_mask,
+                execution_control=execution_control,
+            )
+        else:
+            torch.ops.trtllm.moe_a2a_combine(
+                payload.view(1, 1, 16),
+                1,
+                workspace,
+                metainfo,
+                1,
+                0,
+                1,
+                1,
+                0,
+                False,
+                use_cft_counted_writes=True,
+                enable_rank_mask=True,
+                active_rank_mask=active_rank_mask,
+                execution_control=execution_control,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("execution_epoch,message", [(-1, "non-negative"), (1 << 38, "38-bit")])
+@pytest.mark.parametrize("operation", ["dispatch", "combine", "begin"])
+def test_native_ops_reject_unrepresentable_execution_epoch(
+    execution_epoch: int, message: str, operation: str
+) -> None:
+    workspace = torch.zeros((1, 4096), dtype=torch.uint8, device="cuda")
+    metainfo = torch.ops.trtllm.moe_a2a_initialize(workspace, 0, 1, 1)
+    control = torch.ops.trtllm.moe_a2a_create_execution_control(workspace, 0)
+    payload = torch.zeros((1, 16), dtype=torch.bfloat16, device="cuda")
+    active_rank_mask = torch.tensor([1, 0, 0, 0], dtype=torch.uint64)
+    try:
+        with pytest.raises(RuntimeError, match=message):
+            if operation == "begin":
+                torch.ops.trtllm.moe_a2a_begin_execution_epoch(
+                    workspace, 0, control, execution_epoch
+                )
+            elif operation == "dispatch":
+                torch.ops.trtllm.moe_a2a_dispatch(
+                    torch.zeros((1, 1), dtype=torch.int32, device="cuda"),
+                    [payload],
+                    workspace,
+                    metainfo,
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    enable_rank_mask=True,
+                    active_rank_mask=active_rank_mask,
+                    execution_control=control,
+                    expected_execution_epoch=execution_epoch,
+                )
+            else:
+                torch.ops.trtllm.moe_a2a_combine(
+                    payload.view(1, 1, 16),
+                    1,
+                    workspace,
+                    metainfo,
+                    1,
+                    0,
+                    1,
+                    1,
+                    0,
+                    False,
+                    enable_rank_mask=True,
+                    active_rank_mask=active_rank_mask,
+                    execution_control=control,
+                    expected_execution_epoch=execution_epoch,
+                )
+    finally:
+        torch.ops.trtllm.moe_a2a_release_execution_control(control)
 
 
 def test_fake_ops_match_rank_mask_execution_control_contract() -> None:
@@ -682,7 +1054,7 @@ def test_fake_ops_match_rank_mask_execution_control_contract() -> None:
     token_selected_experts = torch.empty((1, 1), dtype=torch.int32, device="meta")
     payload = torch.empty((1, 16), dtype=torch.bfloat16, device="meta")
     combine_payload = payload.view(1, 1, 16)
-    active_rank_mask = torch.tensor([1, 0], dtype=torch.uint64)
+    active_rank_mask = torch.tensor([1, 0, 0, 0], dtype=torch.uint64)
 
     recv_tensors, combine_payload_offset, _ = torch.ops.trtllm.moe_a2a_dispatch(
         token_selected_experts,
@@ -722,9 +1094,8 @@ def test_fake_ops_match_rank_mask_execution_control_contract() -> None:
             1,
             1,
             1,
-            None,
-            True,
-            active_rank_mask,
+            enable_rank_mask=True,
+            active_rank_mask=active_rank_mask,
         )
     with pytest.raises(RuntimeError, match="execution_control is required"):
         torch.ops.trtllm.moe_a2a_combine(
@@ -738,7 +1109,6 @@ def test_fake_ops_match_rank_mask_execution_control_contract() -> None:
             1,
             0,
             False,
-            False,
-            True,
-            active_rank_mask,
+            enable_rank_mask=True,
+            active_rank_mask=active_rank_mask,
         )

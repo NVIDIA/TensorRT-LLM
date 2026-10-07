@@ -68,7 +68,7 @@ static constexpr int64_t kExecutionControlAcknowledgedEpochWord = 1;
 static constexpr int64_t kExecutionControlTimeoutCyclesWord = 2;
 static constexpr int64_t kExecutionControlHostStatusWord = CACHELINE_ALIGNMENT / sizeof(uint64_t);
 static constexpr int64_t kExecutionControlNumWords = 2 * CACHELINE_ALIGNMENT / sizeof(uint64_t);
-static constexpr uint64_t kExecutionStatusEpochMask = (uint64_t{1} << 39) - 1;
+static constexpr uint64_t kExecutionStatusEpochMask = tensorrt_llm::kernels::moe_comm::kMoeA2AExecutionEpochMask;
 
 // The custom op launches asynchronously while its control tensor lives in CPU
 // memory, so PyTorch's CUDA allocator cannot defer that tensor's deletion for us.
@@ -343,6 +343,8 @@ inline uint64_t* getExecutionDeviceStatusPtr(torch::Tensor const& workspace, int
 {
     TORCH_CHECK(workspace.dim() == 2, "workspace must be a 2D tensor");
     TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range");
+    TORCH_CHECK(workspace.stride(1) == 1, "workspace rows must be byte-contiguous");
+    TORCH_CHECK(workspace.stride(0) >= workspace.size(1), "workspace rank rows must not overlap");
     TORCH_CHECK(workspace.size(1) >= static_cast<int64_t>(kExecutionDeviceAdmissionOffset + sizeof(uint64_t)),
         "workspace row is too small for execution abort device state");
     uint8_t* rankWorkspacePtr = workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0);
@@ -359,7 +361,7 @@ inline tensorrt_llm::kernels::moe_comm::MoeA2AExecutionControl resolveExecutionC
     using tensorrt_llm::kernels::moe_comm::MoeA2AExecutionControl;
     TORCH_CHECK(expectedEpoch >= 0, "expected_execution_epoch must be non-negative");
     TORCH_CHECK(static_cast<uint64_t>(expectedEpoch) <= kExecutionStatusEpochMask,
-        "expected_execution_epoch exceeds the 39-bit status range");
+        "expected_execution_epoch exceeds the 38-bit status range");
     TORCH_CHECK(controlTensor.has_value() && controlTensor.value().defined(),
         "execution_control is required so an aborted epoch cannot return unobserved partial output");
 
@@ -384,6 +386,7 @@ torch::Tensor moeA2ACreateExecutionControlOp(torch::Tensor const& workspace, int
     TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range for execution_control workspace");
     TORCH_CHECK(workspace.size(1) >= static_cast<int64_t>(kExecutionDeviceAdmissionOffset + sizeof(uint64_t)),
         "workspace row is too small for execution abort device state");
+    (void) getExecutionDeviceStatusPtr(workspace, epRank);
     at::cuda::CUDAGuard deviceGuard(workspace.device());
     int const device = workspace.get_device();
 
@@ -451,7 +454,7 @@ int64_t moeA2ARequestExecutionAbortOp(torch::Tensor& control)
     uint64_t current = atomicLoadAcquire(liveEpoch);
     while (true)
     {
-        TORCH_CHECK(current < kExecutionStatusEpochMask, "execution abort epoch exhausted its 39-bit status range");
+        TORCH_CHECK(current < kExecutionStatusEpochMask, "execution abort epoch exhausted its 38-bit status range");
         uint64_t const next = current + 1;
         if (atomicCompareExchangeAcqRel(liveEpoch, current, next))
         {
@@ -490,7 +493,7 @@ void moeA2ABeginExecutionEpochOp(
     TORCH_CHECK(epRank >= 0 && epRank < workspace.size(0), "ep_rank out of range");
     TORCH_CHECK(executionEpoch >= 0, "execution_epoch must be non-negative");
     TORCH_CHECK(static_cast<uint64_t>(executionEpoch) <= kExecutionStatusEpochMask,
-        "execution_epoch exceeds the 39-bit status range");
+        "execution_epoch exceeds the 38-bit status range");
 
     (void) getExecutionControlRegistration(control, &workspace, epRank);
     uint64_t* words = validateMutableExecutionControlHostTensor(control);
@@ -529,7 +532,7 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 
     // Local device-side sticky execution status and combine admission word. Keep
     // both on a dedicated cacheline; their offsets are intentionally private so
-    // the ten-entry metainfo ABI remains stable.
+    // the metainfo field-count ABI remains stable.
     offset = alignOffset(offset, CACHELINE_ALIGNMENT);
     TLLM_CHECK(offset == kExecutionDeviceStatusOffset);
     offset += 2 * sizeof(uint64_t);
@@ -809,6 +812,8 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::optional<int64_t> invalidTokenExpertId, bool enableRankMask, torch::optional<torch::Tensor> activeRankMask,
     torch::optional<torch::Tensor> executionControl, int64_t expectedExecutionEpoch)
 {
+    TORCH_CHECK(!(enableRankMask && useCftCountedWrites),
+        "WideEP FT execution abort currently supports only non-CFT transport");
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
@@ -1148,6 +1153,8 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     torch::optional<torch::Tensor> activeRankMask = torch::nullopt,
     torch::optional<torch::Tensor> executionControl = torch::nullopt, int64_t expectedExecutionEpoch = 0)
 {
+    TORCH_CHECK(!(enableRankMask && useCftCountedWrites),
+        "WideEP FT execution abort currently supports only non-CFT transport");
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_combine_launch;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_cft_combine_push_launch;

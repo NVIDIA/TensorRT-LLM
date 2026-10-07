@@ -39,7 +39,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import \
     _MnnvlAlltoAllWorkspaceLifecycle
 from tensorrt_llm._torch.moe_a2a_execution_control import (
-    MoeA2AExecutionAbortStatus, MoeA2AExecutionControl)
+    MoeA2AExecutionAbortStatus, MoeA2AExecutionControl, validate_execution_mode)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -346,6 +346,8 @@ class MoeAlltoAll:
         # the variable unset keeps CFT disabled, as before.
         can_use_cft_counted_writes = resolve_can_use_cft(
             can_use_cft_counted_writes)
+        validate_execution_mode(ep_group_health is not None,
+                                can_use_cft_counted_writes)
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -367,7 +369,6 @@ class MoeAlltoAll:
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace, self.ep_rank, self.ep_size, self.max_num_tokens,
                 self.eplb_stats_num_experts, self.can_use_cft_counted_writes)
-            execution_control = MoeA2AExecutionControl(workspace, self.ep_rank)
             workspace_entry = {
                 "workspace_size_per_rank": workspace_size_per_rank,
                 "max_num_tokens": self.max_num_tokens,
@@ -379,7 +380,7 @@ class MoeAlltoAll:
                 "workspace": workspace,
                 "metainfo": metainfo,
                 "cft_initialized": False,
-                "execution_control": execution_control,
+                "execution_control": None,
                 "instances": WeakSet(),
             }
             MoeAlltoAll._WORKSPACES[workspace_key] = workspace_entry
@@ -402,7 +403,7 @@ class MoeAlltoAll:
         self.mnnvl_mem = workspace_entry["mnnvl_mem"]
         self.workspace = workspace_entry["workspace"]
         workspace_state["instances"].add(self)
-        self._execution_control = workspace_state["execution_control"]
+        self._execution_control = None
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
@@ -434,6 +435,14 @@ class MoeAlltoAll:
             watchdog_on_timeout=alltoall_watchdog_on_timeout,
         )
         self._workspace_registered = True
+
+        # The process-lifetime cache owns the optional FT registration; ordinary
+        # fence/CFT communicators have no mapped-control allocation or polling.
+        if self._rank_mask_enabled:
+            if workspace_state["execution_control"] is None:
+                workspace_state["execution_control"] = MoeA2AExecutionControl(
+                    self.workspace, self.ep_rank)
+            self._execution_control = workspace_state["execution_control"]
 
     @property
     def metainfo(self) -> torch.Tensor:
@@ -539,9 +548,16 @@ class MoeAlltoAll:
         )
 
     def _mnnvl_checkpoint_is_idle(self) -> bool:
-        return self._state.phase == "idle"
+        return self._state.phase == "idle" and (
+            self._execution_control is None
+            or not self._execution_control.has_pending_abort())
 
     def _mnnvl_checkpoint_reset(self) -> None:
+        if self._execution_control is not None and self._execution_control.has_pending_abort(
+        ):
+            raise RuntimeError(
+                "Cannot restore an MNNVL workspace with an unacknowledged execution abort"
+            )
         self.reset_state()
 
     def dispatch(self,
@@ -602,7 +618,9 @@ class MoeAlltoAll:
         active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
             requested_active_rank_mask)
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
-        execution_epoch = self._execution_control.capture_epoch()
+        execution_control = self._execution_control
+        execution_epoch = execution_control.capture_epoch(
+        ) if execution_control is not None else 0
         recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
@@ -619,7 +637,7 @@ class MoeAlltoAll:
             invalid_token_expert_id if can_fuse_sanitize else None,
             self._rank_mask_enabled,
             active_rank_mask,
-            self._execution_control.tensor,
+            execution_control.tensor if execution_control is not None else None,
             execution_epoch,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
@@ -697,7 +715,8 @@ class MoeAlltoAll:
             self.ep_size, self.top_k, self._state.combine_payload_offset,
             payload_in_workspace, use_low_precision_combine,
             use_cft_for_combine, self._rank_mask_enabled, active_rank_mask,
-            self._execution_control.tensor, self._state.execution_epoch)
+            self._execution_control.tensor if self._execution_control
+            is not None else None, self._state.execution_epoch)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 
@@ -727,14 +746,19 @@ class MoeAlltoAll:
     def get_execution_abort_status(
             self) -> Optional[MoeA2AExecutionAbortStatus]:
         """Return the first kernel-observed abort/timeout, if any."""
-        return self._execution_control.status()
+        return self._execution_control.status(
+        ) if self._execution_control is not None else None
 
     def begin_execution_epoch(self,
                               execution_epoch: Optional[int] = None) -> int:
         """Acknowledge/reset an epoch after the coordinator has quiesced old work."""
+        if not self._rank_mask_enabled:
+            raise RuntimeError(
+                "recoverable MoE A2A execution abort requires WideEP FT rank-mask mode"
+            )
         acknowledged_epoch = self._execution_control.begin_epoch(
             execution_epoch)
-        for instance in list(MoeAlltoAll._WORKSPACE["instances"]):
+        for instance in list(self._workspace_state["instances"]):
             instance.reset_state()
         return acknowledged_epoch
 

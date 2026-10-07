@@ -20,6 +20,7 @@ def comm(request):
     instance._destroyed = True
     instance._workspace_state = {}
     instance._dispatch_state = {"phase": "idle"}
+    instance._execution_control = None
     instance.ep_size = 4
     instance.max_num_tokens_per_rank = 32
     instance.can_use_cft_counted_writes = request.param

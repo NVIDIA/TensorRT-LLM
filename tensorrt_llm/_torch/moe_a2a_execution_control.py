@@ -9,6 +9,23 @@ from threading import Lock
 import torch
 
 
+def validate_execution_mode(rank_mask_enabled: bool, can_use_cft: bool) -> None:
+    """Reject a transport mode without cooperative execution-abort support.
+
+    Args:
+        rank_mask_enabled: Whether this communicator uses WideEP FT kernels.
+        can_use_cft: Whether dispatch or combine may select counted writes.
+
+    Raises:
+        RuntimeError: If the FT communicator can select the unqualified CFT path.
+    """
+    if rank_mask_enabled and can_use_cft:
+        raise RuntimeError(
+            "WideEP FT execution abort currently supports only non-CFT transport; "
+            "disable CFT explicitly before constructing a rank-mask communicator"
+        )
+
+
 @dataclass(frozen=True)
 class MoeA2AExecutionAbortStatus:
     """First recoverable failure observed by an NVLinkOneSided kernel."""
@@ -21,13 +38,21 @@ class MoeA2AExecutionAbortStatus:
 
     @classmethod
     def from_raw(cls, raw_status: int) -> MoeA2AExecutionAbortStatus | None:
+        """Decode the first failure without inferring completion or quiescence.
+
+        Args:
+            raw_status: Packed nonnegative status word returned by the native op.
+
+        Returns:
+            Decoded diagnostic evidence, or None when no failure was observed.
+        """
         if raw_status == 0:
             return None
 
         reason_code = raw_status & 0xFF
         phase_code = (raw_status >> 8) & 0xFF
-        peer_code = (raw_status >> 16) & 0xFF
-        execution_epoch = (raw_status >> 24) & ((1 << 39) - 1)
+        peer_code = (raw_status >> 16) & 0x1FF
+        execution_epoch = (raw_status >> 25) & ((1 << 38) - 1)
         phase = {1: "dispatch", 2: "combine"}.get(phase_code, f"unknown({phase_code})")
         reason = {1: "host_requested", 2: "timeout"}.get(reason_code, f"unknown({reason_code})")
         return cls(
@@ -49,9 +74,17 @@ class MoeA2AExecutionControl:
     epoch has quiesced. This primitive does not provide the admission gate.
     Communication wrappers expose recoverable abort only in the opt-in
     rank-mask/FT specialization; ordinary MoE retains its fail-stop timeout.
+    Completion flags are progress only. A local CUDA stream drain is not proof
+    that a failed peer can no longer write to reusable storage.
     """
 
     def __init__(self, workspace: torch.Tensor, ep_rank: int) -> None:
+        """Register a mapped-host token tied to one rank's CUDA workspace.
+
+        Args:
+            workspace: Two-dimensional uint8 CUDA symmetric workspace tensor.
+            ep_rank: Local logical rank indexing the workspace's first dimension.
+        """
         self._lock = Lock()
         self._closed = False
         self._workspace = workspace
@@ -67,6 +100,7 @@ class MoeA2AExecutionControl:
         self._has_acknowledged_abort = False
 
     def _check_open(self) -> None:
+        """Reject use after the mapped control registration has been released."""
         if self._closed:
             raise RuntimeError("MoE A2A execution control has been released")
 
@@ -90,6 +124,7 @@ class MoeA2AExecutionControl:
             return int(torch.ops.trtllm.moe_a2a_request_execution_abort(self.tensor))
 
     def requested_epoch(self) -> int:
+        """Read the latest host-requested epoch without admitting new execution."""
         with self._lock:
             self._check_open()
             live_epoch, _ = torch.ops.trtllm.moe_a2a_get_execution_abort_state(self.tensor)
@@ -102,8 +137,33 @@ class MoeA2AExecutionControl:
             _, raw_status = torch.ops.trtllm.moe_a2a_get_execution_abort_state(self.tensor)
             return MoeA2AExecutionAbortStatus.from_raw(int(raw_status))
 
+    def has_pending_abort(self) -> bool:
+        """Report invalidated or failed work, without asserting quiescence.
+
+        Checkpoint eligibility must not let workspace reinitialization clear
+        device status while its host-side abort remains unacknowledged.
+        """
+        with self._lock:
+            self._check_open()
+            live_epoch, raw_status = torch.ops.trtllm.moe_a2a_get_execution_abort_state(self.tensor)
+            return int(live_epoch) != self._expected_epoch or int(raw_status) != 0
+
     def begin_epoch(self, execution_epoch: int | None = None) -> int:
-        """Acknowledge an abort and reset local status after coordinator quiescence."""
+        """Reset local status after the caller establishes transport quiescence.
+
+        The caller must stop launch admission and prove that old local and peer
+        writes cannot reach reused storage. This method supplies no such proof.
+
+        Args:
+            execution_epoch: Latest requested epoch, or None to read it here.
+
+        Returns:
+            Acknowledged execution epoch shared by dispatch and combine.
+
+        Raises:
+            ValueError: If the epoch is stale or no new abort was requested.
+            RuntimeError: If this control has already been released.
+        """
         with self._lock:
             self._check_open()
             live_epoch, raw_status = torch.ops.trtllm.moe_a2a_get_execution_abort_state(self.tensor)
