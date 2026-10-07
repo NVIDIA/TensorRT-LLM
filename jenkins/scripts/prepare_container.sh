@@ -86,7 +86,13 @@ else
 fi
 trap '[ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true' EXIT
 MAX_WAIT_ITERS="${FAT_BUILD_MAX_WAIT_ITERS:-30}"   # 30 * 60s = 30min
+# A builder stuck in the CPU queue falls back sooner than one that is building, so
+# the GPU job does not idle on queue time it could spend on a full install. The
+# builder is left queued: once it finishes, retries and later stages hit the cache.
+MAX_PENDING_ITERS="${FAT_BUILD_MAX_PENDING_ITERS:-10}"
 iters=0
+pendingIters=0
+gaveUp=false
 while true; do
     STATUS=$(sacct -j "$BUILDER_ID" --format=State -Pn --allocations 2>/dev/null | head -1 || true)
     # sacct prints "CANCELLED by <uid>" for cancelled jobs; strip the trailing words.
@@ -96,6 +102,7 @@ while true; do
         iters=$((iters + 1))
         if [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
             echo "Giving up on fat sqsh builder $BUILDER_ID after ${iters} polls; GPU job will fall back to base sqsh + full install"
+            gaveUp=true
             break
         fi
         sleep 60
@@ -106,11 +113,24 @@ while true; do
             echo "Fat sqsh builder job $BUILDER_ID finished: $STATUS"
             break
             ;;
+        PENDING)
+            REASON=$(squeue -h -j "$BUILDER_ID" -o "%r" 2>/dev/null | head -1 || true)
+            echo "Fat sqsh builder job $BUILDER_ID state: PENDING (reason=${REASON:-unknown}), waiting..."
+            iters=$((iters + 1))
+            pendingIters=$((pendingIters + 1))
+            if [ "$pendingIters" -ge "$MAX_PENDING_ITERS" ] || [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
+                echo "Giving up on fat sqsh builder $BUILDER_ID (still PENDING after ${pendingIters} polls); it stays queued for later stages. GPU job will fall back to base sqsh + full install"
+                gaveUp=true
+                break
+            fi
+            sleep 60
+            ;;
         *)
             echo "Fat sqsh builder job $BUILDER_ID state: ${STATUS}, waiting..."
             iters=$((iters + 1))
             if [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
                 echo "Giving up on fat sqsh builder $BUILDER_ID (state=$STATUS) after ${iters} polls; GPU job will fall back to base sqsh + full install"
+                gaveUp=true
                 break
             fi
             sleep 60
@@ -122,7 +142,7 @@ trap - EXIT
 
 if [ -f "$fatSqshPath" ]; then
     echo "Fat sqsh ready: $fatSqshPath"
-else
+elif [ "$gaveUp" = false ]; then
     echo "Fat sqsh not found after builder completed (status=$STATUS); GPU job will fall back to base sqsh + full install"
 fi
 echo "=== [Prepare Container] STAGE END: $(date '+%Y-%m-%d %H:%M:%S') cpu_builder_job_id=$BUILDER_ID final_status=$STATUS ==="
