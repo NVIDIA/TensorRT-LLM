@@ -66,7 +66,7 @@ trtllm-serve Qwen/Qwen3-0.6B \
   --num_serve_frontends 4 --port 50051
 ```
 
-Every frontend binds the same fixed port with `SO_REUSEPORT`. The kernel distributes TCP connections, not individual RPCs within an HTTP/2 connection. Configure the client or router to open multiple independent connections; one multiplexed connection uses only one frontend, and connection distribution is not guaranteed to be even.
+Every frontend binds the same fixed port with `SO_REUSEPORT`. The kernel distributes TCP connections, not individual RPCs within an HTTP/2 connection. Configure the client or router to open multiple independent connections; one multiplexed connection uses only one frontend, and connection distribution is not guaranteed to be even. Python `grpcio` channels with the same target and arguments share a connection; set the `grpc.use_local_subchannel_pool` channel argument to 1 on each channel to give them independent connections.
 
 The launcher owns the executor and a private local coordinator. Other frontends attach to that executor; model weights and GPU execution are shared. Token streams go directly through each frontend's executor result lane. The coordinator reserves request IDs across all frontends and routes control operations to the owning process. `Abort(request_id)` works from any connection, `Abort(all_requests)` targets a snapshot of active requests, and `GetLoad` reports the aggregate active reservation count, including pending submissions and health probes. All frontends advertise the same engine instance ID.
 

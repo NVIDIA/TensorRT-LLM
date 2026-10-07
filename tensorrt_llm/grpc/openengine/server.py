@@ -7,6 +7,7 @@ import asyncio
 import ipaddress
 import os
 import signal
+import socket
 import tempfile
 import threading
 from collections.abc import Callable
@@ -195,6 +196,13 @@ def launch_server(
         mode = _init_multi_frontend_mode(llm_args, enabled=True)
         if mode.num_frontends > 1 and port == 0:
             raise click.UsageError("Multiple OpenEngine frontends require a fixed --port")
+        if mode.is_launcher:
+            family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
+            try:
+                with socket.create_server((host, port), family=family):
+                    pass
+            except OSError as error:
+                raise RuntimeError(f"Failed to bind {host}:{port}: {error}") from error
         stop_event = asyncio.Event()
         startup_cancelled = threading.Event()
         server = llm = coordinator = frontend = monitor = None
@@ -336,6 +344,11 @@ def launch_server(
             if coordinator is not None:
                 coordinator.ready = False
                 coordinator.stopping = True
+            elif mode.is_attached_frontend and frontend is not None:
+                try:
+                    await frontend.request("withdraw", frontend=frontend.frontend_id)
+                except CoordinationError:
+                    pass
             if monitor is not None:
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)

@@ -112,7 +112,6 @@ class Coordinator:
         self.instance_id = instance_id
         self.ready = False
         self.stopping = False
-        self._accepted = [0] * count
         self._heartbeats: list[float | None] = [None] * count
         self._healthy = healthy
         self._fail = fail
@@ -179,9 +178,14 @@ class Coordinator:
                 "ready": self._group_ready(),
                 "instance_id": self.instance_id,
                 "count": len(self._requests),
-                "accepted": self._accepted,
                 "stopping": self.stopping,
             }
+        if operation == "withdraw":
+            self.ready = False
+            if not self.stopping:
+                self.stopping = True
+                self._fail(f"OpenEngine frontend {message['frontend']} is stopping")
+            return {}
         if operation == "reserve":
             if not self._group_ready():
                 return {"ready": False, "reserved": False}
@@ -190,8 +194,6 @@ class Coordinator:
             current = self._requests.get(request_id)
             if current is not None and current != owner:
                 return {"reserved": False}
-            if current is None:
-                self._accepted[owner[1]] += 1
             self._requests[request_id] = owner
             return {"reserved": True}
         if operation == "release":

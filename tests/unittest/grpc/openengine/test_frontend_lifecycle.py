@@ -16,10 +16,27 @@ from unittest.mock import Mock
 import grpc
 import pytest
 
+from tensorrt_llm.grpc.openengine import server as openengine_server
 from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
 from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+
+
+def test_second_frontend_group_rejects_occupied_port_before_model_load(monkeypatch):
+    monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
+    model_loaded = Mock(side_effect=AssertionError("model loaded before port check"))
+    monkeypatch.setattr(openengine_server, "PyTorchLLM", model_loaded)
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with pytest.raises(RuntimeError, match="Failed to bind"):
+            openengine_server.launch_server(
+                "127.0.0.1", port, {"model": "test", "backend": "pytorch", "num_serve_frontends": 2}
+            )
+    model_loaded.assert_not_called()
 
 
 @pytest.mark.parametrize("exits", [True, False])

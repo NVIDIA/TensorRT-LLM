@@ -72,7 +72,6 @@ async def test_cross_frontend_ownership_load_and_abort():
             "count": 1,
             "ready": True,
             "instance_id": "shared-engine",
-            "accepted": [1, 0],
             "stopping": False,
         }
         assert await second.request("abort", request_id="request") == {"aborted": 1, "failed": 0}
@@ -457,3 +456,18 @@ async def test_expired_heartbeat_stops_admission_and_cannot_be_revived(monkeypat
         await reservation.release()  # Existing ownership can still be cleaned up.
         assert (await first.request("status"))["count"] == 0
         assert len(failures) == 1
+
+
+@pytest.mark.asyncio
+async def test_frontend_withdraw_stops_group_admission():
+    async with group() as (coordinator, (first, second), failures):
+        reservation = await second.reserve("in-flight")
+        assert await first.request("withdraw", frontend=0) == {}
+        status = await second.request("status")
+        assert not status["ready"]
+        assert status["stopping"]
+        assert not coordinator.ready
+        assert failures == ["OpenEngine frontend 0 is stopping"]
+        with pytest.raises(CoordinationError):
+            await second.reserve("new-work")
+        await reservation.release()
