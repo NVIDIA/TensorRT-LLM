@@ -41,7 +41,7 @@ target_link_libraries(th_utils PUBLIC tllm::runtime_buffers ${TORCH_LIBRARIES}
 
 function(add_th_common_family target)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "COMPONENT_LOCAL" ""
-                        "SOURCES;LINK_LIBRARIES")
+                        "SOURCES;LINK_LIBRARIES;OBJECT_LIBRARIES")
   if(ARG_UNPARSED_ARGUMENTS
      OR ARG_KEYWORDS_MISSING_VALUES
      OR NOT ARG_SOURCES)
@@ -51,8 +51,12 @@ function(add_th_common_family target)
   set_property(TARGET ${target} PROPERTY POSITION_INDEPENDENT_CODE ON)
   set_target_properties(${target} PROPERTIES CXX_STANDARD 20
                                              CXX_STANDARD_REQUIRED ON)
-  target_link_libraries(${target} PRIVATE tllm::torch_utils
-                                          ${ARG_LINK_LIBRARIES})
+  target_link_libraries(
+    ${target} PRIVATE tllm::torch_utils ${ARG_LINK_LIBRARIES}
+                      ${ARG_OBJECT_LIBRARIES})
+  foreach(backend IN LISTS ARG_OBJECT_LIBRARIES)
+    target_sources(${target} INTERFACE $<TARGET_OBJECTS:${backend}>)
+  endforeach()
   if(NOT ARG_COMPONENT_LOCAL)
     target_link_libraries(${target} PRIVATE ${SHARED_TARGET} pg_utils)
   endif()
@@ -211,6 +215,7 @@ add_library(tllm::torch_visual_gen ALIAS th_common_visual_gen)
 
 add_th_common_family(
   th_common_decoding
+  COMPONENT_LOCAL
   SOURCES
   logitsBitmaskOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
@@ -221,7 +226,18 @@ add_th_common_family(
   loraOp.cpp
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
-  compressorOp.cpp)
+  compressorOp.cpp
+  LINK_LIBRARIES
+  tllm::kernel_logits
+  tllm::kernel_speculative_decoding
+  tllm::kernel_lora
+  tllm::kernel_grouped_gemm
+  tllm::common_op_utils
+  OBJECT_LIBRARIES
+  fusedSamplingKernels_src
+  mhcKernels_src
+  compressorKernels_src)
+add_library(tllm::torch_decoding ALIAS th_common_decoding)
 
 add_library(
   th_common SHARED
