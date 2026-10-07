@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pytest
 import torch
@@ -14,7 +16,9 @@ from transformers.video_utils import make_batched_videos
 pytest.importorskip("cv2")
 import cv2  # noqa: E402
 
-from tensorrt_llm.inputs.media_io import _load_video_by_cv2  # noqa: E402
+from tensorrt_llm.inputs.media_io import VideoMediaIO, _load_video_by_cv2  # noqa: E402
+from tensorrt_llm.inputs.multimodal import default_hasher  # noqa: E402
+from tensorrt_llm.inputs.utils import async_load_video, load_video  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -66,3 +70,21 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+def test_offline_loaders_match_serve_video_hash(sample_video_path: str) -> None:
+    """The offline loaders must produce the same cache identity as serve's `VideoMediaIO`."""
+
+    def digest(video) -> str:
+        hasher = default_hasher()
+        video.update_hash(hasher)
+        return hasher.hexdigest()
+
+    serve = VideoMediaIO(num_frames=10).load_file(sample_video_path)
+    offline = load_video(sample_video_path, num_frames=10)
+    offline_async = asyncio.run(async_load_video(sample_video_path, num_frames=10))
+
+    assert serve.raw_bytes_hash is not None
+    assert offline.raw_bytes_hash == serve.raw_bytes_hash
+    assert offline_async.raw_bytes_hash == serve.raw_bytes_hash
+    assert digest(offline) == digest(serve) == digest(offline_async)
