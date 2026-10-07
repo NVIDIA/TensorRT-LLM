@@ -784,7 +784,7 @@ class PrefillTarget(Target):
         # bottom-right within-block causal mask.
         gen_seqs = md.num_seqs - num_ctx
         gen_p = gen // gen_seqs if gen_seqs else 1
-        ctx_kv_tokens = int(md.host_total_kv_lens[0]) if tc else 0
+        ctx_kv_tokens = int(md.host_total_kv_lens[0])
         dp_rows = core._dp_rows(md, num_tokens)
         pad_rows = dp_rows - num_tokens
 
@@ -801,56 +801,55 @@ class PrefillTarget(Target):
             q_ctx, q_gen = torch.split(q, [tc, gen], 0)
             latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
-            if tc:
-                if core._cached_ctx:
-                    self._mla_append(
-                        q=q_ctx,
-                        latent_cache=latent_ctx,
-                        num_contexts=num_ctx,
-                        cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
-                        cu_seq_lens=md.ctx_kv_indptr,
-                        max_input_uncached_seq_len=int(md.max_ctx_seq_len),
-                        kv_cache_block_offsets=block_offsets,
-                        host_kv_cache_pool_pointers=pool_ptrs,
-                        host_kv_cache_pool_mapping=pool_map,
-                        layer=i,
-                    )
-                    ckv_full, k_pe_full = self._mla_load(
-                        out_dtype=dt,
-                        num_contexts=num_ctx,
-                        num_ctx_kv_tokens=ctx_kv_tokens,
-                        max_ctx_kv_len=int(md.max_ctx_kv_len),
-                        cu_ctx_kv_lens=md.ctx_kv_indptr,
-                        kv_cache_block_offsets=block_offsets,
-                        host_kv_cache_pool_pointers=pool_ptrs,
-                        host_kv_cache_pool_mapping=pool_map,
-                        layer=i,
-                    )
-                    latent_arg = None
-                else:
-                    ckv_full, _ = torch.split(ckv, [tc, gen], 0)
-                    k_pe_full = None
-                    latent_arg = latent_ctx
-                tkv = ctx_kv_tokens
-                # The context FMHA hard-codes V's row stride as the full packed [k_nope | v]
-                # width and reads the column block, so V must stay this split view.
-                kv = self._kvb(ckv_full, layer=i)
-                k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
-                k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
-                k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
-                k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
-                if k_pe_full is not None:
-                    k_pe_dst.copy_(
-                        torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
-                    )
-                self._attn_ctx(
+            if core._cached_ctx:
+                self._mla_append(
                     q=q_ctx,
-                    k=torch.reshape(k, [tkv, heads * qk_dim]),
-                    v=v_view,
-                    output=attn_ctx,
-                    latent_cache=latent_arg,
+                    latent_cache=latent_ctx,
+                    num_contexts=num_ctx,
+                    cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
+                    cu_seq_lens=md.ctx_kv_indptr,
+                    max_input_uncached_seq_len=int(md.max_ctx_seq_len),
+                    kv_cache_block_offsets=block_offsets,
+                    host_kv_cache_pool_pointers=pool_ptrs,
+                    host_kv_cache_pool_mapping=pool_map,
                     layer=i,
                 )
+                ckv_full, k_pe_full = self._mla_load(
+                    out_dtype=dt,
+                    num_contexts=num_ctx,
+                    num_ctx_kv_tokens=ctx_kv_tokens,
+                    max_ctx_kv_len=int(md.max_ctx_kv_len),
+                    cu_ctx_kv_lens=md.ctx_kv_indptr,
+                    kv_cache_block_offsets=block_offsets,
+                    host_kv_cache_pool_pointers=pool_ptrs,
+                    host_kv_cache_pool_mapping=pool_map,
+                    layer=i,
+                )
+                latent_arg = None
+            else:
+                ckv_full, _ = torch.split(ckv, [tc, gen], 0)
+                k_pe_full = None
+                latent_arg = latent_ctx
+            tkv = ctx_kv_tokens
+            # The context FMHA hard-codes V's row stride as the full packed [k_nope | v]
+            # width and reads the column block, so V must stay this split view.
+            kv = self._kvb(ckv_full, layer=i)
+            k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
+            k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
+            k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
+            k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
+            if k_pe_full is not None:
+                k_pe_dst.copy_(
+                    torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
+                )
+            self._attn_ctx(
+                q=q_ctx,
+                k=torch.reshape(k, [tkv, heads * qk_dim]),
+                v=v_view,
+                output=attn_ctx,
+                latent_cache=latent_arg,
+                layer=i,
+            )
 
             if gen:
                 q3 = torch.reshape(q_gen, [gen, heads, qk_dim])
@@ -1198,7 +1197,7 @@ class PrefillTarget(Target):
         block_offsets = md.kv_cache_block_offsets
         pool_ptrs = md.host_kv_cache_pool_pointers
         pool_map = md.host_kv_cache_pool_mapping
-        ctx_kv_tokens = int(md.host_total_kv_lens[0]) if tc else 0
+        ctx_kv_tokens = int(md.host_total_kv_lens[0])
         # Under a one-model MTP mode the engine raises the KV pool's layer count by
         # `num_nextn_predict_layers`, so this module addresses layer `num_hidden_layers` in the
         # same pool as the trunk's 61 layers. Nothing in the config stub or manifest says so.
@@ -1221,56 +1220,55 @@ class PrefillTarget(Target):
         q_ctx, q_gen = torch.split(q, [tc, gen], 0)
         latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
-        if tc:
-            if core._cached_ctx:
-                self._mtp_mla_append(
-                    q=q_ctx,
-                    latent_cache=latent_ctx,
-                    num_contexts=num_ctx,
-                    cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
-                    cu_seq_lens=md.ctx_kv_indptr,
-                    max_input_uncached_seq_len=int(md.max_ctx_seq_len),
-                    cos_sin_cache=rope["rotary_cos_sin"],
-                    kv_cache_block_offsets=block_offsets,
-                    host_kv_cache_pool_pointers=pool_ptrs,
-                    host_kv_cache_pool_mapping=pool_map,
-                    tokens_per_block=tokens_per_block,
-                    attention_window_size=md.max_seq_len,
-                )
-                ckv_full, k_pe_full = self._mtp_mla_load(
-                    out_dtype=dt,
-                    num_contexts=num_ctx,
-                    num_ctx_kv_tokens=ctx_kv_tokens,
-                    max_ctx_kv_len=int(md.max_ctx_kv_len),
-                    cu_ctx_kv_lens=md.ctx_kv_indptr,
-                    kv_cache_block_offsets=block_offsets,
-                    host_kv_cache_pool_pointers=pool_ptrs,
-                    host_kv_cache_pool_mapping=pool_map,
-                    tokens_per_block=tokens_per_block,
-                    attention_window_size=md.max_seq_len,
-                )
-                latent_arg = None
-            else:
-                ckv_full, _ = torch.split(ckv, [tc, gen], 0)
-                k_pe_full = None
-                latent_arg = latent_ctx
-            tkv = ctx_kv_tokens
-            kv = self._mtp_kvb(ckv_full)
-            k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
-            k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
-            k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
-            k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
-            if k_pe_full is not None:
-                k_pe_dst.copy_(
-                    torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
-                )
-            self._mtp_attn_ctx(
+        if core._cached_ctx:
+            self._mtp_mla_append(
                 q=q_ctx,
-                k=torch.reshape(k, [tkv, heads * qk_dim]),
-                v=v_view,
-                output=attn_ctx,
-                latent_cache=latent_arg,
+                latent_cache=latent_ctx,
+                num_contexts=num_ctx,
+                cu_ctx_cached_kv_lens=md.ctx_cached_token_indptr,
+                cu_seq_lens=md.ctx_kv_indptr,
+                max_input_uncached_seq_len=int(md.max_ctx_seq_len),
+                cos_sin_cache=rope["rotary_cos_sin"],
+                kv_cache_block_offsets=block_offsets,
+                host_kv_cache_pool_pointers=pool_ptrs,
+                host_kv_cache_pool_mapping=pool_map,
+                tokens_per_block=tokens_per_block,
+                attention_window_size=md.max_seq_len,
             )
+            ckv_full, k_pe_full = self._mtp_mla_load(
+                out_dtype=dt,
+                num_contexts=num_ctx,
+                num_ctx_kv_tokens=ctx_kv_tokens,
+                max_ctx_kv_len=int(md.max_ctx_kv_len),
+                cu_ctx_kv_lens=md.ctx_kv_indptr,
+                kv_cache_block_offsets=block_offsets,
+                host_kv_cache_pool_pointers=pool_ptrs,
+                host_kv_cache_pool_mapping=pool_map,
+                tokens_per_block=tokens_per_block,
+                attention_window_size=md.max_seq_len,
+            )
+            latent_arg = None
+        else:
+            ckv_full, _ = torch.split(ckv, [tc, gen], 0)
+            k_pe_full = None
+            latent_arg = latent_ctx
+        tkv = ctx_kv_tokens
+        kv = self._mtp_kvb(ckv_full)
+        k_nope, v_view = torch.split(kv, [heads * nope, heads * v_dim], -1)
+        k = torch.empty([tkv, heads, qk_dim], dtype=dt, device=dev)
+        k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
+        k_nope_dst.copy_(torch.reshape(k_nope, [tkv, heads, nope]))
+        if k_pe_full is not None:
+            k_pe_dst.copy_(
+                torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
+            )
+        self._mtp_attn_ctx(
+            q=q_ctx,
+            k=torch.reshape(k, [tkv, heads * qk_dim]),
+            v=v_view,
+            output=attn_ctx,
+            latent_cache=latent_arg,
+        )
 
         if gen:
             q3 = torch.reshape(q_gen, [gen, heads, qk_dim])
