@@ -43,7 +43,9 @@ def test_certified_cells(cell) -> None:
     a, w, out, parent = _build(cell.spec, seed=abs(hash(cell.why)) % 2**31)
     parent_ptr = parent.data_ptr()
     with validating(op):
-        assert op(a, w, out) is None, "the op writes in place"
+        # Identity, not equality: the op must have written this very buffer and
+        # returned it, not produced a copy that happens to match.
+        assert op(a, w, out) is out, "the op writes in place and returns what it wrote"
     # The product has to be in the caller's buffer, not in a replacement the op
     # allocated: that is the whole reason this op exists over torch.bmm.
     assert parent.data_ptr() == parent_ptr
