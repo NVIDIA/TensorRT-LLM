@@ -12,14 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Everything selection writes once collection is over.
+"""Everything selection records once collection is over.
 
-    SelectionOutput.of(selection, rootdir) -> Artifacts.write(report, out_dir)
-                                           -> TerminalSummary.render(...)
+    SelectionOutput.of(selection, rootdir) -> SelectionReport -> Artifacts.write(report, out_dir)
 
 Two formats from one record: `.ids` files the pipeline filters with `awk`, and
-a JSON record holding the counts and the per-test outcome. `plugin.py` holds
-the hooks and renders the summary through pytest's terminal reporter.
+a JSON record holding the counts and the per-test outcome. `plugin.py` renders
+the same report in the terminal.
 """
 
 import json
@@ -142,19 +141,19 @@ class SelectionReport:
         )
 
     @property
-    def feasible(self) -> Tuple[Outcome, ...]:
-        """The tests this machine can run, whatever allocation they land in."""
+    def selected(self) -> Tuple[Outcome, ...]:
+        """The tests this run keeps, whichever rung holds them."""
         return tuple(outcome for outcome in self.outcomes if outcome.selected)
 
     @property
     def rungs(self) -> Dict[int, Tuple[Outcome, ...]]:
-        """The feasible tests partitioned by allocation, empty rungs included.
+        """The selected tests partitioned by rung, empty rungs included.
 
         Every rung, not only the one a caller is running: one collection
         carries what all of them need.
         """
         return {
-            rung: tuple(outcome for outcome in self.feasible if outcome.rung == rung)
+            rung: tuple(outcome for outcome in self.selected if outcome.rung == rung)
             for rung in self.ladder
         }
 
@@ -192,8 +191,8 @@ class SelectionReport:
         """Every population's size."""
         return {
             "candidates": len(self.outcomes),
-            "feasible": len(self.feasible),
-            "deselected": len(self.outcomes) - len(self.feasible),
+            "selected": len(self.selected),
+            "deselected": len(self.outcomes) - len(self.selected),
             "unclassified": 0,
         }
 
@@ -281,48 +280,3 @@ class SelectionOutput:
             report=report,
             written=tuple(Artifacts.write(report, out_dir)) if out_dir is not None else (),
         )
-
-
-class TerminalSummary:
-    """The human-readable block, rendered in pytest's terminal summary."""
-
-    TITLE = "qa selection"
-
-    # Every line is a label then a value, in one column pair.
-    LABEL_WIDTH = 14
-
-    @classmethod
-    def render(cls, writer, output: SelectionOutput) -> None:
-        """Write the summary block through pytest's terminal reporter."""
-        writer.section(cls.TITLE, sep="-")
-        for line in cls.lines(output):
-            writer.line(line)
-
-    @classmethod
-    def lines(cls, output: SelectionOutput) -> List[str]:
-        """The block's lines, so they can be asserted without a terminal."""
-        report = output.report
-        counts = report.counts
-        lines = [
-            cls.line("target", cls.target(report)),
-            cls.line("candidates", counts["candidates"]),
-            cls.line("feasible", f"{counts['feasible']}  ({counts['deselected']} deselected)"),
-            cls.line("rungs", cls.rung_counts(report)),
-        ]
-        lines += [cls.line("written", path) for path in output.written]
-        return lines
-
-    @classmethod
-    def line(cls, label: str, value: object) -> str:
-        """One `label   value` line, aligned with every other."""
-        return f"{label:<{cls.LABEL_WIDTH}}{value}"
-
-    @staticmethod
-    def target(report: SelectionReport) -> str:
-        """The machine and the ladder decisions were made against."""
-        return f"{report.machine}, ladder {report.ladder}"
-
-    @staticmethod
-    def rung_counts(report: SelectionReport) -> str:
-        """One count per rung, in ladder order."""
-        return "  ".join(f"{rung}: {len(outcomes)}" for rung, outcomes in report.rungs.items())
