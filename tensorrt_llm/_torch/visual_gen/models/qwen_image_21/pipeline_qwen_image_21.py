@@ -48,6 +48,30 @@ _QWEN_IMAGE_21_DEFAULT_GENERATION_PARAMS = {
 }
 
 
+def _resolve_qwen_image_21_vae_fallback():
+    """Resolve the declared Diffusers Qwen-Image-2.1 image-VAE fallback.
+
+    Qwen-Image 2.1 checkpoints declare ``AutoencoderKLQwenImage21`` in
+    ``vae/config.json`` and store 64-channel 2.1-specific residual VAE weights.
+    Older Diffusers releases expose ``AutoencoderKLQwenImage`` for Qwen-Image
+    1.x, but that class has a different default architecture (for example a
+    16-channel latent VAE) and cannot load the 2.1 checkpoint safely.  Do not
+    silently fall back to that alias: using the wrong VAE architecture fails at
+    load time or produces invalid decoded media.  The run manifest declares only
+    the exact 2.1 image-VAE fallback, so runtime must require that symbol.
+    """
+
+    try:
+        from diffusers import AutoencoderKLQwenImage21
+    except ImportError as exc:  # pragma: no cover - depends on installed Diffusers version.
+        raise ImportError(
+            "Qwen-Image 2.1 VAE fallback requires a Diffusers build exposing "
+            "AutoencoderKLQwenImage21. The older AutoencoderKLQwenImage alias "
+            "is not architecture-compatible with Qwen-Image-2.1 checkpoints."
+        ) from exc
+    return AutoencoderKLQwenImage21, "diffusers.AutoencoderKLQwenImage21"
+
+
 @register_pipeline(
     "QwenImage21Pipeline",
     hf_ids=["Qwen/Qwen-Image-2.1"],
@@ -155,8 +179,7 @@ class QwenImage21Pipeline(QwenImagePipeline):
 
         return {
             "image_reference": RefSlotSpec(
-                modality="image",
-                roles=[RoleSpec(role="reference", min=0, max=None)],
+                modality="image", roles=[RoleSpec(role="reference", min=0, max=None)]
             )
         }
 
@@ -238,15 +261,9 @@ class QwenImage21Pipeline(QwenImagePipeline):
             ).to(self.device)
 
         if PipelineComponent.VAE not in skip_components:
-            try:
-                from diffusers import AutoencoderKLQwenImage21
-            except ImportError as e:  # pragma: no cover
-                raise ImportError(
-                    "Qwen-Image 2.1 VAE fallback requires diffusers with AutoencoderKLQwenImage21."
-                ) from e
-
-            logger.info("Loading declared Diffusers AutoencoderKLQwenImage21 image-VAE fallback...")
-            self.vae = AutoencoderKLQwenImage21.from_pretrained(
+            vae_cls, vae_name = _resolve_qwen_image_21_vae_fallback()
+            logger.info("Loading declared Diffusers %s image-VAE fallback...", vae_name)
+            self.vae = vae_cls.from_pretrained(
                 checkpoint_dir,
                 subfolder="vae",
                 torch_dtype=self.pipeline_config.torch_dtype,
