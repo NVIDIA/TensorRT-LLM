@@ -202,7 +202,7 @@ trtllm-serve meta-llama/Llama-3.1-8B-Instruct --enable_sleep_mode
 
 If the YAML configuration has no `sleep_config`, the command creates a default
 `SleepConfig`. An explicitly configured `sleep_config` is preserved. Sleep
-mode is rejected for AutoDeploy and gRPC.
+mode is rejected for gRPC.
 
 The enabled routes are:
 
