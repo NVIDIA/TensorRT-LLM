@@ -41,6 +41,7 @@ MetadataValue: TypeAlias = (
 
 __all__ = [
     "MetadataValue",
+    "MISSING_METADATA",
     "ProfilerRegion",
     "custom_region_active",
     "custom_region_enabled",
@@ -60,6 +61,7 @@ _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
 _METADATA_PREFIX = "TRTLLM1:"
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+MISSING_METADATA = object()
 
 
 def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
