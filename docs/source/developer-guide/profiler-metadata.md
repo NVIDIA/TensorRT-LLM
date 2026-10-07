@@ -135,3 +135,62 @@ The ATen-dependent implementation is owned once by the existing native shared
 library when `BUILD_PYT` is enabled; Torch ops and bindings reuse that owner.
 `BUILD_PYT=OFF` does not build it. Profiling adds scope, callback and active
 metadata encoding costs.
+
+## MPI operations
+
+`MPIDist` records `trtllm::mpi_<method>` scopes in the `mpi` category. `TorchDist`
+is not labeled as MPI. Coverage includes world broadcast/allgather/allreduce/barrier,
+TP and CP broadcast/allgather, TP allreduce/barrier/gather, PP
+broadcast/allgather/gather, and buffer/object send/isend/recv. Typed int64
+allgather/broadcast paths are also covered. Combined operations record their
+constituent communication steps, retaining CP-then-TP allgather and TP-then-CP
+broadcast ordering. TP/CP `small_payload` fast paths remain native object
+allgathers; chunked and typed-buffer protocols are unchanged. A nonblocking send
+scope covers submission, not request completion.
+
+`MPIDist` checks selection and the current profiler state before creating lazy
+metadata callbacks or profiling scopes. Disabled or inactive calls use a reusable
+no-op context. The same instance can emit scopes when profiling starts later.
+
+Every scope includes `mpi.operation`, `mpi.communicator` (`world`, `tp`, `pp` or
+`cp`), `mpi.kind` (`collective` or `p2p`), `mpi.rank`, and `mpi.group`. Rank and
+ordered comma-separated group members use the active parent `mpi_comm()` rank
+space, not necessarily `MPI.COMM_WORLD` or the mapping's world size/rank. This
+uses the emitting thread's communicator override when that thread is profiled. World membership is queried from
+that parent's actual size. Uninitialized subgroups use their ordered mapping
+members; cached subgroups translate their actual group into the parent's rank
+space. Inspection is lazy and noncollective, frees temporary MPI groups, and
+never creates a communicator solely for profiling. Unmappable members or inspection failures discard
+the scope without changing the operation's result or exception.
+
+`mpi.root` and `mpi.peer` are passed through in the operated communicator's
+local rank space, **not** the parent rank space: for TP/PP/CP, a root of `1`
+means the second member of `mpi.group`. World P2P peers and world roots are
+already parent-local. `mpi.direction` is `send` or `recv`; `mpi.tag` preserves
+the supplied tag, including MPI wildcard values. `mpi.reduce_op` is the numeric
+`ReduceOp` value and `mpi.chunk_bytes` is the configured chunk-size bound, not
+the measured transfer volume. Direct NumPy integers/floats/booleans and enums
+are converted to the shared literal types; nested values still obey the shared
+codec and are not recursively normalized by MPI helpers.
+
+An explicitly supplied payload, including `None`, adds `mpi.payload.type`.
+NumPy arrays of any shape/dtype add `shape`, `dtype`, `numel` and `bytes` under
+`mpi.payload`; tensors also add `stride` and `device`. These describe only the
+direct input: no values are read, no device copies/synchronizations or pickling
+are introduced, and nested tensors are not discovered. Scalars and unknown
+objects provide only their type. Strings/lists/tuples/dicts/sets provide their
+top-level `length`; bytes/bytearray/memoryview provide their byte size (not the
+memoryview's element count). Typed methods describe the input object before
+their existing int64 conversion, except combined typed broadcasts describe each
+step's existing buffer. Counts describe logical payload storage, not serialized
+wire bytes or receive results. Object receives have no input payload metadata.
+
+`record_mpi_function` supports an eager integer rank or a lazy rank callable;
+the callable, group factory and payload inspection run only inside the selected,
+active shared scope. Metadata is observational and capture-safe for direct
+shape/stride inspection, but it does not trace tensor contents or asynchronous
+communication completion. Profiling introduces scope and metadata overhead.
+
+Direct `_utils.mpi_*` helpers and background-thread calls without a profiler are
+not covered by `MPIDist` annotations. A missing scope cannot establish that no
+communication occurred.
