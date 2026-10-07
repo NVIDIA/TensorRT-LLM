@@ -23,20 +23,15 @@ engine's for max batch 8 and max draft length 7 (sampler stores [8, slots, 1], [
   > 0; shuffled distinct slot tables; accepted lengths from 0 to past the output width. A mixed context / generation
   batch laid out as the one-model worker writes it (a context row's tokens past column 0 never written) stores zeros
   there.
-* ``StepInputStage.gather`` committed on its own vs PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (the
-  stores by slot into the input ids and draft tokens, the lengths by the per-token index list into the position
-  offsets, ``new_tokens_lens - T`` by slot into the KV-length offsets): the engine's offsets (the requests without a
-  previous batch first), zero and arbitrary offsets, a draft width below T - 1, the engine's and arbitrary index lists.
-* ``StepInputStage`` vs those gathers plus what it stages instead of copying: ``dst.copy_(pinned, non_blocking=True)``
-  per staged copy (positions, prompt and KV lengths, a fourth) and the KV cache manager's block-offset copy
-  (``copy_batch_block_offsets_to_device``, target and draft managers, bad pages included): the engine's step, all four
-  copy slots at offset destinations, the gathers alone, the copies alone.
+* ``StepInputGather.gather`` vs PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (the stores by slot into
+  the input ids and draft tokens, the lengths by the per-token index list into the position offsets,
+  ``new_tokens_lens - T`` by slot into the KV-length offsets): the engine's offsets (the requests without a previous
+  batch first), zero and arbitrary offsets, a draft width below T - 1, the engine's and arbitrary index lists.
 * The calls the kernels do not cover launch nothing and return False, so the caller keeps its torch path.
 
 Every buffer starts random and is compared whole (what an op must not touch included), every case runs twice (reruns
-bit-identical), and one CUDA graph per split family (R = 1 .. 8 at one T) captures each step's scatter, gather and
-staged commit; it is replayed with every input (and the staged values in the stages' pinned records) rewritten in
-place, bit-identical to the eager ops and to the torch ops on every replay.
+bit-identical), and one CUDA graph per split family (R = 1 .. 8 at one T) captures each step's scatter and gather; it
+is replayed with every input rewritten in place, bit-identical to the eager ops and to the torch ops on every replay.
 
 Table: ``python3 test_spec_step_copies.py report``. Timing: ``python3 test_spec_step_copies.py time`` (CUDA graphs of
 back-to-back calls, median us per call over 15 replays, each kernel vs the torch ops it replaces, at every split).
@@ -53,11 +48,6 @@ MAX_DRAFT = 7  # max_draft_len (linear speculation: max_total_draft_tokens == ma
 STORE_WIDTH = MAX_DRAFT + 1  # the sampler's new_tokens / next_new_tokens stores
 MAX_NUM_TOKENS = 8192  # the engine's per-token buffers (input ids, positions, previous_*)
 DRAFT_BUFFER = MAX_DRAFT * MAX_BATCH  # draft_tokens_cuda: max_draft_loop_tokens * batch_size
-STAGE_CAPACITY = 3 * MAX_NUM_TOKENS  # PyTorchModelEngine._get_step_input_stage
-BLOCKS = 40  # KV blocks per sequence (copy_batch_block_offsets_to_device needs a multiple of 4)
-TABLE_SEQS = 24  # rows of a KV cache manager's pinned host block-offset table
-POOLS = (2, 1)  # pools of the target and the draft KV cache managers
-COPY_NAMES = ("position_ids", "prompt_lens", "kv_lens", "extra")  # staged copies, in order
 
 ROWS = list(range(1, MAX_BATCH + 1))
 TOKENS = [1, 2, 4, 8]
@@ -79,33 +69,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _pinned_ok() -> bool:
-    """StepInputStage reads a pinned host record in place; it refuses to run where pinned memory is not preferred."""
-    from tensorrt_llm._utils import prefer_pinned
-
-    return prefer_pinned()
-
-
-_eager = {}
-
-
-def eager_stage():
-    """The StepInputStage of the eager runs (never captured: a captured commit's stage cannot stage again)."""
-    if "stage" not in _eager:
-        _eager["stage"] = _op().StepInputStage(STAGE_CAPACITY)
-    return _eager["stage"]
-
-
 def kernel_scatter(args) -> None:
     """``SlotScatter.scatter`` on ``args``, which it must cover."""
     assert _op().SlotScatter().scatter(*args), "scatter declined a covered call"
 
 
-def kernel_gather(stage, args) -> None:
-    """The overlap gathers on ``args`` (which they must cover) committed on their own through ``stage``."""
-    stage.begin()
-    assert stage.gather(*args), "gather declined a covered call"
-    stage.commit()
+def kernel_gather(args) -> None:
+    """``StepInputGather.gather`` on ``args``, which it must cover."""
+    assert _op().StepInputGather().gather(*args), "gather declined a covered call"
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -166,7 +137,7 @@ def torch_gather(
     previous_kv_lens_offsets_cuda,
     kv_begin,
 ):
-    """PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (StepInputStage.gather's arguments)."""
+    """PyTorchModelEngine._prepare_tp_inputs's torch overlap gathers (StepInputGather.gather's arguments)."""
     tokens = runtime_tokens_per_gen_step
     width = runtime_draft_token_buffer_width
     previous_slots = previous_batch_indices_cuda[:previous_batch_len]
@@ -187,17 +158,6 @@ def torch_gather(
     )
     previous_kv_lens_offsets_cuda[kv_begin : kv_begin + previous_batch_len].copy_(
         kv_len_offsets_device[previous_slots], non_blocking=True
-    )
-
-
-def torch_block_copy(offsets, table, copy_index, index_scales, kv_offset):
-    """KVCacheManagerV2.copy_batch_block_offsets's copy (StepInputStage.block_copy's arguments), current stream."""
-    from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
-        copy_batch_block_offsets_to_device,
-    )
-
-    copy_batch_block_offsets_to_device(
-        table, offsets, copy_index, index_scales, kv_offset, torch.cuda.current_stream().cuda_stream
     )
 
 
@@ -228,19 +188,15 @@ def engine_begins(rows, tokens):
 
 
 class Step:
-    """One decode step of ``rows`` requests x ``tokens`` tokens on engine-sized int32 buffers, all random so that a
-    stray or a missing write shows (index buffers hold valid indices past their used part):
+    """One decode step of ``rows`` requests x ``tokens`` tokens on engine-sized int32 device buffers, all random so
+    that a stray or a missing write shows (index buffers hold valid indices past their used part):
 
     * the forward's outputs: new_tokens [N, a], next_new_tokens [N, b], new_tokens_lens [N], next_draft_tokens [N, c]
       (default a = b = T, c = T - 1);
     * the sampler's slot table [slots] and stores new_tokens / next_new_tokens [8, slots, 1], new_tokens_lens [slots],
       next_draft_tokens [slots, 7];
-    * the engine's previous_batch_indices / previous_pos_indices, and two output sets ("a": the gathers committed on
-      their own, "b": the gathers in a full staged step) of input_ids, draft_tokens [56], previous_pos_id_offsets and
-      previous_kv_lens_offsets [8] (grown only when an offset needs it);
-    * the staged copies' destinations (positions, prompt and KV lengths [slots], a fourth buffer) and host values;
-    * the target and draft KV cache managers' device block offsets [pools, slots, 2, 40] and pinned host tables
-      [pools, 24, 2, 40] (a fifth of the pages bad, -1), copy indices, index scales and KV offsets.
+    * the engine's previous_batch_indices / previous_pos_indices and the gathers' outputs input_ids, draft_tokens [56],
+      previous_pos_id_offsets and previous_kv_lens_offsets [8] (grown only when an offset needs it).
 
     ``chain``: the gather reads the scatter's slots in another order (the next step's inputs from this step's stores).
     """
@@ -259,20 +215,19 @@ class Step:
         draft_width=None,
         pos_list="engine",
         chain=False,
-        copy_at=(0, 0, 0, 0),
     ):
         self.rows, self.tokens, self.num_slots = rows, tokens, num_slots
         self.widths = widths or (tokens, tokens, tokens - 1)
         self.row_begin, self.begins = row_begin, begins
         self.draft_width = tokens - 1 if draft_width is None else draft_width
-        self.pos_list, self.chain, self.copy_at = pos_list, chain, copy_at
+        self.pos_list, self.chain = pos_list, chain
         self.g = torch.Generator().manual_seed(seed)
         n_out = max(MAX_BATCH, row_begin + rows) if out_rows is None else out_rows
         assert n_out >= row_begin + rows
         n_draft = max(DRAFT_BUFFER, begins[1] + rows * self.draft_width)
         n_kv = max(MAX_BATCH, begins[3] + rows)
         a, b, c = self.widths
-        device = {
+        shapes = {
             "out_new": (n_out, a),
             "out_next": (n_out, b),
             "out_lens": (n_out,),
@@ -284,36 +239,20 @@ class Step:
             "st_draft": (num_slots, MAX_DRAFT),
             "prev_slots": (MAX_NUM_TOKENS,),
             "prev_pos": (MAX_NUM_TOKENS,),
-            "position_ids": (MAX_NUM_TOKENS,),
-            "prompt_lens": (num_slots,),
-            "kv_lens": (num_slots,),
-            "extra": (MAX_NUM_TOKENS,),
+            "input_ids": (MAX_NUM_TOKENS,),
+            "draft": (n_draft,),
+            "pos_off": (MAX_NUM_TOKENS,),
+            "kv_off": (n_kv,),
         }
-        host = {}
-        for s in "ab":
-            device[f"input_ids_{s}"] = (MAX_NUM_TOKENS,)
-            device[f"draft_{s}"] = (n_draft,)
-            device[f"pos_off_{s}"] = (MAX_NUM_TOKENS,)
-            device[f"kv_off_{s}"] = (n_kv,)
-        for m, pools in zip("td", POOLS):
-            device[f"blk_{m}"] = (pools, num_slots, 2, BLOCKS)
-            host[f"tab_{m}"] = (pools, TABLE_SEQS, 2, BLOCKS)
-            host[f"cidx_{m}"] = (rows,)
-            host[f"scale_{m}"] = (pools,)
-            host[f"kvoff_{m}"] = (pools,)
-        self.bufs = {k: torch.empty(v, dtype=torch.int32, device="cuda") for k, v in device.items()}
-        for k, v in host.items():
-            self.bufs[k] = torch.empty(v, dtype=torch.int32, pin_memory=True)
+        self.bufs = {k: torch.empty(v, dtype=torch.int32, device="cuda") for k, v in shapes.items()}
         self.rewrite()
 
     def rewrite(self) -> None:
-        """New random contents for every buffer and host value, written in place (a captured graph keeps the
-        addresses)."""
+        """New random contents for every buffer, written in place (a captured graph keeps the addresses)."""
         g, rows, tokens, num_slots = self.g, self.rows, self.tokens, self.num_slots
         b = self.bufs
         for t in b.values():
-            if t.is_cuda:
-                t.copy_(rand_i32(t.shape, g))
+            t.copy_(rand_i32(t.shape, g))
         # Accepted lengths from none to past the new-token width, so every row cuts its new tokens somewhere.
         b["out_lens"].copy_(rand_i32(b["out_lens"].shape, g, 0, self.widths[0] + 2))
         slots = shuffled_distinct(rows, num_slots, g)
@@ -329,20 +268,6 @@ class Step:
         if self.pos_list == "engine":  # each row's slot, once per token
             per_token[: rows * tokens] = previous.repeat_interleave(tokens)
         b["prev_pos"].copy_(per_token)
-        self.values = {
-            "position_ids": rand_i32((rows * tokens,), g, 0, 1 << 20),
-            "prompt_lens": rand_i32((rows,), g, 1, 1 << 20),
-            "kv_lens": rand_i32((rows,), g, 1, 1 << 20),
-            "extra": rand_i32((rows,), g),
-        }
-        self.pinned = {k: v.pin_memory() for k, v in self.values.items()}
-        for m in "td":
-            pages = rand_i32(b[f"tab_{m}"].shape, g, 0, 1 << 20)
-            pages[torch.rand(pages.shape, generator=g) < 0.2] = -1
-            b[f"tab_{m}"].copy_(pages)
-            b[f"cidx_{m}"].copy_(torch.tensor(shuffled_distinct(rows, TABLE_SEQS, g)))
-            b[f"scale_{m}"].copy_(rand_i32(b[f"scale_{m}"].shape, g, 1, 8))
-            b[f"kvoff_{m}"].copy_(rand_i32(b[f"kvoff_{m}"].shape, g, 0, 1 << 16))
 
     def outputs(self, b):
         return {
@@ -357,60 +282,16 @@ class Step:
         return (self.outputs(b), self.row_begin, self.rows, b["slot_table"], b["st_new"], b["st_next"],
                 b["st_lens"], b["st_draft"])  # fmt: skip
 
-    def gather_args(self, b, out):
-        """StepInputStage.gather's arguments on the buffers ``b``, into output set ``out``."""
+    def gather_args(self, b):
+        """StepInputGather.gather's arguments on the buffers ``b``."""
         ib, db, pb, kb = self.begins
         return (b["st_next"], b["st_draft"], b["st_lens"], b["prev_slots"], b["prev_pos"], self.rows, self.tokens,
-                self.draft_width, b[f"input_ids_{out}"], ib, b[f"draft_{out}"], db, b[f"pos_off_{out}"], pb,
-                b[f"kv_off_{out}"], kb)  # fmt: skip
-
-    def copies(self, b, count):
-        """The first ``count`` staged copies: (destination view, host value name)."""
-        return [
-            (b[name][at : at + self.values[name].numel()], name)
-            for name, at in zip(COPY_NAMES[:count], self.copy_at)
-        ]
-
-    def block_copies(self, b):
-        """StepInputStage.block_copy's arguments for the target and the draft KV cache managers."""
-        return [
-            (b[f"blk_{m}"], b[f"tab_{m}"], b[f"cidx_{m}"], b[f"scale_{m}"], b[f"kvoff_{m}"])
-            for m in "td"
-        ]
-
-    def run_stage(self, b, stage, gather=True, copies=3, blocks=True):
-        """The step's inputs through ``stage`` (a StepInputStage): one commit."""
-        stage.begin()
-        if gather:
-            assert stage.gather(*self.gather_args(b, "b")), "gather declined"
-        for dst, name in self.copies(b, copies):
-            assert stage.copy(dst, self.values[name]), "copy declined"
-        if blocks:
-            for args in self.block_copies(b):
-                assert stage.block_copy(*args), "block copy declined"
-        stage.commit()
-
-    def torch_stage(self, b, gather=True, copies=3, blocks=True):
-        """What the stage replaces: the gathers, a non-blocking copy from pinned memory per staged copy, and the KV
-        cache managers' block-offset copies."""
-        if gather:
-            torch_gather(*self.gather_args(b, "b"))
-        for dst, name in self.copies(b, copies):
-            dst.copy_(self.pinned[name], non_blocking=True)
-        if blocks:
-            for args in self.block_copies(b):
-                torch_block_copy(*args)
+                self.draft_width, b["input_ids"], ib, b["draft"], db, b["pos_off"], pb, b["kv_off"], kb)  # fmt: skip
 
 
 def clone_bufs(bufs):
-    """A copy of every buffer (pinned host buffers stay pinned)."""
-    out = {}
-    for k, t in bufs.items():
-        if t.is_cuda:
-            out[k] = t.clone()
-        else:
-            out[k] = torch.empty(t.shape, dtype=t.dtype, pin_memory=t.is_pinned()).copy_(t)
-    return out
+    """A copy of every buffer."""
+    return {k: t.clone() for k, t in bufs.items()}
 
 
 def mismatches(x, y):
@@ -476,21 +357,6 @@ def gather_cases(rows, tokens):
     ]  # fmt: skip
 
 
-def stage_cases(rows, tokens):
-    """(label, Step arguments, run_stage arguments)."""
-    begins = engine_begins(rows, tokens)
-    return [
-        (f"engine step: gathers at {begins}, positions / prompt / KV lengths, target + draft block offsets",
-         dict(num_slots=MAX_BATCH, begins=begins), dict()),
-        ("4 copies to offset destinations, gathers at (37, 5, 11, 3), block offsets, 16 slots",
-         dict(num_slots=2 * MAX_BATCH, begins=(37, 5, 11, 3), pos_list="any", copy_at=(7, 1, 2, 3)),
-         dict(copies=4)),
-        ("gathers only, 16 slots", dict(num_slots=2 * MAX_BATCH), dict(copies=0, blocks=False)),
-        ("copies + block offsets only (no previous batch), 16 slots",
-         dict(num_slots=2 * MAX_BATCH, copy_at=(5, 3, 0, 0)), dict(gather=False)),
-    ]  # fmt: skip
-
-
 def measure_scatter(rows, tokens):
     out = []
     for i, (case, kw) in enumerate(scatter_cases(rows, tokens)):
@@ -505,91 +371,53 @@ def measure_scatter(rows, tokens):
 
 
 def measure_gather(rows, tokens):
-    stage = eager_stage()
     out = []
     for i, (case, kw) in enumerate(gather_cases(rows, tokens)):
         st = Step(rows, tokens, _seed(2, rows, tokens, i), **kw)
         bad = compare(
             st.bufs,
-            lambda b: torch_gather(*st.gather_args(b, "a")),
-            lambda b: kernel_gather(stage, st.gather_args(b, "a")),
-        )
-        out.append(result(case, **bad))
-    return out
-
-
-def measure_stage(rows, tokens):
-    stage = eager_stage()
-    out = []
-    for i, (case, kw, run_kw) in enumerate(stage_cases(rows, tokens)):
-        st = Step(rows, tokens, _seed(3, rows, tokens, i), **kw)
-        bad = compare(
-            st.bufs,
-            lambda b: st.torch_stage(b, **run_kw),
-            lambda b: st.run_stage(b, stage, **run_kw),
+            lambda b: torch_gather(*st.gather_args(b)),
+            lambda b: kernel_gather(st.gather_args(b)),
         )
         out.append(result(case, **bad))
     return out
 
 
 def measure_graph(tokens, replays=6):
-    """One CUDA graph for the split family R = 1 .. 8 at ``tokens``: each step's scatter, its gather (from the stores
-    the scatter wrote, as the next step reads them) and its staged commit, captured once and replayed with every
-    input rewritten in place; each replay against the eager ops and the torch ops on the same inputs, then a replay
-    of the last inputs against the first."""
-    op = _op()
-    with_stage = _pinned_ok()
-    gather_stage = op.StepInputStage(STAGE_CAPACITY)  # gathers only: its record is never read
+    """One CUDA graph for the split family R = 1 .. 8 at ``tokens``: each step's scatter and its gather (from the
+    stores the scatter wrote, as the next step reads them), captured once and replayed with every input rewritten in
+    place; each replay against the eager ops and the torch ops on the same inputs, then a replay of the last inputs
+    against the first."""
     steps = [
         Step(r, tokens, _seed(4, r, tokens, 0), num_slots=2 * MAX_BATCH, row_begin=MAX_BATCH - r,
              out_rows=MAX_BATCH, begins=engine_begins(r, tokens), chain=True)
         for r in ROWS
     ]  # fmt: skip
-    stage = eager_stage() if with_stage else None
-    # A captured commit reads its stage's record at every replay, so each step keeps its own stage.
-    captured = [op.StepInputStage(STAGE_CAPACITY) if with_stage else None for _ in steps]
 
-    def run_kernels(st, b, step_stage):
+    def run_kernels(st, b):
         kernel_scatter(st.scatter_args(b))
-        kernel_gather(gather_stage, st.gather_args(b, "a"))
-        if step_stage is not None:
-            st.run_stage(b, step_stage)
+        kernel_gather(st.gather_args(b))
 
     def run_torch(st, b):
         torch_scatter(*st.scatter_args(b))
-        torch_gather(*st.gather_args(b, "a"))
-        if with_stage:
-            st.torch_stage(b)
+        torch_gather(*st.gather_args(b))
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for st in steps:  # the kernels compile on their first call, outside capture
-            run_kernels(st, clone_bufs(st.bufs), stage)
+            run_kernels(st, clone_bufs(st.bufs))
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
-            for st, step_stage in zip(steps, captured):
-                run_kernels(st, st.bufs, step_stage)
+            for st in steps:
+                run_kernels(st, st.bufs)
     torch.cuda.synchronize()
-    # The staged values sit in each captured stage's pinned record in staging order; a replay reads them in place.
-    spans = []
-    for st, step_stage in zip(steps, captured):
-        at, step_spans = 0, []
-        for _, name in st.copies(st.bufs, 3) if with_stage else []:
-            n = st.values[name].numel()
-            assert torch.equal(step_stage.record[at : at + n], st.values[name]), "record layout"
-            step_spans.append((at, n, name))
-            at += n
-        spans.append(step_spans)
-    what = "scatter, gather" + (", staged commit" if with_stage else "")
     out = []
     before = None
     for rep in range(replays):
-        for st, step_stage, step_spans in zip(steps, captured, spans):
+        for st in steps:
             st.rewrite()
-            for at, n, name in step_spans:
-                step_stage.record[at : at + n].copy_(st.values[name])
         before = [clone_bufs(st.bufs) for st in steps]
         graph.replay()
         torch.cuda.synchronize()
@@ -597,11 +425,11 @@ def measure_graph(tokens, replays=6):
         for st, start in zip(steps, before):
             want, got = clone_bufs(start), clone_bufs(start)
             run_torch(st, want)
-            run_kernels(st, got, stage)
+            run_kernels(st, got)
             torch.cuda.synchronize()
             bad["torch"] += [f"{st.rows}x{tokens} {k}" for k in mismatches(want, st.bufs)]
             bad["eager"] += [f"{st.rows}x{tokens} {k}" for k in mismatches(got, st.bufs)]
-        out.append(result(f"replay {rep}: {what}, every input rewritten", **bad))
+        out.append(result(f"replay {rep}: scatter, gather, every input rewritten", **bad))
     after = [clone_bufs(st.bufs) for st in steps]
     for st, start in zip(steps, before):
         for k, t in st.bufs.items():
@@ -629,14 +457,6 @@ def test_scatter(rows, tokens):
 @pytest.mark.parametrize("rows,tokens", SPLITS, ids=[f"{r}x{t}" for r, t in SPLITS])
 def test_gather(rows, tokens):
     bad = [r for r in measure_gather(rows, tokens) if not r["ok"]]
-    assert not bad, bad
-
-
-@pytest.mark.parametrize("rows,tokens", SPLITS, ids=[f"{r}x{t}" for r, t in SPLITS])
-def test_stage(rows, tokens):
-    if not _pinned_ok():
-        pytest.skip("StepInputStage needs pinned host memory (not preferred here)")
-    bad = [r for r in measure_stage(rows, tokens) if not r["ok"]]
     assert not bad, bad
 
 
@@ -701,20 +521,16 @@ def test_scatter_zeros_past_accepted_length(poison):
 
 def test_contract():
     """rows == 0 launches nothing; every call the kernels do not cover returns False and launches nothing, so the
-    caller keeps its torch path; StepInputStage's per-step limits (max_copies = 4 copies, max_block_copies = 2 block
-    copies, one gather) decline the call past them."""
+    caller keeps its torch path."""
     op = _op()
     assert op.is_supported()
     st = Step(MAX_BATCH, STORE_WIDTH, _seed(6, 0, 0, 0))
     b = clone_bufs(st.bufs)
     before = clone_bufs(b)
     scatter = list(st.scatter_args(b))
-    gather = list(st.gather_args(b, "a"))
-    stage = op.StepInputStage(STAGE_CAPACITY)
+    gather = list(st.gather_args(b))
     assert op.SlotScatter().scatter(*scatter[:2], 0, *scatter[3:])
-    stage.begin()
-    assert stage.gather(*gather[:5], 0, *gather[6:])
-    stage.commit()
+    assert op.StepInputGather().gather(*gather[:5], 0, *gather[6:])
     torch.cuda.synchronize()
     assert not mismatches(before, b), "rows == 0 wrote"
     # Argument 7 (draft width) == tokens, argument 6 (tokens) wider than the 8-wide store, argument 15 (KV begin)
@@ -727,8 +543,9 @@ def test_contract():
     ):
         args = list(gather)
         args[index] = value
-        stage.begin()
-        assert not stage.gather(*args), f"gather argument {index} = {value!r} was staged"
+        assert not op.StepInputGather().gather(*args), (
+            f"gather argument {index} = {value!r} was launched"
+        )
     # Outputs of 8 rows with rows 1 .. 8 asked, an int64 slot table, a non-contiguous output.
     assert not op.SlotScatter().scatter(scatter[0], 1, *scatter[2:])
     assert not op.SlotScatter().scatter(*scatter[:3], b["slot_table"].long(), *scatter[4:])
@@ -736,27 +553,6 @@ def test_contract():
         scatter[0], next_draft_tokens=torch.empty_like(b["out_draft"]).t().contiguous().t()
     )
     assert not op.SlotScatter().scatter(strided, *scatter[1:])
-    if _pinned_ok():
-        stage.begin()
-        for _ in range(stage.max_copies):
-            assert stage.copy(b["extra"][:2], torch.tensor([1, 2], dtype=torch.int32))
-        assert not stage.copy(b["extra"][:2], torch.tensor([1, 2], dtype=torch.int32))
-        stage.begin()
-        assert not stage.copy(b["extra"][:2], torch.tensor([1, 2]))  # int64 values
-        assert not stage.copy(
-            b["out_new"], torch.tensor([1, 2], dtype=torch.int32)
-        )  # 2-D destination
-        assert stage.gather(*gather)
-        assert not stage.gather(*gather)
-        blocks = st.block_copies(b)
-        for args in blocks:
-            assert stage.block_copy(*args)
-        assert not stage.block_copy(*blocks[0])
-        stage.begin()  # drops the staged step: nothing was launched
-        unpinned = blocks[0][1].clone()  # a pageable host table
-        assert not unpinned.is_pinned()
-        assert not stage.block_copy(blocks[0][0], unpinned, *blocks[0][2:])
-        stage.begin()
     torch.cuda.synchronize()
     assert not mismatches(before, b), "a declined call wrote"
 
@@ -769,11 +565,10 @@ def test_contract():
 def report() -> int:
     print(f"{torch.cuda.get_device_name()}")
     ok_all = True
-    sections = [("SlotScatter.scatter", measure_scatter), ("StepInputStage.gather", measure_gather)]
-    if _pinned_ok():
-        sections.append(("StepInputStage", measure_stage))
-    else:
-        print("StepInputStage: skipped (pinned host memory not preferred here)")
+    sections = [
+        ("SlotScatter.scatter", measure_scatter),
+        ("StepInputGather.gather", measure_gather),
+    ]
     for name, measure in sections:
         print(f"\n## {name}\n")
         print("| split | case | identical | result |")
@@ -822,45 +617,22 @@ def time_graph(body, calls, replays=15):
     return statistics.median(per_call), min(per_call), max(per_call)
 
 
-class StageArm:
-    """Back-to-back staged commits: fresh stages for every capture (a captured commit's stage cannot stage again),
-    and one of its own for the warm-up call."""
-
-    def __init__(self, step, bufs, calls):
-        self.step, self.bufs, self.calls = step, bufs, calls
-        self.warm = _op().StepInputStage(STAGE_CAPACITY)
-        self.fresh = []
-
-    def __call__(self, i):
-        if i < 0:
-            self.fresh = [_op().StepInputStage(STAGE_CAPACITY) for _ in range(self.calls)]
-            self.step.run_stage(self.bufs, self.warm)
-        else:
-            self.step.run_stage(self.bufs, self.fresh[i])
-
-
 def timing() -> None:
-    op = _op()
     calls = 32
-    with_stage = _pinned_ok()
     print(f"{torch.cuda.get_device_name()}; graphs of {calls} back-to-back calls on one step's buffers (the engine's "
           "layout), 15 replays: median (min-max) us per call")  # fmt: skip
-    print("| split | scatter: torch | scatter: kernel | gather: torch | gather: kernel | stage: torch "
-          "| stage: kernel |")  # fmt: skip
-    print("| :-- | --: | --: | --: | --: | --: | --: |")
+    print("| split | scatter: torch | scatter: kernel | gather: torch | gather: kernel |")
+    print("| :-- | --: | --: | --: | --: |")
     for rows, tokens in SPLITS:
         st = Step(rows, tokens, _seed(5, rows, tokens, 0), row_begin=MAX_BATCH - rows, out_rows=MAX_BATCH,
                   begins=engine_begins(rows, tokens))  # fmt: skip
         b = st.bufs
-        gather_stage = op.StepInputStage(STAGE_CAPACITY)
         arms = [
             lambda i: torch_scatter(*st.scatter_args(b)),
             lambda i: kernel_scatter(st.scatter_args(b)),
-            lambda i: torch_gather(*st.gather_args(b, "a")),
-            lambda i: kernel_gather(gather_stage, st.gather_args(b, "a")),
+            lambda i: torch_gather(*st.gather_args(b)),
+            lambda i: kernel_gather(st.gather_args(b)),
         ]
-        if with_stage:
-            arms += [lambda i: st.torch_stage(b), StageArm(st, b, calls)]
         res = [[] for _ in arms]
         for rep in range(3):  # alternating order
             order = range(len(arms)) if rep % 2 == 0 else reversed(range(len(arms)))
@@ -871,7 +643,6 @@ def timing() -> None:
             meds = sorted(x[0] for x in timings)
             lo, hi = min(x[1] for x in timings), max(x[2] for x in timings)
             cells.append(f"{meds[1]:.2f} ({lo:.2f}-{hi:.2f})")
-        cells += ["n/a"] * (6 - len(cells))
         print(f"| {rows}x{tokens} | " + " | ".join(cells) + " |", flush=True)
 
 

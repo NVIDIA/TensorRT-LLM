@@ -15,14 +15,13 @@
 """Host side of the one-model speculative decoding step's copy kernels (``spec_step_copies_kernel``).
 
 ``SlotScatter`` moves a step's per-row outputs into the sampler's slot stores (one launch for the sampler's four
-``index_copy_``). ``StepInputStage`` writes a decode step's per-step inputs with one launch: the overlap scheduler's
-gathers from those stores, host-to-device copies whose values the kernel reads from a pinned host record, and KV cache
-block-offset copies. Each kernel takes every size and address as a launch argument, so it is compiled once per process,
-on the first launch, which must happen outside CUDA-graph capture. The kernels are called through TVM-FFI: a launch
-costs a few microseconds of host time.
+``index_copy_``). ``StepInputGather`` performs the overlap scheduler's gathers from those stores into a decode step's
+inputs (one launch for the engine's four). Each kernel takes every size and address as a launch argument, so it is
+compiled once per process, on the first launch, which must happen outside CUDA-graph capture. The kernels are called
+through TVM-FFI: a launch costs a few microseconds of host time.
 
 Callers use them only where ``is_supported()`` holds. A call whose arguments are outside what the kernel covers launches
-and stages nothing and returns False; the caller then does that work itself.
+nothing and returns False; the caller then does that work itself.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from typing import Any, ClassVar
 
 import torch
 
-from ...._utils import get_sm_version, prefer_pinned
+from ...._utils import get_sm_version
 from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
@@ -52,11 +51,6 @@ def is_supported() -> bool:
 def _is_i32(t: torch.Tensor) -> bool:
     """A contiguous CUDA int32 tensor."""
     return t.is_cuda and t.dtype == torch.int32 and t.is_contiguous()
-
-
-def _is_pinned_i32(t: torch.Tensor) -> bool:
-    """A contiguous pinned host int32 tensor."""
-    return not t.is_cuda and t.dtype == torch.int32 and t.is_contiguous() and t.is_pinned()
 
 
 def _compile(name: str, args: tuple):
@@ -200,40 +194,10 @@ class SlotScatter:
         return True
 
 
-class StepInputStage:
-    """One decode step's per-step device inputs, written by one ``stage_kernel`` launch.
-
-    A step calls ``begin()``, then stages the overlap gathers (``gather``), host-to-device copies whose values go into a
-    pinned host record that the kernel reads in place (``copy``, up to ``max_copies``) and KV cache block-offset copies
-    (``block_copy``, up to ``max_block_copies``), then ``commit()`` launches one kernel on the current stream that
-    performs all of them. The record is reused every step: the first ``copy`` after a commit that staged copies waits
-    for that commit's kernel (in the overlap loop it has run by then: the host is at most one step ahead).
-
-    Args:
-        capacity: The record's size in int32 values, the most a step's copies stage in total.
-    """
+class StepInputGather:
+    """The overlap scheduler's gathers of a decode step's inputs from the sampler's slot stores, as one kernel."""
 
     _kernel: ClassVar[Any] = None
-
-    def __init__(self, capacity: int) -> None:
-        from . import spec_step_copies_kernel as kernel
-
-        self.max_copies = kernel.STAGED_COPIES
-        self.max_block_copies = kernel.BLOCK_COPIES
-        self.record = torch.empty((capacity,), dtype=torch.int32, pin_memory=prefer_pinned())
-        self._copies: list[tuple[int, int, int]] = []
-        self._block_copies: list[tuple[int, ...]] = []
-        self._gather: tuple[int, ...] | None = None
-        self._used = 0
-        self._done: torch.cuda.Event | None = None
-        self._record_free = True
-
-    def begin(self) -> None:
-        """Start a step: drop anything staged by a step that did not commit (its preparation raised)."""
-        self._copies = []
-        self._block_copies = []
-        self._gather = None
-        self._used = 0
 
     def gather(
         self,
@@ -254,7 +218,7 @@ class StepInputStage:
         kv_offsets: torch.Tensor,
         kv_begin: int,
     ) -> bool:
-        """Stage the overlap scheduler's gathers of the rows whose request ran in the previous step.
+        """Launch the gathers of the rows whose request ran in the previous step on the current stream.
 
         For ``r < rows`` with ``s = slots[r]`` and ``j < tokens_per_row``:
         ``input_ids[input_begin + r * tokens_per_row + j] = store_next_new_tokens[j, s, 0]``,
@@ -264,8 +228,7 @@ class StepInputStage:
         stores are [width, slots, 1], [slots, width] and [slots].
 
         Returns:
-            False, staging nothing, when an argument is outside what the kernel covers or a gather is already
-            staged; True otherwise.
+            False, launching nothing, when an argument is outside what the kernel covers; True otherwise.
         """
         tensors = (
             store_next_new_tokens,
@@ -279,8 +242,7 @@ class StepInputStage:
             kv_offsets,
         )
         if not (
-            self._gather is None
-            and all(_is_i32(t) for t in tensors)
+            all(_is_i32(t) for t in tensors)
             and _gather_shapes_ok(
                 store_next_new_tokens,
                 store_next_draft,
@@ -300,7 +262,7 @@ class StepInputStage:
             return False
         if rows == 0:
             return True
-        self._gather = (
+        args = (
             store_next_new_tokens.data_ptr(),
             store_next_draft.data_ptr(),
             store_lens.data_ptr(),
@@ -320,124 +282,7 @@ class StepInputStage:
             pos_begin,
             kv_begin,
         )
+        if StepInputGather._kernel is None:
+            StepInputGather._kernel = _compile("gather", args)
+        StepInputGather._kernel(*args, torch.cuda.current_stream().cuda_stream)
         return True
-
-    def copy(self, dst: torch.Tensor, values: torch.Tensor) -> bool:
-        """Stage ``dst[:n] = values`` for the ``n`` int32 host ``values``; ``dst`` is a 1-D int32 device tensor.
-
-        Returns:
-            False, staging nothing, when ``dst`` is not a contiguous 1-D CUDA int32 tensor of at least ``n``
-            values, the step already staged ``max_copies`` copies or the record cannot hold the values; True
-            otherwise.
-        """
-        host = values.reshape(-1)
-        n = host.numel()
-        if not (
-            _is_i32(dst)
-            and dst.dim() == 1
-            and n <= dst.numel()
-            and host.dtype == torch.int32
-            and not host.is_cuda
-            and len(self._copies) < self.max_copies
-            and self._used + n <= self.record.numel()
-            and self.record.is_pinned()
-        ):
-            return False
-        if n == 0:
-            return True
-        if not self._record_free:
-            self._done.synchronize()
-            self._record_free = True
-        self.record[self._used : self._used + n].copy_(host)
-        self._copies.append((dst.data_ptr(), self._used, n))
-        self._used += n
-        return True
-
-    def block_copy(
-        self,
-        offsets: torch.Tensor,
-        table: torch.Tensor,
-        copy_index: torch.Tensor,
-        index_scales: torch.Tensor,
-        kv_offset: torch.Tensor,
-    ) -> bool:
-        """Stage a KV cache manager's block-offset copy (``copy_batch_block_offsets_to_device``).
-
-        Args:
-            offsets: The device block offsets, int32 [pools, seqs_cap, 2, blocks].
-            table: The pinned host page table, int32 [pools, table_seqs, 2, blocks].
-            copy_index: The table row of each of the step's sequences, pinned host int32 [seqs].
-            index_scales: The per-pool page index scale, pinned host int32 [pools].
-            kv_offset: The per-pool V offset, pinned host int32 [pools].
-
-        For every pool and sequence the K row is ``index_scale * page`` and the V row ``index_scale * page +
-        kv_offset`` over the table row ``copy_index[sequence]``; a bad page (-1) gives 0.
-
-        Returns:
-            False, staging nothing, when an argument is outside what the kernel covers or the step already staged
-            ``max_block_copies`` block copies; True otherwise.
-        """
-        if not (
-            _is_i32(offsets)
-            and offsets.dim() == 4
-            and table.dim() == 4
-            and all(_is_pinned_i32(t) for t in (table, copy_index, index_scales, kv_offset))
-            and len(self._block_copies) < self.max_block_copies
-        ):
-            return False
-        pools, table_seqs, kv, blocks = table.shape
-        seqs = copy_index.numel()
-        if not (
-            kv == 2
-            and offsets.shape[0] >= pools
-            and offsets.shape[1] >= seqs
-            and offsets.shape[2] == 2
-            and offsets.shape[3] == blocks
-            and index_scales.numel() >= pools
-            and kv_offset.numel() >= pools
-        ):
-            return False
-        if pools * seqs * blocks == 0:
-            return True
-        self._block_copies.append(
-            (
-                table.data_ptr(),
-                offsets.data_ptr(),
-                copy_index.data_ptr(),
-                index_scales.data_ptr(),
-                kv_offset.data_ptr(),
-                pools,
-                table_seqs,
-                offsets.shape[1],
-                blocks,
-                seqs,
-            )
-        )
-        return True
-
-    def commit(self) -> None:
-        """Launch the staged gathers and copies as one kernel on the current stream, then start the next staging."""
-        if self._gather is None and not self._copies and not self._block_copies:
-            return
-        gather = self._gather or (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0)
-        copies = self._copies + [(0, 0, 0)] * (self.max_copies - len(self._copies))
-        blocks = self._block_copies + [(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)] * (
-            self.max_block_copies - len(self._block_copies)
-        )
-        args = (
-            *gather,
-            self.record.data_ptr(),
-            *(c[0] for c in copies),
-            *(c[1] for c in copies),
-            *(c[2] for c in copies),
-            *(v for b in blocks for v in b),
-        )
-        if StepInputStage._kernel is None:
-            StepInputStage._kernel = _compile("stage", args)
-        StepInputStage._kernel(*args, torch.cuda.current_stream().cuda_stream)
-        if self._copies:
-            if self._done is None:
-                self._done = torch.cuda.Event()
-            self._done.record()
-            self._record_free = False
-        self.begin()

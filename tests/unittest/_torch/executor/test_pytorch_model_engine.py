@@ -1727,40 +1727,23 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
 
-    def _check_staged_spec_decode_graph_step(
-            self, use_kv_cache_manager_v2: bool) -> None:
-        """A CUDA graph decode step of a speculative engine whose step inputs
-        are staged on the StepInputStage (one launch after the attention
-        metadata's prepare) writes what the torch path writes."""
+    def test_spec_decode_graph_step_gather_kernel_matches_torch_path(
+            self) -> None:
+        """A CUDA graph decode step of a speculative engine whose overlap
+        gathers run as one StepInputGather launch writes what the torch path
+        writes."""
         from tensorrt_llm._torch.attention.backends.trtllm import \
             TrtllmAttentionMetadata
         from tensorrt_llm._torch.cute_dsl_kernels.spec_step_copies import \
             op as spec_step_copies
-        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-            KVCacheManagerV2
-        from tensorrt_llm.llmapi.llm_args import \
-            KvCacheConfig as LlmKvCacheConfig
         if not spec_step_copies.is_supported():
             self.skipTest("the step-copy kernels run on SM 100 / 103 / 107")
         max_draft_len = 3
         tokens_per_step = max_draft_len + 1
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
             spec_config=SADecodingConfig(max_draft_len=max_draft_len))
-        if use_kv_cache_manager_v2:
-            kv_cache_manager.shutdown()
-            kv_cache_manager = KVCacheManagerV2(
-                LlmKvCacheConfig(max_tokens=512, enable_block_reuse=False),
-                tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-                num_layers=1,
-                num_kv_heads=model_engine.model.config.num_key_value_heads,
-                head_dim=model_engine.model.config.head_dim,
-                tokens_per_block=4,
-                max_seq_len=256,
-                max_batch_size=8,
-                mapping=Mapping(world_size=1, tp_size=1, rank=0),
-                dtype=tensorrt_llm.bindings.DataType.HALF)
-        stage = model_engine._step_input_stage
-        self.assertIsNotNone(stage)
+        step_gather = model_engine._step_input_gather
+        self.assertIsNotNone(step_gather)
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
 
@@ -1806,19 +1789,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                             device="cuda"),
         )
 
-        def step_inputs(step_input_stage):
+        def step_inputs(step_input_gather):
             """The buffers one step writes, from a filler they all start at."""
-            model_engine._step_input_stage = step_input_stage
+            model_engine._step_input_gather = step_input_gather
             for request, slot in zip(requests, slots):
                 request.py_batch_idx = slot
             written = (model_engine.input_ids_cuda,
                        model_engine.position_ids_cuda,
                        model_engine.draft_tokens_cuda,
                        model_engine.previous_pos_id_offsets_cuda,
-                       model_engine.previous_kv_lens_offsets_cuda,
-                       graph_metadata.prompt_lens_cuda,
-                       graph_metadata.kv_lens_cuda,
-                       graph_metadata.kv_cache_block_offsets)
+                       model_engine.previous_kv_lens_offsets_cuda)
             for buffer in written:
                 buffer.fill_(-3)
             model_engine._prepare_tp_inputs(scheduled_requests=batch,
@@ -1834,28 +1814,24 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             return [buffer.clone() for buffer in written]
 
         torch_path = step_inputs(None)
-        with patch.object(stage, "commit", wraps=stage.commit) as commit, \
-                patch.object(stage, "block_copy",
-                             wraps=stage.block_copy) as block_copy:
-            staged = step_inputs(stage)
-        commit.assert_called_once()
-        self.assertEqual(block_copy.call_count,
-                         1 if use_kv_cache_manager_v2 else 0)
-        for expected, actual in zip(torch_path, staged):
+        launched = []
+        launch = step_gather.gather
+
+        def recorded_launch(*args, **kwargs):
+            launched.append(launch(*args, **kwargs))
+            return launched[-1]
+
+        with patch.object(step_gather, "gather", side_effect=recorded_launch):
+            kernel_path = step_inputs(step_gather)
+        self.assertEqual(launched, [True])
+        for expected, actual in zip(torch_path, kernel_path):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         # The previous rows' input ids came from the stores, by slot.
         num_tokens = len(requests) * tokens_per_step
         expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
-        self.assertEqual(staged[0][:num_tokens].tolist(),
+        self.assertEqual(kernel_path[0][:num_tokens].tolist(),
                          expected_input_ids.tolist())
         kv_cache_manager.shutdown()
-
-    def test_staged_spec_decode_graph_step_matches_torch_path(self) -> None:
-        self._check_staged_spec_decode_graph_step(use_kv_cache_manager_v2=False)
-
-    def test_staged_spec_decode_graph_step_matches_torch_path_kv_v2(
-            self) -> None:
-        self._check_staged_spec_decode_graph_step(use_kv_cache_manager_v2=True)
 
     def test_multimodal_encoder_max_seq_len(self) -> None:
 

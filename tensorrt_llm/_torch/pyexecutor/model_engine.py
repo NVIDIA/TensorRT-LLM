@@ -887,12 +887,11 @@ class PyTorchModelEngine(ModelEngine):
                                       attn_backend=self.attn_backend,
                                       cuda_graph_manager=None)
         self._prepare_inputs_event: Optional[torch.cuda.Event] = None
-        # Where the step-copy kernels run: writes a speculative decode step's
-        # per-step inputs with one launch. Positions (up to max_num_tokens) and
-        # two per-sequence lengths fit its record.
-        self._step_input_stage: Optional[spec_step_copies.StepInputStage] = (
-            spec_step_copies.StepInputStage(3 * self.max_num_tokens) if
-            self.is_spec_decode and spec_step_copies.is_supported() else None)
+        # Where the step-copy kernels run: performs a speculative decode step's
+        # overlap gathers with one launch.
+        self._step_input_gather: Optional[spec_step_copies.StepInputGather] = (
+            spec_step_copies.StepInputGather() if self.is_spec_decode
+            and spec_step_copies.is_supported() else None)
         # Let the first CUDA graph capture create its private pool. Piecewise
         # CUDA graphs use a separate pool owned by their runners, so sharing a
         # pre-created pool handle with the outer graph runner is unnecessary.
@@ -5578,18 +5577,8 @@ class PyTorchModelEngine(ModelEngine):
         num_draft_tokens = len(draft_tokens)
         total_num_tokens = len(position_ids)
         # Where the step-copy kernels run, the overlap gathers below are one
-        # kernel. On a CUDA graph step whose attention metadata is a plain
-        # TrtllmAttentionMetadata (its prepare() reads none of these inputs on
-        # the device), the gathers, the positions and the metadata's prompt
-        # lengths, KV lengths and block offsets are staged instead and written
-        # by one launch right after attn_metadata.prepare().
-        step_copies = (self._step_input_stage if enable_spec_decode else None)
-        if step_copies is not None:
-            step_copies.begin()
-        stage = (step_copies if step_copies is not None
-                 and attn_metadata.is_cuda_graph and not self.use_mrope
-                 and type(attn_metadata) is TrtllmAttentionMetadata
-                 and attn_metadata.fp4_mla_state is None else None)
+        # kernel.
+        step_gather = (self._step_input_gather if enable_spec_decode else None)
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
@@ -5654,7 +5643,7 @@ class PyTorchModelEngine(ModelEngine):
                 #       Zeroed above.
                 previous_begin = (num_extend_reqeust_wo_dummy -
                                   previous_batch_len)
-                if step_copies is not None and step_copies.gather(
+                if step_gather is None or not step_gather.gather(
                         new_tokens_device, next_draft_tokens_device,
                         new_tokens_lens_device,
                         self.previous_batch_indices_cuda,
@@ -5665,9 +5654,6 @@ class PyTorchModelEngine(ModelEngine):
                         self.previous_pos_id_offsets_cuda,
                         previous_begin * runtime_tokens_per_gen_step,
                         self.previous_kv_lens_offsets_cuda, previous_begin):
-                    if stage is None:
-                        step_copies.commit()
-                else:
                     # previous input ids
                     new_tokens = new_tokens_device.transpose(0, 1)[
                         previous_slots, :runtime_tokens_per_gen_step].flatten()
@@ -5765,11 +5751,8 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            if stage is None or not stage.copy(
-                    self.position_ids_cuda[:total_num_tokens],
-                    host_position_ids):
-                self.position_ids_cuda[:total_num_tokens].copy_(
-                    host_position_ids, non_blocking=True)
+            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids,
+                                                            non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
                                                             0)
@@ -5852,15 +5835,7 @@ class PyTorchModelEngine(ModelEngine):
         # pre-prepare counts so the steady-gen recording below stores values
         # that the per-step prepare() can re-clamp from scratch.
         num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
-        if stage is None:
-            attn_metadata.prepare()
-        else:
-            attn_metadata.h2d_stage = stage
-            try:
-                attn_metadata.prepare()
-            finally:
-                attn_metadata.h2d_stage = None
-            stage.commit()
+        attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
             cross_encoder_seq_lens,
