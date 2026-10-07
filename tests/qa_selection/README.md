@@ -37,7 +37,7 @@ importable: the integration suite's ini `pythonpath` provides it, elsewhere set
 
 ```text
 qa_selection/
-  plugin.py        the options, the markers, the item adapter, the five hooks;
+  plugin.py        the options, the markers, the item adapter, the six hooks;
                    the `-p` entry point, and the only module importing pytest
   core/            the decisions -- stdlib only, never pytest
     ladder.py        what a legal ladder is
@@ -49,7 +49,7 @@ qa_selection/
     artifacts.py     what the output files are called
     request.py       what one run was asked for
     selection.py     what it decided about every test
-    report.py        the .ids lists, the JSON record, the summary lines
+    report.py        the .ids lists and the JSON record
   tests/           the behaviour suite -- no GPU, no container, no wheel
 ```
 
@@ -90,17 +90,36 @@ per test in collection order, so `partition` can split the item list by position
 not selected goes to pytest's own deselection hook and is removed from the list in place.
 
 **After collection** `report.py` turns those decisions into the per-rung `.ids` lists the
-pipeline filters with `awk`, a JSON record, and a terminal summary. Nothing is written unless
-`--selection-out-dir` was given.
+pipeline filters with `awk` and a JSON record. Nothing is written unless `--selection-out-dir`
+was given. `plugin.py` prints the same report, so a live run without files can still see why
+each test was dropped:
+
+```text
+qa selection: B200 (sm 100, 8 GPUs/node), ladder 1,4        <- session header; -q hides it
+...
+------------------------------ qa selection ------------------------------
+target        B200, ladder 1,4
+candidates    4
+selected      2
+  1gpu        1
+  4gpu        1
+deselected    2
+  1  skip_less_device(8): needs 8 GPUs, largest rung is 4
+  1  skip_less_mpi_world_size(8): needs 8 GPUs, largest rung is 4
+written       out/: B200.json B200-1gpu.ids B200-4gpu.ids
+```
+
+`-v` lists each reason's node ids beneath it. `candidates` and `deselected` count this plugin's
+decisions only; pytest's own `deselected` also counts the test-list and waive filtering.
 
 ## Acceptance tests
 
-Six criteria, one module each. Every expected value was derived from the production decorators
+Seven criteria, one module each. Every expected value was derived from the production decorators
 before the plugin was run, so a test states a command line and the answer expected back — what
 the plugin decides, and how to drive it.
 
 ```bash
-pytest tests/qa_selection/tests      # 31 tests, no GPU, no container, no wheel
+pytest tests/qa_selection/tests      # 36 tests, no GPU, no container, no wheel
 ```
 
 | | guarantee | proved by |
@@ -111,6 +130,7 @@ pytest tests/qa_selection/tests      # 31 tests, no GPU, no container, no wheel
 | **AC-4** | A **machine and a ladder** are the whole command — the three questions above — and the tests a run keeps are exactly the tests its lists hold | [`test_options.py`](tests/test_options.py) (5) |
 | **AC-5** | A test **above the largest rung** is deselected, in no list, with one blocker naming its demand, its markers and that rung — the same reason for a small node and a short ladder | [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
 | **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
+| **AC-7** | A run **explains itself** in the terminal: the header names the target, and the block breaks selected tests down by rung and deselected tests by reason, with node ids at `-v` | [`test_summary.py`](tests/test_summary.py) (5) |
 
 ## Config
 
