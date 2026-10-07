@@ -131,11 +131,6 @@ class Assignment:
         return not self.blockers
 
     @property
-    def unassignable(self) -> bool:
-        """A selected test no rung holds. Never true: such a test has a count blocker."""
-        return self.selected and self.rung is None
-
-    @property
     def nodeid(self) -> str:
         """The node id this assignment is about."""
         return self.decision.nodeid
