@@ -258,10 +258,11 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
         batch = ScheduledRequests()
         resources = object()
 
-        def decoder_forward(forward_inputs, resource_manager):
+        def decoder_forward(forward_inputs, resource_manager, *, is_dummy):
             assert isinstance(forward_inputs, ScheduledInputs)
             assert forward_inputs.batch is batch
             assert resource_manager is resources
+            assert is_dummy
             return model_forward()
 
         engine = object.__new__(PyTorchModelEngine)

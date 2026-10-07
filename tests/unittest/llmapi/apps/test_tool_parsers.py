@@ -679,6 +679,43 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
 
+    def test_hyphenated_function_name(self):
+        """Test that function names containing hyphens are parsed."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get-weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        tool_call = ('<|tool_call_begin|>functions.get-weather:0'
+                     '<|tool_call_argument_begin|>{"location":"Tokyo"}'
+                     '<|tool_call_end|>')
+
+        result = KimiK2ToolParser().detect_and_parse(
+            '<|tool_calls_section_begin|>' + tool_call +
+            '<|tool_calls_section_end|>', tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+        parser = KimiK2ToolParser()
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>', tools)
+        result = parser.parse_streaming_increment(tool_call, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
@@ -1897,6 +1934,22 @@ def test_deepseek_streaming_preserves_withheld_text(
     assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
     assert parser_cls().detect_and_parse(expected,
                                          sample_tools).normal_text == expected
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+def test_deepseek_streaming_keeps_markdown_fences(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """Content without tool-call markup is streamed verbatim."""
+    text = "Here is the code:\n```python\nprint(1)\n```\nDone."
+
+    streamed = parser_cls().parse_streaming_increment(text,
+                                                      sample_tools).normal_text
+
+    assert streamed == text, f"Expected {text!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
 
 
 @pytest.mark.parametrize(
