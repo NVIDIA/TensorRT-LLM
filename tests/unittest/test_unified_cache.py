@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm import _bootstrap
-from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi import mpi_session
 
 pytestmark = pytest.mark.cpu_only
@@ -18,6 +17,9 @@ pytestmark = pytest.mark.cpu_only
 def _clear_cache_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, raising=False)
     monkeypatch.delenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, raising=False)
+    monkeypatch.delenv("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", raising=False)
+    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
     for name in _bootstrap._UNIFIED_CACHE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
 
@@ -75,20 +77,42 @@ def test_unified_cache_respects_individual_overrides(
         assert os.environ[name] == f"/explicit/{name.lower()}"
 
 
-def test_ray_deep_gemm_isolates_explicit_unified_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "cache_override,isolate,expected",
+    [
+        (None, True, "isolated"),
+        ("unified", True, "isolated"),
+        (None, False, "unified"),
+        ("explicit", True, "explicit"),
+    ],
+)
+def test_ray_deep_gemm_cache_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cache_override: str | None,
+    isolate: bool,
+    expected: str,
 ) -> None:
     from tensorrt_llm.executor.ray.utils import _configure_deep_gemm_cache
 
     cache_root = tmp_path / "unified"
     cache_dir = cache_root / "deep_gemm"
     monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, str(cache_root))
-    monkeypatch.setenv("DG_JIT_CACHE_DIR", str(cache_dir))
-    monkeypatch.delenv("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", raising=False)
+    if cache_override:
+        override = cache_dir if cache_override == "unified" else tmp_path / "explicit"
+        monkeypatch.setenv("DG_JIT_CACHE_DIR", str(override))
+    if not isolate:
+        monkeypatch.setenv("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", "0")
 
+    _bootstrap._setup_unified_cache()
     _configure_deep_gemm_cache(rank=2, gpu=3)
 
-    assert os.environ["DG_JIT_CACHE_DIR"] == str(cache_dir / "deep_gemm_rank2_gpu3")
+    expected_cache = {
+        "isolated": cache_dir / "deep_gemm_rank2_gpu3",
+        "unified": cache_dir,
+        "explicit": tmp_path / "explicit",
+    }[expected]
+    assert os.environ["DG_JIT_CACHE_DIR"] == str(expected_cache)
 
 
 def test_prepare_environment_configures_cache_first(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,9 +132,6 @@ def test_prepare_environment_configures_cache_first(monkeypatch: pytest.MonkeyPa
 def test_mpi_pool_environment_forwards_unified_cache_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not ENABLE_MULTI_DEVICE:
-        pytest.skip("multi-device required")
-
     captured: dict[str, object] = {}
 
     class FakeMpiPoolExecutor:
@@ -122,7 +143,7 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
         monkeypatch.setenv(name, f"/cache/{name.lower()}")
     monkeypatch.setenv(_bootstrap._TRTLLM_DG_DUMP_CUBIN_ENV, "1")
     monkeypatch.setenv("UNRELATED_CACHE_DIR", "/not-forwarded")
-    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
     session = SimpleNamespace(mpi_pool=None, n_workers=1, _env_overrides={})
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
@@ -135,13 +156,22 @@ def test_mpi_pool_environment_forwards_unified_cache_variables(
     assert "UNRELATED_CACHE_DIR" not in worker_env
 
 
-@pytest.mark.parametrize("use_unified_cache", [False, True])
+@pytest.mark.parametrize(
+    "use_unified_cache,isolate,explicit_workspace",
+    [
+        (False, True, False),
+        (True, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
 def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_unified_cache: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    use_unified_cache: bool,
+    isolate: bool,
+    explicit_workspace: bool,
 ) -> None:
-    if not ENABLE_MULTI_DEVICE:
-        pytest.skip("multi-device required")
-
     captured: dict[str, object] = {}
 
     class FakeMpiPoolExecutor:
@@ -151,9 +181,11 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
     cache_root = tmp_path / "unified"
     if use_unified_cache:
         monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, str(cache_root))
-    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_MANAGED", raising=False)
-    monkeypatch.delenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", raising=False)
-    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor)
+    if not isolate:
+        monkeypatch.setenv("TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS", "0")
+    if explicit_workspace:
+        monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(tmp_path / "explicit-flashinfer"))
+    monkeypatch.setattr(mpi_session, "MPIPoolExecutor", FakeMpiPoolExecutor, raising=False)
     _bootstrap._setup_unified_cache()
     session = SimpleNamespace(mpi_pool=None, n_workers=2, _env_overrides={})
 
@@ -165,9 +197,16 @@ def test_mpi_pool_flashinfer_isolation_respects_unified_cache_configuration(
         workspace_root = str(cache_root / "flashinfer")
     else:
         workspace_root = mpi_session._FLASHINFER_WORKSPACE_ROOT
-    assert captured["python_args"] == [
-        "-c",
-        mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-        workspace_root,
-    ]
-    assert "FLASHINFER_WORKSPACE_BASE" not in worker_env
+    if isolate and not explicit_workspace:
+        assert captured["python_args"] == [
+            "-c",
+            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+            workspace_root,
+        ]
+        assert "FLASHINFER_WORKSPACE_BASE" not in worker_env
+    else:
+        expected_workspace = (
+            str(tmp_path / "explicit-flashinfer") if explicit_workspace else workspace_root
+        )
+        assert captured["python_args"] is None
+        assert worker_env["FLASHINFER_WORKSPACE_BASE"] == expected_workspace
