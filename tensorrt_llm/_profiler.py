@@ -17,8 +17,10 @@
 import math
 import os
 from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager
-from typing import Literal, TypeAlias, cast
+from contextlib import AbstractContextManager, contextmanager
+from functools import wraps
+from types import TracebackType
+from typing import Literal, ParamSpec, TypeAlias, TypeVar, cast
 
 import torch
 
@@ -39,6 +41,7 @@ __all__ = [
     "ProfilerRegion",
     "custom_region_enabled",
     "record_function_metadata_scope",
+    "record_function_with_metadata",
 ]
 
 _CUSTOM_REGIONS_ENV = "TLLM_PROFILE_CUSTOM_REGIONS"
@@ -47,6 +50,8 @@ _CUSTOM_REGION_NAMES: frozenset[ProfilerRegion] = frozenset(
 )
 _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
 _METADATA_PREFIX = "TRTLLM1"
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def _parse_custom_regions(value: str | None) -> frozenset[ProfilerRegion]:
@@ -153,3 +158,99 @@ def record_function_metadata_scope(
             except Exception:
                 # Cleanup must not replace an exception raised by the operation body.
                 pass
+
+
+def _tensor_metadata(tensor: torch.Tensor) -> dict[str, MetadataValue]:
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "stride": list(tensor.stride()),
+        "device": str(tensor.device),
+    }
+
+
+class _RecordFunctionWithMetadata:
+    """Context manager/decorator for lazily inspected direct tensor arguments."""
+
+    def __init__(
+        self,
+        name: str,
+        *values: object,
+        metadata_factory: Callable[..., Mapping[str, MetadataValue]] | None = None,
+    ) -> None:
+        self._name = name
+        self._values = values
+        self._metadata_factory = metadata_factory
+        self._scope: AbstractContextManager[None] | None = None
+
+    def _metadata(self) -> dict[str, MetadataValue]:
+        metadata: dict[str, MetadataValue] = {}
+        tensor_index = 0
+        for value in self._values:
+            if isinstance(value, torch.Tensor):
+                prefix = f"workflow.tensor.{tensor_index}"
+                metadata.update(
+                    {f"{prefix}.{key}": item for key, item in _tensor_metadata(value).items()}
+                )
+                tensor_index += 1
+        metadata["workflow.tensor_count"] = tensor_index
+        if self._metadata_factory is not None:
+            metadata.update(self._metadata_factory())
+        return metadata
+
+    def __enter__(self) -> "_RecordFunctionWithMetadata":
+        self._scope = record_function_metadata_scope(self._name, "workflow", self._metadata)
+        self._scope.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        assert self._scope is not None
+        return self._scope.__exit__(exc_type, exc_value, traceback)
+
+    def __call__(self, func: Callable[_P, _R]) -> Callable[_P, _R]:
+        @wraps(func)
+        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            factory = self._metadata_factory
+            with _RecordFunctionWithMetadata(
+                self._name,
+                *self._values,
+                *args,
+                *kwargs.values(),
+                metadata_factory=(lambda: factory(*args, **kwargs))
+                if factory is not None
+                else None,
+            ):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+
+def record_function_with_metadata(
+    name: str,
+    *values: object,
+    metadata_factory: Callable[..., Mapping[str, MetadataValue]] | None = None,
+) -> _RecordFunctionWithMetadata:
+    """Record a workflow boundary as a context manager or typed decorator.
+
+    Args:
+        name: The PyTorch user-scope name.
+        values: Objects to inspect lazily. Direct tensors of any shape/dtype
+            contribute shape, dtype, stride, and device; containers are not
+            traversed and tensor contents are never copied. A decorated call
+            also inspects its direct positional and keyword arguments.
+        metadata_factory: Optional lazy typed fields, merged after tensor fields.
+            For a context it takes no arguments; for a decorator it receives
+            the wrapped call's arguments. It runs inside observational setup.
+
+    Returns:
+        A scope that preserves arguments, return identity, and body exceptions
+        through the shared observational scope API. Metadata is constructed only
+        when workflow is selected and a profiler is active. CUDA graph replay
+        does not re-execute Python decorators inside the captured model.
+    """
+    return _RecordFunctionWithMetadata(name, *values, metadata_factory=metadata_factory)
