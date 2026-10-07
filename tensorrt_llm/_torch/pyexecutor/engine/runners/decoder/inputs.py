@@ -16,6 +16,7 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._profiler import record_function_with_metadata
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionMetadata,
     AttentionRuntimeFeatures,
@@ -1254,6 +1255,7 @@ class DecoderInputPreparer:
         return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
     @nvtx_range("_prepare_inputs")
+    @record_function_with_metadata("trtllm::prepare_inputs")
     def prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
