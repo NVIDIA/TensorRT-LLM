@@ -94,10 +94,6 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::validate_allreduce_tuning_buckets")
-    def _(buckets: List[int]) -> None:
-        return None
-
     @torch.library.register_fake("trtllm::clear_allreduce_tactic_cache")
     def _() -> None:
         return None
