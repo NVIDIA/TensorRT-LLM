@@ -549,13 +549,62 @@ def test_gqa_dspark_rejects_a_mask_row_the_shipped_embedding_does_not_have(
 
 @needs_gpu
 def test_gqa_dspark_keeps_no_mask_row_when_its_config_names_no_mask_token():
-    """A drafter config that names no mask token leaves DFlash's default id (vocab_size), one past the shipped rows.
-    The drafter keeps no row and loads; the speculative config can still name the mask token."""
+    """With no mask token named by the drafter config or a speculative config, the drafter keeps DFlash's default id
+    (vocab_size), one past the shipped rows: it keeps no row and loads."""
     weights = _tiny_weights()
     weights["embed_tokens.weight"] = torch.zeros(VOCAB, TINY["hidden_size"], dtype=torch.bfloat16)
     drafter = _build_drafter(True, weights, mask_token_id=None)
     assert drafter.mask_token_id == VOCAB
     assert getattr(drafter, "mask_token_embedding", None) is None
+
+
+@needs_gpu
+def test_gqa_dspark_warns_when_its_shipped_embedding_keeps_no_mask_row():
+    """Keeping no row for DFlash's default id is logged as a warning, since the masked slots then use the shared
+    embedding's row instead of a trained one."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.models import modeling_dspark
+
+    weights = _tiny_weights()
+    weights["embed_tokens.weight"] = torch.zeros(VOCAB, TINY["hidden_size"], dtype=torch.bfloat16)
+    with patch.object(modeling_dspark.logger, "warning") as warning:
+        drafter = _build_drafter(True, weights, mask_token_id=None)
+    assert getattr(drafter, "mask_token_embedding", None) is None
+    messages = [" ".join(map(str, call.args)) for call in warning.call_args_list]
+    assert any("no trained mask row is kept" in m for m in messages), messages
+
+
+@needs_gpu
+def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
+    """A checkpoint that names its mask token only as ``dspark_noise_token_id``: the speculative config resolves that
+    key and the worker embeds its id, while the drafter config resolution falls back to DFlash's default. The builder
+    hands the drafter the speculative config's id, so the drafter keeps that id's trained row and its mask id is the
+    worker's."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    mask_id = VOCAB - 2
+    pretrained = _tiny_config(True, mask_token_id=None)
+    pretrained.dspark_noise_token_id = mask_id
+    spec = SimpleNamespace(
+        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+    )
+    drafter = _build_dspark_draft(
+        SimpleNamespace(spec_config=spec),
+        ModelConfig(pretrained_config=pretrained, attn_backend="TRTLLM"),
+        None,
+        None,
+    ).to("cuda")
+    weights = _tiny_weights()
+    g = torch.Generator().manual_seed(31)
+    trained = (torch.randn(VOCAB, TINY["hidden_size"], generator=g) * 0.05).to(torch.bfloat16)
+    weights["embed_tokens.weight"] = trained
+    drafter.load_weights(dict(weights))
+
+    assert isinstance(drafter, GQADSparkForCausalLM)
+    assert drafter.mask_token_id == spec.mask_token_id
+    torch.testing.assert_close(drafter.mask_token_embedding.cpu(), trained[mask_id], rtol=0, atol=0)
 
 
 @needs_gpu

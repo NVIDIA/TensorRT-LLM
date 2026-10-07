@@ -2666,8 +2666,23 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # _paged_ctx_cache is False here, so VANILLA is the only route to the arena.
     _default_attention_backend = "TRTLLM"
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+    def __init__(
+        self,
+        draft_config,
+        *,
+        dflash_attention_backend: str = "AUTO",
+        spec_mask_token_id: Optional[int] = None,
+    ):
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
+        # The worker embeds the speculative config's mask id when it has one, and that config also reads keys the
+        # drafter config resolution does not (``dspark_noise_token_id``). Adopting it keeps the trained row of the id
+        # the worker uses.
+        if spec_mask_token_id is not None and int(spec_mask_token_id) != self.mask_token_id:
+            logger.info(
+                f"{type(self).__name__}: mask_token_id {int(spec_mask_token_id)} from the speculative config "
+                f"(the drafter config resolves {self.mask_token_id})."
+            )
+            self.mask_token_id = int(spec_mask_token_id)
         self._init_dspark_heads(draft_config.pretrained_config)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
@@ -2692,8 +2707,7 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         differs from the target's, and the shipped ``lm_head`` is bit-exact with the target's.
 
         Raises:
-            ValueError: the embedding is not ``[rows, hidden_size]``, or the mask id the drafter config names is not
-                one of its rows.
+            ValueError: the embedding is not ``[rows, hidden_size]``, or the mask id in use is not one of its rows.
         """
         names = [k for k in ("embed_tokens.weight", "model.embed_tokens.weight") if k in weights]
         if not names:
@@ -2709,12 +2723,16 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         if 0 <= self.mask_token_id < weight.shape[0]:
             return weight[self.mask_token_id]
         if self.mask_token_id == self.config.vocab_size:
-            # DFlash's default when the drafter config names no mask token in a key the drafter reads. The speculative
-            # config may still name one (a user value, or a key only it reads), so there is no known row to keep.
+            # DFlash's default id, used when no config names a mask token.
+            logger.warning(
+                f"{type(self).__name__}: the checkpoint ships {name}, but mask_token_id is DFlash's default "
+                f"({self.mask_token_id} = vocab_size, outside its {weight.shape[0]} rows): no trained mask row is "
+                "kept, and the masked slots use the shared embedding's row."
+            )
             return None
         raise ValueError(
-            f"{type(self).__name__}: the drafter's mask_token_id {self.mask_token_id} is not a row of the "
-            f"checkpoint's {name} ({weight.shape[0]} rows)."
+            f"{type(self).__name__}: mask_token_id {self.mask_token_id} is not a row of the checkpoint's {name} "
+            f"({weight.shape[0]} rows)."
         )
 
 
@@ -3458,12 +3476,16 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
     # model registry, so keying on model_type a second time would force a new
     # entry for every GQA family that already works.
-    drafter_cls = (
-        MLADSparkForCausalLM if is_mla(draft_config.pretrained_config) else GQADSparkForCausalLM
-    )
-    return drafter_cls(
+    if is_mla(draft_config.pretrained_config):
+        return MLADSparkForCausalLM(
+            draft_config,
+            dflash_attention_backend=model_config.spec_config.attention_backend,
+        )
+    # The drafter's own ModelConfig has no spec_config, so the worker's mask id is handed over here.
+    return GQADSparkForCausalLM(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
+        spec_mask_token_id=model_config.spec_config.mask_token_id,
     )
 
 
