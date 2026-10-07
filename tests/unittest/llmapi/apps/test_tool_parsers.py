@@ -39,11 +39,13 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.serve.tool_parser.utils import infer_type_from_json_schema
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
@@ -5721,3 +5723,139 @@ class TestUnparsedToolCallWarning:
             for call in mock_logger.warning_once.call_args_list
         ]
         assert keys == [self._PARSER_NAME, self._OTHER_PARSER_NAME]
+
+
+# ============================================================================
+# Argument types declared through JSON-schema references
+# ============================================================================
+
+_SCHEMA_ROOT = {
+    "type": "object",
+    "$defs": {
+        "Opts": {
+            "type": "object",
+            "properties": {
+                "verbose": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "Code": {
+            "type": "string"
+        },
+        "Loop": {
+            "anyOf": [{
+                "$ref": "#/$defs/Loop"
+            }]
+        },
+    },
+    "definitions": {
+        "Mode": {
+            "enum": ["fast", "slow"]
+        }
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "schema,root,expected",
+    [
+        ({
+            "$ref": "#/$defs/Opts"
+        }, _SCHEMA_ROOT, "object"),
+        ({
+            "allOf": [{
+                "$ref": "#/$defs/Opts"
+            }],
+            "description": "options"
+        }, _SCHEMA_ROOT, "object"),
+        ({
+            "anyOf": [{
+                "$ref": "#/$defs/Opts"
+            }, {
+                "type": "null"
+            }]
+        }, _SCHEMA_ROOT, "object"),
+        ({
+            "anyOf": [{
+                "type": "null"
+            }, {
+                "type": "integer"
+            }]
+        }, None, "integer"),
+        ({
+            "$ref": "#/definitions/Mode"
+        }, _SCHEMA_ROOT, "string"),
+        ({
+            "allOf": [{
+                "type": "string"
+            }, {
+                "minLength": 1
+            }]
+        }, None, "string"),
+        # A reference that cannot be resolved declares no type.
+        ({
+            "allOf": [{
+                "$ref": "#/$defs/Opts"
+            }]
+        }, None, None),
+        ({
+            "$ref": "#/$defs/Missing"
+        }, _SCHEMA_ROOT, None),
+        ({
+            "$ref": "https://example.com/opts.json"
+        }, _SCHEMA_ROOT, None),
+        ({
+            "$ref": "#/$defs/Loop"
+        }, _SCHEMA_ROOT, None),
+    ],
+)
+def test_infer_type_from_json_schema(schema, root, expected):
+    assert infer_type_from_json_schema(schema, root) == expected
+
+
+_VALUE = '{"verbose": true}'
+_ONE_ARGUMENT_CALLS = {
+    Glm4ToolParser:
+    f"<tool_call>run\n<arg_key>arg</arg_key>\n<arg_value>{_VALUE}</arg_value>\n</tool_call>",
+    Glm47ToolParser:
+    f"<tool_call>run<arg_key>arg</arg_key><arg_value>{_VALUE}</arg_value></tool_call>",
+    PoolsideV1ToolParser:
+    f"<tool_call>run\n<arg_key>arg</arg_key>\n<arg_value>{_VALUE}</arg_value>\n</tool_call>",
+    MiniMaxM2ToolParser:
+    ('<minimax:tool_call><invoke name="run"><parameter name="arg">'
+     f"{_VALUE}</parameter></invoke></minimax:tool_call>"),
+    MiniMaxM3ToolParser:
+    ("]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"run\">\n"
+     f"]<]minimax[>[<arg>{_VALUE}]<]minimax[>[</arg>\n"
+     "]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"),
+}
+
+
+@pytest.mark.parametrize("parser_cls",
+                         list(_ONE_ARGUMENT_CALLS),
+                         ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("wrap", [False, True], ids=["ref", "allOf_ref"])
+@pytest.mark.parametrize("definition,expected", [("Opts", json.loads(_VALUE)),
+                                                 ("Code", _VALUE)])
+def test_an_argument_is_typed_by_its_referenced_definition(
+        parser_cls, wrap, definition, expected):
+    ref = {"$ref": f"#/$defs/{definition}"}
+    parameters = {
+        **_SCHEMA_ROOT, "properties": {
+            "arg": {
+                "allOf": [ref],
+                "description": "x"
+            } if wrap else ref
+        }
+    }
+    tool = ChatCompletionToolsParam(type="function",
+                                    function=FunctionDefinition(
+                                        name="run", parameters=parameters))
+
+    result = parser_cls().detect_and_parse(_ONE_ARGUMENT_CALLS[parser_cls],
+                                           [tool])
+
+    assert [json.loads(c.parameters) for c in result.calls] == [{
+        "arg": expected
+    }]

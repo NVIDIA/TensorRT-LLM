@@ -49,7 +49,7 @@ def _get_argument_type(func_name: str, arg_key: str, tools: list[Tool]) -> str |
     if not isinstance(schema, dict):
         return None
 
-    return infer_type_from_json_schema(schema)
+    return infer_type_from_json_schema(schema, tool.function.parameters)
 
 
 def _convert_number(value: str) -> Any:

@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/qwen25_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
@@ -56,19 +58,43 @@ def is_complete_json(input_str: str) -> bool:
         return False
 
 
+# Bounds the recursion, so a schema that references itself still terminates.
+_MAX_SCHEMA_DEPTH = 32
+
+
+def _resolve_local_ref(ref: Any, root: Optional[Dict[str, Any]]) -> Any:
+    """The subschema a local reference such as ``#/$defs/Name`` points to."""
+    if not isinstance(ref, str) or not ref.startswith("#") or not isinstance(
+            root, dict):
+        return None
+    node = root
+    for token in ref[1:].split("/")[1:]:
+        token = token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or token not in node:
+            return None
+        node = node[token]
+    return node
+
+
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/function_call/utils.py
-def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+def infer_type_from_json_schema(schema: Dict[str, Any],
+                                root: Optional[Dict[str, Any]] = None,
+                                _depth: int = 0) -> Optional[str]:
     """Infer the primary type of a parameter from JSON Schema.
 
     Supports complex JSON Schema structures including:
     - Direct type field (including type arrays)
+    - $ref: a local reference, resolved against ``root``, the tool's whole
+      parameters schema
     - anyOf/oneOf: parameter can be any of multiple types
     - enum: parameter must be one of enum values
     - allOf: parameter must satisfy all type definitions
     - properties: inferred as object type
     - items: inferred as array type
+
+    Returns None when the schema declares no type.
     """
-    if not isinstance(schema, dict):
+    if not isinstance(schema, dict) or _depth > _MAX_SCHEMA_DEPTH:
         return None
 
     if "type" in schema:
@@ -81,14 +107,23 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                 return non_null_types[0]
             return "string"
 
+    if "$ref" in schema:
+        inferred_type = infer_type_from_json_schema(
+            _resolve_local_ref(schema["$ref"], root), root, _depth + 1)
+        if inferred_type:
+            return inferred_type
+
     if "anyOf" in schema or "oneOf" in schema:
         schemas = schema.get("anyOf") or schema.get("oneOf")
         types = []
         if isinstance(schemas, list):
             for sub_schema in schemas:
-                inferred_type = infer_type_from_json_schema(sub_schema)
+                inferred_type = infer_type_from_json_schema(
+                    sub_schema, root, _depth + 1)
                 if inferred_type:
                     types.append(inferred_type)
+        # A null alternative only makes the parameter optional.
+        types = [t for t in types if t != "null"] or types
         if types:
             if len(set(types)) == 1:
                 return types[0]
@@ -120,11 +155,15 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
         return "string"
 
     if "allOf" in schema and isinstance(schema["allOf"], list):
-        for sub_schema in schema["allOf"]:
-            inferred_type = infer_type_from_json_schema(sub_schema)
+        types = [
+            infer_type_from_json_schema(sub_schema, root, _depth + 1)
+            for sub_schema in schema["allOf"]
+        ]
+        for inferred_type in types:
             if inferred_type and inferred_type != "string":
                 return inferred_type
-        return "string"
+        if "string" in types:
+            return "string"
 
     if "properties" in schema:
         return "object"
