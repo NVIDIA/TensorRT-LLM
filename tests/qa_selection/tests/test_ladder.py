@@ -16,37 +16,37 @@
 
 Each criterion collects one module from `cases/` for one machine:
 
-    selection.run(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8",
+    selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8",
                   "--selection-out-dir={out}")
 
     run.ids(4)    the 4-GPU allocation's published list
 
-    B200    8 GPUs/node, which can run every test here
+    B200    8 GPUs/node, which can hold every GPU demand here
 """
 
-from mock_suite import BothGpuMarkers, LadderDemands, MixedGpuMarkers
+from mocks import DeviceCases, MarkerCases
 
 
 def test_smallest_rung_that_fits(selection):
     """1, 2 and 8 GPUs land on the 1-, 4- and 8-GPU allocations."""
     run = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
 
-    assert run.ids(1) == [LadderDemands.UNMARKED]
-    assert run.ids(4) == [LadderDemands.NEEDS_TWO]
-    assert run.ids(8) == [LadderDemands.NEEDS_EIGHT]
+    assert run.ids(1) == [DeviceCases.UNMARKED]
+    assert run.ids(4) == [DeviceCases.TWO_GPUS]
+    assert run.ids(8) == [DeviceCases.EIGHT_GPUS, DeviceCases.EIGHT_RANKS]
 
 
 def test_rungs_partition_the_selected_set(selection):
     """One list per rung, pairwise disjoint, and together the whole selected set.
 
-    A four-rung ladder over the same three demands, so that rung 4 has no
+    A four-rung ladder over the same demands, so that rung 4 has no
     members and an empty rung's list is observable.
     """
     ladder = (1, 2, 4, 8)
     run = selection.run(
-        LadderDemands.MODULE,
+        DeviceCases.MODULE,
         "--machine=B200",
         "--ladder=1,2,4,8",
         "--selection-out-dir={out}",
@@ -73,15 +73,15 @@ def test_both_gpu_markers_are_credited(selection):
     Ranks are measured one per GPU.
     """
     run = selection.run(
-        BothGpuMarkers.MODULE,
+        MarkerCases.MODULE,
         "--machine=B200",
         "--ladder=1,4,8",
         "--selection-out-dir={out}",
     )
 
-    assert run.ids(8) == [BothGpuMarkers.NEEDS_EIGHT_OF_BOTH]
+    assert MarkerCases.AGREEING_BOUNDS in run.ids(8)
 
-    outcome = run.outcome(BothGpuMarkers.NEEDS_EIGHT_OF_BOTH)
+    outcome = run.outcome(MarkerCases.AGREEING_BOUNDS)
     assert outcome["required_gpus"] == 8
     assert outcome["required_gpus_from"] == [
         "skip_less_device(8)",
@@ -92,13 +92,13 @@ def test_both_gpu_markers_are_credited(selection):
 def test_unmarked_lands_on_the_smallest_rung(selection):
     """A test stating no bound is assumed to want one GPU, and the record says so."""
     run = selection.run(
-        LadderDemands.MODULE,
+        DeviceCases.MODULE,
         "--machine=B200",
         "--ladder=1,4,8",
         "--selection-out-dir={out}",
     )
 
-    outcome = run.outcome(LadderDemands.UNMARKED)
+    outcome = run.outcome(DeviceCases.UNMARKED)
     assert outcome["rung"] == 1
     assert outcome["required_gpus"] == 1
     assert outcome["required_gpus_from"] == []
@@ -111,14 +111,14 @@ def test_larger_bound_decides(selection):
     carries the two markers at different values.
     """
     run = selection.run(
-        MixedGpuMarkers.MODULE,
+        MarkerCases.MODULE,
         "--machine=B200",
         "--ladder=1,4,8",
         "--selection-out-dir={out}",
     )
 
-    assert run.ids(8) == [MixedGpuMarkers.TWO_DEVICES_EIGHT_RANKS]
+    assert MarkerCases.DISAGREEING_BOUNDS in run.ids(8)
 
-    outcome = run.outcome(MixedGpuMarkers.TWO_DEVICES_EIGHT_RANKS)
+    outcome = run.outcome(MarkerCases.DISAGREEING_BOUNDS)
     assert outcome["required_gpus"] == 8
     assert outcome["required_gpus_from"] == ["skip_less_mpi_world_size(8)"]

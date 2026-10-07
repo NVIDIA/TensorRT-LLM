@@ -16,7 +16,7 @@
 
     framework.py    runs the plugin's command line
     cases/          the mock suite it runs against
-    mock_suite.py   what `cases/` holds, named: one class per mock module
+    mocks.py        what `cases/` holds, named: one class per mock module
     test_*.py       the criteria: the options passed, and the ids expected back
 
 Not `cases/conftest.py`, which is mock content loaded by the run under test.

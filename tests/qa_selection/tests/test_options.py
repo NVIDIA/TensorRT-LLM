@@ -24,38 +24,38 @@ through `run.selected` and `run.reported(...)`; a ladder alone publishes every
 rung's list.
 """
 
-from mock_suite import LadderDemands
+from mocks import DeviceCases
 
 
 def test_rung_run_selects_its_published_list(selection):
     """The tests a rung run keeps are the tests that rung published, in order."""
     plan = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
-    rung = selection.run(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
+    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
 
-    assert plan.ids(4) == [LadderDemands.NEEDS_TWO]
+    assert plan.ids(4) == [DeviceCases.TWO_GPUS]
     assert rung.selected == plan.ids(4)
 
 
 def test_rung_narrows_what_executes_not_the_machine(selection):
     """A rung miss is reported feasible with no blocker, never as infeasible."""
-    rung = selection.run(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
+    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
     plan = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
 
-    assert LadderDemands.NEEDS_EIGHT not in rung.selected
+    assert DeviceCases.EIGHT_GPUS not in rung.selected
 
     # Feasibility was decided against the whole node.
     assert rung.reported("target") == "B200, ladder 1,4,8"
-    assert rung.reported("feasible") == "3  (0 deselected)"
+    assert rung.reported("feasible") == "4  (0 deselected)"
     assert rung.reported("live") == "1  (rung 4 only)"
 
     # The record, which only the plan run writes, says the same.
-    assert plan.outcome(LadderDemands.NEEDS_EIGHT)["selected"] is True
-    assert plan.outcome(LadderDemands.NEEDS_EIGHT)["blockers"] == []
-    assert plan.outcome(LadderDemands.NEEDS_EIGHT)["rung"] == 8
+    assert plan.outcome(DeviceCases.EIGHT_GPUS)["selected"] is True
+    assert plan.outcome(DeviceCases.EIGHT_GPUS)["blockers"] == []
+    assert plan.outcome(DeviceCases.EIGHT_GPUS)["rung"] == 8
 
 
 def test_a_rung_run_differs_from_the_plan_only_in_what_runs(selection):
@@ -65,14 +65,15 @@ def test_a_rung_run_differs_from_the_plan_only_in_what_runs(selection):
     rung run keeps that rung's share of them.
     """
     plan = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
+        DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--selection-out-dir={out}"
     )
-    rung = selection.run(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
+    rung = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=4")
 
     assert plan.selected == [
-        LadderDemands.UNMARKED,
-        LadderDemands.NEEDS_TWO,
-        LadderDemands.NEEDS_EIGHT,
+        DeviceCases.UNMARKED,
+        DeviceCases.TWO_GPUS,
+        DeviceCases.EIGHT_GPUS,
+        DeviceCases.EIGHT_RANKS,
     ]
     assert plan.written == [
         "B200-1gpu.ids",
@@ -80,17 +81,17 @@ def test_a_rung_run_differs_from_the_plan_only_in_what_runs(selection):
         "B200-8gpu.ids",
         "B200.json",
     ]
-    assert rung.selected == [LadderDemands.NEEDS_TWO]
+    assert rung.selected == [DeviceCases.TWO_GPUS]
 
     assert plan.reported("target") == rung.reported("target") == "B200, ladder 1,4,8"
-    assert plan.reported("feasible") == rung.reported("feasible") == "3  (0 deselected)"
-    assert plan.reported("live") == "3"
+    assert plan.reported("feasible") == rung.reported("feasible") == "4  (0 deselected)"
+    assert plan.reported("live") == "4"
     assert rung.reported("live") == "1  (rung 4 only)"
 
 
 def test_rung_outside_the_ladder(selection):
     """A rung the ladder does not hold is refused, not silently empty."""
-    run = selection.refuse(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=2")
+    run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=2")
 
     run.result.stderr.fnmatch_lines(["*--rung: 2 is not a rung of --ladder=1,4,8*"])
 
@@ -98,7 +99,7 @@ def test_rung_outside_the_ladder(selection):
 def test_rung_with_an_output_directory(selection):
     """`--rung` and an output directory are refused, naming the command that writes them."""
     run = selection.refuse(
-        LadderDemands.MODULE,
+        DeviceCases.MODULE,
         "--machine=B200",
         "--ladder=1,4,8",
         "--rung=4",

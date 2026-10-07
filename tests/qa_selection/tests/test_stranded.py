@@ -24,21 +24,22 @@ Both are recorded in `<machine>.json`; `selected` and `unassignable` tell them
 apart, and only the first warns.
 """
 
-from mock_suite import DeviceCount
+from mocks import DeviceCases
 
 
 def test_an_infeasible_test_is_never_stranded(selection):
     """A test the machine cannot run is deselected, not counted as waiting for an allocation."""
     run = selection.run(
-        DeviceCount.MODULE, "--machine=GB200", "--ladder=1,4", "--selection-out-dir={out}"
+        DeviceCases.MODULE, "--machine=GB200", "--ladder=1,4", "--selection-out-dir={out}"
     )
 
-    assert run.selected == [DeviceCount.UNMARKED]
-    assert run.outcome(DeviceCount.NEEDS_EIGHT)["unassignable"] is False
+    assert run.selected == [DeviceCases.UNMARKED, DeviceCases.TWO_GPUS]
+    assert run.outcome(DeviceCases.EIGHT_GPUS)["unassignable"] is False
     assert run.record["counts"]["unassignable"] == 0
     assert run.record["unassignable"]["nodeids"] == []
     assert run.record["deselected_by_reason"] == {
-        "skip_less_device(8): needs 8 GPUs, largest rung is 4": [DeviceCount.NEEDS_EIGHT]
+        "skip_less_device(8): needs 8 GPUs, largest rung is 4": [DeviceCases.EIGHT_GPUS],
+        "skip_less_mpi_world_size(8): needs 8 GPUs, largest rung is 4": [DeviceCases.EIGHT_RANKS],
     }
 
     assert "UnassignableWarning" not in run.result.stdout.str()
