@@ -576,7 +576,7 @@ class PyTorchModelEngine(ModelEngine):
             # dynamic draft length is enabled; otherwise stays fixed).  Tree
             # modes verify all tree nodes per step, which can be wider than the
             # tree depth used by the drafter loop.
-            self.runtime_draft_len = get_static_draft_len(self)
+            self.runtime_draft_len = get_static_draft_len(self.spec_config)
 
         else:
             self.without_logits = False

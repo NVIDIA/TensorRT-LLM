@@ -1264,7 +1264,7 @@ class DecoderRunner(ScheduledModelRunner):
                             batch,
                             resource_manager,
                             enable_spec_decode=self._config.is_spec_decode,
-                            runtime_draft_len=get_static_draft_len(self._config),
+                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
                         )
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
@@ -1380,7 +1380,7 @@ class DecoderRunner(ScheduledModelRunner):
                             batch,
                             resource_manager,
                             enable_spec_decode=self._config.is_spec_decode,
-                            runtime_draft_len=get_static_draft_len(self._config),
+                            runtime_draft_len=get_static_draft_len(self._config.spec_config),
                         )
                     torch.cuda.synchronize()
 
@@ -1536,7 +1536,7 @@ class DecoderRunner(ScheduledModelRunner):
                                 batch,
                                 resource_manager,
                                 enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config),
+                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
                             )
                             ran_forward = True
                             torch.cuda.synchronize()
@@ -1763,7 +1763,7 @@ class DecoderRunner(ScheduledModelRunner):
                                 batch,
                                 resource_manager,
                                 enable_spec_decode=self._config.is_spec_decode,
-                                runtime_draft_len=get_static_draft_len(self._config),
+                                runtime_draft_len=get_static_draft_len(self._config.spec_config),
                             )
 
                             if autotuner_enabled:
@@ -1874,7 +1874,7 @@ class DecoderRunner(ScheduledModelRunner):
         # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
         # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
-        draft_lengths = [get_static_draft_len(self._config)]
+        draft_lengths = [get_static_draft_len(self._config.spec_config)]
         should_capture_no_spec = (
             self._config.max_total_draft_tokens > 0
             and not self._config.spec_config.spec_dec_mode.use_one_engine()
@@ -2155,7 +2155,7 @@ class DecoderRunner(ScheduledModelRunner):
             else contextlib.nullcontext()
         )
         enable_spec_decode = self._config.is_spec_decode
-        runtime_draft_len = get_static_draft_len(self._config)
+        runtime_draft_len = get_static_draft_len(self._config.spec_config)
         with capture_context, self.no_cuda_graph():
             for num_tokens in prefill_cuda_graph_num_tokens:
                 warmup_request = self._create_warmup_request(resource_manager, num_tokens, 0)
@@ -2441,7 +2441,7 @@ class DecoderRunner(ScheduledModelRunner):
         result = ScheduledRequests()
         result.reset_context_requests(ctx_requests)
         result.generation_requests = gen_requests
-        static_draft_len = get_static_draft_len(self._config)
+        static_draft_len = get_static_draft_len(self._config.spec_config)
         resolve_draft_len(
             self._config.spec_config,
             result,
@@ -2602,7 +2602,7 @@ class DecoderRunner(ScheduledModelRunner):
             self._config.spec_config,
             result,
             max_draft_len=self._config.max_draft_len,
-            static_draft_len=get_static_draft_len(self._config),
+            static_draft_len=get_static_draft_len(self._config.spec_config),
             draft_len=draft_len,
         )
         return result
@@ -3483,7 +3483,7 @@ class DecoderRunner(ScheduledModelRunner):
         # For tree decoding, runtime_draft_len should match total tree
         # tokens (not tree depth).  py_executor resets it every iteration.
         if spec_config is not None and not spec_config.is_linear_tree:
-            runtime_draft_len = get_static_draft_len(self._config)
+            runtime_draft_len = get_static_draft_len(spec_config)
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -4684,7 +4684,6 @@ class DecoderRunner(ScheduledModelRunner):
 
     def model_forward(self, *, is_dummy: bool, **kwargs):
         assert self._model_caller is not None
-        # Transitional: move this scope and reclaimer lifecycle into the decoder runner.
         reclaimer = self._eager_workspace_reclaimer
         metadata = kwargs["attn_metadata"]
         reclaim_scope = (
