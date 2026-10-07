@@ -28,14 +28,8 @@ import numpy as np
 import torch
 
 ProfilerRegion: TypeAlias = Literal["workflow", "mpi", "nccl", "nanobind", "kv", "moe"]
-
-
 MpiOperationKind: TypeAlias = Literal["collective", "p2p"]
-
-
 MpiDirection: TypeAlias = Literal["send", "recv"]
-
-
 MetadataValue: TypeAlias = (
     str
     | int
@@ -47,7 +41,6 @@ MetadataValue: TypeAlias = (
     | dict[str, "MetadataValue"]
 )
 
-
 __all__ = [
     "MetadataValue",
     "MpiDirection",
@@ -57,29 +50,20 @@ __all__ = [
     "custom_region_enabled",
     "record_function_metadata_scope",
     "record_function_with_metadata",
+    "record_moe_routing",
     "record_mpi_function",
     "warn_profiler_failure",
+    "warn_unsupported_moe_routing",
 ]
+
 _CUSTOM_REGIONS_ENV = "TLLM_PROFILE_CUSTOM_REGIONS"
-
-
 _CUSTOM_REGION_NAMES: frozenset[ProfilerRegion] = frozenset(
     {"workflow", "mpi", "nccl", "nanobind", "kv", "moe"}
 )
-
-
 _CUSTOM_REGION_DEFAULTS = _CUSTOM_REGION_NAMES - {"kv", "moe"}
-
-
 _METADATA_PREFIX = "TRTLLM1"
-
-
 _P = ParamSpec("_P")
-
-
 _R = TypeVar("_R")
-
-
 _MISSING = object()
 
 
@@ -110,8 +94,8 @@ def _load_custom_regions() -> frozenset[ProfilerRegion]:
 
 
 _CUSTOM_REGIONS = _load_custom_regions()
-
-
+# Metadata access, literal validation, tensor conversion, and profiler operations
+# can fail independently of the observed workload.
 _OBSERVATION_ERRORS = (AttributeError, LookupError, TypeError, ValueError, RuntimeError, OSError)
 
 
@@ -146,6 +130,22 @@ def warn_profiler_failure(name: str, region: ProfilerRegion, phase: str, error: 
         )
     except (ImportError, AttributeError, TypeError, ValueError, RuntimeError, OSError):
         # Diagnostic delivery is observational too, including during imports.
+        pass
+
+
+def warn_unsupported_moe_routing(backend_name: str) -> None:
+    """Report standalone MoE paths that cannot provide routing observations."""
+    if not custom_region_enabled("moe"):
+        return
+    try:
+        from .logger import logger
+
+        logger.warning_once(
+            f"TLLM_PROFILE_CUSTOM_REGIONS=moe cannot record routing for {backend_name}; "
+            "routing events require a ConfigurableMoE scheduler path.",
+            key=("moe_profiler_unsupported", backend_name),
+        )
+    except (ImportError, AttributeError, TypeError, ValueError, RuntimeError, OSError):
         pass
 
 
@@ -435,3 +435,69 @@ def record_mpi_function(
 
     with record_function_metadata_scope(f"trtllm::mpi_{operation}", "mpi", metadata):
         yield
+
+
+def _moe_routing_metadata(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor | None,
+) -> dict[str, MetadataValue]:
+    selected_experts = cast(list[MetadataValue], token_selected_experts.detach().cpu().tolist())
+    routing_weights = (
+        None
+        if token_final_scales is None
+        else cast(list[MetadataValue], token_final_scales.detach().cpu().tolist())
+    )
+    return {
+        "moe.layer": layer_idx,
+        "moe.num_tokens": token_selected_experts.shape[0],
+        "moe.num_experts": num_experts,
+        "moe.experts_per_token": token_selected_experts.shape[1],
+        "moe.selected_expert_ids": selected_experts,
+        "moe.routing_weights": routing_weights,
+    }
+
+
+def record_moe_routing(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor | None,
+) -> None:
+    """Record already-materialized logical routing without changing its tensors.
+
+    Args:
+        layer_idx: Model layer index, or None when unavailable.
+        num_experts: Logical expert count, not the EPLB slot count.
+        token_selected_experts: Integer expert IDs [num_tokens, top_k] in routing order.
+        token_final_scales: Floating routing weights of the same shape, or None
+            when unavailable. This does not relax a scheduler's weight contract.
+
+    Disabled, inactive, or compiling calls do not inspect tensors or construct metadata. Active
+    eager calls copy tensors to CPU and serialize their values, which synchronizes
+    CUDA work and has measurable cost. CUDA current-stream capture skips only this
+    observation; existing RouterReplay device capture remains independent. Python
+    events do not recur on graph replay. Metadata/setup/cleanup failures are
+    discarded for the expected error types at the shared observational boundary;
+    tensor values are not modified.
+    """
+    if not custom_region_active("moe"):
+        return
+    try:
+        uses_cuda = token_selected_experts.is_cuda or (
+            token_final_scales is not None and token_final_scales.is_cuda
+        )
+        if uses_cuda and torch.cuda.is_current_stream_capturing():
+            return
+    except RuntimeError as error:
+        warn_profiler_failure("trtllm::moe_routing", "moe", "capture-state query", error)
+        return
+    with record_function_metadata_scope(
+        "trtllm::moe_routing",
+        "moe",
+        lambda: _moe_routing_metadata(
+            layer_idx, num_experts, token_selected_experts, token_final_scales
+        ),
+    ):
+        pass
