@@ -244,18 +244,14 @@ class Flux2Pipeline(BasePipeline):
         return keys
 
     def _warmup_reference_shape(self, height: int, width: int) -> Tuple[int, int]:
-        """Reference size the warmup pass conditions on for an output shape.
-
-        A client that posts a reference without an explicit output size gets the
-        output shape from the reference itself (``_resolve_target_dimensions``),
-        so a reference at the output shape is the canonical /v1/images/edits
-        case. Floored the same way ``_preprocess_reference_images`` floors a real
-        client image, so the warmed key matches what a request produces.
-        """
+        """Apply the reference area limit and spatial alignment to a warmup shape."""
+        image = PIL.Image.new("RGB", (width, height))
+        image = self.image_processor._resize_if_exceeds_area(image)
+        reference_width, reference_height = image.size
         multiple_of = self.vae_scale_factor * 2
         return (
-            max(height // multiple_of, 1) * multiple_of,
-            max(width // multiple_of, 1) * multiple_of,
+            (reference_height // multiple_of) * multiple_of,
+            (reference_width // multiple_of) * multiple_of,
         )
 
     def _init_transformer(self) -> None:
@@ -278,9 +274,7 @@ class Flux2Pipeline(BasePipeline):
         reference_height, reference_width = self._warmup_reference_shape(height, width)
         with torch.no_grad():
             self.forward(**forward_kwargs)
-            # A reference lengthens the transformer sequence, so the text-only
-            # pass above leaves that graph uncompiled; without this the compile
-            # would land inside the first measured /v1/images/edits request.
+            # Reference tokens change the transformer's compiled sequence shape.
             self.forward(
                 **forward_kwargs,
                 _condition_images=[
