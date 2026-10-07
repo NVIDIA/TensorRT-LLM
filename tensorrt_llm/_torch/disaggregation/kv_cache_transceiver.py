@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from os import getenv
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 import tensorrt_llm
 from tensorrt_llm import logger
@@ -207,13 +207,34 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        transceiver = KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                           cache_transceiver_config)
 
-    # Explicit legacy runtime: transceiver_runtime is None or "CPP".
-    return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
-                                  attention_type, cache_transceiver_config,
-                                  mamba_cache_manager)
+    else:
+        # Explicit legacy runtime: transceiver_runtime is None or "CPP".
+        transceiver = BindKvCacheTransceiver(mapping, dist, kv_cache_manager,
+                                             attention_type,
+                                             cache_transceiver_config,
+                                             mamba_cache_manager)
+
+    return _maybe_profile_kv_cache_transceiver(transceiver,
+                                               cache_transceiver_config.backend,
+                                               mapping.rank)
+
+
+def _maybe_profile_kv_cache_transceiver(transceiver: "KvCacheTransceiver",
+                                        backend: str,
+                                        rank: int) -> "KvCacheTransceiver":
+    from tensorrt_llm._profiler import custom_region_enabled
+
+    if not custom_region_enabled("kv"):
+        return transceiver
+    from .profiler import _ProfiledKvCacheTransceiver
+
+    return _ProfiledKvCacheTransceiver(transceiver, backend, rank)
+
+
+SendTerminalOutcome = Literal["complete", "failed", "cancelled"]
 
 
 class CtxTransferStatus(NamedTuple):
@@ -292,6 +313,30 @@ class KvCacheTransceiver(ABC):
     def has_retired_send_session(self, req: LlmRequest) -> bool:
         """Whether the send session closed before its final slice."""
         return False
+
+    def transfer_resource_ownership(self, req: LlmRequest) -> bool | None:
+        """Observe admission without changing resource ownership.
+
+        Returns True/False only when the implementation can authoritatively
+        determine whether it owns resources for req. None means unknown,
+        unlike the compatibility default of ``has_inflight_transfer``.
+        """
+        return None
+
+    def observe_send_terminal_outcome(self,
+                                      req: LlmRequest,
+                                      enabled: bool = True) -> None:
+        """Opt in/out of bounded outcome observation for one pending send.
+
+        Implementations without precise terminal evidence leave this a no-op.
+        Observers must opt out on terminal or rejected admission. This does
+        not start, poll, cancel, or release a transfer.
+        """
+
+    def get_send_terminal_outcome(
+            self, req: LlmRequest) -> SendTerminalOutcome | None:
+        """Return a precisely observed, safely retired send outcome, if any."""
+        return None
 
     @property
     def consumes_transfer_buffer(self) -> bool:
