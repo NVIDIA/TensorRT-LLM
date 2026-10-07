@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import gc
 import os
 import sys
@@ -87,6 +102,33 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.await_response_task,
             error_queue=self._error_queue,
             name="await_response_thread")
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: int | list[int] | None = None,
+    ) -> list:
+        """Call a worker method directly and return its result in a list.
+
+        Only blocking calls without rank selection are supported. Runtime-memory
+        methods coordinate multi-rank execution internally; other methods require
+        a single-rank deployment, as with the MPI proxy dispatchers.
+        """
+        from .proxy import _check_collective_rpc_guard
+
+        _check_collective_rpc_guard(self.llm_args.parallel_config.world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
+        if non_block:
+            raise NotImplementedError(
+                "GenerationExecutorWorker collective_rpc only supports blocking calls."
+            )
+        return [getattr(self, method)(*args, **(kwargs or {}))]
 
     def start_thread(self, thread: ManagedThread):
         if not self.engine.can_enqueue_requests():

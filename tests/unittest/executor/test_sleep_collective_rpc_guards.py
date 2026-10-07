@@ -19,9 +19,13 @@ via object.__new__ + manual attribute injection.
 """
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1849,3 +1853,80 @@ class TestIpcProxyRpcClientGuard:
         p = _make_proxy("ipc", rpc_client=None)
         with pytest.raises(RuntimeError, match="RPC client is not initialised"):
             p.collective_rpc("sleep")
+
+
+class TestWorkerCollectiveRpc:
+    @staticmethod
+    def _make_worker(world_size: int = 1) -> "GenerationExecutorWorker":
+        from tensorrt_llm.executor.worker import GenerationExecutorWorker
+
+        worker = object.__new__(GenerationExecutorWorker)
+        worker.doing_shutdown = True
+        worker.llm_args = SimpleNamespace(parallel_config=SimpleNamespace(world_size=world_size))
+        worker.sleep = MagicMock()
+        worker.wakeup = MagicMock()
+        worker.get_memory_status = MagicMock(
+            return_value={"state": "parked", "parked_tags": ["kv_cache"]}
+        )
+        return worker
+
+    def test_llm_runtime_memory_dispatch(self) -> None:
+        from tensorrt_llm.llmapi.llm import LLM
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker = self._make_worker()
+        llm = object.__new__(LLM)
+        llm.shutdown = MagicMock()
+        llm._executor = worker
+        llm._encode_only = False
+        llm.args = SimpleNamespace(sleep_config=object())
+
+        llm.release(["kv_cache"])
+        status = llm.get_memory_status()
+        llm.resume()
+
+        assert status.state == "parked"
+        assert status.parked_tags == [ExecutorMemoryType.KV_CACHE]
+        worker.sleep.assert_called_once_with(["kv_cache"])
+        worker.get_memory_status.assert_called_with()
+        assert worker.get_memory_status.call_count == 2
+        worker.wakeup.assert_called_once_with(["kv_cache"])
+
+    @pytest.mark.parametrize("world_size", [1, 2])
+    @pytest.mark.parametrize("method", ["sleep", "wakeup", "get_memory_status"])
+    def test_blocking_dispatch(self, world_size: int, method: str) -> None:
+        worker = self._make_worker(world_size)
+        worker_method = getattr(worker, method)
+        args = () if method == "get_memory_status" else (["kv_cache"],)
+        result = worker.collective_rpc(method, args=args)
+
+        assert result == [worker_method.return_value]
+        worker_method.assert_called_once_with(*args)
+
+    def test_forwards_keyword_arguments(self) -> None:
+        worker = self._make_worker()
+        worker.collective_rpc("sleep", kwargs={"sleep_tags": ["kv_cache"]})
+        worker.sleep.assert_called_once_with(sleep_tags=["kv_cache"])
+
+    @pytest.mark.parametrize(
+        "options",
+        [{"non_block": True}, {"unique_reply_rank": 0}, {"target_ranks": [0]}],
+    )
+    def test_unsupported_options_rejected_before_dispatch(self, options: dict) -> None:
+        worker = self._make_worker()
+        with pytest.raises(NotImplementedError):
+            worker.collective_rpc("sleep", args=(["kv_cache"],), **options)
+        worker.sleep.assert_not_called()
+
+    def test_multirank_other_method_rejected_before_dispatch(self) -> None:
+        worker = self._make_worker(world_size=2)
+        worker.update_weights = MagicMock()
+        with pytest.raises(NotImplementedError, match="model_world_size > 1"):
+            worker.collective_rpc("update_weights")
+        worker.update_weights.assert_not_called()
+
+    def test_worker_error_propagates(self) -> None:
+        worker = self._make_worker()
+        worker.sleep.side_effect = RuntimeError("transition failed")
+        with pytest.raises(RuntimeError, match="transition failed"):
+            worker.collective_rpc("sleep", args=(["kv_cache"],))
