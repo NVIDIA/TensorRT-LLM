@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -29,6 +30,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
+from tensorrt_llm._torch.visual_gen.models.wan import fused_block
 from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
     WanPerTokenAdaLN,
     WanPerTokenAdaLNRuntime,
@@ -281,6 +283,10 @@ def _default_vsa_gate(linear: Linear, bias_value: float) -> None:
         linear.weight.zero_()
         if linear.bias is not None:
             linear.bias.fill_(bias_value)
+
+
+# Read once so the compiled block forward has no env lookups.
+_FUSED_BLOCK = os.environ.get("TRTLLM_WAN_FUSED_BLOCK", "0") == "1"
 
 
 class WanBlock(nn.Module):
@@ -549,6 +555,10 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
+        if _FUSED_BLOCK and fused_block.eligible(self, x, temb):
+            return fused_block.forward(
+                self, x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timestep
+            )
         pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
         if pertoken_adaln is None:
             if temb.ndim == 4:
