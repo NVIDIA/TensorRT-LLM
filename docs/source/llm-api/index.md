@@ -134,8 +134,8 @@ The following tips typically assist new LLM API users who are familiar with othe
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
 artifact caches under a single root. TensorRT-LLM supplies the following
-defaults; an individually configured environment variable always takes
-precedence.
+defaults. Except for the isolation behavior described below, an individually
+configured environment variable takes precedence.
 
 | Environment variable | Default under `TRTLLM_CACHE_DIR` |
 |----------------------|------------------------------------|
@@ -168,8 +168,11 @@ workspace isolation, either set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0`,
 or set `FLASHINFER_WORKSPACE_BASE` to a different path from the one assigned
 under `TRTLLM_CACHE_DIR`.
 
-Ray workers similarly isolate the unified `DG_JIT_CACHE_DIR` by rank and GPU.
-Set `TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0` to disable this behavior.
+Ray workers treat `DG_JIT_CACHE_DIR` equal to
+`<TRTLLM_CACHE_DIR>/deep_gemm` as unified-cache-managed and isolate it by rank
+and GPU, even when that value was set explicitly. Other explicit values are
+preserved. Set `TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS=0` to preserve and share the
+unified path.
 
 ### FlashInfer JIT workspaces for MPI workers
 

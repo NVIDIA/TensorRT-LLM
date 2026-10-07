@@ -75,6 +75,23 @@ def test_unified_cache_respects_individual_overrides(
         assert os.environ[name] == f"/explicit/{name.lower()}"
 
 
+def test_ray_deep_gemm_isolates_explicit_unified_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("ray")
+    from tensorrt_llm.executor.ray.gpu_worker import _configure_deep_gemm_cache
+
+    cache_root = tmp_path / "unified"
+    cache_dir = cache_root / "deep_gemm"
+    monkeypatch.setenv(_bootstrap._UNIFIED_CACHE_ROOT_ENV, str(cache_root))
+    monkeypatch.setenv("DG_JIT_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("TRTLLM_DEEP_GEMM_CACHE_PER_PROCESS", raising=False)
+
+    _configure_deep_gemm_cache(rank=2, gpu=3)
+
+    assert os.environ["DG_JIT_CACHE_DIR"] == str(cache_dir / "deep_gemm_rank2_gpu3")
+
+
 def test_prepare_environment_configures_cache_first(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = []
     monkeypatch.setattr(_bootstrap, "_setup_unified_cache", lambda: calls.append("cache"))
