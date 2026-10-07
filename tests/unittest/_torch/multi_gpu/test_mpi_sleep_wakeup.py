@@ -177,7 +177,11 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
     Ensures that a partial tag set (KV_CACHE only) propagates correctly to
     rank-1's control listener and that generation still works after wakeup.
     """
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_tokens=16384,
+        use_kv_cache_manager_v2=False,
+    )
 
     llm = LLM(
         model=_LLAMA_MODEL_PATH,
