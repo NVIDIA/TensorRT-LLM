@@ -59,6 +59,30 @@ class _GdnReplayCacheManager:
         )
 
 
+class _StateIndexCacheManager:
+    """Returns ``state_indices`` as set, a list or a CPU tensor, for a batch of decode requests."""
+
+    def __init__(self, state_indices):
+        self.state_indices = state_indices
+
+    def get_state_indices(self, request_ids, is_padding):
+        return self.state_indices[: len(request_ids)]
+
+
+def _decode_attn_metadata(kv_cache_manager):
+    """Attention metadata of a two-request decode step."""
+    seq_lens = torch.tensor([1, 1], dtype=torch.int)
+    return SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens.cuda(),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        kv_cache_manager=kv_cache_manager,
+        request_ids=[10, 11],
+        kv_cache_params=None,
+    )
+
+
 def _torch_reference_work_items(state_indices, prev_num_accepted_tokens, cache_buf_idx):
     """Run the production ATen path into fresh buffers.
 
@@ -141,26 +165,9 @@ class TestMamba2Metadata:
     def test_prepare_skips_an_unchanged_state_index_upload(self):
         """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
         device buffer keeps values the host never sent. A changed step uploads again."""
-
-        class ListCacheManager:
-            def __init__(self):
-                self.state_indices = [3, 1]
-
-            def get_state_indices(self, request_ids, is_padding):
-                return self.state_indices[: len(request_ids)]
-
-        manager = ListCacheManager()
+        manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
-        seq_lens = torch.tensor([1, 1], dtype=torch.int)
-        attn_metadata = SimpleNamespace(
-            seq_lens=seq_lens,
-            seq_lens_cuda=seq_lens.cuda(),
-            num_contexts=0,
-            num_ctx_tokens=0,
-            kv_cache_manager=manager,
-            request_ids=[10, 11],
-            kv_cache_params=None,
-        )
+        attn_metadata = _decode_attn_metadata(manager)
 
         metadata.prepare(attn_metadata)
         torch.cuda.synchronize()
@@ -175,6 +182,24 @@ class TestMamba2Metadata:
         metadata.prepare(attn_metadata)
         torch.cuda.synchronize()
         assert metadata.state_indices[:2].tolist() == [3, 2]
+
+    def test_prepare_uploads_state_indices_from_a_list_or_a_cpu_tensor(self):
+        """State indices that come as a list, then a CPU tensor, then the first list again all reach the device: the
+        tensor step's upload updates the record of what the device holds, so the last step is not taken as
+        unchanged."""
+        manager = _StateIndexCacheManager([3, 1])
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+
+        for state_indices, expected in (
+            ([3, 1], [3, 1]),
+            (torch.tensor([5, 6], dtype=torch.int32), [5, 6]),
+            ([3, 1], [3, 1]),
+        ):
+            manager.state_indices = state_indices
+            metadata.prepare(attn_metadata)
+            torch.cuda.synchronize()
+            assert metadata.state_indices[:2].tolist() == expected
 
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:

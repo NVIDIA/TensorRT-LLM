@@ -493,8 +493,8 @@ class Mamba2Metadata:
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                copy_to_device_if_changed(self.state_indices,
+                                          self.state_indices_cpu[:batch_size])
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
