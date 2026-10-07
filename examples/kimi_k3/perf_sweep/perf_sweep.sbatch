@@ -2,8 +2,7 @@
 # Kimi K3 serving perf sweep (GB300, 8K-in/1K-out): one trtllm-serve launch
 # per job, all requested concurrencies measured against it.
 #
-# Modes bake the tuned serving recipe (2026-07-26 A/B campaign; per-knob
-# evidence in the campaign run folder's round1-insights.md):
+# Modes:
 #   tep8   TP8 attention + EP8 MoE, 8 GPU / 2 nodes  (interactive, c 1-16)
 #   tep16  TP16 attention + EP16 MoE, 16 GPU / 4 nodes (latency record, c 1-4)
 #   dep16  attention-DP + EP16 MoE, 16 GPU / 4 nodes (throughput, c 16-1024)
@@ -13,8 +12,8 @@
 #       --mode dep16|tep16|tep8 --model PATH --image PATH \
 #       [--repo PATH] [--concurrencies "16 32 64"] [--isl N] [--osl N] [--tag NAME]
 #
-# Submit ALL jobs of a comparison batch at the same time: a concurrent 1.5 TB
-# weight load depresses in-flight DEP16 c>=128 measurements by ~30%.
+# Submit ALL jobs of a comparison batch at the same time so one job's weight
+# load does not overlap another job's measurement window.
 #
 #SBATCH --job-name=kimi-k3-sweep
 #SBATCH --partition=batch
@@ -55,10 +54,9 @@ done
 #   KIMI_K3_FP8_WEIGHT_READ_KDA=0  keep the KDA q/k/v/g/o projections in
 #       BF16 within the enabled master (the most precision-sensitive slice).
 #   KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1  FP8 shared-expert gate_up read at TEP
-#       (with the master on it defaults on only under attention DP): +8-9%
-#       with stream_interval >= 10.
-#   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; the in-cubin
-#       top-k tier register-spills at decode batch 5-64 (33 us/layer).
+#       (with the master on it defaults on only under attention DP).
+#   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; avoid the
+#       in-cubin top-k path at decode batch 5-64.
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
@@ -69,13 +67,8 @@ case "$MODE" in
         TP_SIZE=16; MAX_BATCH_SIZE=16
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
         MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
-        # bf16 KDA read + FP8 gate_up at tp16: c1 77.0 tps/user (12.98 ms) vs
-        # 55.1 bare, GSM8K 96.85 (also 96.82 for KDA=0 alone, 96.63 gate_up
-        # alone, 96.44 bare). "Bare" = the master FP8 stack with no overrides
-        # (measured when the FP8 read was default-on; the master env is now
-        # set explicitly instead). Do NOT add the separated-routing env here:
-        # alone it scores 94.05 at tp16 and combined with gate_up it destroys
-        # accuracy (8.49-9.36); that pair is tep8-only (96.59).
+        # Do not add TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING here.
+        # That setting belongs on tep8 only.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
@@ -96,14 +89,14 @@ REPO=${REPO_ARG:-$(cd "$SCRIPT_DIR/../../.." && pwd)}
 WORK_DIR=$SLURM_SUBMIT_DIR/kimi-k3-sweep-$MODE${TAG:+-$TAG}-$SLURM_JOB_ID
 mkdir -p "$WORK_DIR"
 
-# Tuned serving config per mode. stream_interval 10 removes the ~18 ms/token
-# host streaming floor (TPOT metric unaffected: (latency-TTFT)/(len-1)).
+# Tuned serving config per mode. stream_interval 10 avoids the host streaming
+# floor. TPOT stays (latency-TTFT)/(len-1).
 CONFIG_FILE=$WORK_DIR/serve_config.yaml
 case "$MODE" in
     dep16)
         # moe max_num_tokens 33024: fewer serialized A2A chunk rounds per
-        # prefill wave (TTFT -4-6%). use_low_precision_moe_combine: FP8 A2A
-        # combine payload, +3.6-4.6% at c64-128 (GSM8K 96.74). enable_padding:
+        # prefill wave. use_low_precision_moe_combine: FP8 A2A
+        # combine payload. enable_padding:
         # ADP graphs are all-or-nothing without it.
         cat > "$CONFIG_FILE" <<'EOF'
 enable_attention_dp: true

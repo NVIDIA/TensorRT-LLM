@@ -34,8 +34,8 @@ constexpr bool isSupportedHeadCount(int numHeads)
         || numHeads == 12 || numHeads == 16 || numHeads == 24 || numHeads == 32 || numHeads == 48 || numHeads == 96;
 }
 
-//! Select the compact-head kernel only in the GB300 domain measured by the
-//! KDA decode sweep. Division keeps the B*H threshold overflow-safe.
+//! Select the compact-head kernel only for SM103.
+//! Division keeps the B*H threshold overflow-safe.
 constexpr bool shouldUseCompactHeads(int smVersion, int batchSize, int numHeads, int numValueHeads)
 {
     return smVersion == 103 && batchSize > 0 && numHeads == numValueHeads && isSupportedHeadCount(numHeads)

@@ -2,8 +2,7 @@
 # Kimi K3 ACCURACY sweep (GSM8K) for the serving recipes measured by
 # perf_sweep.sbatch: same per-mode yaml, same env, same tp/batch/token CLI
 # flags (keep the mode blocks below in sync with perf_sweep.sbatch by hand).
-# One in-process trtllm-eval run per job; expect ~96.5 +/- 0.5 on the full
-# 1319-question set.
+# One in-process trtllm-eval run per job on the full 1319-question set.
 #
 # Usage:
 #   sbatch [--nodes=N --segment=S ...] acc_sweep.sbatch \
@@ -36,8 +35,7 @@ done
     echo "error: --mode, --model and --image are required" >&2; exit 2; }
 [[ -e "$MODEL" && -e "$CONTAINER_IMAGE" ]] || { echo "error: bad model/image path" >&2; exit 2; }
 
-# Same batch shape and tuned env as perf_sweep.sbatch (see that script and
-# the campaign notes for the per-knob evidence).
+# Same batch shape and tuned env as perf_sweep.sbatch.
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
@@ -46,13 +44,8 @@ case "$MODE" in
     tep16)
         TP_SIZE=16; MAX_BATCH_SIZE=16
         MODE_ENV="KIMI_K3_FP8_WEIGHT_READ=1 KIMI_K3_FP8_WEIGHT_READ_KDA=0 KIMI_K3_FP8_WEIGHT_READ_GATE_UP=1"
-        # bf16 KDA read + FP8 gate_up at tp16: c1 77.0 tps/user (12.98 ms) vs
-        # 55.1 bare, GSM8K 96.85 (also 96.82 for KDA=0 alone, 96.63 gate_up
-        # alone, 96.44 bare). "Bare" = the master FP8 stack with no overrides
-        # (measured when the FP8 read was default-on; the master env is now
-        # set explicitly instead). Do NOT add the separated-routing env here:
-        # alone it scores 94.05 at tp16 and combined with gate_up it destroys
-        # accuracy (8.49-9.36); that pair is tep8-only (96.59).
+        # Do not add TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING here.
+        # That setting belongs on tep8 only.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
