@@ -15,11 +15,13 @@
 """CPU contract tests for the shared profiler primitives."""
 
 import builtins
+import inspect
 import json
 import logging
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -115,7 +117,6 @@ def test_selection_is_cached_at_module_initialization() -> None:
 
 
 def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
-    """Verify invalid startup configuration warns and enables defaults."""
     env = os.environ.copy()
     env["TLLM_PROFILE_CUSTOM_REGIONS"] = "workflow,unknown"
     completed = subprocess.run(
@@ -323,6 +324,118 @@ def test_contextmanager_decorator_preserves_arguments_and_result(
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
         assert wrapped(4, offset=2) == 6
     assert "decorated" in {event.name for event in trace.events()}
+
+
+@pytest.mark.parametrize(("active", "selected"), [(False, True), (True, False)])
+def test_inactive_workflow_decorator_bypasses_scope_construction(
+    monkeypatch: pytest.MonkeyPatch, active: bool, selected: bool
+) -> None:
+    """Disabled calls must bypass per-call profiler object and closure setup."""
+    monkeypatch.setattr(
+        profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}) if selected else frozenset()
+    )
+    result = object()
+    original = ValueError("workload failed")
+
+    @profiler.record_function_with_metadata("inactive_workflow")
+    def wrapped(value: object, *, fails: bool = False) -> object:
+        if fails:
+            raise original
+        return value
+
+    def forbidden_scope(*args: object, **kwargs: object) -> None:
+        raise AssertionError("inactive call constructed a profiler scope")
+
+    monkeypatch.setattr(profiler, "_RecordFunctionWithMetadata", forbidden_scope)
+    context = (
+        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU])
+        if active
+        else nullcontext()
+    )
+    with context:
+        assert wrapped(result) is result
+        with pytest.raises(ValueError) as caught:
+            wrapped(result, fails=True)
+    assert caught.value is original
+
+
+@pytest.mark.parametrize("selection", [frozenset(), frozenset({"kv"})])
+def test_startup_disabled_workflow_decorator_returns_original_function(
+    monkeypatch: pytest.MonkeyPatch, selection: frozenset[str]
+) -> None:
+    """Excluded startup regions must leave no decorator on each function call."""
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", selection)
+    calls: list[str] = []
+    result = object()
+    original = ValueError("workload failed")
+
+    def forbidden_checker() -> bool:
+        calls.append("checker")
+        raise AssertionError("disabled decorator checked the profiler")
+
+    def forbidden_metadata(value: object, *, fails: bool = False) -> dict[str, str]:
+        calls.append("metadata")
+        raise AssertionError("disabled decorator evaluated metadata")
+
+    def operation(value: object, *, fails: bool = False) -> object:
+        if fails:
+            raise original
+        return value
+
+    monkeypatch.setattr(torch.autograd, "_profiler_enabled", forbidden_checker)
+    wrapped = profiler.record_function_with_metadata(
+        "startup_disabled", metadata_factory=forbidden_metadata
+    )(operation)
+    assert wrapped is operation
+    assert wrapped(result) is result
+    with pytest.raises(ValueError) as caught:
+        wrapped(result, fails=True)
+    assert caught.value is original
+    assert calls == []
+
+
+def test_workflow_decorator_tracks_live_selection_and_profiler_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A startup-selected callable must follow both runtime gates across calls."""
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    metadata_labels: list[str] = []
+    result = object()
+    original = ValueError("workload failed")
+
+    def metadata(value: object, *, label: str = "positional") -> dict[str, str]:
+        assert value is result
+        metadata_labels.append(label)
+        return {"label": label}
+
+    def operation(value: object, *, label: str = "positional") -> object:
+        if label == "failure":
+            raise original
+        return value
+
+    wrapped = profiler.record_function_with_metadata("live_workflow", metadata_factory=metadata)(
+        operation
+    )
+    assert inspect.unwrap(wrapped) is operation
+    assert inspect.signature(wrapped) == inspect.signature(operation)
+    assert wrapped(result) is result
+
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as trace:
+        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+        assert wrapped(result, label="unselected") is result
+        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+        assert wrapped(result) is result
+        assert wrapped(result, label="selected") is result
+        with pytest.raises(ValueError) as caught:
+            wrapped(result, label="failure")
+        assert caught.value is original
+        monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
+        assert wrapped(result, label="deselected") is result
+
+    monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset({"workflow"}))
+    assert wrapped(result, label="profiler_stopped") is result
+    assert metadata_labels == ["positional", "selected", "failure"]
+    assert sum(event.name == "live_workflow" for event in trace.events()) == 3
 
 
 def test_metadata_failures_log_once_per_scope_at_warning_level(
