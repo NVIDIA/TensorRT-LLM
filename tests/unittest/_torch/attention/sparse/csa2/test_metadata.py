@@ -2223,7 +2223,9 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
 
     def forward():
         # The real engine's preprocessing is captured ahead of every consumer.
-        engine._preprocess_inputs({"attn_metadata": metadata})
+        engine._preprocess_inputs(
+            {"attn_metadata": metadata}, enable_spec_decode=False, runtime_draft_len=0
+        )
         return {name: tensor.clone() for name, tensor in _decode_derived_outputs(metadata).items()}
 
     for _ in range(2):

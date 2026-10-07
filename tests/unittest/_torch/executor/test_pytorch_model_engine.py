@@ -2609,9 +2609,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                token_nums=[257],
                                                is_gen=False))
                 try:
-                    inputs, _, _ = engine._runner._prepare_inputs(scheduled, manager,
-                                                       metadata, enable_spec_decode=False,
-                                                       runtime_draft_len=0, is_dummy=warmup)
+                    inputs, _, _ = engine._runner._prepare_inputs(
+                        scheduled,
+                        manager,
+                        metadata,
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=warmup)
                     self.assertEqual(inputs['context_requests'],
                                      scheduled.context_requests)
                     self.assertTrue(inputs['context_requests'][0].is_dummy)
@@ -2659,7 +2663,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                         metadata,
                         new_tensors_device=SimpleNamespace(
                             new_tokens=new_tokens) if overlap else None,
-                        enable_spec_decode=False, runtime_draft_len=0, is_dummy=False)
+                        enable_spec_decode=False,
+                        runtime_draft_len=0,
+                        is_dummy=False)
                     expected_context = list(range(3872, 5000)) if mixed else []
                     self.assertEqual(
                         inputs['input_ids'].cpu().tolist(),
