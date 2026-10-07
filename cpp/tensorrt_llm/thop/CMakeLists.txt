@@ -39,6 +39,15 @@ set_property(TARGET th_utils PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(th_utils PUBLIC tllm::runtime_buffers ${TORCH_LIBRARIES}
                                       Python3::Python)
 
+add_library(th_tensor_allocators STATIC userbuffersTensor.cpp)
+add_library(tllm::torch_tensor_allocators ALIAS th_tensor_allocators)
+set_property(TARGET th_tensor_allocators PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_compile_features(th_tensor_allocators PUBLIC cxx_std_20)
+target_link_libraries(
+  th_tensor_allocators
+  PUBLIC tllm::torch_utils
+  PRIVATE tllm::kernel_userbuffers)
+
 function(add_th_common_family target)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "COMPONENT_LOCAL" ""
                         "SOURCES;LINK_LIBRARIES;OBJECT_LIBRARIES")
@@ -98,6 +107,7 @@ add_subdirectory(minimaxM3)
 
 add_th_common_family(
   th_common_gemm_quant
+  COMPONENT_LOCAL
   SOURCES
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
@@ -133,7 +143,45 @@ add_th_common_family(
   weightOnlyQuantOp.cpp
   finegrained_mixed_dtype_gemm_thop.cpp
   lmHeadArgmaxOp.cpp
-  tinygemm2.cpp)
+  tinygemm2.cpp
+  LINK_LIBRARIES
+  tllm::torch_tensor_allocators
+  tllm::common_op_utils
+  tllm::common_fp8
+  tllm::common_nccl_comm
+  tllm::kernel_cuda_core_gemm
+  tllm::kernel_cuda_core_gemm_nvfp4
+  tllm::kernel_gemm_utilities
+  tllm::kernel_quantization
+  tllm::kernel_activation_quantization
+  tllm::kernel_normalization
+  tllm::kernel_lm_head_argmax
+  tllm::kernel_weight_only_gemm
+  tllm::kernel_fp8_block_scale_gemm
+  tllm::kernel_tiny_gemm
+  fb_gemm_src
+  OBJECT_LIBRARIES
+  trtllm_gen_gemm
+  trtllm_gen_gemm_gated_act
+  trtllm_gen_batched_gemm
+  ws_layernorm_src
+  fusedGatedRMSNormQuant_src
+  groupRmsNormKernels_src
+  marlin_src
+  dsv3_min_latency_kernels)
+add_library(tllm::torch_gemm_quant ALIAS th_common_gemm_quant)
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  target_link_libraries(th_common_gemm_quant PRIVATE low_latency_gemm_src)
+else()
+  target_link_libraries(th_common_gemm_quant
+                        PRIVATE ${INTERNAL_CUTLASS_KERNELS_TARGET})
+endif()
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  target_link_libraries(th_common_gemm_quant PRIVATE fp4_gemm_src)
+else()
+  target_link_libraries(th_common_gemm_quant
+                        PRIVATE ${INTERNAL_CUTLASS_KERNELS_TARGET})
+endif()
 
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
 # because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
@@ -161,7 +209,7 @@ add_th_common_family(
   reducescatterOp.cpp
   localityDomainAllocator.cpp
   userbuffersFinalizeOp.cpp
-  userbuffersTensor.cpp
+  userbuffersTensorOp.cpp
   virtualMemoryAllocator.cpp
   fusedGemmAllreduceOp.cpp
   dwdpFabricGatherOp.cpp)
@@ -254,7 +302,7 @@ set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
-                    ${SHARED_TARGET} pg_utils)
+                    ${SHARED_TARGET} pg_utils th_tensor_allocators)
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common_decoding
@@ -282,6 +330,7 @@ endif()
 
 if(ENABLE_CUBLASLT_FP4_GEMM)
   target_link_libraries(th_common PRIVATE ${CUBLASLT_LIB})
+  target_link_libraries(th_common_gemm_quant PRIVATE ${CUBLASLT_LIB})
 endif()
 
 if(ENABLE_MULTI_DEVICE)

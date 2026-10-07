@@ -57,13 +57,15 @@ if(${BUILD_PYT})
     tllm::torch_utils
     LABELS
     "unit;runtime;thop;gpu")
-  foreach(family Sequence VisualGen Decoding)
+  foreach(family Sequence VisualGen Decoding GemmQuant)
     if(family STREQUAL "Sequence")
       set(family_target tllm::torch_sequence)
     elseif(family STREQUAL "VisualGen")
       set(family_target tllm::torch_visual_gen)
-    else()
+    elseif(family STREQUAL "Decoding")
       set(family_target tllm::torch_decoding)
+    else()
+      set(family_target tllm::torch_gemm_quant)
     endif()
     add_tllm_gtest(
       torch${family}RegistrationTest

@@ -45,12 +45,13 @@ inline void expectTorchRegistrations(std::span<TorchRegistration const> registra
 inline void expectOnlyTorchFamily(std::span<TorchRegistration const> registrations)
 {
     auto const names = c10::Dispatcher::singleton().getAllOpNames();
-    auto const count
-        = std::count_if(names.begin(), names.end(), [](auto const& name) { return name.name.starts_with("trtllm::"); });
+    auto const count = std::count_if(names.begin(), names.end(),
+        [](auto const& name)
+        { return (name.name.starts_with("trtllm::") || name.name.starts_with("tensorrt_llm::")); });
     EXPECT_EQ(count, registrations.size());
     for (auto const& name : names)
     {
-        if (name.name.starts_with("trtllm::"))
+        if ((name.name.starts_with("trtllm::") || name.name.starts_with("tensorrt_llm::")))
         {
             EXPECT_TRUE(std::any_of(registrations.begin(), registrations.end(),
                 [&](auto const& registration) { return name.name == registration.name; }))
