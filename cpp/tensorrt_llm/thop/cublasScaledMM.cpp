@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "cublasScaledMM.h"
 #include "cublasScaledMMLut.h"
 #include "tensorrt_llm/common/cublasMMWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -349,8 +350,8 @@ Tensor& cublas_scaled_mm_out(Tensor const& mat_a, Tensor const& mat_b, Tensor co
 }
 
 Tensor cublas_scaled_mm(Tensor const& mat_a, Tensor const& mat_b, Tensor const& scale_a, Tensor const& scale_b,
-    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    std::optional<at::Tensor> const& bias, std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind,
+    c10::optional<torch::List<int64_t>> group)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -384,8 +385,7 @@ Tensor& cublas_mm_out(Tensor const& mat_a, Tensor const& mat_b, std::optional<at
 }
 
 Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Tensor> const& bias,
-    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind = 0,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind, c10::optional<torch::List<int64_t>> group)
 {
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
@@ -398,20 +398,3 @@ Tensor cublas_mm(Tensor const& mat_a, Tensor const& mat_b, std::optional<at::Ten
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "cublas_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scale_a, Tensor scale_b, Tensor? bias,"
-        " ScalarType? out_dtype, int output_buffer_kind=0, int[]? group=None)"
-        " -> (Tensor out)");
-    m.def(
-        "cublas_mm(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype,"
-        " int output_buffer_kind=0, int[]? group=None) -> (Tensor out)");
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("cublas_scaled_mm", &tensorrt_llm::torch_ext::cublas_scaled_mm);
-    m.impl("cublas_mm", &tensorrt_llm::torch_ext::cublas_mm);
-}

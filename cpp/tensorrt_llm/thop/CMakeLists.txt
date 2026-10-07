@@ -48,6 +48,16 @@ target_link_libraries(
   PUBLIC tllm::torch_utils
   PRIVATE tllm::kernel_userbuffers)
 
+add_library(th_cublas STATIC cublasScaledMM.cpp)
+add_library(tllm::torch_cublas ALIAS th_cublas)
+set_property(TARGET th_cublas PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_compile_features(th_cublas PUBLIC cxx_std_20)
+target_link_libraries(
+  th_cublas
+  PUBLIC tllm::torch_utils
+  PRIVATE tllm::torch_tensor_allocators tllm::common_op_utils
+          tllm::common_nccl_comm)
+
 function(add_th_common_family target)
   cmake_parse_arguments(PARSE_ARGV 1 ARG "COMPONENT_LOCAL" ""
                         "SOURCES;LINK_LIBRARIES;OBJECT_LIBRARIES")
@@ -129,7 +139,7 @@ add_th_common_family(
   COMPONENT_LOCAL
   SOURCES
   cutlassScaledMM.cpp
-  cublasScaledMM.cpp
+  cublasScaledMMOp.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
   marlinNvfp4MM.cpp
@@ -165,6 +175,7 @@ add_th_common_family(
   tinygemm2.cpp
   LINK_LIBRARIES
   tllm::torch_tensor_allocators
+  tllm::torch_cublas
   tllm::common_op_utils
   tllm::common_fp8
   tllm::common_nccl_comm
@@ -205,8 +216,42 @@ endif()
 # TODO: th_common_moe does not compile with USING_OSS_CUTLASS_MOE_GEMM=OFF
 # because moe/utils/moeUtilOp.cpp depends on OSS-specific MoE utility types and
 # function signatures.
-add_th_common_family(th_common_moe SOURCES fusedTopkSoftmax.cpp
-                     llama4MinLatency.cpp noAuxTcOp.cpp dsv3RouterGemmOp.cpp)
+add_th_common_family(
+  th_common_moe
+  COMPONENT_LOCAL
+  SOURCES
+  fusedTopkSoftmax.cpp
+  llama4MinLatency.cpp
+  noAuxTcOp.cpp
+  dsv3RouterGemmOp.cpp
+  LINK_LIBRARIES
+  tllm::torch_cublas
+  tllm::common_op_utils
+  tllm::common_environment
+  tllm::kernel_moe
+  tllm::kernel_moe_custom_routing
+  tllm::kernel_moe_prepare
+  tllm::kernel_moe_communication
+  tllm::kernel_moe_load_balance
+  tllm::kernel_quantization
+  tllm::kernel_fp8_block_scale_gemm
+  tllm::kernel_grouped_gemm
+  tllm::runtime_moe_load_balance
+  tllm::runtime_host_accessible_memory
+  tllm::runtime_distributed
+  pg_utils
+  OBJECT_LIBRARIES
+  llama4_min_latency_kernels
+  dsv3_min_latency_kernels
+  marlin_src
+  trtllm_gen_fp8_block_scale_moe
+  trtllm_gen_batched_gemm
+  cute_dsl_src
+  moe_dynamic_eplb_src)
+add_library(tllm::torch_moe ALIAS th_common_moe)
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_link_libraries(th_common_moe PRIVATE tllm::kernel_moe_lora)
+endif()
 
 # MoE torch ops live in moe/<backend|role>/; that directory adds them to
 # th_common_moe with target_sources() so the list stays next to the files.
@@ -320,8 +365,14 @@ set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_target_properties(th_common PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED
                                                            ON)
 target_link_libraries(
-  th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
-                    ${SHARED_TARGET} pg_utils th_tensor_allocators)
+  th_common
+  PRIVATE ${TORCH_LIBRARIES}
+          th_utils
+          ${Python3_LIBRARIES}
+          ${SHARED_TARGET}
+          pg_utils
+          th_tensor_allocators
+          th_cublas)
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common_decoding
