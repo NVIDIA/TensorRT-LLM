@@ -604,17 +604,22 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 7b: Model-owned finalize, before the combine ==========
         # ``do_finalize=False`` means the backend hands back the unfinalized
         # ``(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)``
-        # triple so the model can apply its own per-expert transform to each
-        # expert row. No ``Communication.combine`` can carry that: every
-        # strategy is typed for a dense per-token tensor. So when a comm
-        # strategy is active the model's finalize has to run HERE, on the
-        # dispatched rows, and the combine then reduces already-finalized
-        # partials. That reordering is valid only for a finalize computed from
-        # one ``(token, expert)`` row at a time, which is the contract a model
-        # accepts by setting ``unfinalized_combine_fn``.
-        if not do_finalize and moe.comm is not None:
+        # triple. A registered ``unfinalized_combine_fn`` ALWAYS runs on it,
+        # with or without a comm strategy, so the forward's return type is a
+        # function of static config alone: call sites unpack either a triple
+        # or a dense tensor, and ``trtllm::moe_custom_op`` fixes the return
+        # type at trace time. Under a comm strategy the finalize must run here
+        # anyway -- no combine can carry the triple -- and the combine then
+        # reduces already-finalized partials, which is correct only because
+        # the finalize is computed from one ``(token, expert)`` row at a time.
+        # That is the contract a model accepts by registering the hook, and
+        # ``validate_backend`` rejected every configuration it cannot hold
+        # under at construction. A comm strategy with no registered hook is
+        # the one combination left to refuse at runtime, inside the helper.
+        if not do_finalize and (moe.unfinalized_combine_fn is not None or moe.comm is not None):
             final_hidden_states = self._finalize_before_combine(
                 final_hidden_states,
+                token_selected_slots=token_selected_slots,
                 token_final_scales=token_final_scales,
                 output_dtype=output_dtype,
             )
@@ -642,6 +647,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         self,
         unfinalized: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
         *,
+        token_selected_slots: Optional[torch.Tensor],
         token_final_scales: Optional[torch.Tensor],
         output_dtype: Optional[torch.dtype],
     ) -> torch.Tensor:
@@ -653,16 +659,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
         weights. The index map may flatten token and top-k dimensions, while a
         quantized layout is free to reinterpret ``x``'s leading dimension.
 
-        ``token_final_scales`` must be the POST-dispatch copy: under attention
-        DP this rank holds rows for tokens it does not own, and only the
-        dispatched weights cover them.
+        ``token_selected_slots`` and ``token_final_scales`` must be the
+        POST-dispatch copies: under attention DP this rank holds rows for
+        tokens it does not own, and only the dispatched copies cover them.
         """
         moe = self.moe
-        # ``ConfigurableMoE`` declares the attribute; the default keeps the
-        # unit tests that stub ``moe`` with a minimal namespace working, the
-        # same way the zero-token DP-pad guard above does.
-        finalize_fn = getattr(moe, "unfinalized_combine_fn", None)
+        finalize_fn = moe.unfinalized_combine_fn
         if finalize_fn is None:
+            # Reached only with an active comm strategy: the registered-hook
+            # combinations were validated at construction, so this is the one
+            # refusal that stays at runtime (``do_finalize`` is a forward
+            # argument, not config).
             raise NotImplementedError(
                 f"{type(moe.backend).__name__} was asked for do_finalize=False while "
                 f"{type(moe.comm).__name__} is active, but the model registered no "
@@ -692,8 +699,19 @@ class ExternalCommMoEScheduler(MoEScheduler):
         combined = finalize_fn(
             gemm2_output=gemm2_output,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            # A per-expert transform needs to know which expert (slot) each
+            # row came from; the index map alone cannot answer that.
+            token_selected_slots=token_selected_slots,
             routing_weights=token_final_scales,
             num_tokens=num_tokens,
+        )
+        # ``gemm2_output`` is hidden-padded for some kernels and the backend
+        # only slices it on its own finalize path, so the hook must hand back
+        # exactly the layer's hidden size for the combine to reduce.
+        assert combined.shape == (num_tokens, moe.hidden_size), (
+            f"unfinalized_combine_fn returned {tuple(combined.shape)}, expected "
+            f"({num_tokens}, {moe.hidden_size}); gemm2_output is hidden-padded "
+            "and the hook owns the slice."
         )
         # Cast BEFORE the combine, not after: the one-sided workspace's combine
         # region is sized from (hidden_size, act_dtype), so handing it a wider
