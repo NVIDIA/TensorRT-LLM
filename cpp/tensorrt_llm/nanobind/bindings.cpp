@@ -31,6 +31,9 @@
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/quantization.h"
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
@@ -75,6 +78,10 @@ using OptVec = std::optional<std::vector<T>>;
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
+#if TRTLLM_ENABLE_NCCL_PROFILING
+    // Nanobind translates startup configuration errors into Python import errors.
+    tc::initializeProfiler();
+#endif
     m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     nb::set_leak_warnings(false);
 
@@ -168,6 +175,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
     buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
+    buildInfo.attr("ENABLE_NCCL_PROFILING") = nb::bool_(TRTLLM_ENABLE_NCCL_PROFILING);
 
     nb::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
