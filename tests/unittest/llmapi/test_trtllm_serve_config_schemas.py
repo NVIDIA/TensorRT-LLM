@@ -35,11 +35,14 @@ generator = SimpleNamespace(
 
 @pytest.fixture(scope="module")
 def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
-    paths = generator.write_schemas(tmp_path_factory.mktemp("schemas"), version="test-release")
+    from tensorrt_llm.version import __version__
+
+    paths = generator.write_schemas(tmp_path_factory.mktemp("schemas"))
     result = {path.name: json.loads(path.read_text()) for path in paths}
     for name, schema in result.items():
         Draft202012Validator.check_schema(schema)
-        assert schema["$id"].endswith(f"/test-release/_static/schemas/{name}")
+        assert schema["$id"].endswith(f"/{__version__}/_static/schemas/{name}")
+        assert schema["title"].startswith(f"TensorRT-LLM {__version__} ")
     return result
 
 
@@ -187,22 +190,21 @@ def test_docs_publishes_only_after_successful_html_build(
     monkeypatch.setattr(
         extension.runpy,
         "run_path",
-        lambda _path: {"write_schemas": lambda *args, **kwargs: calls.append((args, kwargs))},
+        lambda _path: {"write_schemas": lambda output_dir: calls.append(output_dir)},
     )
     app = SimpleNamespace(
         builder=SimpleNamespace(format=builder_format),
         outdir=tmp_path,
-        config=SimpleNamespace(version="test-release"),
     )
     extension._write_schema_assets(app, RuntimeError("failed") if failed else None)
     if builder_format == "html" and not failed:
-        assert calls == [((tmp_path / "_static/schemas",), {"version": "test-release"})]
+        assert calls == [tmp_path / "_static/schemas"]
     else:
         assert not calls
 
 
 def test_generation_is_deterministic(tmp_path: Path, schemas: dict[str, dict]) -> None:
-    paths = generator.write_schemas(tmp_path, version="test-release")
+    paths = generator.write_schemas(tmp_path)
     assert {path.name: json.loads(path.read_text()) for path in paths} == schemas
 
 
@@ -212,13 +214,13 @@ def test_checked_in_schemas_are_current() -> None:
 
 @pytest.mark.parametrize("missing", [False, True])
 def test_check_detects_stale_files_without_writing(tmp_path: Path, missing: bool) -> None:
-    paths = generator.write_schemas(tmp_path, version="test-release")
-    generator.write_schemas(tmp_path, version="test-release", check=True)
+    paths = generator.write_schemas(tmp_path)
+    generator.write_schemas(tmp_path, check=True)
     if missing:
         paths[0].unlink()
     else:
         paths[0].write_text("{}\n", encoding="utf-8")
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
-        generator.write_schemas(tmp_path, version="test-release", check=True)
+        generator.write_schemas(tmp_path, check=True)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before

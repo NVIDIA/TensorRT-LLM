@@ -29,7 +29,7 @@ def _write_schema_assets(app: Sphinx, exception: Exception | None) -> None:
         return
     generator = Path(__file__).resolve().parents[3] / "scripts/generate_trtllm_serve_schemas.py"
     write_schemas = runpy.run_path(str(generator))["write_schemas"]
-    write_schemas(Path(app.outdir) / "_static" / "schemas", version=app.config.version)
+    write_schemas(Path(app.outdir) / "_static" / "schemas")
 
 
 def setup(app: Sphinx) -> dict:
