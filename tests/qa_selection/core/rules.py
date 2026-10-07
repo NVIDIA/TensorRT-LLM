@@ -56,8 +56,6 @@ class MachineCondition:
     FIELD_OPERATORS = {
         "sm": NUMERIC_OPERATORS,
         "device_memory_mib": NUMERIC_OPERATORS,
-        "gpu_count": NUMERIC_OPERATORS,
-        "max_gpu_per_node": NUMERIC_OPERATORS,
         "device_name": STRING_OPERATORS,
         "cpu_arch": STRING_OPERATORS,
     }

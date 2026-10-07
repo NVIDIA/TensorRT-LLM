@@ -45,8 +45,8 @@ def test_a_loaded_but_untargeted_plugin_is_invisible(selection):
 def test_options_are_not_validated_while_inert(selection):
     """Without `--machine` no other option is read, so none can be refused.
 
-    `--gpus=999 --ladder=1,4,8` is two usage errors for any named machine.
+    `--ladder=999` is a usage error for any named machine.
     """
-    run = selection.run(DeviceCount.MODULE, "--gpus=999", "--ladder=1,4,8")
+    run = selection.run(DeviceCount.MODULE, "--ladder=999")
 
     assert run.selected == [DeviceCount.UNMARKED, DeviceCount.NEEDS_EIGHT]

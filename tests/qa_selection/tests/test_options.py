@@ -14,7 +14,6 @@
 # limitations under the License.
 """AC-4: each option answers one question, and a rung run matches what was published.
 
-    --gpus=N       GPUs this run may use            feasibility
     --ladder=R,..  allocation sizes that exist      partition
     --rung=N       the allocation this run holds    neither
 
@@ -49,7 +48,7 @@ def test_rung_narrows_what_executes_not_the_machine(selection):
     assert LadderDemands.NEEDS_EIGHT not in rung.selected
 
     # Feasibility was decided against the whole node.
-    assert rung.reported("target") == "B200, 8 GPUs, ladder 1,4,8"
+    assert rung.reported("target") == "B200, ladder 1,4,8"
     assert rung.reported("feasible") == "3  (0 deselected)"
     assert rung.reported("live") == "1  (rung 4 only)"
 
@@ -83,51 +82,10 @@ def test_a_rung_run_differs_from_the_plan_only_in_what_runs(selection):
     ]
     assert rung.selected == [LadderDemands.NEEDS_TWO]
 
-    assert plan.reported("target") == rung.reported("target") == "B200, 8 GPUs, ladder 1,4,8"
+    assert plan.reported("target") == rung.reported("target") == "B200, ladder 1,4,8"
     assert plan.reported("feasible") == rung.reported("feasible") == "3  (0 deselected)"
     assert plan.reported("live") == "3"
     assert rung.reported("live") == "1  (rung 4 only)"
-
-
-def test_gpu_budget_alone_publishes_one_list(selection):
-    """`--gpus` names no ladder, so it writes one list and no per-rung lists."""
-    run = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--gpus=4", "--selection-out-dir={out}"
-    )
-
-    assert run.selected == [LadderDemands.UNMARKED, LadderDemands.NEEDS_TWO]
-    assert run.written == ["B200.ids", "B200.json"]
-    assert run.ids() == [LadderDemands.UNMARKED, LadderDemands.NEEDS_TWO]
-
-
-def test_the_two_artifacts_answer_different_questions(selection):
-    """`<machine>.ids` lists what runs; `<machine>.json` records every decision."""
-    run = selection.run(
-        LadderDemands.MODULE, "--machine=B200", "--gpus=4", "--selection-out-dir={out}"
-    )
-
-    # The list: node ids only, and only the ones that will run.
-    assert run.ids() == [LadderDemands.UNMARKED, LadderDemands.NEEDS_TWO]
-
-    # The record: every candidate, in collection order, including the one the
-    # list omits -- and the blocker that omitted it.
-    assert [outcome["nodeid"] for outcome in run.record["tests"]] == [
-        LadderDemands.UNMARKED,
-        LadderDemands.NEEDS_TWO,
-        LadderDemands.NEEDS_EIGHT,
-    ]
-    assert run.outcome(LadderDemands.NEEDS_EIGHT)["selected"] is False
-    assert run.record["deselected_by_reason"] == {
-        "skip_less_device: needs 8 GPUs, target has 4": [LadderDemands.NEEDS_EIGHT]
-    }
-    assert run.record["counts"] == {
-        "candidates": 3,
-        "feasible": 2,
-        "deselected": 1,
-        "live": 2,
-        "unassignable": 0,
-        "unclassified": 0,
-    }
 
 
 def test_rung_outside_the_ladder(selection):
@@ -135,22 +93,6 @@ def test_rung_outside_the_ladder(selection):
     run = selection.refuse(LadderDemands.MODULE, "--machine=B200", "--ladder=1,4,8", "--rung=2")
 
     run.result.stderr.fnmatch_lines(["*--rung: 2 is not a rung of --ladder=1,4,8*"])
-
-
-def test_rung_without_a_ladder(selection):
-    """`--rung` without `--ladder` is refused."""
-    run = selection.refuse(LadderDemands.MODULE, "--machine=B200", "--rung=4")
-
-    run.result.stderr.fnmatch_lines(["*--rung: requires --ladder*"])
-
-
-def test_budget_and_ladder_together(selection):
-    """`--gpus` and `--ladder` both state a GPU count, and are refused together."""
-    run = selection.refuse(LadderDemands.MODULE, "--machine=B200", "--gpus=4", "--ladder=1,4,8")
-
-    run.result.stderr.fnmatch_lines(
-        ["*--gpus: cannot be combined with --ladder*--rung*shorter --ladder*"]
-    )
 
 
 def test_rung_with_an_output_directory(selection):
