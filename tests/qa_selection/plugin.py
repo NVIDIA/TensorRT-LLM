@@ -27,7 +27,7 @@ import pytest
 
 from .core.machines import ProfileConfigError, default_catalog
 from .core.markers import default_markers
-from .core.report import SelectionOutput, TerminalSummary, UnassignableWarning
+from .core.report import SelectionOutput, TerminalSummary
 from .core.request import SelectionError, SelectionRequest
 from .core.selection import Selection
 from .core.selector import CollectedTest, Mark
@@ -78,8 +78,6 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         return
     output = SelectionOutput.of(selection, Path(str(config.rootpath)))
     config.stash[SelectionStash.OUTPUT] = output
-    # Warned rather than summarised, so a job log can grep the warnings section.
-    UnassignableWarning.issue_for(output.report)
 
 
 def pytest_terminal_summary(terminalreporter) -> None:
