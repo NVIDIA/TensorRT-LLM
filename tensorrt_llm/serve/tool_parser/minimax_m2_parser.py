@@ -189,10 +189,12 @@ class MiniMaxM2ToolParser(BaseToolParser):
 
             # Find all complete invoke blocks
             complete_invocations = list(self.invoke_regex.finditer(inner_text))
-            # Check for partial invoke (started but not closed)
+            # Check for a partial invoke (started but not closed) after the
+            # last complete one.
+            partial_start = complete_invocations[-1].end() if complete_invocations else 0
             partial_invoke = re.search(
                 r'<invoke\s+name=["\']?(.*?)["\']?\s*>((?:(?!</invoke>).)*?)$',
-                inner_text,
+                inner_text[partial_start:],
                 re.DOTALL,
             )
 
@@ -210,47 +212,49 @@ class MiniMaxM2ToolParser(BaseToolParser):
                     param_type = _get_param_types(param_name, func_name, tools)
                     arguments[param_name] = _parse_param_value(param_value, param_type)
 
-                # Send function name
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id + 1 if self.current_tool_id >= 0 else 0,
-                        name=func_name,
-                        parameters="",
-                    )
-                )
-                # Send complete arguments
                 args_json = json.dumps(arguments, ensure_ascii=False)
-                self.current_tool_id = self.current_tool_id + 1 if self.current_tool_id >= 0 else 0
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=None,
-                        parameters=args_json,
+                if self.current_tool_name_sent:
+                    # The name and an argument prefix were already streamed
+                    # while this invoke was partial; send only the remainder.
+                    streamed_json = self._json_buffers.get(self.current_tool_id, "")
+                    args_json = args_json[len(streamed_json) :]
+                else:
+                    self.current_tool_id += 1
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
                     )
-                )
+                if args_json:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=args_json,
+                        )
+                    )
+                self.current_tool_name_sent = False
                 self._current_invoke_count = i + 1
 
             # Handle partial invoke (streaming in progress)
-            if partial_invoke and len(complete_invocations) == self._current_invoke_count:
+            if partial_invoke:
                 func_name = partial_invoke.group(1).strip()
                 partial_params_text = partial_invoke.group(2)
 
                 # If we haven't sent the name for this tool yet
-                if (
-                    not self.current_tool_name_sent
-                    or self.current_tool_id < self._current_invoke_count
-                ):
-                    if func_name:
-                        self.current_tool_id = self._current_invoke_count
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=func_name,
-                                parameters="",
-                            )
+                if not self.current_tool_name_sent and func_name:
+                    self.current_tool_id += 1
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
                         )
-                        self.current_tool_name_sent = True
-                        self._json_buffers[self.current_tool_id] = ""
+                    )
+                    self.current_tool_name_sent = True
+                    self._json_buffers[self.current_tool_id] = ""
 
                 # Stream partial arguments
                 if self.current_tool_name_sent and partial_params_text:
@@ -261,15 +265,16 @@ class MiniMaxM2ToolParser(BaseToolParser):
                             param_name = param_name.strip()
                             param_type = _get_param_types(param_name, func_name, tools)
                             arguments[param_name] = _parse_param_value(param_value, param_type)
-                        new_args_json = json.dumps(arguments, ensure_ascii=False)
+                        # Leave the object open so that later parameters
+                        # extend the already-streamed prefix.
+                        new_args_json = json.dumps(arguments, ensure_ascii=False)[:-1]
                         prev_json = self._json_buffers.get(self.current_tool_id, "")
-                        if new_args_json != prev_json:
-                            # Send incremental diff
+                        if len(new_args_json) > len(prev_json):
                             calls.append(
                                 ToolCallItem(
                                     tool_index=self.current_tool_id,
                                     name=None,
-                                    parameters=new_args_json,
+                                    parameters=new_args_json[len(prev_json) :],
                                 )
                             )
                             self._json_buffers[self.current_tool_id] = new_args_json
