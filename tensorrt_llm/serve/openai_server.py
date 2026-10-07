@@ -590,6 +590,11 @@ class OpenAIServer(_VideoRoutesMixin):
         if (enable_runtime_control_endpoints
                 and generator.args.sleep_config is None):
             raise ValueError("Runtime control endpoints require sleep_config")
+        if (enable_runtime_control_endpoints
+                and generator.args.num_serve_frontends > 1):
+            raise ValueError(
+                "Runtime control endpoints require num_serve_frontends=1 "
+                "because replay protection is local to each frontend.")
 
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)

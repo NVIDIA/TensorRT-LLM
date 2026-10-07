@@ -297,8 +297,11 @@ def test_runtime_control_rejects_duplicate_request_nonce():
 
     with TestClient(server.app) as client:
         first_response = client.post("/release_memory", content=body, headers=headers)
+        resume_response = _post(client, "/resume_memory")
         replay_response = client.post("/release_memory", content=body, headers=headers)
 
+    assert resume_response.status_code == 200
+    server.generator.resume.assert_called_once_with(None)
     assert first_response.status_code == 200
     assert replay_response.status_code == 401
     server.generator.release.assert_called_once_with(None)
@@ -457,6 +460,23 @@ def test_legacy_and_generic_controls_are_mutually_exclusive():
             metadata_server_cfg=None,
             enable_rl_control_endpoints=True,
             rl_control_api_key="legacy-secret",
+            enable_runtime_control_endpoints=True,
+            runtime_control_api_key="secret",
+        )
+
+
+@pytest.mark.parametrize("generator_cls", [LLM, AsyncLLM])
+def test_runtime_control_rejects_multiple_frontends(generator_cls):
+    generator = object.__new__(generator_cls)
+    generator.args = SimpleNamespace(sleep_config=SleepConfig(), num_serve_frontends=2)
+
+    with pytest.raises(ValueError, match="require num_serve_frontends=1"):
+        OpenAIServer(
+            generator=generator,
+            model="model",
+            tool_parser=None,
+            server_role=None,
+            metadata_server_cfg=None,
             enable_runtime_control_endpoints=True,
             runtime_control_api_key="secret",
         )

@@ -671,6 +671,10 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
+        raise click.BadParameter(
+            "Runtime control endpoints require num_serve_frontends=1 because "
+            "replay protection is local to each frontend.")
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
     # re-execs this command line verbatim, so with port 0 every frontend binds
     # its own kernel-assigned port instead of sharing one, and every frontend
