@@ -36,8 +36,9 @@ decode kernels' catalog entries:
 
 * KDA (`K3DecodeKDA`): one token per request, the fused input projection and the plain decode in one
   `ssm/k3_kda_decode_attn` launch. Verify tokens (DFlash / DSpark at an even verify width up to 8): the cache manager
-  then keeps the KDA state after every verify token, and every verify of the layer, on any step, runs the kernels
-  that keep it: `ssm/k3_kda_attn` for one request of 8 tokens (the projection fused in), else `ssm/k3_kda_verify`.
+  then keeps the last verify's draft records (per draft the row innovations, beta * k and the decay), and every
+  verify of the layer, on any step, runs the kernels that write them and replay the accepted drafts from them:
+  `ssm/k3_kda_attn` for one request of 8 tokens (the projection fused in), else `ssm/k3_kda_verify`.
 * MLA (`K3DecodeMLA`): `attention/k3_mla_qkv` (the query path and the step's latent KV rows into the paged cache),
   then `attention/k3_mla_attn_vb_out` (the attention, v_b and the output gate in one launch).
 
@@ -1831,10 +1832,11 @@ class KimiLinearModel(DecoderModel):
 
     @property
     def kda_token_states(self) -> bool:
-        """Whether the hybrid cache manager keeps the KDA state after every verify token, the protocol of
-        ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn``. The engine reads it once the weights are loaded, to build the
-        manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer taking the K3 kernels.
-        Otherwise the KDA verify replays the accepted drafts (the built-in verify)."""
+        """Whether the hybrid cache manager keeps the last verify's draft records (``kda_state_tok``), from which
+        ``ssm/k3_kda_verify`` and ``ssm/k3_kda_attn`` replay the accepted drafts. The engine reads it once the weights
+        are loaded, to build the manager: DFlash / DSpark drafts of an even verify width up to 8, every KDA layer
+        taking the K3 kernels. Otherwise the KDA verify replays the accepted drafts from the replay caches (the
+        built-in verify)."""
         spec_config = getattr(self.model_config, "spec_config", None)
         return bool(
             spec_config is not None
