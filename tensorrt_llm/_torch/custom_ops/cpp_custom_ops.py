@@ -16,6 +16,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::rotate_rows_")
+    def rotate_rows_(self: torch.Tensor, shift: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::scatter_kv_slots_")
+    def scatter_kv_slots_(
+        pool: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dst: torch.Tensor,
+        dst2: Optional[torch.Tensor] = None,
+        src: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,

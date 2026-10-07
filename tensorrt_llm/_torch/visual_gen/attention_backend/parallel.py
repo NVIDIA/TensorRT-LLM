@@ -348,7 +348,10 @@ class UlyssesAttention(AttentionBackend):
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
     Backend-specific kwargs are forwarded to the inner backend. Sequence
     lengths are updated after all-to-all, and VSA gates are redistributed with
-    the same sequence/head mapping as Q before they are forwarded.
+    the same sequence/head mapping as Q before they are forwarded. With a
+    ``kv_cache`` the caller's ``seq_len`` is the number of real tokens, the same
+    on every rank, and is passed through untouched; rows past it are padding
+    from the exchange.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -360,7 +363,8 @@ class UlyssesAttention(AttentionBackend):
     Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
     - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
     - Fused: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
-      + 1 for output (2 collectives total)
+      + 1 for output (2 collectives total). Requires equal Q and K/V head
+      counts; grouped-query attention always uses the unfused mode.
     """
 
     # One side stream shared across all UlyssesAttention instances on the
@@ -437,7 +441,29 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
-        if self.inner_backend.support_fused_qkv():
+        if kwargs.get("kv_cache") is not None:
+            # With a cache, seq_len counts the real tokens of the whole sequence and
+            # rows past it are padding; a caller passing its own shard length would
+            # silently drop real tokens.
+            rows = q.shape[1] * self.world_size
+            seq_len = kwargs.get("seq_len")
+            if seq_len is None:
+                raise ValueError(
+                    "with a K/V cache, pass seq_len: the real token count of the chunk"
+                )
+            if self.world_size > 1 and not q.shape[1] < seq_len <= rows:
+                raise ValueError(
+                    f"seq_len {seq_len} with a K/V cache must count the real tokens of the whole "
+                    f"sequence: more than this rank's {q.shape[1]} rows, at most {rows}"
+                )
+        # The fused path stacks q/k/v on one axis, which needs equal head counts;
+        # grouped-query models take the per-tensor path, and so does the K/V cache
+        # path, whose backends take q, k, v separately.
+        if (
+            self.inner_backend.support_fused_qkv()
+            and q.shape[2] == k.shape[2]
+            and kwargs.get("kv_cache") is None
+        ):
             return self._forward_fused(q, k, v, **kwargs)
         return self._forward_unfused(q, k, v, **kwargs)
 
@@ -597,11 +623,12 @@ class UlyssesAttention(AttentionBackend):
             if gate_fine is not None:
                 gate_fine = gate_fine.transpose(1, 2)
 
-        # Caller passed pre-A2A (sharded) seq_lens; hand the inner
-        # backend the post-A2A lengths instead.
         kwargs["batch_size"] = batch_size
-        kwargs["seq_len"] = seq_len_full
-        kwargs["seq_len_kv"] = kv_seq_len_full
+        if kwargs.get("kv_cache") is None:
+            # Caller passed pre-A2A (sharded) seq_lens; hand the inner
+            # backend the post-A2A lengths instead.
+            kwargs["seq_len"] = seq_len_full
+            kwargs["seq_len_kv"] = kv_seq_len_full
         if gate_compress is not None:
             kwargs["gate_compress"] = gate_compress
         if gate_fine is not None:
@@ -689,6 +716,8 @@ class UlyssesAttention(AttentionBackend):
         makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
+        if attn_kwargs.get("kv_cache") is not None:
+            raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
 
         # Issue the closures in issue_order. Order is correctness-neutral (_join_async
@@ -789,6 +818,9 @@ class UlyssesAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        return self.inner_backend.support_kv_cache()
 
 
 class Attention2DAttention(AttentionBackend):
