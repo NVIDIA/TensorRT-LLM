@@ -3962,13 +3962,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return fallback_capacity
 
     def _state_quota(self, state_slots: int) -> int:
-        """Quota for ``state_slots`` recurrent-state slots, plus the drafts'
-        records of the further slots the live floor keeps
-        (``_live_floor_token_state_slots``)."""
-        extra_slots = self._live_floor_token_state_slots(
-            self.kv_cache_config.max_util_for_resume) - state_slots
-        return (state_slots * self._mamba_state_bytes_per_slot() +
-                max(0, extra_slots) * self._kda_token_state_bytes_per_slot())
+        """Quota for ``state_slots`` recurrent-state slots, or for every slot
+        the live floor keeps (``_live_floor_token_state_slots``) when that is
+        more: each holds its states and its drafts' records."""
+        slots = max(
+            state_slots,
+            self._live_floor_token_state_slots(
+                self.kv_cache_config.max_util_for_resume))
+        return slots * self._mamba_state_bytes_per_slot()
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         attention_quota = super()._get_quota_from_max_tokens(max_tokens)

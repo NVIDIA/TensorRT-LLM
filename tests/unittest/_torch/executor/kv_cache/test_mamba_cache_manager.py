@@ -3880,15 +3880,17 @@ def test_v2_kda_token_states_reserve_quota_before_sizing():
     plain = _v2_kda_token_state_manager(kda_token_states=False, enable_block_reuse=False)
     assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 3
     # The pool keeps ceil(3 / max_util_for_resume) = 4 slots, each with the records of 2 drafts (3 x 8 x 256 fp32
-    # each); the quotas without them differ by exactly those.
+    # each). The quotas count the 4 slots' records and the 4th slot's states, which the quotas without the records
+    # leave out; the build takes the records out of the quota.
     reserved = 4 * 2 * 3 * 8 * 256 * 4
+    extra_slot_states = plain._mamba_state_bytes_per_slot()
     minimum = mgr._minimum_live_gpu_quota()
-    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    assert minimum - plain._minimum_live_gpu_quota() == reserved + extra_slot_states
     for max_tokens in (0, 4096):
         assert (
             mgr._get_quota_from_max_tokens(max_tokens)
             - plain._get_quota_from_max_tokens(max_tokens)
-            == reserved
+            == reserved + extra_slot_states
         )
 
     def build(quota):
@@ -3922,7 +3924,11 @@ def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
     assert mgr._max_resident_sequences() + mgr._num_reserved_dummy_slots == 19
     reserved = 21 * 2 * 3 * 8 * 256 * 4
     minimum = mgr._minimum_live_gpu_quota()
-    assert minimum - plain._minimum_live_gpu_quota() == reserved
+    # The 2 slots past the 19 resident ones count with their states as well.
+    assert (
+        minimum - plain._minimum_live_gpu_quota()
+        == reserved + 2 * plain._mamba_state_bytes_per_slot()
+    )
     quota = minimum + (64 << 20)
     built = mgr._build_cache_config(
         KVCacheManagerConfig(
