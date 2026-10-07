@@ -260,14 +260,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
 
-        # Opt-out escape hatch for the blocked-pending-context fast path (see
-        # _pending_ctx_certainly_blocked). On by default: the skip is decision-
-        # neutral by construction; the env var exists to measure it or rule it
-        # out in the field.
-        self._skip_blocked_pending_ctx = (
-            os.environ.get("TLLM_SCHEDULER_DISABLE_BLOCKED_CTX_SKIP", "0") != "1"
-        )
-
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -512,8 +504,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 break
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
-            # Checked before the admission-gate skip below because it is pure
-            # budget arithmetic (no manager call).
             if (
                 self.chunking_enabled
                 and req.state_value == self._context_init_state_value
@@ -521,16 +511,6 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 continue
             if req.py_request_id in preempted_ids:
-                continue
-            # Fast path: a pending context request whose draft-mirror admission
-            # is certainly refused this iteration cannot be scheduled, so the
-            # prefix-reuse probe below (two O(prompt_len / tokens_per_block)
-            # radix walks) and the schedule attempt are pure overhead. Under a
-            # pending-context pile this loop otherwise re-pays that cost for
-            # every pending request every iteration (measured ~3.7 ms per
-            # pending request, ~1.2 s host time per iteration at ~250 pending).
-            # Decision-neutral by construction: see the helper's contract.
-            if self._pending_ctx_certainly_blocked(req):
                 continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
@@ -1020,57 +1000,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         if draft_manager is None or self._joint_draft_manager is not None:
             return True
         return draft_manager.admit_mirror(req)
-
-    def _pending_ctx_certainly_blocked(self, req: LlmRequest) -> bool:
-        """Whether scheduling *req* this iteration is already known to fail.
-
-        Contract: this is a pure fast path. It returns True only when the full
-        phase-2 path for *req* would deterministically end in a SKIP with no
-        persistent side effects, so skipping the prefix-reuse probe and the
-        schedule attempt cannot change any scheduling decision or any state a
-        later decision depends on. When in doubt it returns False and the full
-        path runs.
-
-        The case it targets: an unpaired draft mirror (DFlash-style hidden-
-        state drafters) that reserves full prompt length per request pins the
-        draft pool at its ``max_util_for_resume`` gate, so every context
-        request beyond the admission ceiling stays pending with its
-        ``admit_mirror`` resume refused — yet the loop above re-pays two
-        O(prompt) radix walks and a doomed schedule attempt for each of them,
-        every iteration. Host step time then scales linearly with the pending
-        pile instead of with the scheduled batch.
-
-        Preconditions, each required for decision-neutrality:
-
-        * Chunked prefill only. On the non-chunked path a prepare failure
-          returns STOP and ends the loop after a single probe, so there is no
-          per-pending-request cost to save — and a ``continue`` here would
-          wrongly let later requests be attempted.
-        * Context request with an ACTIVE target cache. First-sight requests
-          must run the full path: their ``prepare_context`` claims reuse pages
-          (protecting them from eviction) and creates the mirror, both side
-          effects the skip must preserve. A suspended target must likewise be
-          given its resume attempt.
-        * ``mirror_admission_certainly_blocked``: the mirror exists, is
-          suspended, and the draft pool is above ``max_util_for_resume`` — the
-          exact gate ``admit_mirror``'s resume checks first, previewed without
-          side effects. Nothing between this check and where ``admit_mirror``
-          would run for *this* request can lower draft-pool utilization
-          (earlier pending requests have fully finished their attempts, and
-          the target-pool calls in between do not touch the draft pool), so
-          True here implies the refusal, and the full path's outcome — SKIP,
-          request stays pending — is reproduced for free.
-        """
-        if not self._skip_blocked_pending_ctx or not self.chunking_enabled:
-            return False
-        draft_manager = self.draft_kv_cache_manager
-        if draft_manager is None or self._joint_draft_manager is not None:
-            return False
-        if req.state_value != self._context_init_state_value:
-            return False
-        if not self.kv_cache_manager.has_active_cache(req):
-            return False
-        return draft_manager.mirror_admission_certainly_blocked(req)
 
     def _prepare_context_pair(self, req: LlmRequest) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
