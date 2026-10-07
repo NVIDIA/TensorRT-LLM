@@ -947,6 +947,30 @@ def _create_output_messages(
     return messages
 
 
+def _custom_tool_parameters() -> dict[str, Any]:
+    # A custom tool takes one freeform string rather than JSON arguments -
+    # apply_patch is the common case, whose payload is a patch, not an
+    # object. The chat template can only describe functions, so it is
+    # described as a single named string parameter and the call is turned
+    # back into a custom tool call on the way out; see
+    # _tool_call_output_item. Without the named parameter the model invents
+    # its own argument name and the client rejects the call as an
+    # incompatible payload.
+    return {
+        "type": "object",
+        "properties": {
+            CUSTOM_TOOL_INPUT_ARG: {
+                "type":
+                "string",
+                "description":
+                "The complete freeform input for this tool, "
+                "passed through verbatim.",
+            },
+        },
+        "required": [CUSTOM_TOOL_INPUT_ARG],
+    }
+
+
 def _get_chat_completion_function_tools(
         tools: Optional[list[Tool]]) -> list[ChatCompletionToolsParam]:
     function_tools: list[ChatCompletionToolsParam] = []
@@ -968,29 +992,6 @@ def _get_chat_completion_function_tools(
                 },
             ),
         )
-
-    def custom_parameters() -> dict[str, Any]:
-        # A custom tool takes one freeform string rather than JSON arguments -
-        # apply_patch is the common case, whose payload is a patch, not an
-        # object. The chat template can only describe functions, so it is
-        # described as a single named string parameter and the call is turned
-        # back into a custom tool call on the way out; see
-        # _tool_call_output_item. Without the named parameter the model invents
-        # its own argument name and the client rejects the call as an
-        # incompatible payload.
-        return {
-            "type": "object",
-            "properties": {
-                CUSTOM_TOOL_INPUT_ARG: {
-                    "type":
-                    "string",
-                    "description":
-                    "The complete freeform input for this tool, "
-                    "passed through verbatim.",
-                },
-            },
-            "required": [CUSTOM_TOOL_INPUT_ARG],
-        }
 
     for tool in tools:
         tool_type = getattr(tool, "type", None)
@@ -1014,7 +1015,7 @@ def _get_chat_completion_function_tools(
                 # qualified name as custom, so the output path goes looking for
                 # CUSTOM_TOOL_INPUT_ARG the prompt never mentioned.
                 if getattr(inner, "type", None) == "custom":
-                    inner_parameters = custom_parameters()
+                    inner_parameters = _custom_tool_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
                 function_tools.append(
@@ -1026,7 +1027,7 @@ def _get_chat_completion_function_tools(
         elif tool_type in ("custom", ):
             function_tools.append(
                 as_function(tool.name, getattr(tool, "description", None),
-                            custom_parameters()))
+                            _custom_tool_parameters()))
         elif is_web_search_tool(tool):
             # Web search is a *server* tool: the client sends the definition
             # and expects the server to run the query and feed the results
@@ -1066,6 +1067,148 @@ def _get_chat_completion_function_tools(
     return function_tools
 
 
+def _template_supports_deferred_tools(template_source: Optional[str]) -> bool:
+    """Whether the active template renders namespace/deferred tools natively.
+
+    Keyed on the template reading ``deferred_render_mode``: the template
+    revision that introduced that variable is the one that renders
+    ``{"type": "namespace"}`` tools and ``defer_loading`` flags itself.
+    ``None`` (a renderer with no analyzable Jinja source) and templates the
+    reference analysis cannot see into stay on the flattened rendering,
+    which every template understands.
+    """
+    if not isinstance(template_source, str):
+        return False
+    return not unreferenced_chat_template_kwargs(template_source,
+                                                 ("deferred_render_mode", ))
+
+
+def _explicit_defer_flag(tool) -> Optional[bool]:
+    """The tool's ``defer_loading`` only when the client set it.
+
+    Tri-state matters: the template reads an absent flag on a namespace
+    member as "inherit the namespace's deferral", while explicit flags can
+    carve members out (a member set ``false`` renders eagerly when other
+    members are explicitly ``true``). A pydantic default of ``None`` must
+    therefore not be serialized as ``false``.
+    """
+    flag = getattr(tool, "defer_loading", None)
+    return flag if isinstance(flag, bool) else None
+
+
+def _wants_native_tool_rendering(tools: Optional[list[Tool]]) -> bool:
+    """True when the request carries structure only the native form keeps."""
+    for tool in tools or []:
+        if getattr(tool, "type", None) == "namespace":
+            return True
+        if _explicit_defer_flag(tool):
+            return True
+    return False
+
+
+def _native_function_tool_dict(name: str, description: Optional[str],
+                               parameters: Optional[Any],
+                               defer_flag: Optional[bool]) -> dict[str, Any]:
+    function: dict[str, Any] = {
+        "name": name,
+        "description": description or "",
+        "parameters": parameters if parameters is not None else {
+            "type": "object",
+            "properties": {},
+        },
+    }
+    if defer_flag is not None:
+        function["defer_loading"] = defer_flag
+    return {"type": "function", "function": function}
+
+
+def _native_tools_for_chat_template(tools: list[Tool]) -> list[dict[str, Any]]:
+    """Tool dicts in the shape the native template rendering expects.
+
+    Function and custom tools keep the chat-completions wrapping (with the
+    same freeform schema a flattened custom tool gets); a namespace passes
+    through as ``{"type": "namespace", ...}`` with flat member entries, so
+    the template itself qualifies the names, writes the namespace metadata
+    line and recipient pattern, and applies ``defer_loading``. Tools the
+    template cannot describe (web_search and unknown types) are dropped
+    exactly as the flattened conversion drops them; the flattened pass over
+    the same request already warned about them.
+    """
+    native: list[dict[str, Any]] = []
+    for tool in tools:
+        tool_type = getattr(tool, "type", None)
+        if isinstance(tool, FunctionTool) or tool_type == "function":
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           getattr(tool, "parameters", None),
+                                           _explicit_defer_flag(tool)))
+        elif tool_type == "namespace":
+            members: list[dict[str, Any]] = []
+            for inner in getattr(tool, "tools", None) or []:
+                inner_name = getattr(inner, "name", None)
+                if not inner_name:
+                    continue
+                if getattr(inner, "type", None) == "custom":
+                    inner_parameters = _custom_tool_parameters()
+                else:
+                    inner_parameters = getattr(inner, "parameters", None)
+                member: dict[str, Any] = {
+                    "name":
+                    inner_name,
+                    "description":
+                    getattr(inner, "description", None)
+                    or getattr(tool, "description", None) or "",
+                    "parameters":
+                    inner_parameters if inner_parameters is not None else {
+                        "type": "object",
+                        "properties": {},
+                    },
+                }
+                member_flag = _explicit_defer_flag(inner)
+                if member_flag is not None:
+                    member["defer_loading"] = member_flag
+                members.append(member)
+            entry: dict[str, Any] = {
+                "type": "namespace",
+                "name": tool.name,
+                "description": getattr(tool, "description", None) or "",
+                "tools": members,
+            }
+            ns_flag = _explicit_defer_flag(tool)
+            if ns_flag is not None:
+                entry["defer_loading"] = ns_flag
+            native.append(entry)
+        elif tool_type in ("custom", ):
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           _custom_tool_parameters(),
+                                           _explicit_defer_flag(tool)))
+    return native
+
+
+def _tools_for_chat_template(
+        tools: Optional[list[Tool]], flat_tool_dicts: list[dict[str, Any]],
+        template_source: Optional[str]) -> list[dict[str, Any]]:
+    """The tool dicts handed to ``apply_chat_template``.
+
+    Default is the flattened function-tool view every template understands.
+    A request carrying namespace tools or explicit ``defer_loading`` flags
+    switches to the native structures when the active template renders them
+    (see _template_supports_deferred_tools): the model was trained on the
+    native rendering, and flattening erases the deferral, so every tool
+    arrives eagerly with its full schema. On an older template the flattened
+    view keeps today's eager rendering rather than handing the template
+    structures it would mis-render.
+    """
+    if not _wants_native_tool_rendering(tools):
+        return flat_tool_dicts
+    if not _template_supports_deferred_tools(template_source):
+        return flat_tool_dicts
+    return _native_tools_for_chat_template(tools)
+
+
 async def _create_input_tokens(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
@@ -1094,10 +1237,21 @@ async def _create_input_tokens(
 
     conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
         messages, model_config)
-    tools_dict = [
+    flat_tool_dicts = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
+    # Resolved before the tool-form decision: the same source drives both
+    # the native-vs-flattened choice and the reasoning-kwargs injection.
+    # Template resolution only uses tools for variant selection, which the
+    # flattened view serves as well as the native one.
+    template_source = rendered_hf_chat_template_source(
+        tokenizer=tokenizer,
+        processor=processor,
+        tools=flat_tool_dicts,
+    )
+    tools_dict = _tools_for_chat_template(request.tools, flat_tool_dicts,
+                                          template_source)
     # Carry the request's reasoning configuration into the chat template.
     #
     # Chat templates that support thinking are opt-in: DeepSeek-V4's custom
@@ -1121,11 +1275,7 @@ async def _create_input_tokens(
     # are forwarded untouched and stay subject to the guard.
     chat_template_kwargs = reasoning_chat_template_kwargs(
         request,
-        template_source=rendered_hf_chat_template_source(
-            tokenizer=tokenizer,
-            processor=processor,
-            tools=tools_dict,
-        ),
+        template_source=template_source,
     )
 
     token_task = async_apply_chat_template(
