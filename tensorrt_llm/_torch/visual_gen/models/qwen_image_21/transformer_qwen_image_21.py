@@ -126,6 +126,29 @@ class QwenImage21ZeroCenterRMSNorm(nn.Module):
         return (hidden_states * rrms * (self.weight.float() + 1)).to(input_dtype)
 
 
+class QwenImage21RMSNorm(nn.Module):
+    """Diffusers-compatible regular RMSNorm with effective scale ``weight``.
+
+    Qwen-Image 2.1 uses zero-centered RMSNorm only for the text projection.
+    The attention Q/K norms are regular RMSNorm in the upstream Diffusers
+    transformer.  Keeping this distinction is required for checkpoint parity:
+    treating Q/K norm weights as zero-centered doubles the typical effective
+    attention normalization scale and produces severe image-quality drift.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return hidden_states * self.weight
+
+
 class QwenImage21TextProjection(nn.Module):
     def __init__(self, context_in_dim: int, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -315,8 +338,8 @@ class QwenImage21Attention(nn.Module):
         self.to_k = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
         self.to_out = nn.ModuleList([nn.Linear(self.inner_dim, dim, bias=False), nn.Dropout(0.0)])
-        self.norm_q = QwenImage21ZeroCenterRMSNorm(dim_head, eps=eps)
-        self.norm_k = QwenImage21ZeroCenterRMSNorm(dim_head, eps=eps)
+        self.norm_q = QwenImage21RMSNorm(dim_head, eps=eps)
+        self.norm_k = QwenImage21RMSNorm(dim_head, eps=eps)
         self.set_processor(processor if processor is not None else self._default_processor_cls())
 
     def set_processor(self, processor: Any) -> None:
@@ -686,8 +709,10 @@ __all__ = [
     "QwenImage21AttnProcessor",
     "QwenImage21KVCache",
     "QwenImage21KVLayerCache",
+    "QwenImage21RMSNorm",
     "QwenImage21Transformer2DModel",
     "QwenImage21TransformerBlock",
+    "QwenImage21ZeroCenterRMSNorm",
     "QwenImageTransformerBlock",
     "QwenJointAttention",
     "apply_rotary_emb_qwen",
