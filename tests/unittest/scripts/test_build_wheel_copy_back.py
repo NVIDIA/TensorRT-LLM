@@ -277,10 +277,12 @@ def test_same_src_dst_is_noop(sync_tree, tmp_path):
 @pytest.mark.parametrize(
     ("cuda_architectures", "expected"),
     [
-        ("80-real", False),
-        ("86-real;89-real", False),
-        ("90-real", True),
-        ("86-real;90-real;120-real", True),
+        ("80", False),
+        ("86;89", False),
+        ("90", True),
+        ("86;90;120", True),
+        # Suffixed entries are still accepted for compatibility.
+        ("86-real;90-real", True),
         ("all", True),
     ],
 )

@@ -48,11 +48,11 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 Kimi K3 support currently requires TensorRT LLM built from source and installed in place. Inside the TensorRT LLM container, from the repository root:
 
 ```bash
-python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
+python3 scripts/build_wheel.py --cuda_architectures 103 --skip_building_wheel --yes
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300, `100-real` for B200). A `103-real` build also runs on B200 (the Kimi K3 kernels compile for the `100f` family) but omits the `sm100a`-specific batched-GEMM kernels, so build with `100-real` when targeting B200. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
+`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103` for GB300, `100` for B200). A `103` build also runs on B200 (the Kimi K3 kernels compile for the `100f` family) but omits the `sm100a`-specific batched-GEMM kernels, so build with `100` when targeting B200. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
 
 Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-place environment (these dependencies might be removed in future releases, replaced by other kernels):
 
@@ -283,7 +283,7 @@ sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
 
 The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (`KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0`). Set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.
 
-Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
+Measured on 16 GB200 GPUs (4 nodes, `100` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
 
 | Filter | Exact match |
 | :-- | --: |

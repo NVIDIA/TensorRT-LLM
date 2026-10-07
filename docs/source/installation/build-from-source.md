@@ -62,7 +62,7 @@ Once inside the container, build TensorRT LLM from source using `scripts/build_w
 Build the C++ code, skip wheel packaging, and use symlinks so that changes are reflected immediately. Then install in editable mode for Python development.
 
 ```bash
-python3 scripts/build_wheel.py --use_ccache -a "90-real" --skip_building_wheel --linking_install_binary
+python3 scripts/build_wheel.py --use_ccache -a "90" --skip_building_wheel --linking_install_binary
 pip install -e .
 ```
 
@@ -71,10 +71,18 @@ Key flags used above:
 | Flag | Purpose |
 |------|---------|
 | `--use_ccache` | Use ccache for faster incremental rebuilds |
-| `-a "90-real"` | Build only for a specific GPU architecture (e.g. Hopper). Reduces compile time significantly. See [Supported Hardware](../supported-hardware.md) for values. |
+| `-a "90"` | Build only for a specific GPU architecture (e.g. Hopper). Reduces compile time significantly. See [Supported Hardware](../supported-hardware.md) for values. |
 | `--skip_building_wheel` | Skip `.whl` packaging -- only needed for distribution, not development |
 | `--linking_install_binary` | Symlink built libraries instead of copying them |
 | `pip install -e .` | Editable install so Python changes take effect without reinstalling |
+
+`-a` (`--cuda_architectures`) lists the **exact** GPU architectures the build supports, as plain
+SM numbers separated by `;` (for example `"90;100"`). Each listed architecture is built with its
+fully optimized kernels; an architecture that is not listed is not supported by the build, even if
+it could run some kernels through family compatibility (for example, an SM 100 only build does not
+support SM 107). Do not add `-real`, `a` or `f` suffixes: the build picks the right variant for
+every architecture and warns about suffixed entries. Without `-a`, all supported architectures are
+built.
 
 ### Other common options
 
@@ -92,7 +100,7 @@ Network filesystems (Lustre, NFS, GPFS) handle large streaming I/O well but are 
 Pass `--build_root` (or set the `TRTLLM_BUILD_ROOT` environment variable) to keep all high-churn build state on fast local storage while the checkout stays on shared storage:
 
 ```bash
-python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --use_ccache -a "90-real" --skip_building_wheel --linking_install_binary
+python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --use_ccache -a "90" --skip_building_wheel --linking_install_binary
 ```
 
 With `--build_root <dir>` set, the following default under `<dir>` instead of the checkout:
@@ -120,7 +128,7 @@ Artifact copy-back into the checkout (`tensorrt_llm/include`, the `deep_gemm`/`d
 For CI or ephemeral-node workflows that only need a wheel, add `--out-of-tree` to guarantee the checkout is never written — it can even be mounted read-only:
 
 ```bash
-python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --out-of-tree --use_ccache -a "90-real"
+python3 scripts/build_wheel.py --build_root /tmp/trtllm-build --out-of-tree --use_ccache -a "90"
 ```
 
 In this mode the generated FMHA kernel sources and the configured `version.h` go to the build tree (via the `TRTLLM_FMHA_GEN_DIR` and `TRTLLM_VERSION_H_INCLUDE_DIR` CMake variables), and the wheel is assembled from a staging copy of the Python package under `<build_root>/package`, landing in `<build_root>/dist` by default. Submodules and git-lfs content must be materialized before the build (the usual `git submodule update --init --recursive`), since the build will not modify the checkout. Editable-install workflows (`--skip_building_wheel`, `--linking_install_binary`, `--install`) are incompatible with `--out-of-tree`: they import compiled artifacts from the checkout by design. `--version-override` is also incompatible, since it edits `tensorrt_llm/version.py` in the checkout.

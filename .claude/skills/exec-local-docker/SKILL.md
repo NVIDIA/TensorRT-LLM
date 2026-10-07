@@ -38,7 +38,7 @@ This executor owns image selection and the build for the local Docker target. Sk
 1. **Detect the target GPU type.** Use `gpu_type` from `job_spec.json` if upstream env-check resolved it; otherwise probe locally with `nvidia-smi --query-gpu=name --format=csv,noheader | head -1`.
 2. **Detect the host CPU arch** with `uname -m` (`x86_64` or `aarch64`).
 3. **Resolve the container image.** Read `<repo_root>/jenkins/current_image_tags.properties` and pick the tag whose CPU-arch flavor matches the host. If the orchestrator already passed a `container_image` field in the job spec, use that and skip the lookup.
-4. **Map GPU → build arch (`-a` flag):** `H100`/`H200` → `90-real`; `B200`/`GB200`/`B300`/`GB300` → `100-real`; `A100` → `80-real`; `L40S` → `89-real`. Default `100-real` when the GPU is unknown.
+4. **Map GPU → build arch (`-a` flag):** `H100`/`H200` → `90`; `B200`/`GB200` → `100`; `B300`/`GB300` → `103`; `A100` → `80`; `L40S` → `89`. Default `100` when the GPU is unknown.
 5. **Compile.** Invoke the `exec-local-compile` skill with `repo_dir=<repo_root>`, `image=<resolved tag>`, `arch=<arch>`. Wait for completion.
 6. **On failure**, do not launch the workload. Report `BUILD_FAILED` with the last 100 lines of the compile log.
 

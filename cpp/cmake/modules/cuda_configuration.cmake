@@ -326,11 +326,24 @@ function(setup_cuda_architectures)
         message(FATAL_ERROR "Including PTX in compiled binary is unsupported.")
       elseif(CUDA_ARCH MATCHES "^(([1-9])([0-9])+)a?(-real)?$")
         list(APPEND CMAKE_CUDA_ARCHITECTURES_CLEAN ${CMAKE_MATCH_1})
+        if(NOT CUDA_ARCH STREQUAL CMAKE_MATCH_1)
+          list(APPEND CMAKE_CUDA_ARCHITECTURES_SUFFIXED ${CUDA_ARCH})
+        endif()
       else()
         message(FATAL_ERROR "Unrecognized CUDA architecture: ${CUDA_ARCH}")
       endif()
     endforeach()
     list(REMOVE_DUPLICATES CMAKE_CUDA_ARCHITECTURES_CLEAN)
+    if(CMAKE_CUDA_ARCHITECTURES_SUFFIXED)
+      list(JOIN CMAKE_CUDA_ARCHITECTURES_SUFFIXED ";" _suffixed)
+      list(JOIN CMAKE_CUDA_ARCHITECTURES_CLEAN ";" _clean)
+      message(
+        WARNING
+          "CMAKE_CUDA_ARCHITECTURES entries \"${_suffixed}\" carry suffixes, "
+          "which are ignored. List plain architecture numbers instead, e.g. "
+          "\"${_clean}\": TensorRT LLM produces a build that's optimized for "
+          "every listed architecture using appropriate config for each kernel.")
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES_RAW ${CMAKE_CUDA_ARCHITECTURES_CLEAN})
   endif()
 

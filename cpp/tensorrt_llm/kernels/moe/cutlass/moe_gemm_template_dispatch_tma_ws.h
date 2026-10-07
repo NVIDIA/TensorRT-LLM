@@ -149,25 +149,25 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
 #ifndef COMPILE_HOPPER_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 90 && Arch::kMinComputeCapability < 100)
     {
-        TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for hopper by passing 90 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 103 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 100 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 120)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 120-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 120 as an arch to build_wheel.py.");
     }
 #endif
     else

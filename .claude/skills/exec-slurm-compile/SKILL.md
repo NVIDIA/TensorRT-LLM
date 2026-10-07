@@ -83,7 +83,7 @@ Optional parameters:
 | `jobname` | SLURM job name | `trtllm-compile.<username>` |
 | `gpu_count` | Number of GPUs to request | `4` |
 | `time_limit` | Job time limit | `02:00:00` |
-| `arch` | GPU architecture(s) for `-a` flag | `100-real` |
+| `arch` | GPU architecture(s) for `-a` flag | `100` |
 | `extra_build_args` | Extra flags for `build_wheel.py` | (none) |
 
 ## Companion Scripts
@@ -204,7 +204,7 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 
 | Flag | Description |
 |------|-------------|
-| `-a "100-real"` | Target architecture — `100` for Blackwell, `90` for Hopper, etc. |
+| `-a "100"` | Target architecture — `100` for B200/GB200, `103` for B300/GB300, `90` for Hopper, etc. |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--no-venv` | Skip virtual environment creation |
 | `--use_ccache` | Use ccache to speed up recompilation |
@@ -213,11 +213,12 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 | `-c` | Clean build — wipe build directory before building |
 
 Common architecture values:
-- `"100-real"` — Blackwell (B200, GB200)
-- `"90-real"` — Hopper (H100, H200)
-- `"89-real"` — Ada Lovelace (L40S)
-- `"80-real"` — Ampere (A100)
-- `"90;100-real"` — Multiple architectures
+- `"103"` — Blackwell Ultra (B300, GB300)
+- `"100"` — Blackwell (B200, GB200)
+- `"90"` — Hopper (H100, H200)
+- `"89"` — Ada Lovelace (L40S)
+- `"80"` — Ampere (A100)
+- `"90;100"` — Multiple architectures
 
 ## Troubleshooting
 
