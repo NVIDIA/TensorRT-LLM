@@ -295,16 +295,18 @@ are shared with the offline examples:
 # 1 GPU Nano
 trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
-# 4 GPU / 8 GPU (Super): trtllm-serve starts the configured workers
+# Blackwell default: 4 B200/B300 GPUs (Super)
 trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
+
+# 8 GPU (Super): trtllm-serve starts the configured workers
 trtllm-serve nvidia/Cosmos3-Super --visual_gen_args ../configs/cosmos3-super-8gpu.yaml
 
 # 1 GPU text-to-image deployment: warms the 1024x1024 single-frame shape
 # instead of the omni video shape
 trtllm-serve nvidia/Cosmos3-Super-Text2Image-4Step --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
 
-# 4 H200 GPUs on one node for distilled image-to-video
-trtllm-serve nvidia/Cosmos3-Super-Image2Video-4Step --visual_gen_args ../configs/cosmos3-super-4gpu.yaml
+# Hopper: 4 H200 GPUs on one node for distilled image-to-video
+trtllm-serve nvidia/Cosmos3-Super-Image2Video-4Step --visual_gen_args ../configs/cosmos3-super-4gpu-hopper.yaml
 
 # 1 GPU Edge generator: no YAML is needed, but select the VisualGen runtime
 trtllm-serve nvidia/Cosmos3-Edge --enable_visual_gen
@@ -316,7 +318,9 @@ trtllm-serve nvidia/Cosmos3-Edge-Policy-DROID --enable_visual_gen
 The distilled image-to-video checkpoint reads its fixed four-step schedule from
 the checkpoint. Its default 720p x 189-frame workload needs more device memory
 than one H200 provides. Use a higher-memory GPU, such as Blackwell, or the
-single-node 4-GPU config shown above on Hopper. Edge and DROID need no YAML
+single-node 4-GPU Hopper config shown above. The default 4-GPU config targets
+Blackwell (B200 / B300) with CFG plus Ulysses; the Hopper config uses tensor
+parallelism plus Ulysses to reduce per-GPU memory use. Edge and DROID need no YAML
 because their checkpoint defaults already are the deployed shape, but they do need
 `--enable_visual_gen` to select the generator rather than the Reasoner. The
 DROID checkpoint metadata then selects Policy mode and supplies its deployment
