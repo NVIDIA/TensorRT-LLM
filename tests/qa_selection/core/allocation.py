@@ -16,8 +16,8 @@
 
     GpuDemand.of(test) -> demand.assign_rung(ladder) -> Assignment.of(...)
 
-The GPU count is decided here and nowhere else: `skip_less_device` and
-`skip_less_mpi_world_size` are read once, closest marker only, and a demand
+The GPU count is decided here and nowhere else: the markers `markers.json`
+declares as bounding `gpus` are read once, each as it declares, and a demand
 above the largest rung is a blocker. Demand reads marks, never a
 `MachineProfile`, so it is the same on every machine. Whether the rules allow
 the test on the machine's card is `selector.py`'s question.
@@ -27,6 +27,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from .markers import ResourceMarker, default_markers
 from .selector import CollectedTest, Decision
 
 
@@ -36,10 +37,6 @@ class GpuDemand:
 
     # Used when a test states no lower bound; `required_gpus_from` is then empty.
     ASSUMED_GPUS = 1
-
-    # Markers stating a GPU lower bound, each read at its closest level only.
-    # `skip_less_mpi_world_size` is measured in GPUs: one rank per GPU.
-    MARKERS = ("skip_less_device", "skip_less_mpi_world_size")
 
     required_gpus: int
     required_gpus_from: Tuple[str, ...]
@@ -63,16 +60,12 @@ class GpuDemand:
 
     @classmethod
     def bounds_of(cls, test: CollectedTest) -> Tuple[Tuple[str, int], ...]:
-        """Every GPU lower bound `test` states, as (marker, value) pairs.
-
-        Takes the nearest marker of each kind, as `get_closest_marker` does.
-        """
-        bounds = []
-        for marker in cls.MARKERS:
-            required = test.closest_requirement(marker)
-            if required is not None:
-                bounds.append((marker, int(required)))
-        return tuple(bounds)
+        """Every GPU lower bound `test` states, as (marker name, value) pairs."""
+        return tuple(
+            (marker.name, int(required))
+            for marker in default_markers().bounding(ResourceMarker.GPUS)
+            for required in test.requirements(marker)
+        )
 
     @property
     def assumed(self) -> bool:
