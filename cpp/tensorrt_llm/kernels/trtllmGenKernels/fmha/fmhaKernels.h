@@ -32,6 +32,7 @@
 #include <linux/limits.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <thread>
@@ -43,6 +44,7 @@
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaJitWarmup.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
@@ -118,11 +120,12 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 // unsynchronized, file-scope global LRU cache (fmha::kernelCache); even cache
 // hits mutate the LRU list, so FmhaInterface::generateAndCompileKernel() and
 // FmhaInterface::run() must never execute concurrently. Every call site in
-// this file must hold this mutex.
+// this file must hold this mutex. Intentionally leaked: a background warmup
+// sweep may still take it during process teardown (see fmhaJitWarmup.h).
 inline std::mutex& getFmhaInterfaceMutex()
 {
-    static std::mutex sMutex;
-    return sMutex;
+    static auto* const sMutex = new std::mutex();
+    return *sMutex;
 }
 
 // Serializes kernel selection (FmhaAutoTuner::selectKernel and
@@ -136,11 +139,12 @@ inline std::mutex& getFmhaInterfaceMutex()
 // CGA-reduction / tile decisions) for identical inputs — observed as the
 // background warmup sweep compiling a different KernelKey set than foreground
 // traffic derives. Selection is microseconds-fast; this lock is never held
-// while getFmhaInterfaceMutex() is taken.
+// while getFmhaInterfaceMutex() is taken. Intentionally leaked, like the
+// interface mutex.
 inline std::mutex& getFmhaSelectionMutex()
 {
-    static std::mutex sMutex;
-    return sMutex;
+    static auto* const sMutex = new std::mutex();
+    return *sMutex;
 }
 
 // Whether the TRTLLM-Gen FMHA JIT warmup grid is compiled on a background
@@ -156,121 +160,35 @@ inline bool asyncJITWarmupEnabled()
     return sEnabled;
 }
 
-// A single background worker thread that runs the JIT warmup grid compilation
-// off the startup critical path. A single thread is intentional: all compile
-// calls serialize on getFmhaInterfaceMutex() anyway (the export library's
-// kernel cache is not thread-safe), so a pool would add no parallelism.
-class TllmGenFmhaAsyncWarmupWorker
-{
-public:
-    // Enqueue for the background worker; returns false if the worker thread could
-    // not be started, in which case the task was NOT queued and the caller must
-    // run it inline.
-    bool enqueue(std::function<void()> task)
-    {
-        {
-            std::lock_guard<std::mutex> lock(mMutex);
-            mQueue.push_back(std::move(task));
-            mNumPendingTasks.fetch_add(1, std::memory_order_acq_rel);
-            if (!mThreadStarted)
-            {
-                // Only mark started after the thread object is successfully constructed:
-                // if std::thread throws (resource exhaustion), the queued task must not
-                // be stranded behind a worker that never runs (drain() would deadlock).
-                try
-                {
-                    std::thread(
-                        [this]()
-                        {
-                            // Relaxed capture mode: CUDA calls made by this thread (NVRTC module
-                            // loads) must neither fail nor invalidate a CUDA graph capture that the
-                            // forward-pass thread may have in progress. Module loads never touch a
-                            // capturing stream. This is the same pattern NCCL/cuDNN use for lazy
-                            // module loading from helper threads.
-                            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
-                            if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess)
-                            {
-                                TLLM_LOG_WARNING(
-                                    "TRTLLM-Gen FMHA async JIT warmup: failed to set relaxed stream-capture mode; "
-                                    "run() will drain this worker before any CUDA graph capture.");
-                            }
-                            workerLoop();
-                        })
-                        .detach();
-                    mThreadStarted = true;
-                }
-                catch (std::exception const& e)
-                {
-                    mQueue.pop_back();
-                    mNumPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-                    TLLM_LOG_WARNING(
-                        "TRTLLM-Gen FMHA async JIT warmup: worker thread failed to start (%s); compiling inline.",
-                        e.what());
-                    return false;
-                }
-            }
-        }
-        mQueueCv.notify_one();
-        return true;
-    }
-
-    int numPendingTasks() const
-    {
-        return mNumPendingTasks.load(std::memory_order_acquire);
-    }
-
-    // Blocks until all enqueued warmup tasks have finished.
-    void drain()
-    {
-        std::unique_lock<std::mutex> lock(mMutex);
-        mDrainCv.wait(lock, [this]() { return mNumPendingTasks.load(std::memory_order_acquire) == 0; });
-    }
-
-private:
-    void workerLoop()
-    {
-        while (true)
-        {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(mMutex);
-                mQueueCv.wait(lock, [this]() { return !mQueue.empty(); });
-                task = std::move(mQueue.front());
-                mQueue.pop_front();
-            }
-            try
-            {
-                task();
-            }
-            catch (std::exception const& e)
-            {
-                TLLM_LOG_WARNING("TRTLLM-Gen FMHA async JIT warmup task failed: %s", e.what());
-            }
-            catch (...)
-            {
-                TLLM_LOG_WARNING("TRTLLM-Gen FMHA async JIT warmup task failed with an unknown error.");
-            }
-            {
-                std::lock_guard<std::mutex> lock(mMutex);
-                mNumPendingTasks.fetch_sub(1, std::memory_order_acq_rel);
-            }
-            mDrainCv.notify_all();
-        }
-    }
-
-    std::mutex mMutex;
-    std::condition_variable mQueueCv;
-    std::condition_variable mDrainCv;
-    std::deque<std::function<void()>> mQueue;
-    std::atomic<int> mNumPendingTasks{0};
-    bool mThreadStarted{false};
-};
-
+// Process-wide worker for the background JIT warmup sweeps. See
+// fmhaJitWarmup.h for the lifetime and shutdown-ordering contract.
 inline TllmGenFmhaAsyncWarmupWorker& getAsyncJITWarmupWorker()
 {
-    // Intentionally leaked: the detached worker thread parks on the queue
-    // condition variable forever and must outlive static destruction.
-    static TllmGenFmhaAsyncWarmupWorker* sWorker = new TllmGenFmhaAsyncWarmupWorker();
+    static TllmGenFmhaAsyncWarmupWorker* const sWorker = []()
+    {
+        auto* worker = new TllmGenFmhaAsyncWarmupWorker(
+            []()
+            {
+                // Relaxed capture mode: CUDA calls made by the worker thread (NVRTC module
+                // loads) must neither fail nor invalidate a CUDA graph capture that the
+                // forward-pass thread may have in progress. Module loads never touch a
+                // capturing stream. This is the same pattern NCCL/cuDNN use for lazy
+                // module loading from helper threads.
+                cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+                if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess)
+                {
+                    TLLM_LOG_WARNING(
+                        "TRTLLM-Gen FMHA async JIT warmup: failed to set relaxed stream-capture mode; "
+                        "run() will drain this worker before any CUDA graph capture.");
+                }
+            });
+        // The worker is first created from the first warmup forward, after every
+        // static a sweep depends on has been constructed, so this handler drains
+        // and joins the worker before any of them is destroyed. The object itself
+        // is intentionally leaked.
+        std::atexit([]() { getAsyncJITWarmupWorker().shutdown(); });
+        return worker;
+    }();
     return *sWorker;
 }
 
@@ -350,12 +268,11 @@ public:
 
     ~TllmGenFmhaKernel()
     {
-        // A queued background warmup task captures `this`. Scheduled sweeps drain
-        // before CUDA-graph capture in normal operation, but nothing forces that
-        // before this object is destroyed (e.g. static teardown of the owning
-        // factory while startup is still in flight). The worker singleton is
-        // intentionally leaked, so draining here is safe even during static
-        // destruction.
+        // A queued background warmup task captures `this`. At process exit the
+        // worker's atexit handler has already drained and joined it (see
+        // fmhaJitWarmup.h); draining here as well covers a kernel object destroyed
+        // while the process keeps running. The worker is leaked, so this is safe
+        // during static destruction too.
         if (asyncJITWarmupEnabled())
         {
             getAsyncJITWarmupWorker().drain();
@@ -625,6 +542,7 @@ private:
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
             mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITKernelKey(fmhaConfig);
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
@@ -685,97 +603,66 @@ private:
         return fingerprint;
     }
 
-    // Per-configuration warmup progress.
-    enum class JITWarmupState : int
-    {
-        kScheduled = 0,  // Background sweep enqueued (async mode).
-        kBackgroundDone, // Background sweep finished; foreground verify pass pending.
-        kVerified,       // Sweep ran (or re-ran) on a foreground thread.
-    };
+    using JITWarmupRegistry = TllmGenFmhaJitWarmupRegistry<RunnerParams, TllmGenFmhaKernel>;
 
-    struct JITWarmupConfig
+    // Process-wide; intentionally leaked (heap-allocated, never destroyed) so a
+    // background sweep can touch it at any point during process teardown.
+    static JITWarmupRegistry& getJITWarmupRegistry()
     {
-        RunnerParams mParams;
-        JITWarmupState mState;
-        // Device the sweep was registered for. The fingerprint already includes it;
-        // kept here so the verify pass only picks up sweeps for the current device.
-        int mDeviceId;
-        // The kernel instance that registered this sweep. The registry is shared
-        // across all TllmGenFmhaKernel objects on the same device (different dtypes
-        // / attention configs); without this, one instance's verify pass could
-        // consume another's entry and mark it verified without ever checking it.
-        TllmGenFmhaKernel const* mKernelInstance;
-    };
-
-    // All three singletons below are intentionally leaked (heap-allocated, never
-    // destroyed). The async warmup worker is also leaked, and a queued background
-    // task can use any of these at any time during process teardown. C++ destroys
-    // function-local statics in reverse construction order, so a non-leaked
-    // static mutex or counter could be destroyed before the factory's kernels,
-    // leaving the destructor's drain() waiting on a task that touches destroyed
-    // state. Leaking keeps them alive for the remainder of the process.
-
-    static std::mutex& getJITWarmupRegistryMutex()
-    {
-        static auto* sMutex = new std::mutex();
-        return *sMutex;
-    }
-
-    static std::unordered_map<uint64_t, JITWarmupConfig>& getJITWarmupRegistry()
-    {
-        static auto* sRegistry = new std::unordered_map<uint64_t, JITWarmupConfig>();
+        static auto* const sRegistry = new JITWarmupRegistry();
         return *sRegistry;
     }
 
-    // Number of configs in kBackgroundDone state (cheap gate for the verify pass).
-    static std::atomic<int>& getNumUnverifiedJITWarmups()
+    // Keys of every NVRTC kernel configuration requested from the export library
+    // so far, hashed exactly as its kernel cache keys them: a key seen for the
+    // first time is a compile. Intentionally leaked. Guarded by
+    // getFmhaInterfaceMutex(), which both request sites already hold.
+    static std::unordered_set<size_t>& getRequestedJITKernelKeys()
     {
-        static auto* sCount = new std::atomic<int>(0);
-        return *sCount;
+        static auto* const sKeys = new std::unordered_set<size_t>();
+        return *sKeys;
     }
 
-    // Registers a warmup configuration; returns true if an identical sweep was
-    // already executed or scheduled.
-    bool tryRegisterJITWarmupConfig(RunnerParams const& params, JITWarmupState initialState) const
+    // Must be called with getFmhaInterfaceMutex() held, after generateAndCompileKernel().
+    static void recordJITKernelKey(FmhaConfig const& fmhaConfig)
     {
-        uint64_t const fingerprint = jitWarmupFingerprint(params);
-        std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
-        auto& registry = getJITWarmupRegistry();
-        if (registry.find(fingerprint) != registry.end())
-        {
-            return true;
-        }
-        JITWarmupConfig config;
-        config.mParams = params;
-        config.mState = initialState;
-        config.mDeviceId = tensorrt_llm::common::getDevice();
-        config.mKernelInstance = this;
-        registry.emplace(fingerprint, std::move(config));
-        return false;
+        getRequestedJITKernelKeys().insert(std::hash<fmha::KernelConfigBase>{}(fmhaConfig.mOptions));
+    }
+
+    // Registers a warmup sweep for this kernel object on the current device;
+    // returns true if an identical sweep was already registered.
+    bool tryRegisterJITWarmupConfig(RunnerParams const& params, JITWarmupState initialState)
+    {
+        return getJITWarmupRegistry().tryRegister(
+            jitWarmupFingerprint(params), params, initialState, tensorrt_llm::common::getDevice(), this);
     }
 
     static void markJITWarmupBackgroundDone(uint64_t fingerprint)
     {
-        std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
-        auto it = getJITWarmupRegistry().find(fingerprint);
-        if (it != getJITWarmupRegistry().end() && it->second.mState == JITWarmupState::kScheduled)
-        {
-            it->second.mState = JITWarmupState::kBackgroundDone;
-            getNumUnverifiedJITWarmups().fetch_add(1, std::memory_order_acq_rel);
-        }
+        getJITWarmupRegistry().markBackgroundDone(fingerprint);
     }
 
-    // Foreground verify pass (async mode only). After a background sweep
-    // finishes, the first eager (non-capturing, non-warmup) NVRTC-path run()
-    // re-executes the same sweep on a foreground thread. If the background pass
-    // compiled exactly the keys the foreground derivation produces, this is a
-    // pure cache-hit loop (milliseconds). Any divergence — e.g. from a source of
-    // nondeterminism this patch has not closed — is compiled here, before
-    // readiness, instead of stalling the first real requests, and shows up as
-    // "JIT Warmup: Warmup for ... took ..." log lines inside the verify window.
+    // Re-runs a finished background sweep on the calling thread. A cache-hit loop
+    // (milliseconds) when the background pass compiled exactly the keys the
+    // foreground derivation produces; anything it missed, or a sweep whose
+    // background task failed, is compiled here and shows up as "JIT Warmup:
+    // Warmup for ... took ..." log lines inside the verify window.
+    void verifyJITWarmupSweep(JITWarmupRegistry::PendingSweep const& sweep)
+    {
+        TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass started (fingerprint=%llx).",
+            static_cast<unsigned long long>(sweep.mFingerprint));
+        runJITWarmupGrid(sweep.mParams);
+        TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass finished (fingerprint=%llx).",
+            static_cast<unsigned long long>(sweep.mFingerprint));
+    }
+
+    // Foreground verify pass (async mode only): the first eager (non-capturing,
+    // non-warmup) NVRTC-path run() re-runs the sweeps this kernel object
+    // scheduled on the current device. drainAndVerifyAllJITWarmups() normally
+    // gets there first; this is the fallback for callers that never invoke it.
     void maybeRunJITWarmupVerifyPass(RunnerParams const& liveParams)
     {
-        if (getNumUnverifiedJITWarmups().load(std::memory_order_acquire) == 0 || liveParams.mJITWarmup)
+        if (getJITWarmupRegistry().numUnverified() == 0 || liveParams.mJITWarmup)
         {
             return;
         }
@@ -785,40 +672,13 @@ private:
         {
             return;
         }
-        // Only verify sweeps registered for the current device AND kernel
-        // instance: the sweep re-runs on this thread through this kernel's
-        // table, and compiled modules load into the current device's context.
-        // Without the instance filter, one kernel (e.g. fp8) could consume
-        // another's (e.g. bf16) entry and mark it verified without checking it.
+        // Only sweeps this kernel object scheduled on the current device: the
+        // sweep re-runs through this object's kernel table and loads modules into
+        // the current device's context.
         int const currentDevice = tensorrt_llm::common::getDevice();
-        TllmGenFmhaKernel const* const currentInstance = this;
-        while (true)
+        while (auto sweep = getJITWarmupRegistry().claimUnverified(currentDevice, this))
         {
-            uint64_t fingerprint = 0;
-            RunnerParams sweepParams{};
-            {
-                std::lock_guard<std::mutex> lock(getJITWarmupRegistryMutex());
-                auto& registry = getJITWarmupRegistry();
-                auto it = std::find_if(registry.begin(), registry.end(),
-                    [currentDevice, currentInstance](auto const& entry) {
-                        return entry.second.mState == JITWarmupState::kBackgroundDone
-                            && entry.second.mDeviceId == currentDevice
-                            && entry.second.mKernelInstance == currentInstance;
-                    });
-                if (it == registry.end())
-                {
-                    return;
-                }
-                fingerprint = it->first;
-                sweepParams = it->second.mParams;
-                it->second.mState = JITWarmupState::kVerified;
-                getNumUnverifiedJITWarmups().fetch_sub(1, std::memory_order_acq_rel);
-            }
-            TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass started (fingerprint=%llx).",
-                static_cast<unsigned long long>(fingerprint));
-            runJITWarmupGrid(sweepParams);
-            TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass finished (fingerprint=%llx).",
-                static_cast<unsigned long long>(fingerprint));
+            verifyJITWarmupSweep(*sweep);
         }
     }
 
@@ -881,6 +741,10 @@ private:
 
         if (asyncJITWarmupEnabled())
         {
+            // The install-path string is a function-local static that the sweep reads
+            // on the worker thread. Construct it on this thread, before the worker and
+            // its atexit shutdown exist (lifetime note in fmhaJitWarmup.h).
+            (void) getExecPath();
             uint64_t const fingerprint = jitWarmupFingerprint(warmupParams);
             int const deviceId = tensorrt_llm::common::getDevice();
             TLLM_LOG_INFO(
@@ -966,6 +830,51 @@ private:
     }
 
 public:
+    // Pre-capture / pre-readiness barrier (called from ModelEngine.warmup between
+    // the graph-shape warmup pass and graph capture): waits for every queued
+    // background sweep, then re-runs each finished-but-unverified sweep on the
+    // calling thread through the kernel object and device that scheduled it.
+    // Must be called with no CUDA graph capture in progress. Returns the number of
+    // sweeps verified here. A no-op unless async warmup is enabled.
+    static int64_t drainAndVerifyAllJITWarmups()
+    {
+        if (!asyncJITWarmupEnabled())
+        {
+            return 0;
+        }
+        getAsyncJITWarmupWorker().drain();
+
+        struct RestoreDevice
+        {
+            int mDevice{tensorrt_llm::common::getDevice()};
+
+            ~RestoreDevice()
+            {
+                cudaSetDevice(mDevice);
+            }
+        } restoreDevice;
+
+        int64_t numVerified = 0;
+        while (auto sweep = getJITWarmupRegistry().claimAnyUnverified())
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(sweep->mDeviceId));
+            sweep->mInstance->verifyJITWarmupSweep(*sweep);
+            ++numVerified;
+        }
+        return numVerified;
+    }
+
+    // Number of distinct NVRTC kernel configurations requested from the export
+    // library in this process (keyed as its kernel cache keys them). Grows only
+    // when a configuration is requested for the first time, i.e. on a compile, so
+    // a value that is stable across the first request after readiness proves no
+    // request-time JIT.
+    static int64_t numRequestedJITKernelKeys()
+    {
+        std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
+        return static_cast<int64_t>(getRequestedJITKernelKeys().size());
+    }
+
     void run(RunnerParams const& params)
     {
         if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
@@ -1075,6 +984,7 @@ public:
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
             mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITKernelKey(fmhaConfig);
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface

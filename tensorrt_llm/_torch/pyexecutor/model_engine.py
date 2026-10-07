@@ -1579,14 +1579,7 @@ class PyTorchModelEngine(ModelEngine):
         # launch argument and is baked into every later replay.
         with self._warmup_timer.phase("cuda_graph_capture"), \
                 _moe_a2a_steady_state_budget_for_capture():
-            with self.cuda_graph_runner.allow_capture():
-                self.cuda_graph_runner.is_warmup_only = True
-                try:
-                    self._run_cuda_graph_warmup(resource_manager)
-                finally:
-                    self.cuda_graph_runner.is_warmup_only = False
-                self.cuda_graph_runner.padding_dummy_requests = {}
-                self._run_cuda_graph_warmup(resource_manager)
+            self._run_cuda_graph_warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
@@ -2642,6 +2635,47 @@ class PyTorchModelEngine(ModelEngine):
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes
                 for draft_len in draft_lengths]
+
+    def _run_cuda_graph_warmup_and_capture(
+            self, resource_manager: ResourceManager) -> None:
+        """Run the graph-shape warmup pass, then capture.
+
+        The two passes are separated by the TRTLLM-Gen FMHA JIT warmup barrier:
+        every attention kernel the warmup derived must be compiled before any
+        launch is captured into a graph, and before the engine reports ready.
+        The barrier runs regardless of whether CUDA graphs or the general
+        warmup are enabled, so configurations without graphs still finish
+        verification before readiness.
+        """
+        with self.cuda_graph_runner.allow_capture():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
+                self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
+            self.cuda_graph_runner.padding_dummy_requests = {}
+            self._drain_and_verify_trtllm_gen_fmha_jit_warmup()
+            self._run_cuda_graph_warmup(resource_manager)
+
+    def _drain_and_verify_trtllm_gen_fmha_jit_warmup(self) -> None:
+        """Wait for the background TRTLLM-Gen FMHA JIT warmup and verify it.
+
+        Blocks until every background compilation sweep has finished, then
+        re-runs each finished sweep once on this thread: a cache-hit loop when
+        the background pass compiled every kernel, and the place where any
+        kernel it missed (or a sweep whose background task failed) is compiled
+        instead of on the first real request. A no-op unless async warmup is
+        enabled (``TRTLLM_GEN_FMHA_ASYNC_WARMUP=1``).
+        """
+        if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
+            return
+        with self._warmup_timer.phase("attention_jit_drain_and_verify"):
+            num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify(
+            )
+        if num_verified:
+            logger.info(
+                f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} background "
+                "warmup sweep(s) before CUDA graph capture.")
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""

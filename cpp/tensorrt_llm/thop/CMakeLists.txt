@@ -52,6 +52,7 @@ add_th_common_family(
   mlaPreprocessOp.cpp
   attentionOp.cpp
   fmhaPackMaskOp.cpp
+  trtllmGenFmhaJitWarmupOp.cpp
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
   kdaDecodeOp.cpp
