@@ -22,11 +22,13 @@ its marks, closest level first.
 Marker precedence, reproducing the fixtures that consume each one:
 
     skipif                     every level; any match drops the test
-    skip_less_device           closest marker only
-    skip_less_mpi_world_size   closest marker only, measured in GPUs
     skip_device_not_contain    closest marker only
     skip_less_device_memory    every level
     skip_less_host_memory      not evaluated
+
+The two GPU-count markers, `skip_less_device` and `skip_less_mpi_world_size`,
+are not read here: `allocation.py` decides GPU count once, against the run's
+ladder.
 
 A reason string with no rule keeps the test. The table is curated, so its
 silence is a decision, not a gap: nothing is recorded and nothing is reported.
@@ -89,31 +91,15 @@ class Decision:
     blockers: Tuple[str, ...]
 
 
-def default_mpi_world_size(profile: MachineProfile) -> int:
-    """Ranks `skip_less_mpi_world_size` is measured against: one per GPU.
-
-    Override with `Selector(profile, mpi_world_size=N)`.
-    """
-    return profile.gpu_count
-
-
 class Selector:
     """Decides collected tests for one target machine.
 
     Built once per machine, then asked about many tests.
     """
 
-    def __init__(
-        self,
-        profile: MachineProfile,
-        rules: Optional[SkipRuleTable] = None,
-        mpi_world_size: Optional[int] = None,
-    ) -> None:
+    def __init__(self, profile: MachineProfile, rules: Optional[SkipRuleTable] = None) -> None:
         self.profile = profile
         self.rules = rules if rules is not None else default_rule_table()
-        self.mpi_world_size = (
-            mpi_world_size if mpi_world_size is not None else default_mpi_world_size(profile)
-        )
 
     def decide(self, test: CollectedTest) -> Decision:
         """Return the selection decision for one test, listing every blocker."""
@@ -142,19 +128,8 @@ class Selector:
         return blockers
 
     def resource_blockers(self, test: CollectedTest) -> List[str]:
-        """Apply the resource markers, each in its production precedence."""
-        blockers = self.shortfall(test, "skip_less_device", self.profile.gpu_count, "GPUs")
-        blockers += self.shortfall(test, "skip_less_mpi_world_size", self.mpi_world_size, "ranks")
-        blockers += self.device_name_blockers(test)
-        blockers += self.device_memory_blockers(test)
-        return blockers
-
-    def shortfall(self, test: CollectedTest, marker: str, available: int, units: str) -> List[str]:
-        """Report the nearest `marker` only, as get_closest_marker does."""
-        required = test.closest_requirement(marker)
-        if required is None or available >= int(required):
-            return []
-        return [f"{marker}: needs {int(required)} {units}, target has {available}"]
+        """Apply the per-card resource markers, each in its production precedence."""
+        return self.device_name_blockers(test) + self.device_memory_blockers(test)
 
     def device_name_blockers(self, test: CollectedTest) -> List[str]:
         """Report skip_device_not_contain when no keyword matches the device."""

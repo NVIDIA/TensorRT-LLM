@@ -12,7 +12,7 @@
     "            target machine to skip the test.",
     "'note'      free text for the reader.",
     "",
-    "Fields:  sm, device_name, cpu_arch, device_memory_mib, gpu_count, max_gpu_per_node",
+    "Fields:  sm, device_name, cpu_arch, device_memory_mib",
     "Numeric: lt, le, gt, ge, eq, ne      String: eq, ne, contains, not_contains",
     "",
     "'sm' is major * 10 + minor: Ada 89, Hopper 90, Blackwell 100,",

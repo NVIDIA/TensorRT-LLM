@@ -102,8 +102,8 @@ class Outcome:
         """One assignment, flattened into the fields the record writes."""
         return cls(
             nodeid=assignment.nodeid,
-            selected=assignment.decision.selected,
-            blockers=assignment.decision.blockers,
+            selected=assignment.selected,
+            blockers=assignment.blockers,
             required_gpus=assignment.demand.required_gpus,
             required_gpus_from=assignment.demand.required_gpus_from,
             rung=assignment.rung,
@@ -235,7 +235,6 @@ class SelectionReport:
         """The record, as written to `<machine>.json`."""
         record: Dict[str, object] = {
             "machine": self.machine,
-            "gpu_count": self.profile.gpu_count,
             "max_gpu_per_node": self.profile.max_gpu_per_node,
             "ladder": list(self.ladder) if self.ladder is not None else None,
             "target_rung": self.target_rung,
@@ -392,9 +391,8 @@ class TerminalSummary:
 
     @staticmethod
     def target(report: SelectionReport) -> str:
-        """The machine and the allocation decisions were made against."""
-        target = f"{report.machine}, {report.profile.gpu_count} GPUs"
-        return target if report.ladder is None else f"{target}, ladder {report.ladder}"
+        """The machine and the ladder decisions were made against."""
+        return f"{report.machine}, ladder {report.ladder}"
 
     @staticmethod
     def rung_note(report: SelectionReport) -> str:

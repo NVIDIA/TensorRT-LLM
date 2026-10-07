@@ -14,7 +14,7 @@
 # limitations under the License.
 """What one run was asked for, resolved and checked before anything is collected.
 
-    SelectionRequest.of(machine=..., gpus=..., ladder=..., rung=..., out_dir=...)
+    SelectionRequest.of(machine=..., ladder=..., rung=..., out_dir=...)
 
 Plain values in, a request or None out, `SelectionError` when the caller must
 fix something. The options are named in the messages because they are this
@@ -37,15 +37,15 @@ class SelectionError(ValueError):
 
 @dataclass(frozen=True)
 class SelectionRequest:
-    """One run's target: a machine, and which of its allocations this run occupies.
+    """One run's target: a machine, its ladder, and which allocation this run occupies.
 
-    `profile` answers *what can run here*, and only `gpus` changes it.
-    `ladder` and `target_rung` answer *which allocation*, and neither touches it.
+    `profile` answers *what the rules allow here*. `ladder` answers *how many
+    GPUs, in which allocations*; its largest rung is the run's GPU count.
     """
 
     machine: str
     profile: MachineProfile
-    ladder: Optional[Ladder]
+    ladder: Ladder
     target_rung: Optional[int]
     out_dir: Optional[Path]
 
@@ -53,7 +53,6 @@ class SelectionRequest:
     def of(
         cls,
         machine: Optional[str],
-        gpus: Optional[int] = None,
         ladder: Optional[str] = None,
         rung: Optional[int] = None,
         out_dir: Optional[str] = None,
@@ -65,8 +64,7 @@ class SelectionRequest:
         """
         if not machine:
             return None
-        cls.refuse_two_gpu_counts(gpus, ladder)
-        profile = cls.profile_for(machine, gpus)
+        profile = cls.profile_for(machine)
         parsed_ladder = cls.ladder_for(ladder, profile)
         target_rung = cls.target_rung_for(rung, parsed_ladder)
         return cls(
@@ -77,27 +75,12 @@ class SelectionRequest:
             out_dir=cls.out_dir_for(out_dir, machine, parsed_ladder, target_rung),
         )
 
-    @staticmethod
-    def refuse_two_gpu_counts(gpus: Optional[int], ladder: Optional[str]) -> None:
-        """Refuse `--gpus` with `--ladder`: both state a GPU count for one run.
-
-        They can contradict -- a 4-GPU budget with an 8-GPU rung -- so the
-        error offers both readings rather than choosing one.
-        """
-        if gpus is None or ladder is None:
-            return
-        raise SelectionError(
-            "--gpus: cannot be combined with --ladder; both state a GPU count for one run. "
-            "To run one allocation of the ladder use --rung; to describe a machine with "
-            "fewer GPUs give a shorter --ladder"
-        )
-
     @classmethod
     def out_dir_for(
         cls,
         text: Optional[str],
         machine: str,
-        ladder: Optional[Ladder],
+        ladder: Ladder,
         target_rung: Optional[int],
     ) -> Optional[Path]:
         """Where to write, or None when nothing is written.
@@ -129,7 +112,7 @@ class SelectionRequest:
         return out_dir
 
     @staticmethod
-    def check_no_orphans(out_dir: Path, machine: str, ladder: Optional[Ladder]) -> None:
+    def check_no_orphans(out_dir: Path, machine: str, ladder: Ladder) -> None:
         """Refuse a directory already holding this machine's stale lists.
 
         The directory is written into and never emptied, so a leftover list
@@ -149,16 +132,16 @@ class SelectionRequest:
         )
 
     @staticmethod
-    def ladder_for(text: Optional[str], profile: MachineProfile) -> Optional[Ladder]:
-        """The parsed `--ladder`, or None when it was not given.
+    def ladder_for(text: Optional[str], profile: MachineProfile) -> Ladder:
+        """The parsed `--ladder`, or one rung of the whole node when it was not given.
 
         A rung larger than the machine's GPUs per node is a usage error: that
         allocation cannot be requested. A ladder *shorter* than the machine is
-        not: `--ladder=1,4` on an 8-GPU node is a caller running only the small
-        work there. The tests it strands are reported rather than refused.
+        not: `--ladder=4` on an 8-GPU node asks what one 4-GPU allocation of it
+        can run, and what needs more is deselected.
         """
         if text is None:
-            return None
+            return Ladder.of([profile.max_gpu_per_node])
         try:
             ladder = Ladder.parse(text)
         except ValueError as error:
@@ -171,47 +154,26 @@ class SelectionRequest:
         return ladder
 
     @staticmethod
-    def target_rung_for(rung: Optional[int], ladder: Optional[Ladder]) -> Optional[int]:
+    def target_rung_for(rung: Optional[int], ladder: Ladder) -> Optional[int]:
         """The allocation this run occupies, or None when it names none.
 
-        The profile is not touched: naming a rung narrows what executes, never
-        what the machine can do. A rung outside the ladder is a usage error
-        rather than a run that selects nothing.
+        A rung outside the ladder is a usage error rather than a run that
+        selects nothing.
         """
         if rung is None:
             return None
-        if ladder is None:
-            raise SelectionError(
-                f"--rung: requires --ladder; there is no set of allocations for {rung} to name"
-            )
         if rung not in ladder:
             raise SelectionError(f"--rung: {rung} is not a rung of --ladder={ladder}")
         return rung
 
     @staticmethod
-    def profile_for(machine: str, gpus: Optional[int]) -> MachineProfile:
-        """The named machine sized for `gpus`, or a usage error naming the fault.
-
-        `gpus` of None sizes the profile to the machine's whole node.
-        """
+    def profile_for(machine: str) -> MachineProfile:
+        """The named machine, or a usage error naming the fault."""
         try:
             catalog = default_catalog()
         except (ProfileConfigError, OSError) as error:
             raise SelectionError(f"--machine: cannot read the machine catalogue: {error}")
         try:
-            node = catalog.profile_for(machine)
+            return catalog.profile_for(machine)
         except KeyError as error:
             raise SelectionError(f"--machine: {error.args[0]}")
-
-        if gpus is None:
-            return node
-        if gpus > node.max_gpu_per_node:
-            # The veto the ladder gets: that allocation cannot be requested.
-            raise SelectionError(
-                f"--gpus: {gpus} exceeds {node.name}, which has "
-                f"{node.max_gpu_per_node} GPUs per node"
-            )
-        try:
-            return node.with_gpu_count(gpus)
-        except ProfileConfigError as error:
-            raise SelectionError(f"--gpus: {error}")
