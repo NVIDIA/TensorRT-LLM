@@ -599,7 +599,7 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 
     // We only use 1 stage for the oneshot allreduce. Arrivals are counted per CTA: the RMSNorm epilogue's cluster
     // reduction below must be each thread's only phase of the cluster barrier.
-    LamportFlags<PackedType, false> flag(params.bufferFlags, 1);
+    LamportFlags<PackedType> flag(params.bufferFlags, 1);
     T* stagePtrMcast = reinterpret_cast<T*>(flag.getCurLamportBuf(params.mcastPtr, 0));
     T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
     bool const inBounds = packedIdx * kELTS_PER_THREAD < params.tokenDim;
@@ -717,7 +717,6 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
             }
-            // cluster.sync();
             cluster.barrier_wait(cluster.barrier_arrive());
             for (int i = 0; i < numBlocks; ++i)
             {
@@ -893,7 +892,7 @@ __global__ __launch_bounds__(128) void twoshotAllreduceKernel(MnnvlAllReduceKern
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-    LamportFlags<PackedType, false> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    LamportFlags<PackedType> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
 
     T* scatterBufLocal
         = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], MNNVLTwoShotStage::SCATTER));
@@ -1021,7 +1020,7 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
 
     // Arrivals are counted per CTA: with UseCGA the RMSNorm cluster reduction below must be each thread's only phase
     // of the cluster barrier.
-    LamportFlags<float4, false> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
+    LamportFlags<float4> flag(params.bufferFlags, MNNVLTwoShotStage::NUM_STAGES);
     T* input = reinterpret_cast<T*>(
         flag.getCurLamportBuf(reinterpret_cast<void*>(params.bufferInputPtr), MNNVLTwoShotStage::BROADCAST));
 
@@ -1148,7 +1147,6 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
             {
                 cluster.map_shared_rank(&sharedVal[0], threadIdx.x)[blockRank] = blockSum;
             }
-            // cluster.sync();
             cluster.barrier_wait(cluster.barrier_arrive());
             for (int i = 0; i < numBlocks; ++i)
             {
