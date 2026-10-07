@@ -581,6 +581,11 @@ class OpenAIServer(_VideoRoutesMixin):
             )
         if enable_rl_control_endpoints and not isinstance(generator, AsyncLLM):
             raise ValueError("RL control endpoints require AsyncLLM")
+        if (enable_runtime_control_endpoints
+                and server_role is ServerRole.EMBEDDING):
+            raise ValueError(
+                "Runtime control endpoints are not supported for embedding servers"
+            )
         if enable_runtime_control_endpoints and not runtime_control_api_key:
             raise ValueError(
                 "runtime_control_api_key is required when runtime control "

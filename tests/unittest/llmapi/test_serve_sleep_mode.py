@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
 from unittest import mock
 
 import click
@@ -20,6 +21,9 @@ import pytest
 
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import ExecutorMemoryType, SleepConfig
+from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.llmapi.llm import LLM
+from tensorrt_llm.serve.openai_server import OpenAIServer
 
 pytestmark = pytest.mark.cpu_only
 
@@ -125,3 +129,26 @@ def test_sleep_mode_rejects_multiple_frontends(monkeypatch, tmp_path, source):
         _invoke_sleep_mode(extra_args)
 
     llm.assert_not_called()
+
+
+def test_runtime_control_rejects_embedding_server() -> None:
+    generator = mock.Mock(spec=LLM)
+    generator.args = SimpleNamespace(
+        encode_only=True,
+        sleep_config=SleepConfig(),
+        num_serve_frontends=1,
+    )
+
+    with mock.patch.object(OpenAIServer, "_register_runtime_control_routes") as register_routes:
+        with pytest.raises(ValueError, match="not supported for embedding servers"):
+            OpenAIServer(
+                generator=generator,
+                model="dummy/model",
+                tool_parser=None,
+                server_role=ServerRole.EMBEDDING,
+                metadata_server_cfg=None,
+                enable_runtime_control_endpoints=True,
+                runtime_control_api_key="secret",
+            )
+
+    register_routes.assert_not_called()
