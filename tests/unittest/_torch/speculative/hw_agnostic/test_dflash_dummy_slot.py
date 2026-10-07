@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DFlash's dummy slot (CUDA-graph padding and warmup dummies) starts every step at context length 0.
+"""DFlash's dummy slot (CUDA-graph padding, warmup and attention-DP dummies) is at context length 0 between steps.
 
-Padding rows add their accepted tokens to the dummy slot's length like any request, while their page-table rows are
-the padding request's pages with the rest mapped to page 0, which another request owns. A dummy length that kept
-growing would put the padding rows' context K / V on that page. ``DFlashSpecMetadata.prepare`` runs before every step
-(eager or replayed graph); after it the dummy slot's length is 0 and every real slot's is untouched.
+Dummy rows add their accepted tokens to the dummy slot's length like any request, while a padding row's page-table row
+maps past the padding request's own pages to page 0, which another request owns. A dummy length that kept growing
+would put the padding rows' context K / V on that page. The drafting step's ``DFlashWorker._advance_ctx_len`` empties
+the slot right after the add, inside the captured step, so ``DFlashSpecMetadata.prepare`` writes slot lengths only for
+evicted requests.
 """
 
 from functools import partial
@@ -43,11 +44,13 @@ def _worker(lengths):
         _free_slots=[3],
         _graph_dummy_id_floor=FLOOR,
         _dummy_slot=len(lengths) - 1,
+        _max_ctx=1000,
         _ctx_len=torch.tensor(lengths, dtype=torch.long, device="cuda"),
         _ctx_len_host=list(lengths),
         _batch_to_slot=torch.zeros(8, dtype=torch.long, device="cuda"),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
+    w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)
     w._assign_slot = lambda rid, *a, **k: None
     return w
 
@@ -63,21 +66,54 @@ def _prepare(worker, request_ids, num_generations):
     torch.cuda.synchronize()
 
 
-def test_padding_steps_keep_the_dummy_slot_empty():
+def _cuda(values):
+    return torch.tensor(values, dtype=torch.long, device="cuda")
+
+
+def test_padded_steps_keep_the_dummy_slot_empty():
     worker = _worker([40, 300, 7, 0, 0])
-    padded = [11, 12, 13, FLOOR + 1, FLOOR + 1]  # three requests in a graph of five
-    for step in range(4):
-        # What the step's acceptance does to the slots of its rows (k3_ctx_kv / the torch path): + accepted.
-        _prepare(worker, padded, num_generations=5)
+    # Three requests in a graph of five.
+    _prepare(worker, [11, 12, 13, FLOOR + 1, FLOOR + 1], num_generations=5)
+    slots = worker._batch_to_slot[:5].clone()
+    assert slots.tolist() == [0, 1, 2, 4, 4]
+    for step in range(1, 5):
+        worker._advance_ctx_len(slots, _cuda([8] * 5))
+        torch.cuda.synchronize()
         assert worker._ctx_len.tolist() == [40 + 8 * step, 300 + 8 * step, 7 + 8 * step, 0, 0], step
-        assert worker._batch_to_slot[:5].tolist() == [0, 1, 2, 4, 4]
-        assert worker._ctx_len_host[4] == 0
-        worker._ctx_len[[0, 1, 2]] += 8
-        worker._ctx_len[4] += 2 * 8  # both padding rows land on the dummy slot
 
 
-def test_evicted_request_and_dummy_reset_together():
+def test_dummy_slot_reset_replays_in_a_cuda_graph():
+    worker = _worker([40, 300, 7, 0, 0])
+    slots = _cuda([0, 1, 4])
+    accepted = _cuda([2, 3, 5])
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        worker._advance_ctx_len(slots, accepted)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        worker._advance_ctx_len(slots, accepted)
+    worker._ctx_len.copy_(_cuda([40, 300, 7, 0, 0]))
+    for step in range(1, 4):
+        worker._ctx_len[worker._dummy_slot] = 99  # whatever the slot holds before the step
+        graph.replay()
+        torch.cuda.synchronize()
+        assert worker._ctx_len.tolist() == [40 + 2 * step, 300 + 3 * step, 7, 0, 0], step
+
+
+def test_prepare_resets_only_evicted_slots():
     worker = _worker([40, 300, 7, 0, 96])
-    _prepare(worker, [11, 13, FLOOR + 1], num_generations=3)  # request 12 left; one padding row
-    assert worker._ctx_len.tolist() == [40, 0, 7, 0, 0]
+    written = []
+    write = worker._write_ctx_len
+
+    def record(updates):
+        written.append(dict(updates))
+        write(updates)
+
+    worker._write_ctx_len = record
+    _prepare(worker, [11, 12, 13, FLOOR + 1], num_generations=4)
+    _prepare(worker, [11, 13, FLOOR + 1], num_generations=3)  # request 12 left
+    assert written == [{}, {1: 0}]
+    assert worker._ctx_len.tolist() == [40, 0, 7, 0, 96]
     assert 1 in worker._free_slots and 12 not in worker._req_to_slot
