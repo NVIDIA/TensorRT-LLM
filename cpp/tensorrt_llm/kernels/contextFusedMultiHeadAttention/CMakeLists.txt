@@ -120,8 +120,10 @@ foreach(arch IN ITEMS 80 86 89 90 100 120)
               ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/src/
               ${CMAKE_CURRENT_SOURCE_DIR}/../../../kernels/fmha_v2/generated/)
     set_cuda_architectures(${TARGET_NAME} ${TARGET_ARCH})
-    target_sources(context_attention_src
-                   PRIVATE $<TARGET_OBJECTS:${TARGET_NAME}>)
+    # Final consumers need generated objects even through LINK_ONLY boundaries.
+    target_link_libraries(
+      context_attention_src INTERFACE ${TARGET_NAME}
+                                      $<TARGET_OBJECTS:${TARGET_NAME}>)
   else()
     # arch is enabled (disabled archs already `continue`d above) but the
     # generation step produced no *_sm${arch}.cu kernels for it. Fail rather

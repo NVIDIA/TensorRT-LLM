@@ -73,6 +73,7 @@ endfunction()
 
 add_th_common_family(
   th_common_attention
+  COMPONENT_LOCAL
   SOURCES
   mlaPreprocessOp.cpp
   attentionOp.cpp
@@ -94,15 +95,33 @@ add_th_common_family(
   pagedFp8ContextFmhaOp.cpp
   trtllmGenQKVProcessOp.cpp
   csa2SparseContextOp.cpp
-  csa2SparseDecodeOp.cpp)
+  csa2SparseDecodeOp.cpp
+  LINK_LIBRARIES
+  tllm::common_attention
+  tllm::common_op_utils
+  tllm::runtime_debug
+  tllm::kernel_mla
+  tllm::kernel_mla_chunked_prefill
+  tllm::kernel_rope
+  tllm::kernel_sparse_attention
+  tllm::kernel_attention_utilities
+  tllm::kernel_cache_indexing
+  tllm::kernel_indexer
+  tllm::kernel_tensor_operations
+  tllm::kernel_minimax_m3
+  trtllm_gen_fmha_interface
+  OBJECT_LIBRARIES
+  kda_decode_src
+  kimi_k3_attn_res_src
+  csa2_sparse_context_src
+  csa2_sparse_decode_src
+  minimax_m3_attn_src
+  minimax_m3_sm107_src)
+add_library(tllm::torch_attention ALIAS th_common_attention)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
-# pagedFp8ContextFmhaOp.cpp includes the trtllm-gen FMHA runner headers (see
-# th_common_visual_gen below).
-target_link_libraries(th_common_attention PRIVATE trtllm_gen_fmha_interface)
 
-# MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
-# th_common_attention with target_sources() so the list stays next to the files.
+# MiniMax-M3 registers its operators on the attention family.
 add_subdirectory(minimaxM3)
 
 add_th_common_family(

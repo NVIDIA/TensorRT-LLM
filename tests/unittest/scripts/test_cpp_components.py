@@ -189,3 +189,54 @@ def test_delegation_names_build_definition_outside_source_directory(tmp_path: Pa
         timeout=30,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_generated_fmha_objects_survive_private_object_consumer(tmp_path: Path) -> None:
+    if not shutil.which("cmake") or not shutil.which("c++"):
+        pytest.skip("CMake and a C++ compiler are required")
+    backend = REPO_ROOT / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/CMakeLists.txt"
+    arch_loop = backend.read_text().split("foreach(arch IN ITEMS", 1)[1]
+    generated = tmp_path / "generated/fmha_v2_cu"
+    generated.mkdir(parents=True)
+    (generated / "stub_sm80.cu").write_text("int generatedValue() { return 17; }\n")
+    (tmp_path / "context.cpp").write_text(
+        "int generatedValue(); int contextValue() { return generatedValue(); }\n"
+    )
+    (tmp_path / "orchestrator.cpp").write_text(
+        "int contextValue(); int orchestrate() { return contextValue(); }\n"
+    )
+    (tmp_path / "family.cpp").write_text(
+        "int orchestrate(); int family() { return orchestrate(); }\n"
+    )
+    (tmp_path / "main.cpp").write_text(
+        "int family(); int main() { return family() == 17 ? 0 : 1; }\n"
+    )
+    cmake = r"""
+cmake_minimum_required(VERSION 3.20)
+project(forwarded_fmha LANGUAGES CXX)
+set(CMAKE_CUDA_ARCHITECTURES_ORIG 80)
+set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY 100)
+set(TRTLLM_FMHA_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated")
+set_source_files_properties("${TRTLLM_FMHA_GEN_DIR}/fmha_v2_cu/stub_sm80.cu"
+                            PROPERTIES LANGUAGE CXX)
+function(set_cuda_architectures)
+endfunction()
+add_library(context_attention_src OBJECT context.cpp)
+@ARCH_LOOP@
+add_library(orchestrator STATIC orchestrator.cpp)
+target_link_libraries(orchestrator INTERFACE context_attention_src
+                     $<TARGET_OBJECTS:context_attention_src>)
+add_library(family OBJECT family.cpp)
+target_link_libraries(family PRIVATE orchestrator)
+add_executable(consumer main.cpp)
+target_link_libraries(consumer PRIVATE family)
+""".replace("@ARCH_LOOP@", "foreach(arch IN ITEMS" + arch_loop)
+    (tmp_path / "CMakeLists.txt").write_text(cmake)
+    build_dir = tmp_path / "build"
+    for command in (
+        ["cmake", "-S", str(tmp_path), "-B", str(build_dir)],
+        ["cmake", "--build", str(build_dir), "--target", "consumer"],
+        [str(build_dir / "consumer")],
+    ):
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stdout + result.stderr
