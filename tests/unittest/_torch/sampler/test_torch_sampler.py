@@ -3398,6 +3398,21 @@ class TestRequestSeed:
         stride = _SeedManager.OFFSET_STRIDE
         assert first.offset.tolist() + second.offset.tolist() == [i * stride for i in range(5)]
 
+    def test_unseeded_offsets_continue_across_mixed_batches(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 1234
+        manager._slot_seeded[0] = True
+        device = torch.device("cpu")
+
+        before = manager.take_row_seeds([1], device=device)
+        mixed = manager.take_row_seeds([0, 1], device=device)
+        after = manager.take_row_seeds([1], device=device)
+
+        assert mixed.seed.tolist() == [1234, 42]
+        stride = _SeedManager.OFFSET_STRIDE
+        unseeded = before.offset.tolist() + mixed.offset.tolist()[1:] + after.offset.tolist()
+        assert unseeded == [0, stride, 2 * stride]
+
 
 class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
