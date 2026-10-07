@@ -112,7 +112,7 @@ registered with a requested tag are affected.
 | `MODEL_ENGINE_MAIN` | `model` | Other main-model engine allocations |
 | `MODEL_WEIGHTS_DRAFT` | `draft_model_weights` | Draft-model parameters |
 | `MODEL_ENGINE_DRAFT` | `draft_model` | Other draft-model engine allocations |
-| `KV_CACHE` | `kv_cache` | KV-cache allocations |
+| `KV_CACHE` | `kv_cache` | KV-cache allocations; KV-cache sleep is rejected when KV-cache manager V2 is enabled |
 | `SAMPLER` | `sampler` | Sampling resources |
 | `DRAFTER` | `drafter` | Drafting resources |
 | `GUIDED_DECODER` | `guided_decoder` | Guided-decoding resources |
