@@ -1462,6 +1462,21 @@ class _ImportReplacementDB(_FakeDB):
         }
 
 
+class _ExternalTestReferenceDB(_FakeDB):
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "CPU-Generic-x86": {
+                "test_unittests.py::test_unittests_v2[unittest/pkg]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py]",
+            },
+            "B300-PyTorch": {
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_one]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_two]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py::test_one]",
+            },
+        }
+
+
 def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     path = "tensorrt_llm/example.py"
     source = (
@@ -1611,6 +1626,89 @@ def test_selector_declines_when_changed_binding_has_external_reference() -> None
     assert "external binding reference(s)" in result.reason
 
 
+def test_selector_selects_registered_external_test_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 522\n"
+    diff = "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"
+    selector = CoverageSelector(
+        _ExternalTestReferenceDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_reference_paths=lambda _path, names: {
+            name: {"tests/unittest/pkg/test_consumer.py"} for name in names
+        },
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    consumer = "test_unittests.py::test_unittests_v2[unittest/pkg]"
+    unrelated = "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py]"
+    assert result.ok
+    assert result.impacted == {
+        "B300-PyTorch": {
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_one]",
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_two]",
+        },
+        "CPU-Generic-x86": {consumer},
+    }
+    assert result.skippable == {
+        "B300-PyTorch": {
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py::test_one]"
+        },
+        "CPU-Generic-x86": {unrelated},
+    }
+
+
+@pytest.mark.parametrize(
+    ("reference_path", "reason"),
+    (
+        ("tensorrt_llm/consumer.py", "non-test external reference"),
+        (
+            "tests/unittest/missing/test_missing.py",
+            "unregistered external test reference",
+        ),
+    ),
+)
+def test_selector_declines_unbounded_external_reference_path(
+    reference_path: str, reason: str
+) -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 522\n"
+    diff = "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"
+    selector = CoverageSelector(
+        _ExternalTestReferenceDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_reference_paths=lambda _path, names: {name: {reference_path} for name in names},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert reason in result.reason
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        "unittest/pkg -k focused",
+        "unittest/pkg --ignore=unittest/pkg/test_consumer.py",
+        "unittest/pkg --ignore unittest/pkg/test_consumer.py",
+    ),
+)
+def test_unittest_entry_does_not_claim_partial_test_file(entry: str) -> None:
+    assert not CoverageSelector._unittest_entry_covers(entry, "unittest/pkg/test_consumer.py")
+
+
+def test_unittest_entry_matches_file_and_directory_entries() -> None:
+    path = "unittest/pkg/test_consumer.py"
+
+    assert CoverageSelector._unittest_entry_covers(path, path)
+    assert CoverageSelector._unittest_entry_covers(f"{path}::test_one", path)
+    assert CoverageSelector._unittest_entry_covers("unittest/pkg", path)
+    assert not CoverageSelector._unittest_entry_covers("unittest/other", path)
+
+
 def test_selector_ignores_external_reference_for_pure_new_function() -> None:
     path = "tensorrt_llm/example.py"
     source = "VALUE = 1\n\ndef helper():\n    return VALUE\n"
@@ -1718,6 +1816,61 @@ def test_repository_reference_index_treats_module_escape_as_unresolved(
     )
 
     assert references == {"VALUE", "OTHER"}
+
+
+def test_repository_reference_index_reports_reference_paths(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "direct.py").write_text("from pkg.owner import VALUE\n")
+    (package / "opaque.py").write_text("import pkg.owner as owner\nregister(owner)\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {
+        "VALUE": {"pkg/direct.py", "pkg/opaque.py"},
+        "OTHER": {"pkg/opaque.py"},
+    }
+
+
+def test_repository_reference_index_respects_static_star_exports(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text('__all__ = ["PUBLIC"]\nPUBLIC = 1\n_PRIVATE = 2\n')
+    (package / "consumer.py").write_text("from pkg.owner import *\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"PUBLIC", "_PRIVATE"}
+    )
+
+    assert references == {"PUBLIC": {"pkg/consumer.py"}}
+
+
+def test_repository_reference_index_keeps_dynamic_star_exports_conservative(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("__all__ = build_exports()\nPUBLIC = 1\n_PRIVATE = 2\n")
+    (package / "consumer.py").write_text("from pkg.owner import *\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"PUBLIC", "_PRIVATE"}
+    )
+
+    assert references == {
+        "PUBLIC": {"pkg/consumer.py"},
+        "_PRIVATE": {"pkg/consumer.py"},
+    }
 
 
 def test_repository_reference_index_tracks_simple_module_alias(reference_root: Path) -> None:

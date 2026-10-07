@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,7 @@ from touch_db import (
     canon,
     split_stage,
     stage_family,
+    unwrap_unittest,
 )
 
 
@@ -84,6 +86,7 @@ class CoverageSelector:
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
         read_source: Callable[[str], str | None] | None = None,
         external_references: Callable[[str, set[str]], set[str]] | None = None,
+        external_reference_paths: Callable[[str, set[str]], dict[str, set[str]]] | None = None,
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
@@ -95,9 +98,13 @@ class CoverageSelector:
         self._no_data_policy = no_data_policy
         # Defaults to the checkout; callers explaining a past commit inject their own.
         self._read_source = read_source or self._read_head
-        self._external_references = (
-            external_references or RepositoryReferenceIndex(self.repo_root).external_references
-        )
+        if external_references is None and external_reference_paths is None:
+            reference_index = RepositoryReferenceIndex(self.repo_root)
+            self._external_references = reference_index.external_references
+            self._external_reference_paths = reference_index.external_reference_paths
+        else:
+            self._external_references = external_references
+            self._external_reference_paths = external_reference_paths
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -196,28 +203,26 @@ class CoverageSelector:
                         # repository-wide fail-closed check for every removed
                         # or rebound name, while bounding pure imports and
                         # declarations through their targets and consumers.
-                        external = self._external_references(
-                            cf,
+                        checked_bindings = (
                             dependencies.changed_bindings
                             - dependencies.new_import_bindings
-                            - dependencies.new_declaration_bindings,
+                            - dependencies.new_declaration_bindings
                         )
+                        external_paths: dict[str, set[str]] = {}
+                        if self._external_reference_paths is not None:
+                            external_paths = self._external_reference_paths(cf, checked_bindings)
+                            external = set(external_paths)
+                        elif self._external_references is not None:
+                            external = self._external_references(cf, checked_bindings)
+                        else:
+                            external = set()
                         if external:
-                            why = (
-                                f"import-executed change has external binding reference(s): "
-                                f"{path}::{', '.join(sorted(external))}"
-                            )
-                            return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
-                        for consumer in sorted(dependencies.binding_consumers):
-                            if (
-                                not self.db.tests_touching_func(cf, consumer)
-                                and "." not in consumer
-                                and consumer not in dependencies.new_declaration_bindings
-                                and self._external_references(cf, {consumer})
-                            ):
+                            external_tests, limitation = self._external_test_impact(external_paths)
+                            if limitation:
                                 why = (
-                                    "import-derived consumer has external reference(s): "
-                                    f"{path}::{consumer}"
+                                    "import-executed change has external binding "
+                                    f"reference(s): {path}::{', '.join(sorted(external))} "
+                                    f"({limitation})"
                                 )
                                 return (
                                     impacted,
@@ -226,6 +231,39 @@ class CoverageSelector:
                                     no_diff,
                                     why,
                                 )
+                            impacted |= external_tests
+                        for consumer in sorted(dependencies.binding_consumers):
+                            if (
+                                not self.db.tests_touching_func(cf, consumer)
+                                and "." not in consumer
+                                and consumer not in dependencies.new_declaration_bindings
+                            ):
+                                consumer_paths: dict[str, set[str]] = {}
+                                if self._external_reference_paths is not None:
+                                    consumer_paths = self._external_reference_paths(cf, {consumer})
+                                    consumer_external = set(consumer_paths)
+                                else:
+                                    consumer_external = self._external_reference_names(
+                                        cf, {consumer}
+                                    )
+                                if consumer_external:
+                                    external_tests, limitation = self._external_test_impact(
+                                        consumer_paths
+                                    )
+                                    if limitation:
+                                        why = (
+                                            "import-derived consumer has external "
+                                            f"reference(s): {path}::{consumer} "
+                                            f"({limitation})"
+                                        )
+                                        return (
+                                            impacted,
+                                            sorted(no_data),
+                                            sorted(caller_bounded),
+                                            no_diff,
+                                            why,
+                                        )
+                                    impacted |= external_tests
                             tests, bounded = self._qualname_impact(
                                 cf, consumer, dependencies, allow_caller_bound=True
                             )
@@ -255,6 +293,69 @@ class CoverageSelector:
                     if bounded:
                         caller_bounded.add(f"{cf}::{qualname}")
         return impacted, sorted(no_data), sorted(caller_bounded), no_diff, None
+
+    def _external_reference_names(self, path: str, names: set[str]) -> set[str]:
+        """Return referenced names through either configured reference API."""
+        if self._external_reference_paths is not None:
+            return set(self._external_reference_paths(path, names))
+        if self._external_references is not None:
+            return self._external_references(path, names)
+        return set()
+
+    def _external_test_impact(self, references: dict[str, set[str]]) -> tuple[set[str], str | None]:
+        """Bound external references when every path is a registered unit test."""
+        paths = {path for binding_paths in references.values() for path in binding_paths}
+        if not paths:
+            return set(), "reference locations unavailable"
+
+        impacted: set[str] = set()
+        known = self.db.known_by_family()
+        for path in sorted(paths):
+            relative = path.removeprefix("tests/")
+            if (
+                relative == path
+                or not relative.startswith("unittest/")
+                or not Path(relative).name.startswith("test_")
+                or not relative.endswith(".py")
+            ):
+                return set(), f"non-test external reference: {path}"
+
+            matched = False
+            for family, nodeids in known.items():
+                for nodeid in nodeids:
+                    entry = unwrap_unittest(nodeid)
+                    if entry is None:
+                        continue
+                    if self._unittest_entry_covers(entry, relative):
+                        impacted.add(f"{family}/{nodeid}")
+                        matched = True
+            if not matched:
+                return set(), f"unregistered external test reference: {path}"
+        return impacted, None
+
+    @staticmethod
+    def _unittest_entry_covers(entry: str, test_path: str) -> bool:
+        """Return whether a unittest entry collects a path without excluding it."""
+        try:
+            tokens = shlex.split(entry)
+        except ValueError:
+            return False
+        if not tokens or "-k" in tokens:
+            return False
+        entry_path = tokens[0].partition("::")[0]
+
+        ignored: set[str] = set()
+        for index, token in enumerate(tokens):
+            if token.startswith("--ignore="):
+                ignored.add(token.partition("=")[2])
+            elif token == "--ignore" and index + 1 < len(tokens):
+                ignored.add(tokens[index + 1])
+        if any(test_path == path or test_path.startswith(f"{path}/") for path in ignored):
+            return False
+
+        if entry_path.endswith(".py"):
+            return entry_path == test_path
+        return test_path.startswith(f"{entry_path.rstrip('/')}/")
 
     def _import_target_impact(
         self,

@@ -49,6 +49,55 @@ def _resolve_from(module: str, is_package: bool, node: ast.ImportFrom) -> str:
     return ".".join(base)
 
 
+def _star_imported_names(source: str, names: set[str]) -> set[str]:
+    """Return candidate names exposed by ``from module import *``."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set(names)
+
+    all_statements = [
+        statement
+        for statement in tree.body
+        if any(
+            isinstance(node, ast.Name)
+            and node.id == "__all__"
+            or isinstance(node, ast.Constant)
+            and node.value == "__all__"
+            for node in ast.walk(statement)
+        )
+    ]
+    if not all_statements:
+        return {name for name in names if not name.startswith("_")}
+    if len(all_statements) != 1:
+        return set(names)
+
+    statement = all_statements[0]
+    if (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and statement.targets[0].id == "__all__"
+    ):
+        value = statement.value
+    elif (
+        isinstance(statement, ast.AnnAssign)
+        and isinstance(statement.target, ast.Name)
+        and statement.target.id == "__all__"
+        and statement.value is not None
+    ):
+        value = statement.value
+    else:
+        return set(names)
+
+    if not isinstance(value, (ast.List, ast.Tuple, ast.Set)) or not all(
+        isinstance(element, ast.Constant) and isinstance(element.value, str)
+        for element in value.elts
+    ):
+        return set(names)
+    return names & {element.value for element in value.elts}
+
+
 @dataclass(frozen=True)
 class _ParsedModule:
     path: str
@@ -220,12 +269,20 @@ class RepositoryReferenceIndex:
 
     def external_references(self, defining_path: str, names: set[str]) -> set[str]:
         """Return bindings referenced from another repository Python file."""
+        return set(self.external_reference_paths(defining_path, names))
+
+    def external_reference_paths(self, defining_path: str, names: set[str]) -> dict[str, set[str]]:
+        """Return each externally referenced binding's repository paths."""
         target_module, _ = _module_name(defining_path)
         target_leaf = target_module.rpartition(".")[2]
-        referenced: set[str] = set()
+        try:
+            target_source = (self.repo_root / defining_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            star_imported_names = set(names)
+        else:
+            star_imported_names = _star_imported_names(target_source, names)
+        referenced: dict[str, set[str]] = {}
         for module in self._modules_containing(target_leaf):
-            if referenced == names:
-                break
             if module.path == defining_path:
                 continue
             try:
@@ -239,16 +296,21 @@ class RepositoryReferenceIndex:
             except SyntaxError:
                 # Candidate discovery already found the target module's leaf.
                 # Without an AST, no binding can be excluded soundly.
-                referenced.update(names)
-                continue
-            referenced.update(
-                self._references_from_module(parsed, target_module, names - referenced)
-            )
+                module_references = names
+            else:
+                module_references = self._references_from_module(
+                    parsed, target_module, names, star_imported_names
+                )
+            for name in module_references:
+                referenced.setdefault(name, set()).add(module.path)
         return referenced
 
     @staticmethod
     def _references_from_module(
-        source_module: _ParsedModule, target_module: str, names: set[str]
+        source_module: _ParsedModule,
+        target_module: str,
+        names: set[str],
+        star_imported_names: set[str],
     ) -> set[str]:
         tree = source_module.tree
         if tree is None or not names:
@@ -267,7 +329,7 @@ class RepositoryReferenceIndex:
                 if imported_from == target_module:
                     imported_names = {alias.name for alias in node.names}
                     if "*" in imported_names:
-                        referenced.update(names)
+                        referenced.update(star_imported_names)
                     else:
                         referenced.update(names & imported_names)
                 for alias in node.names:
