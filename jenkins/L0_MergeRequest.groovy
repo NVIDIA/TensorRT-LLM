@@ -215,8 +215,37 @@ def BOLT_CONSUME = "bolt_consume"
 // on for every eligible build is a reviewed code change; a `/bot run` with
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
+//
+// On today means aarch64/SBSA only in practice: the post-merge producer promotes
+// `targetArch: aarch64-linux-gnu` alone (see the BOLT-Profile-Gen stage below), so
+// main has no x86_64 bundle. The x86_64 build still asks and takes apply_latest.sh's
+// documented "nothing promoted" exit (3), which Build.groovy reports as a skip and
+// leaves un-BOLTed.
+//
+// Promoting an x86_64 bundle is necessary but not sufficient to start consuming on
+// that arch. The consume scope and the profile pin are both aarch64-specific, and
+// each has to grow an x86_64 entry alongside the producer.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = false
+def ENABLE_BOLT_PREMERGE_CONSUME = true
+// Version-controlled rollout switch for post-merge BOLT, same idiom as above.
+//
+// Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
+// canonical tarball: that tarball is BoltProfileGen's input and must stay
+// un-BOLTed, or the next bundle is generated from already-optimized binaries.
+// So post-merge publishes BOTH -- canonical untouched, plus bolted-<tarName>
+// carrying a bolt.ref property naming the bundle applied.
+//
+// On means post-merge SBSA also runs its tests against bolted-<tarName> instead
+// of only publishing it. Turning it off stops both the extra publish and the
+// test-side switch; the canonical tarball is never touched either way, so a
+// post-merge run with this off is byte-for-byte what it is today.
+//
+// This is deliberately not the pre-merge switch above. Post-merge is scoped to
+// one branch and one arch, and it exercises the same apply-to-tarball path a
+// pre-merge build would, which is what makes it the smoke test for flipping
+// ENABLE_BOLT_PREMERGE_CONSUME afterwards.
+@Field
+def ENABLE_BOLT_POSTMERGE_VARIANT = true
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -261,6 +290,48 @@ def RUN_MODE = "run_mode"
 def BUILD_BRANCH = "build_branch"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+// The one BOLT profile bundle every consumer in this pipeline applies. Resolved
+// once (see resolveBoltProfileRef) rather than each consumer reading the mutable
+// `latest` pointer whenever it happens to run -- which made two stages in the
+// same pipeline able to disagree about which profiles they used. Empty means
+// unpinned, i.e. today's read-`latest`-per-consumer behaviour.
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+// Whether this run's build publishes bolted-<tarName> beside an untouched
+// canonical. Decided once: the build needs it to know what to publish, and the
+// test stages need it to know what to fetch. Two copies of the condition would
+// eventually disagree, and the failure would be tests silently reading the
+// un-BOLTed tarball -- indistinguishable from a healthy run.
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+// The branch whose promote directory holds that bundle. A ref alone does not
+// address an object -- the path is <branch>/<triple>/bolt-profile-<ref>-<triple>
+// -- and consumers used to supply the branch themselves from four different
+// expressions. They agree on post-merge main and nowhere guaranteed else, and a
+// disagreement is a 404, which apply_latest.sh reports as "nothing promoted":
+// indistinguishable from a cold start, so it degrades silently. Carrying the
+// branch with the ref means a pinned consumer never has to guess.
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// The one triple with a BOLT profile producer. BoltProfileGen runs aarch64 only,
+// so this is the only triple with a promoted bundle to resolve or apply. Named
+// once because the pin resolver and the consume scope below must not disagree.
+@Field
+def BOLT_PRODUCER_TRIPLE = "aarch64-linux-gnu"
+// The triples BOLT consume applies to. Stated explicitly rather than inferred
+// from the pin: "which bundle" and "which architectures consume BOLT" are
+// independent questions, and answering the second from the first made the
+// x86_64 path behave differently depending on whether the pin happened to
+// resolve -- an unresolvable pin is non-fatal by design, so x86_64 would then
+// go on to stage llvm-bolt and request a bundle that does not exist before
+// giving up. Both consumers are launched for both architectures off this one
+// map, so the scope has to travel with it.
+//
+// Adding a triple here also needs a per-triple pin: BOLT_PROFILE_REF names one
+// bundle under one promote directory, so a second architecture reading it would
+// demand aarch64's bundle. Change the two together.
+@Field
+def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 @Field
 def RELEASE_TARGET = "release_target"
 def globalVars = [
@@ -273,13 +344,25 @@ def globalVars = [
     (RUN_MODE): runMode,
     (RELEASE_TARGET): runMode == "nightly_release" ?
         normalizeReleaseTargets(gitlabParamsFromBot.get(RELEASE_TARGET, null)) : [],
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): (env.JOB_NAME ==~ /.*PostMerge.*/) && ENABLE_BOLT_POSTMERGE_VARIANT,
+    (BOLT_PROFILE_BRANCH): "",
+    (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
 // Compare against "true" rather than relying on Groovy truthiness: the bot phrase
 // is free-form JSON, and a quoted "false" would otherwise read as opt-in.
+// globalVars[BOLT_PUBLISH_VARIANT], not the raw ENABLE_BOLT_POSTMERGE_VARIANT:
+// the raw flag carries no job scope, so ORing it into `requested` would make
+// every PRE-merge job targeting main pass resolveBoltConsume and start
+// consuming in the replace-canonical shape. That silently takes over what
+// ENABLE_BOLT_PREMERGE_CONSUME governs, and pre-merge behaviour is supposed to
+// be untouched by this work. The globalVars value is already PostMerge-scoped.
 globalVars[BOLT_CONSUME_BUILD] = resolveBoltConsume(
-    ENABLE_BOLT_PREMERGE_CONSUME || gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
-    globalVars[TARGET_BRANCH])
+    ENABLE_BOLT_PREMERGE_CONSUME || globalVars[BOLT_PUBLISH_VARIANT] ||
+        gitlabParamsFromBot.get(BOLT_CONSUME, false).toString() == "true",
+    globalVars[TARGET_BRANCH],
+    globalVars[BOLT_PUBLISH_VARIANT])
 if (runMode == "nightly_release") {
     globalVars[TRTLLM_VERSION_OVERRIDE] = params.version
 }
@@ -560,6 +643,29 @@ def preparation(pipeline, testFilter, globalVars)
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
+        }
+        // Must resolve BEFORE launchStages, not inside any branch of it.
+        // launchStages forks Release-Check, SBSA and x86_64 in parallel and
+        // launchJob serializes globalVars per child job, so a pin assigned in
+        // one branch races the jobs in the others: whichever serializes first
+        // receives an empty pin and resolves `latest` on its own -- the drift
+        // this exists to remove, now with the added property of being
+        // nondeterministic. Release Check is also skippable, which would leave
+        // the whole pipeline unpinned.
+        //
+        // preparation() is the earliest correct home: the script-level BOLT
+        // setup runs outside any node and cannot shell out, while the stage
+        // above has already checked the repo out into ${LLM_ROOT}, which is
+        // where the resolver's script lives.
+        stage("Pin BOLT Profile Bundle") {
+            def pinBranch = globalVars[BUILD_BRANCH]
+            def pinRef = resolveBoltProfileRef(pinBranch, BOLT_PRODUCER_TRIPLE)
+            globalVars[BOLT_PROFILE_REF] = pinRef
+            // The branch is only meaningful alongside a ref, so it is left empty
+            // when the pin does not resolve -- a consumer cannot then half-honour
+            // a pin. Which architectures consume BOLT is unaffected either way;
+            // that is BOLT_CONSUME_TRIPLES, decided independently of this.
+            globalVars[BOLT_PROFILE_BRANCH] = pinRef ? pinBranch : ""
         }
         stage("Upload Build Info") {
             try {
@@ -1042,7 +1148,8 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
 // a result map (or null = defer to existing filter chain). Result keys:
 // scope, affected_stages, reasons, test_db_dir_override,
-// affected_stage_test_counts, affected_stage_split_counts.
+// affected_stage_test_counts, affected_stage_split_counts,
+// coverage_residual_files, coverage_decline_reason.
 // CBTS narrows test cases only — Build always runs. See cbts/README.md.
 // ============================================================================
 
@@ -1081,12 +1188,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // Evaluate Tier 2 for every eligible PR. The pilot gate below controls
-        // application only; non-pilot coverage hits remain shadow decisions.
-        def coverageContext = _cbtsCoverageAudit(pipeline)
-        def coverageDb = coverageContext?.db
-        def coveragePilotEligible = coverageContext?.pilotEligible ?: false
-
+        def coveragePilotEligible = false
         // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
@@ -1100,7 +1202,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         if (filesNeedingDiff) {
             def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
             def fileChanges = githubPrApiUrl != null
-                ? getGithubMRChangedFileWithFallback(pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
+                ? getGithubMRChangedFileWithFallback(
+                    pipeline, globalVars, "getFileChanges", "", filesNeedingDiff)
                 : getGitlabMRChangedFile(pipeline, "getFileChanges")
             diffs = filesNeedingDiff.collectEntries { filePath ->
                 // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
@@ -1118,12 +1221,34 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         writeFile file: inputPath, text: inputJson
 
         def mainCmd = "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json"
-        if (coverageDb) {
-            mainCmd += " --coverage-db ${coverageDb.path} --coverage-db-meta ${coverageDb.meta}"
-        }
         def output = sh(script: mainCmd, returnStdout: true)
-
         def result = _cbtsParseSelectionResult(output)
+
+        // Tier 1 owns the definition of handled files. Only prepare a coverage DB when
+        // its residual is eligible for Tier 2, and scope the compatibility check to it.
+        if (result.scope == null && result.coverage_residual_files &&
+                !result.coverage_decline_reason) {
+            def residualPath = "${LLM_ROOT}/cbts_coverage_residual.json"
+            writeFile file: residualPath,
+                      text: groovy.json.JsonOutput.toJson(result.coverage_residual_files)
+            def coverageContext = _cbtsCoverageAudit(pipeline, globalVars, residualPath)
+            def coverageDb = coverageContext?.db
+            coveragePilotEligible = coverageContext?.pilotEligible ?: false
+            if (coverageDb?.meta) {
+                def coverageCmd = mainCmd + " --coverage-db-meta ${coverageDb.meta}"
+                if (coverageDb.path) {
+                    coverageCmd += " --coverage-db ${coverageDb.path}"
+                }
+                output = sh(script: coverageCmd, returnStdout: true)
+                result = _cbtsParseSelectionResult(output)
+            } else if (coverageDb?.compatibility) {
+                result.coverage_compatibility = coverageDb.compatibility
+                result.coverage_decline_reason = coverageDb.decline_reason ?: ""
+                result.coverage_decline_category = "coverage_unavailable"
+                output = groovy.json.JsonOutput.toJson(result)
+            }
+        }
+
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
@@ -1195,9 +1320,21 @@ def _cbtsMultiGpuLabelGateOpen(pipeline, globalVars)
     }
 }
 
+def _cbtsCoverageDecline(boolean pilotEligible, String reason)
+{
+    return [
+        db: [
+            compatibility: "unknown",
+            decline_reason: "coverage tier declined: ${reason}",
+        ],
+        pilotEligible: pilotEligible,
+    ]
+}
+
 // Resolve pilot application eligibility, then fetch and audit the touch DB for
-// every PR. Returns {db, pilotEligible}; db is null on a non-fatal preparation failure.
-def _cbtsCoverageAudit(pipeline)
+// every Tier-2 residual. Returns {db, pilotEligible}; a compatibility decline
+// remains in db without a path so it is observable in shadow and pilot modes.
+def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
 {
     def pilotEligible = false
     try {
@@ -1205,26 +1342,85 @@ def _cbtsCoverageAudit(pipeline)
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
         // The checked-out revision is the PR head; its merge base is what drift is measured against.
         def prHead = env.gitlabMergeRequestLastCommit ?: ""
+        def prNumber = _cbtsPrNumber(globalVars)
+        if (!(prHead ==~ /[0-9a-fA-F]{40}/) || !(prNumber ==~ /[1-9]\d*/)) {
+            pipeline.echo("CBTS audit: PR number/head unavailable; cannot make coverage DB selection repeatable")
+            return _cbtsCoverageDecline(
+                pilotEligible, "PR identity unavailable for coverage DB pin")
+        }
+
         def readyJson = ""
         def prAuthor = ""
-        withCredentials([usernamePassword(credentialsId: 'github-cred-trtllm-ci', usernameVariable: 'NOT_USED_YET', passwordVariable: 'GITHUB_API_TOKEN')]) {
+        def pinPlanJson = ""
+        withCredentials([usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'NOT_USED_YET',
+            passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
             prAuthor = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_pilot.py",
                 returnStdout: true,
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
+            pinPlanJson = sh(
+                script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
+                        "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
+                        "--pr-head ${prHead} || true",
+                returnStdout: true,
+            ).trim()
+        }
+        if (!pinPlanJson) {
+            pipeline.echo("CBTS audit: coverage DB pin could not be resolved")
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB pin could not be resolved")
+        }
+        def pinPlan = new groovy.json.JsonSlurper().parseText(pinPlanJson)
+        if (pinPlan.status != "ready") {
+            pipeline.echo("CBTS audit: ${pinPlan.decline_reason ?: 'coverage DB pin declined'}")
+            return [db: pinPlan, pilotEligible: pilotEligible]
+        }
+
+        if (pinPlan.pin_upload_required) {
+            try {
+                trtllm_utils.uploadArtifacts(
+                    "${LLM_ROOT}/${pinPlan.pin_path}", pinPlan.pin_target)
+                pipeline.echo("CBTS audit: pinned coverage DB build ${pinPlan.build} " +
+                              "for PR head ${prHead}")
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("CBTS audit: coverage DB pin upload failed (${e.message})")
+                return _cbtsCoverageDecline(pilotEligible, "coverage DB pin upload failed")
+            }
+        } else {
+            pipeline.echo("CBTS audit: reusing pinned coverage DB build ${pinPlan.build}")
+        }
+
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'github-cred-trtllm-ci',
+                usernameVariable: 'NOT_USED_YET',
+                passwordVariable: 'GITHUB_API_TOKEN'),
+        ]) {
             readyJson = sh(
                 script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/coverage_selection/artifact.py " +
-                        "--prepare cbts_cov${prHead ? " --pr-head ${prHead}" : ""} || true",
+                        "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
+                        " --pr-head ${prHead}" +
+                        " --build ${pinPlan.build}" +
+                        " --expected-commit ${pinPlan.commit} || true",
                 returnStdout: true,
             ).trim()
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
-            return [db: null, pilotEligible: pilotEligible]
+            return _cbtsCoverageDecline(pilotEligible, "coverage DB could not be prepared")
         }
         def ready = new groovy.json.JsonSlurper().parseText(readyJson)
+        if (!ready.path) {
+            pipeline.echo("CBTS audit: Tier-2 residual compatibility check did not pass")
+            return [db: ready, pilotEligible: pilotEligible]
+        }
+        pipeline.echo("CBTS audit: Tier-2 residual applies cleanly to the selected coverage DB")
         sh "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/tools/coverage_audit.py --db ${ready.path}"
         return [db: ready, pilotEligible: pilotEligible]
     } catch (InterruptedException e) {
@@ -1233,6 +1429,19 @@ def _cbtsCoverageAudit(pipeline)
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
         return [db: null, pilotEligible: pilotEligible]
     }
+}
+
+def _cbtsPrNumber(globalVars)
+{
+    def prUrl = globalVars[GITHUB_PR_API_URL]
+    if (prUrl) {
+        def match = (prUrl =~ /\/pulls?\/(\d+)/)
+        if (match.find()) {
+            return match.group(1)
+        }
+        return ""
+    }
+    return env.gitlabMergeRequestIid ?: ""
 }
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
@@ -1266,16 +1475,7 @@ def _cbtsReportDecision(pipeline, globalVars, String status, String reason, Stri
         // PR number for s_pr_number, mirroring perf_regression_utils: GitHub PR
         // builds carry it in github_pr_api_url (.../pulls/<n>); GitLab MR builds
         // expose env.gitlabMergeRequestIid. Empty for post-merge/branch builds.
-        def prNumber = ""
-        def prUrl = globalVars[GITHUB_PR_API_URL]
-        if (prUrl) {
-            def m = (prUrl =~ /\/pulls?\/(\d+)/)
-            if (m.find()) {
-                prNumber = m.group(1)
-            }
-        } else {
-            prNumber = env.gitlabMergeRequestIid ?: ""
-        }
+        def prNumber = _cbtsPrNumber(globalVars)
         if (prNumber) {
             args += " --pr-number ${prNumber}"
         }
@@ -1337,6 +1537,9 @@ def _cbtsParseSelectionResult(String text)
         test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
         affected_stage_split_counts: data.affected_stage_split_counts ?: [:],
+        // The first pass uses these to decide whether Tier 2 should prepare a DB.
+        coverage_residual_files: data.coverage_residual_files ?: [],
+        coverage_decline_reason: data.coverage_decline_reason ?: "",
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
@@ -1363,7 +1566,6 @@ def getOssComplianceFileChanged(pipeline, globalVars)
         "requirements.txt",
         "requirements-dev.txt",
         "cpp/CMakeLists.txt",
-        "cpp/conanfile.py",
         ".github/CODEOWNERS",
         "jenkins/license_cpp.json",
         "tensorrt_llm/usage/llm_args_golden_manifest.json",
@@ -1925,12 +2127,65 @@ def resolveBuildBranch(globalVars)
 //
 // Skips are announced rather than silent: a run that asked for BOLTed binaries
 // and did not get them should say so in the log.
-def resolveBoltConsume(boolean requested, String targetBranch)
+// (Everything above documents resolveBoltConsume, defined further down.)
+
+// Pick the single BOLT profile bundle this pipeline will use, and pin it.
+//
+// Without a pin every consumer resolves `latest` independently, at whatever
+// moment it happens to run. Post-merge promotes a new bundle mid-pipeline, so a
+// stage that pulls before the promote and one that pulls after legitimately get
+// different profiles -- and parallel post-merge pipelines make it worse. That is
+// invisible: each consumer succeeds, and the run is green having tested
+// something other than what it shipped.
+//
+// Pinning is post-merge only. Pre-merge keeps reading `latest` (requirement: its
+// drift is acceptable and its behaviour must not change), and returning "" leaves
+// every consumer on exactly today's path.
+//
+// Best-effort by design. A branch with nothing promoted, or a bundle too old to
+// carry the label, yields "" and the pipeline runs unpinned rather than failing
+// -- an unresolvable pin is a reason to keep the old behaviour, not to break the
+// build.
+def resolveBoltProfileRef(String branch, String triple = "aarch64-linux-gnu")
+{
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+        return ""
+    }
+    def ref = ""
+    try {
+        ref = sh(returnStdout: true, script: """
+            bash ${LLM_ROOT}/scripts/bolt/internal/artifactory.sh \
+                 resolve-latest ${branch} ${triple} 2>/dev/null || true
+        """).trim()
+    } catch (InterruptedException e) {
+        // Aborts and timeouts reach here as FlowInterruptedException, which
+        // extends InterruptedException. Letting the catch below swallow one
+        // would turn a cancelled pipeline into an unpinned pipeline that
+        // carries on and launches every build job.
+        throw e
+    } catch (Exception e) {
+        echo "BOLT profile pin: resolve failed (${e.message}); running unpinned."
+        return ""
+    }
+    if (!ref) {
+        echo "BOLT profile pin: nothing promoted for ${branch}/${triple}; running unpinned."
+        return ""
+    }
+    echo "BOLT profile pin: ${branch}/${triple} -> ${ref}. Every consumer in this run uses this bundle."
+    return ref
+}
+
+def resolveBoltConsume(boolean requested, String targetBranch, boolean postMergeVariant = false)
 {
     if (!requested) {
         return false
     }
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+    // Post-merge is allowed only in the publish-both shape. The exclusion exists
+    // to protect BoltProfileGen's input, and publishing the optimized build under
+    // a second name protects it just as well as not building one -- canonical is
+    // still the un-BOLTed tarball the producer profiles. Without that shape the
+    // build would replace canonical, which is what the exclusion forbids.
+    if ((env.JOB_NAME ==~ /.*PostMerge.*/) && !postMergeVariant) {
         echo "BOLT consume requested but disabled: the post-merge build is the un-BOLTed input BoltProfileGen profiles."
         return false
     }
@@ -2127,6 +2382,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         // profile bundle so the tests below exercise bolted binaries.
                         // Off unless resolveBoltConsume() allowed it (pre-merge, main).
                         'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        // Publish the BOLTed build beside an untouched canonical rather
+                        // than replacing it. Post-merge only: canonical is the un-BOLTed
+                        // tarball BoltProfileGen profiles.
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2309,9 +2568,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         // Off unless resolveBoltConsume() allowed it. Post-merge is
-                        // excluded there precisely because this tarball is what the
-                        // BOLT-Profile-Gen stage below profiles.
+                        // allowed only together with boltPublishVariant below, which
+                        // keeps canonical -- the BOLT-Profile-Gen input -- un-BOLTed.
                         'boltConsume': globalVars[BOLT_CONSUME_BUILD],
+                        'boltPublishVariant': globalVars[BOLT_PUBLISH_VARIANT],
                     ]
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
@@ -2354,6 +2614,20 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 'targetArch': "aarch64-linux-gnu",
                                 'branch': globalVars[BUILD_BRANCH],
                                 'promote': "true",
+                                // Exactly ONE writer publishes a BOLTed build per
+                                // commit, and this launch site is where that choice
+                                // is made. The SBSA build stage is that writer (see
+                                // BOLT_PUBLISH_VARIANT): it publishes
+                                // bolted-<tarName> and leaves canonical un-BOLTed on
+                                // purpose, canonical being this job's own input and
+                                // what every consumer not yet migrated still
+                                // fetches. BoltProfileGen's canonical repush is the
+                                // other writer and would overwrite exactly that.
+                                // Already its default, but sent explicitly: the
+                                // default lives in a job config editable outside
+                                // this repo, and a flip there would silently put
+                                // both writers on the same object.
+                                'boltPublishCanonical': "false",
                             ]
                             launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
                         }
@@ -2530,6 +2804,17 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             // main, so a ref with no promoted bundle still gets profiles.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            // The overlay above only bakes in the profile bundle; it
+                            // leaves the installed wheel unoptimized. This BOLTs the
+                            // wheel the SBSA release image installs, applying the
+                            // branch's last promoted bundle during the image build.
+                            // Deliberately not this run's profiles: those are not
+                            // published until BoltProfileGen finishes, hours after
+                            // this build starts, so depending on them would serialize
+                            // every release behind a multi-hour GPU job. Inert on
+                            // x86_64 (no promoted bundle) and whenever the wheel is
+                            // built from source rather than downloaded.
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [
@@ -2589,9 +2874,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'uploadPath': UPLOAD_PATH,
                             // Must match Build-Docker-Images above: this path pushes the
                             // same tags, so the scanned+registered image has to be the
-                            // BOLTed canonical one rather than a plain build.
+                            // BOLTed canonical one rather than a plain build, built on
+                            // the BOLT-optimized wheel rather than the first tarball to
+                            // appear.
                             'boltOverlayEnabled': true,
                             'boltProfilesRequired': true,
+                            'boltOptimizeWheel': true,
                         ]
                         if (runMode == "nightly_release") {
                             additionalParameters += [

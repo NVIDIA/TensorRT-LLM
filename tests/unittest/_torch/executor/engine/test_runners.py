@@ -648,24 +648,69 @@ def test_engine_consumes_optional_length_update_and_passes_call_state(effective_
     assert "runtime_draft_len" not in outputs
 
 
-def test_decoder_fallback_length_update_does_not_modify_graph_output_dictionary():
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_decoder_fallback_passes_call_state_without_engine_writes(is_dummy):
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
     engine._fallback_to_engine = True
-    cached_outputs = {"logits": torch.tensor([1.0])}
-    inputs = ScheduledInputs(batch=ScheduledRequests(), runtime_draft_len=2)
+    # The dummy flag comes from the caller, not from the warmup scope.
+    engine._is_warmup = not is_dummy
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 5
+    inputs = ScheduledInputs(
+        batch=ScheduledRequests(), enable_spec_decode=True, runtime_draft_len=2
+    )
+    expected = {"logits": object(), "runtime_draft_len": 4}
+    engine._forward_decoder = Mock(return_value=expected)
 
-    def decoder_forward(*args):
-        engine.runtime_draft_len = 4
-        return cached_outputs
+    outputs = engine._forward_scheduled(inputs, resource_manager=resources, is_dummy=is_dummy)
+
+    assert outputs is expected
+    engine._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=is_dummy)
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
+
+
+def test_engine_forward_keeps_call_state_when_decoder_fails():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._fallback_to_engine = True
+    engine._is_warmup = False
+    engine.enable_spec_decode = True
+    engine.runtime_draft_len = 2
+    engine._forward_decoder = Mock(side_effect=RuntimeError("decoder failure"))
+
+    with pytest.raises(RuntimeError, match="decoder failure"):
+        engine.forward(ScheduledRequests(), resources)
+
+    inputs = engine._forward_decoder.call_args.args[0]
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 2)
+
+
+def test_forward_warmup_runs_local_call_state_in_forward_context():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    engine._is_warmup = True
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 5
+    batch = ScheduledRequests()
+
+    def decoder_forward(inputs, resource_manager, *, is_dummy):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is engine.model.extra_attrs
+        return {"logits": object(), "runtime_draft_len": 3}
 
     engine._forward_decoder = Mock(side_effect=decoder_forward)
-    outputs = engine._forward_scheduled(inputs, resource_manager=resources)
 
-    assert outputs is not cached_outputs
-    assert outputs["logits"] is cached_outputs["logits"]
-    assert outputs.pop("runtime_draft_len") == 4
-    assert set(cached_outputs) == {"logits"}
-    assert inputs.runtime_draft_len == 2
+    outputs = engine._forward_warmup(batch, resources, enable_spec_decode=True, runtime_draft_len=1)
+
+    inputs = engine._forward_decoder.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.new_tensors_device is None
+    assert inputs.cache_indirection_buffer is None
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 1)
+    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": True}
+    assert outputs["runtime_draft_len"] == 3
+    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
+    assert get_model_extra_attrs() is None
 
 
 def test_no_kv_forward_preserves_model_output_dictionary_without_length_update():
@@ -690,16 +735,12 @@ def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_
     engine._fallback_to_engine = True
     engine._is_warmup = is_dummy
     engine.runtime_draft_len = 2
-
-    def decoder_forward(inputs, resource_manager):
-        assert inputs.runtime_draft_len == 2
-        engine.runtime_draft_len = 4
-        return raw_output
-
-    engine._forward_decoder = Mock(side_effect=decoder_forward)
+    engine._forward_decoder = Mock(return_value=raw_output)
 
     assert engine.forward(ScheduledRequests(), resources) is raw_output
-    assert engine.runtime_draft_len == 4
+    assert engine.runtime_draft_len == 2
+    assert engine._forward_decoder.call_args.args[0].runtime_draft_len == 2
+    assert engine._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
 
 
 def test_model_caller_uses_current_forward_and_restores_outer_attribute_context():
