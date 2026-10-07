@@ -5,8 +5,7 @@
 # Kimi K3 serving perf sweep (8K-in/1K-out): one trtllm-serve launch
 # per job, all requested concurrencies measured against it.
 #
-# Modes bake the tuned serving recipes (measured on GB300 NVL; treat them
-# as starting points for your own cluster):
+# Modes (starting points for your own cluster):
 #   tep8   TP8 attention + EP8 MoE, 8 GPU / 2 nodes  (interactive, c 1-16)
 #   tep16  TP16 attention + EP16 MoE, 16 GPU / 4 nodes (low latency, c 1-4)
 #   dep16  attention-DP + EP16 MoE, 16 GPU / 4 nodes (throughput, c 16-1024)
@@ -16,9 +15,8 @@
 #       --mode dep16|tep16|tep8 --model PATH --image PATH \
 #       [--repo PATH] [--concurrencies "16 32 64"] [--isl N] [--osl N] [--tag NAME]
 #
-# Submit ALL jobs of a comparison batch at the same time: a concurrent
-# multi-hundred-GB weight load depresses in-flight DEP16 c>=128
-# measurements by ~30%.
+# Submit ALL jobs of a comparison batch at the same time so one job's weight
+# load does not overlap another job's measurement window.
 #
 # The #SBATCH partition and account below are placeholders — edit them or
 # override on the sbatch command line (sbatch --partition=... --account=...).
@@ -57,8 +55,8 @@ done
 # dep16 (attention DP), GLOBAL for the TEP modes.
 # Attention formats follow checkpoint quantization. BF16 shared/latent MLP
 # conversion is opt-in; KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1 enables it.
-#   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; the in-cubin
-#       top-k tier register-spills at decode batch 5-64 (33 us/layer).
+#   TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=1  host-side routing; avoid the
+#       in-cubin top-k path at decode batch 5-64.
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
@@ -70,7 +68,7 @@ case "$MODE" in
         DEFAULT_CONCURRENCIES="1 2 4 8 16"
         MODE_ENV=""
         # Attention formats follow the checkpoint. Shared gate_up stays
-        # BF16 under TP; historical timings with forced FP8 need remeasurement.
+        # BF16 under TP.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
@@ -91,14 +89,14 @@ REPO=${REPO_ARG:-$(cd "$SCRIPT_DIR/../../.." && pwd)}
 WORK_DIR=$SLURM_SUBMIT_DIR/kimi-k3-sweep-$MODE${TAG:+-$TAG}-$SLURM_JOB_ID
 mkdir -p "$WORK_DIR"
 
-# Tuned serving config per mode. stream_interval 10 removes the ~18 ms/token
-# host streaming floor (TPOT metric unaffected: (latency-TTFT)/(len-1)).
+# Tuned serving config per mode. stream_interval 10 avoids the host streaming
+# floor. TPOT stays (latency-TTFT)/(len-1).
 CONFIG_FILE=$WORK_DIR/serve_config.yaml
 case "$MODE" in
     dep16)
         # moe max_num_tokens 33024: fewer serialized A2A chunk rounds per
-        # prefill wave (TTFT -4-6%). use_low_precision_moe_combine: FP8 A2A
-        # combine payload, +3.6-4.6% at c64-128 (GSM8K 96.74). enable_padding:
+        # prefill wave. use_low_precision_moe_combine: FP8 A2A
+        # combine payload. enable_padding:
         # ADP graphs are all-or-nothing without it.
         cat > "$CONFIG_FILE" <<'EOF'
 enable_attention_dp: true

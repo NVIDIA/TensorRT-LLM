@@ -35,7 +35,7 @@ constexpr bool isSupportedHeadCount(int numHeads)
         || numHeads == 96;
 }
 
-//! Select the compact-head kernel within the measured KDA decode work threshold.
+//! Select the compact-head kernel within the KDA decode work threshold.
 //! Division keeps the B*H threshold overflow-safe.
 constexpr bool shouldUseCompactHeads(int batchSize, int numHeads, int numValueHeads)
 {
