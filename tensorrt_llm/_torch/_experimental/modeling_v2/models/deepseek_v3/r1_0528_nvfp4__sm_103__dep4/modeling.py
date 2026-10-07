@@ -828,7 +828,10 @@ class PrefillTarget(Target):
         k_nope_dst, k_pe_dst = torch.split(k, [nope, rope_dim], -1)
         fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
         fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
+        fq_nope_t = torch.transpose(fq_nope, 0, 1)
         lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+        lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
+        attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
         cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         counter = torch.empty([1], dtype=torch.uint32, device=dev)
@@ -858,7 +861,7 @@ class PrefillTarget(Target):
             latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
             if core._cached_ctx:
-                self._mla_append(q=q_ctx, latent_cache=latent_ctx, layer=i)
+                q_ctx = self._mla_append(q=q_ctx, latent_cache=latent_ctx, layer=i)
                 ckv_full, k_pe_full = self._mla_load(layer=i)
                 latent_arg = None
             else:
@@ -874,7 +877,7 @@ class PrefillTarget(Target):
                 k_pe_dst.copy_(
                     torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
                 )
-            self._attn_ctx(
+            attn_ctx = self._attn_ctx(
                 q=q_ctx,
                 k=torch.reshape(k, [tkv, heads * qk_dim]),
                 v=v_view,
@@ -889,25 +892,21 @@ class PrefillTarget(Target):
                 # Over an fp8 pool `_mla_gen` reads this half to build the quantized query, so
                 # this BMM must be issued first on the same stream; overlapping them is a silent
                 # race (they only write disjoint halves on a bf16 pool).
-                self._absorb(
-                    a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1), layer=i
+                fq_nope_t = self._absorb(a=torch.transpose(q_nope, 0, 1), out=fq_nope_t, layer=i)
+                fused_q = self._mla_gen(
+                    fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i
                 )
-                self._mla_gen(fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i)
-                self._attn_gen(
+                lat_out = self._attn_gen(
                     q=torch.reshape(fused_q, [gen, heads * lat_dim]),
                     output=lat_out,
                     latent_cache=latent_gen,
                     q_pe=q_pe,
                     layer=i,
                 )
-                self._expand(
-                    a=torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
-                    out=torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
-                    layer=i,
-                )
+                attn_gen_t = self._expand(a=lat_out_t, out=attn_gen_t, layer=i)
 
             o = self._o(attn_out, layer=i)
-            self._norm2(o, residual, layer=i)
+            o, residual = self._norm2(o, residual, layer=i)
             if i < dense_layers:
                 mlp_out = self._dense_mlp(o, i, dt)
             else:
@@ -948,7 +947,7 @@ class PrefillTarget(Target):
                 )
                 main.wait_stream(side)
                 mlp_out = torch.add(routed, shared)
-            self._next_norm(mlp_out, residual, layer=i)
+            mlp_out, residual = self._next_norm(mlp_out, residual, layer=i)
             x = mlp_out
         return x
 
@@ -1218,7 +1217,7 @@ class PrefillTarget(Target):
         latent_ctx, latent_gen = torch.split(latent, [tc, gen], 0)
 
         if core._cached_ctx:
-            self._mtp_mla_append(
+            q_ctx = self._mtp_mla_append(
                 q=q_ctx,
                 latent_cache=latent_ctx,
                 num_contexts=num_ctx,
@@ -1259,7 +1258,7 @@ class PrefillTarget(Target):
             k_pe_dst.copy_(
                 torch.reshape(k_pe_full, [tkv, 1, rope_dim]).expand([tkv, heads, rope_dim])
             )
-        self._mtp_attn_ctx(
+        attn_ctx = self._mtp_attn_ctx(
             q=q_ctx,
             k=torch.reshape(k, [tkv, heads * qk_dim]),
             v=v_view,
@@ -1272,14 +1271,15 @@ class PrefillTarget(Target):
             q_nope, q_pe = torch.split(q3, [nope, rope_dim], -1)
             fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
             fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
-            self._mtp_absorb(a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1))
+            fq_nope_t = torch.transpose(fq_nope, 0, 1)
+            fq_nope_t = self._mtp_absorb(a=torch.transpose(q_nope, 0, 1), out=fq_nope_t)
             cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
             cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
             counter = torch.empty([1], dtype=torch.uint32, device=dev)
             quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
             bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
             bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
-            self._mtp_mla_gen(
+            fused_q = self._mtp_mla_gen(
                 fused_q=fused_q,
                 q_pe=q_pe,
                 latent_cache=latent_gen,
@@ -1302,7 +1302,7 @@ class PrefillTarget(Target):
                 attention_window_size=md.max_seq_len,
             )
             lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
-            self._mtp_attn_gen(
+            lat_out = self._mtp_attn_gen(
                 q=torch.reshape(fused_q, [gen, heads * lat_dim]),
                 output=lat_out,
                 latent_cache=latent_gen,
@@ -1315,13 +1315,12 @@ class PrefillTarget(Target):
                 quant_q_buffer=quant_q,
                 predicted_tokens_per_seq=gen_p,
             )
-            self._mtp_expand(
-                a=torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
-                out=torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
-            )
+            lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
+            attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
+            attn_gen_t = self._mtp_expand(a=lat_out_t, out=attn_gen_t)
 
         o = self._mtp_o(attn_out)
-        self._mtp_norm2(o, residual)
+        o, residual = self._mtp_norm2(o, residual)
         shared = self._mtp_shared_mlp(o)
         routed = self._mtp_routed_experts(o, all_rank_num_tokens, rows, dt)
         return torch.add(residual, torch.add(routed, shared))
@@ -1662,7 +1661,10 @@ class DecodeTarget(Target):
         # overwrite what layer i still reads. 8 allocations per step, not 8 x 61.
         fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
         fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
+        fq_nope_t = torch.transpose(fq_nope, 0, 1)
         lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
+        lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
+        attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
         cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         counter = torch.empty([1], dtype=torch.uint32, device=dev)
@@ -1696,25 +1698,19 @@ class DecodeTarget(Target):
             # Over an fp8 pool `_mla_gen` reads this half to build the quantized query, so
             # this BMM must be issued first on the same stream; overlapping them is a silent
             # race (they only write disjoint halves on a bf16 pool).
-            self._absorb(
-                a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1), layer=i
-            )
-            self._mla_gen(fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i)
-            self._attn_gen(
+            fq_nope_t = self._absorb(a=torch.transpose(q_nope, 0, 1), out=fq_nope_t, layer=i)
+            fused_q = self._mla_gen(fused_q=fused_q, q_pe=q_pe, latent_cache=latent_gen, layer=i)
+            lat_out = self._attn_gen(
                 q=torch.reshape(fused_q, [gen, heads * lat_dim]),
                 output=lat_out,
                 latent_cache=latent_gen,
                 q_pe=q_pe,
                 layer=i,
             )
-            self._expand(
-                a=torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
-                out=torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
-                layer=i,
-            )
+            attn_gen_t = self._expand(a=lat_out_t, out=attn_gen_t, layer=i)
 
             o = self._o(attn_out, layer=i)
-            self._norm2(o, residual, layer=i)
+            o, residual = self._norm2(o, residual, layer=i)
             if i < dense_layers:
                 mlp_out = self._dense_mlp(o, i, dt)
             else:
@@ -1755,7 +1751,7 @@ class DecodeTarget(Target):
                 )
                 main.wait_stream(side)
                 mlp_out = torch.add(routed, shared)
-            self._next_norm(mlp_out, residual, layer=i)
+            mlp_out, residual = self._next_norm(mlp_out, residual, layer=i)
             x = mlp_out
         return x
 
@@ -1978,14 +1974,15 @@ class DecodeTarget(Target):
         q_nope, q_pe = torch.split(q3, [nope, rope_dim], -1)
         fused_q = torch.empty([gen, heads, lat_dim], dtype=dt, device=dev)
         fq_nope, _ = torch.split(fused_q, [kv_lora, rope_dim], -1)
-        self._mtp_absorb(a=torch.transpose(q_nope, 0, 1), out=torch.transpose(fq_nope, 0, 1))
+        fq_nope_t = torch.transpose(fq_nope, 0, 1)
+        fq_nope_t = self._mtp_absorb(a=torch.transpose(q_nope, 0, 1), out=fq_nope_t)
         cu_q = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         cu_kv = torch.empty([gen + 1], dtype=torch.int32, device=dev)
         counter = torch.empty([1], dtype=torch.uint32, device=dev)
         quant_q = torch.empty([gen, heads, lat_dim], dtype=torch.float8_e4m3fn, device=dev)
         bmm1_scale = torch.empty([2], dtype=torch.float32, device=dev)
         bmm2_scale = torch.empty([1], dtype=torch.float32, device=dev)
-        self._mtp_mla_gen(
+        fused_q = self._mtp_mla_gen(
             fused_q=fused_q,
             q_pe=q_pe,
             latent_cache=latent_gen,
@@ -2008,7 +2005,7 @@ class DecodeTarget(Target):
             attention_window_size=md.max_seq_len,
         )
         lat_out = torch.empty([gen, heads * kv_lora], dtype=dt, device=dev)
-        self._mtp_attn_gen(
+        lat_out = self._mtp_attn_gen(
             q=torch.reshape(fused_q, [gen, heads * lat_dim]),
             output=lat_out,
             latent_cache=latent_gen,
@@ -2021,13 +2018,12 @@ class DecodeTarget(Target):
             quant_q_buffer=quant_q,
             predicted_tokens_per_seq=gen_p,
         )
-        self._mtp_expand(
-            a=torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1),
-            out=torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1),
-        )
+        lat_out_t = torch.transpose(torch.reshape(lat_out, [gen, heads, kv_lora]), 0, 1)
+        attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
+        attn_gen_t = self._mtp_expand(a=lat_out_t, out=attn_gen_t)
 
         o = self._mtp_o(attn_out)
-        self._mtp_norm2(o, residual)
+        o, residual = self._mtp_norm2(o, residual)
         shared = self._mtp_shared_mlp(o)
         routed = self._mtp_routed_experts(o, all_rank_num_tokens, rows, dt)
         return torch.add(residual, torch.add(routed, shared))
