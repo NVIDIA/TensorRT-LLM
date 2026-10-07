@@ -35,13 +35,16 @@ from dataclasses import dataclass
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
-from tensorrt_llm._torch.pyexecutor import ep_failure_broadcast
+from tensorrt_llm._torch.moe.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.pyexecutor import ep_failure_broadcast, ep_failure_evidence
 from tensorrt_llm._torch.pyexecutor.ep_failure_broadcast import (
     FailureEvidenceState,
     MpiFtSubcomm,
     MpiFtSubcommConfig,
 )
+from tensorrt_llm._torch.pyexecutor.ep_failure_evidence import FailureEvidenceTransport
+
+pytestmark = pytest.mark.cpu_only
 
 _TEST_CONFIG = MpiFtSubcommConfig(
     poll_interval_sec=0.001,
@@ -363,6 +366,39 @@ def test_committed_ep_group_health_is_rejected_before_mpi_setup() -> None:
 
     assert comm.errhandler_calls == 0
     assert comm.is_revoked_calls == 0
+
+
+def test_evidence_types_keep_existing_import_identity() -> None:
+    """Keep transport-neutral evidence usable through either import location."""
+    assert FailureEvidenceState is ep_failure_evidence.FailureEvidenceState
+    assert (
+        ep_failure_broadcast.FailureEvidenceSnapshot is ep_failure_evidence.FailureEvidenceSnapshot
+    )
+    assert (
+        ep_failure_broadcast.FailureDetectedCallback is ep_failure_evidence.FailureDetectedCallback
+    )
+
+
+def test_mpi_transport_implements_neutral_evidence_contract() -> None:
+    """Exercise the real MPI adapter without exposing committed membership."""
+    broadcaster, evidence, _, _ = _make_broadcaster(size=2)
+    transport: FailureEvidenceTransport = broadcaster
+    committed = EPGroupHealth(2)
+    initial_membership = committed.snapshot()
+    transport.start()
+    try:
+        assert transport.last_error is None
+        assert transport.failure_evidence_is_reconciled()
+        assert transport.report_detected_failure(1)
+        _wait_until(lambda: transport.failure_detection_is_reconciled(1))
+        assert transport.failure_evidence_is_reconciled()
+        assert evidence.snapshot().failed_ranks == frozenset({1})
+        assert not transport.report_detected_failure(1)
+        assert committed.snapshot() == initial_membership
+    finally:
+        transport.stop()
+    assert not transport.failure_detection_is_reconciled(1)
+    assert not transport.failure_evidence_is_reconciled()
 
 
 def test_watchdog_callback_records_and_fans_out_detected_failure() -> None:

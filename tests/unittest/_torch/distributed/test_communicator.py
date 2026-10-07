@@ -21,6 +21,8 @@ import pytest
 
 from tensorrt_llm._torch.distributed import communicator
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _restore_mpi_ft_process_lifetime_state() -> Iterator[None]:

@@ -66,6 +66,28 @@ def _mpi_launcher() -> str | None:
     return shutil.which("mpiexec") or shutil.which("mpirun")
 
 
+def _mpi_smoke_environment(environment: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Prepare portable smoke defaults without changing the source environment.
+
+    Args:
+        environment: Mapping to copy, or the current process environment if omitted.
+
+    Returns:
+        A copied environment with smoke defaults and explicit PRRTE mapping preserved.
+    """
+    environment = dict(os.environ if environment is None else environment)
+    # Open MPI requires explicit opt-in when CI runs inside a root container.
+    # Other MPI implementations ignore these variables.
+    environment["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
+    environment["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] = "1"
+    environment["OMPI_MCA_rmaps_base_oversubscribe"] = "1"
+    # PRRTE uses a mapping policy instead of the Open MPI 4.x boolean. Preserve
+    # explicit operator placement constraints, including no-oversubscription.
+    environment.setdefault("PRTE_MCA_rmaps_default_mapping_policy", ":oversubscribe")
+    environment["PYTHONUNBUFFERED"] = "1"
+    return environment
+
+
 def _smoke_is_required(environment: Mapping[str, str] | None = None) -> bool:
     """Return whether missing MPI prerequisites must fail this invocation."""
     environment = os.environ if environment is None else environment
@@ -306,6 +328,30 @@ def test_mpi_ft_smoke_missing_prerequisite_is_optional_locally() -> None:
 def test_mpi_ft_smoke_missing_prerequisite_fails_when_required() -> None:
     with pytest.raises(pytest.fail.Exception, match="required.*missing launcher"):
         _handle_missing_prerequisite("missing launcher", required=True)
+
+
+@pytest.mark.parametrize(
+    "mapping_policy", [None, "slot:pe=2:oversubscribe", "slot:nooversubscribe"]
+)
+def test_mpi_ft_smoke_environment_supports_open_mpi_versions_and_preserves_mapping(
+    mapping_policy: str | None,
+) -> None:
+    original = {"UNRELATED_SETTING": "preserved"}
+    if mapping_policy is not None:
+        original["PRTE_MCA_rmaps_default_mapping_policy"] = mapping_policy
+    original_snapshot = original.copy()
+
+    environment = _mpi_smoke_environment(original)
+
+    assert environment["OMPI_ALLOW_RUN_AS_ROOT"] == "1"
+    assert environment["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] == "1"
+    assert environment["OMPI_MCA_rmaps_base_oversubscribe"] == "1"
+    assert environment["PRTE_MCA_rmaps_default_mapping_policy"] == (
+        ":oversubscribe" if mapping_policy is None else mapping_policy
+    )
+    assert environment["PYTHONUNBUFFERED"] == "1"
+    assert environment["UNRELATED_SETTING"] == "preserved"
+    assert original == original_snapshot
 
 
 def test_mpi_ft_smoke_launcher_failure_precedes_skip_marker() -> None:
@@ -690,13 +736,7 @@ def test_ep_failure_broadcast_real_mpi(world_size: int) -> None:
         _handle_missing_prerequisite("mpiexec/mpirun is not installed", required=required)
 
     worker = Path(__file__).with_name("_ep_failure_broadcast_mpi_worker.py")
-    environment = os.environ.copy()
-    # Open MPI requires explicit opt-in when CI runs inside a root container.
-    # Other MPI implementations ignore these variables.
-    environment["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
-    environment["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] = "1"
-    environment["OMPI_MCA_rmaps_base_oversubscribe"] = "1"
-    environment["PYTHONUNBUFFERED"] = "1"
+    environment = _mpi_smoke_environment()
     if not required:
         environment[_ALLOW_SKIP_ENV] = "1"
 

@@ -42,11 +42,9 @@ survivor; failure to confirm that echo within a bounded interval uses
 from __future__ import annotations
 
 import math
-import operator
 import queue
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Protocol, cast
@@ -58,6 +56,19 @@ try:
 except ImportError:
     MPI = None
 
+from tensorrt_llm._torch.pyexecutor.ep_failure_evidence import (
+    FailureDetectedCallback as FailureDetectedCallback,
+)
+from tensorrt_llm._torch.pyexecutor.ep_failure_evidence import (
+    FailureEvidenceSnapshot as FailureEvidenceSnapshot,
+)
+from tensorrt_llm._torch.pyexecutor.ep_failure_evidence import (
+    FailureEvidenceState as FailureEvidenceState,
+)
+from tensorrt_llm._torch.pyexecutor.ep_failure_evidence import (
+    FailureEvidenceTransport,
+    _require_integer,
+)
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -121,93 +132,6 @@ class _MpiModule(Protocol):
     Exception: type[BaseException]
 
     def Query_thread(self) -> int: ...
-
-
-FailureDetectedCallback = Callable[[int, int, float], None]
-
-
-def _require_integer(value: object, name: str) -> int:
-    """Normalize one integer-like value while rejecting booleans."""
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be an integer, got bool")
-    try:
-        return operator.index(value)
-    except TypeError as error:
-        raise TypeError(f"{name} must be an integer, got {type(value).__name__}") from error
-
-
-@dataclass(frozen=True)
-class FailureEvidenceSnapshot:
-    """Atomic snapshot of rank-failure evidence for one communicator epoch."""
-
-    failed_ranks: frozenset[int]
-    evidence_epoch: int
-
-
-class FailureEvidenceState:
-    """Thread-safe, process-local rank-failure evidence.
-
-    This state is deliberately distinct from `EPGroupHealth`. It is evidence
-    exclusively mutated by :class:`MpiFtSubcomm`, not a committed execution
-    mask, and it is monotonic for one FT communicator epoch. Callers may retain
-    and inspect the state, but must not mutate it.
-
-    Args:
-        ep_size: Number of EP-local ranks represented by this state.
-
-    Raises:
-        TypeError: If `ep_size` is not an integer.
-        ValueError: If `ep_size` is not positive.
-    """
-
-    def __init__(self, ep_size: int) -> None:
-        ep_size = _require_integer(ep_size, "ep_size")
-        if ep_size <= 0:
-            raise ValueError(f"ep_size must be > 0, got {ep_size}")
-        self._ep_size = ep_size
-        self._failed_ranks: set[int] = set()
-        self._evidence_epoch = 0
-        self._lock = threading.Lock()
-
-    @property
-    def ep_size(self) -> int:
-        """Number of ranks represented by this immutable communicator epoch."""
-        return self._ep_size
-
-    def _record_failure(self, rank: int) -> bool:
-        """Record one failed rank, returning whether evidence changed."""
-        rank = self._validate_rank(rank)
-        with self._lock:
-            if rank in self._failed_ranks:
-                return False
-            self._failed_ranks.add(rank)
-            self._evidence_epoch += 1
-            return True
-
-    def has_failure(self, rank: int) -> bool:
-        """Return whether failure evidence has been recorded for `rank`."""
-        rank = self._validate_rank(rank)
-        with self._lock:
-            return rank in self._failed_ranks
-
-    def has_failures(self) -> bool:
-        """Return whether this communicator epoch contains failure evidence."""
-        with self._lock:
-            return bool(self._failed_ranks)
-
-    def snapshot(self) -> FailureEvidenceSnapshot:
-        """Return one coherent failed-rank set and evidence-epoch snapshot."""
-        with self._lock:
-            return FailureEvidenceSnapshot(
-                failed_ranks=frozenset(self._failed_ranks),
-                evidence_epoch=self._evidence_epoch,
-            )
-
-    def _validate_rank(self, rank: int) -> int:
-        rank = _require_integer(rank, "rank")
-        if not 0 <= rank < self._ep_size:
-            raise ValueError(f"rank must be in [0, {self._ep_size}), got {rank}")
-        return rank
 
 
 @dataclass(frozen=True)
@@ -285,7 +209,7 @@ class _Lifecycle(Enum):
     FAILED = auto()
 
 
-class MpiFtSubcomm:
+class MpiFtSubcomm(FailureEvidenceTransport):
     """Broadcast EP-rank failure detections over a dedicated MPI communicator.
 
     Construction creates the FT communicator collectively on the caller's
