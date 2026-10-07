@@ -18,13 +18,14 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from .cpp_custom_ops import _register_fake
+from .nvfp4_sfc_finalize import nvfp4_sfc_finalize
 from .torch_custom_ops import BufferKind, bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
 
-# Attention custom ops are defined in modules.attention, and MLA custom ops are
-# defined in modules.mla. They are not re-exported here to avoid circular imports:
-# custom_ops must not depend on modules.attention or modules.mla.
+# Attention custom ops are defined in attention.attention, and MLA custom ops are
+# defined in attention.mla. They are not re-exported here to avoid circular imports:
+# custom_ops must not depend on attention.attention or attention.mla.
 
 
 def inplace_slice_copy(dest: torch.Tensor, src: torch.Tensor, dim1_start: int,
@@ -43,6 +44,7 @@ __all__ = [
     'matmul_to_ub',
     'IS_CUTLASS_DSL_AVAILABLE',
     'inplace_slice_copy',
+    'nvfp4_sfc_finalize',
 ]
 
 if IS_FLASHINFER_AVAILABLE:
@@ -63,6 +65,9 @@ if IS_FLASHINFER_AVAILABLE:
 
 if IS_CUTLASS_DSL_AVAILABLE:
     from .cute_dsl_custom_ops import (
+        cute_dsl_nvfp4_dense_gemm_gelu_blackwell,
+        cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell,
+        cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_blackwell,
         cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell,
         cute_dsl_nvfp4_gemm_blackwell)
@@ -70,6 +75,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         'cute_dsl_nvfp4_gemm_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_blackwell',
         'cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_fp4out_blackwell',
+        'cute_dsl_nvfp4_dense_gemm_gelu_deferred_fp4out_blackwell',
     ]
 
     # MegaMoE NVFP4 op probes a strict superset of IS_CUTLASS_DSL_AVAILABLE

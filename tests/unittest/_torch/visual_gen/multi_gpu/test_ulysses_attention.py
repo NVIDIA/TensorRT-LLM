@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Multi-GPU tests for Ulysses Attention.
 
 These tests use torch.multiprocessing.spawn to launch multiple processes internally.
@@ -5,11 +20,10 @@ Run with:
     pytest tests/visual_gen/multi_gpu/test_ulysses_attention.py -v
 """
 
-import os
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import math
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Callable
 
 import pytest
@@ -18,34 +32,23 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
-# Try to import the modules - skip tests if not available
-try:
-    import sys
-    from pathlib import Path
 
-    from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
+@contextmanager
+def _disable_mpi() -> Iterator[None]:
+    """Temporarily use torch.distributed, preserving the caller's MPI setting."""
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("TLLM_DISABLE_MPI", "1")
+        yield
+
+
+with _disable_mpi():
+    from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
         AttentionBackend,
         AttentionTensorLayout,
     )
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _cleanup_mpi_env():
-    """Clean up TLLM_DISABLE_MPI env var after tests complete."""
-    yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
 
 
 def init_distributed_worker(rank: int, world_size: int, backend: str = "gloo", port: int = 29500):
@@ -90,23 +93,75 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
                  Should accept (rank, world_size) as arguments.
         use_cuda: Whether to use CUDA (requires sufficient GPUs)
     """
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
-
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
     backend = "nccl" if use_cuda else "gloo"
 
     # Spawn processes
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    # Spawned workers inherit this setting before importing the test module.
+    with _disable_mpi():
+        from ._visual_gen_dist_utils import spawn_with_retry
+
+        spawn_with_retry(
+            lambda port: mp.spawn(
+                _distributed_worker,
+                args=(world_size, backend, test_fn, port),
+                nprocs=world_size,
+                join=True,
+            )
         )
+
+
+def test_forward_async_redistributes_vsa_gates(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tensorrt_llm._torch.visual_gen.attention_backend.parallel as parallel_backend
+
+    class _CaptureBackend:
+        preferred_layout = AttentionTensorLayout.NHD
+
+        def forward(
+            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs: object
+        ) -> torch.Tensor:
+            self.kwargs = kwargs
+            return q
+
+    inner_backend = _CaptureBackend()
+    attention = object.__new__(UlyssesAttention)
+    attention.world_size = 1
+    attention.process_group = None
+    attention.inner_backend = inner_backend
+    attention._issue_async = lambda tensor: tensor.unsqueeze(0)
+    attention._join_async = lambda: None
+    attention._output_a2a = lambda output, batch_size, seq_len: output
+    redistributed = []
+
+    def _fake_all_to_all(tensor: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        redistributed.append((tensor, kwargs))
+        return tensor + 1
+
+    monkeypatch.setattr(parallel_backend, "all_to_all_4d", _fake_all_to_all)
+    q = torch.randn(1, 3, 2, 4)
+    gate_compress = torch.randn_like(q)
+    gate_fine = torch.randn_like(q)
+
+    output = attention.forward_async(
+        lambda: q,
+        lambda: q,
+        lambda: q,
+        gate_compress=gate_compress,
+        gate_fine=gate_fine,
     )
+
+    assert output.shape == q.shape
+    assert redistributed[0][0] is gate_compress
+    assert redistributed[1][0] is gate_fine
+    assert all(entry[1]["scatter_dim"] == 2 for entry in redistributed)
+    assert all(entry[1]["gather_dim"] == 1 for entry in redistributed)
+    assert inner_backend.kwargs["batch_size"] == q.shape[0]
+    torch.testing.assert_close(inner_backend.kwargs["gate_compress"], gate_compress + 1)
+    torch.testing.assert_close(inner_backend.kwargs["gate_fine"], gate_fine + 1)
 
 
 # =============================================================================
@@ -379,6 +434,177 @@ def _logic_ulysses_with_key_padding_mask_parity(rank, world_size):
                 f"from unpadded SDPA on valid Q rows"
             ),
         )
+
+
+def _logic_ulysses_replicated_kv_impl(
+    rank, world_size, unequal_lengths, compile_backend: str | None = None
+):
+    """Match unpadded SDPA with text-first K/V under Ulysses (transparent)."""
+    batch = 2
+    generated_len = 5
+    generated_padded_len = 6
+    seq_per_rank = generated_padded_len // world_size
+    context_len = 4
+    context_lengths = [1, context_len] if unequal_lengths else [context_len] * batch
+    num_heads = world_size * 2
+    head_dim = 16
+    device = torch.device("cpu")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, generated_padded_len, num_heads, head_dim, device=device)
+    context_k = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+    context_v = torch.randn(batch, context_len, num_heads, head_dim, device=device)
+
+    start = rank * seq_per_rank
+    end = start + seq_per_rank
+    q_shard = q_full[:, start:end].contiguous()
+    k_shard = k_full[:, start:end].contiguous()
+    v_shard = v_full[:, start:end].contiguous()
+
+    class _RecordingVanillaAttention(VanillaAttention):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.kv_seq_lens = []
+            self.kv_inputs = []
+            self.timesteps = []
+
+        def forward(self, q, k, v, *, key_padding_mask=None, **kwargs):
+            assert key_padding_mask is None
+            self.kv_seq_lens.append(k.shape[2])
+            self.kv_inputs.append((k, v))
+            self.timesteps.append(kwargs.get("timestep"))
+            return super().forward(q, k, v, key_padding_mask=key_padding_mask, **kwargs)
+
+    inner = _RecordingVanillaAttention(
+        num_heads=num_heads // world_size,
+        head_dim=head_dim,
+    )
+    attention = UlyssesAttention(inner_backend=inner, process_group=None)
+    if compile_backend is not None:
+        from torch._dynamo.testing import CompileCounterWithBackend
+
+        compile_counter = CompileCounterWithBackend(compile_backend)
+        run_attention = torch.compile(attention, backend=compile_counter, fullgraph=True)
+    else:
+        run_attention = attention
+    context_lengths_host = (
+        torch.tensor(context_lengths, dtype=torch.int32) if unequal_lengths else None
+    )
+    call_kwargs = dict(
+        attention_mask=PredefinedAttentionMask.FULL,
+        timestep=torch.tensor([0.25, 0.75]),
+        replicated_k=context_k,
+        replicated_v=context_v,
+        replicated_k_lengths=context_lengths_host,
+        global_generated_seq_len=generated_len,
+    )
+    output = run_attention(
+        q_shard,
+        k_shard,
+        v_shard,
+        **call_kwargs,
+    )
+    expected_kv_seq_lens = (
+        [generated_len + length for length in context_lengths]
+        if unequal_lengths
+        else [generated_len + context_len]
+    )
+    assert inner.kv_seq_lens == expected_kv_seq_lens
+    for call_idx, actual_timestep in enumerate(inner.timesteps):
+        batch_slice = slice(call_idx, call_idx + 1) if unequal_lengths else slice(None)
+        torch.testing.assert_close(actual_timestep, call_kwargs["timestep"][batch_slice])
+
+    head_start = rank * (num_heads // world_size)
+    head_end = head_start + num_heads // world_size
+    for call_idx, (k_input, v_input) in enumerate(inner.kv_inputs):
+        batch_slice = slice(call_idx, call_idx + 1) if unequal_lengths else slice(None)
+        text_len = context_lengths[call_idx]
+        for actual, context in ((k_input, context_k), (v_input, context_v)):
+            expected_text = context[batch_slice, :text_len, head_start:head_end].transpose(1, 2)
+            torch.testing.assert_close(actual[:, :, :text_len], expected_text, rtol=0, atol=0)
+
+    reference = []
+    for batch_idx, text_len in enumerate(context_lengths):
+        k_valid = torch.cat(
+            [
+                context_k[batch_idx : batch_idx + 1, :text_len],
+                k_full[batch_idx : batch_idx + 1, :generated_len],
+            ],
+            dim=1,
+        )
+        v_valid = torch.cat(
+            [
+                context_v[batch_idx : batch_idx + 1, :text_len],
+                v_full[batch_idx : batch_idx + 1, :generated_len],
+            ],
+            dim=1,
+        )
+        reference.append(
+            F.scaled_dot_product_attention(
+                q_full[batch_idx : batch_idx + 1, :generated_len].transpose(1, 2),
+                k_valid.transpose(1, 2),
+                v_valid.transpose(1, 2),
+                scale=1.0 / math.sqrt(head_dim),
+                dropout_p=0.0,
+            ).transpose(1, 2)
+        )
+    reference = torch.cat(reference, dim=0)
+
+    valid_in_shard = max(0, min(end, generated_len) - start)
+    if valid_in_shard > 0:
+        torch.testing.assert_close(
+            output[:, :valid_in_shard],
+            reference[:, start : start + valid_in_shard],
+            rtol=1e-4,
+            atol=1e-4,
+            msg=f"Rank {rank}: replicated K/V padding changed Ulysses attention output",
+        )
+
+    if compile_backend is not None:
+        assert compile_counter.frame_count == 1, "fullgraph must compile exactly one graph"
+        has_replicated_kv_op = any(
+            "visual_gen_replicated_kv_attention" in str(node.target)
+            for node in compile_counter.graphs[0].graph.nodes
+        )
+        assert has_replicated_kv_op == unequal_lengths, "only unequal lengths need the opaque op"
+        if unequal_lengths:
+            # Same shapes, different lengths: empty prefix, then a uniform batch.
+            for lengths in ([context_len, 0], [2, 2]):
+                call_kwargs["replicated_k_lengths"] = torch.tensor(lengths, dtype=torch.int32)
+                inner.kv_seq_lens.clear()
+                next_output = run_attention(q_shard, k_shard, v_shard, **call_kwargs)
+                expected_calls = lengths if lengths[0] != lengths[1] else lengths[:1]
+                assert inner.kv_seq_lens == [generated_len + length for length in expected_calls]
+                eager_output = attention(q_shard, k_shard, v_shard, **call_kwargs)
+                torch.testing.assert_close(next_output, eager_output, rtol=1e-4, atol=1e-4)
+                cosine = F.cosine_similarity(next_output.flatten(), eager_output.flatten(), dim=0)
+                reference_norm = eager_output.norm()
+                assert reference_norm > 0, "random-input attention reference must have nonzero norm"
+                relative_l2 = (next_output - eager_output).norm() / reference_norm
+                max_error = (next_output - eager_output).abs().max()
+                evidence = (
+                    f"Rank {rank}: fullgraph Ulysses {compile_backend}, "
+                    f"dtype={next_output.dtype}, shape={tuple(next_output.shape)}, "
+                    f"lengths={lengths}, relative L2={relative_l2}, cosine={cosine}, "
+                    f"max error={max_error}"
+                )
+                print(evidence)
+                assert cosine >= 0.9999, evidence
+                assert relative_l2 <= 1e-2, evidence
+                assert max_error <= 1e-3, evidence
+                assert compile_counter.frame_count == 1, (
+                    "text lengths must not specialize the graph"
+                )
+
+
+def _logic_ulysses_replicated_kv_unequal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=True)
+
+
+def _logic_ulysses_replicated_kv_equal_lengths(rank, world_size):
+    _logic_ulysses_replicated_kv_impl(rank, world_size, unequal_lengths=False)
 
 
 def _logic_ulysses_invalid_heads(rank, world_size):

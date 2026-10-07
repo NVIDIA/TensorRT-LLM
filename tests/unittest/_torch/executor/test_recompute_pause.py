@@ -6,6 +6,7 @@ from __future__ import annotations
 import types
 from unittest.mock import Mock
 
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import ReqIdsSet
@@ -27,8 +28,7 @@ def _make_executor(handler: Mock | None) -> PyExecutor:
     executor.inflight_req_ids = ReqIdsSet()
     executor.resource_manager = Mock()
     executor._prefetched_request_ids = set()
-    executor._disagg_timed_out_ctx_cancelled_ids = set()
-    executor._disagg_timed_out_gen_cancelled_ids = set()
+    executor._disagg_coordinator = NoopDisaggCoordinator()
     executor.gather_all_responses = False
     executor.dist = types.SimpleNamespace(rank=0)
     executor.result_wait_queues = {}

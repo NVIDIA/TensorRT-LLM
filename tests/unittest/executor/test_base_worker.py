@@ -1,6 +1,7 @@
-import os
-import sys
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,7 +10,6 @@ from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
@@ -20,8 +20,66 @@ from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 model_path = llm_models_root() / default_model_name
+
+
+@pytest.mark.cpu_only
+def test_get_startup_metrics_promotes_model_engine_stages() -> None:
+    """Verify startup metrics promote saved engine stages while retaining executor metrics."""
+    worker = object.__new__(BaseWorker)
+    worker._is_pytorch_backend = True
+    worker.engine = SimpleNamespace(
+        metrics={
+            "worker_start_seconds": 0.5,
+            "initial_model_engine": {
+                "total_warmup_seconds": 2.5
+            },
+            "final_model_engine": {
+                "total_warmup_seconds": 3.5
+            },
+            "initial_draft_model_engine": {
+                "total_warmup_seconds": 1.0
+            },
+            "final_draft_model_engine": {
+                "total_warmup_seconds": 1.25
+            },
+        },
+        model_engine=SimpleNamespace(
+            metrics={"must_not_be_reported": 1.0},
+            model_loader=SimpleNamespace(
+                metrics={"total_model_loading_seconds": 1.5}),
+        ),
+        draft_model_engine=SimpleNamespace(
+            metrics={"must_not_be_reported": 1.0},
+            model_loader=SimpleNamespace(
+                metrics={"total_model_loading_seconds": 0.75}),
+        ),
+    )
+
+    assert worker.get_startup_metrics() == {
+        "initial_model_engine": {
+            "total_warmup_seconds": 2.5
+        },
+        "final_model_engine": {
+            "total_warmup_seconds": 3.5
+        },
+        "initial_draft_model_engine": {
+            "total_warmup_seconds": 1.0
+        },
+        "final_draft_model_engine": {
+            "total_warmup_seconds": 1.25
+        },
+        "py_executor": {
+            "worker_start_seconds": 0.5
+        },
+        "model_loader": {
+            "total_model_loading_seconds": 1.5
+        },
+        "draft_model_loader": {
+            "total_model_loading_seconds": 0.75
+        },
+    }
 
 
 @pytest.mark.cpu_only
@@ -59,15 +117,15 @@ def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     assert request.path == missing_path
 
 
-def create_fake_executor_config(engine_path, tp_size: int = 1):
-    """Create TorchLlmArgs and executor_config for testing.
+def create_fake_llm_args(engine_path, tp_size: int = 1):
+    """Create TorchLlmArgs for testing.
 
     Args:
         engine_path: Path to the model
         tp_size: Tensor parallel size
 
     Returns:
-        Tuple of (llm_args, executor_config)
+        TorchLlmArgs
     """
     llm_args = TorchLlmArgs(
         model=engine_path,
@@ -78,9 +136,7 @@ def create_fake_executor_config(engine_path, tp_size: int = 1):
         max_batch_size=8,  # Set reasonable batch size for tests
         max_num_tokens=2048,  # Set reasonable max tokens
     )
-    # executor_config is not needed for PyTorch backend
-    executor_config = None
-    return llm_args, executor_config
+    return llm_args
 
 
 class FakeWorker(BaseWorker):

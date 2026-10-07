@@ -27,9 +27,11 @@ from pydantic import Field
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
@@ -68,6 +70,30 @@ class ExtraParamSchema(StrictBaseModel):
         "rather than hard-coded in the routes so the serving layer needs no "
         "per-model knowledge.",
     )
+
+
+class RoleSpec(StrictBaseModel):
+    """One accepted role for a reference modality, with its count bounds."""
+
+    role: MediaRole = Field(description="Role of the reference input.")
+    min: int = Field(default=1, description="Minimum count for this role.")
+    max: Optional[int] = Field(
+        default=1, description="Maximum count for this role (None = unbounded)."
+    )
+
+
+class RefSlotSpec(StrictBaseModel):
+    """Reference slot a pipeline accepts for one modality.
+
+    A request item's ``role`` is required only when ``roles`` has more than one
+    entry (same modality carries multiple roles, e.g. first + last frame);
+    otherwise the single declared role is inferred. Exposed via
+    ``VisualGen.ref_slot_specs`` and enforced by ``validate_visual_gen_params``.
+    Pickled to the coordinator in the READY handshake, so keep it plain data.
+    """
+
+    modality: MediaModality = Field(description="Reference modality.")
+    roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
 if TYPE_CHECKING:
@@ -347,6 +373,17 @@ class BasePipeline(nn.Module):
         Subclasses override to declare which ``extra_params`` keys they
         accept and their metadata.  Maps parameter names to
         ``ExtraParamSchema`` instances.
+        """
+        return {}
+
+    @property
+    def ref_slot_specs(self) -> Dict[str, RefSlotSpec]:
+        """Reference slots this pipeline accepts.
+
+        Maps a ``VisualGenParams`` reference field name
+        (``image_reference`` / ``video_reference`` / ``audio_reference``) to a
+        :class:`RefSlotSpec` declaring the accepted roles and per-role counts.
+        Empty by default (pipeline takes no reference inputs).
         """
         return {}
 
@@ -1187,6 +1224,7 @@ class BasePipeline(nn.Module):
         scheduler,
         extra_stream_schedulers,
         scheduler_step_kwargs=None,
+        extra_stream_timesteps=None,
     ):
         """Execute scheduler step for all streams."""
         step_kwargs = scheduler_step_kwargs or {}
@@ -1198,7 +1236,7 @@ class BasePipeline(nn.Module):
             if name in extra_stream_schedulers:
                 extra_stream_latents[name] = extra_stream_schedulers[name].step(
                     noise_extra,
-                    timestep,
+                    (extra_stream_timesteps or {}).get(name, timestep),
                     extra_stream_latents[name],
                     return_dict=False,
                     **step_kwargs,
@@ -1225,6 +1263,7 @@ class BasePipeline(nn.Module):
         guidance_interval: Optional[Tuple[float, float]] = None,
         post_step_fn: Optional[Callable] = None,
         scheduler_step_kwargs: Optional[Dict[str, Any]] = None,
+        extra_stream_timesteps: dict[str, torch.Tensor] | None = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -1265,6 +1304,9 @@ class BasePipeline(nn.Module):
                          Use for constraints that must hold throughout denoising.
             scheduler_step_kwargs: Extra keyword arguments forwarded to every
                          scheduler's ``step()`` call.
+            extra_stream_timesteps: Optional native timestep schedules keyed by extra
+                         stream name. Each must match the primary schedule length.
+                         Omitted streams use the primary timestep, as before.
 
         Returns:
             Single latents if no extra_streams
@@ -1275,6 +1317,11 @@ class BasePipeline(nn.Module):
 
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
+        for name, stream_timesteps in (extra_stream_timesteps or {}).items():
+            if name not in (extra_streams or {}):
+                raise ValueError(f"Timestep schedule provided for unknown stream: {name}")
+            if stream_timesteps.ndim != 1 or len(stream_timesteps) != total_steps:
+                raise ValueError(f"Timestep schedule for {name} must have {total_steps} entries.")
 
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
         if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
@@ -1368,6 +1415,9 @@ class BasePipeline(nn.Module):
                 scheduler,
                 extra_stream_schedulers,
                 scheduler_step_kwargs=scheduler_step_kwargs,
+                extra_stream_timesteps={
+                    name: schedule[i] for name, schedule in (extra_stream_timesteps or {}).items()
+                },
             )
 
             if post_step_fn is not None:

@@ -31,29 +31,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
-
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.visual_gen.args import (
-        AttentionConfig,
-        ParallelConfig,
-        TeaCacheConfig,
-        TorchCompileConfig,
-    )
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.visual_gen.args import (
+    AttentionConfig,
+    ParallelConfig,
+    TeaCacheConfig,
+    TorchCompileConfig,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -93,10 +79,12 @@ def _distributed_worker(rank, world_size, backend, test_fn, port, fn_args):
 
 
 def run_test_in_distributed(world_size: int, test_fn: Callable, *fn_args):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    from ._visual_gen_dist_utils import spawn_with_retry
+
     spawn_with_retry(
         lambda port: mp.spawn(
             _distributed_worker,
@@ -327,6 +315,67 @@ class TestWanAsyncUlysses:
         """ws=2: async path (block-level inline-replaced by forward_async)
         matches sync path (Attention.forward FUSE_QKV packed kernel)."""
         run_test_in_distributed(2, _logic_async_vs_sync_parity, backend)
+
+
+def test_forward_async_uses_tp_local_heads_for_qkv_gates_and_output() -> None:
+    from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+
+    class _CaptureAsyncAttention(torch.nn.Module):
+        def forward_async(
+            self,
+            compute_q: Callable[[], torch.Tensor],
+            compute_k: Callable[[], torch.Tensor],
+            compute_v: Callable[[], torch.Tensor],
+            **kwargs: object,
+        ) -> torch.Tensor:
+            self.q = compute_q()
+            self.k = compute_k()
+            self.v = compute_v()
+            self.kwargs = kwargs
+            return self.q
+
+    class _CaptureOutputProjection(torch.nn.Module):
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            self.input = hidden_states
+            return hidden_states
+
+    attention = Attention.__new__(Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_attention_heads = 4
+    attention.num_key_value_heads = 4
+    attention.local_num_attention_heads = 2
+    attention.local_num_key_value_heads = 2
+    attention.head_dim = 4
+    attention.fuse_qk_norm_rope = False
+    attention.qk_norm = False
+    attention._maybe_share_qkv_quantize = False
+    attention.to_q = torch.nn.Linear(12, 8, bias=False)
+    attention.to_k = torch.nn.Linear(12, 8, bias=False)
+    attention.to_v = torch.nn.Linear(12, 8, bias=False)
+    attention.attn = _CaptureAsyncAttention()
+    output_projection = _CaptureOutputProjection()
+    attention.to_out = torch.nn.ModuleList([output_projection])
+    gate_compress = torch.randn(1, 3, 8)
+    gate_fine = torch.randn_like(gate_compress)
+
+    output = attention.forward_async(
+        torch.randn(1, 3, 12),
+        gate_compress=gate_compress,
+        gate_fine=gate_fine,
+    )
+
+    expected_shape = (1, 3, 2, 4)
+    assert attention.attn.q.shape == expected_shape
+    assert attention.attn.k.shape == expected_shape
+    assert attention.attn.v.shape == expected_shape
+    assert attention.attn.kwargs["gate_compress"].shape == expected_shape
+    assert attention.attn.kwargs["gate_fine"].shape == expected_shape
+    torch.testing.assert_close(
+        attention.attn.kwargs["gate_compress"], gate_compress.view(expected_shape)
+    )
+    torch.testing.assert_close(attention.attn.kwargs["gate_fine"], gate_fine.view(expected_shape))
+    assert output_projection.input.shape == (1, 3, 8)
+    assert output.shape == (1, 3, 8)
 
 
 if __name__ == "__main__":

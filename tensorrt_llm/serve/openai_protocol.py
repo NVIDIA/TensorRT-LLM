@@ -47,8 +47,9 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
-from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, PositiveInt,
-                      field_validator, model_validator)
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
+                      NonNegativeInt, PositiveInt, field_validator,
+                      model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
@@ -61,6 +62,8 @@ from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import (check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
+from tensorrt_llm.serve.serving_extensions import structured_output_format_for
+from tensorrt_llm.visual_gen.params import MediaRole
 
 _LOGIT_BIAS_MIN = -100.0
 _LOGIT_BIAS_MAX = 100.0
@@ -147,6 +150,73 @@ def _logit_bias_to_embedding_bias(
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+class SpeculativeDecodingStats(OpenAIBaseModel):
+    """Per-request speculative-decoding acceptance for one generated sequence.
+
+    Opt-in: emitted only when the server sets per_request_spec_decode_stats.
+    Absent entirely when the request drafted nothing. PyTorch backend only.
+
+    ``mean acceptance length`` is deliberately not a field here: it is already
+    reported per choice as ``avg_decoded_tokens_per_iter``, and duplicating it
+    would let the two drift. Consumers derive it as
+    ``1 + total_accepted_draft_tokens / num_spec_steps``.
+
+    Three identities hold on every emitted record, and a consumer may rely on
+    them:
+
+    * ``sum(acceptance_histogram) == num_spec_steps``
+    * ``sum(j * acceptance_histogram[j]) == total_accepted_draft_tokens``
+    * ``total_accepted_draft_tokens <= total_draft_tokens``
+    """
+
+    acceptance_rate: float = Field(
+        description="Accepted draft tokens divided by proposed draft tokens.")
+    total_accepted_draft_tokens: int = Field(
+        description="Draft tokens accepted across the request, excluding the "
+        "always-accepted bonus token.")
+    total_draft_tokens: int = Field(
+        description="Draft tokens proposed across the request. For tree "
+        "drafting this counts paths, not tree nodes, mirroring the "
+        "getMaxDraftPathLen clamp in updateNumTokensPerIteration.")
+    num_spec_steps: int = Field(
+        description="Verify steps performed for the request. Equals the sum of "
+        "acceptance_histogram.")
+    acceptance_histogram: List[int] = Field(
+        description="Dense histogram indexed by accepted-draft count: entry j "
+        "is the number of verify steps that accepted exactly j draft tokens. "
+        "Tree-agnostic -- it records output lengths per step and encodes no "
+        "parent/child structure.")
+    num_spec_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum draft length per step, when the run has a fixed "
+        "bound. None under draft_len_schedule, where the bound varies by batch "
+        "size.")
+
+
+class _OmitsAbsentSpecDecodeStats(OpenAIBaseModel):
+    """Drops ``speculative_decoding`` from serialized output when it is absent.
+
+    Per-request spec-decode stats are off by default, so without this every
+    response on the paths that serialize with a plain ``model_dump()`` -- the
+    non-streaming chat and completions responses, and the completions stream
+    (``exclude_unset=False``) -- would gain ``"speculative_decoding": null`` for
+    every user, whether or not they enabled ``per_request_spec_decode_stats``.
+
+    Scoped to this one field on purpose. Blanket ``exclude_none`` would also
+    strip unrelated optional fields that clients may rely on being present, and
+    the dump calls are spread across the serving layer rather than funnelled
+    through one place where an ``exclude=`` argument could be applied.
+    """
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_spec_decode_stats(self, handler: Any) -> Any:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("speculative_decoding",
+                                               ...) is None:
+            data.pop("speculative_decoding", None)
+        return data
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -259,6 +329,14 @@ class ConversationParams(OpenAIBaseModel):
     conversation_id: str = Field(
         description=("Stable multi-turn conversation id used for routing"), )
 
+    # Forwarded as a header; excluded from the request body for older workers.
+    subagent_affinity_id: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description=("Server-private parent-session id for sub-agent routing "
+                     "affinity; forwarded to workers as a header, never in the "
+                     "body."))
+
     @field_validator("conversation_id", mode="before")
     @classmethod
     def validate_conversation_id(cls, value: Any) -> str:
@@ -275,7 +353,9 @@ class ErrorResponse(OpenAIBaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: int
+    # HTTP status by default; a machine-readable string for conditions that
+    # define one (e.g. "context_length_exceeded", matching OpenAI).
+    code: Union[int, str]
 
 
 class CompletionLogProbs(OpenAIBaseModel):
@@ -285,7 +365,7 @@ class CompletionLogProbs(OpenAIBaseModel):
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
-class CompletionResponseChoice(OpenAIBaseModel):
+class CompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -302,6 +382,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -316,7 +398,7 @@ class CompletionResponse(OpenAIBaseModel):
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
 
 
-class CompletionResponseStreamChoice(OpenAIBaseModel):
+class CompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     text: str
     token_ids: Optional[List[int]] = None
@@ -330,6 +412,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -475,48 +559,13 @@ def _response_format_to_guided_decoding_params(
     elif guided_decoding_params.grammar is not None:
         content = {"type": "grammar", "grammar": guided_decoding_params.grammar}
 
-    if reasoning_parser == "gpt_oss":
-        # Trigger user constraint by final channel
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|start|>assistant<|channel|>final<|message|>"],
-            "tags": [
-                {
-                    "begin": "<|start|>assistant<|channel|>final<|message|>",
-                    "content": content,
-                    "end": "",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
-    elif reasoning_parser == "kimi_k3":
-        # K3 XTML: the generation prompt already ends inside the channel the
-        # model starts in. In thinking mode (the default) the response channel
-        # opens mid-generation, so trigger the user constraint on it
-        # (mirrors the gpt_oss final-channel handling). In non-thinking mode
-        # the prompt ends inside <|open|>response<|sep|>, the trigger would
-        # never be generated, and the raw grammar applies from the first
-        # generated token instead.
-        thinking = (chat_template_kwargs or {}).get("thinking",
-                                                    True) is not False
-        if not thinking:
+    extension_format = structured_output_format_for(reasoning_parser)
+    if extension_format is not None:
+        # A registered per-model serving extension owns the placement of the
+        # constraint relative to this model's reasoning markup.
+        stag_format = extension_format(content, chat_template_kwargs)
+        if stag_format is None:
             return guided_decoding_params
-        stag_format = {
-            "type":
-            "triggered_tags",
-            "triggers": ["<|open|>response<|sep|>"],
-            "tags": [
-                {
-                    "begin": "<|open|>response<|sep|>",
-                    "content": content,
-                    "end": "<|close|>response<|sep|>",
-                },
-            ],
-            "stop_after_first":
-            True,
-        }
     else:
         # Force thinking and then trigger user constraint
         parser = ReasoningParserFactory.create_reasoning_parser(
@@ -846,7 +895,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: Optional[List[ChatCompletionLogProbsContent]] = None
 
 
-class ChatCompletionResponseChoice(OpenAIBaseModel):
+class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     message: ChatMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
@@ -858,6 +907,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -884,13 +935,15 @@ class DeltaMessage(OpenAIBaseModel):
     tool_calls: Optional[List[DeltaToolCall]] = None
 
 
-class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
+class ChatCompletionResponseStreamChoice(_OmitsAbsentSpecDecodeStats):
     index: int
     delta: DeltaMessage
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
+    speculative_decoding: Optional[SpeculativeDecodingStats] = Field(
+        default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
@@ -902,11 +955,67 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     usage: Optional[UsageInfo] = Field(default=None)
 
 
+# Maximum total number of `enum` values across all properties of one tool
+# function's parameters schema. Mirrors the cap reference OpenAI-compatible
+# platforms enforce; unbounded enums also inflate the guided-decoding
+# grammar compiled for strict tool calls.
+TOOL_PARAM_MAX_ENUM_VALUES = 1000
+
+# JSON Schema keywords whose value is instance data rather than a subschema.
+# An `enum` key nested inside these is a value (e.g. a default that happens to
+# be `{"enum": [...]}`), not an enum constraint, so it must not count.
+_SCHEMA_INSTANCE_KEYWORDS = frozenset({"default", "const", "examples"})
+# JSON Schema keywords whose value is a map of {name: subschema}. The names are
+# user-controlled (a property can be literally named `default` or `enum`), so
+# recurse into the values as subschemas without treating the names as keywords.
+_SCHEMA_MAP_KEYWORDS = frozenset({
+    "properties", "patternProperties", "$defs", "definitions",
+    "dependentSchemas"
+})
+
+
+def _count_schema_enum_values(schema: Any) -> int:
+    """Recursively count `enum` *constraint* entries in a JSON-schema fragment.
+
+    Only `enum` keywords in schema positions are counted. `enum` keys that are
+    instance data -- nested under `default`/`const`/`examples`, or the name of a
+    property -- are ignored, so a valid schema is not rejected for values that
+    are not enum constraints.
+    """
+    count = 0
+    if isinstance(schema, dict):
+        for key, value in schema.items():
+            if key == "enum" and isinstance(value, list):
+                count += len(value)
+            elif key in _SCHEMA_INSTANCE_KEYWORDS:
+                continue
+            elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+                for subschema in value.values():
+                    count += _count_schema_enum_values(subschema)
+            else:
+                count += _count_schema_enum_values(value)
+    elif isinstance(schema, list):
+        for item in schema:
+            count += _count_schema_enum_values(item)
+    return count
+
+
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
     strict: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def check_enum_value_cap(self):
+        if self.parameters is not None:
+            num_enum_values = _count_schema_enum_values(self.parameters)
+            if num_enum_values > TOOL_PARAM_MAX_ENUM_VALUES:
+                raise ValueError(
+                    f"tool function {self.name!r} declares {num_enum_values} "
+                    f"enum values across its parameters schema; the maximum "
+                    f"is {TOOL_PARAM_MAX_ENUM_VALUES}.")
+        return self
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -965,6 +1074,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto", "required"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    # Standard OpenAI field, accepted for compatibility. `false` is not
+    # enforced: the engine does not restrict how many tool calls the model
+    # emits per turn, so parallel emission remains model behavior either way.
+    parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
@@ -1048,6 +1161,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Additional kwargs to pass to the template renderer. "
                      "Will be accessible by the chat template."),
+    )
+    injected_chat_template_kwargs: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Server-populated. Keys of `chat_template_kwargs` that the server "
+            "derived from API-level fields (for example the Anthropic "
+            "`thinking` and `context_management` controls) rather than the "
+            "caller. The unused-kwargs guard exempts them, since the caller "
+            "cannot remove a control the server added. Relayed with the "
+            "request so a disaggregated worker rendering the prompt applies "
+            "the same exemption."),
     )
 
     media_io_kwargs: Optional[Dict[MediaModality, Dict[str, Any]]] = Field(
@@ -1317,6 +1441,27 @@ ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,
 _ID_STRIPPED_ROLES = ("user", "system", "developer")
 
 
+def _drop_explicit_nulls(value, _depth=0):
+    """Recursively drop dict keys whose value is an explicit ``null``.
+
+    On the OpenAI wire an unset optional field is omitted, so an explicit
+    ``null`` carries no information — but the vendored Responses item types
+    validate ``null`` differently from omitted and reject it. Dropping
+    null-valued keys restores the omit-unset wire shape for clients that
+    serialize every unset optional as ``null`` (litellm among them).
+    """
+    if _depth > 12:
+        return value
+    if isinstance(value, dict):
+        return {
+            k: _drop_explicit_nulls(v, _depth + 1)
+            for k, v in value.items() if v is not None
+        }
+    if isinstance(value, list):
+        return [_drop_explicit_nulls(v, _depth + 1) for v in value]
+    return value
+
+
 def _materialize_validator_iterators(value, _depth=0):
     """Recursively replace pydantic ValidatorIterator objects with lists.
 
@@ -1376,6 +1521,10 @@ class ResponsesRequest(OpenAIBaseModel):
         """
         if not isinstance(value, list):
             return value
+
+        # Must run before the per-item shaping below: the item types reject
+        # explicit nulls that mean "unset" (see _drop_explicit_nulls).
+        value = [_drop_explicit_nulls(item) for item in value]
 
         def _with_annotations(part):
             """output_text requires annotations; clients often omit it."""
@@ -1508,6 +1657,20 @@ class ResponsesRequest(OpenAIBaseModel):
         )
         _record_sampling_params_request_fields(self, sampling_params)
         return sampling_params
+
+    @model_validator(mode="before")
+    @classmethod
+    def _null_top_level_fields_mean_unset(cls, data):
+        """Drop explicitly-null top-level fields so they take their defaults.
+
+        Shallow on purpose: ``input`` items are scrubbed recursively by their
+        own validator, and the remaining structured fields are Optional
+        throughout. A null required field (``model``, ``input``) still
+        reports as missing.
+        """
+        if not isinstance(data, dict):
+            return data
+        return {k: v for k, v in data.items() if v is not None}
 
     @model_validator(mode="before")
     @classmethod
@@ -1939,7 +2102,7 @@ class ImageEditRequest(OpenAIBaseModel):
         description=
         "Optional edit mask. Currently accepted for compatibility but unsupported.",
     )
-    response_format: Literal["url", "b64_json"] = "url"
+    response_format: Literal["url", "b64_json", "path"] = "url"
     output_format: Literal["png", "webp", "jpeg"] = Field(
         default="png",
         validation_alias=AliasChoices("output_format", "format"),
@@ -2011,6 +2174,35 @@ class ImageGenerationResponse(OpenAIBaseModel):
     size: Optional[str] = None
 
 
+class MediaReferenceItem(OpenAIBaseModel):
+    """One media reference (image / video / audio) for conditioning (mirrors ``MediaRef``).
+
+    ``format`` declares how to read ``content``; it is required, so no wire form
+    is ever guessed. The request field it sits in (``image_reference`` /
+    ``video_reference`` / ``audio_reference``) fixes the modality. ``role`` is
+    required only when it is ambiguous — a model with more than one required role
+    for that modality; a single role, or a single required role (e.g. i2v
+    first_frame), is inferred.
+    """
+
+    content: str = Field(
+        description="The reference payload, in the form declared by ``format``."
+    )
+    format: Literal["path", "url", "base64"] = Field(description=(
+        "Wire form of ``content``: ``path`` (a file readable by the server; a "
+        "``file://`` URI is also accepted), ``url`` (``http(s)``, fetched "
+        "through the SSRF-guarded loader), or ``base64`` (a ``data:`` URI is "
+        "also accepted). Raw bytes reach the server as a multipart upload, "
+        "which carries no ``format`` of its own. Distinct from the top-level "
+        "``format``, which selects the *output* encoding."))
+    role: Optional[MediaRole] = Field(
+        default=None,
+        description="Which conditioning slot this reference fills. Required only "
+        "when the target model accepts this modality in more than one slot; omit "
+        "it when the model leaves no ambiguity.",
+    )
+
+
 class VideoGenerationRequest(OpenAIBaseModel):
     """Video generation request (extended API).
 
@@ -2034,14 +2226,46 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
+    image_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Image reference(s) conditioning generation (e.g. image-to-video "
+             "first frame). Send a ``{content, format, role}`` object or a list "
+             "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
+             "upload a single image file via multipart, whose form is implied. "
+             "PNG or JPEG only — HEIF/AVIF are not supported."),
+        )
+    video_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Video reference(s) conditioning generation (video-to-video). Send "
+             "a ``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
+             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "tested codec and others best-effort."),
+        )
+    audio_reference: Optional[Union[
+        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+            default=None,
+            description=
+            ("Audio reference(s) conditioning generation. Send a "
+             "``{content, format}`` object or a list of them, where ``format`` "
+             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
+             "file via multipart, whose form is implied. Accepted only by "
+             "models that declare an audio reference slot."),
+        )
     input_reference: Optional[Union[str, UploadFile]] = Field(
         default=None,
-        description=(
-            "Optional image or video reference that guides generation. PNG or "
-            "JPEG images condition image-to-video; MP4 or AVI video conditions "
-            "video-to-video, with H.264 the tested codec and others "
-            "best-effort. HEIF/AVIF are not supported. JSON requests carry "
-            "base64 bytes; multipart requests upload the file."),
+        description=
+        ("Deprecated. A single image or video reference, routed by content "
+         "signature to image-to-video or video-to-video. A JSON request carries "
+         "base64 bytes; a multipart request uploads the file. Kept for backward "
+         "compatibility; prefer the typed ``image_reference`` / "
+         "``video_reference`` fields, which take precedence — this field is "
+         "ignored whenever a typed ``image_reference`` or ``video_reference`` "
+         "is provided."),
     )
 
     # Resolution
@@ -2169,9 +2393,9 @@ class VideoJob(OpenAIBaseModel):
         description=
         "Server-side paths for n>1 (internal; excluded from the wire).")
     # exclude=True internal timings, never on the wire (status/list
-    # model_dump() stays status-only). ``request_started`` is a
-    # ``perf_counter()`` stamped at the POST handler; the background task
-    # computes ``total`` from it and stores the header timings
+    # model_dump() stays status-only). ``request_started`` carries the
+    # steady-clock ``server_arrival_time``; the background task computes
+    # ``total`` from it and stores the header timings
     # (``generation``/``denoise``/``total``) in ``timing_metrics`` so
     # ``/content`` emits the same Server-Timing header as the sync route.
     request_started: Optional[float] = Field(default=None, exclude=True)
@@ -2195,3 +2419,31 @@ class VideoJobList(OpenAIBaseModel):
 
 UCompletionRequest = Union[CompletionRequest, ChatCompletionRequest]
 UCompletionResponse = Union[CompletionResponse, ChatCompletionResponse]
+
+ProfileActivity = Literal["CPU", "GPU", "CUDA_PROFILER"]
+
+
+class StartProfileRequest(OpenAIBaseModel):
+    """Request body for the POST /start_profile endpoint."""
+    output_dir: Optional[str] = Field(
+        default=None,
+        description="Directory where chrome traces are written. Defaults "
+        "to the TLLM_TORCH_PROFILER_DIR environment variable, "
+        "then /tmp.")
+    num_steps: Optional[PositiveInt] = Field(
+        default=None,
+        description="Number of iterations to profile. Must be >= 1 if "
+        "provided; if omitted, profiling runs until /stop_profile is "
+        "called. ``num_steps == 0`` is rejected because the profile "
+        "window would never close — the stop iteration would equal the "
+        "start iteration, profile_step() would discard the stop marker "
+        "as stale, and the window would run forever.")
+    start_step: NonNegativeInt = Field(
+        default=0,
+        description="Skip this many iterations before profiling begins. "
+        "Must be >= 0.")
+    activities: List[ProfileActivity] = Field(
+        default_factory=lambda: ["CPU", "GPU"],
+        description="Which activities to trace. Supported values: "
+        "'CPU', 'GPU', 'CUDA_PROFILER'. Unknown values are rejected at "
+        "schema validation time.")

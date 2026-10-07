@@ -260,7 +260,7 @@ def cpu_reference(data):
     }
 
 
-def cute_run(data, zero_accepted_hint=False):
+def cute_run(data, zero_accepted_hint=False, beta_cache_override=None):
     """Run the in-tree op on cloned caches; return the drop-format dict."""
     import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 
@@ -275,7 +275,7 @@ def cute_run(data, zero_accepted_hint=False):
         cs[name] = dst
     qkg_cache = data["qkg_cache"].clone()
     v_cache = data["v_cache"].clone()
-    beta_cache = data["beta_cache"].clone()
+    beta_cache = data["beta_cache"].clone() if beta_cache_override is None else beta_cache_override
     out = torch.ops.trtllm.kda_mtp_decode(
         x_q=data["x_q"],
         x_k=data["x_k"],
@@ -532,6 +532,133 @@ def test_zero_accepted_hint_variant(B, H):
         "cs_v",
     ):
         _assert_close(f"{name}(fast vs general)", fast[name], general[name], atol=1e-5)
+
+
+@pytest.mark.parametrize("field", ["ssm_state_indices", "cu_seqlens", "num_accepted_tokens"])
+def test_misaligned_scalar_metadata_after_aligned_warmup(field):
+    """Every scalar CuTe metadata argument accepts an offset int32 view.
+
+    Mixed context/generation batches hand the op a view into the shared buffer
+    that starts after one to three context rows: contiguous, int32, and not
+    16-byte aligned. The op states 4-byte alignment for these, so the CuTe
+    bridge no longer has to be told a guarantee the caller cannot make.
+    """
+    data = make_conv_data(B=1, H=6, M=M, seed=17)
+    expected = cute_run(data)
+
+    source = data[field]
+    storage = torch.empty(source.numel() + 1, dtype=torch.int32, device="cuda")
+    storage[0] = -1
+    storage[1:].copy_(source)
+    misaligned = storage[1:]
+    assert misaligned.is_contiguous()
+    assert misaligned.data_ptr() % 16 != 0
+
+    misaligned_data = dict(data)
+    misaligned_data[field] = misaligned
+    actual = cute_run(misaligned_data)
+
+    for name in ("out", "recurrent_state", "qkg_cache", "v_cache", "beta_cache"):
+        _assert_close(
+            f"{name}({field} misaligned vs aligned)", actual[name], expected[name], atol=1e-5
+        )
+
+
+@pytest.mark.parametrize(
+    "attention_mode,parallel_size,dtype,pool_size,num_spec,expected",
+    (
+        pytest.param("dep", 8, torch.float32, 1177, 5, 16, id="dep8-mtp5-fp32"),
+        pytest.param("dep", 16, torch.float32, 1177, 7, 16, id="dep16-mtp7-fp32"),
+        pytest.param("tep", 8, torch.float32, 1177, 7, 16, id="tep8-mtp7-fp32"),
+        pytest.param("tep", 16, torch.float32, 1177, 2, 16, id="tep16-mtp2-fp32"),
+        pytest.param("tep", 16, torch.float32, 1177, 5, 8, id="tep16-mtp5-fp32"),
+        pytest.param("tep", 16, torch.float32, 1177, 7, 8, id="tep16-mtp7-fp32"),
+        pytest.param("tep", 16, torch.float32, 248, 7, 16, id="tep16-mtp7-even-pool"),
+        pytest.param("tep", 32, torch.float32, 1177, 7, 4, id="tep32-mtp7-fp32"),
+        pytest.param("dep", 16, torch.bfloat16, 1177, 7, 16, id="dep16-mtp7-bf16"),
+        pytest.param("tep", 8, torch.bfloat16, 1177, 7, 8, id="tep8-mtp7-bf16"),
+        pytest.param("tep", 16, torch.bfloat16, 1177, 7, 4, id="tep16-mtp7-bf16"),
+        pytest.param("tep", 32, torch.bfloat16, 1177, 7, 2, id="tep32-mtp7-bf16"),
+    ),
+)
+def test_beta_cache_alignment_is_derived_from_layout_and_dtype(
+    attention_mode, parallel_size, dtype, pool_size, num_spec, expected
+):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        _beta_cache_assumed_align,
+    )
+
+    local_heads = 96 if attention_mode == "dep" else 96 // parallel_size
+    parent = torch.empty(2, pool_size, num_spec, local_heads, dtype=dtype, device="cuda")
+    beta_cache = parent[0]
+
+    assert _beta_cache_assumed_align(beta_cache) == expected
+
+
+def test_beta_cache_alignment_uses_padded_physical_stride():
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        _beta_cache_assumed_align,
+    )
+
+    parent = torch.empty(2, 1177, 7, 8, dtype=torch.float32, device="cuda")
+    beta_cache = parent[0, ..., :6]
+
+    assert beta_cache.shape == (1177, 7, 6)
+    assert beta_cache.stride() == (56, 8, 1)
+    assert _beta_cache_assumed_align(beta_cache) == 16
+
+
+@pytest.mark.parametrize(
+    "attention_mode,parallel_size,num_spec,expected_alignment",
+    (
+        pytest.param("dep", 16, 7, 16, id="dep16-mtp7"),
+        pytest.param("tep", 8, 7, 16, id="tep8-mtp7"),
+        pytest.param("tep", 16, 5, 8, id="tep16-mtp5"),
+        pytest.param("tep", 16, 7, 8, id="tep16-mtp7"),
+        pytest.param("tep", 32, 7, 4, id="tep32-mtp7"),
+    ),
+)
+def test_beta_cache_sibling_layer_after_aligned_warmup(
+    attention_mode, parallel_size, num_spec, expected_alignment
+):
+    """A cached kernel accepts the next real per-layer beta-cache slice."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        _beta_cache_assumed_align,
+    )
+
+    local_heads = 96 if attention_mode == "dep" else 96 // parallel_size
+    data = make_conv_data(B=1, H=local_heads, M=num_spec, seed=29)
+
+    parent = torch.zeros(2, 1177, num_spec, local_heads, dtype=torch.float32, device="cuda")
+    layer0, layer1 = parent.unbind(0)
+    layer0[0].copy_(data["beta_cache"][0])
+    layer1[0].copy_(data["beta_cache"][0])
+
+    assert _beta_cache_assumed_align(layer0) == expected_alignment
+    assert layer0.data_ptr() % 16 == 0
+    assert layer1.data_ptr() % expected_alignment == 0
+    if expected_alignment < 16:
+        assert layer1.data_ptr() % (2 * expected_alignment) != 0
+
+    expected = cute_run(data, beta_cache_override=layer0)
+    actual = cute_run(data, beta_cache_override=layer1)
+
+    for name in (
+        "out",
+        "recurrent_state",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(
+            f"{name}({attention_mode}{parallel_size}-mtp{num_spec})",
+            actual[name],
+            expected[name],
+            atol=1e-5,
+        )
 
 
 if __name__ == "__main__":

@@ -15,13 +15,13 @@
 
 import contextlib
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._utils import prefer_pinned
@@ -105,11 +105,7 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
-    """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops.
-
-    Keep field order and write-first partitioning in sync with the AutoDeploy
-    replay metadata path in shim/interface.py.
-    """
+    """Same partition as :func:`_build_replay_work_items_triton`, in ATen ops."""
     num_decodes = state_indices.shape[0]
     position_in_decode_batch = torch.arange(num_decodes,
                                             dtype=torch.int32,
@@ -328,6 +324,11 @@ class Mamba2Metadata:
     # inference from a stray shell export or a forked worker.
     _warmup_force_initial_states: bool = False
 
+    # Set by a subclass whose prefill kernel compiles a separate variant
+    # depending on whether every context length is a multiple of this value.
+    # Warmup reads it to cover both variants.
+    prefill_chunk_alignment: Optional[int] = None
+
     @classmethod
     @contextlib.contextmanager
     def force_initial_states_for_warmup(cls):
@@ -338,9 +339,15 @@ class Mamba2Metadata:
         finally:
             cls._warmup_force_initial_states = prev
 
-    def __init__(self, max_batch_size: int, chunk_size: int):
+    def __init__(
+        self,
+        max_batch_size: int,
+        chunk_size: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
         self.max_batch_size = max_batch_size
         self.chunk_size = chunk_size
+        self.max_num_tokens = max_num_tokens
 
         # cumulative sequence lengths for prefill requests [batch_size+1]
         self.cu_seqlens = torch.zeros(max_batch_size + 1,

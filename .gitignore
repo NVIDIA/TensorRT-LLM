@@ -38,7 +38,6 @@ config.json
 /*.svg
 cpp/cmake-build-*
 cpp/.ccache
-cpp/.conan
 tensorrt_llm/bin
 tensorrt_llm/include
 tensorrt_llm/libs
@@ -58,17 +57,13 @@ tensorrt_llm/flash_mla
 tensorrt_llm/flash_mla_cpp_tllm.*.so
 tensorrt_llm/flash_mla_cpp_tllm.pyi
 /3rdparty/fmha_sm100/
-tensorrt_llm/runtime/kv_cache_manager_v2/**/*.so
-**/*__mypyc*.so
+/3rdparty/nccl_extensions/
 tensorrt_llm/scripts
 *docs/cpp_docs*
 *docs/source/_cpp_gen*
 docs/source/**/*.rst
 !docs/source/examples/index.rst
 !docs/source/_includes/note_sections.rst
-!docs/source/features/auto_deploy/transforms.rst
-!docs/source/features/auto_deploy/transforms/
-!docs/source/features/auto_deploy/transforms/*.rst
 *.swp
 .nfs*
 
@@ -86,6 +81,7 @@ ad-test-workspace/
 */tllm_debug/**
 *.patch
 !cpp/tensorrt_llm/deep_ep/*.patch
+!3rdparty/vendor_patches/*.patch
 examples/disaggregated/slurm/benchmark/logs/
 scripts/attribution/data/checksum_to_paths.yml
 
@@ -131,3 +127,6 @@ tests/integration/defs/stress_test/artifacts/
 # (run_eval_kimi_k3.sbatch --parallel tep and --dflash rewrites)
 examples/kimi_k3/.eval_tep_runtime.*.yaml
 examples/kimi_k3/.eval_dflash_runtime.*.yaml
+
+# Media a VisualGen server generates, when it is started from the checkout
+trtllm_generated/

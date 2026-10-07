@@ -15,6 +15,15 @@ from pathlib import Path
 
 import pytest
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+    VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
+)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    resolve_checkpoint_policy_defaults,
+    resolve_domain_action_config,
+)
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE_DIR = _PROJECT_ROOT / "examples" / "visual_gen" / "models" / "cosmos3"
 
@@ -80,6 +89,29 @@ class TestPromptAcceptsTextOrPath:
         assert enable_audio is True
         assert output_type == "image"
 
+    def test_nested_structured_prompt_is_serialized_at_request_boundary(self, tmp_path):
+        """The client transports model-specific JSON; the pipeline does not create it."""
+        caption = {
+            "cinematography": {"framing": "concatenated robot camera views"},
+            "actions": [{"time": "0:00-0:02", "description": "Pick up the cup."}],
+            "fps": 15.0,
+        }
+        path = tmp_path / "policy.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "prompt": caption,
+                    "vision_path": "observation.png",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        prompt, image, _, _ = _resolve(prompt=str(path))
+
+        assert json.loads(prompt) == caption
+        assert image == "observation.png"
+
     def test_plain_text_file(self, tmp_path):
         path = tmp_path / "prompt.txt"
         path.write_text("  the camera pans right  \n", encoding="utf-8")
@@ -135,6 +167,12 @@ class TestPromptFileIsStrict:
         path = tmp_path / "list.json"
         path.write_text("[1, 2]", encoding="utf-8")
         with pytest.raises(ValueError, match="JSON object or text"):
+            cosmos3.load_prompt_file(str(path))
+
+    def test_nested_prompt_array_raises(self, tmp_path):
+        path = tmp_path / "list-prompt.json"
+        path.write_text(json.dumps({"prompt": ["not", "caption"]}), encoding="utf-8")
+        with pytest.raises(ValueError, match="must be text or a JSON object"):
             cosmos3.load_prompt_file(str(path))
 
     def test_no_prompt_source_raises(self):
@@ -208,10 +246,83 @@ class TestNegativePromptFile:
 class TestShippedPromptFiles:
     """The files this README tells users to pass must actually load."""
 
-    @pytest.mark.parametrize("name", ["t2v", "t2i", "i2v", "v2v", "t2av"])
-    def test_bundled_prompt_files_load(self, name):
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "t2v",
+            "t2i",
+            "i2v",
+            "v2v",
+            "t2av",
+            "action_policy",
+            "action_forward_dynamics",
+            "action_inverse_dynamics",
+            "action_edge_policy_droid",
+        ],
+    )
+    def test_bundled_prompt_files_load(self, name: str) -> None:
         data = cosmos3.load_prompt_file(f"prompts/{name}.json")
         assert data["prompt"]
+
+    @pytest.mark.parametrize(
+        ("name", "domain_name"),
+        [
+            ("action_policy", "bridge_orig_lerobot"),
+            ("action_forward_dynamics", "av"),
+            ("action_inverse_dynamics", "bridge_orig_lerobot"),
+        ],
+    )
+    def test_action_prompt_matches_example_domain(self, name: str, domain_name: str) -> None:
+        data = cosmos3.load_prompt_file(f"prompts/{name}.json")
+        prompt = json.loads(data["prompt"])
+        config = resolve_domain_action_config(domain_name=domain_name)
+
+        assert list(prompt) == [
+            "cinematography",
+            "actions",
+            "duration",
+            "fps",
+            "resolution",
+            "aspect_ratio",
+        ]
+        assert prompt["cinematography"] == {
+            "framing": "This video is captured from a first-person perspective looking at the scene."
+        }
+        duration_seconds = config["num_frames"] / config["frame_rate"]
+        minutes, seconds = divmod(round(duration_seconds), 60)
+        assert prompt["duration"] == f"{int(duration_seconds)}s"
+        assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
+        assert prompt["fps"] == config["frame_rate"]
+        width, height = find_closest_target_size(720, 1280, config["action_resolution"])
+        assert prompt["resolution"] == {"H": height, "W": width}
+        assert VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][prompt["aspect_ratio"]] == (
+            width,
+            height,
+        )
+
+    def test_edge_policy_prompt_matches_checkpoint_defaults(self):
+        data = cosmos3.load_prompt_file("prompts/action_edge_policy_droid.json")
+        prompt = json.loads(data["prompt"])
+        policy_defaults = resolve_checkpoint_policy_defaults(
+            {
+                "action_chunk_size": 32,
+                "conditioning_fps": 15.0,
+                "domain_name": "droid_lerobot",
+            }
+        )
+        config = resolve_domain_action_config(checkpoint_policy_defaults=policy_defaults)
+
+        duration_seconds = config["num_frames"] / config["frame_rate"]
+        minutes, seconds = divmod(round(duration_seconds), 60)
+        assert prompt["duration"] == f"{int(duration_seconds)}s"
+        assert prompt["actions"][0]["time"] == f"0:00-{minutes}:{seconds:02d}"
+        assert prompt["fps"] == config["frame_rate"]
+        width, height = find_closest_target_size(544, 736, config["action_resolution"])
+        assert prompt["resolution"] == {"H": height, "W": width}
+        width, height = VIDEO_RES_SIZE_INFO[str(config["action_resolution"])][
+            prompt["aspect_ratio"]
+        ]
+        assert prompt["resolution"] == {"H": height, "W": width}
 
     def test_default_prompt_file(self):
         assert cosmos3.load_prompt_file(cosmos3.DEFAULT_PROMPT_FILE)["prompt"]

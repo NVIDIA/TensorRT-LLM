@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 from ...distributed.ops import reducescatter
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .impl_blocks import (MoEEplbWeightLayoutMixin, MoEExecutionContractMixin,
                           MoEWeightOwnerMixin)
 from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
@@ -35,8 +36,8 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 # the same math the attention-DP deployments already run.
 #
 # Lives here rather than next to either reader because both need it: the
-# scheduler decides whether to precompute top-k at all, and TRTLLMGenFusedMoE
-# decides whether its kernel may route again.
+# scheduler decides whether to precompute top-k at all, and
+# TrtllmGenFusedMoEBase decides whether its kernel may route again.
 FORCE_SEPARATED_ROUTING = os.environ.get(
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
@@ -248,14 +249,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         bias: bool = False,
-        swiglu_alpha: Optional[torch.Tensor] = None,
-        swiglu_beta: Optional[torch.Tensor] = None,
-        swiglu_limit: Optional[torch.Tensor] = None,
-        swiglu_limit_scalar: Optional[float] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         layer_idx: Optional[int] = None,
-        activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
-    ):
+    ) -> None:
         from ...distributed import AllReduce
 
         super().__init__()
@@ -267,22 +264,19 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         self.bias = bias
         self.dtype = dtype
         self.reduce_results = reduce_results
-        self.swiglu_alpha = swiglu_alpha
-        self.swiglu_beta = swiglu_beta
-        self.swiglu_limit = swiglu_limit
-        # Uniform-across-experts scalar variant of swiglu_limit, consumed by
-        # FP8 paths (DeepGEMM Triton kernel, TRTLLMGen FP8 separate-activation
-        # kernel) that don't actually need a per-expert tensor. Distinct from
-        # `swiglu_limit` (kept for NVFP4 fused-activation cubins that *do*
-        # consume per-expert values via fc31_alpha rescaling).
-        self.swiglu_limit_scalar = swiglu_limit_scalar
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
-        self.activation_type = int(activation_type)
+        # Intent only: a layer that owns kernels turns this into the ``act_*``
+        # slots via ``install_activation_params`` against its own declaration.
+        # ``ConfigurableMoE`` forwards it to the backend instead.
+        self.activation = activation
+        # ``ActivationType``, not a bare int: as an ``IntEnum`` it still reads as an
+        # int for op schemas and tuning keys, and rejection messages get ``.name``.
+        self.activation_type = ActivationType(activation.kind)
         # Note:
         # - for gated activations, there should be with gate and up projections, so the intermediate size should be expanded by 2.
         # - for non-gated activations, there is only one up projection (no gate projection), so the intermediate size should not be expanded.
-        self.is_gated_activation = is_gated_activation(activation_type)
+        self.is_gated_activation = is_gated_activation(activation.kind)
         self.intermediate_size_expand_ratio = 2 if self.is_gated_activation else 1
 
         self._register_layer(model_config)
@@ -696,8 +690,13 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         if model_config is not None and self.layer_idx_str is not None:
             if "moe_layers" not in model_config.extra_attrs:
                 model_config.extra_attrs["moe_layers"] = {}
-            assert self.layer_idx_str not in model_config.extra_attrs["moe_layers"], \
-                f"Duplicate MoE layer for layer_idx={self.layer_idx_str}"
+            suffix = 0
+            # ``layer_idx`` is local to a model stack, while one-model
+            # speculative decoding shares this registry across target and
+            # draft modules. Preserve every module under a stable unique key.
+            while self.layer_idx_str in model_config.extra_attrs["moe_layers"]:
+                self.layer_idx_str = str(self.layer_idx) + f"_{suffix}"
+                suffix += 1
             model_config.extra_attrs["moe_layers"][
                 self.layer_idx_str] = weakref.ref(self)
             self.register_to_config = True
@@ -856,6 +855,18 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         from the communication strategy the layer owns, and ``ConfigurableMoE``
         overrides it from ``self.comm``.
         """
+        return False
+
+    def can_use_deep_ep_direct_metadata(
+            self, supports_post_quant_dispatch: bool) -> bool:
+        """Return whether this backend instance can consume DeepEP counts directly.
+
+        ``can_implement`` and ``capabilities`` remain pure construction-time
+        declarations. This query is instance-level because the complete fast
+        path also depends on the selected quantization method, finalize fusion,
+        and rollback controls.
+        """
+        del supports_post_quant_dispatch
         return False
 
     def reducescatter_or_allreduce(

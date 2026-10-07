@@ -14,7 +14,7 @@ from utils.util import skip_no_hopper
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
@@ -80,8 +80,7 @@ def test_gpt_oss_one_model_eagle3_keeps_v2():
     assert _resolve_gpt_oss_kv_cache_manager_v2(
         speculative_config=Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model="/tmp/dummy_eagle_model",
-            eagle3_one_model=True)) is True
+            speculative_model="/tmp/dummy_eagle_model")) is True
 
 
 def dump_config_json(dst_dir):

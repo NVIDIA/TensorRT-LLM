@@ -57,11 +57,11 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from claude_agent_sdk import tool
 from rich.syntax import Syntax
 
 from agent_flow.console import print_layer_panel
 from agent_flow.logger import get_logger
+from agent_flow.tools import tool
 
 ANALYSIS_STAGE = "analysis"
 _AGENTS = ("benchmarker", "projector", "analyzer", "reporter")
@@ -301,7 +301,7 @@ def build_progress_tools(ctx: ProgressContext) -> dict[str, list[Any]]:
                 "summary": {
                     "type": "string",
                     "description": "Short human-readable summary: which profilers you ran "
-                    "(nsys / torch / ncu), the trace files you produced, and the "
+                    "(nsys / ncu), the trace files you produced, and the "
                     "ranked bottleneck hypotheses with their key evidence.",
                 },
             },

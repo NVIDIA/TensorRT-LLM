@@ -20,6 +20,7 @@ from ...utils import (
     swizzle_sf,
     unswizzle_sf,
 )
+from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation, MoEActivationSupport
 from .impl_base import MoEImplBase, apply_moe_impl_construction_state
 from .impl_contract import (
     MoEDeployment,
@@ -28,9 +29,11 @@ from .impl_contract import (
     MoEProblem,
     MoERejectReason,
     MoERunContext,
+    MoEStaticCapability,
     require_comm_plan,
 )
-from .interface import MoEWeightLoadingMode, _reject
+from .impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
+from .interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
 from .quantization import NVFP4CuteDslFusedMoEMethod
 from .routing import BaseMoeRoutingMethod
 
@@ -101,10 +104,12 @@ def gen_fc2_alpha_fused(
 _FC2_MMA_TILE_K = 256
 
 
-class DenseGEMMFusedMoE(MoEImplBase):
-    """CuteDSL DenseGEMM flow of fused mixture of experts (MoE) Layer.
+@register_moe_impl
+class TrtllmCutedslDenseGemmNvfp4Impl(MoEImplBase):
+    """``trtllm.cutedsl.dense_gemm.nvfp4``.
 
-    This backend uses CuTe DSL dense GEMM kernels with fused SwiGLU for MoE
+    CuteDSL DenseGEMM flow of fused mixture of experts (MoE) Layer. This
+    backend uses CuTe DSL dense GEMM kernels with fused SwiGLU for MoE
     computation. It supports NVFP4 quantization only and is restricted to
     SM100/SM103 (Blackwell) architectures.
 
@@ -113,17 +118,44 @@ class DenseGEMMFusedMoE(MoEImplBase):
     which can be more efficient for small token counts (min-latency scenarios).
 
     Args:
+        routing_method (BaseMoeRoutingMethod): Token-to-expert assignment.
         num_experts (int): Number of experts in the MoE layer.
-        top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
-        dtype (Optional[torch.dtype]): Data type for the weights.
+        dtype (torch.dtype | None): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
+        aux_stream_dict (dict[AuxStreamType, torch.cuda.Stream] | None):
+            Auxiliary CUDA streams for overlapping.
+        weight_loading_mode (MoEWeightLoadingMode): How checkpoint weights map
+            onto this backend's parameters.
+        apply_router_weight_on_input (bool): Unsupported; a True raises. The
+            routing weight is folded into the FC2 dequant alpha, which scales
+            the output rather than pre-scaling the input.
+        layer_idx (int | None): Index of the layer this backend serves.
+        activation (MoEActivation): The layer's activation kind and its
+            constants. SwiGLU only, fused into the FC1 epilogue.
+        init_load_balancer (bool): Register with the EPLB load balancer at
+            construction.
     """
 
-    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+    descriptor = MoEImplDescriptor(
+        identity=MoEImplId("trtllm", "cutedsl", "dense_gemm", "nvfp4"),
+        scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+        # ``supports_eplb`` overrides a conservative default: this backend
+        # registers its weights with the load balancer.
+        capabilities=MoEStaticCapability(supports_eplb=True),
+        input_requirement=MoEInputRequirement(routing_scales_dtype=torch.float32),
+        doc="CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency.",
+    )
+
+    # Taken off the descriptor, not restated, so the two cannot drift apart.
+    scheduler_kind = descriptor.scheduler_kind
+    capabilities = descriptor.capabilities
+    input_requirement = descriptor.input_requirement
+
+    # The dense-GEMM epilogue fuses plain SwiGLU and takes no constants.
+    activation_support = MoEActivationSupport(kinds=frozenset({ActivationType.Swiglu}))
 
     # Memory buffer pool for CUDA graph compatibility
     buffers = get_memory_buffers()
@@ -194,8 +226,8 @@ class DenseGEMMFusedMoE(MoEImplBase):
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
         init_load_balancer: bool = False,
-        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         # Eligibility (SM / quant / SwiGLU / EP / intermediate alignment) is
         # owned by ``can_implement``; do not re-assert it here.
@@ -225,8 +257,8 @@ class DenseGEMMFusedMoE(MoEImplBase):
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             layer_idx=layer_idx,
+            activation=activation,
             init_load_balancer=init_load_balancer,
-            activation_type=activation_type,
         )
 
         # Environment variable to control fc2_alpha fusion into FC1's alpha_post.
@@ -531,3 +563,7 @@ class DenseGEMMFusedMoE(MoEImplBase):
             x_sf=x_sf,
             enable_alltoall=enable_alltoall,
         )
+
+
+# An alias, not a base class, so there is no second class to keep in step.
+DenseGEMMFusedMoE = TrtllmCutedslDenseGemmNvfp4Impl

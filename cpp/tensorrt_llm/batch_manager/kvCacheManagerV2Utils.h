@@ -56,7 +56,9 @@ using PackedInt = union
 class IndexMapper
 {
 public:
-    IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth);
+    //! maxBeamWidth is the source page-table stride. maxCopyBeamWidth can be
+    //! larger for request-scoped caches whose beam-0 row is broadcast to beams.
+    IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxCopyBeamWidth = 0);
 
     ~IndexMapper();
 
@@ -69,8 +71,10 @@ public:
 
     void removeSequence(LlmRequest::RequestIdType requestId);
 
-    at::Tensor getCopyIndex(
-        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth);
+    //! Map scheduled sequence rows to source page-table rows. When
+    //! replicateBeamZero is true, every generation beam maps to beam 0.
+    at::Tensor getCopyIndex(std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext,
+        SizeType32 beamWidth, bool replicateBeamZero = false);
 
     //! Gathers each request's beam-0 K block offsets into a host snapshot.
     void gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
@@ -92,6 +96,7 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, SizeType32> indexMap_;
     std::set<SizeType32> freeIndices_;
     SizeType32 maxBeamWidth_;
+    SizeType32 maxCopyBeamWidth_;
     at::Tensor copyIndex_;
 };
 
@@ -99,12 +104,9 @@ CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize
 CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToHost(std::vector<Task<MemAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyHostToDevice(
-    std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyDeviceToHost(
-    std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyDeviceToDevice(
-    std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
+CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
+CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
 
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;

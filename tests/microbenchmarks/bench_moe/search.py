@@ -24,18 +24,25 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
+
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,
     canonical_activation,
     canonical_quant,
+    normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from .backend import MoeBackendType, get_backend_class
+from .backend import MoeBackendType, find_backend_classes
 from .mapping import (
     _resolve_mapping_layout,
     default_hybrid_parallel_modes,
@@ -44,6 +51,10 @@ from .mapping import (
 from .specs import _ALL_BACKENDS, _FORCED_COMM_ENV_VALUES, ConfigSpec, ModelSpec, SearchSpec
 
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"})
+
+# Comm methods whose workspace is MNNVL symmetric memory (MnnvlMemory), and which
+# therefore inherit its cross-node handle-exchange constraint.
+_MNNVL_COMM_METHODS = ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED")
 
 
 def _is_deepep_feasible(num_ranks: int) -> bool:
@@ -64,6 +75,29 @@ def _is_deepep_feasible(num_ranks: int) -> bool:
     return (num_ranks // mpi_size) in _INTERNODE_RDMA_NODES
 
 
+def _is_mnnvl_comm_feasible(num_ranks: int) -> bool:
+    """Return True if MNNVL-backed comm can cover this many ranks on this system.
+
+    Within a single node the symmetric-memory allocation handles are exchanged
+    over pidfd_getfd, which always works. Spanning nodes additionally requires
+    fabric handles: a POSIX file descriptor is a node-local kernel object, so
+    importing one from a peer PID on another node fails with ESRCH and the whole
+    candidate dies in MnnvlMemory with a build error rather than a skip.
+
+    The handle type is read off the same allocation prop that
+    ``MnnvlMemory.open_mnnvl_memory`` branches on, instead of re-deriving it from
+    the CPU architecture here, so this gate opens by itself if fabric handles
+    ever become available on x86 (see the TODO in ``get_allocation_prop``).
+    """
+    if num_ranks <= local_mpi_size():
+        return True
+    allocation_prop = MnnvlMemory.get_allocation_prop(torch.cuda.current_device())
+    return (
+        allocation_prop.requestedHandleTypes
+        == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+    )
+
+
 def _check_backend_can_implement(
     backend_str: str,
     quant_algo: Optional[QuantAlgo],
@@ -78,9 +112,22 @@ def _check_backend_can_implement(
     own explicit checks in :func:`is_candidate_valid` with better messages.
     """
     try:
-        backend_cls = get_backend_class(MoeBackendType(backend_str.upper()))
-    except (ImportError, KeyError, RuntimeError, ValueError) as exc:
+        backend_type = MoeBackendType(backend_str.upper())
+    except ValueError as exc:
         return False, f"unknown MoE backend {backend_str!r}: {exc}"
+    # ``find_backend_classes``, not ``get_backend_class``: "TRTLLM publishes no
+    # leaf for this format" is a pruning answer, not an unknown backend name.
+    env = collect_moe_environment()
+    # The broad ``except`` stays because the lookup lazy-imports backend
+    # modules, so a missing optional wheel should cost the candidates that
+    # need it rather than kill the sweep before it benchmarks anything.
+    try:
+        candidates = find_backend_classes(backend_type, quant_algo)
+    except (ImportError, KeyError, RuntimeError, ValueError) as exc:
+        return False, f"{backend_str} lookup failed: {type(exc).__name__}: {exc}"
+    if not candidates:
+        quant = normalize_quant(canonical_quant(quant_algo))
+        return False, f"no {backend_str} implementation for quant={quant}"
     problem = MoEProblem(
         quant=canonical_quant(quant_algo),
         dtype_act=dtype_activation,
@@ -95,15 +142,23 @@ def _check_backend_can_implement(
         parallel_size=1,
         use_dp=False,
         num_slots=0,
-        env=collect_moe_environment(),
+        env=env,
     )
-    try:
-        verdict = backend_cls.can_implement(problem, deployment)
-    except Exception as exc:
-        return False, (f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}")
-    if verdict.eligible:
-        return True, None
-    return False, f"{verdict.reject_reason.value}: {verdict.detail}"
+    reason = None
+    for backend_cls in candidates:
+        try:
+            verdict = backend_cls.can_implement(problem, deployment)
+        except Exception as exc:
+            return False, (
+                f"{backend_cls.__name__}.can_implement raised {type(exc).__name__}: {exc}"
+            )
+        if verdict.eligible:
+            return True, None
+        # The last candidate's reason, not the first: without the opt-in flag
+        # every FlashInfer leaf rejects for the flag alone, which says nothing
+        # about why the configuration is unrunnable.
+        reason = f"{verdict.reject_reason.value}: {verdict.detail}"
+    return False, reason
 
 
 def _expand_axis(values: Iterable[Any], default: Any) -> Tuple[Any, ...]:
@@ -304,6 +359,13 @@ def is_candidate_valid(
             return False, f"comm_method={forced} requires moe_tp_size=1 (got {moe_tp})"
         if world_size == 1:
             return False, f"comm_method={forced} has no effect at world_size=1"
+        if forced in _MNNVL_COMM_METHODS and not _is_mnnvl_comm_feasible(moe_ep):
+            return False, (
+                f"comm_method={forced}: MNNVL symmetric memory cannot span nodes here "
+                f"(moe_ep_size={moe_ep} > local_mpi_size={local_mpi_size()}, and this "
+                f"platform exchanges allocation handles as POSIX fds, not fabric "
+                f"handles); use an NVL-domain cluster or a non-MNNVL comm method"
+            )
         if forced == "DEEPEP" and not _is_deepep_feasible(moe_ep):
             return False, (
                 f"comm_method={forced}: moe_ep_size={moe_ep} not supported by DeepEP topology "

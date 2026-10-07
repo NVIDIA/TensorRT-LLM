@@ -11,10 +11,11 @@ from torch import nn
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.models.modeling_kimi_linear import (
-    _convert_kda_projections_to_fp8_weight_read,
-)
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import QuantAlgo
 
 
 class _Cfg:
@@ -29,19 +30,6 @@ class _Cfg:
     }
 
 
-class _Layer(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.is_kda = True
-        self.linear_attn = attention
-
-
-class _Model(nn.Module):
-    def __init__(self, attention: KimiKDALinearAttention) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList([_Layer(attention)])
-
-
 def _has_supported_gpu() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
 
@@ -53,9 +41,24 @@ pytestmark = pytest.mark.skipif(
 
 
 def _make_attention() -> KimiKDALinearAttention:
-    attention = KimiKDALinearAttention(_Cfg(), layer_idx=0).to("cuda")
-    assert _convert_kda_projections_to_fp8_weight_read(_Model(attention)) == 5
-    attention.finalize_decode_weights_fp8()
+    config = ModelConfig(quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES))
+    attention = KimiKDALinearAttention(
+        _Cfg(),
+        layer_idx=0,
+        model_config=config,
+    ).to("cuda")
+    for module in attention.children():
+        if isinstance(module, Linear):
+            # Checkpoint-native codes and scales, independent of any BF16 quantizer.
+            codes = torch.randint(-64, 65, module.weight.shape, device="cuda").to(
+                torch.float8_e4m3fn
+            )
+            scales = torch.full(module.weight_scale.shape, 0.001, device="cuda")
+            module.load_weights([{"weight": codes, "weight_scale": scales}])
+    attention.finalize_decode_weights()
+    for module in attention.modules():
+        if isinstance(module, Linear):
+            module.post_load_weights()
     return attention
 
 
@@ -141,14 +144,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         attention.qkvg_proj = None
         ref_conv = conv_seed.clone()
         ref_state = state_seed.clone()
-        expected = attention.forward_prefill(
-            hidden,
-            cu_seqlens,
-            metadata,
-            num_prefills,
-            ref_conv,
-            ref_state,
-            slot_indices,
+        expected = attention._project_output(
+            attention.forward_prefill(
+                hidden,
+                cu_seqlens,
+                metadata,
+                num_prefills,
+                ref_conv,
+                ref_state,
+                slot_indices,
+            )
         )
         assert calls == {"qkvg": 0, "q": 1, "k": 1, "v": 1}
 
@@ -156,14 +161,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
         attention.qkvg_proj = fused_qkvg
         actual_conv = conv_seed.clone()
         actual_state = state_seed.clone()
-        actual = attention.forward_prefill(
-            hidden,
-            cu_seqlens,
-            metadata,
-            num_prefills,
-            actual_conv,
-            actual_state,
-            slot_indices,
+        actual = attention._project_output(
+            attention.forward_prefill(
+                hidden,
+                cu_seqlens,
+                metadata,
+                num_prefills,
+                actual_conv,
+                actual_state,
+                slot_indices,
+            )
         )
         assert calls == {"qkvg": 1, "q": 0, "k": 0, "v": 0}
     finally:
@@ -193,14 +200,16 @@ def test_fp8_packed_qkv_prefill_matches_separate_path_and_updates_state(
 
     repeat_conv = conv_seed.clone()
     repeat_state = state_seed.clone()
-    repeated = attention.forward_prefill(
-        hidden,
-        cu_seqlens,
-        metadata,
-        num_prefills,
-        repeat_conv,
-        repeat_state,
-        slot_indices,
+    repeated = attention._project_output(
+        attention.forward_prefill(
+            hidden,
+            cu_seqlens,
+            metadata,
+            num_prefills,
+            repeat_conv,
+            repeat_state,
+            slot_indices,
+        )
     )
     torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
     torch.testing.assert_close(repeat_conv, actual_conv, rtol=0, atol=0)

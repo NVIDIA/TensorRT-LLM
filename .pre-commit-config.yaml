@@ -9,7 +9,6 @@ common-files: &common_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -28,7 +27,6 @@ common-files: &common_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -103,17 +101,16 @@ common-files: &common_files |
         setup.py |
         tensorrt_llm/__init__.py |
         tensorrt_llm/_torch/__init__.py |
-        tensorrt_llm/_torch/attention_backend/__init__.py |
-        tensorrt_llm/_torch/attention_backend/flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/interface.py |
-        tensorrt_llm/_torch/attention_backend/sparse/__init__.py |
-        tensorrt_llm/_torch/attention_backend/sparse/dsa.py |
-        tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
-        tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
-        tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/trtllm.py |
-        tensorrt_llm/_torch/attention_backend/utils.py |
-        tensorrt_llm/_torch/attention_backend/vanilla.py |
+        tensorrt_llm/_torch/attention/attention.py |
+        tensorrt_llm/_torch/attention/backends/__init__.py |
+        tensorrt_llm/_torch/attention/backends/flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/interface.py |
+        tensorrt_llm/_torch/attention/backends/sparse/__init__.py |
+        tensorrt_llm/_torch/attention/backends/trtllm.py |
+        tensorrt_llm/_torch/attention/backends/utils.py |
+        tensorrt_llm/_torch/attention/backends/vanilla.py |
+        tensorrt_llm/_torch/attention/qk_norm_attention.py |
+        tensorrt_llm/_torch/attention/rotary_embedding.py |
         tensorrt_llm/_torch/autotuner.py |
         tensorrt_llm/_torch/compilation/__init__.py |
         tensorrt_llm/_torch/compilation/backend.py |
@@ -166,6 +163,7 @@ common-files: &common_files |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
         tensorrt_llm/_torch/device_mesh.py |
+        tensorrt_llm/_torch/disaggregation/kv_cache_transceiver.py |
         tensorrt_llm/_torch/distributed/__init__.py |
         tensorrt_llm/_torch/distributed/communicator.py |
         tensorrt_llm/_torch/distributed/ops.py |
@@ -233,7 +231,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/models/modeling_utils.py |
         tensorrt_llm/_torch/models/modeling_vila.py |
         tensorrt_llm/_torch/modules/__init__.py |
-        tensorrt_llm/_torch/modules/attention.py |
         tensorrt_llm/_torch/modules/decoder_layer.py |
         tensorrt_llm/_torch/modules/embedding.py |
         tensorrt_llm/_torch/modules/fla/__init__.py |
@@ -269,9 +266,7 @@ common-files: &common_files |
         tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py |
         tensorrt_llm/_torch/modules/mlp.py |
         tensorrt_llm/_torch/modules/multi_stream_utils.py |
-        tensorrt_llm/_torch/modules/qk_norm_attention.py |
         tensorrt_llm/_torch/modules/rms_norm.py |
-        tensorrt_llm/_torch/modules/rotary_embedding.py |
         tensorrt_llm/_torch/modules/swiglu.py |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/moe/expert_statistic.py |
@@ -303,10 +298,9 @@ common-files: &common_files |
         tensorrt_llm/_torch/pyexecutor/guided_decoder.py |
         tensorrt_llm/_torch/pyexecutor/handle_additional_outputs.py |
         tensorrt_llm/_torch/pyexecutor/handle_logits.py |
-        tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py |
+        tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
-        tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |
@@ -320,7 +314,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/speculative/drafter.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
-        tensorrt_llm/_torch/speculative/model_drafter.py |
         tensorrt_llm/_torch/speculative/mtp.py |
         tensorrt_llm/_torch/speculative/ngram.py |
         tensorrt_llm/_torch/speculative/save_hidden_state.py |
@@ -484,7 +477,6 @@ common-files: &common_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -502,7 +494,6 @@ common-files: &common_files |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
         tests/integration/defs/examples/serve/test_serve.py |
         tests/integration/defs/examples/serve/test_serve_negative.py |
-        tests/integration/defs/examples/test_ad_guided_decoding.py |
         tests/integration/defs/examples/test_gpt.py |
         tests/integration/defs/examples/test_llm_api_with_mpi.py |
         tests/integration/defs/examples/test_phi.py |
@@ -555,6 +546,7 @@ common-files: &common_files |
         tests/unittest/_torch/attention/test_attention_mla.py |
         tests/unittest/_torch/attention/test_attention_no_cache.py |
         tests/unittest/_torch/attention/test_flashinfer_attention.py |
+        tests/unittest/_torch/attention/test_rotary_embedding.py |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
@@ -587,7 +579,6 @@ common-files: &common_files |
         tests/unittest/_torch/modeling/test_modeling_siglip.py |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
-        tests/unittest/_torch/modules/test_rotary_embedding.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
         tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
         tests/unittest/_torch/moe/test_fused_moe.py |
@@ -652,6 +643,7 @@ common-files: &common_files |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
         tests/unittest/bindings/test_hostfunc.py |
+        tests/unittest/check_pip_install.py |
         tests/unittest/conftest.py |
         tests/unittest/disaggregated/test_cluster_storage.py |
         tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py |
@@ -690,7 +682,6 @@ common-files: &common_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -735,7 +726,6 @@ common-files: &common_files |
         tests/unittest/scaffolding/test_scaffolding.py |
         tests/unittest/scaffolding/test_task_collection.py |
         tests/unittest/scaffolding/test_worker.py |
-        tests/unittest/test_pip_install.py |
         tests/unittest/tools/__init__.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
@@ -772,7 +762,6 @@ legacy-files: &legacy_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -791,7 +780,6 @@ legacy-files: &legacy_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -866,17 +854,16 @@ legacy-files: &legacy_files |
         setup.py |
         tensorrt_llm/__init__.py |
         tensorrt_llm/_torch/__init__.py |
-        tensorrt_llm/_torch/attention_backend/__init__.py |
-        tensorrt_llm/_torch/attention_backend/flashinfer.py |
-        tensorrt_llm/_torch/attention_backend/interface.py |
-        tensorrt_llm/_torch/attention_backend/sparse/__init__.py |
-        tensorrt_llm/_torch/attention_backend/sparse/dsa.py |
-        tensorrt_llm/_torch/attention_backend/sparse/kernel.py |
-        tensorrt_llm/_torch/attention_backend/sparse/rocket.py |
-        tensorrt_llm/_torch/attention_backend/sparse/utils.py |
-        tensorrt_llm/_torch/attention_backend/trtllm.py |
-        tensorrt_llm/_torch/attention_backend/utils.py |
-        tensorrt_llm/_torch/attention_backend/vanilla.py |
+        tensorrt_llm/_torch/attention/attention.py |
+        tensorrt_llm/_torch/attention/backends/__init__.py |
+        tensorrt_llm/_torch/attention/backends/flashinfer.py |
+        tensorrt_llm/_torch/attention/backends/interface.py |
+        tensorrt_llm/_torch/attention/backends/sparse/__init__.py |
+        tensorrt_llm/_torch/attention/backends/trtllm.py |
+        tensorrt_llm/_torch/attention/backends/utils.py |
+        tensorrt_llm/_torch/attention/backends/vanilla.py |
+        tensorrt_llm/_torch/attention/qk_norm_attention.py |
+        tensorrt_llm/_torch/attention/rotary_embedding.py |
         tensorrt_llm/_torch/autotuner.py |
         tensorrt_llm/_torch/compilation/__init__.py |
         tensorrt_llm/_torch/compilation/backend.py |
@@ -929,6 +916,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/debug/__init__.py |
         tensorrt_llm/_torch/debug/debug_hook.py |
         tensorrt_llm/_torch/device_mesh.py |
+        tensorrt_llm/_torch/disaggregation/kv_cache_transceiver.py |
         tensorrt_llm/_torch/distributed/__init__.py |
         tensorrt_llm/_torch/distributed/communicator.py |
         tensorrt_llm/_torch/distributed/ops.py |
@@ -996,7 +984,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/models/modeling_utils.py |
         tensorrt_llm/_torch/models/modeling_vila.py |
         tensorrt_llm/_torch/modules/__init__.py |
-        tensorrt_llm/_torch/modules/attention.py |
         tensorrt_llm/_torch/modules/decoder_layer.py |
         tensorrt_llm/_torch/modules/embedding.py |
         tensorrt_llm/_torch/modules/fla/__init__.py |
@@ -1032,9 +1019,7 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py |
         tensorrt_llm/_torch/modules/mlp.py |
         tensorrt_llm/_torch/modules/multi_stream_utils.py |
-        tensorrt_llm/_torch/modules/qk_norm_attention.py |
         tensorrt_llm/_torch/modules/rms_norm.py |
-        tensorrt_llm/_torch/modules/rotary_embedding.py |
         tensorrt_llm/_torch/modules/swiglu.py |
         tensorrt_llm/_torch/modules/triton_linear.py |
         tensorrt_llm/_torch/moe/expert_statistic.py |
@@ -1066,10 +1051,9 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/pyexecutor/guided_decoder.py |
         tensorrt_llm/_torch/pyexecutor/handle_additional_outputs.py |
         tensorrt_llm/_torch/pyexecutor/handle_logits.py |
-        tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py |
+        tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
-        tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |
@@ -1083,7 +1067,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/speculative/drafter.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
-        tensorrt_llm/_torch/speculative/model_drafter.py |
         tensorrt_llm/_torch/speculative/mtp.py |
         tensorrt_llm/_torch/speculative/ngram.py |
         tensorrt_llm/_torch/speculative/save_hidden_state.py |
@@ -1247,7 +1230,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/accuracy/scripts/compute_theta_and_thresholds.py |
         tests/integration/defs/accuracy/test_cli_flow.py |
         tests/integration/defs/accuracy/test_disaggregated_serving.py |
-        tests/integration/defs/accuracy/test_llm_api_autodeploy.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch.py |
         tests/integration/defs/accuracy/test_llm_api_pytorch_ray.py |
         tests/integration/defs/ci_profiler.py |
@@ -1265,7 +1247,6 @@ legacy-files: &legacy_files |
         tests/integration/defs/examples/run_llm_quickstart_atexit.py |
         tests/integration/defs/examples/serve/test_serve.py |
         tests/integration/defs/examples/serve/test_serve_negative.py |
-        tests/integration/defs/examples/test_ad_guided_decoding.py |
         tests/integration/defs/examples/test_gpt.py |
         tests/integration/defs/examples/test_llm_api_with_mpi.py |
         tests/integration/defs/examples/test_phi.py |
@@ -1318,6 +1299,7 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/attention/test_attention_mla.py |
         tests/unittest/_torch/attention/test_attention_no_cache.py |
         tests/unittest/_torch/attention/test_flashinfer_attention.py |
+        tests/unittest/_torch/attention/test_rotary_embedding.py |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
@@ -1350,7 +1332,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/modeling/test_modeling_siglip.py |
         tests/unittest/_torch/modeling/test_modeling_vila.py |
         tests/unittest/_torch/modules/test_group_rmn_norm.py |
-        tests/unittest/_torch/modules/test_rotary_embedding.py |
         tests/unittest/_torch/modules/test_triton_linear.py |
         tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py |
         tests/unittest/_torch/moe/test_fused_moe.py |
@@ -1415,6 +1396,7 @@ legacy-files: &legacy_files |
         tests/unittest/bindings/test_bindings_ut.py |
         tests/unittest/bindings/test_executor_bindings.py |
         tests/unittest/bindings/test_hostfunc.py |
+        tests/unittest/check_pip_install.py |
         tests/unittest/conftest.py |
         tests/unittest/disaggregated/test_cluster_storage.py |
         tests/unittest/disaggregated/test_disagg_cluster_manager_worker.py |
@@ -1453,7 +1435,6 @@ legacy-files: &legacy_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -1498,7 +1479,6 @@ legacy-files: &legacy_files |
         tests/unittest/scaffolding/test_scaffolding.py |
         tests/unittest/scaffolding/test_task_collection.py |
         tests/unittest/scaffolding/test_worker.py |
-        tests/unittest/test_pip_install.py |
         tests/unittest/tools/__init__.py |
         tests/unittest/tools/test_prepare_dataset.py |
         tests/unittest/tools/test_test_to_stage_mapping.py |
@@ -1535,7 +1515,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1567,18 +1547,6 @@ repos:
     -   id: trailing-whitespace
         exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
-    -   id: mixed-line-ending
-        args: [--fix=lf]
-        files: ".*/auto_deploy/.*"
-    -   id: debug-statements
-        files: ".*/auto_deploy/.*"
-    -   id: check-json
-        files: ".*/auto_deploy/.*"
-        exclude: >
-          (?x)^(
-            .*\.vscode/.*\.json | # vscode files can take comments
-            .*\.devcontainer/.*\.json # devcontainer json files can take comments
-          )$
     -   id: file-contents-sorter
         files: ^tests/integration/test_lists/waives\.txt$
 -   repo: https://github.com/PyCQA/autoflake
@@ -1615,23 +1583,8 @@ repos:
         exclude: *legacy_files
     -   id: ruff-format
         exclude: *legacy_files
--   repo: https://github.com/executablebooks/mdformat
-    rev: 0.7.17
-    hooks:
-    -   id: mdformat
-        additional_dependencies:
-        - mdformat_frontmatter
-        files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
-    -   id: model-registry-check
-        name: Validate AutoDeploy model registry
-        entry: python scripts/check_model_registry.py
-        language: python
-        additional_dependencies:
-        - PyYAML
-        files: ^examples/auto_deploy/model_registry/models\.yaml$
-        pass_filenames: false
     -   id: ruff-legacy
         name: ruff-legacy (baseline-gated lint for legacy files)
         entry: python scripts/legacy_utils.py lint-precommit
@@ -1646,6 +1599,25 @@ repos:
         additional_dependencies: [jinja2]
         always_run: true
         pass_filenames: false
+    -   id: vendor-sources-check
+        name: verify vendored sources are in sync
+        entry: python scripts/vendor_sources.py check
+        language: python
+        additional_dependencies: [PyYAML]
+        always_run: true
+        pass_filenames: false
+    -   id: openengine-bindings-check
+        name: verify generated OpenEngine bindings are in sync
+        entry: python scripts/generate_openengine_protos.py --check
+        language: python
+        # Keep these pins in sync with requirements-build-openengine.txt.
+        additional_dependencies:
+        - grpcio==1.67.1
+        - grpcio-tools==1.67.1
+        - protobuf==5.27.2
+        - setuptools==84.0.0
+        pass_filenames: false
+        files: ^(requirements\.txt|requirements-build-openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
@@ -1671,11 +1643,6 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
-    -   id: auto-deploy-import-discipline
-        name: Enforce relative imports inside auto_deploy
-        entry: python scripts/check_auto_deploy_imports.py
-        language: python
-        files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

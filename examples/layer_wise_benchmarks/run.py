@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import itertools
 import json
@@ -41,6 +44,9 @@ parser.add_argument("--scaled-from", type=int)
 parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
+parser.add_argument(
+    "--use-kv-cache-manager-v2", action=argparse.BooleanOptionalAction, default="auto"
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
 group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
@@ -212,6 +218,7 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
     spec_config=spec_config,
     vision_config=args.vision_config,
+    use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
@@ -255,9 +262,59 @@ if args.replay_file_path:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
         replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
+        # An inverted window is empty, so the membership check below reports nothing
+        # missing and lets it through -- and the replay index at the bottom of this
+        # file then divides by (stop - start + 1), which is zero or negative.
+        if replay_start_iter > replay_stop_iter:
+            parser.error(
+                f"--replay-start-iter {replay_start_iter} is past --replay-stop-iter "
+                f"{replay_stop_iter}; the window is inclusive on both ends."
+            )
+        # Check the window before pre_step() indexes into it: a missing iteration
+        # otherwise surfaces as a KeyError thousands of lines into an interleaved
+        # multi-rank log. Membership, not bounds -- a calibration with a hole
+        # satisfies a first/last comparison and still dies at that KeyError.
+        missing_count, missing = calibrator.get_missing_replay_iterations(
+            replay_start_iter, replay_stop_iter
+        )
+        if missing_count:
+            shown = ", ".join(str(i) for i in missing)
+            if missing_count > len(missing):
+                shown += f", ... ({missing_count:d} in total)"
+            parser.error(
+                f"--replay-start-iter/--replay-stop-iter ask for iterations "
+                f"[{replay_start_iter}, {replay_stop_iter}], but "
+                f"{args.replay_file_path} does not hold {shown}. Pick a window it "
+                f"does hold, or drop both flags to take the recorded range, which "
+                f"has to be contiguous."
+            )
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
+    # The replay has to put the same number of tokens through MoE that the calibration
+    # recorded, or it profiles different routing and still reports a number. Scoped to
+    # the window being replayed: iterations outside it may hold another shape, and
+    # those are none of this run's business.
+    try:
+        recorded_tokens = calibrator.get_replay_token_count(replay_start_iter, replay_stop_iter)
+    except ValueError as e:
+        # Report it the way the rest of this block does rather than as a traceback:
+        # the message names the shapes and the iterations that carry them, which is
+        # what the caller has to act on.
+        parser.error(f"{args.replay_file_path}: {e}")
+    mismatched = [
+        (b, s)
+        for b in args.batch_size_list
+        for s in args.seq_len_q_list
+        if b * s != recorded_tokens
+    ]
+    if mismatched:
+        parser.error(
+            f"{args.replay_file_path} recorded {recorded_tokens} tokens per "
+            f"iteration, but --batch-size/--seq-len-q ask for "
+            f"{', '.join(f'{b}x{s}={b * s}' for b, s in mismatched)}. "
+            f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len seq_len_q-1."
+        )
 else:
     calibrator.init("NONE", None, None)
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics

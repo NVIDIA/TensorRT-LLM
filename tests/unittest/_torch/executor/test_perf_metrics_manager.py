@@ -52,7 +52,7 @@ def _make_emitting_request(request_id):
     request.py_request_id = request_id
     request.is_attention_dp_dummy = False
     request.py_kv_transfer_timed_out = False
-    request.is_generation_only_request.return_value = False
+    request.is_generation_only_request = False
     request.py_draft_tokens = []
     request.py_decoding_iter = 1
     request.return_perf_metrics = True

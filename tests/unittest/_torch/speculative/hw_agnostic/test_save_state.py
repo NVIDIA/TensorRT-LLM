@@ -1,5 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-import sys
 import tempfile
 import unittest
 
@@ -10,7 +24,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SaveHiddenStatesDecodingConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+QWEN3_5_HIDDEN_SIZE = 2560
 
 
 def test_multi_save_state():
@@ -22,12 +36,12 @@ def test_multi_save_state():
     layers_to_capture = {10, 11, 12}
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 80:
-        pytest.skip("Not enough memory to load target + draft model")
+    if total_mem_gb < 20:
+        pytest.skip("Not enough memory to load target model")
 
     models_path = llm_models_root()
     with tempfile.TemporaryDirectory() as temp_dir:
-        target_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B-Instruct"
+        target_model_dir = f"{models_path}/Qwen3.5-4B"
 
         max_batch_size = 16
         kv_cache_config = KvCacheConfig(
@@ -65,9 +79,9 @@ def test_multi_save_state():
 
         assert saved_data["aux_hidden_states"].shape == (
             len(tok_ids),
-            2048 * len(layers_to_capture),
+            QWEN3_5_HIDDEN_SIZE * len(layers_to_capture),
         )
-        assert saved_data["hidden_state"].shape == (len(tok_ids), 2048)
+        assert saved_data["hidden_state"].shape == (len(tok_ids), QWEN3_5_HIDDEN_SIZE)
         assert saved_data["input_ids"].tolist() == tok_ids
 
 
@@ -80,12 +94,12 @@ def test_save_state(layers_to_capture):
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 80:
-        pytest.skip("Not enough memory to load target + draft model")
+    if total_mem_gb < 20:
+        pytest.skip("Not enough memory to load target model")
 
     models_path = llm_models_root()
     with tempfile.TemporaryDirectory() as temp_dir:
-        target_model_dir = f"{models_path}/llama-3.2-models/Llama-3.2-1B-Instruct"
+        target_model_dir = f"{models_path}/Qwen3.5-4B"
 
         max_batch_size = 16
         kv_cache_config = KvCacheConfig(
@@ -121,12 +135,21 @@ def test_save_state(layers_to_capture):
         # Read in .pt file
         saved_data = torch.load(os.path.join(temp_dir, "data_1.pt"))[0]
         if layers_to_capture is None:
-            assert saved_data["aux_hidden_states"].shape == (len(tok_ids), 2048 * 3)
-            assert saved_data["hidden_state"].shape == (len(tok_ids), 2048)
+            assert saved_data["aux_hidden_states"].shape == (
+                len(tok_ids),
+                QWEN3_5_HIDDEN_SIZE * 3,
+            )
+            assert saved_data["hidden_state"].shape == (
+                len(tok_ids),
+                QWEN3_5_HIDDEN_SIZE,
+            )
             assert saved_data["input_ids"].tolist() == tok_ids
         else:
             assert "aux_hidden_states" not in saved_data
-            assert saved_data["hidden_state"].shape == (len(tok_ids), 2048)
+            assert saved_data["hidden_state"].shape == (
+                len(tok_ids),
+                QWEN3_5_HIDDEN_SIZE,
+            )
             assert saved_data["input_ids"].tolist() == tok_ids
 
 

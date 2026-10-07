@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Utility functions for request processing."""
 
 import os
@@ -84,7 +87,7 @@ def derive_attention_dp_per_rank_request_cap(
     attention DP, where no component otherwise enforces a per-rank token cap
     (nvbug-6133201). Each gen request occupies ``1 + max_total_draft_tokens``
     token slots per step. Mirrors the CUDA graph batch-size cap at
-    ``model_engine._filter_cuda_graph_batch_sizes``.
+    ``engine.cuda_graph.filter_cuda_graph_batch_sizes``.
 
     Args:
         base_cap: Per-rank request cap from ``get_max_num_sequences()``.
@@ -408,11 +411,11 @@ class RequestBroadcaster:
             return request_count
 
         if not self.dist.has_pp:
-            return self.dist.broadcast(request_count, root=0)
+            return int(self.dist.broadcast_int64([request_count], root=0)[0])
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):
-                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+                request_count = int(self.dist.tp_cp_broadcast_int64([request_count], root=0)[0])
 
         tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
 

@@ -17,15 +17,19 @@ from dataclasses import replace
 from typing import Optional, Tuple, Union
 
 import torch
+from packaging.version import Version
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...utils import ActivationType, Fp4QuantizedTensor
+from .activation import MoEActivationSupport
 from .fused_moe_cutlass import CutlassFusedMoE
 from .impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEInputRequirement,
     MoEProblem,
     MoERejectReason,
     MoERunContext,
@@ -52,38 +56,146 @@ _ACTIVATION_MAP = {
     ActivationType.Swiglu: "silu",
 }
 
+# FlashInfer's SM12x W4A16 fused MoE (0.6.17 and 0.6.18) selects a TC-decode
+# "ultra-wide" FC2 tile of tile_n=512 / tile_k=32 for small m whenever that
+# collapses FC2 to FC1's wave count (m=3 and m=4 for Qwen3.6-35B-A3B on the
+# 188-SM RTX PRO 6000). tile_k=32 sits below the tile_k>=64 floor of its
+# generic ``_candidate_tile_fits`` check, which the auto-selection skips but
+# the ``force_tile_config`` re-pin across the custom-op boundary does not, so
+# the kernel it just selected is rejected with "force_tile_config fc2 tile
+# (tile_k=32, tile_n=512) does not fit ..." and CUDA-graph warmup aborts
+# executor init (nvbug 6721561). Accepting the ultra tile in the re-validation
+# under the same rule that produced it is the upstream fix; this shim mirrors
+# it so the pinned wheel behaves like the fixed one. Drop it once the
+# flashinfer pin carries ``_ultra_wide_fc2_tile_fits``.
+_FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE = (512, 32, 256)  # (tile_n, tile_k, cta_threads)
+_FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE = Version("0.6.17")
+
+
+def _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() -> bool:
+    """Make flashinfer's W4A16 ``force_tile_config`` re-validation accept the
+    ultra-wide FC2 tile its own auto-selection produces.
+
+    Idempotent. Returns True when the shim is active, False when flashinfer is
+    absent, predates the ultra-wide override, or already ships the fix.
+    """
+    try:
+        import flashinfer
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_w4a16_kernel as kernel
+    except ImportError:
+        return False
+    if Version(flashinfer.__version__) < _FLASHINFER_W4A16_ULTRA_WIDE_FC2_SINCE:
+        return False
+    if hasattr(kernel, "_ultra_wide_fc2_tile_fits"):
+        return False
+    upstream_fits = getattr(kernel, "_candidate_tile_fits", None)
+    smem_footprint = getattr(kernel, "_shared_memory_footprint", None)
+    scale_group_size = getattr(kernel, "_scale_group_size", None)
+    if upstream_fits is None or smem_footprint is None or scale_group_size is None:
+        return False
+    if getattr(upstream_fits, "_trtllm_ultra_wide_fc2_shim", False):
+        return True
+
+    def candidate_tile_fits(
+        *,
+        problem_n: int,
+        problem_k: int,
+        cta_m_blocks: int,
+        tile_n: int,
+        tile_k: int,
+        cta_threads: int,
+        max_shared_mem: int,
+        scale_format: str = "e4m3_k16",
+        weight_layout: str = "packed",
+        allow_logical_tail: bool = False,
+    ) -> bool:
+        if (int(tile_n), int(tile_k), int(cta_threads)) != _FLASHINFER_W4A16_ULTRA_WIDE_FC2_TILE:
+            return upstream_fits(
+                problem_n=problem_n,
+                problem_k=problem_k,
+                cta_m_blocks=cta_m_blocks,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                cta_threads=cta_threads,
+                max_shared_mem=max_shared_mem,
+                scale_format=scale_format,
+                weight_layout=weight_layout,
+                allow_logical_tail=allow_logical_tail,
+            )
+        # Same rule as the auto-selection override: exact N/K tiling, one scale
+        # group per k-tile, and shared-memory fit.
+        if int(problem_n) % int(tile_n) != 0 or int(problem_k) % int(tile_k) != 0:
+            return False
+        if int(tile_k) % int(scale_group_size(scale_format)) != 0:
+            return False
+        smem_bytes = smem_footprint(
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+        )
+        return int(smem_bytes) <= int(max_shared_mem)
+
+    candidate_tile_fits._trtllm_ultra_wide_fc2_shim = True
+    candidate_tile_fits._trtllm_upstream_fits = upstream_fits
+    kernel._candidate_tile_fits = candidate_tile_fits
+    logger.info_once(
+        f"flashinfer {flashinfer.__version__}: accepting the SM12x W4A16 ultra-wide FC2 "
+        "tile (tile_n=512, tile_k=32) in force_tile_config re-validation (nvbug 6721561).",
+        key="flashinfer_w4a16_ultra_wide_fc2_tile_shim",
+    )
+    return True
+
 
 class CuteDslB12xFusedMoE(CutlassFusedMoE):
     """B12x NVFP4 fused-MoE backend for SM120 / SM121.
 
     Large prefill chunks use CUTLASS; decode uses FlashInfer's b12x kernel.
 
-    Inherits ``CutlassFusedMoE`` rather than only the shared blocks -- the same
-    shortcut its siblings (CuteDsl, DeepGemm, Marlin) take, but here it is a
-    real dependency: ``_route_to_cutlass`` sends every
-    NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
+    The only subclass of ``CutlassFusedMoE``, and the only backend for which
+    that is a real dependency rather than a shortcut: ``_route_to_cutlass``
+    sends every NVFP4 prefill chunk through ``CutlassFusedMoE.quantize_input`` /
     ``CutlassFusedMoE.run_moe``, which read the whole Cutlass execution state
     (chunking stream and events, ``use_fused_finalize``, the tuner flags, the
     LoRA slot helpers, ``_tuner_shapes``, ``_run_moe_w4a16_nvfp4``).
 
-    Two ``CuteDslFusedMoE.__init__`` side effects are deliberately dropped, not
-    restated: the ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries, and
-    the ``swiglu_limit_scalar or inf`` fallback. Both are read only by
-    ``CuteDslFusedMoE.run_moe_nvfp4*``, which the ``run_moe`` override below
-    never reaches. Restate them before routing any CuteDSL path through this
-    class -- ``event_dict`` can now be None and ``swiglu_limit_scalar`` unset.
+    ``CuteDslFusedMoE.run_moe_nvfp4*`` is never reached from here, so the
+    ``AuxStreamType.MoeOutputMemset`` / ``EventType`` entries it needs are not
+    set up and ``event_dict`` can be None. Restate them, and
+    ``limit_when_absent`` below, before routing any CuteDSL path through this
+    class.
     """
 
-    # Restated rather than inherited: the LoRA gate this replaces compared the
-    # exact class and answered False here, while the DWDP gate used isinstance
-    # and answered True through CuteDslFusedMoE.
-    capabilities = MoEStaticCapability(supports_moe_lora=False, supports_dwdp=True)
+    # Inherited wholesale from CutlassFusedMoE, so every field is restated.
+    # No code path here reads ``w3_w1_bias`` / ``w2_bias`` or fuses LoRA, and
+    # ``supports_eplb`` stays False -- which is why ``can_implement`` has to
+    # decline ``d.eplb_enabled`` explicitly, since the inherited
+    # ``_supports_load_balancer()`` answers True.
+    # ``supports_apply_router_weight_on_input`` is False where the parent says
+    # True: only the NVFP4 prefill chunk reaches ``CutlassFusedMoE.run_moe``,
+    # while the decode path hands ``token_final_scales`` straight to the
+    # flashinfer b12x wrapper, which has no declared behaviour for the ``None``
+    # the scheduler's fold leaves there.
+    capabilities = MoEStaticCapability(
+        supports_moe_lora=False,
+        supports_dwdp=True,
+        supports_expert_bias=False,
+        supports_apply_router_weight_on_input=False,
+    )
 
-    # This and ``supports_moe_output_in_alltoall_workspace`` came through
-    # ``CuteDslFusedMoE`` before the reparent and Cutlass answers differently on
-    # both, so both are restated to keep the declared values unchanged. Read by
-    # ``ConfigurableMoE._reject_non_divisible_ep_backend()``; moot for this class
-    # in practice because ``can_implement`` rejects ``ep_size != 1`` outright.
+    # Same value the parent declares, pinned so a change there cannot silently
+    # retarget this backend.
+    input_requirement = MoEInputRequirement(routing_scales_dtype=torch.float32)
+
+    # The kinds ``_ACTIVATION_MAP`` above gates on. The b12x decode kernel takes
+    # no activation constants, so none are declared.
+    activation_support = MoEActivationSupport(
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Relu2})
+    )
+
+    # Read by ``ConfigurableMoE._reject_non_divisible_ep_backend()``; moot in
+    # practice because ``can_implement`` rejects ``ep_size != 1`` outright.
     _supports_non_divisible_ep: bool = True
 
     def supports_moe_output_in_alltoall_workspace(self) -> bool:
@@ -139,6 +251,15 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
                 MoERejectReason.DEP_MISSING,
                 "CuteDslB12xFusedMoE requires the flashinfer package",
             )
+        # The only backend the construction-time allow-list turned down that
+        # never said so during selection, so an EPLB run resolved to b12x and
+        # then died in the factory. Declining here degrades with the usual
+        # warning instead, matching VanillaMoE / TritonFusedMoE / MarlinFusedMoE.
+        if d.eplb_enabled:
+            return _reject(
+                MoERejectReason.EPLB_UNSUPPORTED,
+                "CuteDslB12xFusedMoE does not support the MoE load balancer",
+            )
         # No expert-parallel dispatch/combine kernel: EP must stay at 1.
         if d.ep_size != 1:
             return _reject(
@@ -167,6 +288,10 @@ class CuteDslB12xFusedMoE(CutlassFusedMoE):
         self._b12x_use_cuda_graph = bool(getattr(model_config, "use_cuda_graph", False))
 
         super().__init__(*args, **kwargs)
+
+        # Only the W4A16 decode path reaches flashinfer's W4A16 tile selector.
+        if self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
+            _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
 
         # No alltoall guard here: alltoall is picked by the wrapper's
         # communication strategy, and ``can_implement`` already rejects the

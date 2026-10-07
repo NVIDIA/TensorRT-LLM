@@ -22,22 +22,19 @@ JSON parameter against ground truth values from torch.cuda, platform, etc.
 import json
 import os
 import platform
-import sys
 import threading
 from unittest.mock import patch
 
 import pytest
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM as LLM_torch
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.usage import schemas
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
-from utils.llm_data import llm_models_root  # noqa: E402
-
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
@@ -107,7 +104,7 @@ class TestPayloadVerification:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=capture_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop),
         ):
             usage_lib._background_reporter(llm_args, pretrained_config, usage_context)
 
@@ -130,7 +127,7 @@ class TestPayloadVerification:
         assert params["cpuArchitecture"] == platform.machine()
         assert params["cpuCount"] == os.cpu_count()
         assert params["cudaVersion"] == torch.version.cuda
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["backend"] == "pytorch"
 
         # Step 4: String length checks (ShortString<=128, LongString<=256)

@@ -27,9 +27,10 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
-from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig
+from torch.utils._python_dispatch import TorchDispatchMode
+from transformers import AutoConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
-from tensorrt_llm._torch.attention_backend import FlashInferAttention, FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention.backends import FlashInferAttention, FlashInferAttentionMetadata
 from tensorrt_llm._torch.configs.gemma4 import Gemma4AssistantConfig
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -50,10 +51,10 @@ from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 _FLASHINFER_WORKSPACE_BYTES = 320 * 1024 * 1024
 _TRTLLM_GEN_TOKENS_PER_BLOCK = 32
@@ -645,6 +646,7 @@ class TestGemma4Assistant(unittest.TestCase):
         model_config = _make_assistant_model_config()
         model_config.extra_attrs["_speculative_position_headroom"] = 2 * 4
         assistant = Gemma4AssistantForCausalLM(model_config)
+        self.assertIs(assistant.model.model_config.extra_attrs, model_config.extra_attrs)
         self.assertEqual(len(assistant.model.layers), 4)
         self.assertTrue(all(layer.is_kv_shared_layer for layer in assistant.model.layers))
         self.assertEqual(
@@ -936,7 +938,7 @@ def _build_gemma4_kv_cache_manager(
     sizes line up with what the model actually requests at runtime.
     """
     import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
     if quant_config is not None and quant_config.layer_quant_mode.has_fp8_kv_cache():
@@ -1164,7 +1166,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """Run context + generation comparison for a given config."""
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1361,7 +1363,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         # Run context-phase comparison with tighter tolerance
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         hf_cache = DynamicCache()
@@ -1467,7 +1469,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1547,7 +1549,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         """
         from transformers.cache_utils import DynamicCache
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -1684,9 +1686,6 @@ class TestGemma4HFComparison(unittest.TestCase):
     # ---- VSWA (Variable Sliding Window Attention) page index tests ----
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_vswa_per_pool_page_indices(self):
         """VSWA: FlashInfer metadata builds separate page indices per pool.
 
@@ -1695,7 +1694,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         indices per pool so that each layer uses the correct indices during
         append_paged_kv_cache and attention plan/run.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         # E4B-like: sliding head_dim=64, full head_dim=128, kv_heads=2 both
@@ -1774,9 +1773,6 @@ class TestGemma4HFComparison(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_vswa_page_index_bounds(self):
         """VSWA: page indices must be within each layer's pool buffer bounds.
 
@@ -1785,7 +1781,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         returned by get_paged_kv_indices_for_layer are within each pool's
         buffer size.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -1836,9 +1832,6 @@ class TestGemma4HFComparison(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_vswa_swap_restores_correct_pool(self):
         """VSWA: swapping indices between pools and back produces correct data.
 
@@ -1846,7 +1839,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         sliding layer, verifying the shared buffer has the right pool's
         indices at each step.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2056,7 +2049,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         data.  After swap pool0→pool1→pool0, the restored pool0 indices
         must match the original values, not pool1's values.
         """
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2127,12 +2120,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_vswa_evicted_page_indices_are_sanitized(self) -> None:
         """FlashInfer metadata replaces evicted SWA page markers."""
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
@@ -2208,7 +2198,7 @@ class TestGemma4HFComparison(unittest.TestCase):
         a BS=1 baseline where B never existed.
         """
 
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
         from tensorrt_llm._torch.metadata import KVCacheParams
 
         torch.random.manual_seed(42)
@@ -2633,7 +2623,7 @@ class TestGemma4ModelDefaults(unittest.TestCase):
 
     def test_attn_backend_dispatches_to_trtllm(self):
         """Verify the Gemma4 default dispatches to TrtllmAttention."""
-        from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+        from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 
         defaults = Gemma4ForCausalLM.get_model_defaults(None)
         backend_cls = get_attention_backend(defaults["attn_backend"])
@@ -2877,9 +2867,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_shared_kv_draft_view(self) -> None:
         """The draft view advances lengths without modifying target KV."""
         kv_cache_manager, layers, metadata, queries, _, _ = self._make_trtllm_gen_decode_case(
@@ -2919,9 +2906,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_trtllm_gen_block_table_transitions(self) -> None:
         """Shrinking the active rectangle clears stale rows and columns."""
         initial_page_counts = [8, 5, 3, 2]
@@ -2957,9 +2941,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_trtllm_gen_host_table_growth_keeps_device_pointer(self) -> None:
         """Crossing 64 pages grows host staging without moving the graph buffer."""
         initial_page_counts = [63, 2]
@@ -3008,9 +2989,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_trtllm_gen_request_turnover_matches_eager(self) -> None:
         """A captured graph remains correct when long requests are replaced by short ones."""
         initial_page_counts = [8, 4]
@@ -3079,9 +3057,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
             )
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_decode_hybrid_headdim(self):
         """CUDA graph decode with hybrid head_dim (VSWA).
 
@@ -3096,7 +3071,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         """
         import random
 
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3260,9 +3235,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_multi_step_decode(self):
         """CUDA graph multi-step decode with hybrid head_dim.
 
@@ -3272,7 +3244,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         several decode iterations (e.g., stale plan data, growing kv_lens,
         VSWA swap with changing page counts).
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3434,16 +3406,13 @@ class TestGemma4CUDAGraph(unittest.TestCase):
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_decode_high_gqa(self) -> None:
         """CUDA graph decode with GQA=8 and real head_dim (E2B-like).
 
         Uses E2B real-dims config (hd=256/512, GQA=8) with multi-step
         decode to verify _block_tables update works for high-GQA models.
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3601,9 +3570,6 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def _run_cuda_graph_real_headdim(
         self,
         config_dict: dict,
@@ -3615,7 +3581,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         expect_split_kv: bool = False,
     ) -> None:
         """Helper: CUDA graph decode test with real head_dim configs."""
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -3803,17 +3769,11 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_decode_real_headdim(self):
         """E2B-like: GQA=8, hd=256/512, non-K=V."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_E2B_REAL_DIMS_CONFIG), "E2B")
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     @unittest.skipUnless(
         torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
         "FA2 split-K schedule refresh is Hopper-specific",
@@ -3832,26 +3792,17 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         )
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_decode_31b_like(self):
         """31B-like: mixed GQA (2 sliding, 8 full K=V), hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_31B_REAL_DIMS_CONFIG), "31B")
 
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_decode_26b_like(self):
         """26B-like: GQA=2, K=V, hd=256/512."""
         self._run_cuda_graph_real_headdim(deepcopy(GEMMA4_26B_REAL_DIMS_CONFIG), "26B")
 
     @unittest.skipUnless(is_sm_100f(), "trtllm-gen attention requires SM100f")
     @torch.no_grad()
-    @unittest.mock.patch(
-        "tensorrt_llm.runtime.kv_cache_manager_v2._utils.assert_critical", lambda *a, **kw: None
-    )
     def test_cuda_graph_multi_step_trtllm_gen(self) -> None:
         """Multi-step CG decode with trtllm-gen (hd=256/512).
 
@@ -3859,7 +3810,7 @@ class TestGemma4CUDAGraph(unittest.TestCase):
         across multiple graph replays with changing kv_lens.  Uses
         31B-like config with trtllm-gen for all layers.
         """
-        from tensorrt_llm._torch.attention_backend import (
+        from tensorrt_llm._torch.attention.backends import (
             FlashInferAttention,
             FlashInferAttentionMetadata,
         )
@@ -4265,6 +4216,40 @@ class TestGemma4MMTowerRMSNormConvention(unittest.TestCase):
             "``Gemma4VisionRMSNorm`` adapter for q/k/v norms and "
             "encoder layer norms.",
         )
+
+
+class _RejectMatrixMultiply(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+            raise AssertionError(f"Gemma4 vision RoPE must not dispatch {func}")
+        return func(*args, **(kwargs or {}))
+
+
+class TestGemma4VisionRotaryEmbedding(unittest.TestCase):
+    def test_rotary_table_avoids_matrix_multiply(self):
+        from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionRotaryEmbedding
+
+        config = Gemma4VisionConfig(
+            hidden_size=1152,
+            num_attention_heads=16,
+            head_dim=72,
+            rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+        )
+        rotary = Gemma4VisionRotaryEmbedding(config)
+        axis = torch.arange(64, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(axis, axis, indexing="ij")
+        position_ids = torch.stack((grid_x.flatten(), grid_y.flatten()), dim=-1).unsqueeze(0)
+
+        with _RejectMatrixMultiply():
+            cos, sin = rotary(torch.empty(0), position_ids)
+
+        inv_freq = rotary.inv_freq.double()[None, None, :]
+        reference_parts = [
+            inv_freq * position_ids[:, :, dim].double().unsqueeze(-1) for dim in range(2)
+        ]
+        reference = torch.cat([torch.cat((part, part), dim=-1) for part in reference_parts], dim=-1)
+        torch.testing.assert_close(cos.double(), reference.cos(), atol=2e-6, rtol=0)
+        torch.testing.assert_close(sin.double(), reference.sin(), atol=2e-6, rtol=0)
 
 
 class TestGemma4AudioTowerStructure(unittest.TestCase):

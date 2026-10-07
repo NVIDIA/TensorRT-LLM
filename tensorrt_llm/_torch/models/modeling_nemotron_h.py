@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import re
 from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
@@ -35,10 +34,10 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo  # noqa: E402
 
-from ..attention_backend import AttentionMetadata
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
@@ -47,7 +46,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import MoEWeightLoadingMode, create_moe
+from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
 from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
                                           W4A16NVFP4CutlassFusedMoEMethod)
@@ -81,6 +80,14 @@ def _get_layer_moe_param(config, layer_idx: int, param_name: str):
         if val is not None:
             return val
     return getattr(config, param_name, None)
+
+
+def _remap_hf_quant_module_name(name: str, num_hidden_layers: int) -> str:
+    """Map an HF-checkpoint module name or glob onto the TRT-LLM module tree.
+    """
+    from .checkpoints.hf.nemotron_h_weight_mapper import NemotronHHfWeightMapper
+
+    return NemotronHHfWeightMapper.map_mtp_module_name(name, num_hidden_layers)
 
 
 class MLPLayer(MLP):
@@ -171,13 +178,20 @@ class NemotronHMOE(nn.Module):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         reduce_output: bool = False,
         use_custom_cublas_mm: bool = False,
+        module_prefix: str | None = None,
     ):
         super().__init__()
 
         # Import here to avoid circular dependency.
         from .modeling_deepseekv3 import DeepseekV3Gate
 
-        self.activation_type = ActivationType.Relu2
+        # Name of this mixer's parent layer in the TRT-LLM module tree, used to
+        # look up per-layer quant configs and exclusions. Decoder layers live at
+        # ``model.layers.{layer_idx}``; MTP sublayers pass their nested path.
+        if module_prefix is None:
+            module_prefix = f"model.layers.{layer_idx}"
+
+        self.moe_activation = SimpleActivation(kind=ActivationType.Relu2)
         self.reduce_results = False
 
         config = model_config.pretrained_config
@@ -253,11 +267,27 @@ class NemotronHMOE(nn.Module):
         # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
         override_quant_config = None
         if model_config.quant_config_dict is not None:
-            experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
+            experts_prefix = f"{module_prefix}.mixer.experts"
             for key, cfg in model_config.quant_config_dict.items():
-                if key.startswith(experts_prefix):
+                if key == experts_prefix or key.startswith(experts_prefix +
+                                                           "."):
                     override_quant_config = cfg
                     break
+
+        # Last, so it overrides the per-layer entry above: an override is
+        # authoritative over anything __post_init__ wrote, so this stands in
+        # for both quantization passes and exclusion runs second. Otherwise an
+        # excluded layer keeps the per-layer format and loads quantized weights
+        # the checkpoint left in bf16. No trailing dot -- unlike the weight-form
+        # keys above, exclusion matches module names.
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        global_quant_config = model_config.quant_config
+        if (global_quant_config is not None
+                and global_quant_config.is_module_excluded_from_quantization(
+                    f"{module_prefix}.mixer.experts")):
+            override_quant_config = QuantConfig(
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo)
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -273,7 +303,7 @@ class NemotronHMOE(nn.Module):
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
-            activation_type=self.activation_type,
+            activation=self.moe_activation,
         )
 
         if reduce_output:
@@ -430,6 +460,7 @@ class NemotronHLayer(DecoderLayer):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         fuse_allreduce_norm: bool = False,
         use_custom_cublas_mm: bool = False,
+        module_prefix: str | None = None,
     ):
         super().__init__()
 
@@ -437,6 +468,11 @@ class NemotronHLayer(DecoderLayer):
 
         self.layer_idx = layer_idx
         self.layer_type = layer_type
+        # Name of this layer in the TRT-LLM module tree, used to look up
+        # per-layer quant configs and exclusions. Decoder layers live at
+        # ``model.layers.{layer_idx}``; MTP sublayers pass their nested path.
+        if module_prefix is None:
+            module_prefix = f"model.layers.{layer_idx}"
 
         quant_mode = (model_config.quant_config.quant_mode
                       if model_config.quant_config is not None else None)
@@ -448,7 +484,7 @@ class NemotronHLayer(DecoderLayer):
         # quant_config_dict to see if this specific layer is NVFP4-quantized.
         if (not self.is_nvfp4 and _has_fp4_hw
                 and model_config.quant_config_dict is not None):
-            layer_prefix = f"model.layers.{layer_idx}."
+            layer_prefix = f"{module_prefix}."
             for key, cfg in model_config.quant_config_dict.items():
                 if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
                     self.is_nvfp4 = True
@@ -522,7 +558,7 @@ class NemotronHLayer(DecoderLayer):
             if fuse_allreduce_norm:
                 self.mixer.out_proj.reduce_output = False
             # Hopper: route RMSNormGated to its bf16 Triton fallback
-            # (fused_gated_rmsnorm_quant is SM100-only).
+            # (fused_gated_rmsnorm_quant is SM100+ only).
             if not _has_fp4_hw:
                 self.mixer.is_nvfp4 = False
                 self.mixer.norm.is_nvfp4 = False
@@ -547,6 +583,7 @@ class NemotronHLayer(DecoderLayer):
                 aux_stream_dict=aux_stream_dict,
                 reduce_output=has_tp_allreduce,
                 use_custom_cublas_mm=use_custom_cublas_mm,
+                module_prefix=module_prefix,
             )
         else:
             raise ValueError(f"{layer_type} is not supported")
@@ -836,7 +873,7 @@ def _use_w4a16_for_nvfp4_on_hopper():
 
     def _patched_mlp_create_weights(self):
         # Original sets _use_fused_relu2_quant=True for NVFP4 ckpts; off here
-        # so MLP.forward emits bf16 (the SM100-only fused kernel never runs).
+        # so MLP.forward emits bf16 (the SM100+ only fused kernel never runs).
         original_mlp_create_weights(self)
         self._use_fused_relu2_quant = False
 
@@ -883,11 +920,19 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 and model_config.mapping.tp_size not in [1, 2, 4, 8]):
             raise ValueError("TP has to be either 1, 2, 4 or 8")
 
+        num_hidden_layers = model_config.pretrained_config.num_hidden_layers
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                re.sub(r"(model\.layers\.)?backbone", "model", k)
+                _remap_hf_quant_module_name(k, num_hidden_layers)
                 for k in model_config.quant_config.exclude_modules
             ]
+        else:
+            model_config.quant_config.exclude_modules = []
+        # Depthwise conv1d is stored in a Linear for TP, but it is not a GEMM.
+        # NVFP4 groups along in_features (d_conv, typically 4), which is not
+        # divisible by the block size of 16, so keep this Linear unquantized.
+        if "*.mixer.conv1d" not in model_config.quant_config.exclude_modules:
+            model_config.quant_config.exclude_modules.append("*.mixer.conv1d")
 
         # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
         # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
@@ -895,7 +940,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         if model_config.quant_config_dict is not None:
             model_config._frozen = False
             model_config.quant_config_dict = {
-                re.sub(r"(model\.layers\.)?backbone", "model", k): v
+                _remap_hf_quant_module_name(k, num_hidden_layers): v
                 for k, v in model_config.quant_config_dict.items()
             }
             model_config._frozen = True
@@ -919,11 +964,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 "Set speculative_config.speculative_model to a separate MTP "
                 "head replacement checkpoint, or use a target checkpoint that "
                 "embeds MTP.")
-            if ckpt_nextn == 0 and has_mtp_head_replacement:
-                # Neither checkpoint declares a head count: fall back to a
-                # single shared head, matching MTPForCausalLM's MTP-Eagle
-                # default.
-                ckpt_nextn = model_nextn = 1
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 pass
             else:
@@ -1072,6 +1112,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         has_end_norm: bool,
         layer_type: str,
         use_custom_cublas_mm: bool = False,
+        module_prefix: str | None = None,
     ) -> None:
         super().__init__(
             model_config=model_config,
@@ -1079,6 +1120,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             layer_type=layer_type,
             aux_stream_dict=aux_stream_dict,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            module_prefix=module_prefix,
         )
         self.model_nextn = 0
         if (model_config.spec_config is not None
@@ -1190,8 +1232,18 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             residual = None  # Start fresh after fusion
 
         if residual is None:
+            # The residual-less norm returns either a bf16
+            # tensor or a Fp4QuantizedTensor with the bf16 normed copy
+            # stashed on it when the norm feeds an NVFP4 mixer.
             residual = hidden_states
             hidden_states = self.norm(hidden_states)
+            if self.norm.return_hp_output:
+                hidden_states = (hidden_states,
+                                 hidden_states.unquantized_hidden_states)
+        elif self.norm.return_hp_output:
+            hidden_states, residual, high_precision_normed_output = self.norm(
+                hidden_states, residual)
+            hidden_states = (hidden_states, high_precision_normed_output)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
@@ -1243,8 +1295,9 @@ class NemotronHMTP(nn.Module):
             is_start_of_step = step_rel_idx == 0
             is_end_of_step = step_rel_idx == self.pattern_len - 1
 
+            sublayer_prefix = f"model.layers.{self.layer_idx}.layers.{step_rel_idx}"
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
-                model_config, self.layer_idx)
+                model_config, sublayer_prefix)
 
             # Create a model_config copy with quant_config overridden and
             # spec_config cleared. All other fields (use_cuda_graph,
@@ -1254,6 +1307,7 @@ class NemotronHMTP(nn.Module):
             sublayer_model_config = replace(model_config,
                                             quant_config=sublayer_quant_config,
                                             spec_config=None)
+            sublayer_model_config.extra_attrs = model_config.extra_attrs
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
@@ -1263,29 +1317,36 @@ class NemotronHMTP(nn.Module):
                 has_end_norm=is_end_of_step,
                 layer_type=char,
                 use_custom_cublas_mm=self.use_custom_cublas_mm,
+                module_prefix=sublayer_prefix,
             )
 
         # Add shared_head for MTP, following DeepseekV3MTP pattern
         self.shared_head = DeepseekV3MTPHead(model_config)
 
     def _get_mtp_sublayer_quant_config(self, model_config: NemotronHModelConfig,
-                                       layer_idx: int):
+                                       sublayer_prefix: str):
+        """Quantization config for the MTP sublayer at ``sublayer_prefix``.
+
+        The checkpoint decides whether an MTP sublayer is quantized:
+        - A MIXED_PRECISION checkpoint lists quantized modules per layer in
+          ``quant_config_dict``. The global algo maps to QuantMode(0), so the
+          sublayer is built unquantized and the per-layer entries are applied
+          by ``apply_layerwise_quant_config`` (Linear) and the
+          ``quant_config_dict`` lookup in ``NemotronHMOE`` (experts).
+        - A single-algo checkpoint quantizes the sublayer unless it is listed
+          in ``exclude_modules`` (modelopt writes ``mtp*`` for an unquantized
+          head). Partial exclusions inside a quantized sublayer are handled
+          per module by ``apply_quant_config_exclude_modules``.
         """
-        Get quantization config for MTP sublayer.
-        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
-        moe_backend only supports fp8/fp4 quantization, we need to override
-        the quant_config for the MTP layer.
-        """
-        from tensorrt_llm.models.modeling_utils import QuantConfig
 
         quant_config = model_config.quant_config
-        # MTP layers are always unquantized, force quant_algo=None
         if quant_config is None:
             return None
-        return QuantConfig(
-            quant_algo=None,
-            kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
-        )
+        if (quant_config.quant_algo in (None, QuantAlgo.MIXED_PRECISION)
+                or quant_config.is_module_excluded_from_quantization(
+                    sublayer_prefix)):
+            return quant_config.model_copy(update={"quant_algo": None})
+        return quant_config
 
     def forward(
         self,

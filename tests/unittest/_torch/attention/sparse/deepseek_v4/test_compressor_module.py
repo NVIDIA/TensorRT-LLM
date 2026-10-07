@@ -25,26 +25,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.attention_backend.interface import (
+from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
     PositionEmbeddingType,
     RotaryScalingType,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttentionMetadata,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.compressor import (
     Compressor,
     KVCacheDtype,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.params import (
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
 )
-from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
+from tensorrt_llm._torch.attention.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version
@@ -929,7 +929,7 @@ class CompressorWrapper:
         # of the architecture-specific attention layout. Keep that coverage on
         # H100 without selecting the Hopper-required footer-scale cache.
         with mock.patch(
-            "tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager.get_sm_version",
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager.get_sm_version",
             return_value=100,
         ):
             cache_manager = DeepseekV4CacheManager(
@@ -1787,9 +1787,15 @@ class _FakeCompressorCacheManager:
         self.compressed_block_sizes = {0: tokens_per_block}
         self.layer_offsets = {0: 0}
         self._buffer = torch.empty(1, tokens_per_block * head_dim, device=DEVICE, dtype=DTYPE)
+        self._scale_buffer = torch.empty(
+            1, tokens_per_block * (head_dim // 16), device=DEVICE, dtype=torch.float8_e4m3fn
+        )
 
     def get_buffers(self, layer_idx, attn_type):
         return self._buffer
+
+    def get_compress_scale_buffers(self, layer_idx):
+        return self._scale_buffer
 
 
 def _create_small_compressor(kv_cache_dtype: str, is_indexer: bool) -> Compressor:
@@ -1902,6 +1908,7 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         nope_head_dim,
         rope_head_dim,
         kv_cache,
+        kv_cache_scale,
         num_comp_tokens,
         cu_new_comp_kv,
         start_pos,
@@ -1909,6 +1916,8 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         compressed_mask,
         tokens_per_block,
         cache_dtype,
+        nvfp4_global_scale,
+        nvfp4_residual_dim,
         rotate_activation,
         quant_output,
         scale_output,
@@ -1917,6 +1926,9 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         seen["quant_output"] = quant_output
         seen["scale_output"] = scale_output
         seen["cache_dtype"] = cache_dtype
+        seen["kv_cache_scale"] = kv_cache_scale
+        seen["nvfp4_global_scale"] = nvfp4_global_scale
+        seen["nvfp4_residual_dim"] = nvfp4_residual_dim
         if kv_out is not None:
             kv_out.fill_(0.5)
         if quant_output is not None:

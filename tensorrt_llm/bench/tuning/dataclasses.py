@@ -22,7 +22,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 # Model types that use Multi-Head Latent Attention (MLA). The runtime KV-cache
 # formula for these is a single compressed head with
 # head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1 -- matching the MLA
-# branch in tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py.
+# branch in tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py.
 _MLA_MODEL_TYPES = frozenset(
     {
         "deepseek_v2",

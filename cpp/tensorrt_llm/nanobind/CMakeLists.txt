@@ -11,11 +11,11 @@ set(SRCS
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/kvCacheManagerV2.cpp
-    batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
@@ -24,7 +24,7 @@ set(SRCS
     testing/kvCacheManagerTestUtilBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
-    ../runtime/ipcNvlsMemory.cu
+    visual_gen/coordinatorWatchdog.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -66,6 +66,7 @@ target_link_libraries(
   PUBLIC ${SHARED_TARGET}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
+         Threads::Threads
          torch_python
          ${CUDA_DRV_LIB}
          th_common

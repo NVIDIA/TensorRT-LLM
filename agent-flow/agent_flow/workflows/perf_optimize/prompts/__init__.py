@@ -2,10 +2,17 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from agent_flow.workflows.perf_analyze.prompts import (
+    PROMPTS_DIRNAME,
+    build_remote_execution_context,
+)
+from agent_flow.workflows.perf_analyze.prompts._common import CASEBOOK_DISABLED
+
 from ._common import (
     DISAGG_CAMPAIGN,
     EXECUTION_SLURM_BOOTSTRAP,
     KERNEL_COVERAGE_REPORTER_GUIDANCE,
+    REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_OPTIMIZE_REPORTER_GUIDANCE,
     SOL_OPTIMIZER_CONTEXT,
@@ -15,6 +22,7 @@ from ._common import (
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
 from .evaluator import SYSTEM_PROMPT as EVALUATOR_SYSTEM_PROMPT
+from .integrator import SYSTEM_PROMPT as INTEGRATOR_SYSTEM_PROMPT
 from .optimizer import SYSTEM_PROMPT as OPTIMIZER_SYSTEM_PROMPT
 from .projector import SYSTEM_PROMPT as PROJECTOR_SYSTEM_PROMPT
 from .projector import build_projector_prompt
@@ -36,6 +44,7 @@ class PromptBundle:
     analyzer: str
     optimizer: str
     evaluator: str
+    integrator: str
     qa: str
     reporter: str
 
@@ -47,6 +56,7 @@ class PromptBundle:
         analyzer: str = "",
         optimizer: str = "",
         evaluator: str = "",
+        integrator: str = "",
         qa: str = "",
         reporter: str = "",
     ) -> "PromptBundle":
@@ -68,6 +78,7 @@ class PromptBundle:
             analyzer=_append(self.analyzer, analyzer),
             optimizer=_append(self.optimizer, optimizer),
             evaluator=_append(self.evaluator, evaluator),
+            integrator=_append(self.integrator, integrator),
             qa=_append(self.qa, qa),
             reporter=_append(self.reporter, reporter),
         )
@@ -79,6 +90,7 @@ DEFAULT_PROMPTS = PromptBundle(
     analyzer=ANALYZER_SYSTEM_PROMPT,
     optimizer=OPTIMIZER_SYSTEM_PROMPT,
     evaluator=EVALUATOR_SYSTEM_PROMPT,
+    integrator=INTEGRATOR_SYSTEM_PROMPT,
     qa=QA_SYSTEM_PROMPT,
     reporter=REPORTER_SYSTEM_PROMPT,
 )
@@ -86,11 +98,14 @@ DEFAULT_PROMPTS = PromptBundle(
 
 def build_perf_optimize_prompts(
     include_slurm_environment: bool = False,
+    remote_execution: Mapping[str, Any] | None = None,
+    campaign_name: str = "perf-optimize",
     approaches: Sequence[str] | None = None,
     include_sol: bool = False,
     kernel_coverage: Mapping[str, Any] | None = None,
     sol_methodology: str = "full",
     include_disagg: bool = False,
+    include_casebook: bool = True,
 ) -> PromptBundle:
     """Return the workflow's prompt bundle, augmented per the task spec.
 
@@ -101,6 +116,10 @@ def build_perf_optimize_prompts(
     projector, which launches no servers either (under Slurm it runs on
     the login node and records the latency constants as unmeasured, per
     its own prompt).
+
+    ``remote_execution`` is the resolved task spec. When it names an SSH
+    target, a short remote boundary plus its task-specific connection and
+    Slurm values is appended to every role that may touch runtime data.
 
     When ``approaches`` (``optimize.approaches`` from the task spec)
     restricts the run to a subset of the roadmap's approach values, the
@@ -137,7 +156,8 @@ def build_perf_optimize_prompts(
     When ``kernel_coverage`` is set (the validated
     ``profile.kernel_coverage`` block — the per-kernel coverage
     contract), the analyzer gets the coverage-driven ncu targeting, the
-    two per-kernel questions (faster? fusible?), and the
+    four per-kernel questions (eliminable? faster? fusible?
+    overlappable?), and the
     ``kernel_ledger.yaml`` contract with the task's bars interpolated;
     the reporter gets the "Kernel Coverage" accountability section. The
     other roles are unchanged — the ledger is authored by the analyzer
@@ -161,6 +181,12 @@ def build_perf_optimize_prompts(
     wrong.
     """
     bundle = DEFAULT_PROMPTS
+    if not include_casebook:
+        bundle = bundle.with_extensions(
+            benchmarker=CASEBOOK_DISABLED,
+            analyzer=CASEBOOK_DISABLED,
+            optimizer=CASEBOOK_DISABLED,
+        )
     if sol_methodology != "full":
         bundle = dataclasses.replace(bundle, projector=build_projector_prompt(sol_methodology))
     restriction = approach_restriction_note(approaches) if approaches is not None else ""
@@ -176,6 +202,7 @@ def build_perf_optimize_prompts(
             analyzer=EXECUTION_SLURM_BOOTSTRAP,
             optimizer=EXECUTION_SLURM_BOOTSTRAP,
             evaluator=EXECUTION_SLURM_BOOTSTRAP,
+            integrator=EXECUTION_SLURM_BOOTSTRAP,
             qa=EXECUTION_SLURM_BOOTSTRAP,
         )
     if include_sol:
@@ -190,6 +217,7 @@ def build_perf_optimize_prompts(
             analyzer=DISAGG_CAMPAIGN,
             optimizer=DISAGG_CAMPAIGN,
             evaluator=DISAGG_CAMPAIGN,
+            integrator=DISAGG_CAMPAIGN,
             qa=DISAGG_CAMPAIGN,
         )
     if kernel_coverage is not None:
@@ -200,6 +228,16 @@ def build_perf_optimize_prompts(
             ),
             reporter=KERNEL_COVERAGE_REPORTER_GUIDANCE,
         )
+    context = build_remote_execution_context(remote_execution, campaign_name)
+    if context:
+        bundle = bundle.with_extensions(
+            benchmarker=context,
+            projector=context,
+            analyzer=context,
+            optimizer=context,
+            evaluator=context,
+            qa=context,
+        )
     return bundle
 
 
@@ -208,8 +246,11 @@ __all__ = [
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
     "EVALUATOR_SYSTEM_PROMPT",
+    "INTEGRATOR_SYSTEM_PROMPT",
     "OPTIMIZER_SYSTEM_PROMPT",
     "PROJECTOR_SYSTEM_PROMPT",
+    "PROMPTS_DIRNAME",
+    "REMOTE_SLURM_EXECUTION",
     "PromptBundle",
     "QA_SYSTEM_PROMPT",
     "REPORTER_SYSTEM_PROMPT",

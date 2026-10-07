@@ -8,8 +8,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, Generic, Iterator, List, Literal,
-                    Optional, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
+                    Literal, Optional, Tuple, Type, TypeVar, Union)
 
 import torch
 from torch import nn
@@ -23,10 +23,10 @@ from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
 from ...models.modeling_utils import QuantConfig
-from ..attention_backend import AttentionMetadata
+from ..attention.attention import Attention
+from ..attention.backends import AttentionMetadata
 from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
-from ..modules.attention import Attention
 from ..modules.embedding import Embedding, LMHead
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
 from ..modules.logits_processor import LogitsProcessor
@@ -366,6 +366,105 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 remove_weights(layer)
 
 
+def apply_layerwise_quant_config(
+        model_config: ModelConfig,
+        named_modules: Iterator[tuple[str, nn.Module]]) -> None:
+    quant_config_dict = model_config.quant_config_dict
+    if quant_config_dict is not None:
+        for name, module in named_modules:
+            if isinstance(module, (MoE, VanillaMoE)):
+                for n, q in quant_config_dict.items():
+                    # all linear layers inside FusedMoE share the same quant config
+                    if name in n:
+                        module.quant_config = q
+                        break
+            elif isinstance(module, Linear):
+                weight_mode = module.weights_loading_config.weight_mode
+                prefix_name = '.'.join(name.split('.')[:-1])
+                if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                    for n, q in quant_config_dict.items():
+                        # gate_proj and up_proj share the same quant config
+                        if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
+                            module.quant_config = q
+                            break
+                elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                    for n, q in quant_config_dict.items():
+                        # q_proj, k_proj and v_proj share the same quant config
+                        if prefix_name + '.q_proj' in n:
+                            module.quant_config = q
+                            break
+                else:
+                    for n, q in quant_config_dict.items():
+                        if name == n:
+                            module.quant_config = q
+                            break
+            elif isinstance(module, Attention):
+                for n, q in quant_config_dict.items():
+                    # reuse q_proj quant config as the attention quant config
+                    if name + '.q_proj' in n:
+                        module.quant_config = q
+                        break
+            elif hasattr(module, 'kv_a_proj_with_mqa'):
+                # DeepseekV3Attention
+                for n, q in quant_config_dict.items():
+                    # reuse q_proj quant config as the attention quant config
+                    if name + '.kv_a_proj_with_mqa' in n:
+                        module.quant_config = q
+                        break
+
+
+def apply_quant_config_exclude_modules(
+        model_config: ModelConfig,
+        named_modules: Iterator[tuple[str, nn.Module]]) -> None:
+    """
+    Skip quant for modules in QuantConfig.exclude_modules.
+    kv_cache_quant_algo takes precedence over exclude_modules.
+    kv_cache_quant_algo, if not None, is set for non-Attention
+    modules too, which is the same practice as when there's no
+    exclude_modules.
+    """
+    quant_config = model_config.quant_config
+    kv_cache_quant_algo = None
+    if quant_config:
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo
+    new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+    if quant_config is not None:
+        if quant_config.exclude_modules is not None:
+            for name, module in named_modules:
+                candidates = [name]
+                if isinstance(module, Linear):
+                    weight_mode = module.weights_loading_config.weight_mode
+                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
+                        # sometimes gate and up proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('gate_up_proj', 'gate_proj'),
+                            name.replace('gate_up_proj', 'up_proj')
+                        ]
+                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
+                        # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
+                        # but they still share the same exclusion rule
+                        candidates += [
+                            name.replace('qkv_proj', 'q_proj'),
+                            name.replace('qkv_proj', 'k_proj'),
+                            name.replace('qkv_proj', 'v_proj')
+                        ]
+                is_excluded = any(
+                    quant_config.is_module_excluded_from_quantization(n)
+                    for n in candidates)
+                if is_excluded and getattr(module, "quant_config",
+                                           None) is not None:
+                    module.quant_config = new_config
+                    # Reset _weights_created so create_weights() in
+                    # __post_init__ will re-create this module's weights
+                    # with the updated (non-quantized) config. Some
+                    # Wrappers such as ConfigurableMoE delegate this state
+                    # update to their child backend.
+                    if hasattr(module, '_weights_created'):
+                        module._weights_created = False
+
+
 class PostInitCaller(type):
 
     def __call__(cls, *args, **kwargs):
@@ -388,16 +487,22 @@ class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
 
+    # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
+    use_fx_for_pcg_fallback: ClassVar[bool] = True
+
     @staticmethod
-    def _checkpoint_has_lm_head_scale(config: ModelConfig[TConfig]) -> bool:
+    def _checkpoint_has_lm_head_scale(
+            config: ModelConfig[TConfig],
+            checkpoint_dir: str | None = None) -> bool:
         """Whether the checkpoint stores a quantized lm_head (a weight scale).
 
         Used to decide lm_head quantization for homogeneous checkpoints, which
         carry no explicit per-layer quant entry. Reads only the safetensors
         header for ``lm_head.weight_scale`` (no weight load).
         """
-        checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
-                                 None)
+        if checkpoint_dir is None:
+            checkpoint_dir = getattr(config.pretrained_config, "_name_or_path",
+                                     None)
         if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
             return False
         return ModelConfig._get_safetensors_header_for_tensor(
@@ -544,98 +649,16 @@ class DecoderModelForCausalLM(nn.Module,
 
         self.model.__pp_init__()
 
+    def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        return self.named_modules()
+
     def apply_layerwise_quant_config(self):
-        quant_config_dict = self.model_config.quant_config_dict
-        if quant_config_dict is not None:
-            for name, module in self.named_modules():
-                if isinstance(module, (MoE, VanillaMoE)):
-                    for n, q in quant_config_dict.items():
-                        # all linear layers inside FusedMoE share the same quant config
-                        if name in n:
-                            module.quant_config = q
-                            break
-                elif isinstance(module, Linear):
-                    weight_mode = module.weights_loading_config.weight_mode
-                    prefix_name = '.'.join(name.split('.')[:-1])
-                    if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                        for n, q in quant_config_dict.items():
-                            # gate_proj and up_proj share the same quant config
-                            if prefix_name + '.gate_proj' in n or prefix_name + '.gate_up_proj' in n:
-                                module.quant_config = q
-                                break
-                    elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                        for n, q in quant_config_dict.items():
-                            # q_proj, k_proj and v_proj share the same quant config
-                            if prefix_name + '.q_proj' in n:
-                                module.quant_config = q
-                                break
-                    else:
-                        for n, q in quant_config_dict.items():
-                            if name == n:
-                                module.quant_config = q
-                                break
-                elif isinstance(module, Attention):
-                    for n, q in quant_config_dict.items():
-                        # reuse q_proj quant config as the attention quant config
-                        if name + '.q_proj' in n:
-                            module.quant_config = q
-                            break
-                elif hasattr(module, 'kv_a_proj_with_mqa'):
-                    # DeepseekV3Attention
-                    for n, q in quant_config_dict.items():
-                        # reuse q_proj quant config as the attention quant config
-                        if name + '.kv_a_proj_with_mqa' in n:
-                            module.quant_config = q
-                            break
+        apply_layerwise_quant_config(self.model_config,
+                                     self._quantization_named_modules())
 
     def apply_quant_config_exclude_modules(self):
-        """
-        Skip quant for modules in QuantConfig.exclude_modules.
-        kv_cache_quant_algo takes precedence over exclude_modules.
-        kv_cache_quant_algo, if not None, is set for non-Attention
-        modules too, which is the same practice as when there's no
-        exclude_modules.
-        """
-        quant_config = self.model_config.quant_config
-        kv_cache_quant_algo = None
-        if quant_config:
-            kv_cache_quant_algo = quant_config.kv_cache_quant_algo
-        new_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
-
-        if quant_config is not None:
-            if quant_config.exclude_modules is not None:
-                for name, module in self.named_modules():
-                    candidates = [name]
-                    if isinstance(module, Linear):
-                        weight_mode = module.weights_loading_config.weight_mode
-                        if weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-                            # sometimes gate and up proj are not packed in the checkpoint,
-                            # but they still share the same exclusion rule
-                            candidates += [
-                                name.replace('gate_up_proj', 'gate_proj'),
-                                name.replace('gate_up_proj', 'up_proj')
-                            ]
-                        elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-                            # sometimes q_proj, k_proj and v_proj are not packed in the checkpoint,
-                            # but they still share the same exclusion rule
-                            candidates += [
-                                name.replace('qkv_proj', 'q_proj'),
-                                name.replace('qkv_proj', 'k_proj'),
-                                name.replace('qkv_proj', 'v_proj')
-                            ]
-                    is_excluded = any(
-                        quant_config.is_module_excluded_from_quantization(n)
-                        for n in candidates)
-                    if is_excluded and getattr(module, "quant_config",
-                                               None) is not None:
-                        module.quant_config = new_config
-                        # Reset _weights_created so create_weights() in
-                        # __post_init__ will re-create this module's weights
-                        # with the updated (non-quantized) config. Some
-                        # Wrappers such as ConfigurableMoE delegate this state
-                        # update to their child backend.
-                        if hasattr(module, '_weights_created'):
-                            module._weights_created = False
+        apply_quant_config_exclude_modules(self.model_config,
+                                           self._quantization_named_modules())
 
     def __post_init__(self):
         self.apply_layerwise_quant_config()
@@ -913,17 +936,61 @@ MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
 CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
-# Registration priority under lazy loading: on main the built-in zoo imported
-# first and external code (--custom_module_dirs, user modules) overrode it
-# later. With the zoo imported lazily, built-in modules may run their
-# decorators *after* an external registration, so every registry applies one
-# rule: built-in registrations only fill empty slots, never overwrite.
-# Anything already present outranks a built-in — it is either an external
-# registration (which must keep its main-order priority) or another built-in
-# (no architecture is double-registered among built-ins, so filling empty
-# slots is equivalent to main). External registrations always overwrite.
 def _is_builtin_model_class(cls) -> bool:
     return is_builtin_zoo_module(getattr(cls, "__module__", ""))
+
+
+# The architecture-keyed registries a provider module fills through its
+# decorators, named so a registration can be recorded and replayed without
+# carrying the dict around.
+_MODEL_CLASS_REGISTRY = "model class"
+_VISION_ENCODER_REGISTRY = "vision encoder"
+_ARCH_REGISTRIES = {
+    _MODEL_CLASS_REGISTRY: MODEL_CLASS_MAPPING,
+    _VISION_ENCODER_REGISTRY: MODEL_CLASS_VISION_ENCODER_MAPPING,
+}
+
+# Every architecture registration a module's decorators made, in the order they
+# ran. A module's decorators run once per process, so this is the only way to
+# put a provider back after its slots were released: importing it again is a
+# no-op against ``sys.modules``.
+_MODULE_REGISTRATIONS: Dict[str, List[Tuple[str, str, Any]]] = {}
+
+
+def _describe_provider(value: Any) -> str:
+    cls = value[0] if isinstance(value, tuple) else value
+    module = getattr(cls, "__module__", "?")
+    return f"{module}.{getattr(cls, '__qualname__', cls)}"
+
+
+def _apply_arch_registration(registry_name: str, arch: str, value: Any,
+                             module_name: str) -> None:
+    """Fill one architecture slot, honouring built-in priority.
+
+    Built-in registrations only fill empty slots. With the zoo imported lazily a
+    built-in module can run its decorators after an external registration, and
+    anything already present outranks it: that is either an external
+    registration, which owns the architecture, or another built-in, and no
+    architecture is registered twice among built-ins. External registrations
+    always overwrite.
+    """
+    registry = _ARCH_REGISTRIES[registry_name]
+    existing = registry.get(arch)
+    if (existing is not None and existing != value
+            and is_builtin_zoo_module(module_name)):
+        logger.info(
+            f"Keeping {registry_name} registration {_describe_provider(existing)} "
+            f"for architecture {arch}; built-in "
+            f"{_describe_provider(value)} not registered.")
+        return
+    registry[arch] = value
+
+
+def _record_arch_registration(registry_name: str, arch: str, value: Any,
+                              module_name: str) -> None:
+    _MODULE_REGISTRATIONS.setdefault(module_name, []).append(
+        (registry_name, arch, value))
+    _apply_arch_registration(registry_name, arch, value, module_name)
 
 
 # Architecture names each decorated class declared via ``register_auto_model``,
@@ -943,19 +1010,82 @@ def register_auto_model(name: str):
             setattr(cls, _REGISTERED_ARCHS_ATTR, archs)
         archs.add(name)
 
-        existing = MODEL_CLASS_MAPPING.get(name)
-        if (existing is not None and existing is not cls
-                and _is_builtin_model_class(cls)):
-            logger.info(
-                f"Keeping existing registration "
-                f"{existing.__module__}.{existing.__name__} for architecture "
-                f"{name}; built-in {cls.__module__}.{cls.__name__} not "
-                f"registered.")
-            return cls
-        MODEL_CLASS_MAPPING[name] = cls
+        _record_arch_registration(_MODEL_CLASS_REGISTRY, name, cls,
+                                  getattr(cls, "__module__", ""))
         return cls
 
     return decorator
+
+
+# Architectures contributed from outside the built-in zoo (--custom_module_dirs,
+# user modules). The static index cannot know them, so a driver propagates them to
+# its workers as module names; see export_external_model_modules.
+_EXTERNAL_ARCH_TO_MODULE: Dict[str, str] = {}
+
+
+def export_external_model_modules() -> Dict[str, str]:
+    """Architectures a fresh process could not discover on its own.
+
+    Maps architecture -> providing module for externally registered classes only; a
+    built-in is already reachable through the static index. Naming the module rather
+    than handing over the class keeps the receiver's zoo lazy: it imports one module
+    when that architecture is looked up, instead of every module the sender happened
+    to have imported.
+    """
+    external = {
+        arch: cls.__module__
+        for arch, cls in MODEL_CLASS_MAPPING.items()
+        if not _is_builtin_model_class(cls)
+    }
+    # Declarations this process has not resolved yet name a provider no lookup
+    # here has put in the mapping; they still have to reach the receiver.
+    for arch, module_name in _EXTERNAL_ARCH_TO_MODULE.items():
+        external.setdefault(arch, module_name)
+    return external
+
+
+def _replay_provider(module_name: str, declared: Dict[str, str]) -> None:
+    for registry_name, arch, value in _MODULE_REGISTRATIONS.get(
+            module_name, ()):
+        if declared.get(arch, module_name) != module_name:
+            # The declaration hands this architecture to another provider, so
+            # every slot this module filled for it belongs to that one -- and
+            # stays empty until a lookup imports it.
+            continue
+        _apply_arch_registration(registry_name, arch, value, module_name)
+
+
+def _rebuild_arch_registries(declared: Dict[str, str]) -> None:
+    """Restore the architecture registries to what ``declared`` alone produces."""
+    for registry in _ARCH_REGISTRIES.values():
+        registry.clear()
+    for module_name in _MODULE_REGISTRATIONS:
+        if is_builtin_zoo_module(module_name):
+            _replay_provider(module_name, declared)
+    # Declared providers replay last so they overwrite the built-ins, the order
+    # a process sees when it loads the zoo and then the custom modules. A
+    # provider that has not been imported here contributes nothing and is left
+    # to _ensure_model_registered.
+    for module_name in dict.fromkeys(declared.values()):
+        _replay_provider(module_name, declared)
+
+
+def register_external_model_modules(arch_to_module: Dict[str, str]) -> None:
+    """Declare where externally registered architectures live, importing nothing.
+
+    ``arch_to_module`` is the whole set of external providers in effect, so the
+    architecture registries end up holding what a process built from this
+    declaration alone would hold: providers resolved under an earlier declaration
+    release their slots, and one that is named again is restored from what its
+    decorators registered the first time. Every slot is rebuilt, so a provider
+    that only ever filled a sibling registry is released as well.
+    """
+    declared = dict(arch_to_module)
+    if declared == _EXTERNAL_ARCH_TO_MODULE:
+        return
+    _EXTERNAL_ARCH_TO_MODULE.clear()
+    _EXTERNAL_ARCH_TO_MODULE.update(declared)
+    _rebuild_arch_registries(declared)
 
 
 def _ensure_model_registered(model_arch: str) -> None:
@@ -978,10 +1108,12 @@ def _ensure_model_registered(model_arch: str) -> None:
     registration decorator; the import itself is idempotent via
     ``sys.modules``.
     """
-    module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
-    if module_name is None:
-        return
-    full_name = f"tensorrt_llm._torch.models.{module_name}"
+    full_name = _EXTERNAL_ARCH_TO_MODULE.get(model_arch)
+    if full_name is None:
+        module_name = MODEL_ARCH_TO_MODULE.get(model_arch)
+        if module_name is None:
+            return
+        full_name = f"tensorrt_llm._torch.models.{module_name}"
     try:
         importlib.import_module(full_name)
     except ModuleNotFoundError as e:
@@ -990,7 +1122,7 @@ def _ensure_model_registered(model_arch: str) -> None:
         # and must not be masked as "unknown architecture".
         if e.name != full_name:
             raise
-        logger.warning(f"Lazy import of {module_name} for architecture "
+        logger.warning(f"Lazy import of {full_name} for architecture "
                        f"{model_arch} failed: {e!r}")
 
 
@@ -1171,15 +1303,11 @@ def register_vision_encoder(
                 f"via register_auto_model; decorator order must ensure registration occurs first."
             )
         for arch_name in archs:
-            if (arch_name in MODEL_CLASS_VISION_ENCODER_MAPPING
-                    and _is_builtin_model_class(model_cls)):
-                # Built-in registrations only fill empty slots (see the
-                # priority rule above register_auto_model).
-                logger.info(f"Keeping existing vision encoder registration for "
-                            f"architecture {arch_name}.")
-                continue
-            MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls,
-                                                             vlm_base_model)
+            # Attributed to the decorated model class's module: that is the
+            # provider this entry stands or falls with.
+            _record_arch_registration(_VISION_ENCODER_REGISTRY, arch_name,
+                                      (vision_encoder_cls, vlm_base_model),
+                                      getattr(model_cls, "__module__", ""))
 
         return model_cls
 
@@ -1407,6 +1535,17 @@ def run_concurrently(func,
                 raise
 
 
+#: Modules stored unfused in a checkpoint and fused in the module tree, mapped
+#: to the components they are built from. This is the table the mapper-less
+#: load path below uses; HfWeightMapper.map_weights installs the same pairs for
+#: the mapper path. Anything reasoning about what a checkpoint must provide has
+#: to read one of the two rather than keep a third copy.
+FUSED_MODULE_COMPONENTS = {
+    'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
+    'gate_up_proj': ['gate_proj', 'up_proj'],
+}
+
+
 def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
@@ -1433,10 +1572,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
         model.config, 'num_key_value_heads'
     ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
 
-    params_map = {
-        'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        'gate_up_proj': ['gate_proj', 'up_proj']
-    }
+    params_map = dict(FUSED_MODULE_COMPONENTS)
     device_id = local_mpi_rank()
 
     def load_single_module(name, module):

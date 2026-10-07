@@ -184,28 +184,7 @@ inline __device__ cutlass::uint128_t convertE4m3ToBfloat16(uint64_t src) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline __device__ cutlass::uint128_t convertE4m3ToBfloat16WithSassPatch(uint64_t src) {
-#ifndef TLLM_PUBLIC_RELEASE
-  cutlass::uint128_t dst;
-  auto srcB16 = reinterpret_cast<uint16_t const*>(&src);
-  auto srcB32 = reinterpret_cast<uint32_t const*>(&src);
-  auto dstB32 = reinterpret_cast<uint32_t*>(&dst);
-
-#pragma unroll
-  for (int ii = 0; ii < 4; ++ii) {
-    uint32_t srcPair = srcB16[ii];
-    // The second source keeps the placeholder instruction shape stable for the SASS patcher; the
-    // patched direct unpack uses only srcPair.
-    uint32_t dummy = srcB32[(ii >> 1) ^ 1];
-
-    // Placeholder for SASS patching. Replaced with:
-    //   F2FP.BF16.E4M3.UNPACK_B dst, srcPair, 4.5736980577097704378e-41.H0
-    asm volatile("lop3.b32 %0, %1, %1, %2, 0x77;" : "=r"(dstB32[ii]) : "r"(srcPair), "r"(dummy));
-  }
-
-  return dst;
-#else
   return convertE4m3ToBfloat16(src);
-#endif // TLLM_PUBLIC_RELEASE
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1164,6 +1143,25 @@ inline __device__ float reinterpret_uint32_to_float(uint32_t val) {
 __forceinline__ __device__ float scale_rcp_exp_only(float val) {
   uint32_t bits = 0x7f000000u - reinterpret_cast<uint32_t&>(val);
   return reinterpret_cast<float&>(bits);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Returns the exact FP32 reciprocal of a finite UE8m0 scaling factor.
+__forceinline__ __device__ float scale_rcp_ue8m0(cutlass::float_ue8m0_t val) {
+  uint32_t const exponent = static_cast<uint32_t>(val.storage);
+  float result;
+  asm volatile("{\n"
+               ".reg .b32 reciprocal, bf16x2;\n"
+               ".reg .b16 lo, hi;\n"
+               "sub.u32 reciprocal, 254, %1;\n"
+               "mov.b32 {lo, hi}, reciprocal;\n"
+               "cvt.rn.bf16x2.ue8m0x2 bf16x2, lo;\n"
+               "prmt.b32 %0, 0, bf16x2, 0x5410;\n"
+               "}\n"
+               : "=f"(result)
+               : "r"(exponent));
+  return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

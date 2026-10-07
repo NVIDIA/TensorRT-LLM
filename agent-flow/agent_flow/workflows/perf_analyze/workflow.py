@@ -6,14 +6,8 @@ from typing import Any
 
 import yaml
 
-from agent_flow import (
-    CLAUDE_CODE_DEFAULT_MODEL,
-    AgentLayer,
-    AgentLayerConfig,
-    BackendConfig,
-    SessionConfig,
-    require_tool_call_stop_hook,
-)
+from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfig
+from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
 
@@ -25,6 +19,8 @@ from .progress import (
     read_progress,
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
+from .prompts._common import profile_ranks_note
+from .roles import ROLES
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
     STAGE_ANALYZER,
@@ -37,10 +33,13 @@ from .state import (
     save_state,
 )
 from .task_schema import (
+    CASEBOOK_SKILL_NAMES,
+    casebook_enabled,
     concurrency_points,
     dump_task_yaml,
     is_curve_mode,
     load_and_validate_task_yaml,
+    profile_ranks,
     sol_enabled,
 )
 
@@ -99,43 +98,29 @@ def _progress_has_entries(path: Path) -> bool:
     return bool(data[ANALYSIS_STAGE])
 
 
-def _compose_required_tools_hooks(required_tools: list[str]) -> dict | None:
-    """Compose stop hooks that require *every* listed tool to be called.
-
-    ``require_tool_call_stop_hook`` enforces "at least one of the listed
-    names was called". Stacking one such hook per tool — each independent
-    — yields AND semantics: every per-tool hook must allow the stop, so
-    all listed tools must have been called this turn.
-    """
-    if not required_tools:
-        return None
-    merged: dict[str, list] = {"Stop": []}
-    for name in required_tools:
-        merged["Stop"].extend(require_tool_call_stop_hook([name])["Stop"])
-    return merged
-
-
 def _make_agent(
     name: str,
     system_prompt: str,
+    agent_config: AgentConfig,
     tools: list | None = None,
     required_tools: list[str] | None = None,
-    backend_kind: str = "claude-code",
-    model: str = CLAUDE_CODE_DEFAULT_MODEL,
     session_mode: str = "persistent",
+    disabled_skills: tuple[str, ...] = (),
 ) -> AgentLayer:
-    hooks = _compose_required_tools_hooks(required_tools or [])
     return AgentLayer(
         AgentLayerConfig(
             name=name,
             system_prompt=system_prompt,
             backend=BackendConfig(
-                kind=backend_kind,
-                model=model,
+                kind=agent_config.backend,
+                model=agent_config.model,
+                reasoning_effort=agent_config.reasoning_effort,
+                disabled_skills=disabled_skills,
                 tools=tools,
-                hooks=hooks,
+                extra_mcp_servers=agent_config.extra_mcp_servers,
             ),
             session=SessionConfig(mode=session_mode),
+            required_tools=tuple(required_tools or ()),
         )
     )
 
@@ -144,8 +129,8 @@ class PerfAnalyzeWorkflow:
     """Linear benchmarker → projector → analyzer → reporter pipeline.
 
     Serves a model checkpoint with ``trtllm-serve``, benchmarks and
-    profiles it with ``benchmark_serving.py`` (nsys + torch profiler +
-    ncu per-kernel deep dive), and synthesizes a report whose headline
+    profiles it with ``benchmark_serving.py`` (nsys + ncu per-kernel
+    deep dive), and synthesizes a report whose headline
     is the main performance bottleneck. The projector stage — on unless
     ``task.yaml`` sets ``sol.enabled: false`` — derives an analytical
     speed-of-light (SOL) ceiling between the benchmarker and the analyzer
@@ -190,7 +175,7 @@ class PerfAnalyzeWorkflow:
         if clean:
             # Wipe the workflow's managed files so the constructor proceeds
             # as a fresh run. Other files in the workspace (run artifacts
-            # such as serve.log, *.nsys-rep, torch_trace/) are left alone.
+            # such as serve.log, *.nsys-rep, *.ncu-rep) are left alone.
             for path in (
                 self.state_path,
                 self.benchmark_results_path,
@@ -250,33 +235,11 @@ class PerfAnalyzeWorkflow:
         self._progress_ctx = ProgressContext(path=self.progress_path)
         progress_tools = build_progress_tools(self._progress_ctx)
 
-        self.benchmarker = _make_agent(
-            "benchmarker",
-            self.prompts.benchmarker,
-            progress_tools["benchmarker"],
-            required_tools=["append_benchmarker_progress"],
-        )
-        # Constructed unconditionally (the stage gate lives in ``run``);
-        # the backend client is lazy, so a skipped projector costs nothing.
-        self.projector = _make_agent(
-            "projector",
-            self.prompts.projector,
-            progress_tools["projector"],
-            required_tools=["append_projector_progress"],
-        )
-        self.analyzer = _make_agent(
-            "analyzer",
-            self.prompts.analyzer,
-            progress_tools["analyzer"],
-            required_tools=["append_analyzer_progress"],
-        )
-        self.reporter = _make_agent(
-            "reporter",
-            self.prompts.reporter,
-            progress_tools["reporter"],
-            required_tools=["append_reporter_progress"],
-        )
         self._progress_tools = progress_tools
+        self._agent_configs: dict[str, AgentConfig] = {}
+        self._disabled_skills: tuple[str, ...] = ()
+        for role in ROLES:
+            setattr(self, role, None)
 
     def __enter__(self) -> "PerfAnalyzeWorkflow":
         return self
@@ -285,8 +248,28 @@ class PerfAnalyzeWorkflow:
         self.close()
 
     def close(self) -> None:
-        for layer in (self.benchmarker, self.projector, self.analyzer, self.reporter):
-            layer.__exit__(None, None, None)
+        for role in ROLES:
+            layer = getattr(self, role)
+            if layer is not None:
+                layer.__exit__(None, None, None)
+
+    def _configure_agents(self) -> None:
+        task_data = self._task_data()
+        self._disabled_skills = () if casebook_enabled(task_data) else CASEBOOK_SKILL_NAMES
+        self._agent_configs = {role: resolve_agent_config(task_data, role) for role in ROLES}
+        for role in ROLES:
+            setattr(
+                self,
+                role,
+                _make_agent(
+                    role,
+                    getattr(self.prompts, role),
+                    self._agent_configs[role],
+                    self._progress_tools[role],
+                    required_tools=[f"append_{role}_progress"],
+                    disabled_skills=self._disabled_skills,
+                ),
+            )
 
     # ------------------------------------------------------------- orchestration
 
@@ -296,6 +279,7 @@ class PerfAnalyzeWorkflow:
         state = self._init_state(task, log)
         if state is None:
             return
+        self._configure_agents()
 
         try:
             # Each stage checkpoints before advancing, so a crash / Ctrl-C
@@ -440,11 +424,13 @@ class PerfAnalyzeWorkflow:
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, the optional `extra_llm_api_options` path, "
             f"and the `benchmark` block.\n\n"
-            f"Then **load the `perf-optimization-casebook` skill** (via the "
-            f"`Skill` tool) as read-only reference, as your system prompt "
-            f"directs, so your Configuration/Notes are grounded in known "
-            f"TRT-LLM performance precedents.\n\n"
-            f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
+            + self._casebook_instruction(
+                "Then **load the `perf-optimization-casebook` skill** (via the "
+                "`Skill` tool) as read-only reference, as your system prompt "
+                "directs, so your Configuration/Notes are grounded in known "
+                "TRT-LLM performance precedents.\n\n"
+            )
+            + f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
             f"set), poll it to "
             f"readiness, {load_instruction}. Use the "
             f"**canonical `benchmark_serving.py` command in your system "
@@ -506,8 +492,8 @@ class PerfAnalyzeWorkflow:
         projection_context = ""
         correlation_instruction = ""
         findings_sections = (
-            "Profiling setup / nsys timeline / Torch profiler / ncu kernel "
-            "analysis / Ranked bottleneck hypotheses / Caveats"
+            "Profiling setup / nsys timeline / ncu kernel analysis / "
+            "Ranked bottleneck hypotheses / Caveats"
         )
         if self._sol_enabled():
             projection_context = (
@@ -536,9 +522,8 @@ class PerfAnalyzeWorkflow:
                 f"record `Correlation unavailable: <reason>` there instead.\n\n"
             )
             findings_sections = (
-                "Profiling setup / nsys timeline / Torch profiler / ncu "
-                "kernel analysis / SOL correlation / Ranked bottleneck "
-                "hypotheses / Caveats"
+                "Profiling setup / nsys timeline / ncu kernel analysis / "
+                "SOL correlation / Ranked bottleneck hypotheses / Caveats"
             )
         self.analyzer(
             f"Workspace: {self.workspace}\n\n"
@@ -549,38 +534,68 @@ class PerfAnalyzeWorkflow:
             f"baseline.\n\n"
             + curve_context
             + projection_context
-            + f"Early on, **load the `perf-optimization-casebook` skill** (via "
-            f"the `Skill` tool) as read-only reference, as your system prompt "
-            f"directs, and match each ranked bottleneck hypothesis against its "
-            f"*bottleneck signal → candidate pattern* index so the Reporter "
-            f"inherits a known precedent.\n\n"
-            f"First **verify this checkout's profiling knobs** with "
+            + self._casebook_instruction(
+                "Early on, **load the `perf-optimization-casebook` skill** (via "
+                "the `Skill` tool) as read-only reference, as your system prompt "
+                "directs, and match each ranked bottleneck hypothesis against its "
+                "*bottleneck signal → candidate pattern* index so the Reporter "
+                "inherits a known precedent.\n\n"
+            )
+            + f"First **verify this checkout's profiling knobs** with "
             f"`grep -rn`/`rg` via `Bash` under "
-            f"`{self._trtllm_hint()}` — `py_executor.py` for both "
-            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate) and the "
-            f"torch-trace env var (e.g. `TLLM_TORCH_PROFILE_TRACE`), and "
+            f"`{self._trtllm_hint()}` — `py_executor.py` for "
+            f"`TLLM_PROFILE_START_STOP` (the iteration-window gate), and "
             f"`openai_server.py` for whether a `/start_profile` endpoint even "
             f"exists — use the names you find. Then run the profilers listed "
-            f"in `profile.methods` (default all three): **nsys** (GPU "
-            f"timeline), the **torch profiler**, and **ncu** (per-kernel deep "
-            f"dive) — nsys and torch gated server-side by "
+            f"in `profile.methods` (default both): **nsys** (GPU timeline) "
+            f"and **ncu** (per-kernel deep dive) — nsys gated server-side by "
             f"`TLLM_PROFILE_START_STOP` over `profile.nsys_iter_range` (not by "
             f"the client's `--profile` flag), ncu over the same window via "
             f"`--profile-from-start off`. Drive nsys from the **canonical "
             f"`nsys profile` command in your system prompt** (don't improvise "
             f"nsys flags): it keeps `--capture-range-end=stop` so the window "
             f"lands in steady-state load without tearing the engine down, and "
-            f"the replayed benchmark keeps `--no-test-input`. Run ncu last, "
-            f"per your system prompt's Run C: **load the "
+            f"the replayed benchmark keeps `--no-test-input`. "
+            f"{profile_ranks_note(self._profile_ranks())} Then "
+            f"**decompose that timeline with the "
+            f"`internal-perf-nsight-system-analysis` skill** (via the `Skill` tool; "
+            f"fully-qualified "
+            f"`trtllm-agent-toolkit:internal-perf-nsight-system-analysis` if the bare "
+            f"name is not found), per your system prompt's Run A step 5: "
+            f"export the report with `nsys export --type sqlite`, run the "
+            f"skill's `run_all.py` single-variant into "
+            f"`{self.workspace}/nsys_analysis`, and report the *nsys "
+            f"timeline* section from what it produces — per-iteration time, "
+            f"the busy/idle rungs, and the compute-absent split "
+            f"(launch-starved / blocking / dependency-stalled) — not from "
+            f"the `nsys stats` table alone. After that "
+            f"timing pass lands, take the two **Run A2** nsys passes from your "
+            f"system prompt — `--gpu-metrics-devices` / "
+            f"`--gpu-metrics-frequency` for per-operator utilization, and the "
+            f"backtrace flags for call sites — as separate captures, never "
+            f"folded into the timing pass; skip either one gracefully (record "
+            f"the reason under *Caveats*) rather than fabricating it. When "
+            f"A2a lands, re-run the skill's `run_all.py` with "
+            f"`--metrics-profile` pointed at its sqlite so the utilization "
+            f"bullet comes from the pipeline too (it re-reads files only — no "
+            f"server, no GPU). Verify the taxonomy and author "
+            f"`{self.workspace}/nsys_analysis/items.json` as Run A step 5 "
+            f"requires — the opportunity list is the analysis's "
+            f"machine-readable half, and skipping it leaves only prose. Run ncu "
+            f"last, "
+            f"per your system prompt's Run B: **load the "
             f"`perf-nsight-compute-analysis` skill** (via the `Skill` tool; "
             f"fully-qualified "
             f"`trtllm-agent-toolkit:perf-nsight-compute-analysis` if the bare "
             f"name is not found) as the capture + interpretation methodology, "
-            f"target the top kernels from the nsys table, keep the canonical "
+            f"target the top kernels from the timeline decomposition (not the "
+            f"`kern_sum` table — see Run B step 2), keep the canonical "
             f"ncu flags (`--launch-count` bounded), and classify each "
             f"profiled kernel (SOL%, bound class, occupancy, stalls). Save "
-            f"`server_nsys.nsys-rep`, the `nsys stats` output, the torch traces "
-            f"under `torch_trace/`, `server_ncu.ncu-rep` + its "
+            f"`server_nsys.nsys-rep`, the `nsys stats` output, the "
+            f"`nsys_analysis/` directory, "
+            f"`server_nsys_metrics.nsys-rep` and `server_nsys_stacks.nsys-rep` "
+            f"from the Run A2 passes, `server_ncu.ncu-rep` + its "
             f"`ncu_details.txt` / `ncu_raw.csv` summaries, and "
             f"`perf_metrics.json` if available. Tear "
             f"every server down.\n\n"
@@ -675,6 +690,13 @@ class PerfAnalyzeWorkflow:
         On by default — only ``sol.enabled: false`` turns it off.
         """
         return sol_enabled(self._task_data())
+
+    def _casebook_instruction(self, text: str) -> str:
+        return "" if self._disabled_skills else text
+
+    def _profile_ranks(self) -> tuple[int, ...]:
+        """The rank ids nsys must capture, from the resolved spec."""
+        return profile_ranks(self._task_data())
 
     def _curve_mode(self) -> bool:
         """Whether the resolved task spec runs in Pareto-curve mode."""

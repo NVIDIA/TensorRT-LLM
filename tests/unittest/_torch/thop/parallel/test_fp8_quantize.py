@@ -20,6 +20,7 @@ from parameterized import parameterized
 from utils.util import (getSMVersion, isSM100Family,
                         skip_pre_blackwell_unittest, unittest_name_func)
 
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm.quantization.utils.fp8_utils import \
     per_token_quant_and_transform
 
@@ -516,6 +517,66 @@ def test_fp8_quantize_1x128_packed_ue8m0_r128c4_padding_is_zero(m, k):
                + (m_idx % 128) // 32) * 4 + sf_k_idx % 4
     valid[offsets.flatten()] = True
     assert torch.count_nonzero(scale[~valid]).item() == 0
+
+
+@skip_if_not_sm100_family
+@pytest.mark.parametrize("use_r128c4_layout", [False, True])
+@pytest.mark.parametrize("m,k,swiglu_limit", [
+    (1, 128, None),
+    (3, 256, None),
+    (16, 1536, None),
+    (32, 3072, None),
+    (32, 7168, None),
+    (7, 512, 7.0),
+    pytest.param(262141, 128, None, id="grid-y-overflow"),
+])
+def test_silu_and_mul_fp8_quantize_1x128_packed_ue8m0_matches_separate(
+        m, k, swiglu_limit, use_r128c4_layout):
+    """Fused SwiGLU quantization should match separate SwiGLU and quantize."""
+    torch.manual_seed(0)
+    gate_up = torch.randn((m, 2 * k), device="cuda", dtype=torch.bfloat16)
+
+    fused_fp8, fused_packed = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+        gate_up, swiglu_limit, use_r128c4_layout)
+
+    swiglu = torch.ops.trtllm.silu_and_mul(gate_up, swiglu_limit=swiglu_limit)
+    reference_fp8, reference_packed = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+        swiglu, use_r128c4_layout)
+
+    assert torch.equal(fused_fp8.view(torch.uint8),
+                       reference_fp8.view(torch.uint8))
+    assert torch.equal(fused_packed.contiguous(), reference_packed.contiguous())
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and Rubin CuTe DSL support.")
+@pytest.mark.parametrize("n,k", [(128, 128), (129, 256), (2112, 7168)])
+def test_transform_k128_scales_to_cutedsl_mxfp8_layout(n, k):
+    """Weight K128 scales are expanded over N rows and four K32 slots."""
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    num_n_blocks = math.ceil(n / 128)
+    num_k_blocks = k // 128
+    exponents = torch.arange(num_n_blocks * num_k_blocks,
+                             device="cuda",
+                             dtype=torch.float32).reshape(
+                                 num_n_blocks, num_k_blocks)
+    weight_scale = torch.pow(2.0, exponents.remainder(32) - 16)
+
+    transformed = \
+        fp8_utils.transform_k128_scales_to_cutedsl_mxfp8_layout(
+            weight_scale, mn=n, k=k)
+
+    per_row = weight_scale.repeat_interleave(128, dim=0)[:n]
+    expected_ue8m0 = (per_row.contiguous().view(torch.int32) >> 23).to(
+        torch.uint8).repeat_interleave(4, dim=1)
+    expected = torch.ops.trtllm.block_scale_interleave(
+        expected_ue8m0.contiguous())
+
+    assert transformed.dtype == torch.uint8
+    assert transformed.numel() == math.ceil(n / 128) * 128 * (k // 32)
+    assert torch.equal(transformed, expected)
 
 
 @skip_if_not_sm100_family

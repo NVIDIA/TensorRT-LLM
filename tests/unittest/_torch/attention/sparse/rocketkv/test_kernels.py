@@ -6,7 +6,7 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.rocket.kernels import (
+from tensorrt_llm._torch.attention.backends.sparse.rocket.kernels import (
     triton_bmm,
     triton_rocket_paged_kt_cache_bmm,
     triton_topk,

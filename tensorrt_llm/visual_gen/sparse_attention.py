@@ -16,11 +16,15 @@
 
 import fnmatch
 from types import SimpleNamespace
-from typing import Any, Dict, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional
 
 from pydantic import Field as PydanticField
+from pydantic import field_validator
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -41,6 +45,21 @@ class BaseSparseAttentionConfig(StrictBaseModel):
     def to_sparse_metadata_params(self, **kwargs):
         """Lower user-facing config into SparseMetadataParams."""
         return None
+
+    def resolve_disabled_until_timestep(
+        self,
+        *,
+        checkpoint_config: Optional[Dict[str, Any]] = None,
+        pretrained_config: Any = None,
+    ) -> Optional[float]:
+        """Return the normalized timestep below which the algorithm runs sparse.
+
+        ``None`` means the algorithm has no dense prefix. Algorithms with a
+        ``disabled_until_timestep`` field return it; algorithms that also read a
+        checkpoint-provided cutoff override this method.
+        """
+        del checkpoint_config, pretrained_config
+        return getattr(self, "disabled_until_timestep", None)
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -69,7 +88,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     )
 
     def to_sparse_params(self, **kwargs):
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             SkipSoftmaxParams,
             SkipSoftmaxScheduler,
         )
@@ -115,7 +134,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if self.disabled_until_timestep is not None:
             return self.disabled_until_timestep
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_disabled_until_timestep_from_ckpt_sparse_attention_config,
         )
 
@@ -132,7 +151,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         ckpt_sparse_attention_config: Optional[Dict[str, Any]],
     ) -> bool:
         """Return whether skip-softmax should be disabled for this layer."""
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_ignore_from_ckpt_sparse_attention_config,
         )
 
@@ -167,7 +186,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
 
         sparsity = self.target_sparsity
         if sparsity is None:
-            from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+            from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
                 skip_softmax_target_sparsity_from_ckpt_sparse_attention_config,
             )
 
@@ -184,7 +203,7 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         if sparsity is None:
             return None
 
-        from tensorrt_llm._torch.attention_backend.sparse.skip_softmax import (
+        from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import (
             skip_softmax_formula_from_ckpt_sparse_attention_config,
         )
 
@@ -221,12 +240,98 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         return None
 
 
+class SolAttentionConfig(BaseSparseAttentionConfig):
+    """SOL sparse attention configuration for visual generation.
+
+    SOL (Sol-Attn, arXiv:2607.24027) routes attention blocks dynamically and
+    corrects the approximation of the blocks it skips. Two backends serve it:
+
+    - ``TRTLLM`` runs SOL in two stages. A TRT-LLM-owned predictor derives an
+      exact block bitmask and K/V proxy summaries from Q/K/V, then the generic
+      PrimTS block-sparse FMHA executes that route. Unsupported runtime tensor
+      envelopes raise instead of silently falling back to dense attention.
+    - ``CUTEDSL`` runs the fused kernel vendored from the reference
+      implementation, which folds routing, sparse computation and correction
+      into one online-softmax pass on datacenter Blackwell (sm100/sm103) with
+      head_dim=128, bf16 and MHA. Inputs the kernel cannot serve fall back to
+      dense attention and are counted; GQA/MQA raises at construction.
+
+    Context parallelism (cp_size > 1) is rejected for both backends in
+    visual_gen/modules/attention.py.
+    """
+
+    algorithm: Literal["sol_attn"] = "sol_attn"
+    tau: float = PydanticField(
+        1.0,
+        allow_inf_nan=False,
+        description=(
+            "Routing threshold in standard deviations above the mean block score; "
+            "higher tau routes more blocks sparse."
+        ),
+    )
+    thresh_type: Literal["diag", "exact"] = PydanticField(
+        "diag",
+        description=(
+            "Block routing threshold policy: 'diag' models each key channel "
+            "independently, 'exact' uses the full key covariance."
+        ),
+    )
+    disabled_until_timestep: Optional[float] = PydanticField(
+        None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Dense-prefix cutoff on the normalized denoising timestep, with the "
+            "same sense as skip_softmax's field of the same name: the layer runs "
+            "dense while timestep >= this value and switches to SOL below it. "
+            "Larger timesteps are earlier, noisier steps, so this protects the "
+            "high-noise prefix. Use None (not 0.0) to disable the prefix; 0.0 is "
+            "rejected because it would run dense on every step and silently turn "
+            "SOL off entirely. Read from the `timestep` forward kwarg, which must "
+            "be the normalized scheduler time (larger = noisier); a pipeline that "
+            "does not pass it runs sparse on every step (fail-open)."
+        ),
+    )
+    dense_layers: Optional[list[int]] = PydanticField(
+        None,
+        description=(
+            "Layer indices forced dense regardless of the dense prefix, e.g. "
+            "[0, 2, 3]. Evaluated per layer at construction time; no pipeline "
+            "wiring required."
+        ),
+    )
+
+    @field_validator("dense_layers")
+    @classmethod
+    def _validate_dense_layers(cls, layers: Optional[list[int]]) -> Optional[list[int]]:
+        if layers is None:
+            return None
+        for index in layers:
+            if index < 0:
+                raise ValueError(f"dense_layers contains a negative layer index: {index}")
+        return sorted(set(layers))
+
+    def to_sparse_params(self, **kwargs: Any) -> "SolParams":
+        """Lower the public recipe into the SOL parameters shared by both backends."""
+        del kwargs
+        from tensorrt_llm._torch.visual_gen.attention_backend.sparse.sol.params import SolParams
+
+        return SolParams(
+            tau=self.tau,
+            thresh_type=self.thresh_type,
+            disabled_until_timestep=self.disabled_until_timestep,
+            dense_layers=frozenset(self.dense_layers or ()),
+        )
+
+
 class VideoSparseAttentionConfig(StrictBaseModel):
-    """Video Sparse Attention (VSA) sparse-attention recipe (CUTEDSL backend only).
+    """Video Sparse Attention (VSA) sparse-attention recipe.
 
     Two-stage hybrid attention: a coarse mean-pooled stage over (4,4,4) cubes
     and a block-sparse fine stage over the top-K cubes selected per head.
     vsa_sparsity controls the fraction of cubes dropped on the fine stage.
+    The fine stage may run on either the CuTeDSL backend or the TRTLLM PrimTS
+    backend, while the user-facing sparsity semantics stay the same.
     """
 
     algorithm: Literal["vsa"] = PydanticField(

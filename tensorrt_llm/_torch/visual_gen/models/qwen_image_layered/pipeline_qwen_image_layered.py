@@ -14,17 +14,24 @@
 # limitations under the License.
 """Qwen-Image-Layered image decomposition pipeline."""
 
-import io
 import math
 import time
+from io import BytesIO
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+import PIL.Image
 import torch
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image_layered import QwenImageLayeredTransformer2DModel
@@ -248,6 +255,15 @@ class QwenImageLayeredPipeline(BasePipeline):
             ),
         }
 
+    @property
+    def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        return {
+            "image_reference": RefSlotSpec(
+                modality="image",
+                roles=[RoleSpec(role="reference", min=1, max=1)],
+            ),
+        }
+
     def load_standard_components(
         self,
         checkpoint_dir: str,
@@ -347,14 +363,11 @@ class QwenImageLayeredPipeline(BasePipeline):
 
     @staticmethod
     def _load_image_input(image):
-        from PIL import Image
-
         if isinstance(image, list):
             return [QwenImageLayeredPipeline._load_image_input(item) for item in image]
-        if isinstance(image, str):
-            return Image.open(image).convert("RGBA")
         if isinstance(image, bytes):
-            return Image.open(io.BytesIO(image)).convert("RGBA")
+            # Layer decomposition needs the alpha channel, not a flattened RGB.
+            return PIL.Image.open(BytesIO(image)).convert("RGBA")
         if hasattr(image, "convert") and getattr(image, "mode", None) != "RGBA":
             return image.convert("RGBA")
         return image
@@ -506,7 +519,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         prompt: List[str],
         device: torch.device,
         max_sequence_length: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         drop_idx = _PROMPT_TEMPLATE_START_IDX
         txt = [_PROMPT_TEMPLATE.format(e) for e in prompt]
         tok = self.tokenizer(
@@ -540,6 +553,8 @@ class QwenImageLayeredPipeline(BasePipeline):
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
         prompt_embeds = prompt_embeds.to(dtype=self.dtype, device=device)
+        if prompt_embeds_mask.bool().all():
+            return prompt_embeds, None
         return prompt_embeds, prompt_embeds_mask
 
     @staticmethod
@@ -758,8 +773,9 @@ class QwenImageLayeredPipeline(BasePipeline):
                 )
             negative = [n for n in negatives for _ in range(num_per)]
 
+        refs = req.params.image_reference
         return self.forward(
-            image=req.params.image,
+            image=refs[0].content if refs else None,
             prompt=prompts,
             negative_prompt=negative,
             height=req.params.height,
@@ -811,7 +827,7 @@ class QwenImageLayeredPipeline(BasePipeline):
         image = self._load_image_input(image)
 
         device = self.device
-        generator = torch.Generator(device=device).manual_seed(seed)
+        generator = make_noise_generator(seed, device)
         is_latent_image = self._is_layered_latent_image(image)
         if (
             isinstance(image, torch.Tensor)
@@ -944,6 +960,10 @@ class QwenImageLayeredPipeline(BasePipeline):
         additional_t_cond = torch.zeros(batch_size, device=device, dtype=torch.long)
         timer.mark_denoise_start()
         logger.info("Denoising layered output (%d steps)...", len(timesteps))
+        cache_acc = getattr(self, "cache_accelerator", None)
+        if cache_acc is not None and cache_acc.is_enabled():
+            cache_acc.refresh(len(timesteps), separate_cfg=do_true_cfg)
+
         for _, t in self._profile_denoise_steps(timesteps):
             latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -981,6 +1001,11 @@ class QwenImageLayeredPipeline(BasePipeline):
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
+
+        if getattr(self, "rank", 0) == 0 and cache_acc is not None and cache_acc.is_enabled():
+            stats = cache_acc.get_stats()
+            if stats:
+                logger.info("Cache-DiT stats: %s", stats)
 
         timer.mark_post_start()
         logger.info("Decoding layered output...")

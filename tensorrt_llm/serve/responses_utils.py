@@ -43,6 +43,7 @@ from transformers import AutoProcessor, PretrainedConfig
 
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
@@ -71,7 +72,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import (
+    BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
@@ -1112,6 +1114,8 @@ async def _create_input_tokens(
         mm_placeholder_counts=mm_placeholder_counts,
         chat_template_kwargs=chat_template_kwargs or None,
         enable_tokenize=True,
+        injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
+            request),
     )
     token_ids, (mm_data,
                 _mm_embeddings) = await asyncio.gather(token_task,
@@ -1234,6 +1238,20 @@ def reasoning_chat_template_kwargs(request) -> dict:
     return kwargs
 
 
+def reasoning_injected_chat_template_keys(request) -> frozenset[str]:
+    """Keys `reasoning_chat_template_kwargs` added on the caller's behalf.
+
+    The unused-kwargs guard rejects caller controls the template never reads,
+    but a Responses client only asked for `reasoning.effort`; it did not pick
+    `reasoning_effort` / `thinking` and cannot drop them when a template (a
+    Qwen3 one, say) reads neither. Keys the caller passed explicitly in
+    `chat_template_kwargs` stay subject to the guard.
+    """
+    raw = getattr(request, "chat_template_kwargs", None)
+    caller_keys = set(raw) if isinstance(raw, Mapping) else set()
+    return frozenset(set(reasoning_chat_template_kwargs(request)) - caller_keys)
+
+
 def _apply_reasoning_parser(
     reasoning_parser_id: Optional[str],
     output_index: int,
@@ -1301,6 +1319,8 @@ def _apply_tool_parser(
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
         normal_text, calls = result.normal_text, result.calls
+        if not streaming:
+            warn_if_tool_call_unparsed(tool_parser_id, tool_parser, text, calls)
     else:
         normal_text, calls = text, []
 
@@ -2652,15 +2672,17 @@ class ServerArrivalTimeMiddleware:
     See: https://github.com/encode/starlette/discussions/2094
     """
 
-    def __init__(self, app):
+    def __init__(self,
+                 app,
+                 adjusted_clock: Optional[AdjustedSteadyClock] = None):
         self.app = app
+        self._adjusted_clock = adjusted_clock or AdjustedSteadyClock()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             # Add arrival time to scope
             scope["state"] = {}
-            scope["state"][
-                "server_arrival_time"] = get_steady_clock_now_in_seconds()
+            scope["state"]["server_arrival_time"] = self._adjusted_clock.now()
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)

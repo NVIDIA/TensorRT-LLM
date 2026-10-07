@@ -27,7 +27,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.attention_backend import trtllm as trtllm_backend
+from tensorrt_llm._torch.attention.backends import trtllm as trtllm_backend
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor._util import (
     get_attention_workspace_bytes_per_token,

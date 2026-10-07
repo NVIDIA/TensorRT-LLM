@@ -1,10 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import contextlib
 import datetime
 import json
 import os
 import random
-import sys
 import time
 from typing import List, Optional, Union
 
@@ -14,24 +28,23 @@ import torch
 import transformers
 
 from tensorrt_llm import LLM
+from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor import GenerationResultBase, RequestError
 from tensorrt_llm.llmapi import (KvCacheConfig, KvCacheRetentionConfig,
-                                 LookaheadDecodingConfig, RequestOutput,
-                                 SADecodingConfig)
+                                 RequestOutput, SADecodingConfig)
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import _ParallelConfig
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.sampling_params import LogitsProcessor, SamplingParams
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import CompletionRequest, StreamOptions
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, altered_env
@@ -39,8 +52,6 @@ from utils.util import force_ampere, similar, altered_env
 # isort: on
 
 # The unittests are based on the tiny-llama, which is fast to build and run.
-# There are other tests based on llama-7B model, such as the end-to-end tests in test_e2e.py, and parallel tests in
-# test_llm_multi_gpu.py.
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -125,7 +136,7 @@ def llm_check_output(llm: LLM,
                  stop_reasons=stop_reasons)
 
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
@@ -240,7 +251,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
         (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
-        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
@@ -496,7 +506,7 @@ def test_generate_with_stop_words():
 @force_ampere
 @pytest.mark.part0
 @pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
+    get_model_path(qwen3_tokenizer_model_name),
 ])
 def test_generate_with_detokenization_stop_words(model_path):
     llm = LLM(
@@ -511,16 +521,28 @@ def test_generate_with_detokenization_stop_words(model_path):
     }]
 
     formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
 
     detokenization_prompts = [formatted_prompt]
 
-    # Test case 1: Stop word "How" should be detected after detokenization
-    llm_check_output(llm,
-                     detokenization_prompts, ["Hello there!"],
-                     sampling_params=SamplingParams(stop="How", max_tokens=10),
-                     finish_reasons=['stop'],
-                     stop_reasons=["How"])
+    # Test case 1: Stop word "How" should be detected after detokenization.
+    # Use an exact text match (rather than llm_check_output's fuzzy
+    # similarity check) to confirm the stop string is actually stripped from
+    # the output, not merely close enough to pass a SequenceMatcher ratio.
+    outputs = llm.generate(detokenization_prompts,
+                           sampling_params=SamplingParams(stop="How",
+                                                          max_tokens=10))
+    out = outputs[0].outputs[0]
+    assert out.finish_reason == 'stop'
+    assert out.stop_reason == "How"
+    # Truncation happens in text space (`text[:text.find(stop)]`), so the
+    # whitespace that separated "there!" from the stop string belongs to the
+    # retained prefix -- matching OpenAI/vLLM stop-string semantics.
+    assert out.text == "Hello there! ", \
+        f"Stop string 'How' must not be retained in output text, got: {out.text!r}"
 
     # Test case 2: Stop word "there" should be detected after detokenization
     llm_check_output(llm,
@@ -549,7 +571,7 @@ def test_generate_with_detokenization_stop_words(model_path):
 @force_ampere
 @pytest.mark.part0
 @pytest.mark.parametrize("model_path", [
-    get_model_path('gemma/gemma-3-1b-it'),
+    get_model_path(qwen3_tokenizer_model_name),
 ])
 def test_generate_with_detokenization_stop_words_streaming(model_path):
     llm = LLM(
@@ -564,18 +586,48 @@ def test_generate_with_detokenization_stop_words_streaming(model_path):
     }]
 
     formatted_prompt = llm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True)
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False)
 
     sampling_params = SamplingParams(stop="How", max_tokens=10)
 
+    # NOTE: without tracking `found_stop` and asserting on it after the loop,
+    # this test can silently pass if generate_async yields no outputs at all
+    # or never reaches a terminal finish_reason.
+    found_stop = False
     for output in llm.generate_async(formatted_prompt,
                                      sampling_params=sampling_params,
                                      streaming=True):
         if output.outputs[0].finish_reason == 'stop':
             assert output.outputs[0].stop_reason == "How"
+            # Trailing space is retained by text-space truncation; see the
+            # non-streaming test above.
+            assert output.outputs[0].text == "Hello there! "
+            found_stop = True
             break
         elif output.outputs[0].finish_reason == 'length':
             assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_stop, "Expected to observe finish_reason='stop' with stop_reason='How', but no such output was produced"
+
+    # Test case: unmatched stop string should not trigger early stopping
+    sampling_params_no_match = SamplingParams(stop="XYZ", max_tokens=10)
+    found_length = False
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params_no_match,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'length':
+            assert output.outputs[0].stop_reason is None
+            found_length = True
+            break
+        elif output.outputs[0].finish_reason not in (None, ''):
+            assert False, f"Unexpected finish_reason: {output.outputs[0].finish_reason}"
+
+    assert found_length, "Expected to observe finish_reason='length' with stop_reason=None, but no such output was produced"
 
 
 @force_ampere
@@ -620,34 +672,28 @@ class MyLogitsProcessor(LogitsProcessor):
 def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    max_tokens = 6
     sampling_params = SamplingParams(
-        max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
+        max_tokens=max_tokens,
+        logits_processor=MyLogitsProcessor(biased_word_id))
 
     prompts = ["A B C"]
     if llm_kwargs.get('enable_chunked_prefill', None):
         prompts[0] = prompts[0] * 256
         llm_kwargs["max_num_tokens"] = 256
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
-        prompts, ["Z Z Z Z Z Z"],
+        prompts, [expected_output],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
         **llm_kwargs)
-
-
-@force_ampere
-def test_executor_lookahead_decoding_config():
-    lookahead_config = LookaheadDecodingConfig(max_window_size=10,
-                                               max_ngram_size=9,
-                                               max_verification_set_size=8)
-    sampling_params = SamplingParams(max_tokens=3,
-                                     lookahead_config=lookahead_config)
-
-    assert sampling_params.lookahead_config.max_window_size == 10
-    assert sampling_params.lookahead_config.max_ngram_size == 9
-    assert sampling_params.lookahead_config.max_verification_set_size == 8
 
 
 def test_executor_results_cleanup():
@@ -758,6 +804,7 @@ def validate_stats(
     results,
     pytorch_backend,
     max_tokens,
+    prompt_len,
     pp_size=1,
     use_overlap=False,
     enable_chunked_prefill=False,
@@ -810,18 +857,20 @@ def validate_stats(
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS", f"iter: {iter}"
                 assert req_stat[
-                    "contextPrefillPosition"] == 54 if use_overlap else 32, f"iter: {iter}"
+                    "contextPrefillPosition"] == prompt_len if use_overlap else 32, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == 0, f"iter: {iter}"
             elif iter < (context_iterations - 1 + generation_iterations):
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == iter - (
                     context_iterations - 1) + 1, f"iter: {iter}"
             else:
                 assert req_stat[
                     "stage"] == "GENERATION_COMPLETE", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat[
                     "numGeneratedTokens"] == max_tokens, f"iter: {iter}"
             assert req_stat["scheduled"] == True, f"iter: {iter}"
@@ -930,9 +979,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
         for output in llm.generate(long_prompts,
                                    sampling_params=sampling_params):
             print(output)
+            prompt_len = len(output.prompt_token_ids)
 
         time.sleep(2)
         results = llm.get_stats(2)
@@ -940,6 +991,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         validate_stats(results=results,
                        pp_size=pp_size,
                        pytorch_backend=pytorch_backend,
+                       prompt_len=prompt_len,
                        max_tokens=max_tokens,
                        use_overlap=use_overlap,
                        enable_chunked_prefill=enable_chunked_prefill,
@@ -1058,12 +1110,16 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
+
         async def task0():
+            nonlocal prompt_len
             async for output in llm.generate_async(
                     long_prompts[0],
                     streaming=True,
                     sampling_params=sampling_params):
                 print(output)
+                prompt_len = len(output.prompt_token_ids)
 
         async def task1(repetition_index: int):
             results = []
@@ -1080,6 +1136,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                     pp_size=pp_size,
                     pytorch_backend=pytorch_backend,
                     max_tokens=max_tokens,
+                    prompt_len=prompt_len,
                     use_overlap=use_overlap,
                     # After the first repetition, context will be reused and there will be no chunking.
                     enable_chunked_prefill=enable_chunked_prefill
@@ -1233,6 +1290,41 @@ def test_chat_stream_post_processor_reuses_stream_metadata() -> None:
     assert payloads[-1]["choices"][0]["delta"]["content"] == "y"
 
 
+def test_chat_stream_post_processor_usage_applies_prompt_token_offset() -> None:
+    result = GenerationResultBase(123, SamplingParams())
+    output = result._outputs[0]
+    output.text = "x"
+    output.token_ids = [1]
+    output.finish_reason = "stop"
+    result._done = True
+
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            num_prompt_tokens=5,
+                            num_prompt_tokens_offset=3,
+                            stream_options=StreamOptions(include_usage=True))
+    payloads = _stream_payloads_from_chunks(
+        chat_stream_post_processor(result, args))
+
+    final_chunk = payloads[-1]
+    assert final_chunk["choices"] == []
+    assert final_chunk["usage"]["prompt_tokens"] == 2
+    assert final_chunk["usage"]["completion_tokens"] == 1
+    assert final_chunk["usage"]["total_tokens"] == 3
+
+
+def test_chat_stream_post_processor_usage_requires_prompt_token_count() -> None:
+    # Usage arithmetic needs a concrete count: a missing one must surface as a
+    # clear error, never as None leaking into UsageInfo or a TypeError.
+    result = GenerationResultBase(123, SamplingParams())
+    args = ChatPostprocArgs(role="assistant",
+                            model="test-model",
+                            stream_options=StreamOptions(include_usage=True))
+
+    with pytest.raises(ValueError, match="num_prompt_tokens"):
+        chat_stream_post_processor(result, args)
+
+
 class _FakeCompletionGeneratorArgs:
     backend = "pytorch"
     gather_generation_logits = False
@@ -1380,6 +1472,7 @@ def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:
         server.metrics_collector = None
         server._collect_perf_metrics = False
         server._input_proc_executor = None
+        server._adjusted_steady_clock = AdjustedSteadyClock()
 
         request = CompletionRequest(model="test-model",
                                     prompt=["A", "B"],
@@ -1429,7 +1522,10 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               tensor_parallel_size=tp_size,
               num_postprocess_workers=2,
               postprocess_tokenizer_dir=llama_model_path)
-    golden_result = "D E F G H I"
+    # Qwen3's byte-level BPE tokenizer folds the space before the first
+    # generated token into that token itself, so the decoded continuation
+    # of "A B C" carries a leading space that TinyLlama's tokenizer didn't.
+    golden_result = " D E F G H I"
     outputs = []
     for output in llm.generate_async(prompts[0],
                                      sampling_params=sampling_params,

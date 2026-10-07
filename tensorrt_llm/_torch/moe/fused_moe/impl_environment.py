@@ -40,6 +40,12 @@ class MoEDep(str, Enum):
     MEGAMOE_CUTEDSL_RUNTIME = "megamoe_cutedsl_runtime"
     #: The ``trtllm::cute_dsl_megamoe_nvfp4_*`` custom ops are registered.
     MEGAMOE_CUTEDSL_OP = "megamoe_cutedsl_op"
+    #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
+    #: kernels are written against.
+    CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: Locality-domain execution is usable here: SM107, driver support, and
+    #: ``DISABLE_LOCALITY_DOMAINS`` unset.
+    LOCALITY_DOMAIN = "locality_domain"
 
 
 class MoEEnvFlag(str, Enum):
@@ -48,6 +54,11 @@ class MoEEnvFlag(str, Enum):
     #: Opt-in to the FlashInfer provider for quantized TRTLLM-Gen. Changes the
     #: routing split, which is why load-balancer eligibility depends on it.
     TRTLLM_GEN_USE_FLASHINFER = "TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER"
+    #: Opt-in to folding the shared experts into the routed grouped GEMM.
+    #: Collected rather than read from ``os.environ`` because it changes how
+    #: many expert slots the GEMM builds: two ranks disagreeing on it would
+    #: otherwise share a fingerprint while building differently shaped layers.
+    SHARED_EXPERT_FUSION = "TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"
 
 
 # Probe details are logged but excluded from the stable fingerprint.
@@ -94,6 +105,22 @@ def _probe_megamoe_cutedsl_runtime() -> Tuple[bool, str]:
     return bool(available), "" if available else str(reason)
 
 
+def _probe_cutedsl_rubin() -> Tuple[bool, str]:
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return True, ""
+    return False, "installed CuTe DSL lacks Rubin helpers"
+
+
+def _probe_locality_domain() -> Tuple[bool, str]:
+    from ...locality_domain_utils import is_locality_domain_enabled
+
+    if is_locality_domain_enabled():
+        return True, ""
+    return False, "locality domain unsupported or disabled on this machine"
+
+
 def _probe_megamoe_cutedsl_op() -> Tuple[bool, str]:
     # Read the module because registration updates this flag after import.
     from ..custom_ops import cute_dsl_megamoe_custom_op as megamoe_op
@@ -109,11 +136,14 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
+    MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
 # Preserve prior defaults when environment variables are unset.
 _ENV_FLAG_DEFAULTS: Dict[MoEEnvFlag, str] = {
     MoEEnvFlag.TRTLLM_GEN_USE_FLASHINFER: "0",
+    MoEEnvFlag.SHARED_EXPERT_FUSION: "0",
 }
 
 _CACHED_ENVIRONMENT: Optional[MoEEnvironment] = None

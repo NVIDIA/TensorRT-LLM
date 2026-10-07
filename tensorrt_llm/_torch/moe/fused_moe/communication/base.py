@@ -24,11 +24,33 @@ Key Design: Communication dispatch can happen BEFORE or AFTER quantization
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from collections.abc import Hashable
+from typing import List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
 from tensorrt_llm.mapping import Mapping
+
+
+@runtime_checkable
+class CheckpointableCommunication(Protocol):
+    """MoE communication resource participating in engine sleep/wakeup.
+
+    Implementations own their local checkpoint details and expose a stable key
+    so the executor invokes each shared workspace exactly once.
+    """
+
+    def checkpoint_resource_key(self) -> Hashable:
+        """Return the identity shared by wrappers using one checkpoint resource."""
+        ...
+
+    def checkpoint_prepare(self) -> None:
+        """Detach checkpoint-backed resources after global quiescence."""
+        ...
+
+    def checkpoint_restore(self) -> None:
+        """Restore checkpoint-backed resources before admission reopens."""
+        ...
 
 
 class Communication(ABC):
@@ -100,6 +122,16 @@ class Communication(ABC):
         Default: True for most strategies (post-quant is more common)
         """
         return True
+
+    def uses_internal_dispatch_quantization(self) -> bool:
+        """Return whether dispatch itself quantizes BF16 activations.
+
+        Strategies returning ``True`` receive unquantized activations and
+        return the quantized payload plus its scales. The external-comm
+        scheduler must therefore not invoke ``backend.quantize_input`` on
+        either side of dispatch.
+        """
+        return False
 
     def prepare_dispatch(
         self,

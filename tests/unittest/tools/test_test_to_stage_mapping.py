@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import random
 import re
@@ -8,15 +23,13 @@ from types import SimpleNamespace
 
 import pytest
 
-pytestmark = pytest.mark.cpu_only
-
-# Add scripts directory to path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
-SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
-sys.path.insert(0, SCRIPTS_DIR)
-
+__extra_import_path__ = ["~/scripts"]
 from test_to_stage_mapping import StageQuery
 
+pytestmark = pytest.mark.cpu_only
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+SCRIPTS_DIR = os.path.join(REPO_ROOT, 'scripts')
 GROOVY = os.path.join(REPO_ROOT, 'jenkins', 'L0_Test.groovy')
 DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
                       'test-db')
@@ -156,7 +169,8 @@ def test_unknown_stage_reports_a_diagnostic(stage_query):
     script = os.path.join(SCRIPTS_DIR, 'test_to_stage_mapping.py')
     proc = subprocess.run([sys.executable, script, '--stages', bogus],
                           stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          stderr=subprocess.PIPE,
+                          timeout=60)
     assert not proc.stdout.strip(), 'Unknown stage should map to no tests'
     assert f'unknown stage: {bogus}' in proc.stderr.decode()
 
@@ -183,7 +197,8 @@ def test_known_stage_without_tests_is_reported(tmp_path):
         str(tmp_path), '--stages', 'Empty-PyTorch-1', 'Filled-PyTorch-1'
     ],
                           stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE)
+                          stderr=subprocess.PIPE,
+                          timeout=60)
     assert proc.stdout.decode().split() == ['unittest/l0_filled.py']
     assert 'no tests mapped to: Empty-PyTorch-1' in proc.stderr.decode()
 

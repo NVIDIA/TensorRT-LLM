@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
-#include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/kernels/rmsnormKernels.h"
 #include "tensorrt_llm/runtime/cudaStream.h"

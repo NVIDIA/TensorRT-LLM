@@ -53,9 +53,11 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
                               PromptTokensDetails, ResponsesRequest,
-                              ResponsesResponse, StreamOptions, ToolCall,
-                              UsageInfo, to_disaggregated_params)
-from .tool_parser.base_tool_parser import BaseToolParser
+                              ResponsesResponse, SpeculativeDecodingStats,
+                              StreamOptions, ToolCall, UsageInfo,
+                              to_disaggregated_params)
+from .tool_parser.base_tool_parser import (BaseToolParser,
+                                           warn_if_tool_call_unparsed)
 from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
 
@@ -143,6 +145,74 @@ class ChatPostprocArgs(PostprocArgs):
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
         )
+
+
+def _build_spec_decode_stats(
+        counters: Any, args: PostprocArgs,
+        finish_reason: Optional[str]) -> Optional[SpeculativeDecodingStats]:
+    """Derive per-request speculative-decoding acceptance for one sequence.
+
+    ``counters`` is the sequence's own ``CompletionOutput._spec_dec_counters``,
+    never the request-level copies on the GenerationResult: with n > 1 every
+    candidate reports its own counters and those copies hold whichever
+    candidate responded last. Callers read it with getattr, since outputs that
+    are not a CompletionOutput (test doubles, for one) lack the field.
+
+    Returns None -- meaning the field is omitted entirely -- when the caller has
+    not opted in, when the sequence has not finished (streaming carries this
+    only on the terminal chunk), when the request never drafted, or when the
+    executor attached no per-position vectors, as on the non-PyTorch backend.
+
+    per_pos_accepted is prefix-cumulative and therefore a survival function:
+    entry k counts the steps that accepted *at least* k+1 draft tokens. The
+    acceptance histogram is its negative first difference. Totals come from
+    spec_dec_totals, which the executor accumulates exactly, rather than from
+    summing the vectors.
+    """
+    if (not args.return_spec_decode_stats or finish_reason is None
+            or counters is None):
+        return None
+    totals = counters.spec_dec_totals
+    per_pos_accepted = counters.per_pos_accepted
+    per_pos_drafted = counters.per_pos_drafted
+    if not totals or not per_pos_drafted or not per_pos_accepted:
+        return None
+    accepted, drafted = totals
+    # Position 0 is incremented once for every step that drafted at all, so it
+    # is the verify-step count.
+    num_spec_steps = per_pos_drafted[0]
+    if drafted <= 0 or num_spec_steps <= 0:
+        return None
+
+    # Survival is non-increasing, so its positive entries form a prefix whose
+    # length is the deepest acceptance any single step reached.
+    deepest = 0
+    for count in per_pos_accepted:
+        if count <= 0:
+            break
+        deepest += 1
+
+    # Size to the configured draft budget when there is one, so the histogram's
+    # length describes the configuration rather than what this request happened
+    # to reach. Under draft_len_schedule there is no fixed bound, so it sizes to
+    # the observed depth instead.
+    num_spec_tokens = args.spec_decode_num_spec_tokens
+    width = deepest if num_spec_tokens is None else max(deepest,
+                                                        num_spec_tokens)
+    histogram = [0] * (width + 1)
+    histogram[0] = num_spec_steps - per_pos_accepted[0]
+    for j in range(1, deepest + 1):
+        following = per_pos_accepted[j] if j < len(per_pos_accepted) else 0
+        histogram[j] = per_pos_accepted[j - 1] - following
+
+    return SpeculativeDecodingStats(
+        acceptance_rate=accepted / drafted,
+        total_accepted_draft_tokens=accepted,
+        total_draft_tokens=drafted,
+        num_spec_steps=num_spec_steps,
+        acceptance_histogram=histogram,
+        num_spec_tokens=num_spec_tokens,
+    )
 
 
 def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
@@ -250,6 +320,9 @@ def apply_tool_parser(args: ChatPostprocArgs,
         normal_text, calls = result.normal_text, result.calls
         if result.calls:
             args.has_tool_call[output_index] = True
+        if not streaming:
+            warn_if_tool_call_unparsed(args.tool_parser, tool_parser, text,
+                                       calls)
     else:
         normal_text, calls = text, []
 
@@ -354,7 +427,11 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
     res: List[str] = []
     finish_reason_sent = [False] * args.num_choices
-    prompt_tokens = args.num_prompt_tokens - args.num_prompt_tokens_offset
+    # num_prompt_tokens stays None until a prompt length is recorded, and only
+    # the usage branches below consume it, so offset it only once it exists.
+    prompt_tokens = args.num_prompt_tokens
+    if prompt_tokens is not None:
+        prompt_tokens -= args.num_prompt_tokens_offset
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
     stream_response_id, stream_created = _ensure_stream_metadata(
         args, rsp, "chatcmpl")
@@ -364,6 +441,17 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     else:
         include_usage = False
         include_continuous_usage = False
+    if include_usage and prompt_tokens is None:
+        # The usage chunks below feed prompt_tokens into UsageInfo (int fields)
+        # and into the total_tokens arithmetic. The server records the prompt
+        # length before the first chunk is post-processed (the executor does so
+        # on the postproc-worker path), so a missing count here means the
+        # caller wired PostprocArgs without one; fail with a clear message
+        # instead of a TypeError from the usage math.
+        raise ValueError(
+            "Streaming usage was requested, but PostprocArgs.num_prompt_tokens "
+            "is not set; record the prompt token count before "
+            "chat_stream_post_processor reports usage.")
     if args.first_iteration:
         for i in range(args.num_choices):
             res.append(
@@ -502,6 +590,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
             stop_reason=output.stop_reason,
         )
         if args.return_logprobs:
@@ -667,6 +758,9 @@ def chat_response_post_processor(
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if output.finish_reason == "stop" and args.has_tool_call.get(
                 output.index, False):
@@ -795,6 +889,9 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
@@ -863,6 +960,9 @@ def completion_response_post_processor(
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',
                                                 None),
+            speculative_decoding=_build_spec_decode_stats(
+                getattr(output, '_spec_dec_counters', None), args,
+                output.finish_reason),
         )
         if args.return_logprobs:
             logprobs = output.logprobs

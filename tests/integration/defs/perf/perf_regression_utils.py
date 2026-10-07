@@ -264,6 +264,18 @@ def _calculate_diff(metric, new_value, baseline_value, maximize_metrics):
         return (baseline_value - new_value) / baseline_value * 100
 
 
+def _is_regressive(value, baseline_value, threshold, maximize):
+    """Return True when *value* misses *baseline_value* by more than *threshold*.
+
+    Shared by the pre-merge verdict and by the check on main's own latest value,
+    so the two can never drift apart. The comparison is strict: a value sitting
+    exactly on baseline_value * (1 -/+ threshold) is not a regression.
+    """
+    if maximize:
+        return value < baseline_value * (1 - threshold)
+    return value > baseline_value * (1 + threshold)
+
+
 def prepare_regressive_test_cases(
     latest_history_data_dict,
     latest_baseline_threshold_dict,
@@ -277,10 +289,26 @@ def prepare_regressive_test_cases(
 
     Uses baseline/threshold fields from latest_baseline_threshold_dict when
     available, otherwise falls back to calculating baseline from history data.
+
+    Returns the set of pre-merge cmd_idx whose regression must not fail the
+    stage because the latest post-merge record for the same case is itself
+    beyond the pre-merge threshold. Both pipelines compare against one shared
+    baseline, so a regression landed on main would otherwise make every
+    subsequent PR measure the same regressed value and fail for a change it did
+    not introduce.
+
+    The latest post-merge value is re-evaluated here against the same baseline
+    and the same pre-merge threshold, rather than reusing the b_is_regression
+    the post-merge run recorded at its own tighter threshold. That makes the
+    exemption exactly as wide as the failure it prevents: if main sits within
+    the pre-merge threshold, a PR reproducing main's value does not fail the
+    gate, so there is nothing to exempt and the gate stays armed.
     """
+    exempt_cmd_idxs = set()
+
     # If latest_history_data_dict is None (network failure), skip regression check
     if latest_history_data_dict is None:
-        return
+        return exempt_cmd_idxs
 
     for cmd_idx in new_data_dict:
         new_data = new_data_dict[cmd_idx]
@@ -291,6 +319,13 @@ def prepare_regressive_test_cases(
         is_post_merge = new_data.get("b_is_post_merge", False)
         regressive_metrics = []
         info_lines = []
+
+        # The latest post-merge record for this same case, used only to decide
+        # whether a pre-merge regression predates the change under test.
+        latest_post_merge = None if is_post_merge else latest_history_data_dict.get(cmd_idx)
+        if not isinstance(latest_post_merge, dict):
+            latest_post_merge = None
+        post_merge_regressive_metrics = []
 
         # Pre-calculate fallback baseline from history if needed
         fallback_baseline = None
@@ -340,19 +375,42 @@ def prepare_regressive_test_cases(
 
             # Check if this metric is regressive (only for key regression metrics)
             if metric in regression_metrics:
-                if metric in maximize_metrics:
-                    # Regressive if new_value < baseline_value * (1 - threshold)
-                    if new_value < baseline_value * (1 - threshold):
-                        regressive_metrics.append(metric)
-                else:
-                    # Regressive if new_value > baseline_value * (1 + threshold)
-                    if new_value > baseline_value * (1 + threshold):
-                        regressive_metrics.append(metric)
+                maximize = metric in maximize_metrics
+                if _is_regressive(new_value, baseline_value, threshold, maximize):
+                    regressive_metrics.append(metric)
+
+                # Re-evaluate main's own latest value against this same baseline
+                # and this same (pre-merge) threshold. Anything unusable -- field
+                # absent, null, non-numeric, non-positive -- must not exempt, so
+                # a broken post-merge record leaves the gate armed.
+                if latest_post_merge is not None:
+                    prior_value = _safe_float(latest_post_merge.get(metric), None)
+                    if (
+                        prior_value is not None
+                        and prior_value > 0
+                        and _is_regressive(prior_value, baseline_value, threshold, maximize)
+                    ):
+                        post_merge_regressive_metrics.append(metric)
 
         test_case = new_data.get("s_test_case_name", "unknown")
         header = f"Regression in {test_case}:"
         new_data["s_regression_info"] = "\n".join([header] + info_lines)
         new_data["b_is_regression"] = len(regressive_metrics) > 0
+
+        # A pre-merge regression is not this PR's fault when main's own latest
+        # value already misses the same gate. post_merge_regressive_metrics is
+        # only ever populated on a pre-merge run, so post-merge is unaffected.
+        if post_merge_regressive_metrics:
+            exempt_cmd_idxs.add(cmd_idx)
+            if new_data["b_is_regression"]:
+                new_data["s_regression_info"] += (
+                    "\n  Not failing this stage: the latest post-merge run of this test "
+                    "case already misses the same threshold against the same baseline "
+                    f"({', '.join(post_merge_regressive_metrics)}), so this regression "
+                    "predates the change under test."
+                )
+
+    return exempt_cmd_idxs
 
 
 def _safe_float(value, default):
@@ -409,40 +467,54 @@ def add_baseline_fields_to_post_merge_data(
                 new_data[baseline_key] = baseline_val
 
 
-def check_perf_regression(new_data_dict, fail_on_regression=False):
+def check_perf_regression(new_data_dict, fail_on_regression=False, exempt_cmd_idxs=None):
     """Check performance regression by printing s_regression_info.
 
     Post-merge regressions log warnings. Pre-merge
     regressions raise RuntimeError when fail_on_regression is True.
+
+    Cases in exempt_cmd_idxs are reported as warnings but never raise: their
+    regression is already present on main, so failing here would block a PR for
+    a change it did not introduce. See prepare_regressive_test_cases.
     """
-    regressive_data_list = [
-        data for data in new_data_dict.values() if data.get("b_is_regression", False)
+    exempt_cmd_idxs = exempt_cmd_idxs or set()
+
+    regressive_data_items = [
+        (cmd_idx, data)
+        for cmd_idx, data in new_data_dict.items()
+        if data.get("b_is_regression", False)
     ]
 
-    if not regressive_data_list:
+    if not regressive_data_items:
         print_info("No regression data found.")
         return
 
     post_merge_regressions = [
-        data for data in regressive_data_list if data.get("b_is_post_merge", False)
+        data for _, data in regressive_data_items if data.get("b_is_post_merge", False)
     ]
     pre_merge_regressions = [
-        data for data in regressive_data_list if not data.get("b_is_post_merge", False)
+        (cmd_idx, data)
+        for cmd_idx, data in regressive_data_items
+        if not data.get("b_is_post_merge", False)
     ]
 
     # Print post-merge regression details as warnings
     for data in post_merge_regressions:
         print_warning(data.get("s_regression_info", ""))
 
-    # Print pre-merge regression details and raise error
-    if pre_merge_regressions:
-        error_parts = []
-        for data in pre_merge_regressions:
-            info = data.get("s_regression_info", "")
-            print_warning(info)
+    # Print pre-merge regression details and raise error. An exempt case is
+    # still reported -- the measurement is real -- but withheld from the error.
+    error_parts = []
+    for cmd_idx, data in pre_merge_regressions:
+        info = data.get("s_regression_info", "")
+        print_warning(info)
+        if cmd_idx not in exempt_cmd_idxs:
             error_parts.append(info)
-        if fail_on_regression:
-            raise RuntimeError("\n".join(error_parts))
+
+    # Guard on error_parts, not on pre_merge_regressions: when every regressive
+    # case is exempt there is nothing to report and nothing to fail.
+    if fail_on_regression and error_parts:
+        raise RuntimeError("\n".join(error_parts))
 
 
 def process_and_upload_test_results(
@@ -511,8 +583,9 @@ def process_and_upload_test_results(
         lookup_data_dict, match_keys, common_values_dict
     )
 
-    # Step 6: Compute regression info
-    prepare_regressive_test_cases(
+    # Step 6: Compute regression info. Cases whose regression is already present
+    # on the latest post-merge run are reported but must not fail the stage.
+    exempt_cmd_idxs = prepare_regressive_test_cases(
         latest_history_data_dict,
         latest_baseline_threshold_dict,
         history_data_dict,
@@ -535,4 +608,8 @@ def process_and_upload_test_results(
     # Step 9: Check regression (auto-detect fail behavior if not specified)
     if fail_on_regression is None:
         fail_on_regression = not is_post_merge
-    check_perf_regression(new_data_dict, fail_on_regression=fail_on_regression)
+    check_perf_regression(
+        new_data_dict,
+        fail_on_regression=fail_on_regression,
+        exempt_cmd_idxs=exempt_cmd_idxs,
+    )

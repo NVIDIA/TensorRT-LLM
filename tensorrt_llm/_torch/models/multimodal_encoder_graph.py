@@ -43,7 +43,7 @@ from ..utils import make_weak_ref, torch_compiling
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import MultimodalEncoderCudaGraphConfig
-    from ..attention_backend import AttentionMetadata
+    from ..attention.backends import AttentionMetadata
 
 # Single token kept aside for the dummy padding context when `enable_padding=True`.
 # The attention backend rejects zero-length contexts, so the dummy must contain at least one token

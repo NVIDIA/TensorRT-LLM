@@ -21,7 +21,6 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
-from ..bindings import executor as tllm
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -43,7 +42,7 @@ from .result import GenerationResult, IterationResult
 from .utils import IntraProcessQueue, ProcessPoolExecutorSession, RequestError
 
 if TYPE_CHECKING:
-    from .._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
+    from .._torch.disaggregation.kv_cache_transceiver import KvCacheTransceiver
     from .proxy import GenerationExecutorProxy
     from .worker import GenerationExecutorWorker
 
@@ -146,7 +145,8 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
+            prompt_token_ids[0], int)
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()
@@ -245,10 +245,10 @@ class GenerationExecutor(ABC):
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
                 # drop logits if users didn't explicitly ask for it, or if it's using PostProcess flow
                 drop_context_logits=(
-                    not request.sampling_params._need_return_context_logits)
+                    not request.sampling_params.return_context_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 drop_generation_logits=(
-                    not request.sampling_params._need_return_generation_logits)
+                    not request.sampling_params.return_generation_logits)
                 or self.postproc_config.num_postprocess_workers > 0,
                 logprobs_simple_format=request.sampling_params.
                 logprobs_simple_format,
@@ -380,6 +380,28 @@ class GenerationExecutor(ABC):
     @abstractmethod
     def shutdown(self):
         pass
+
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"start_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
+
+    def stop_profile(self) -> None:
+        """Stop runtime profiling in the backend engine.
+
+        Default implementation logs a warning. Subclasses that back a
+        ``PyExecutor`` should override to forward the call.
+        """
+        logger.warning(f"stop_profile is not supported on executor type "
+                       f"{type(self).__name__}.")
 
     @property
     def resource_governor_queue(self):
@@ -536,7 +558,6 @@ class GenerationExecutor(ABC):
     @staticmethod
     def create(
         engine: Path,
-        executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
@@ -598,7 +619,6 @@ class GenerationExecutor(ABC):
 
         worker_kwargs = {
             "engine": engine,
-            "executor_config": executor_config,
             "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,

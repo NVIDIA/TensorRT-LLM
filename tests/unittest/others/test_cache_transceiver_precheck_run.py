@@ -39,19 +39,8 @@ import types
 
 import pytest
 
-_PRECHECK_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..",
-    "..",
-    "..",
-    "tests",
-    "scripts",
-    "perf-sanity",
-    "cache_transceiver_precheck",
-)
-sys.path.insert(0, os.path.abspath(_PRECHECK_DIR))
-
-import run_precheck as rp  # noqa: E402  (stdlib-only at import time)
+__extra_import_path__ = ["~/tests/scripts/perf-sanity/cache_transceiver_precheck"]
+import run_precheck as rp
 
 KEY = b"k" * 32
 

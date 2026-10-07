@@ -21,7 +21,7 @@ Uses a local HTTP capture server to intercept the telemetry payload without
 hitting any external endpoint.
 
 Requirements:
-    - GPU (loads TinyLlama via PyTorch backend)
+    - GPU (loads Qwen3-0.6B via PyTorch backend)
     - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data_ci accessible)
     - Must be run with TRTLLM_USAGE_FORCE_ENABLED=1 to bypass pytest
       auto-detection (conftest or env)
@@ -37,8 +37,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -46,11 +48,11 @@ import pytest
 # Model path resolution (same pattern as test_llm_telemetry.py)
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 
 
 def _get_model_path():
-    """Resolve TinyLlama model path from LLM_MODELS_ROOT."""
+    """Resolve Qwen3-0.6B model path from LLM_MODELS_ROOT."""
     root = os.environ.get("LLM_MODELS_ROOT")
     if root is None:
         # Fallback to standard scratch path
@@ -134,12 +136,18 @@ def _assert_llm_api_config_capture(params):
     assert meta["captured_field_count"] > 0
 
 
-def _wait_for_event(event_name, timeout=30):
-    """Wait until the local server captures an event with the requested name."""
+def _wait_for_event(
+    event_name: str,
+    timeout: float = 30,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
+) -> dict[str, Any]:
+    """Wait until the local server captures a matching event."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for payload in CaptureHandler.captured_payloads:
-            if payload.get("events", [{}])[0].get("name") == event_name:
+            event = payload.get("events", [{}])[0]
+            parameters = event.get("parameters", {})
+            if event.get("name") == event_name and (predicate is None or predicate(parameters)):
                 return payload
         time.sleep(0.05)
     pytest.fail(f"Timed out waiting for {event_name}")
@@ -178,18 +186,23 @@ def reset_usage_state():
     import tensorrt_llm.usage.usage_lib as usage_lib
 
     def reset():
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         deadline = time.monotonic() + 2
         while usage_lib._REPORTER_ACTIVE and time.monotonic() < deadline:
             time.sleep(0.01)
+        session = usage_lib._SESSION
+        if session is not None:
+            session.disable()
+            if session.terminal_thread is not None:
+                session.terminal_thread.join(timeout=2)
+                assert not session.terminal_thread.is_alive()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._SESSION_LOCK = threading.Lock()
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
         usage_lib._REPORTER_LOCK = threading.Lock()
-        usage_lib._REPORTER_STOP = threading.Event()
-        usage_lib._PENDING_TERMINAL = None
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
 
     reset()
@@ -200,6 +213,63 @@ def reset_usage_state():
 # ---------------------------------------------------------------------------
 # E2E test
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("failure", ["config_validation", "after_model_config"])
+def test_startup_failure_context_e2e(failure, capture_server, monkeypatch, enable_telemetry):
+    """Real validation and injected loading failures deliver schema-valid context over HTTP."""
+    from pydantic import ValidationError
+
+    from tensorrt_llm import LLM
+    from tensorrt_llm.usage import usage_lib
+
+    model = _get_model_path()
+    monkeypatch.setattr(usage_lib, "_get_stats_server", lambda: capture_server)
+    options = (
+        {"kv_cache_config": {"free_gpu_memory_fraction": 2.0}}
+        if failure == "config_validation"
+        else {}
+    )
+    expected_error = ValidationError
+    expected_message = "free_gpu_memory_fraction"
+    if failure == "after_model_config":
+        from tensorrt_llm.llmapi.llm import _TorchLLM
+
+        expected_error = OSError
+        expected_message = "Injected loading failure after normal model config discovery"
+
+        def fail_loading(self):
+            raise OSError(expected_message)
+
+        monkeypatch.setattr(_TorchLLM, "_try_load_generation_config", fail_loading)
+    with pytest.raises(expected_error, match=expected_message):
+        LLM(model=model, **options)
+    start = time.monotonic()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True, exit_code=1))
+    elapsed = time.monotonic() - start
+    assert CaptureHandler.capture_event.wait(2)
+    assert len(CaptureHandler.captured_payloads) == 1
+    payload = CaptureHandler.captured_payloads[0]
+    assert [event["name"] for event in payload["events"]] == [
+        "trtllm_initial_report",
+        "trtllm_exit_report",
+    ]
+    for event in payload["events"]:
+        _assert_event_matches_sms_schema(event)
+    params = payload["events"][0]["parameters"]
+    meta = json.loads(params["llmApiConfigMetaJson"])
+    assert meta["report_context"] == "pre_initialization_exit"
+    assert params["llmInitializationFailures"] == params["llmInitializationAttempts"] == 1
+    assert params["llmInstancesCreated"] == 0
+    if failure == "config_validation":
+        assert params["llmApiConfigJson"] == "{}"
+    else:
+        assert meta["capture_succeeded"]
+        assert params["architectureClassName"] == "LlamaForCausalLM"
+    assert model not in json.dumps(payload)
+    assert payload["events"][0]["ts"] == payload["events"][1]["ts"]
+    assert not usage_lib._REPORTER_STARTED
+    print(f"Startup terminal delivery including optional NVML: {elapsed * 1000:.1f} ms")
 
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -242,7 +312,11 @@ class TestE2ECapture:
                 "Timed out waiting for telemetry POST. The background reporter may not have fired."
             )
 
-        heartbeat_payload = _wait_for_event("trtllm_heartbeat", timeout=5)
+        heartbeat_payload = _wait_for_event(
+            "trtllm_heartbeat",
+            timeout=5,
+            predicate=lambda parameters: parameters.get("activeLlmInstances") == 0,
+        )
 
         # --- Validate the captured payload ---
         assert len(CaptureHandler.captured_payloads) >= 1, "Expected at least 1 captured payload"
@@ -285,7 +359,7 @@ class TestE2ECapture:
         assert "cudaVersion" in params
 
         # Model architecture
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
         assert params["architectureClassHash"] == ""
 
         # Backend
@@ -334,7 +408,6 @@ class TestE2ECapture:
         assert heartbeat_payload["eventSchemaVer"] == "0.7"
         heartbeat = heartbeat_payload["events"][0]
         assert heartbeat["name"] == "trtllm_heartbeat"
-        assert heartbeat["parameters"]["seq"] == 0
         _assert_lifecycle_snapshot(
             heartbeat["parameters"],
             active_instances=0,

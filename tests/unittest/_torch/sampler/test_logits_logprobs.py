@@ -99,7 +99,7 @@ def llm(
         )
 
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         kv_cache_config=global_kvcache_config,
         max_batch_size=128,  # reduce buffer sizes, specially for generation logits
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -112,7 +112,7 @@ def llm(
 @pytest.fixture(scope="module")
 def simple_llm() -> LLM:
     llm = LLM(
-        model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
+        model=os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B"),
         max_batch_size=8,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
@@ -131,8 +131,7 @@ def check_generated_output(
 ):
     if gather_context_logits:
         assert output.context_logits is not None
-        # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
-        expected_len = len(prompts[0].split()) + 1
+        expected_len = len(output.prompt_token_ids)
         assert expected_len == output.context_logits.shape[0]
     else:
         assert output.context_logits is None
@@ -825,7 +824,7 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
 @force_ampere
 @pytest.mark.gpu2
 def test_logprobs_match_hf_tp2():
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     llm = LLM(
         model=model_path,
         tensor_parallel_size=2,
@@ -881,7 +880,7 @@ def test_logprobs_pp2():
     Without the fix, logprobs length = 2N-1 instead of N due to duplication
     in the PP ring broadcast diff mechanism.
     """
-    model_path = os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0")
+    model_path = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
     max_tokens = 16
     llm = LLM(
         model=model_path,
@@ -1316,14 +1315,14 @@ class TestLogsprobsInBatchedSampling:
             if is_processed_logprobs:
                 # NB: Test considers only temperature + top-k or beam search without temperature
                 if req.sampling_config.temperature is not None:
-                    req_logits = req_logits / req.sampling_config.temperature[0]
+                    req_logits = req_logits / req.sampling_config.temperature
             req_log_probs = req_logits.log_softmax(dim=-1)
             if is_processed_logprobs:
                 # NB: Test considers only temperature + top-k or beam search without temperature
                 if req.sampling_config.top_k is not None:
                     # Computing req_log_probs by renormalizing without masking. This avoids issues
                     # with non-deterministic tie-breaking in top-k.
-                    req_log_probs += torch.topk(req_log_probs, k=req.sampling_config.top_k[0])[
+                    req_log_probs += torch.topk(req_log_probs, k=req.sampling_config.top_k)[
                         0
                     ].log_softmax(dim=-1).amax(dim=-1, keepdim=True) - req_log_probs.amax(
                         dim=-1, keepdim=True
@@ -1394,9 +1393,7 @@ class TestLogsprobsInBatchedSampling:
                             returned_topk_logprobs.pop(sampled_token)
 
                         # validate ranks and suppress masked tokens
-                        req_top_k = None
-                        if (req_top_ks := req.sampling_config.top_k) is not None:
-                            req_top_k = req_top_ks[0]
+                        req_top_k = req.sampling_config.top_k
                         returned_ranks = set()
                         for token, logprob in returned_topk_logprobs.items():
                             assert logprob.rank not in returned_ranks

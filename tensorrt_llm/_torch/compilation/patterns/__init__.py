@@ -13,4 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from inspect import signature
+from typing import Callable, List
+
+import torch
+
 MATCHER_SUBSYSTEM = "torch_compile"
+
+
+def _make_pattern_example_inputs(
+        search_fn: Callable[..., object]) -> List[torch.Tensor]:
+    """Dummy inputs for register_replacement when using search_fn_pattern.
+
+    Torch 2.13+ always builds initial_arg_info from example_inputs via
+    _trace_args_for_initial_trace, even when search_fn_pattern is supplied.
+    Empty [] raises IndexError. These tensors are only for signature
+    flattening; matching still uses search_fn_pattern.
+    """
+    return [torch.empty(0) for _ in signature(search_fn).parameters]

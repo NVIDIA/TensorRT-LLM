@@ -41,7 +41,7 @@ from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from ..conftest import llm_models_root
 
-MODEL = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 SPEC_MODEL = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 EAGLE3_MODEL = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
 PROMPT_TOKEN_IDS = [1] + [42] * 63 + [43]
@@ -484,7 +484,6 @@ def test_zero_runtime_draft_speculation_after_final_token_reuse(
     speculative_config = Eagle3DecodingConfig(
         max_draft_len=1,
         speculative_model=EAGLE3_MODEL,
-        eagle3_one_model=True,
         # Batch size one drafts one token. Larger batches use the implicit
         # zero-draft schedule entry and therefore exercise this stage's gate.
         draft_len_schedule={1: 1},

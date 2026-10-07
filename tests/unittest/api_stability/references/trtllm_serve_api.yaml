@@ -364,6 +364,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   CompletionResponse:
     fields:
@@ -453,6 +459,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   CompletionStreamResponse:
@@ -614,6 +626,12 @@ models:
         kind: openai
         type: Optional[Union[Literal['none', 'auto', 'required'], ChatCompletionNamedToolChoiceParam]]
         default: none
+        status: stable
+        required: false
+      parallel_tool_calls:
+        kind: openai
+        type: Optional[bool]
+        default: null
         status: stable
         required: false
       user:
@@ -778,6 +796,12 @@ models:
         default: null
         status: stable
         required: false
+      injected_chat_template_kwargs:
+        kind: extension
+        type: Optional[List[str]]
+        default: null
+        status: prototype
+        required: false
       media_io_kwargs:
         kind: extension
         type: Optional[Dict[MediaModality, Dict[str, Any]]]
@@ -871,6 +895,12 @@ models:
         default: null
         status: beta
         required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
+        required: false
 
   ChatCompletionResponse:
     fields:
@@ -960,6 +990,12 @@ models:
         type: Optional[float]
         default: null
         status: beta
+        required: false
+      speculative_decoding:
+        kind: extension
+        type: Optional[SpeculativeDecodingStats]
+        default: null
+        status: prototype
         required: false
 
   ChatCompletionStreamResponse:
@@ -1471,11 +1507,29 @@ models:
         default: null
         status: stable
         required: false
+      image_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      video_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
+      audio_reference:
+        kind: extension
+        type: Optional[Union[UploadFile, MediaReferenceItem, List[MediaReferenceItem]]]
+        default: null
+        status: prototype
+        required: false
       input_reference:
         kind: extension
         type: Optional[Union[str, UploadFile]]
         default: null
-        status: prototype
+        status: deprecated
         required: false
       size:
         kind: extension
@@ -1548,4 +1602,24 @@ models:
         type: Optional[str]
         default: null
         status: stable
+        required: false
+  MediaReferenceItem:
+    fields:
+      content:
+        kind: extension
+        type: str
+        default: null
+        status: prototype
+        required: true
+      format:
+        kind: extension
+        type: Literal['path', 'url', 'base64']
+        default: null
+        status: prototype
+        required: true
+      role:
+        kind: extension
+        type: Optional[MediaRole]
+        default: null
+        status: prototype
         required: false

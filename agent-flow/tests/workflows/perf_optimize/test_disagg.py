@@ -133,14 +133,14 @@ def test_a_condition_the_user_wrote_that_disagrees_is_an_error(tmp_path):
 
 
 def test_profiling_reduces_to_nsys_on_the_gen_window(tmp_path):
-    """The harness only wraps workers in nsys; torch/ncu have no path in it."""
+    """The harness only wraps workers in nsys; ncu has no path in it."""
     harness = _write_harness(tmp_path)
     data = task_schema.load_and_validate_task_yaml(
         _write_task(
             tmp_path,
             {
                 "disagg": {"config": str(harness)},
-                "profile": {"methods": ["nsys", "torch", "ncu"], "kernel_coverage": {}},
+                "profile": {"methods": ["nsys", "ncu"], "kernel_coverage": {}},
             },
         )
     )
@@ -148,7 +148,7 @@ def test_profiling_reduces_to_nsys_on_the_gen_window(tmp_path):
     assert data["profile"]["nsys_iter_range"] == "200-250"
     assert "kernel_coverage" not in data["profile"]
     notes = " ".join(data["disagg"]["filled_from_disagg_config"])
-    assert "torch" in notes and "ncu" in notes
+    assert "ncu" in notes
 
 
 def test_focus_concurrencies_validate_against_the_backfilled_points(tmp_path):
@@ -225,11 +225,19 @@ def test_the_disagg_section_is_composed_only_for_a_disagg_campaign():
     per-turn inference the agent can get wrong.
     """
     aggregate = build_perf_optimize_prompts()
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa", "reporter"):
+    for role in (
+        "benchmarker",
+        "analyzer",
+        "optimizer",
+        "evaluator",
+        "integrator",
+        "qa",
+        "reporter",
+    ):
         assert DISAGG_CAMPAIGN not in getattr(aggregate, role)
 
     disagg_bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
         assert DISAGG_CAMPAIGN in getattr(disagg_bundle, role)
     # The reporter only synthesizes artifacts, the projector launches nothing.
     assert DISAGG_CAMPAIGN not in disagg_bundle.reporter
@@ -243,7 +251,7 @@ def test_the_disagg_section_is_composed_last_so_its_overrides_win():
     reads it after the guidance it replaces.
     """
     bundle = build_perf_optimize_prompts(include_disagg=True)
-    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "qa"):
+    for role in ("benchmarker", "analyzer", "optimizer", "evaluator", "integrator", "qa"):
         assert getattr(bundle, role).rstrip().endswith(DISAGG_CAMPAIGN.rstrip())
 
 

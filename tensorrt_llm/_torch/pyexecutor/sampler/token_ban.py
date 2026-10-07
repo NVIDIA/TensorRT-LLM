@@ -271,7 +271,7 @@ class TokenBanHandler(ABC):
                 for step in range(num_steps[index]):
                     if (
                         r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                    ) + pending + step < r.py_min_length[0]:
+                    ) + pending + step < r.py_min_length:
                         bans.rows.append(request_offset + num_steps[index] * beam_idx + step)
                         bans.cols.append(end_id)
                     else:
