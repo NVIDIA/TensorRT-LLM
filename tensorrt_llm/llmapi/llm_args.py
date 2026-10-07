@@ -797,11 +797,15 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the opt-in multimodal encoder embedding cache; 0 "
-         "disables it. String values such as '512MB' and '1GiB' use binary "
-         "units. Inline encoding caches whole single-modality requests; item "
-         "scheduling caches individual items. Compatible with side-stream "
-         "prefetch; their memory limits are additive."),
+        ("Target capacity in bytes for reusable multimodal encoder embeddings; "
+         "0 disables cross-request reuse. The capacity applies per rank; ranks "
+         "do not share a cache. With item scheduling, encoder outputs "
+         "still use the model-owned cache and its capacity is at least one legal "
+         "encoder iteration; this value can make that cache larger. String values "
+         "such as '512MB' and '1GiB' use binary units. Both inline encoding and "
+         "item scheduling cache individual items; inline caching supports only "
+         "single-modality parameters. "
+         "Compatible with side-stream prefetch."),
         status="prototype",
     )
 
@@ -813,7 +817,10 @@ class MultimodalConfig(StrictBaseModel):
             "scheduling and its byte budget off). DEFAULT: item scheduling. "
             "EAGER: item scheduling that advances encoder work for active "
             "requests before LLM capacity filtering. Ignored for models that "
-            "do not support item scheduling."),
+            "do not support item scheduling. Item scheduling does not support "
+            "pipeline parallelism yet: with pipeline_parallel_size > 1, "
+            "DEFAULT (explicit or unset) logs a warning and falls back to "
+            "legacy inline encode, while EAGER raises an error."),
         status="prototype",
     )
 

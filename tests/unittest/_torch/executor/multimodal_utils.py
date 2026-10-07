@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderRequestState,
     initialize_multimodal_encoder_request,
 )
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
 from tensorrt_llm.inputs.registry import (
@@ -33,14 +34,21 @@ def bare_mm_item_scheduler(
 ) -> MultimodalItemScheduler:
     """A scheduler with no budget resolution -- the engine only builds one when item
     scheduling is engaged, so these tests skip `create()` and exercise the item path."""
+    if model._multimodal_encoder_cache is None:
+        model._multimodal_encoder_cache = TensorLRUCache(1 << 20)
     return MultimodalItemScheduler(model=model, input_processor=input_processor)
 
 
-def make_llm_request(request_id: int, multimodal_data: dict[str, Any] | None = None) -> LlmRequest:
+def make_llm_request(
+    request_id: int,
+    multimodal_data: dict[str, Any] | None = None,
+    *,
+    input_tokens: list[int] | None = None,
+) -> LlmRequest:
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=1,
-        input_tokens=[1, 2, 3],
+        input_tokens=input_tokens or [1, 2, 3],
         sampling_config=SamplingConfig(),
         is_streaming=False,
         py_multimodal_data=multimodal_data,
@@ -54,26 +62,38 @@ def record_output(
     hidden: int = 1,
     fill: float = 0.0,
 ) -> None:
-    """Write one item the way the encoder step does, sized from its declaration."""
-    state.record(
-        item_idx,
-        torch.full((state.embedding_lengths[item_idx], hidden), fill),
-    )
+    """Mark one item ready without materializing an output tensor."""
+    del hidden, fill
+    state.item_ready[item_idx] = True
 
 
-def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] = ()) -> LlmRequest:
-    request = make_llm_request(
-        request_id,
-        multimodal_data={
-            "image": {"pixel_values": torch.empty(len(costs), 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
-                item_refs=[("image", item_idx) for item_idx in range(len(costs))],
-                encoder_token_lengths=costs,
-                output_embedding_lengths=[1] * len(costs),
-            ),
-            "multimodal_embedding_lengths": [1] * len(costs),
-        },
-    )
+def make_mm_request(
+    request_id: int,
+    costs: list[int],
+    *,
+    ready: Sequence[int] = (),
+    interleaved: bool = False,
+) -> LlmRequest:
+    """Make a request with one single-row item per cost.
+
+    With `interleaved`, the prompt places one text token before each item and
+    after the last one, so item `i` sits at prompt position `2 * i + 1`.
+    """
+    multimodal_data = {
+        "image": {"pixel_values": torch.empty(len(costs), 1)},
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            item_refs=[("image", item_idx) for item_idx in range(len(costs))],
+            encoder_token_lengths=costs,
+            output_embedding_lengths=[1] * len(costs),
+        ),
+        "multimodal_embedding_lengths": [1] * len(costs),
+    }
+    input_tokens = None
+    if interleaved:
+        embed_mask = [position % 2 for position in range(2 * len(costs) + 1)]
+        multimodal_data["multimodal_embed_mask_cumsum"] = torch.tensor(embed_mask).cumsum(0)
+        input_tokens = list(range(len(embed_mask)))
+    request = make_llm_request(request_id, multimodal_data, input_tokens=input_tokens)
     initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
     for item_idx in ready:
         record_output(request.py_mm_encoder_state, item_idx)
