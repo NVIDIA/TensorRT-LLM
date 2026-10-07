@@ -270,7 +270,8 @@ def test_manager_without_tokens_per_block_fails_closed():
 def test_gate_queries_the_native_kernel_lookup():
     """Inside a blocklisted cell the gate must ask the build what it
     contains, with the manager's KV dtype and the page size the engine will
-    use."""
+    use. A 16-bit KV cache pairs with exactly one output precision (matched),
+    so the gate asks exactly once."""
     with (
         mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103),
         mock.patch.object(
@@ -281,15 +282,100 @@ def test_gate_queries_the_native_kernel_lookup():
         metadata = TrtllmAttentionMetadata(
             max_num_requests=4,
             max_num_tokens=1024,
-            kv_cache_manager=SimpleNamespace(head_dim=64, dtype=DataType.FP8, tokens_per_block=32),
+            kv_cache_manager=SimpleNamespace(head_dim=64, dtype=DataType.BF16, tokens_per_block=32),
             runtime_features=ALL_FEATURES,
         )
     assert metadata.use_paged_context_fmha
-    # output_dtype follows the binding's probe convention: FP8 output for the
-    # FP8/NVFP4 KV kernels, matched 16-bit output otherwise.
     lookup.assert_called_once_with(
         head_size=64,
-        kv_cache_dtype=DataType.FP8,
+        kv_cache_dtype=DataType.BF16,
+        tokens_per_block=32,
+        output_dtype=DataType.BF16,
+    )
+
+
+# For an FP8 KV cache the op quantizes Q to FP8 but keeps the output at the
+# activation dtype (BF16/FP16) unless FP8 attention output is enabled, so any
+# of these output precisions may be the one the model runs.
+_FP8_KV_OUTPUT_VARIANTS = (DataType.BF16, DataType.HALF, DataType.FP8)
+
+
+def _make_fp8_kv_metadata(kernel_exists_stub):
+    with (
+        mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103),
+        mock.patch.object(
+            thop, "fused_context_fmha_kernel_exists", side_effect=kernel_exists_stub, create=True
+        ) as lookup,
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"),
+    ):
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=4,
+            max_num_tokens=1024,
+            kv_cache_manager=SimpleNamespace(head_dim=64, dtype=DataType.FP8, tokens_per_block=32),
+            runtime_features=ALL_FEATURES,
+        )
+    return metadata, lookup
+
+
+@pytest.mark.parametrize("present_output_dtype", _FP8_KV_OUTPUT_VARIANTS, ids=lambda d: d.name)
+def test_fp8_kv_admits_any_present_output_variant(present_output_dtype):
+    """With an FP8 KV cache, the activation dtype and the FP8-attention-output
+    flag are not knowable at metadata construction, so one present output
+    variant admits the cell. In particular a build that carries only the
+    activation-output cubin (BF16 model, no FP8 attention output) must not be
+    refused just because the FP8-output cubin is absent."""
+    metadata, _ = _make_fp8_kv_metadata(
+        lambda **kwargs: kwargs["output_dtype"] == present_output_dtype
+    )
+    assert metadata.use_paged_context_fmha
+
+
+def test_fp8_kv_refused_only_after_every_output_variant_is_absent():
+    """The FP8-KV refusal must be proven against every output precision the
+    op can pair with the cache, not a single hardcoded one."""
+    with (
+        mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103),
+        mock.patch.object(
+            thop, "fused_context_fmha_kernel_exists", return_value=False, create=True
+        ) as lookup,
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"),
+    ):
+        with pytest.raises(RuntimeError, match="64"):
+            TrtllmAttentionMetadata(
+                max_num_requests=4,
+                max_num_tokens=1024,
+                kv_cache_manager=SimpleNamespace(
+                    head_dim=64, dtype=DataType.FP8, tokens_per_block=32
+                ),
+                runtime_features=ALL_FEATURES,
+            )
+    assert {call.kwargs["output_dtype"] for call in lookup.call_args_list} == set(
+        _FP8_KV_OUTPUT_VARIANTS
+    )
+
+
+def test_nvfp4_kv_probes_fp8_output_only():
+    """An NVFP4 KV cache is read by the FP8-output kernel set; the gate must
+    not widen that probe to activation-dtype outputs."""
+    with (
+        mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103),
+        mock.patch.object(
+            thop, "fused_context_fmha_kernel_exists", return_value=True, create=True
+        ) as lookup,
+        mock.patch.object(TrtllmAttentionMetadata, "_post_init_with_buffers"),
+    ):
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=4,
+            max_num_tokens=1024,
+            kv_cache_manager=SimpleNamespace(
+                head_dim=64, dtype=DataType.NVFP4, tokens_per_block=32
+            ),
+            runtime_features=ALL_FEATURES,
+        )
+    assert metadata.use_paged_context_fmha
+    lookup.assert_called_once_with(
+        head_size=64,
+        kv_cache_dtype=DataType.NVFP4,
         tokens_per_block=32,
         output_dtype=DataType.FP8,
     )

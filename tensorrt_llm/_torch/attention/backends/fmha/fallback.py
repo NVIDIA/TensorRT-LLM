@@ -136,21 +136,34 @@ class FallbackFmha(Fmha):
                     f"prefix; the configuration stays refused. Rebuild the "
                     f"bindings, or use the FlashInfer attention backend."
                 )
-            # Probe with the output precision the kernel table pairs with
-            # this KV precision (matched output; FP8 output for the
-            # FP8/NVFP4 KV kernels), mirroring the binding's probe
-            # convention in test_context_fmha_kernel_presence.py. Dtypes the
-            # lookup does not model report absent, so they stay refused.
-            if kv_dtype in (DataType.FP8, DataType.NVFP4):
-                probe_output_dtype = DataType.FP8
+            # Probe with every output precision the op can pair with this
+            # KV precision. For an FP8 KV cache the op quantizes Q to FP8
+            # but keeps dataTypeOut at the activation dtype (BF16/FP16)
+            # unless FP8 attention output is enabled, and neither the
+            # activation dtype nor that per-module flag is knowable at
+            # metadata construction, so one present variant admits the
+            # cell; if the variant the model actually needs is the absent
+            # one, the exact-parameter refusal in get_attention_op still
+            # raises. An NVFP4 KV cache is read by the FP8-output kernels,
+            # and a 16-bit KV cache runs matched output, mirroring the
+            # binding's probe convention in
+            # test_context_fmha_kernel_presence.py. Dtypes the lookup does
+            # not model report absent, so they stay refused.
+            if kv_dtype == DataType.FP8:
+                probe_output_dtypes = (DataType.BF16, DataType.HALF, DataType.FP8)
+            elif kv_dtype == DataType.NVFP4:
+                probe_output_dtypes = (DataType.FP8,)
             else:
-                probe_output_dtype = kv_dtype
+                probe_output_dtypes = (kv_dtype,)
             if all(
-                kernel_exists(
-                    head_size=dim,
-                    kv_cache_dtype=kv_dtype,
-                    tokens_per_block=tokens_per_block,
-                    output_dtype=probe_output_dtype,
+                any(
+                    kernel_exists(
+                        head_size=dim,
+                        kv_cache_dtype=kv_dtype,
+                        tokens_per_block=tokens_per_block,
+                        output_dtype=probe_output_dtype,
+                    )
+                    for probe_output_dtype in probe_output_dtypes
                 )
                 for dim in absent
             ):
