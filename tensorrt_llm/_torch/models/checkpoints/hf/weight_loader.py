@@ -969,6 +969,13 @@ class HfWeightLoader(BaseWeightLoader):
             weight_files: List[str],
             local_communicator=None,
             allow_prefetch: bool = True) -> ConsumableWeightsDict:
+        """Prefetch checkpoint files to the host page cache when they fit in
+        cgroup-aware available host memory, then load weights in parallel.
+
+        Prefetch is skipped (while normal loading continues) unless the
+        files total less than 90% of ``_get_local_available_host_memory()``
+        and no layer override is set.
+        """
         # Prefetch the weight files to CPU memory if the size is less than 90% of the available memory.
         # This is a heuristic to avoid prefetching files that are too large and causing file cache thrashing.
         prefetch_size = sum(os.path.getsize(file) for file in weight_files)
