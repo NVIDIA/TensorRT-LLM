@@ -17,8 +17,10 @@ from tensorrt_llm._torch.visual_gen.config import (
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae import (
+    TiledAutoencoderKLMiniMaxH3,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import TiledAutoencoderKLMiniMaxH3
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel,
 )

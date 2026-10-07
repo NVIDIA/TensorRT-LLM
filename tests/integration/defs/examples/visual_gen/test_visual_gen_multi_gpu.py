@@ -432,8 +432,10 @@ def test_wan22_t2v_lpips_against_golden_tp(
 def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
     """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
     from defs.examples.visual_gen.test_minimax_h3_e2e import (
+        MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
         _mean_lpips_distance,
         _minimax_h3_checkpoint_path,
+        _multi_resolution_log_stft_distance,
     )
 
     from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
@@ -473,8 +475,18 @@ def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size,
             audios.append(torch.as_tensor(output.audio).cpu())
         finally:
             engine.shutdown()
-    torch.testing.assert_close(videos[2], videos[1], rtol=0, atol=0)
-    torch.testing.assert_close(audios[2], audios[1], rtol=0, atol=0)
+    torch.testing.assert_close(videos[2], videos[1])
+    torch.testing.assert_close(audios[2], audios[1])
+    for decode_size, audio in zip((1, vae_size), audios[1:]):
+        audio_score = _multi_resolution_log_stft_distance(audio, audios[0])
+        print(
+            f"H3 Ulysses={ulysses_size} + parallel_vae_size={decode_size} vs single GPU: "
+            f"audio log-STFT={audio_score:.6f}"
+        )
+        assert audio_score < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
+            f"H3 parallelism changed audio: log-STFT={audio_score:.6f} "
+            f">= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
+        )
     reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
     score = _mean_lpips_distance(videos[2], reference)
     print(

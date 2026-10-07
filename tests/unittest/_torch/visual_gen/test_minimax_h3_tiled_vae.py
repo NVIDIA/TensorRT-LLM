@@ -21,7 +21,9 @@ import pytest
 import torch
 from diffusers import AutoencoderKLMiniMaxH3
 
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.tiled_vae import TiledAutoencoderKLMiniMaxH3
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae import (
+    TiledAutoencoderKLMiniMaxH3,
+)
 
 pytestmark = pytest.mark.cpu_only
 

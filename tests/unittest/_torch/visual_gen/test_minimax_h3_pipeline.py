@@ -357,7 +357,6 @@ def test_pipeline_keeps_torch_compile_enabled(
             cpu_offload_config=SimpleNamespace(enable=False),
             cuda_graph=SimpleNamespace(enable=False),
             torch_compile=torch_compile,
-            extra_attrs={},
         )
 
     # The contract is the asymmetry: MiniMax-H3 rejects CUDA graphs and caching
@@ -457,7 +456,6 @@ def test_trtllm_attention_accepts_supported_gpu(
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
         cuda_graph=SimpleNamespace(enable=False),
-        extra_attrs={},
     )
     MiniMaxH3Pipeline(config)
 
