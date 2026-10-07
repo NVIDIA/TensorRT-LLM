@@ -32,6 +32,7 @@ never transposed into a real HND copy.
 """
 
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Optional, Tuple
@@ -171,6 +172,11 @@ def _quantize_mxfp8_v(x_bhsd: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]
 # ============================================================================
 
 
+def _sdpa_autotune_enabled() -> bool:
+    """Time every SDPA plan once per graph; keep the fastest."""
+    return os.environ.get("TRTLLM_CUDNN_SDPA_AUTOTUNE", "0") == "1"
+
+
 @dataclass
 class _CuDNNGraphBundle:
     """A built cuDNN graph plus the tensor handles needed to bind buffers."""
@@ -179,6 +185,8 @@ class _CuDNNGraphBundle:
     workspace_size: int
     inputs: Dict[str, Any] = field(default_factory=dict)
     outputs: Dict[str, Any] = field(default_factory=dict)
+    # Fastest plan from autotune; None until timed.
+    plan_index: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -300,7 +308,7 @@ class CuDNNAttention(AttentionBackend):
     def check_hardware_compatibility(
         cls, device: torch.device, quant_dtype: str | None = None
     ) -> None:
-        if get_sm_version() not in (100, 103) and quant_dtype is not None:
+        if get_sm_version() not in (100, 103, 107) and quant_dtype is not None:
             raise RuntimeError("cuDNN quantized attention requires NVIDIA Blackwell-class GPU.")
 
     @classmethod
@@ -451,7 +459,14 @@ class CuDNNAttention(AttentionBackend):
                 ).set_data_type(f32)
                 outputs[name] = tensor
 
-        graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if _sdpa_autotune_enabled():
+            graph.validate()
+            graph.build_operation_graph()
+            graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            graph.check_support()
+            graph.build_plans(cudnn.build_plan_policy.ALL)
+        else:
+            graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         return _CuDNNGraphBundle(
             graph=graph, workspace_size=graph.get_workspace_size(), inputs=inputs, outputs=outputs
         )
@@ -496,8 +511,63 @@ class CuDNNAttention(AttentionBackend):
         with torch.cuda.device(device):
             handle = cls._get_handle(device)
             cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream(device).cuda_stream)
-            workspace = torch.empty(bundle.workspace_size, dtype=torch.uint8, device=device)
-            bundle.graph.execute(tensor_map, workspace, handle=handle)
+            if not _sdpa_autotune_enabled():
+                workspace = torch.empty(bundle.workspace_size, dtype=torch.uint8, device=device)
+                bundle.graph.execute(tensor_map, workspace, handle=handle)
+                return
+            lowered = bundle.graph._lowered_graph
+            var_pack = {key.uid: tensor for key, tensor in tensor_map.items()}
+            plan_index = bundle.plan_index
+            if plan_index is None:
+                if torch.cuda.is_current_stream_capturing():
+                    # No timing during graph capture: use the heuristic plan.
+                    plan_index = 0
+                else:
+                    plan_index = bundle.plan_index = cls._autotune_plan(
+                        lowered, var_pack, device, handle
+                    )
+            ws_size = lowered.get_workspace_size_plan_at_index(plan_index)
+            workspace = torch.empty(max(ws_size, 1), dtype=torch.uint8, device=device)
+            lowered.execute_plan_at_index(var_pack, workspace, plan_index, handle)
+
+    @staticmethod
+    @torch.compiler.disable
+    def _autotune_plan(
+        lowered: Any,
+        var_pack: Dict[int, torch.Tensor],
+        device: torch.device,
+        handle: Any,
+        iters: int = 3,
+    ) -> int:
+        """Return the index of the fastest built plan."""
+        best, best_ms = 0, float("inf")
+        stream = torch.cuda.current_stream(device)
+        for idx in range(lowered.get_execution_plan_count()):
+            try:
+                ws_size = lowered.get_workspace_size_plan_at_index(idx)
+                workspace = torch.empty(max(ws_size, 1), dtype=torch.uint8, device=device)
+                lowered.execute_plan_at_index(var_pack, workspace, idx, handle)
+                start, end = (
+                    torch.cuda.Event(enable_timing=True),
+                    torch.cuda.Event(enable_timing=True),
+                )
+                start.record(stream)
+                for _ in range(iters):
+                    lowered.execute_plan_at_index(var_pack, workspace, idx, handle)
+                end.record(stream)
+                end.synchronize()
+                ms = start.elapsed_time(end) / iters
+            except (RuntimeError, cudnn.cudnnGraphNotSupportedError) as e:
+                logger.debug(f"[CuDNNAttention] autotune: plan {idx} unusable: {e}")
+                continue
+            logger.info(
+                f"[CuDNNAttention] autotune: plan {idx} {lowered.get_plan_name_at_index(idx)} "
+                f"{ms:.3f} ms"
+            )
+            if ms < best_ms:
+                best, best_ms = idx, ms
+        logger.info(f"[CuDNNAttention] autotune: selected plan {best} ({best_ms:.3f} ms)")
+        return best
 
     # ------------------------------------------------------------------
     # Forward
