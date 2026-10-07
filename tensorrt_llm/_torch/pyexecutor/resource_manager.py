@@ -357,6 +357,12 @@ class KVCacheManager(BaseResourceManager):
     # prepare_resources reads it on such test-built instances. Zero disables
     # the spec recompute tail.
     _spec_recompute_tail: int = 0
+    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
+    # Mamba/GDN managers override this: a reused request's recurrent slot
+    # already summarizes the matched prefix, so a partial rewind would apply
+    # the tokens between the rewind target and the matched length to that
+    # state a second time. Only a full re-prefill (rewind target 0) is safe.
+    _has_recurrent_state: bool = False
 
     def __init__(
         self,
@@ -514,7 +520,18 @@ class KVCacheManager(BaseResourceManager):
         # the auto value never resolved; recompute everything rather than
         # silently serving a degraded drafter.
         tail = getattr(spec_config, "context_recompute_tail", 0)
-        self._spec_recompute_tail = -1 if tail is None else int(tail)
+        tail = -1 if tail is None else int(tail)
+        if tail > 0 and self._has_recurrent_state:
+            # A partial rewind double-applies the rewound span to the
+            # recurrent state (see _has_recurrent_state); only a full
+            # re-prefill rebuilds that state from scratch.
+            logger.warning(
+                "context_recompute_tail > 0 is unsupported on recurrent-state "
+                "cache managers: a partial rewind would apply reused tokens "
+                "to the conv/SSM state twice. Forcing a full re-prefill "
+                "(context_recompute_tail=-1).")
+            tail = -1
+        self._spec_recompute_tail = tail
         # Kept so prepare_resources can re-validate the per-step token budget
         # (the forward-pass scratch size enforced in _prepare_tp_inputs).
         self.max_num_tokens = max_num_tokens
@@ -1194,7 +1211,22 @@ class KVCacheManager(BaseResourceManager):
                 # counterpart (_spec_recompute_target) no-ops on draft pools
                 # for the same reason.
                 if self._spec_recompute_tail and not self.is_draft:
-                    self._maybe_rewind_reused_context(batch_llm_requests)
+                    if self.enable_chunked_prefill:
+                        self._maybe_rewind_reused_context(batch_llm_requests)
+                    else:
+                        # The scheduler admits cache-hit requests at their
+                        # reuse-discounted token cost, so a rewound batch can
+                        # exceed max_num_tokens; only chunked prefill
+                        # (fit_token_budget) can shrink it back under the
+                        # budget. Checked here rather than in __init__ because
+                        # enable_chunked_prefill is finalized after
+                        # construction by _create_kv_cache_manager.
+                        logger.warning(
+                            "context_recompute_tail requires chunked prefill: "
+                            "without it a batch of rewound cache-hit requests "
+                            "can exceed max_num_tokens. Disabling the spec "
+                            "recompute tail.")
+                        self._spec_recompute_tail = 0
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -1234,16 +1266,18 @@ class KVCacheManager(BaseResourceManager):
         allocation/dedup win stays, and the recompute rewrites them with
         identical values) while restoring the drafter's inputs.
 
-        Driven by the spec config's ``context_recompute_tail`` (resolved from
-        the draft model config when unset): each cache-hit request is rewound
+        Driven by the spec config's ``context_recompute_tail`` (0 — off — by
+        default; an explicit None resolves from the draft model config): each
+        cache-hit request is rewound
         so at least that many prompt tokens (block-aligned start) are
         recomputed. For a drafter whose context attention is windowed (e.g.
         DFlash2 ``swa_window_size``), a tail of the window size reproduces
         the no-reuse drafter inputs exactly. ``-1`` forces a full re-prefill
-        (needed for non-windowed drafters). Run with chunked prefill enabled:
-        the micro-batch scheduler admits on estimated reuse, and
-        ``fit_token_budget`` needs chunking to trim the extra compute tokens
-        when a batch of rewound requests exceeds ``max_num_tokens``.
+        (needed for non-windowed drafters). Chunked prefill is required and
+        enforced by the caller: the micro-batch scheduler admits on estimated
+        reuse, and ``fit_token_budget`` needs chunking to trim the extra
+        compute tokens when a batch of rewound requests exceeds
+        ``max_num_tokens``.
         """
         tail = self._spec_recompute_tail
         tokens_per_block = self.tokens_per_block
