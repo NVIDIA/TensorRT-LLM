@@ -315,9 +315,11 @@ def quantize_fp8_block(h: torch.Tensor) -> Fp8BlockScaledActivation:
 
     Pinned to ``trtllm::fp8_quantize_1x128_packed_ue8m0``, the CUDA quantizer of the Linear's
     own ``fp8_swap_ab_gemm`` path (its default, with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``). That
-    path autotunes its quantizer and may pick the Triton kernel for large row counts; the two
-    follow the same scale rule but are not guaranteed bitwise, so the gathered bytes equal the
-    Linear's own exactly for the CUDA tactic.
+    path autotunes its quantizer and may pick the Triton kernel for large row counts, and with
+    ``TRTLLM_FUSED_FP8_QUANT_PACK=0`` it quantizes with ``fp8_quantize_1x128(use_ue8m0=True)``
+    and packs the scales separately. All three follow the same 1x128 UE8M0 scheme but are not
+    guaranteed bitwise with each other, so the gathered bytes equal the Linear's own exactly
+    for the CUDA tactic and up to the quantizers' rounding otherwise.
     """
     h2 = h.reshape(-1, h.shape[-1]).contiguous()
     fp8, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(h2, False)
@@ -601,11 +603,12 @@ class TokenShardedTP:
 
     @staticmethod
     def _check_fp8_consumer(consumer: object, act: Activation) -> None:
-        # Only the DeepGEMM FP8 block-scale Linear takes the (fp8, packed scales) pair; every
-        # other Linear either rejects it or quantizes differently from the gathered bytes.
+        # Only the DeepGEMM FP8 block-scale Linear takes the (fp8, packed scales) pair; any
+        # other consumer either rejects it or quantizes differently from the gathered bytes.
+        # ``None`` is the explicit "no consumer, the caller owns the dtype" escape hatch.
         if (
             isinstance(act, Fp8BlockScaledActivation)
-            and isinstance(consumer, Linear)
+            and consumer is not None
             and not fp8_block_scale_prequant_ok(consumer)
         ):
             raise ValueError(

@@ -377,7 +377,8 @@ def test_fp8_block_scale_prequant_rule(monkeypatch):
     act = Fp8BlockScaledActivation(
         torch.zeros(8, 256, dtype=torch.float8_e4m3fn), torch.zeros(8, 1, dtype=torch.int32)
     )
-    for consumer in (bf16, _fp8_block_linear(disable_deep_gemm=True)):
+    # ... including a consumer the rule cannot read (not a Linear): no silent pass-through.
+    for consumer in (bf16, _fp8_block_linear(disable_deep_gemm=True), object()):
         with pytest.raises(ValueError, match="not an FP8 block-scale Linear on the DeepGEMM path"):
             ts.gather_input(consumer, act)
     TokenShardedTP._check_fp8_consumer(fp8, act)

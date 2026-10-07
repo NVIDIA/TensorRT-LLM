@@ -78,3 +78,28 @@ def padded_rows(t: torch.Tensor, plan: TokenShardPlan) -> torch.Tensor:
     b, s = t.shape[:2]
     pad = t.new_zeros(b, plan.padded_seq_len - s, *t.shape[2:])
     return torch.cat([t, pad], dim=1).reshape(b * plan.padded_seq_len, *t.shape[2:])
+
+
+def fp8_block_checkpoint(
+    weight: torch.Tensor,
+    *,
+    bias: torch.Tensor | None = None,
+    out_device: torch.device | str | None = None,
+) -> dict[str, torch.Tensor]:
+    """128x128 block-scale FP8 checkpoint entry for a bf16 ``[N, K]`` weight (N, K multiples of
+    128): the ``weight`` / ``weight_scale`` pair ``FP8BlockScalesLinearMethod`` loads, plus
+    ``bias`` when given. Computed on ``weight``'s device, returned on ``out_device`` (default:
+    the same device)."""
+    n, k = weight.shape
+    blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
+    scale = blocks.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-12) / 448.0
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    entry = {
+        "weight": q.permute(0, 2, 1, 3).reshape(n, k),
+        "weight_scale": scale.reshape(n // 128, k // 128),
+    }
+    if out_device is not None:
+        entry = {name: t.to(out_device) for name, t in entry.items()}
+    if bias is not None:
+        entry["bias"] = bias
+    return entry

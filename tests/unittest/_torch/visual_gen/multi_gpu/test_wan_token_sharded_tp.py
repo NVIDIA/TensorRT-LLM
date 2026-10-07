@@ -34,6 +34,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from token_sharded_tp_test_utils import fp8_block_checkpoint  # tests/unittest/_torch/visual_gen
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
@@ -793,18 +794,9 @@ class TestWanTokenShardedTPNVFP4Block:
 
 
 def _to_fp8_block(entry):
-    """128x128 block-scale FP8 checkpoint entry for a bf16 Linear: the ``weight`` /
-    ``weight_scale`` pair ``FP8BlockScalesLinearMethod`` loads."""
-    weight = entry["weight"].cuda()
-    n, k = weight.shape
-    blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
-    scale = blocks.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-12) / _FP8_MAX
-    q = (blocks / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-    return {
-        "weight": q.permute(0, 2, 1, 3).reshape(n, k).cpu(),
-        "weight_scale": scale.reshape(n // 128, k // 128).cpu(),
-        "bias": entry["bias"],
-    }
+    """128x128 block-scale FP8 checkpoint entry for a bf16 Linear (the shared builder, computed
+    on the GPU for the D = 5120 weights, returned on the CPU like the bf16 entries)."""
+    return fp8_block_checkpoint(entry["weight"].cuda(), bias=entry["bias"], out_device="cpu")
 
 
 def _logic_fp8_block_scales_block(rank, world_size, *, batch, thw):

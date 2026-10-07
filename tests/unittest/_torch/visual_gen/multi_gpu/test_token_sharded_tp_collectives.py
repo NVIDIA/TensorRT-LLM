@@ -66,7 +66,12 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # pytest's sys.path entry for it).
 __extra_import_path__ = [".."]
 
-from token_sharded_tp_test_utils import padded_rows, swizzle_ref, unswizzle_ref
+from token_sharded_tp_test_utils import (
+    fp8_block_checkpoint,
+    padded_rows,
+    swizzle_ref,
+    unswizzle_ref,
+)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -560,19 +565,6 @@ def _logic_adapters_nvfp4(rank, world_size, device):
 # =============================================================================
 
 
-def _fp8_block_checkpoint(weight):
-    """128x128 block-scale FP8 layout for a bf16 [N, K] weight (N, K multiples of 128): the
-    ``weight`` / ``weight_scale`` pair ``FP8BlockScalesLinearMethod`` loads."""
-    n, k = weight.shape
-    blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
-    scale = blocks.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-12) / 448.0
-    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    return {
-        "weight": q.permute(0, 2, 1, 3).reshape(n, k),
-        "weight_scale": scale.reshape(n // 128, k // 128),
-    }
-
-
 def _fp8_quant_tactics(x):
     """``(pinned, cuda, triton)`` packed 1x128 quantizations of bf16 ``[M, K]`` ``x``: the
     helper's, and the two tactics the Linear's ``fp8_swap_ab_gemm`` autotunes between."""
@@ -630,8 +622,8 @@ def _logic_adapters_fp8_block_scales(rank, world_size, device):
     bias = torch.randn(n_out, dtype=torch.bfloat16) * 0.1
     w_up = torch.randn(n_out, k_in, dtype=torch.bfloat16) * 0.05
     w_down = torch.randn(k_in, n_out, dtype=torch.bfloat16) * 0.05
-    ckpt_col = {**_fp8_block_checkpoint(weight), "bias": bias}
-    ckpt_up, ckpt_down = _fp8_block_checkpoint(w_up), _fp8_block_checkpoint(w_down)
+    ckpt_col = {**fp8_block_checkpoint(weight), "bias": bias}
+    ckpt_up, ckpt_down = fp8_block_checkpoint(w_up), fp8_block_checkpoint(w_down)
     mapping = _mapping(rank, world_size)
     fp8bs = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
@@ -750,6 +742,18 @@ def _logic_adapters_fp8_block_scales(rank, world_size, device):
             f"triton_equals_cuda={bool(agree.item())}",
             flush=True,
         )
+    # Falsifiable form of the claim: the Linear fed the pinned CUDA quantize of ALL rows must
+    # match the gathered path bitwise (same bytes into the same GEMM); the autotuned Linear may
+    # pick the Triton quantizer at this M and then differs by the two kernels' rounding only.
+    h_ref_cuda = col_ref(quantize_fp8_block(x2d)).view(b, s, -1)
+    _check(
+        torch.equal(h, h_ref_cuda),
+        "the gathered-FP8 path differs from the Linear on the CUDA-quantized rows",
+        device,
+    )
+    _check_close(
+        h, h_ref_tuned, device, 2e-2, 2e-2, "gathered-FP8 path vs the autotuned FP8 Linear"
+    )
     _check(
         equal_tuned or not bool(agree.item()),
         "the autotuned FP8 Linear differs from the gathered-FP8 path although the Triton and "
@@ -963,7 +967,7 @@ def _fp8_chain_parts(rank, world_size, device, d=256, n_col=128):
     _, row = _boundary_chain_parts(rank, world_size, device, d, n_col)
     tp = _helper()
     convert_to_token_sharded_tp(_as_model(col=col, row=row), tp, exceptions={"col": "column"})
-    col.load_weights([{**_fp8_block_checkpoint(col_w), "bias": torch.zeros(n_col * world_size)}])
+    col.load_weights([{**fp8_block_checkpoint(col_w), "bias": torch.zeros(n_col * world_size)}])
     col.post_load_weights()
     return tp, col, row
 
