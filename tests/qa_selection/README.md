@@ -115,4 +115,4 @@ wired into pre-commit, fails when a copy drifts.
 |---|---|
 | `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch`. `max_gpu_per_node` is the machine's one GPU count — the default ladder, read by no rule |
 | `rules.json` | the curated skip rules, each keyed by the exact `skipif` reason string it decides; a rule must turn on a permanent property of the machine |
-| `markers.json` | the marks whose first argument is a *requirement* rather than a condition, with the description each is declared with |
+| `markers.json` | the marks whose first argument is a *requirement* rather than a condition: the description each is declared with, the machine fact it `bounds` (`gpus`, `device_memory_mib`, `device_name`, or null when not evaluated), and whether the conftest `read`s it at the closest level or every level. No code names a marker; the check verifies each `read` against `defs/conftest.py` |

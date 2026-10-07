@@ -15,10 +15,11 @@
 # limitations under the License.
 """Check tests/qa_selection/core/*.json against the integration suite it mirrors.
 
-Two hand-maintained inputs, two ways they can drift:
+Two hand-maintained inputs, and what each is checked against:
 
     rules.json    reason strings, against the `skip_*` decorators
-    markers.json  marker descriptions, against `defs/pytest.ini`
+    markers.json  marker descriptions, against `defs/pytest.ini`;
+                  each marker's `read`, against the lookups in `defs/conftest.py`
 
 Both are copies on purpose -- selection must not share a source of truth
 with the code it decides about -- so a check is what keeps them honest.
@@ -35,7 +36,7 @@ Every statement this check makes is about a rule the table declares. A
 decorator with no rule is not one: the table is curated, not an inventory, so
 its silence about a decorator is already the whole answer and needs no report.
 
-Decorators are read with `ast`, never imported.
+Decorators and conftest lookups are read with `ast`, never imported.
 """
 
 import argparse
@@ -45,7 +46,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 
 class RepoPaths:
@@ -65,6 +66,8 @@ class RepoPaths:
 
     # Declares the markers markers.json mirrors, relative to --source-root.
     PYTEST_INI = "pytest.ini"
+    # Holds the fixtures whose lookups each marker's `read` mirrors.
+    CONFTEST = "conftest.py"
 
     @classmethod
     def enable_package_import(cls) -> None:
@@ -76,8 +79,7 @@ class RepoPaths:
 
 RepoPaths.enable_package_import()
 
-from qa_selection.core.allocation import GpuDemand  # noqa: E402
-from qa_selection.core.markers import ResourceMarkers, default_markers  # noqa: E402
+from qa_selection.core.markers import ResourceMarker, ResourceMarkers, default_markers  # noqa: E402
 from qa_selection.core.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
 
 
@@ -307,37 +309,84 @@ class IniMarkers:
         return cls(declared)
 
 
+class ConftestLookups:
+    """How a conftest looks each marker up, as name -> the `read` values it uses.
+
+    Only calls whose first argument is a string literal count, which is how
+    every fixture consuming a resource marker is written.
+    """
+
+    LOOKUPS = {
+        "get_closest_marker": ResourceMarker.CLOSEST,
+        "iter_markers": ResourceMarker.EVERY_LEVEL,
+    }
+
+    def __init__(self, reads: Dict[str, Set[str]]) -> None:
+        self.reads = reads
+
+    @classmethod
+    def read(cls, path: Path) -> "ConftestLookups":
+        """Parse `path` with `ast`, or raise OSError/SyntaxError naming it."""
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        reads: Dict[str, Set[str]] = {}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in cls.LOOKUPS
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                reads.setdefault(node.args[0].value, set()).add(cls.LOOKUPS[node.func.attr])
+        return cls(reads)
+
+
 class MarkerFaults:
-    """Every way markers.json can disagree with the ini it mirrors."""
+    """Every way markers.json can disagree with the ini and conftest it mirrors."""
 
     def __init__(self) -> None:
         self.absent: List[str] = []
         self.drifted: List[Tuple[str, str, str]] = []
+        self.never_read: List[str] = []
+        self.misread: List[Tuple[str, str, List[str]]] = []
         self.unreadable: List[str] = []
 
     def __bool__(self) -> bool:
-        return bool(self.absent or self.drifted or self.unreadable)
+        return bool(
+            self.absent or self.drifted or self.never_read or self.misread or self.unreadable
+        )
 
     def report_lines(self) -> List[str]:
         """One block per fault kind, naming the file to edit."""
         if not self:
             return []
-        lines = [f"{RepoPaths.MARKERS_FILE} is out of date with the integration pytest.ini."]
+        lines = [
+            f"{RepoPaths.MARKERS_FILE} is out of date with the integration "
+            f"{RepoPaths.PYTEST_INI} or {RepoPaths.CONFTEST}."
+        ]
         for name in self.absent:
             lines.append(f"  {name}: declared here, absent from the ini")
         for name, mine, theirs in self.drifted:
             lines.append(f"  {name}: description has drifted")
             lines.append(f"      here: {mine}")
             lines.append(f"       ini: {theirs}")
+        for name in self.never_read:
+            lines.append(f"  {name}: declared here, never looked up by the conftest")
+        for name, mine, theirs in self.misread:
+            lines.append(f"  {name}: read has drifted")
+            lines.append(f"          here: {mine}")
+            lines.append(f"      conftest: {', '.join(theirs)}")
         lines += self.unreadable
         return lines
 
 
 class MarkerDriftCheck:
-    """Resolves every marker this package declares through the ini that owns it."""
+    """Resolves every marker this package declares through the ini and conftest that own it."""
 
-    def __init__(self, ini_path: Path, markers: ResourceMarkers) -> None:
+    def __init__(self, ini_path: Path, conftest_path: Path, markers: ResourceMarkers) -> None:
         self.ini_path = ini_path
+        self.conftest_path = conftest_path
         self.markers = markers
 
     def run(self) -> Tuple[int, str]:
@@ -348,25 +397,25 @@ class MarkerDriftCheck:
         return 1, "\n".join(faults.report_lines())
 
     def faults(self) -> MarkerFaults:
-        """Classify every declared marker against the ini, then the readers."""
+        """Classify every declared marker against the ini, then the conftest."""
         faults = MarkerFaults()
-        if not self.ini_path.is_file():
-            faults.unreadable.append(f"  cannot read {self.ini_path}")
+        for path in (self.ini_path, self.conftest_path):
+            if not path.is_file():
+                faults.unreadable.append(f"  cannot read {path}")
+        if faults.unreadable:
             return faults
 
         declared = IniMarkers.read(self.ini_path).declared
-        for name, description in self.markers.items():
+        reads = ConftestLookups.read(self.conftest_path).reads
+        for name, marker in self.markers.items():
             if name not in declared:
                 faults.absent.append(name)
-            elif declared[name] != description:
-                faults.drifted.append((name, description, declared[name]))
-
-        # The adapter only carries `args[0]` for a marker this file holds, so a
-        # reader naming one it does not would silently read nothing.
-        for name in self.markers.missing_from(GpuDemand.MARKERS):
-            faults.unreadable.append(
-                f"  {name}: read by GpuDemand.MARKERS but not declared in {RepoPaths.MARKERS_FILE}"
-            )
+            elif declared[name] != marker.description:
+                faults.drifted.append((name, marker.description, declared[name]))
+            if name not in reads:
+                faults.never_read.append(name)
+            elif reads[name] != {marker.read}:
+                faults.misread.append((name, marker.read, sorted(reads[name])))
         return faults
 
 
@@ -386,7 +435,9 @@ def main(argv: List[str] = None) -> int:
 
     rules_status, rules_message = RuleTableDriftCheck(args.source_root, default_rule_table()).run()
     markers_status, markers_message = MarkerDriftCheck(
-        args.source_root / RepoPaths.PYTEST_INI, default_markers()
+        args.source_root / RepoPaths.PYTEST_INI,
+        args.source_root / RepoPaths.CONFTEST,
+        default_markers(),
     ).run()
 
     status = rules_status or markers_status
