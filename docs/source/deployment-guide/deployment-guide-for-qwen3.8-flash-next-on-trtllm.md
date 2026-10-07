@@ -148,12 +148,12 @@ Block reuse stays on only if `mamba_state_config` sets at least one snapshot pla
 ```shell
 trtllm-serve <model_path_or_hf_id> \
   --host 0.0.0.0 --port 8000 \
-  --reasoning_parser qwen3_5 \
-  --tool_parser qwen3 \
+  --reasoning_parser auto \
+  --tool_parser auto \
   --config ${EXTRA_LLM_API_FILE}
 ```
 
-The chat template pre-injects a `<think>` block, so reasoning starts at the beginning of the response and the `qwen3_5` reasoning parser applies. This architecture is not in the parser auto-detection table, so pass both parsers explicitly. Thinking is controlled per request through `chat_template_kwargs`, for example `{"chat_template_kwargs": {"enable_thinking": false}}` to answer directly, or `{"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "xhigh"}}` for a longer trace.
+Auto-detection selects the `qwen3_5` reasoning parser and the `qwen3_coder` tool parser. The reasoning parser reads the prefilled `<think>` or `</think>` marker from the rendered prompt, so thinking remains controlled per request through `chat_template_kwargs`, for example `{"chat_template_kwargs": {"enable_thinking": false}}` to answer directly, or `{"chat_template_kwargs": {"enable_thinking": true, "reasoning_effort": "xhigh"}}` for a longer trace.
 
 ### Disaggregated Serving
 
@@ -404,6 +404,6 @@ Complete initialization, CUDA graph capture, and warmup before measuring; the fi
 * If block reuse appears to have no effect, check the effective LLM arguments for `enable_block_reuse`. The runtime turns it off when `kv_cache_config.mamba_state_config` configures no snapshot placement, because the recurrent state cannot be restored from attention blocks alone.
 * If a disaggregated worker fails to start with a KV cache manager V2 error, check that both workers set `cache_transceiver_config.backend: NIXL` and `transceiver_runtime: PYTHON`.
 * If MTP output is empty or incorrect, confirm that the checkpoint contains its MTP weights and that `max_draft_len` is configured identically on every rank.
-* If reasoning content is not separated from the answer, confirm that the server was started with `--reasoning_parser qwen3_5`; this architecture is not auto-detected.
+* If reasoning content is not separated from the answer, check the startup log for the line reporting the auto-detected reasoning parser. It should read `qwen3_5`; if the checkpoint ships a modified chat template, pass `--reasoning_parser qwen3_5` explicitly.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
