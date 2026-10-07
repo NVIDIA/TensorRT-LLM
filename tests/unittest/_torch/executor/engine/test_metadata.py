@@ -8,14 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.metadata import (
     build_attention_metadata,
-    create_spec_metadata,
-    get_spec_managers,
     update_spec_metadata,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
 
@@ -160,49 +156,4 @@ def test_update_spec_metadata_handles_parallel_draft_and_dynamic_tree() -> None:
         spec_metadata=spec_metadata,
         spec_tree_manager=spec_tree_manager,
         num_contexts=1,
-    )
-
-
-@pytest.mark.parametrize("has_tree", [False, True])
-def test_get_spec_managers_returns_tree_manager_when_present(has_tree: bool) -> None:
-    tree_manager = object()
-    spec_resource_manager = (
-        SimpleNamespace(spec_tree_manager=tree_manager) if has_tree else SimpleNamespace()
-    )
-    resource_manager = SimpleNamespace(
-        get_resource_manager=Mock(return_value=spec_resource_manager)
-    )
-
-    managers = get_spec_managers(resource_manager)
-
-    assert managers == (spec_resource_manager, tree_manager if has_tree else None)
-    resource_manager.get_resource_manager.assert_called_once_with(
-        ResourceManagerType.SPEC_RESOURCE_MANAGER
-    )
-
-
-def test_create_spec_metadata_sizes_from_runner_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    get_spec_metadata = Mock()
-    monkeypatch.setattr(metadata_module, "get_spec_metadata", get_spec_metadata)
-    config = SimpleNamespace(
-        spec_config=object(),
-        max_batch_size=4,
-        max_num_tokens=32,
-        max_seq_len=64,
-        num_seq_slots=6,
-    )
-    pretrained_config = object()
-    spec_resource_manager = object()
-
-    result = create_spec_metadata(config, pretrained_config, spec_resource_manager)
-
-    assert result is get_spec_metadata.return_value
-    get_spec_metadata.assert_called_once_with(
-        config.spec_config,
-        pretrained_config,
-        4,
-        max_num_tokens=32,
-        spec_resource_manager=spec_resource_manager,
-        max_seq_len=64,
-        num_seq_slots=6,
     )

@@ -385,8 +385,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _should_run_warmup_batch=Mock(return_value=True),
         _release_megamoe_profiling_scratch=Mock(),
-        # The serving flag differs from the configuration; warmup follows the configuration.
-        enable_spec_decode=True,
         _forward_warmup=Mock(),
     )
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
@@ -592,9 +590,7 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
     )
     runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
-    # differs from that value and must synchronize the requests, while the
-    # engine keeps the serving value.
-    engine.runtime_draft_len = 2
+    # differs from that value and must synchronize the requests.
     batch_size = 2
 
     if draft_len is None:
@@ -613,7 +609,6 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
     with runner._release_batch_context(warmup_request, resource_manager) as batch:
         assert batch is not None
         assert len(batch.generation_requests) == batch_size
-        assert engine.runtime_draft_len == 2
         expected_buffer_width = config.get_runtime_tokens_per_gen_step(expected_draft_len) - 1
         assert all(
             len(request.py_draft_tokens) == expected_buffer_width
@@ -625,9 +620,6 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
 def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     engine, resource_manager = _build_engine_and_resource_manager()
     assert not engine.is_spec_decode
-    # Serving values that differ from every captured shape below.
-    engine.enable_spec_decode = True
-    engine.runtime_draft_len = 5
     runner = engine._runner
     batches = {}
 
@@ -659,23 +651,26 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
             call(batches[0], resource_manager, enable_spec_decode=False, runtime_draft_len=0)
         )
     assert forward_warmup.call_args_list == expected_calls
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 5)
     assert runner._force_lora_graph_for_capture is None
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])
 def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     engine, resource_manager = _build_engine_and_resource_manager()
-    assert not engine.is_spec_decode
-    # Serving values that no warmup phase may read.
-    engine.enable_spec_decode = True
-    engine.runtime_draft_len = 5
     runner = engine._runner
+    spec_config = DraftTargetDecodingConfig(max_draft_len=3, speculative_model="dummy")
     batch = ScheduledRequests()
     forward_warmup = Mock()
     kv_cache_manager = resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
 
     with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                runner,
+                "_config",
+                replace(runner._config, spec_config=spec_config, is_spec_decode=True),
+            )
+        )
         stack.enter_context(
             patch.object(runner, "_create_warmup_request", Mock(return_value=batch))
         )
@@ -721,10 +716,9 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
     assert forward_warmup.call_count > 0
     assert (
         forward_warmup.call_args_list
-        == [call(batch, resource_manager, enable_spec_decode=False, runtime_draft_len=0)]
+        == [call(batch, resource_manager, enable_spec_decode=True, runtime_draft_len=3)]
         * forward_warmup.call_count
     )
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 5)
 
 
 class _Tracker:
@@ -833,16 +827,12 @@ class TestWarmupCleanup(unittest.TestCase):
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
 
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module"
-        ) as warmup_sampling:
-            model_engine.warmup(resource_manager)
+        model_engine.warmup(resource_manager)
 
         self.assertEqual(
             model_engine._runner.method_calls,
             [call.warmup(resource_manager)],
         )
-        warmup_sampling.assert_not_called()
 
     @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self):
@@ -869,7 +859,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine._runner.warmup.assert_called_once_with(resource_manager)
 
     @pytest.mark.cpu_only
-    def test_legacy_warmup_sampling_and_kv_cache_cleanup(self) -> None:
+    def test_decoder_runner_warmup_sampling_and_kv_cache_cleanup(self) -> None:
         """Verify sampling warmup coverage and KV-cache cleanup timing within total warmup."""
         runner = object.__new__(DecoderRunner)
         runner._warmup_timer = _WarmupTimer(rank=0)

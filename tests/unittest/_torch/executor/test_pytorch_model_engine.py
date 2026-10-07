@@ -1514,7 +1514,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         decoder_only = ("input_ids_cuda", "position_ids_cuda",
                         "previous_batch_indices_cuda",
                         "_steady_gen_positions_pinned", "_steady_gen_cache",
-                        "_prepare_inputs_event", "_lora")
+                        "_prepare_inputs_event", "cache_indirection_attention")
         for is_generation in (True, False):
             with self.subTest(is_generation=is_generation):
                 engine = DummyModelEngine(llm_args,
@@ -1528,13 +1528,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     self.assertEqual(
                         tuple(runner.cache_indirection_attention.shape),
                         (4, 2, engine.max_seq_len))
-                    for name in decoder_only:
-                        self.assertTrue(hasattr(runner, name), name)
                 else:
                     self.assertIsInstance(runner, PoolingRunner)
                     self.assertIsNone(engine.cuda_graph_runner)
                 for name in decoder_only:
-                    self.assertFalse(hasattr(engine, name), name)
+                    self.assertEqual(hasattr(runner, name), is_generation, name)
 
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
         runner = Mock()
@@ -1548,8 +1546,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         runner.wait_for_input_copy.assert_called_once_with()
         runner.release_graphs.assert_called_once_with()
-        self.assertFalse(hasattr(engine, "_prepare_inputs_event"))
-        self.assertFalse(hasattr(engine, "_lora"))
+        runner.init_cuda_graph_lora_manager.assert_not_called()
 
     def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
         engine = object.__new__(PyTorchModelEngine)

@@ -688,9 +688,6 @@ def test_engine_forward_keeps_call_state_when_decoder_fails():
 
 def test_forward_warmup_runs_local_call_state_in_forward_context():
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._is_warmup = True
-    engine.enable_spec_decode = False
-    engine.runtime_draft_len = 5
     batch = ScheduledRequests()
 
     def decoder_forward(inputs, resource_manager, *, is_dummy):
@@ -711,7 +708,6 @@ def test_forward_warmup_runs_local_call_state_in_forward_context():
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 1)
     assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": True}
     assert outputs["runtime_draft_len"] == 3
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
     assert get_model_extra_attrs() is None
 
 

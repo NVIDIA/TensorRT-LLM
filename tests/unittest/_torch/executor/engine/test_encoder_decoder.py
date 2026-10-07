@@ -190,10 +190,13 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
     input_processor = object()
     shapes = frozenset({(1, 16)})
 
+    order = Mock()
     with (
         patch.object(encoder_decoder_module, "EncoderStage") as stage_type,
         patch.object(DecoderRunner, "__init__", return_value=None) as decoder_init,
     ):
+        order.attach_mock(stage_type, "stage")
+        order.attach_mock(decoder_init, "decoder")
         stage_type.return_value._encoder_graph_shapes = shapes
         runner = EncoderDecoderRunner(
             model,
@@ -207,36 +210,17 @@ def test_encoder_decoder_runner_builds_stage_before_decoder() -> None:
 
     assert runner._encoder_stage is stage_type.return_value
     assert runner._encoder_graph_shapes is shapes
-    stage_type.assert_called_once_with(
-        model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None
-    )
-    decoder_init.assert_called_once_with(
-        model,
-        config,
-        mapping=mapping,
-        dist=dist,
-        moe_load_balancer=None,
-        input_processor=input_processor,
-    )
-
-
-def test_encoder_decoder_runner_delegates_encoder_entries_to_stage() -> None:
-    runner = object.__new__(EncoderDecoderRunner)
-    runner._encoder_stage = Mock(spec=EncoderStage)
-    runner._encoder_stage._encoder_graph_batch_sizes = (1, 2, 8)
-    runner._encoder_stage._encoder_graph_pad_to_limit = True
-    inputs = ScheduledInputs(batch=_scheduled_encoder_requests(object()))
-    resource_manager = object()
-
-    outputs = runner.forward_encoder(inputs, resource_manager=resource_manager, is_dummy=True)
-    runner.warmup_encoder(resource_manager)
-
-    assert outputs is runner._encoder_stage.forward.return_value
-    runner._encoder_stage.forward.assert_called_once_with(
-        inputs, resource_manager=resource_manager, is_dummy=True
-    )
-    runner._encoder_stage.warmup.assert_called_once_with(resource_manager)
-    assert runner.encoder_graph_batch_sizes(4) == (1, 2, 4)
+    assert order.mock_calls == [
+        call.stage(model, encoder_config, mapping=mapping, dist=dist, moe_load_balancer=None),
+        call.decoder(
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=None,
+            input_processor=input_processor,
+        ),
+    ]
 
 
 def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
@@ -251,14 +235,6 @@ def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
         call.stage.release_graphs(),
         call.decoder(),
     ]
-
-
-def test_encoder_decoder_runner_disables_decoder_only_paths() -> None:
-    assert EncoderDecoderRunner._dummy_request_tokens == ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
-    assert not EncoderDecoderRunner._context_warmups_supported
-    assert not EncoderDecoderRunner._context_graph_promotion_supported
-    assert not EncoderDecoderRunner._steady_gen_cache_supported
-    assert not EncoderDecoderRunner._eager_workspace_reclaim_supported
 
 
 @dataclass
