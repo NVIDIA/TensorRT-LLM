@@ -168,7 +168,7 @@ class MlaRopeGeneration(OpWrapper):
         kv_only: bool = False,
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> torch.Tensor:
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
             q_pe,
@@ -218,6 +218,7 @@ class MlaRopeGeneration(OpWrapper):
             kv_done_elsewhere,
             quant_scale_qkv,
         )
+        return fused_q
 
     def reference(
         self,

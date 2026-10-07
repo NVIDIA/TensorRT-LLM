@@ -95,7 +95,7 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
         attention_window_size: int,
         beam_width: int,
         quant_mode: int,
-    ) -> None:
+    ) -> torch.Tensor:
         torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
             q,
             latent_cache,
@@ -119,6 +119,7 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
             beam_width,
             quant_mode,
         )
+        return q
 
     def reference(
         self,
