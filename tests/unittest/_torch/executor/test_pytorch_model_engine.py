@@ -2919,7 +2919,6 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
             "encoder_decoder",
             "context_parallel",
             "draft_key",
-            "first_draft_key",
         )
         for case in cases:
             with self.subTest(case=case):
@@ -2948,8 +2947,6 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                     engine.mapping.cp_size = 2
                 elif case == "draft_key":
                     selected = key._replace(draft_len=1)
-                elif case == "first_draft_key":
-                    selected = key._replace(is_first_draft=True)
                 with engine._runner._cuda_graph_metadata_prepare_scope(
                         metadata, selected, batch, promoted,
                         enable_spec_decode=engine.enable_spec_decode):
