@@ -116,7 +116,7 @@ def _uniform_nelem(sizes: np.ndarray):
 
 # reusable pinned staging for the metadata copy, one per stream, so the copy is a true async transfer
 _meta_lock = threading.Lock()
-_meta_buffers = {}  # each stream maps to its pinned host buffer, device buffer, and capacity
+_meta_buffers = {}  # stream -> (pinned host buffer, device buffer, capacity, H2D completion event)
 
 
 def _get_meta_buffers(stream_handle: int, need: int, dev):
@@ -128,16 +128,16 @@ def _get_meta_buffers(stream_handle: int, need: int, dev):
             new_cap = max(need, (ent[2] * 2 if ent else 0), 4096)
             pinned = torch.empty(new_cap, dtype=torch.int64, pin_memory=prefer_pinned())
             devt = torch.empty(new_cap, dtype=torch.int64, device=dev)
-            ent = (pinned, devt, new_cap)
+            ent = (pinned, devt, new_cap, torch.cuda.Event())
             _meta_buffers[stream_handle] = ent
-        return ent[0], ent[1]
+        return ent[0], ent[1], ent[3]
 
 
 def _launch_batched_copy(
     dst_addrs: np.ndarray, src_addrs: np.ndarray, sizes: np.ndarray, stream
 ) -> bool:
     """Run the single batched copy on the stream. Returns False when the caller must use the loop
-    fallback."""
+    fallback. Callers must serialize submissions on the same stream."""
     if not _HAVE_TRITON or not torch.cuda.is_available():
         return False
 
@@ -156,17 +156,19 @@ def _launch_batched_copy(
     n_chunks = triton.cdiv(max_nvec, _BLOCK)
     grid = (n, n_chunks)
 
-    # buffer reuse is safe: every caller syncs the stream between calls, so the previous copy and
-    # kernel finish before the refill
     ext_stream = torch.cuda.ExternalStream(stream_handle)
     with torch.cuda.stream(ext_stream):
         # Allocate on the consuming stream so cached storage is ordered before its next use.
-        pinned, devt = _get_meta_buffers(stream_handle, 3 * n, dev)
+        pinned, devt, copy_done = _get_meta_buffers(stream_handle, 3 * n, dev)
+        # CPU writes to pinned memory are not ordered by the stream. Wait for its previous
+        # H2D copy before refilling; device-buffer reuse is ordered by the stream itself.
+        copy_done.synchronize()
         host = pinned.numpy()
         host[:n] = dst_addrs
         host[n : 2 * n] = src_addrs
         host[2 * n : 3 * n] = nvec
         devt[: 3 * n].copy_(pinned[: 3 * n], non_blocking=True)
+        copy_done.record(ext_stream)
         _batched_copy_kernel[grid](
             devt[:n],
             devt[n : 2 * n],
