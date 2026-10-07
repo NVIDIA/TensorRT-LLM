@@ -908,8 +908,10 @@ class PyTorchModelEngine(ModelEngine):
         model = getattr(self, "model", None)
         if model is not None:
             for module in model.modules():
-                if getattr(module, "_rebalance_slots_active", 0) > 0:
-                    module._rebalance_warmup = bool(value)
+                set_rebalance_warmup = getattr(module, "set_rebalance_warmup",
+                                               None)
+                if callable(set_rebalance_warmup):
+                    set_rebalance_warmup(value)
 
     @property
     def moe_load_balancer_iter_info(self):

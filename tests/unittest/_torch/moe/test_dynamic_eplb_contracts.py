@@ -470,7 +470,7 @@ def test_warmup_owner_handoff_drains_once_and_deduplicates_groups():
     group_cls = _extract_class(
         source,
         "RebalanceSlotSchedulerGroupV2",
-        {"_check_owner", "release_warmup_owner_after_sync"},
+        {"has_submission_owner", "_check_owner", "release_warmup_owner_after_sync"},
         {"torch": torch, "threading": threading},
     )
     executor_cls = _extract_class(
@@ -514,8 +514,8 @@ def test_warmup_owner_handoff_drains_once_and_deduplicates_groups():
     executor.draft_model_engine = engine(draft, target)
     executor._handoff_rebalance_warmup_owners()
     assert events == [("synchronize", 0), ("release", "target"), ("release", "draft")]
-    assert target._owner_thread_id is draft._owner_thread_id is None
-    assert unbound._execution_stream_handle is None
+    assert not target.has_submission_owner and not draft.has_submission_owner
+    assert not unbound.has_submission_owner
 
     events.clear()
     executor.model_engine = engine(unbound)
@@ -611,23 +611,23 @@ def test_on_autotune_uses_distinct_tactics_and_state_contract(monkeypatch):
     backend_cls = _extract_class(
         _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py",
         "TrtllmCutedslMegaMoeNvfp4Impl",
-        {"is_rebalance_active"},
+        {"is_rebalance_active", "set_rebalance_warmup"},
         {"AutoTuner": SimpleNamespace(get=lambda: tuning_state)},
     )
     backend = backend_cls()
     backend._rebalance_slots_active = 4
     backend._rebalance_arm_open = True
-    backend._rebalance_warmup = True
+    backend.set_rebalance_warmup(True)
     backend.tactic_autotune = True
     assert backend.is_rebalance_active()
     backend.tactic_autotune = False
     assert not backend.is_rebalance_active()
     tuning_state.is_tuning_mode = False
-    backend._rebalance_warmup = False
+    backend.set_rebalance_warmup(False)
     assert backend.is_rebalance_active()
-    backend._rebalance_warmup = True
+    backend.set_rebalance_warmup(True)
     assert not backend.is_rebalance_active()
-    backend._rebalance_warmup = False
+    backend.set_rebalance_warmup(False)
     backend._rebalance_slots_active = 0
     assert not backend.is_rebalance_active()
 

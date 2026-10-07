@@ -257,6 +257,11 @@ class RebalanceSlotSchedulerGroupV2:
 
         logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
 
+    @property
+    def has_submission_owner(self) -> bool:
+        """Whether a CPU thread currently owns MAIN submissions."""
+        return self._owner_thread_id is not None
+
     def _check_owner(self) -> None:
         thread_id = threading.get_ident()
         if torch.cuda.current_device() != self.device:

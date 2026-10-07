@@ -1129,8 +1129,7 @@ class PyExecutor:
                 continue
             for module in model.modules():
                 group = getattr(module, "_rebalance_scheduler_group", None)
-                if (group is not None and getattr(group, "_owner_thread_id",
-                                                  None) is not None):
+                if group is not None and group.has_submission_owner:
                     groups[id(group)] = group
         if not groups:
             return
