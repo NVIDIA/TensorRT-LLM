@@ -2673,22 +2673,44 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Take the DSpark head weights, then hand the rest to DFlash."""
         weights, _ = self._take_dspark_head_weights(weights)
-        self._keep_trained_mask_embedding(weights)
-        return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        # Checked before the load so a bad row fails early; placed after it, once ``fc`` (its device) exists.
+        mask_row = self._trained_mask_row(weights)
+        loaded = super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        if mask_row is not None:
+            self.mask_token_embedding = mask_row.to(
+                device=self.fc.weight.device, dtype=self.model_config.torch_dtype
+            )
+        return loaded
 
-    def _keep_trained_mask_embedding(self, weights: Dict) -> None:
-        """Keep the checkpoint's own embedding row for the mask token.
+    def _trained_mask_row(self, weights: Dict) -> Optional[torch.Tensor]:
+        """The checkpoint's own embedding row for the mask token, [hidden_size]; None if it ships no embedding.
 
         This drafter takes the target's embedding (``load_weights_from_target_model``). A drafter checkpoint that ships
         an embedding has trained the mask token's row, which the target's embedding does not have: the block decode
-        reads ``mask_token_embedding`` for every masked slot instead of the shared lookup.
+        reads ``mask_token_embedding`` for every masked slot instead of the shared lookup. Only that row is kept: in
+        the Kimi K3 drafter (RedHatAI/Kimi-K3-speculator.dspark) it is the only row of the shipped embedding that
+        differs from the target's, and the shipped ``lm_head`` is bit-exact with the target's.
+
+        Raises:
+            ValueError: the embedding is not ``[rows, hidden_size]``, or ``mask_token_id`` is not one of its rows.
         """
         names = [k for k in ("embed_tokens.weight", "model.embed_tokens.weight") if k in weights]
         if not names:
-            return
-        weight = weights[names[0]]
-        row = weight[self.mask_token_id : self.mask_token_id + 1]
-        self.mask_token_embedding = torch.as_tensor(row).reshape(-1).to("cuda")
+            return None
+        name = names[0]
+        weight = weights[name]
+        hidden_size = self.config.hidden_size
+        if weight.dim() != 2 or weight.shape[1] != hidden_size:
+            raise ValueError(
+                f"{type(self).__name__}: the checkpoint's {name} has shape {list(weight.shape)}, "
+                f"expected [rows, hidden_size={hidden_size}]."
+            )
+        if not 0 <= self.mask_token_id < weight.shape[0]:
+            raise ValueError(
+                f"{type(self).__name__}: the drafter's mask_token_id {self.mask_token_id} is not a row of the "
+                f"checkpoint's {name} ({weight.shape[0]} rows)."
+            )
+        return weight[self.mask_token_id]
 
 
 class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):

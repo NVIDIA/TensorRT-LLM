@@ -445,6 +445,8 @@ def dflash_noise_block_embedding(
     The mask row is the drafter's own trained one when it has one (``trained_mask_embedding``); otherwise the shared
     lookup's. Both rows go through ``embed_tokens.forward`` (NOT ``.weight[...]``) so TP-sharded vocabs mask out
     ranks that don't own the token id and all-reduce, the mask row included, so every rank makes the same call.
+
+    ``trained_mask_embedding`` ([hidden]) is used as given: the drafter casts it to its own dtype and device at load.
     """
     num_gens = bonus.shape[0]
     mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device=bonus.device)
@@ -452,7 +454,7 @@ def dflash_noise_block_embedding(
     embed_bonus = combined_embed[:num_gens]
     embed_mask = combined_embed[num_gens]
     if trained_mask_embedding is not None:
-        embed_mask = trained_mask_embedding.to(embed_mask.dtype)
+        embed_mask = trained_mask_embedding
     noise_embed_2d = embed_mask.expand(num_gens, block_size, -1).clone()
     noise_embed_2d[:, 0, :] = embed_bonus
     return noise_embed_2d
