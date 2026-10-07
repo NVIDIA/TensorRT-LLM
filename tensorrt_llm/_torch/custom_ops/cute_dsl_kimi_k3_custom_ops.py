@@ -33,9 +33,11 @@ in place. Intermediate matrices remain private runner workspace.
 
 import os
 import weakref
-from typing import Optional
+from typing import Any, Hashable, Optional, TypeVar
 
 import torch
+
+from tensorrt_llm.logger import logger
 
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -309,7 +311,10 @@ _k4p_tm_ws = {}
 # cache must therefore be LRU-bounded through _lru_put / _lru_touch.
 
 
-def _lru_put(cache, key, value, max_entries):
+_V = TypeVar("_V")
+
+
+def _lru_put(cache: dict, key: Hashable, value: _V, max_entries: int) -> _V:
     """Insert ``value`` under ``key``, first evicting least-recently-used entries."""
     while len(cache) >= max_entries:
         cache.pop(next(iter(cache)))
@@ -317,15 +322,32 @@ def _lru_put(cache, key, value, max_entries):
     return value
 
 
-def _lru_touch(cache, key):
+def _lru_touch(cache: dict, key: Hashable) -> Any:
     """Mark ``key`` most recently used and return its value."""
     cache[key] = cache.pop(key)
     return cache[key]
 
 
-def _scratch_cache_max_entries():
-    """Entry cap of the shape-keyed scratch caches: TLLM_KDA_BUF_CACHE_ENTRIES, default 2."""
-    return max(1, int(os.environ.get("TLLM_KDA_BUF_CACHE_ENTRIES", "2")))
+_DEFAULT_SCRATCH_CACHE_ENTRIES = 2
+
+
+def _scratch_cache_max_entries() -> int:
+    """Entry cap of the shape-keyed scratch caches: TLLM_KDA_BUF_CACHE_ENTRIES, default 2.
+
+    A non-integer value falls back to the default with a warning instead of
+    failing the import of this module.
+    """
+    raw = os.environ.get("TLLM_KDA_BUF_CACHE_ENTRIES")
+    if raw is None:
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid TLLM_KDA_BUF_CACHE_ENTRIES={raw!r}; "
+            f"using the default of {_DEFAULT_SCRATCH_CACHE_ENTRIES}."
+        )
+        return _DEFAULT_SCRATCH_CACHE_ENTRIES
 
 
 # Buffer cache: avoid re-allocating ~67us of intermediate tensors per call.

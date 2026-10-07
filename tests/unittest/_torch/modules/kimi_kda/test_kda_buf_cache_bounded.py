@@ -30,9 +30,10 @@ N_SHAPES = 16
 
 
 def _op_module():
-    from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_custom_ops
-
-    return cute_dsl_kimi_k3_custom_ops
+    # The module raises ImportError at import time without CuTe DSL / FlashInfer.
+    return pytest.importorskip(
+        "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_custom_ops", exc_type=ImportError
+    )
 
 
 def _settle() -> None:
@@ -50,7 +51,9 @@ def test_lru_put_evicts_least_recently_used() -> None:
     assert list(cache) == ["a", "c"]
 
 
-@pytest.mark.parametrize(("value", "expected"), [(None, 2), ("5", 5), ("1", 1), ("0", 1)])
+@pytest.mark.parametrize(
+    ("value", "expected"), [(None, 2), ("5", 5), ("1", 1), ("0", 1), ("abc", 2), ("", 2)]
+)
 def test_scratch_cache_cap_from_env(
     monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
 ) -> None:
@@ -80,8 +83,6 @@ def clean_caches():
 
 
 def _get_buffers(module, device: torch.device, t: int):
-    if not (module.IS_CUTLASS_DSL_AVAILABLE and module.IS_FLASHINFER_AVAILABLE):
-        pytest.skip("needs the CuTe DSL and FlashInfer")
     return module._get_buffers(
         device, torch.bfloat16, 1, t, H, K_DIM, V_DIM, t // BT, 1, BT, varlen=True
     )
