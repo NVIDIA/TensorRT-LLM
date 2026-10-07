@@ -231,9 +231,6 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
     }                                                                                                                  \
     }
 
-#ifndef TLLM_MOE_A2A_TIMEOUT_SECONDS
-#define TLLM_MOE_A2A_TIMEOUT_SECONDS 300
-#endif
 #if DISABLE_TIMEOUT
 #define check_timeout(s, budget) false
 #else
@@ -243,6 +240,214 @@ int64_t moeA2AGetTimeoutCycles(bool is_warmup)
 // cover that skew via moeA2AGetTimeoutCycles().
 #define check_timeout(s, budget) ((clock64() - (s)) > (budget))
 #endif
+
+// A mapped-host load is much more expensive than the ordinary completion-flag
+// probe. Sample at roughly millisecond granularity instead of on every healthy
+// peer-skew miss; the local device-status load still fans out the first observer's
+// result to every CTA immediately.
+static constexpr uint64_t kHostEpochPollIntervalCycles = 2ULL * 1000ULL * 1000ULL;
+
+// Packed host-visible abort status (bit 63 is kept clear so it can cross the
+// Torch operator boundary as a signed int64):
+//   [62:25] expected execution epoch (low 38 bits)
+//   [24:16] waiting peer + 1 (0 means no peer; 256 means logical rank 255)
+//   [15: 8] MoeA2AExecutionPhase
+//   [ 7: 0] MoeA2AAbortReason
+
+inline bool isExecutionControlPointerAligned(void const* ptr)
+{
+    return reinterpret_cast<std::uintptr_t>(ptr) % alignof(uint64_t) == 0;
+}
+
+inline void validateExecutionControl(MoeA2AExecutionControl const& control)
+{
+    TLLM_CHECK_WITH_INFO(control.live_epoch != nullptr,
+        "MoeA2AExecutionControl.live_epoch must be a registered mapped-host device pointer");
+    TLLM_CHECK_WITH_INFO(control.host_status != nullptr,
+        "MoeA2AExecutionControl.host_status must be a registered mapped-host device pointer");
+    TLLM_CHECK_WITH_INFO(control.device_status != nullptr,
+        "MoeA2AExecutionControl.device_status must point to the local workspace status word");
+    TLLM_CHECK_WITH_INFO(control.device_admission != nullptr,
+        "MoeA2AExecutionControl.device_admission must point to the local workspace admission word");
+    TLLM_CHECK_WITH_INFO(isExecutionControlPointerAligned(control.live_epoch),
+        "MoeA2AExecutionControl.live_epoch must be naturally aligned");
+    TLLM_CHECK_WITH_INFO(isExecutionControlPointerAligned(control.host_status),
+        "MoeA2AExecutionControl.host_status must be naturally aligned");
+    TLLM_CHECK_WITH_INFO(isExecutionControlPointerAligned(control.device_status),
+        "MoeA2AExecutionControl.device_status must be naturally aligned");
+    TLLM_CHECK_WITH_INFO(isExecutionControlPointerAligned(control.device_admission),
+        "MoeA2AExecutionControl.device_admission must be naturally aligned");
+    TLLM_CHECK_WITH_INFO(control.expected_epoch <= kMoeA2AExecutionEpochMask,
+        "MoeA2AExecutionControl.expected_epoch exceeds the 38-bit packed-status range");
+}
+
+__device__ __forceinline__ uint64_t loadAcquireSystem(uint64_t const* ptr)
+{
+    uint64_t value;
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+__device__ __forceinline__ uint64_t loadAcquireDevice(uint64_t const* ptr)
+{
+    uint64_t value;
+    asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+__device__ __forceinline__ void storeReleaseSystem(uint64_t* ptr, uint64_t value)
+{
+    asm volatile("st.release.sys.global.u64 [%0], %1;" : : "l"(ptr), "l"(value) : "memory");
+}
+
+__device__ __forceinline__ void storeReleaseDevice(uint64_t* ptr, uint64_t value)
+{
+    asm volatile("st.release.gpu.global.u64 [%0], %1;" : : "l"(ptr), "l"(value) : "memory");
+}
+
+__device__ __forceinline__ void recordExecutionAbort(
+    MoeA2AExecutionControl const& control, MoeA2AExecutionPhase phase, MoeA2AAbortReason reason, int peerRank)
+{
+    if (control.device_status == nullptr)
+    {
+        return;
+    }
+
+    uint64_t const status = packMoeA2AExecutionStatus(control.expected_epoch, phase, reason, peerRank);
+    auto* statusPtr = reinterpret_cast<unsigned long long*>(control.device_status);
+    unsigned long long const previous = atomicCAS(statusPtr, 0ULL, static_cast<unsigned long long>(status));
+    if (previous == 0ULL && control.host_status != nullptr)
+    {
+        // Exactly the device-status CAS winner mirrors the status to mapped host
+        // memory. A naturally aligned system-scope store is visible to the host
+        // without requiring a CUDA stream or a D2H copy.
+        storeReleaseSystem(control.host_status, status);
+    }
+}
+
+__device__ __forceinline__ bool executionAbortRequested(
+    MoeA2AExecutionControl const& control, MoeA2AExecutionPhase phase, int peerRank, uint64_t& lastHostEpochPoll)
+{
+    unsigned int const activeMask = __activemask();
+    int const laneId = threadIdx.x % warpSize;
+    int const leaderLane = __ffs(activeMask) - 1;
+
+    uint64_t deviceStatus = 0;
+    if (laneId == leaderLane && control.device_status != nullptr)
+    {
+        deviceStatus = loadAcquireDevice(control.device_status);
+    }
+    deviceStatus = __shfl_sync(activeMask, deviceStatus, leaderLane);
+    if (deviceStatus != 0)
+    {
+        return true;
+    }
+
+    uint64_t pollTime = 0;
+    bool pollHostEpoch = false;
+    if (laneId == leaderLane)
+    {
+        pollTime = clock64();
+        pollHostEpoch = pollTime - lastHostEpochPoll >= kHostEpochPollIntervalCycles;
+    }
+    pollTime = __shfl_sync(activeMask, pollTime, leaderLane);
+    pollHostEpoch = __shfl_sync(activeMask, pollHostEpoch, leaderLane);
+    if (!pollHostEpoch || control.live_epoch == nullptr)
+    {
+        return false;
+    }
+    lastHostEpochPoll = pollTime;
+
+    uint64_t liveEpoch = control.expected_epoch;
+    if (laneId == leaderLane)
+    {
+        liveEpoch = loadAcquireSystem(control.live_epoch);
+    }
+    liveEpoch = __shfl_sync(activeMask, liveEpoch, leaderLane);
+    if (liveEpoch != control.expected_epoch)
+    {
+        if (laneId == leaderLane)
+        {
+            recordExecutionAbort(control, phase, MoeA2AAbortReason::kHostRequested, peerRank);
+        }
+        return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool timeoutElapsed(uint64_t start, uint64_t timeoutCycles)
+{
+#if DISABLE_TIMEOUT
+    (void) start;
+    (void) timeoutCycles;
+    return false;
+#else
+    return clock64() - start > timeoutCycles;
+#endif
+}
+
+__device__ __forceinline__ bool executionTimedOut(
+    uint64_t start, MoeA2AExecutionControl const& control, uint64_t defaultTimeoutCycles)
+{
+    uint64_t const timeoutCycles = control.timeout_cycles == 0 ? defaultTimeoutCycles : control.timeout_cycles;
+    return timeoutElapsed(start, timeoutCycles);
+}
+
+__device__ __forceinline__ bool executionAbortLatched(MoeA2AExecutionControl const& control)
+{
+    return control.device_status != nullptr && loadAcquireDevice(control.device_status) != 0;
+}
+
+__device__ __forceinline__ bool executionEpochInvalidated(
+    MoeA2AExecutionControl const& control, MoeA2AExecutionPhase phase)
+{
+    if (loadAcquireSystem(control.live_epoch) == control.expected_epoch)
+    {
+        return false;
+    }
+    recordExecutionAbort(control, phase, MoeA2AAbortReason::kHostRequested, -1);
+    return true;
+}
+
+__device__ __forceinline__ bool executionAdmissionAborted(
+    MoeA2AExecutionControl const& control, MoeA2AExecutionPhase phase, uint64_t defaultTimeoutCycles)
+{
+    constexpr unsigned long long kAdmissionUnchecked = 0;
+    constexpr unsigned long long kAdmissionChecking = 1;
+    constexpr uint64_t kAdmissionReady = 2;
+    auto* admission = reinterpret_cast<unsigned long long*>(control.device_admission);
+    uint64_t state = loadAcquireDevice(control.device_admission);
+    if (state == kAdmissionReady)
+    {
+        return executionAbortLatched(control);
+    }
+    if (state == kAdmissionUnchecked
+        && atomicCAS(admission, kAdmissionUnchecked, kAdmissionChecking) == kAdmissionUnchecked)
+    {
+        bool const aborted = executionAbortLatched(control) || executionEpochInvalidated(control, phase);
+        storeReleaseDevice(control.device_admission, kAdmissionReady);
+        return aborted;
+    }
+
+    uint64_t const start = clock64();
+    uint64_t lastHostEpochPoll = start;
+    while (state != kAdmissionReady)
+    {
+        // A stalled admission observer must not strand the remaining CTAs.
+        // This is cooperative abort evidence, not a global drain barrier.
+        if (executionAbortRequested(control, phase, -1, lastHostEpochPoll))
+        {
+            return true;
+        }
+        if (executionTimedOut(start, control, defaultTimeoutCycles))
+        {
+            recordExecutionAbort(control, phase, MoeA2AAbortReason::kTimeout, -1);
+            return true;
+        }
+        state = loadAcquireDevice(control.device_admission);
+    }
+    return executionAbortLatched(control);
+}
 
 // ============================================================================
 // Helper Functions for Expert-to-Rank Mapping
@@ -471,7 +676,7 @@ __global__ void moeA2APrepareDispatchKernel(
 
 template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
-    const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
+    DispatchKernelPointers const ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
@@ -563,6 +768,25 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         {
             uint32_t const parity = round_parity(*ptrs.flag_val);
             int* const round_recv_counters = ptrs.recv_counters[rank_id] + parity * ep_size;
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                // Rank-mask mode is the current WideEP FT admission gate. Only
+                // this opt-in path may return recoverably: ordinary MoE retains
+                // its visible fail-stop timeout until failed-epoch disposition
+                // is integrated end to end.
+                //
+                // This unthrottled admission check prevents an epoch invalidated
+                // before launch from slipping through when every peer flag is
+                // already satisfiable. Only the publishing CTA performs it.
+                bool abort_latched = lane_id == 0
+                    && (executionAbortLatched(ptrs.execution_control)
+                        || executionEpochInvalidated(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch));
+                abort_latched = __shfl_sync(0xffffffff, abort_latched, 0);
+                if (abort_latched)
+                {
+                    return;
+                }
+            }
 // Store send_counters to recv_counters.
 // Skip masked target ranks: their symmetric memory may be inaccessible.
 #pragma unroll 1 // No unroll as one iter is typically enough
@@ -628,6 +852,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
             // Wait for all active peers to signal; skip dead ranks (otherwise we would
             // spin forever — this is the bug the rank-mask is here to prevent).
+            bool wait_aborted = false;
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
@@ -641,7 +866,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 }
                 bool flag_set = false;
                 auto s = clock64();
-                do
+                [[maybe_unused]] uint64_t last_host_epoch_poll = s;
+                while (!flag_set)
                 {
                     uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
                     uint32_t flag_value;
@@ -654,13 +880,43 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                         rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
                     flag_set = flag_value == expected_value;
-                } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
-
-                if (__builtin_expect(!flag_set, 0))
+                    if (flag_set)
+                    {
+                        break;
+                    }
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        if (executionAbortRequested(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch, peer_rank,
+                                last_host_epoch_poll))
+                        {
+                            wait_aborted = true;
+                            break;
+                        }
+                        if (__builtin_expect(executionTimedOut(s, ptrs.execution_control, ptrs.timeout_cycles), 0))
+                        {
+                            recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kDispatch,
+                                MoeA2AAbortReason::kTimeout, peer_rank);
+                            wait_aborted = true;
+                            break;
+                        }
+                    }
+                    else if (__builtin_expect(check_timeout(s, ptrs.timeout_cycles), 0))
+                    {
+                        printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+                            peer_rank);
+                        asm volatile("trap;");
+                        return;
+                    }
+                }
+                if (wait_aborted)
                 {
-                    printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
-                        peer_rank);
-                    asm volatile("trap;");
+                    break;
+                }
+            }
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                if (__any_sync(0xffffffff, wait_aborted))
+                {
                     return;
                 }
             }
@@ -1151,6 +1407,23 @@ __global__ void moeA2ADispatchCountedWriteKernel(int32_t const* token_selected_e
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 {
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_prepare_dispatch_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
+        params.stream, params.send_counters, params.recv_counters[params.ep_rank], params.local_token_counter,
+        params.ep_size, params.flag_val);
+}
+
+void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    TLLM_CHECK_WITH_INFO(!(params.enable_rank_mask && params.use_cft_counted_writes),
+        "WideEP FT execution abort currently supports only non-CFT transport");
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_prepare_dispatch_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
     // NOTE: LE counters are NOT zeroed between iterations. They grow monotonically.
     // Cumulative baselines in regular device memory track the expected value.
 
@@ -1163,7 +1436,8 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
 // Launch Functions
 // ============================================================================
 
-void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
+static void moe_a2a_dispatch_launch_impl(
+    MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
 {
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
@@ -1240,6 +1514,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     {
         kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
     }
+    kernel_ptrs.execution_control = executionControl;
 
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
 
@@ -1305,6 +1580,26 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
                     params.num_experts, params.eplb_stats_num_experts);
             }))})
     }
+}
+
+void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_dispatch_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_dispatch_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    TLLM_CHECK_WITH_INFO(!(params.enable_rank_mask && params.use_cft_counted_writes),
+        "WideEP FT execution abort currently supports only non-CFT transport");
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_dispatch_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_dispatch_launch_impl(params, executionControl);
 }
 
 // ============================================================================
@@ -1697,11 +1992,11 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 
 // LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
 // LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
-template <bool LOW_PRECISION, typename SrcT>
+template <bool LOW_PRECISION, typename SrcT, bool ENABLE_RANK_MASK>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* source_payload,
     int elements_per_token, int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters,
     int source_stride_per_token, int workspace_stride_per_token, int prepare_first_token, int prepare_num_tokens,
-    uint8_t* region_c_base, int ep_rank)
+    uint8_t* region_c_base, int ep_rank, [[maybe_unused]] uint64_t* execution_admission)
 {
 #if TLLM_MOE_A2A_COMPILE_SM90
     cudaGridDependencySynchronize();
@@ -1713,6 +2008,10 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
     if (blockIdx.x == 0 && threadIdx.x == 0)
     {
         *flag_val_ptr = *flag_val_ptr + 1;
+        if constexpr (ENABLE_RANK_MASK)
+        {
+            *execution_admission = 0;
+        }
     }
     // NOTE: LE counters are NOT zeroed. They grow monotonically with cumulative baselines.
 
@@ -1762,7 +2061,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 
 template <typename T, int TOP_K, bool LOW_PRECISION, bool ENABLE_RANK_MASK>
 __global__ void moeA2ACombineKernel(
-    const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
+    CombineKernelPointers const ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
     int stride_per_token)
 {
@@ -1791,6 +2090,7 @@ __global__ void moeA2ACombineKernel(
 #endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
+    __shared__ int execution_aborted;
     // In-kernel readiness synchronization at start of combine:
     // - One warp signals readiness to all peers with current flag_val.
     // - The first warp of each block waits for all peers' readiness (equality), then __syncthreads.
@@ -1798,12 +2098,46 @@ __global__ void moeA2ACombineKernel(
     if (is_first_warp)
     {
         int lane_id = threadIdx.x % warpSize;
-        uint32_t expected_value = *ptrs.flag_val;
-
-        if (blockIdx.x == 0)
+        if constexpr (ENABLE_RANK_MASK)
         {
-            // Signal readiness to all active peers; skip dead ranks (their symmetric memory
-            // is unreachable).
+            if (lane_id == 0)
+            {
+                // Exactly one CTA samples mapped host memory. The winner publishes
+                // admission through a local GPU word; every other CTA waits only
+                // on local device memory before it can produce output.
+                execution_aborted = executionAdmissionAborted(
+                    ptrs.execution_control, MoeA2AExecutionPhase::kCombine, ptrs.timeout_cycles);
+            }
+            __syncwarp();
+        }
+        if (!ENABLE_RANK_MASK || !execution_aborted)
+        {
+            uint32_t expected_value = *ptrs.flag_val;
+
+            if (blockIdx.x == 0)
+            {
+                // Signal readiness to all active peers; skip dead ranks (their symmetric memory
+                // is unreachable).
+#pragma unroll 1 // No unroll
+                for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
+                {
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                            continue;
+                    }
+                    uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
+                    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+#if ENABLE_DEBUG_PRINT
+                    printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
+                        peer_rank);
+#endif
+                }
+            }
+
+            // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
+            // forever — this is the bug the rank-mask is here to prevent).
+            bool wait_aborted = false;
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
@@ -1812,58 +2146,86 @@ __global__ void moeA2ACombineKernel(
                     if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
                         continue;
                 }
-                uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
-                asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+                bool flag_set = false;
+                auto s = clock64();
+                [[maybe_unused]] uint64_t last_host_epoch_poll = s;
+                while (!flag_set)
+                {
+                    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+                    uint32_t flag_value;
+                    // Acquire load to ensure visibility of peer's release-store
+                    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
 #if ENABLE_DEBUG_PRINT
-                printf("combine: +++Rank %d setting completion flag to %d for rank %d\n", rank_id, expected_value,
-                    peer_rank);
+                    printf(
+                        "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
+                        "%d, "
+                        "address: %p\n",
+                        rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
+                    flag_set = flag_value == expected_value;
+                    if (flag_set)
+                    {
+                        break;
+                    }
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        if (executionAbortRequested(ptrs.execution_control, MoeA2AExecutionPhase::kCombine, peer_rank,
+                                last_host_epoch_poll))
+                        {
+                            wait_aborted = true;
+                            break;
+                        }
+                        if (__builtin_expect(executionTimedOut(s, ptrs.execution_control, ptrs.timeout_cycles), 0))
+                        {
+                            recordExecutionAbort(ptrs.execution_control, MoeA2AExecutionPhase::kCombine,
+                                MoeA2AAbortReason::kTimeout, peer_rank);
+                            wait_aborted = true;
+                            break;
+                        }
+                    }
+                    else if (__builtin_expect(check_timeout(s, ptrs.timeout_cycles), 0))
+                    {
+                        printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+                            peer_rank);
+                        asm volatile("trap;");
+                        return;
+                    }
+                }
+                if (wait_aborted)
+                {
+                    break;
+                }
             }
-        }
-
-        // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
-        // forever — this is the bug the rank-mask is here to prevent).
-#pragma unroll 1 // No unroll
-        for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
-        {
             if constexpr (ENABLE_RANK_MASK)
             {
-                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
-                    continue;
+                if (__any_sync(0xffffffff, wait_aborted) && lane_id == 0)
+                {
+                    execution_aborted = 1;
+                }
+                __syncwarp();
             }
-            bool flag_set = false;
-            auto s = clock64();
-            do
+            if (!ENABLE_RANK_MASK || !execution_aborted)
             {
-                uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-                uint32_t flag_value;
-                // Acquire load to ensure visibility of peer's release-store
-                asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
-#if ENABLE_DEBUG_PRINT
-                printf(
-                    "combine: ---Rank %d received completion flag from rank %d, flag_value: %d, expected_value: "
-                    "%d, "
-                    "address: %p\n",
-                    rank_id, peer_rank, flag_value, expected_value, flag_ptr);
+#if TLLM_MOE_A2A_COMPILE_SM90
+                // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
+                asm volatile("fence.acquire.sys;");
+#else
+                asm volatile("fence.acq_rel.sys;");
 #endif
-                flag_set = flag_value == expected_value;
-            } while (!flag_set && !check_timeout(s, ptrs.timeout_cycles));
-
-            if (__builtin_expect(!flag_set, 0))
-            {
-                printf("combine: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id, peer_rank);
-                asm volatile("trap;");
-                return;
             }
         }
-#if TLLM_MOE_A2A_COMPILE_SM90
-        // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
-        asm volatile("fence.acquire.sys;");
-#else
-        asm volatile("fence.acq_rel.sys;");
-#endif
     }
     __syncthreads();
+    if constexpr (ENABLE_RANK_MASK)
+    {
+        if (execution_aborted)
+        {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            cudaTriggerProgrammaticLaunchCompletion();
+#endif
+            return;
+        }
+    }
 #endif
 
     if (local_num_tokens == 0)
@@ -2068,6 +2430,8 @@ __global__ void moeA2ACombineCountedWriteKernel(const CombineKernelPointers ptrs
 
 void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
 {
+    TLLM_CHECK_WITH_INFO(
+        !params.enable_rank_mask, "WideEP FT execution abort currently supports only non-CFT transport");
     // grid.x selects a source rank; grid.y and the warps in each block fan out its tokens.
     int const bytes_per_token = params.wire_bytes_per_token;
     int const local_stride_per_token = params.cft_push_stride_per_token;
@@ -2128,7 +2492,8 @@ void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params)
     });
 }
 
-void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
+static void moe_a2a_prepare_combine_launch_impl(
+    MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
 {
     constexpr int kBlockSize = 256;
     TLLM_CHECK(params.max_tokens_per_rank > 0);
@@ -2144,23 +2509,46 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     // Zeroing them here (after dispatch's fabric puts) corrupts subsequent counter increments
     // because cudaDeviceSynchronize does NOT wait for fabric engine completion.
 
-    SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
-        SWITCH_DTYPE(params.dtype, SrcT, {
-            auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT>;
-            launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
-                recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
-                params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
-                params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens, region_c_base,
-                params.ep_rank);
+    SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
+        SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
+            SWITCH_DTYPE(params.dtype, SrcT, {
+                auto kernel_fn = moeA2APrepareCombineKernel<LOW_PRECISION, SrcT, ENABLE_RANK_MASK>;
+                launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                    recv_buffer_bytes, params.source_payload, params.elements_per_token, params.ep_size,
+                    params.max_tokens_per_rank, params.flag_val, params.recv_counters, params.source_stride_per_token,
+                    params.workspace_stride_per_token, params.prepare_first_token, params.prepare_num_tokens,
+                    region_c_base, params.ep_rank, executionControl.device_admission);
+            });
         });
     });
+}
+
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_prepare_combine_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_prepare_combine_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    TLLM_CHECK_WITH_INFO(!(params.enable_rank_mask && params.use_cft_for_combine),
+        "WideEP FT execution abort currently supports only non-CFT transport");
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_prepare_combine_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_prepare_combine_launch_impl(params, executionControl);
 }
 
 // ============================================================================
 // Combine Launch Function
 // ============================================================================
 
-void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
+static void moe_a2a_combine_launch_impl(
+    MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
 {
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
@@ -2280,6 +2668,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     {
         kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
     }
+    kernel_ptrs.execution_control = executionControl;
 
     SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
         SWITCH_DTYPE(params.dtype, T, {
@@ -2293,6 +2682,26 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             });
         });
     });
+}
+
+void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
+{
+    TLLM_CHECK_WITH_INFO(!params.enable_rank_mask,
+        "moe_a2a_combine_launch requires a registered MoeA2AExecutionControl in rank-mask mode");
+    moe_a2a_combine_launch_impl(params, MoeA2AExecutionControl{});
+}
+
+void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl)
+{
+    TLLM_CHECK_WITH_INFO(!(params.enable_rank_mask && params.use_cft_for_combine),
+        "WideEP FT execution abort currently supports only non-CFT transport");
+    if (!params.enable_rank_mask)
+    {
+        moe_a2a_combine_launch(params);
+        return;
+    }
+    validateExecutionControl(executionControl);
+    moe_a2a_combine_launch_impl(params, executionControl);
 }
 
 // Kernel to sanitize expert ids for invalid tokens

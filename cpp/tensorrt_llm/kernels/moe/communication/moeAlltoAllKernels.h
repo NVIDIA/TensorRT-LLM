@@ -17,6 +17,7 @@
 #pragma once
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
@@ -57,6 +58,57 @@ static constexpr int64_t kDefaultTimeoutCycles = 300ll * 2000ll * 1000ll * 1000l
 // Default per-block dynamic shared-memory cap on sm_90+; larger requests must opt in via
 // cudaFuncAttributeMaxDynamicSharedMemorySize.
 static constexpr int kDefaultDynamicSmemBytes = 48 * 1024;
+
+// Abort state for one logical execution epoch. The coordinator-owned live_epoch is kept
+// in mapped, page-locked memory so its callback thread can change it without enqueueing
+// work on a CUDA stream. expected_epoch is captured by value when dispatch starts and is
+// reused by combine. device_status is local GPU memory used to fan an abort out across
+// CTAs; device_admission lets one combine CTA sample the mapped epoch and publish the
+// result to every other CTA without one mapped-host read per token. host_status mirrors
+// the first failure into mapped memory for non-blocking host reads. timeout_cycles is
+// zero in production (selecting the built-in deadline) and can be shortened only through
+// the explicitly test-only host op.
+// A nonzero host_status means an abort was observed, not that the grid or transport
+// has quiesced. The coordinator must prove that both local work and failed-peer
+// writes can no longer reach reusable resources; a stream/event drain alone is
+// insufficient for that proof. CFT abort is not yet qualified.
+//
+// This is deliberately independent from the committed EP membership generation. An
+// epoch mismatch only invalidates work already in flight; it never changes rank masks.
+struct MoeA2AExecutionControl
+{
+    uint64_t const* live_epoch{};
+    uint64_t* host_status{};
+    uint64_t* device_status{};
+    uint64_t* device_admission{};
+    uint64_t expected_epoch{};
+    uint64_t timeout_cycles{};
+};
+
+enum class MoeA2AExecutionPhase : uint8_t
+{
+    kDispatch = 1,
+    kCombine = 2,
+};
+
+enum class MoeA2AAbortReason : uint8_t
+{
+    kHostRequested = 1,
+    kTimeout = 2,
+};
+
+// Keep bit 63 clear for the signed Torch ABI. Nine peer bits encode a sentinel
+// plus all 256 supported ranks; the remaining 38 high bits carry the epoch.
+static constexpr uint64_t kMoeA2AExecutionEpochMask = (uint64_t{1} << 38) - 1;
+static_assert(kMaxRanks <= 511, "packed execution status cannot represent every rank");
+
+__host__ __device__ constexpr uint64_t packMoeA2AExecutionStatus(
+    uint64_t epoch, MoeA2AExecutionPhase phase, MoeA2AAbortReason reason, int peerRank)
+{
+    uint64_t const peerCode = peerRank < 0 ? 0 : static_cast<uint64_t>(peerRank + 1);
+    return ((epoch & kMoeA2AExecutionEpochMask) << 25) | ((peerCode & 0x1ff) << 16)
+        | (static_cast<uint64_t>(phase) << 8) | static_cast<uint64_t>(reason);
+}
 
 // Describes a single payload type to be communicated
 struct PayloadDescriptor
@@ -122,6 +174,9 @@ struct DispatchKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Running-kernel abort/status primitive. See MoeA2AExecutionControl.
+    MoeA2AExecutionControl execution_control;
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -152,6 +207,9 @@ struct CombineKernelPointers
 
     // Completion-flag wait budget in clock64() cycles; see moeA2AGetTimeoutCycles().
     int64_t timeout_cycles{kDefaultTimeoutCycles};
+
+    // Running-kernel abort/status primitive. See MoeA2AExecutionControl.
+    MoeA2AExecutionControl execution_control;
 };
 
 // Dispatch phase parameters
@@ -239,9 +297,15 @@ struct MoeA2ADispatchParams
 int64_t moeA2AGetTimeoutCycles(bool is_warmup);
 
 // Dispatch kernels
+// The legacy one-argument ABI remains valid when rank-mask mode is disabled.
+// Rank-mask launches must provide host-visible execution control through the
+// two-argument form.
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
+void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl);
 // Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
+void moe_a2a_prepare_dispatch_launch(
+    MoeA2ADispatchParams const& params, MoeA2AExecutionControl const& executionControl);
 
 // Combine phase parameters
 struct MoeA2ACombineParams
@@ -320,9 +384,12 @@ struct MoeA2ACombineParams
 };
 
 // Combine kernels
+// The legacy one-argument ABI remains valid outside rank-mask mode; see dispatch above.
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
+void moe_a2a_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
+void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params, MoeA2AExecutionControl const& executionControl);
 
 // CFT combine push: processing rank pushes expert output back to originating rank's LE.
 void moe_a2a_cft_combine_push_launch(MoeA2ACombineParams const& params);

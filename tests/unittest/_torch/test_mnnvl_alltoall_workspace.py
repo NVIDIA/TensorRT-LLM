@@ -750,6 +750,7 @@ def test_one_sided_checkpoint_rejects_destroyed_workspace(
     wrapper = NVLinkOneSided.__new__(NVLinkOneSided)
     wrapper._destroyed = False
     wrapper.can_use_cft_counted_writes = False
+    wrapper.workspace = None
     wrapper._workspace_lifecycle = Mock()
     wrapper._workspace_key = ("test",)
     wrapper._workspace_registered = True

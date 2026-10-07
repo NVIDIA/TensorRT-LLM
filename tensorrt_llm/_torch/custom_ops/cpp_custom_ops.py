@@ -722,9 +722,20 @@ def _register_fake():
         top_k: int,
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
+        use_cft_counted_writes: bool = False,
+        expert_id_payload_index: Optional[int] = None,
+        invalid_token_expert_id: Optional[int] = None,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_control: Optional[torch.Tensor] = None,
+        expected_execution_epoch: int = 0,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        if enable_rank_mask and use_cft_counted_writes:
+            raise RuntimeError(
+                "WideEP FT execution abort currently supports only non-CFT transport"
+            )
+        if enable_rank_mask and execution_control is None:
+            raise RuntimeError("execution_control is required")
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
             elements_per_token = payload.shape[1]
@@ -754,9 +765,18 @@ def _register_fake():
         combine_payload_offset: int,
         payload_in_workspace: bool,
         use_low_precision: bool = False,
+        use_cft_counted_writes: bool = False,
         enable_rank_mask: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_control: Optional[torch.Tensor] = None,
+        expected_execution_epoch: int = 0,
     ) -> torch.Tensor:
+        if enable_rank_mask and use_cft_counted_writes:
+            raise RuntimeError(
+                "WideEP FT execution abort currently supports only non-CFT transport"
+            )
+        if enable_rank_mask and execution_control is None:
+            raise RuntimeError("execution_control is required")
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
     @torch.library.register_fake("trtllm::moe_a2a_initialize")

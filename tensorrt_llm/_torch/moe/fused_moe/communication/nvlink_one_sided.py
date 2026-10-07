@@ -28,6 +28,7 @@ import os
 import re
 import sys
 from typing import Callable, Dict, List, Optional, Tuple
+from weakref import WeakSet
 
 import pynvml
 import torch
@@ -44,6 +45,11 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     reject_rank_mask_cuda_graph_capture,
 )
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
+from tensorrt_llm._torch.moe_a2a_execution_control import (
+    MoeA2AExecutionAbortStatus,
+    MoeA2AExecutionControl,
+    validate_execution_mode,
+)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -393,6 +399,7 @@ class NVLinkOneSided(Communication):
         # without the override the CFT path cannot be reached at all. Leaving
         # the variable unset keeps CFT disabled, as before.
         can_use_cft_counted_writes = resolve_can_use_cft(can_use_cft_counted_writes)
+        validate_execution_mode(ep_group_health is not None, can_use_cft_counted_writes)
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -502,6 +509,8 @@ class NVLinkOneSided(Communication):
                 "workspace": workspace,
                 "metainfo": metainfo,
                 "cft_initialized": False,
+                "execution_control": None,
+                "instances": WeakSet(),
             }
         else:
             expected_workspace_state = {
@@ -525,8 +534,10 @@ class NVLinkOneSided(Communication):
         self._destroyed = False
         self._workspace_registered = False
         self._workspace_state = workspace_state
+        workspace_state["instances"].add(self)
         self.mnnvl_mem = workspace_state["mnnvl_mem"]
         self.workspace = workspace_state["workspace"]
+        self._execution_control = None
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
         self.ep_group_health = ep_group_health
         # Keep the kernel specialization stable for this communicator's lifetime.
@@ -593,6 +604,15 @@ class NVLinkOneSided(Communication):
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
 
+        # Allocate only after validating and publishing shared ownership. Normal
+        # fence/CFT communicators do not allocate or poll mapped FT control state.
+        if self._rank_mask_enabled:
+            if workspace_state["execution_control"] is None:
+                workspace_state["execution_control"] = MoeA2AExecutionControl(
+                    self.workspace, self.ep_rank
+                )
+            self._execution_control = workspace_state["execution_control"]
+
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
         return self._require_workspace_lifecycle().metainfo
@@ -624,6 +644,53 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    @classmethod
+    def _clear_workspace_cache(cls) -> None:
+        """Synchronize and release every cached symmetric workspace.
+
+        Reused-worker tests need fresh-process semantics between cases. The
+        execution-control registry owns each workspace until ``close()``, so
+        clearing the Python dictionaries directly would retain both the mapped
+        host allocation and the full CUDA workspace.
+        """
+        workspace_states = []
+        seen_states = set()
+        for workspace_state in cls._WORKSPACES.values():
+            state_id = id(workspace_state)
+            if state_id not in seen_states:
+                seen_states.add(state_id)
+                workspace_states.append(workspace_state)
+
+        if cls._WORKSPACE is not None and id(cls._WORKSPACE) not in seen_states:
+            workspace_states.append(cls._WORKSPACE)
+
+        for workspace_state in workspace_states:
+            for instance in tuple(workspace_state.get("instances", ())):
+                lifecycle = getattr(instance, "_workspace_lifecycle", None)
+                if lifecycle is not None:
+                    lifecycle.unregister(instance)
+                instance._workspace_registered = False
+            AlltoAllWatchdogCoordinator.shutdown_shared_watchdog(workspace_state)
+
+        for workspace_state in workspace_states:
+            workspace = workspace_state.get("workspace")
+            if (
+                torch.cuda.is_available()
+                and isinstance(workspace, torch.Tensor)
+                and workspace.is_cuda
+            ):
+                torch.cuda.synchronize(workspace.device)
+
+        for workspace_state in workspace_states:
+            execution_control = workspace_state.get("execution_control")
+            if execution_control is not None:
+                execution_control.close()
+            workspace_state.clear()
+
+        cls._WORKSPACES.clear()
+        cls._WORKSPACE_REFCOUNTS.clear()
+        cls._WORKSPACE = None
+
     def destroy(self):
         """Release shared state during explicit, rank-coordinated teardown."""
         if getattr(self, "_destroyed", False):
@@ -639,8 +706,12 @@ class NVLinkOneSided(Communication):
             return
         self._workspace_registered = False
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if torch.cuda.is_available() and self.workspace is not None:
+            torch.cuda.synchronize(self.workspace.device)
+
+        workspace_state = NVLinkOneSided._WORKSPACES.get(workspace_key)
+        if workspace_state is not None:
+            workspace_state["instances"].discard(self)
 
         refcount = NVLinkOneSided._WORKSPACE_REFCOUNTS.get(workspace_key, 0) - 1
         if refcount > 0:
@@ -651,12 +722,16 @@ class NVLinkOneSided(Communication):
             if NVLinkOneSided._WORKSPACE is workspace_state:
                 NVLinkOneSided._WORKSPACE = None
             if workspace_state is not None:
+                execution_control = workspace_state.get("execution_control")
+                if execution_control is not None:
+                    execution_control.close()
                 workspace_state.clear()
 
         self.mnnvl_mem = None
         self.workspace = None
         self._workspace_state = None
         self._workspace_lifecycle = None
+        self._execution_control = None
         self._dispatch_state = {"phase": "destroyed"}
 
     def __del__(self) -> None:
@@ -748,9 +823,15 @@ class NVLinkOneSided(Communication):
         )
 
     def _mnnvl_checkpoint_is_idle(self) -> bool:
-        return self._dispatch_state.get("phase") == "idle"
+        return self._dispatch_state.get("phase") == "idle" and (
+            self._execution_control is None or not self._execution_control.has_pending_abort()
+        )
 
     def _mnnvl_checkpoint_reset(self) -> None:
+        if self._execution_control is not None and self._execution_control.has_pending_abort():
+            raise RuntimeError(
+                "Cannot restore an MNNVL workspace with an unacknowledged execution abort"
+            )
         self._dispatch_state = {"phase": "idle"}
 
     def _reserve_combine_region(self, hidden_size: int, dtype: torch.dtype) -> int:
@@ -868,6 +949,8 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
+        execution_control = self._execution_control
+        execution_epoch = execution_control.capture_epoch() if execution_control is not None else 0
         recv_buffers, combine_payload_offset, eplb_gathered_stats = (
             torch.ops.trtllm.moe_a2a_dispatch(
                 token_selected_slots,
@@ -885,6 +968,8 @@ class NVLinkOneSided(Communication):
                 int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
                 self._rank_mask_enabled,
                 active_rank_mask,
+                execution_control.tensor if execution_control is not None else None,
+                execution_epoch,
             )
         )
         self._watchdog_coordinator.watch_collective(
@@ -902,6 +987,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
+        self._dispatch_state["execution_epoch"] = execution_epoch
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -981,11 +1067,13 @@ class NVLinkOneSided(Communication):
         local_num_tokens = self._dispatch_state.get("local_num_tokens")
         combine_payload_offset = self._dispatch_state.get("combine_payload_offset")
         runtime_max_tokens_per_rank = self._dispatch_state.get("runtime_max_tokens_per_rank")
+        execution_epoch = self._dispatch_state.get("execution_epoch")
 
         if (
             local_num_tokens is None
             or combine_payload_offset is None
             or runtime_max_tokens_per_rank is None
+            or execution_epoch is None
         ):
             raise RuntimeError("combine called but dispatch state is missing")
 
@@ -1037,6 +1125,8 @@ class NVLinkOneSided(Communication):
             use_cft_for_combine,
             self._rank_mask_enabled,
             active_rank_mask,
+            self._execution_control.tensor if self._execution_control is not None else None,
+            int(execution_epoch),
         )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask
@@ -1056,6 +1146,30 @@ class NVLinkOneSided(Communication):
         the next ``dispatch`` would raise ``dispatch called twice``.
         """
         self._dispatch_state = {"phase": "idle"}
+
+    def request_execution_abort(self) -> int:
+        """Let the recovery coordinator invalidate in-flight work without a CUDA stream."""
+        if not self._rank_mask_enabled:
+            raise RuntimeError(
+                "recoverable MoE A2A execution abort requires WideEP FT rank-mask mode"
+            )
+        return self._execution_control.request_abort()
+
+    def get_execution_abort_status(self) -> Optional[MoeA2AExecutionAbortStatus]:
+        """Return the first kernel-observed abort/timeout, if any."""
+        return self._execution_control.status() if self._execution_control is not None else None
+
+    def begin_execution_epoch(self, execution_epoch: Optional[int] = None) -> int:
+        """Acknowledge/reset an epoch after the coordinator has quiesced old work."""
+        if not self._rank_mask_enabled:
+            raise RuntimeError(
+                "recoverable MoE A2A execution abort requires WideEP FT rank-mask mode"
+            )
+        acknowledged_epoch = self._execution_control.begin_epoch(execution_epoch)
+        workspace_state = NVLinkOneSided._WORKSPACES[self._workspace_key]
+        for instance in list(workspace_state["instances"]):
+            instance.reset_state()
+        return acknowledged_epoch
 
     def get_combine_payload_tensor_in_workspace(
         self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
