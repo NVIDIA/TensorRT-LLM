@@ -69,6 +69,9 @@ option(ENABLE_UCX "Enable building with UCX (Uniform Communication X) support"
 option(ENABLE_NCCL_PROFILING
        "Emit PyTorch profiler regions around NcclCommunicatorOp send/recv calls"
        OFF)
+if(ENABLE_NANOBIND_PROFILING AND NOT BUILD_PYT)
+  message(FATAL_ERROR "ENABLE_NANOBIND_PROFILING requires BUILD_PYT=ON")
+endif()
 if(ENABLE_NCCL_PROFILING AND (NOT BUILD_PYT OR NOT ENABLE_MULTI_DEVICE))
   message(
     FATAL_ERROR
