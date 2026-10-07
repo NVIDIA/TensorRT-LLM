@@ -26,5 +26,4 @@ parallel_config:
   cfg_size: 1
   tp_size: 2
   ulysses_size: 2
-  async_ulysses: true
   parallel_vae_size: 4
