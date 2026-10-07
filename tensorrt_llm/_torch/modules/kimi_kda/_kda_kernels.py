@@ -406,17 +406,24 @@ def replay_kda_token_records(
     num_accepted_tokens: torch.Tensor,
 ) -> None:
     """Replay each selected slot's accepted drafts onto its pool state from
-    the per-draft records the Kimi K3 verify kernels keep in the slot's
-    per-token state region.
+    the per-draft records the Kimi K3 verify kernels keep in ``state_tok``.
 
-    A slot's region of ``state_tok`` (``[slots, num_spec, H, V, K]`` fp32)
-    starts with the records of the last round's drafts: the row innovations
-    ``vn`` ``[num_spec][H][V]``, then ``beta * k`` and the decay
-    ``[num_spec][H][K]``. Draft ``t`` updates the state as the kernels do,
-    ``S = fma(decay, S, vn (beta * k))``, so the result is bit-identical to the
-    state their next verify starts from.
+    A slot of ``state_tok`` (``[slots, 3, num_spec, H, K]`` fp32) holds the
+    records of the last round's drafts: the row innovations ``vn``
+    ``[num_spec][H][V]``, then ``beta * k`` and the decay
+    ``[num_spec][H][K]`` (V = K). Draft ``t`` updates the state as the
+    kernels do, ``S = fma(decay, S, vn (beta * k))``, so the result is
+    bit-identical to the state their next verify starts from.
     """
-    num_spec, num_heads, v_dim, k_dim = state_tok.shape[1:]
+    _, num_spec, num_heads, k_dim = state_tok.shape[1:]
+    v_dim = recurrent_state.shape[-2]
+    if state_tok.shape[1] != 3 or v_dim != k_dim:
+        raise ValueError(
+            "replay_kda_token_records: expected the drafts' records "
+            "[slots, 3, num_spec, H, K] with V = K, got "
+            f"{tuple(state_tok.shape)} for a state of "
+            f"{tuple(recurrent_state.shape)}"
+        )
     if state_indices.numel() == 0:
         return
     block_v = 32
@@ -458,9 +465,8 @@ def commit_kda_pending_drafts(
     hold the state and the conv window that verify would start from, bit for
     bit, and the caller clears the slot's count:
 
-    * with per-token states (``state_tok``), the drafts are replayed from the
-      per-draft records the Kimi K3 verify kernels keep there
-      (``replay_kda_token_records``);
+    * with the Kimi K3 verify kernels' draft records (``state_tok``), the
+      drafts are replayed from those (``replay_kda_token_records``);
     * otherwise they are replayed from the replay caches by the fused verify
       kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
     """

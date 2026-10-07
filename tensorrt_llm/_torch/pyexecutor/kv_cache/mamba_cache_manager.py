@@ -4377,8 +4377,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             commit_kda_pending_drafts
 
         assert self.prev_num_accepted_tokens is not None
-        # With per-token verify states, the accepted drafts are replayed from
-        # the records the verify kernels keep there instead of the caches.
+        # With the verify kernels' draft records (kda_state_tok), the accepted
+        # drafts are replayed from those instead of the caches.
         state_tok = getattr(self, "kda_state_tok", None)
         with self._on_kv_cache_stream():
             slots = torch.full((1, ),
