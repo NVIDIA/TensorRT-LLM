@@ -205,6 +205,29 @@ void ProfilerMetadata::appendQuoted(std::string_view value)
     mEncoded += '\'';
 }
 
+#if TRTLLM_ENABLE_NCCL_PROFILING
+void addNcclMetadata(ProfilerMetadata& metadata, std::string_view operation, std::vector<std::int64_t> const& group,
+    std::int64_t rank, std::string_view parallelismDimension, std::string_view kind, std::int64_t logicalBytes,
+    std::optional<cudaStream_t> stream)
+{
+    metadata.add("nccl.operation", operation);
+    metadata.add("nccl.group", group);
+    metadata.add("nccl.rank", rank);
+    metadata.add("nccl.parallelism_dimension", parallelismDimension);
+    metadata.add("nccl.kind", kind);
+    metadata.add("nccl.logical_bytes", logicalBytes);
+    if (stream.has_value())
+    {
+        cudaStreamCaptureStatus captureStatus{};
+        auto const captureError = cudaStreamIsCapturing(*stream, &captureStatus);
+        metadata.add("nccl.cuda_graph_state",
+            captureError != cudaSuccess                        ? "unknown"
+                : captureStatus == cudaStreamCaptureStatusNone ? "eager"
+                                                               : "capture");
+    }
+}
+#endif
+
 RecordFunctionWithMetadata::RecordFunctionWithMetadata(ProfilerRegion region) noexcept
 {
     if (!customRegionEnabled(region))

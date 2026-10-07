@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -216,6 +217,32 @@ TEST(ProfilerMetadataTest, ByteLengthsAndControlCharactersAreLiteralCompatible)
     EXPECT_EQ(std::move(metadata).take(), "TRTLLM16:区域{'control':'\\x00\\x01\\r','ids':[-7,0,9223372036854775807]}");
 }
 
+#if TRTLLM_ENABLE_NCCL_PROFILING
+TEST(ProfilerMetadataTest, NcclFieldsPreserveOrderedRanksAndLogicalPayload)
+{
+    tc::ProfilerMetadata metadata{"nccl"};
+    tc::addNcclMetadata(metadata, "all_reduce", std::vector<std::int64_t>{3, 7}, 7, "tp", "collective", 4096);
+    metadata.add("nccl.reduce_op", "sum");
+    metadata.add("nccl.selected_strategy", "NCCL");
+    EXPECT_EQ(std::move(metadata).take(),
+        "TRTLLM14:nccl{'nccl.operation':'all_reduce','nccl.group':[3,7],'nccl.rank':7,"
+        "'nccl.parallelism_dimension':'tp','nccl.kind':'collective','nccl.logical_bytes':4096,"
+        "'nccl.reduce_op':'sum','nccl.selected_strategy':'NCCL'}");
+}
+
+TEST(ProfilerMetadataTest, NcclPointToPointPreservesEmptyPayloadAndUnknownDimension)
+{
+    tc::ProfilerMetadata metadata{"nccl"};
+    tc::addNcclMetadata(metadata, "recv", std::vector<std::int64_t>{0, 1}, 1, "unknown", "p2p", 0);
+    metadata.add("nccl.src_rank", std::int64_t{0});
+    metadata.add("nccl.dst_rank", std::int64_t{1});
+    EXPECT_EQ(std::move(metadata).take(),
+        "TRTLLM14:nccl{'nccl.operation':'recv','nccl.group':[0,1],'nccl.rank':1,"
+        "'nccl.parallelism_dimension':'unknown','nccl.kind':'p2p','nccl.logical_bytes':0,"
+        "'nccl.src_rank':0,'nccl.dst_rank':1}");
+}
+#endif
+
 class ProfilerScopeTest : public ::testing::Test
 {
 protected:
@@ -265,6 +292,96 @@ TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
     EXPECT_EQ(observation().ends, 1);
     EXPECT_TRUE(observation().metadata.empty());
 }
+
+TEST_F(ProfilerScopeTest, NcclBuildGateAndInputDemandKeepExtractionLazy)
+{
+    int fields{0};
+    {
+        CallbackGuard callback{false};
+#if TRTLLM_ENABLE_NCCL_PROFILING
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName(
+            []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
+        EXPECT_EQ(observation().starts, 1);
+#else
+        EXPECT_EQ(observation().starts, 0);
+#endif
+        EXPECT_TRUE(observation().metadata.empty());
+    }
+    EXPECT_EQ(fields, 0);
+#if TRTLLM_ENABLE_NCCL_PROFILING
+    tc::RecordFunctionWithMetadata inactive{tc::ProfilerRegion::kNccl};
+    inactive.startWithLazyName(
+        []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
+    EXPECT_EQ(fields, 0);
+    CallbackGuard callback;
+    {
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+            [&](tc::ProfilerMetadata& metadata)
+            {
+                ++fields;
+                tc::addNcclMetadata(metadata, "all_gather", {0, 1}, 0, "unknown", "collective", 32);
+            });
+    }
+    EXPECT_EQ(fields, 1);
+    EXPECT_EQ(observation().starts, 1);
+    EXPECT_EQ(observation().ends, 1);
+    EXPECT_EQ(observation().name, "trtllm::nccl_metadata");
+    EXPECT_EQ(observation().metadata,
+        "TRTLLM14:nccl{'nccl.operation':'all_gather','nccl.group':[0,1],'nccl.rank':0,"
+        "'nccl.parallelism_dimension':'unknown','nccl.kind':'collective','nccl.logical_bytes':32}");
+#endif
+}
+
+#if TRTLLM_ENABLE_NCCL_PROFILING
+TEST_F(ProfilerScopeTest, NcclInactiveScopeNeverConstructsItsOwningName)
+{
+    int names{0};
+    int fields{0};
+    tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+    scope.startWithLazyName(
+        [&]() -> std::string
+        {
+            ++names;
+            throw std::bad_alloc{};
+        },
+        [&](tc::ProfilerMetadata&) { ++fields; });
+    EXPECT_EQ(names, 0);
+    EXPECT_EQ(fields, 0);
+}
+
+TEST_F(ProfilerScopeTest, NcclThrowingNameDoesNotPreventBodyOrMaskItsException)
+{
+    CallbackGuard callback;
+    int names{0};
+    int fields{0};
+    bool bodyRan{false};
+    try
+    {
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName(
+            [&]() -> std::string
+            {
+                ++names;
+                // Deterministic factory failure, without modifying the process allocator.
+                throw std::bad_alloc{};
+            },
+            [&](tc::ProfilerMetadata&) { ++fields; });
+        bodyRan = true;
+        throw std::logic_error("original operation failure");
+    }
+    catch (std::logic_error const& error)
+    {
+        EXPECT_STREQ(error.what(), "original operation failure");
+    }
+    EXPECT_TRUE(bodyRan);
+    EXPECT_EQ(names, 1);
+    EXPECT_EQ(fields, 0);
+    EXPECT_EQ(observation().starts, 0);
+    EXPECT_EQ(observation().ends, 0);
+}
+#endif
 
 TEST_F(ProfilerScopeTest, InactiveAndUnselectedScopesDoNotEvaluateFactories)
 {

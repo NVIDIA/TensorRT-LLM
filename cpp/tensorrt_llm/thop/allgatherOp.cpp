@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +16,9 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
@@ -71,6 +74,37 @@ public:
             = sizes.has_value() ? std::accumulate(sizes.value().begin(), sizes.value().end(), 0, std::plus<>{}) : 0;
         std::vector<torch::Tensor> output_list;
         output_list.reserve(input_list.size());
+#if TRTLLM_ENABLE_NCCL_PROFILING
+        common::RecordFunctionWithMetadata profiler{common::ProfilerRegion::kNccl};
+        profiler.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+            [&](common::ProfilerMetadata& metadata)
+            {
+                std::vector<std::int64_t> const group(mGroup.begin(), mGroup.end());
+                std::int64_t logicalBytes{0};
+                for (auto const& input : input_list)
+                {
+                    logicalBytes += input.numel() * static_cast<std::int64_t>(input.element_size());
+                }
+                std::optional<cudaStream_t> stream;
+                if (!input_list.empty())
+                {
+                    stream = at::cuda::getCurrentCUDAStream(input_list[0].get_device()).stream();
+                }
+                // The same native schema serves TP, CP and arbitrary groups.
+                common::addNcclMetadata(metadata, "all_gather", group, COMM_SESSION.getRank(), "unknown", "collective",
+                    logicalBytes, stream);
+                auto const* selectedStrategy = use_nccl_allgather ? "nccl_allgather" : "nccl_broadcast";
+                metadata.add("nccl.strategy", selectedStrategy);
+                metadata.add("nccl.requested_strategy", "all_gather");
+                metadata.add("nccl.selected_strategy", selectedStrategy);
+                if (sizes.has_value())
+                {
+                    std::vector<std::int64_t> const splitSizes(sizes.value().begin(), sizes.value().end());
+                    metadata.add("nccl.input_split_sizes", splitSizes);
+                    metadata.add("nccl.output_split_sizes", splitSizes);
+                }
+            });
+#endif
         ncclGroupStart();
         for (auto const& input : input_list)
         {

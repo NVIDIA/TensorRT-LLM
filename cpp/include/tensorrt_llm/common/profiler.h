@@ -20,6 +20,10 @@
 
 #include <ATen/record_function.h>
 
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include <cuda_runtime_api.h>
+#endif
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -79,6 +83,16 @@ private:
     std::string mEncoded;
     bool mFirst{true};
 };
+
+#if TRTLLM_ENABLE_NCCL_PROFILING
+//! Append observed raw-NCCL operation fields; group contains ordered communicator-global ranks.
+//! logicalBytes is local tensor payload, not wire traffic. Use "unknown" when the caller's
+//! parallelism dimension is unavailable. A supplied stream adds eager/capture/unknown state;
+//! querying it neither synchronizes nor adds a collective. Call only in a lazy metadata factory.
+void addNcclMetadata(ProfilerMetadata& metadata, std::string_view operation, std::vector<std::int64_t> const& group,
+    std::int64_t rank, std::string_view parallelismDimension, std::string_view kind, std::int64_t logicalBytes,
+    std::optional<cudaStream_t> stream = std::nullopt);
+#endif
 
 //! An observational, same-thread PyTorch USER_SCOPE owning its name and string input.
 //! Probes remain inactive until initializeProfiler() succeeds. Active callbacks determine

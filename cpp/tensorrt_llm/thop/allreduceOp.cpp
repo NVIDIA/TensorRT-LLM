@@ -21,6 +21,9 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/common/ncclUtils.h"
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
@@ -424,6 +427,20 @@ private:
                            auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
                            int size = input.numel();
                            reduce_output = torch::empty_like(input);
+#if TRTLLM_ENABLE_NCCL_PROFILING
+                           common::RecordFunctionWithMetadata profiler{common::ProfilerRegion::kNccl};
+                           profiler.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+                               [&](common::ProfilerMetadata& metadata)
+                               {
+                                   std::vector<std::int64_t> const group(mGroup.begin(), mGroup.end());
+                                   common::addNcclMetadata(metadata, "all_reduce", group, getRank(), "tp", "collective",
+                                       input.numel() * static_cast<std::int64_t>(input.element_size()),
+                                       stream.stream());
+                                   metadata.add("nccl.reduce_op", "sum");
+                                   metadata.add("nccl.strategy", "NCCL");
+                                   metadata.add("nccl.selected_strategy", "NCCL");
+                               });
+#endif
                            NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
                                (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
                        },
@@ -577,6 +594,21 @@ private:
         }
 
         // Perform allreduce
+#if TRTLLM_ENABLE_NCCL_PROFILING
+        common::RecordFunctionWithMetadata profiler{common::ProfilerRegion::kNccl};
+        profiler.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+            [&](common::ProfilerMetadata& metadata)
+            {
+                auto const* selectedStrategy
+                    = windowBuffer0.isValid() && windowBuffer1.isValid() ? "NCCL_SYMMETRIC" : "NCCL";
+                std::vector<std::int64_t> const group(mGroup.begin(), mGroup.end());
+                common::addNcclMetadata(metadata, "all_reduce", group, getRank(), "tp", "collective",
+                    static_cast<std::int64_t>(bufferSizeBytes), stream.stream());
+                metadata.add("nccl.reduce_op", "sum");
+                metadata.add("nccl.strategy", selectedStrategy);
+                metadata.add("nccl.selected_strategy", selectedStrategy);
+            });
+#endif
         NCCLCHECK_THROW(ncclAllReduce(inputPtr, outputPtr, size, (*getDtypeMap())[mType], ncclSum, comm, stream));
 
         // This operation owns only the temporary used to copy an unregistered input. The collective
