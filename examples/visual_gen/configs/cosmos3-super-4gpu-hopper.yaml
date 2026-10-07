@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Default 4-GPU Cosmos3-Super deployment for Blackwell (B200 / B300).
-# Model: nvidia/Cosmos3-Super
+# 4-GPU Hopper (H200) deployment with tensor parallel + Ulysses + parallel VAE.
+# Models: nvidia/Cosmos3-Super and nvidia/Cosmos3-Super-Image2Video-4Step
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
+# Unlike the Blackwell default in cosmos3-super-4gpu.yaml, TP shards model
+# weights to reduce per-GPU memory use for Super's 720p x 189-frame workload.
+# GPU layout: tp_size=2 (weight shards) x ulysses_size=2 (sequence split).
 # trtllm-serve spawns the 4 workers itself — do not wrap it in torchrun/mpirun.
-#
-# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=2 (sequence split).
-# For Hopper, use cosmos3-super-4gpu-hopper.yaml to shard the model weights.
 attention_config:
   backend: VANILLA
 parallel_config:
-  cfg_size: 2
+  cfg_size: 1
+  tp_size: 2
   ulysses_size: 2
   parallel_vae_size: 4
