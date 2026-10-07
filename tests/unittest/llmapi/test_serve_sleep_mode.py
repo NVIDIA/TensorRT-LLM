@@ -106,3 +106,29 @@ def test_sleep_mode_preserves_yaml_config(monkeypatch, tmp_path):
         restore_modes = sleep_config["restore_modes"]
     mode = restore_modes[ExecutorMemoryType.MODEL_ENGINE_MAIN]
     assert getattr(mode, "name", mode) == "CPU"
+
+
+@pytest.mark.parametrize("source", ["cli", "yaml", "override"])
+def test_sleep_mode_rejects_multiple_frontends(monkeypatch, tmp_path, source):
+    monkeypatch.setenv("TRTLLM_RUNTIME_CONTROL_API_KEY", "secret")
+    if source == "cli":
+        extra_args = ["--num_serve_frontends", "2"]
+    elif source == "yaml":
+        config = tmp_path / "config.yaml"
+        config.write_text("num_serve_frontends: 2\n", encoding="utf-8")
+        extra_args = ["--config", str(config)]
+    else:
+        extra_args = ["--num_serve_frontends", "1", "--set", "num_serve_frontends=2"]
+
+    with (
+        mock.patch(
+            "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+            return_value=False,
+        ),
+        mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+        mock.patch("tensorrt_llm.commands.serve.PyTorchLLM") as llm,
+        pytest.raises(click.BadParameter, match="require num_serve_frontends=1"),
+    ):
+        _invoke_sleep_mode(extra_args)
+
+    llm.assert_not_called()
