@@ -105,6 +105,22 @@ async def test_async_resume_is_noop_when_nothing_is_parked():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["parking", "waking", "failed"])
+@pytest.mark.parametrize("parked_tags", [[], ["model"]])
+@pytest.mark.parametrize("tags", [None, ["model"]])
+async def test_async_resume_rejects_invalid_states(state, parked_tags, tags) -> None:
+    llm = _make_async_llm()
+    llm.collective_rpc.return_value = [{"state": state, "parked_tags": parked_tags}]
+
+    with pytest.raises(
+        RuntimeError, match=f"Cannot resume runtime memory while state is '{state}'"
+    ):
+        await llm.resume(tags)
+
+    llm.collective_rpc.assert_awaited_once_with("get_memory_status")
+
+
+@pytest.mark.asyncio
 async def test_async_get_memory_status_reconciles_worker_replies():
     llm = _make_async_llm()
     llm.collective_rpc.return_value = [
@@ -246,6 +262,21 @@ def test_resume_is_noop_when_nothing_is_parked():
     llm.resume()
 
     llm._collective_rpc.assert_not_called()
+
+
+@pytest.mark.parametrize("state", ["parking", "waking", "failed"])
+@pytest.mark.parametrize("parked_tags", [[], ["model"]])
+@pytest.mark.parametrize("tags", [None, ["model"]])
+def test_resume_rejects_invalid_states(state, parked_tags, tags) -> None:
+    llm = _make_llm()
+    llm._collective_rpc.return_value = [{"state": state, "parked_tags": parked_tags}]
+
+    with pytest.raises(
+        RuntimeError, match=f"Cannot resume runtime memory while state is '{state}'"
+    ):
+        llm.resume(tags)
+
+    llm._collective_rpc.assert_called_once_with("get_memory_status")
 
 
 def test_runtime_memory_status_sorts_parked_tags():
