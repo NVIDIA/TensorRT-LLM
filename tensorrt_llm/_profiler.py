@@ -48,6 +48,7 @@ __all__ = [
     "custom_region_enabled",
     "record_function_metadata_scope",
     "record_function_with_metadata",
+    "record_moe_routing",
     "record_mpi_function",
 ]
 
@@ -366,3 +367,68 @@ def record_mpi_function(
 
     with record_function_metadata_scope(f"trtllm::mpi_{operation}", "mpi", metadata):
         yield
+
+
+def _moe_routing_metadata(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor | None,
+) -> dict[str, MetadataValue]:
+    selected_experts = cast(list[MetadataValue], token_selected_experts.detach().cpu().tolist())
+    routing_weights = (
+        None
+        if token_final_scales is None
+        else cast(list[MetadataValue], token_final_scales.detach().cpu().tolist())
+    )
+    return {
+        "moe.layer": layer_idx,
+        "moe.num_tokens": token_selected_experts.shape[0],
+        "moe.num_experts": num_experts,
+        "moe.experts_per_token": token_selected_experts.shape[1],
+        "moe.selected_expert_ids": selected_experts,
+        "moe.routing_weights": routing_weights,
+    }
+
+
+def record_moe_routing(
+    layer_idx: int | None,
+    num_experts: int,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor | None,
+) -> None:
+    """Record already-materialized logical routing without changing its tensors.
+
+    Args:
+        layer_idx: Model layer index, or None when unavailable.
+        num_experts: Logical expert count, not the EPLB slot count.
+        token_selected_experts: Integer expert IDs [num_tokens, top_k] in routing order.
+        token_final_scales: Floating routing weights of the same shape, or None
+            when unavailable. This does not relax a scheduler's weight contract.
+
+    Disabled or inactive calls do not inspect tensors or construct metadata. Active
+    eager calls copy tensors to CPU and serialize their values, which synchronizes
+    CUDA work and has measurable cost. CUDA current-stream capture skips only this
+    observation; existing RouterReplay device capture remains independent. Python
+    events do not recur on graph replay. Metadata/setup/cleanup failures are
+    discarded at the shared observational boundary; tensor values are not modified.
+    """
+    if not custom_region_enabled("moe") or not torch.autograd._profiler_enabled():
+        return
+    try:
+        uses_cuda = token_selected_experts.is_cuda or (
+            token_final_scales is not None and token_final_scales.is_cuda
+        )
+        if uses_cuda and torch.cuda.is_current_stream_capturing():
+            return
+    except RuntimeError:
+        # An unavailable CUDA capture-state query must not affect computation.
+        return
+    with record_function_metadata_scope(
+        "trtllm::moe_routing",
+        "moe",
+        lambda: _moe_routing_metadata(
+            layer_idx, num_experts, token_selected_experts, token_final_scales
+        ),
+    ):
+        pass
