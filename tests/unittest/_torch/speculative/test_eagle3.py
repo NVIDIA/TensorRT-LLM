@@ -859,10 +859,8 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     else:
         cuda_graph_config = None
 
-    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=False)
     llm_spec = LLM(model=target_model_dir,
                    speculative_config=spec_config,
-                   kv_cache_config=kv_cache_config,
                    max_batch_size=1,
                    cuda_graph_config=cuda_graph_config,
                    disable_overlap_scheduler=True)
@@ -876,7 +874,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     llm_spec.shutdown()
 
     llm_ref = LLM(model=target_model_dir,
-                  kv_cache_config=kv_cache_config,
                   max_batch_size=1,
                   cuda_graph_config=None,
                   disable_overlap_scheduler=False)
@@ -886,9 +883,7 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     generated_text_ref = [result.outputs[0].text for result in results_ref]
     llm_ref.shutdown()
 
-    # The LLM with speculation on should dynamically turn it off in this
-    # test since it goes beyond the max seqlen. Thus, the text should be
-    # _exactly_ the same, no need to use similarity scoring.
+    # Greedy decoding must match the non-speculative reference for a long prompt.
     assert generated_text_spec[0] == generated_text_ref[0]
 
 
