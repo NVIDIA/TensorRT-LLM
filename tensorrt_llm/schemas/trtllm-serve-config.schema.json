@@ -5967,7 +5967,11 @@
     },
     "backend": {
       "const": "pytorch",
-      "description": "Backend marker for ordinary LLM serving."
+      "default": "pytorch",
+      "description": "The backend to use for this LLM instance.",
+      "status": "deprecated",
+      "title": "Backend",
+      "type": "string"
     },
     "batch_wait_max_tokens_ratio": {
       "default": 0,

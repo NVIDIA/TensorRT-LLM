@@ -106,7 +106,6 @@ def generate_serve_schema() -> dict:
     schema["required"] = [name for name in schema.get("required", []) if name != "model"]
     properties = schema["properties"]
     properties.update(
-        backend={"const": "pytorch", "description": "Backend marker for ordinary LLM serving."},
         hf_revision=copy.deepcopy(properties["revision"]),
         allow_request_chat_template={"type": "boolean", "default": False},
         internal_request_auth_key=_nullable({"type": "string", "minLength": 1}),

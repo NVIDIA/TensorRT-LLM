@@ -14,6 +14,7 @@
 # limitations under the License.
 """CPU-only schema generation, validation, and documentation asset checks."""
 
+import ast
 import copy
 import importlib.util
 import json
@@ -56,6 +57,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
+        (generator.SERVE_SCHEMA, {"backend": "pytorch"}, True),
         (generator.SERVE_SCHEMA, {"backend": "_autodeploy"}, False),
         (
             generator.SERVE_SCHEMA,
@@ -83,6 +85,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"cuda_graph_config": {"batch_sizes": [1, 2, 4]}}, True),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
+        (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"num_instnces": 1}}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
@@ -104,6 +108,96 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
+    """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    config_names = {"llm_args", "llm_args_dict", "llm_args_extra_dict", "raw_llm_args_extra_dict"}
+    helpers = {"_pop_bool_config_option", "_pop_optional_str_config_option"}
+    fields = set()
+    for node in ast.walk(function):
+        mapping = key = None
+        if isinstance(node, ast.Call) and node.args:
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "get",
+                "pop",
+                "setdefault",
+            }:
+                mapping, key = node.func.value, node.args[0]
+            elif isinstance(node.func, ast.Name) and node.func.id in helpers and len(node.args) > 1:
+                mapping, key = node.args[:2]
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+            mapping, key = node.value, node.slice
+        if (
+            isinstance(mapping, ast.Name)
+            and mapping.id in config_names
+            and isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+        ):
+            fields.add(key.value)
+    assert fields, f"No recognized config accesses in {function_name}; update the coverage guard."
+    missing = fields - properties.keys()
+    assert not missing, (
+        f"Serving YAML fields missing from schema in {function_name}: {sorted(missing)}. "
+        "Update generate_serve_schema() and regenerate the schemas."
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "function_name"),
+    [
+        ("tensorrt_llm/commands/serve.py", "serve"),
+        ("tensorrt_llm/llmapi/llm_args.py", "update_llm_args_with_extra_dict"),
+    ],
+)
+def test_serving_yaml_fields_have_schema(
+    schemas: dict[str, dict], filename: str, function_name: str
+) -> None:
+    _assert_serving_fields_in_schema(
+        (_REPO_ROOT / filename).read_text(encoding="utf-8"),
+        function_name,
+        schemas[generator.SERVE_SCHEMA]["properties"],
+    )
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        'raw_llm_args_extra_dict.get("new_serving_option")',
+        'llm_args_extra_dict.pop("new_serving_option", None)',
+        'llm_args_dict.setdefault("new_serving_option", False)',
+        'llm_args["new_serving_option"]',
+        '_pop_bool_config_option(llm_args_extra_dict, "new_serving_option")',
+        '_pop_optional_str_config_option(llm_args_extra_dict, "new_serving_option")',
+    ],
+)
+def test_serving_field_guard_detects_new_fields(access: str) -> None:
+    source = f"def serve():\n    def _serve_llm():\n        {access}\n"
+    with pytest.raises(AssertionError, match="Serving YAML fields missing.*new_serving_option"):
+        _assert_serving_fields_in_schema(source, "serve", {})
+    _assert_serving_fields_in_schema(source, "serve", {"new_serving_option": {}})
+
+
+def test_serving_field_guard_ignores_unrelated_and_nested_keys() -> None:
+    source = """
+def serve():
+    request.get("not_a_config_field")
+    _pop_bool_config_option(other_mapping, "not_a_config_field")
+    llm_args.get(dynamic_key)
+    llm_args["internal_only_field"] = True
+    llm_args["kv_cache_config"]["nested_field"]
+"""
+    _assert_serving_fields_in_schema(source, "serve", {"kv_cache_config": {}})
+
+
+def test_serving_field_guard_rejects_empty_scan() -> None:
+    with pytest.raises(AssertionError, match="No recognized config accesses"):
+        _assert_serving_fields_in_schema("def serve(): pass", "serve", {})
 
 
 def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
