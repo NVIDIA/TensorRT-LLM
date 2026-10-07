@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._utils import mpi_allgather
 
 from .build import (
@@ -546,11 +546,12 @@ def _resolve_layout_and_plan(
     """Step 1 of ``_run_one_candidate``: resolve layout, routing plan, per-rank tokens.
 
     Resolves the EP-axis ``moe_ep_size`` from the candidate config (the
-    Mapping object built later will agree), validates that routing-control
-    cases satisfy ``moe_ep_size == world_size`` (so the dispatch_matrix axis
-    aligns with the world-rank token distribution), and either builds the
-    canonical ``RoutingPlan`` from ``rc_spec`` or falls back to a uniform
-    per-rank token split.
+    Mapping object built later will agree) -- surfacing any layout error as a
+    ``skipped`` result -- and either builds the canonical ``RoutingPlan`` from
+    ``rc_spec`` or falls back to a uniform per-rank token split. When
+    ``moe_ep_size != world_size`` (MoE-TP or hybrid TP x EP layouts) the plan
+    builder aggregates world-rank tokens onto the EP axis itself; see
+    ``routing/builders.py::_aggregate_dispatch_source_tokens``.
 
     Returns either:
     - ``RunResult`` (already short-circuited) on any layout/plan error, or

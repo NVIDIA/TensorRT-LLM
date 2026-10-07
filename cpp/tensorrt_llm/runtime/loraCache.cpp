@@ -511,31 +511,30 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
     }
 }
 
-void LoraCache::setDataType(tensorrt_llm::DataType dataType)
-{
-    std::scoped_lock lock(mPagesMutex, mCacheMutex);
-    setDataTypeLocked(dataType);
-}
-
-void LoraCache::setDataTypeCoordinated(LoraCache& other, tensorrt_llm::DataType dataType)
+void LoraCache::setDataTypeCoordinated(
+    LoraCache& other, tensorrt_llm::DataType dataType, SizeType32 totalNumPages, SizeType32 otherTotalNumPages)
 {
     if (&other == this)
     {
         // Locking mPagesMutex/mCacheMutex twice via the same std::scoped_lock call below would
         // be undefined behavior (self-deadlock) for a non-recursive std::mutex.
-        setDataType(dataType);
+        TLLM_CHECK_WITH_INFO(
+            totalNumPages == otherTotalNumPages, "Cannot configure one LoRA cache with two different page capacities");
+        std::scoped_lock lock(mPagesMutex, mCacheMutex);
+        setDataTypeLocked(dataType, totalNumPages);
         return;
     }
 
     std::scoped_lock lock(mPagesMutex, mCacheMutex, other.mPagesMutex, other.mCacheMutex);
-    setDataTypeLocked(dataType);
-    other.setDataTypeLocked(dataType);
+    setDataTypeLocked(dataType, totalNumPages);
+    other.setDataTypeLocked(dataType, otherTotalNumPages);
 }
 
-void LoraCache::setDataTypeLocked(tensorrt_llm::DataType dataType)
+void LoraCache::setDataTypeLocked(tensorrt_llm::DataType dataType, std::optional<SizeType32> totalNumPages)
 {
     TLLM_CHECK_WITH_INFO(mCacheMap.empty(), "Cannot change LoRA cache dtype after a task has been inserted");
-    if (mPageManagerConfig.getDataType() == dataType)
+    auto const configuredNumPages = totalNumPages.value_or(mPageManagerConfig.getTotalNumPages());
+    if (mPageManagerConfig.getDataType() == dataType && mPageManagerConfig.getTotalNumPages() == configuredNumPages)
     {
         return;
     }
@@ -544,6 +543,7 @@ void LoraCache::setDataTypeLocked(tensorrt_llm::DataType dataType)
     // temporary peak equal to both cache allocations.
     mCachePageManager.reset();
     mPageManagerConfig.setDataType(dataType);
+    mPageManagerConfig.setTotalNumPage(configuredNumPages);
     mCachePageManager = std::make_unique<LoraCachePageManager>(mPageManagerConfig, *mBufferManager);
 }
 

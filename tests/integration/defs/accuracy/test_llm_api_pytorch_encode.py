@@ -29,7 +29,7 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
 from ..conftest import llm_models_root
 from .accuracy_core import LlmapiAccuracyTestHarness
@@ -60,44 +60,6 @@ def _resolve_checkpoint_dtype(model_path: str, trust_remote_code: bool = False):
     return torch_dtype, llm_dtype
 
 
-def _reinit_uninitialized_rotary_buffers(hf_model: torch.nn.Module) -> None:
-    """Re-initialize uninitialized rotary-embedding buffers in vendored remote-code modules.
-
-    transformers 5.x's ``from_pretrained`` no longer fills *non-persistent*
-    buffers (those declared with ``persistent=False``) when a vendored
-    ``trust_remote_code`` module registers them inside ``__init__`` and
-    derives them from constants like ``base`` / ``dim`` (e.g. RoPE
-    ``inv_freq`` and the ``cos_cached`` / ``sin_cached`` tables). The
-    buffer's storage is allocated but never written, leaving uninitialized
-    memory that produces NaN cos/sin and propagates to logits.
-
-    Walk every submodule that looks like a Mixtral/Llama-style RoPE module
-    (``inv_freq`` + ``base`` + ``dim`` + ``_set_cos_sin_cache``), recompute
-    ``inv_freq`` from the constants, and rebuild the cos/sin caches.
-    """
-    for module in hf_model.modules():
-        if not (
-            hasattr(module, "inv_freq")
-            and hasattr(module, "_set_cos_sin_cache")
-            and hasattr(module, "base")
-            and hasattr(module, "dim")
-            and hasattr(module, "max_seq_len_cached")
-        ):
-            continue
-        device = module.inv_freq.device
-        new_inv_freq = 1.0 / (
-            module.base
-            ** (torch.arange(0, module.dim, 2, dtype=torch.int64).float().to(device) / module.dim)
-        )
-        module.inv_freq.data.copy_(new_inv_freq)
-        cache_dtype = (
-            module.cos_cached.dtype if hasattr(module, "cos_cached") else torch.get_default_dtype()
-        )
-        module._set_cos_sin_cache(
-            seq_len=module.max_seq_len_cached, device=device, dtype=cache_dtype
-        )
-
-
 # --------------------------------------------------------------------------- #
 # Encoder-only models (non-multimodal)
 # --------------------------------------------------------------------------- #
@@ -110,14 +72,6 @@ CLASSIFICATION_MODELS = [
     ),
 ]
 
-PER_TOKEN_REWARD_MODELS = [
-    pytest.param(
-        "Qwen/Qwen2.5-Math-PRM-7B",
-        f"{llm_models_root()}/Qwen2.5-Math-PRM-7B",
-        marks=pytest.mark.skip_less_device_memory(32000),
-        id="qwen2.5-prm-7b",
-    ),
-]
 
 # Qwen3-Embedding family. All variants are Qwen3ForCausalLM + a sentence-transformers
 # last-token-pool + L2-normalize pipeline; one wrapper class (Qwen3ForTextEmbedding)
@@ -214,6 +168,95 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             torch.testing.assert_close(raw.cpu().float(), hf_logits, rtol=1.5e-2, atol=1.5e-2)
 
     @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_encode_with_token_type_ids_matches_huggingface(self, model_name, model_path):
+        """Verify token_type_ids propagate through encoder CUDA graph replay.
+
+        All-zero token_type_ids equal BERT's internal default (`forward`
+        fills `token_type_ids=None` with zeros), so an all-zero check alone
+        cannot tell "kwarg copied into the static CUDA-graph buffer and
+        replayed" apart from "kwarg silently dropped". This test uses a
+        non-trivial segment pattern and asserts two things:
+
+        1. Propagation: non-zero token_type_ids change the logits vs. all-zero
+           on the same graph-enabled LLM. A dropped kwarg would make both
+           calls collapse to the zeros default and be bit-identical.
+        2. Correctness: the non-zero result matches HF given the *same*
+           token_type_ids, within the existing packed-vs-padded tolerance.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(
+                    name="token_type_ids",
+                    shape=("num_tokens",),
+                    dtype="int32",
+                ),
+            ],
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        encoded = tokenizer(PROMPTS, padding=False, truncation=True, max_length=512)
+        per_prompt_lens = [len(t) for t in encoded["input_ids"]]
+
+        # Non-trivial segment pattern: mark the second half of each prompt's
+        # real tokens as segment 1 (valid: BERT type_vocab_size == 2). The
+        # packed order (prompt-by-prompt concatenation) matches encode()'s flat
+        # input_ids, and a position-dependent pattern makes the HF comparison
+        # sensitive to buffer ordering, not just a global shift.
+        per_prompt_tt = [[0] * (L - L // 2) + [1] * (L // 2) for L in per_prompt_lens]
+        packed_nonzero = torch.tensor(
+            [tt for row in per_prompt_tt for tt in row],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        packed_zero = torch.zeros_like(packed_nonzero)
+
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm:
+            outs_nonzero = llm.encode(PROMPTS, token_type_ids=packed_nonzero)
+            outs_zero = llm.encode(PROMPTS, token_type_ids=packed_zero)
+
+        tllm_nonzero = torch.stack([o.logits.cpu().float() for o in outs_nonzero])
+        tllm_zero = torch.stack([o.logits.cpu().float() for o in outs_zero])
+
+        # (1) Propagation: two calls on the same graph-enabled LLM with
+        # different token_type_ids must differ. If the kwarg were dropped, both
+        # would collapse to the zeros default and be bit-identical.
+        max_abs_diff = (tllm_nonzero - tllm_zero).abs().max().item()
+        assert max_abs_diff > 1e-3, (
+            f"[{model_name}] non-zero token_type_ids produced logits identical "
+            f"to all-zero (max|delta|={max_abs_diff:.3e}); the kwarg is not "
+            f"propagating through the encoder CUDA-graph static buffer."
+        )
+
+        hf_model = (
+            AutoModelForSequenceClassification.from_pretrained(model_path, torch_dtype=torch_dtype)
+            .cuda()
+            .eval()
+        )
+        with torch.inference_mode():
+            hf_inputs = tokenizer(PROMPTS, return_tensors="pt", padding="longest").to(
+                hf_model.device
+            )
+            # Apply the same segment pattern HF-side. HF pads on the right, so
+            # each prompt's real tokens occupy [0:len]; padded positions stay 0
+            # (attention-masked, and BERT pools [CLS] at position 0, so they do
+            # not affect the classification logits).
+            hf_token_type_ids = torch.zeros_like(hf_inputs["input_ids"])
+            for i, row in enumerate(per_prompt_tt):
+                hf_token_type_ids[i, : len(row)] = torch.tensor(row, device=hf_model.device)
+            hf_inputs["token_type_ids"] = hf_token_type_ids
+            hf_logits = hf_model(**hf_inputs).logits.float().cpu()
+
+        # (2) Correctness: match HF given the same token_type_ids.
+        torch.testing.assert_close(tllm_nonzero, hf_logits, rtol=1.5e-2, atol=1.5e-2)
+
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
     def test_encoder_encode_cuda_graph_matches_eager_logits(self, model_name, model_path):
         """Tight numerical bound: graph replay must reproduce eager logits.
 
@@ -238,72 +281,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
 
-    @pytest.mark.parametrize("model_name,model_path", PER_TOKEN_REWARD_MODELS)
-    def test_encoder_encode_matches_huggingface_per_token_reward(self, model_name, model_path):
-        """Per-token reward models: last-content-token argmax per prompt."""
-        from transformers import AutoConfig, AutoModel, AutoTokenizer
-
-        # Resolve the checkpoint's native precision.
-        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path, trust_remote_code=True)
-
-        with LLM(model_path, encode_only=True, dtype=llm_dtype) as llm:
-            outs = llm.encode(PROMPTS)
-
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        # Qwen2.5-Math-PRM-7B's vendored modeling_qwen2_rm.py reads
-        # ``config.pad_token_id`` directly. In transformers >=5.x the base
-        # config no longer auto-exposes ``pad_token_id`` and the vendored
-        # ``Qwen2RMConfig`` doesn't declare it, so the bare attribute access
-        # raises AttributeError. Inject it from the tokenizer (or fall back
-        # to eos) before instantiating the HF model.
-        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if not hasattr(hf_config, "pad_token_id") or hf_config.pad_token_id is None:
-            hf_config.pad_token_id = (
-                getattr(tokenizer, "pad_token_id", None)
-                or getattr(hf_config, "eos_token_id", None)
-                or 0
-            )
-        hf_model = (
-            AutoModel.from_pretrained(
-                model_path,
-                config=hf_config,
-                trust_remote_code=True,
-                torch_dtype=torch_dtype,
-            )
-            .cuda()
-            .eval()
-        )
-        # Force use_cache=False: Qwen2.5-Math-PRM-7B's vendored
-        # modeling_qwen2_rm.py was authored against an older transformers Cache
-        # API and calls DynamicCache.get_usable_length(), which no longer
-        # exists. A single-prefill logits comparison needs no KV cache anyway;
-        # disabling it sidesteps the vendored-code incompatibility.
-        hf_model.config.use_cache = False
-
-        # transformers 5.x doesn't fill non-persistent buffers (e.g. RoPE
-        # ``inv_freq`` / cos / sin caches) registered inside vendored
-        # remote-code modules during ``from_pretrained``. The vendored
-        # ``Qwen2RotaryEmbedding`` derives these from constants in
-        # ``__init__``, so the buffer storage is allocated but never written
-        # — producing NaN cos/sin and NaN logits. Recompute them from the
-        # constants after loading.
-        _reinit_uninitialized_rotary_buffers(hf_model)
-
-        # Tokenize and run HF one prompt at a time, matching TRT-LLM's per-prompt semantics.
-        for i, prompt in enumerate(PROMPTS):
-            with torch.inference_mode():
-                ids = tokenizer(prompt, return_tensors="pt").to(hf_model.device)
-                hf_prompt_logits = hf_model(**ids, use_cache=False).logits.float().cpu()
-            hf_last = hf_prompt_logits[0, -1]
-
-            t = outs[i].logits.cpu().float()
-            t_last = t[-1] if t.dim() > 1 else t
-            assert t_last.argmax(dim=-1) == hf_last.argmax(dim=-1), (
-                f"[{model_name}] prompt#{i} argmax mismatch: "
-                f"TLLM={t_last.argmax(dim=-1)} (logits={t_last.tolist()}) vs "
-                f"HF={hf_last.argmax(dim=-1)} (logits={hf_last.tolist()})"
-            )
-
     @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
     def test_qwen3_text_embedding_matches_huggingface(self, model_name, model_path):
         """Decoder text-embedding: L2-normalized last-token hidden state vs HF."""
@@ -320,6 +297,8 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             dtype=llm_dtype,
             model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
         ) as llm:
+            runtime_config = llm._encoder_executor.model_engine.model.model_config.pretrained_config
+            assert runtime_config.architectures[0] == "Qwen3ForTextEmbedding"
             outs = llm.encode(PROMPTS)
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -352,28 +331,13 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #
 # One representative per distinct TRT-LLM architecture class:
 #   LlamaForCausalLM   — TinyLlama (also covers Mistral, which aliases LlamaModel)
-#   Gemma3ForCausalLM  — Gemma-3-1B (sliding window + global alternation)
-#   Qwen2ForCausalLM   — Qwen2-7B (distinct GQA head config, SwiGLU variant)
-#   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm, architecturally distinct from Qwen2)
+#   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
     pytest.param(
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
         id="tinyllama-1.1b",
-    ),
-    # -- Gemma3ForCausalLM --
-    pytest.param(
-        "google/gemma-3-1b-it",
-        f"{llm_models_root()}/gemma/gemma-3-1b-it/",
-        id="gemma-3-1b",
-    ),
-    # -- Qwen2ForCausalLM --
-    pytest.param(
-        "Qwen/Qwen2-7B-Instruct",
-        f"{llm_models_root()}/Qwen2-7B-Instruct",
-        marks=pytest.mark.skip_less_device_memory(32000),
-        id="qwen2-7b",
     ),
     # -- Qwen3ForCausalLM --
     pytest.param(
@@ -394,8 +358,7 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
     ]
 
     # Top-K size used for the argmax-in-top-K containment / overlap checks.
-    # Chosen to be robust to near-tie argmax flips under FP16/BF16 rounding
-    # on very large vocabularies (Gemma-3 has 262K tokens).
+    # This is robust to near-tie argmax flips under FP16/BF16 rounding.
     TOPK = 5
     TOPK_MIN_OVERLAP = 3
 

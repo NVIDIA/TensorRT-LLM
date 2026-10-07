@@ -30,4 +30,4 @@ measured: []
 - **Accuracy risk:** lossless — removes computation on padding/dummy tokens that never contributed to outputs.
 - **Verify:** throughput/MFU up with imbalanced ISL; profile shows reduced dummy/padding work + lower host prep; output parity vs padded path.
 - **Rollback:** revert to padded collective / full per-step padding. Trigger: correctness mismatch on ragged batches or collective hang.
-- **Prior art:** PRs #6064, #3439, #4664. Files: `cpp/.../thop/{allgatherOp,reducescatterOp}.cpp`, `_torch/distributed/ops.py`, `_torch/pyexecutor/py_executor.py`, `_torch/modules/fused_moe/{fused_moe_cutlass,fused_moe_wide_ep}.py`. Detection: **perf-host-analysis**.
+- **Prior art:** PRs #6064, #3439, #4664. Files: `cpp/.../thop/{allgatherOp,reducescatterOp}.cpp`, `_torch/distributed/ops.py`, `_torch/pyexecutor/py_executor.py`, `_torch/moe/fused_moe/{fused_moe_cutlass,fused_moe_wide_ep}.py`. Detection: **perf-host-analysis**.

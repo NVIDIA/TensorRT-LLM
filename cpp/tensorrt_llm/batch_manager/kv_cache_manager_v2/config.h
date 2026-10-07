@@ -105,6 +105,8 @@ struct BufferConfig
     // If set, overrides tokens_per_block for this buffer.
     // Must be a divisor of KVCacheManagerConfig::tokensPerBlock.
     std::optional<int> tokensPerBlockOverride;
+
+    bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
 };
 
 // ---------------------------------------------------------------------------
@@ -129,8 +131,7 @@ inline void validateNoDuplicateBufferRoles(std::vector<BufferConfig> const& buff
     std::unordered_set<DataRole> roles;
     for (auto const& buf : buffers)
     {
-        if (!roles.insert(buf.role).second)
-            throw std::invalid_argument("duplicate buffer role");
+        TLLM_CHECK(roles.insert(buf.role).second);
     }
 }
 
@@ -149,7 +150,7 @@ struct AttentionLayerConfig
     // nullopt or 0 = no sink tokens.
     std::optional<int> numSinkTokens;
 
-    std::optional<int> windowSize() const noexcept
+    [[nodiscard]] std::optional<int> windowSize() const noexcept
     {
         return slidingWindowSize;
     }
@@ -157,6 +158,13 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        for (auto const& buf : buffers)
+        {
+            if (buf.isSparse != buffers.front().isSparse)
+            {
+                throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
+            }
+        }
     }
 };
 
@@ -177,7 +185,13 @@ struct SsmLayerConfig
         for (auto const& buf : buffers)
         {
             if (buf.tokensPerBlockOverride.has_value())
+            {
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
+            }
+            if (buf.isSparse)
+            {
+                throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
         }
     }
 };
@@ -192,17 +206,29 @@ struct KVCacheDesc
 {
     int capacity = 0;
     int historyLength = 0;
+    // Beam search does not replicate the whole cache. Blocks that lie entirely
+    // inside the prompt are committed and canonicalized to beam 0 (see
+    // KvCache::_appendBeams(), which skips ordinals below promptLength /
+    // tokensPerBlock and every committed block); only the prompt tail onward is
+    // replicated. Sizing that scales everything by beamWidth would cancel out in
+    // the normalized pool ratio and leave the skew between life cycles in place,
+    // so the split has to be modelled explicitly.
+    int beamWidth = 1;
+    int promptLength = 0;
 
     void validate() const
     {
-        TLLM_CHECK_DEBUG(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK(beamWidth >= 1);
+        TLLM_CHECK(0 <= promptLength);
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
     // bindings replace. Required so tests can compare descs by value.
     bool operator==(KVCacheDesc const& other) const noexcept
     {
-        return capacity == other.capacity && historyLength == other.historyLength;
+        return capacity == other.capacity && historyLength == other.historyLength && beamWidth == other.beamWidth
+            && promptLength == other.promptLength;
     }
 
     bool operator!=(KVCacheDesc const& other) const noexcept
@@ -222,7 +248,11 @@ struct BatchDesc
 
     void validate() const
     {
-        TLLM_CHECK_DEBUG(systemPromptLength >= 0);
+        TLLM_CHECK(systemPromptLength >= 0);
+        for (auto const& desc : kvCaches)
+        {
+            desc.validate();
+        }
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
@@ -274,6 +304,16 @@ struct KVCacheManagerConfig
     // Try to reuse tokens from partially matched blocks.
     bool enablePartialReuse = true;
 
+    // Tokens dropped from the tail of every prefix match.
+    //
+    // For a pool whose KV at position i is a function of tokens [0, i] this is 0: a match of
+    // m tokens proves all m are reusable. Set it to D when the pool also holds state that
+    // reads D tokens ahead -- one-model speculative decoding draft layers -- where a match
+    // of m only describes the first m - D positions.
+    //
+    // Applied inside the match so a single tree walk yields the usable depth.
+    int reuseMatchBackoff = 0;
+
     // Constraint-based memory partitioning.
     std::vector<BatchDesc> constraints;   // batches that must always be supportable
     std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
@@ -300,6 +340,10 @@ struct KVCacheManagerConfig
     // path without scanning. A per-KvCache text_only override may only tighten this
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
+
+    // Publish a finalized partial block for reuse when committing stops.
+    // Beam search disables this while retaining full-block reuse.
+    bool enablePartialCommit = true;
 
     bool enableSwaScratchReuse() const noexcept
     {

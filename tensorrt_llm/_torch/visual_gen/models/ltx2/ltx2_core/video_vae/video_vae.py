@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, Callable, Iterator, List, Tuple
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from torch import nn
 
@@ -339,7 +340,7 @@ class VideoDecoder(nn.Module):
         decoder_spatial_padding_mode: PaddingModeType = PaddingModeType.REFLECT,
     ):
         super().__init__()
-        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, width=32, height=32)
+        self.video_downscale_factors = SpatioTemporalScaleFactors(time=8, height=32, width=32)
         self.patch_size = patch_size
         out_channels = out_channels * patch_size**2
         self.causal = causal
@@ -413,8 +414,8 @@ class VideoDecoder(nn.Module):
         batch_size = sample.shape[0]
         if self.timestep_conditioning:
             noise = (
-                torch.randn(
-                    sample.size(), generator=generator, dtype=sample.dtype, device=sample.device
+                randn_tensor(
+                    sample.size(), generator=generator, device=sample.device, dtype=sample.dtype
                 )
                 * self.decode_noise_scale
             )

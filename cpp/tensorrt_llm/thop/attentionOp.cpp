@@ -134,7 +134,8 @@ std::optional<at::Tensor> TrtllmAttentionWorkspaceManager::makeWorkspaceView(
 
 TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLayout(at::ScalarType const qDtype,
     int64_t const batchSize, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
-    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha)
+    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha,
+    bool const skipFmhaWorkspace)
 {
     auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
     auto const localHiddenUnitsQo = numHeads * headSize;
@@ -148,6 +149,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
     auto const fmhaBmm2ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float)) : 0;
 
     tensorrt_llm::common::op::AttentionContextWorkspaceSizes workspaceSizes{};
+    workspaceSizes.cublasWorkspace = skipFmhaWorkspace ? 0 : kTrtllmGenWorkspaceSize;
     workspaceSizes.cuQSeqlens = cuSeqlensSize;
     workspaceSizes.cuKvSeqlens = cuSeqlensSize;
     workspaceSizes.cuMaskRows = cuSeqlensSize;
@@ -170,7 +172,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
         .fmhaTileCounterOffset = exportOffset(layout.fmhaTileCounter),
         .fmhaBmm1ScaleOffset = exportOffset(layout.fmhaBmm1Scale),
         .fmhaBmm2ScaleOffset = exportOffset(layout.fmhaBmm2Scale),
-        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .trtllmGenWorkspaceSize = skipFmhaWorkspace ? 0 : kTrtllmGenWorkspaceSize,
         .cuSeqlensSize = cuSeqlensSize,
         .rotaryInvFreqSize = rotaryInvFreqSize,
         .qBufSize = qBufSize,
@@ -186,7 +188,7 @@ TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLay
 TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerationLayout(at::ScalarType const qDtype,
     int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
     int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
-    bool const useSparseAttention)
+    bool const useSparseAttention, bool const skipFmhaWorkspace)
 {
     auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
     auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
@@ -212,8 +214,9 @@ TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerat
     workspaceSizes.kernelWorkspace = qBufSize;
     auto const xqaLayout = AttentionWorkspaceManager::buildXqaLayout(workspaceSizes, kWorkspaceAlignment);
     auto const trtllmGenWorkspaceOffset = static_cast<int64_t>(xqaLayout.totalSize);
+    auto const trtllmGenWorkspaceSize = skipFmhaWorkspace ? 0 : kTrtllmGenWorkspaceSize;
     auto const totalSize = xqaLayout.totalSize
-        + tensorrt_llm::common::alignSize(static_cast<size_t>(kTrtllmGenWorkspaceSize), kWorkspaceAlignment);
+        + tensorrt_llm::common::alignSize(static_cast<size_t>(trtllmGenWorkspaceSize), kWorkspaceAlignment);
 
     return TrtllmGenGenerationWorkspaceLayout{
         .trtllmGenWorkspaceOffset = trtllmGenWorkspaceOffset,
@@ -225,7 +228,7 @@ TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerat
         .bmm1ScaleOffset = exportOffset(xqaLayout.bmm1Scale),
         .bmm2ScaleOffset = exportOffset(xqaLayout.bmm2Scale),
         .sparseAttnCacheOffset = exportOffset(xqaLayout.sparseAttnCache),
-        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .trtllmGenWorkspaceSize = trtllmGenWorkspaceSize,
         .cuSeqlensSize = cuSeqlensSize,
         .cuKvSeqlensSize = cuKvSeqlensSize,
         .rotaryInvFreqSize = rotaryInvFreqSize,
@@ -261,9 +264,11 @@ int64_t TrtllmAttentionWorkspaceManager::getGenerationWorkspaceSize(at::ScalarTy
 TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeContextWorkspace(
     at::Tensor const& workspace, TrtllmGenContextWorkspaceLayout const& layout)
 {
+    auto const trtllmGenWorkspace = layout.trtllmGenWorkspaceSize == 0
+        ? torch::empty({0}, workspace.options().dtype(at::kByte))
+        : *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte);
     return TrtllmGenContextWorkspaceViews{
-        .trtllmGenWorkspace
-        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .trtllmGenWorkspace = trtllmGenWorkspace,
         .cuQSeqlens = *makeWorkspaceView(workspace, layout.cuQSeqlensOffset, layout.cuSeqlensSize, at::kInt),
         .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuSeqlensSize, at::kInt),
         .cuMaskRows = *makeWorkspaceView(workspace, layout.cuMaskRowsOffset, layout.cuSeqlensSize, at::kInt),
@@ -290,9 +295,11 @@ TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeConte
 TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGenerationWorkspace(
     at::Tensor const& workspace, TrtllmGenGenerationWorkspaceLayout const& layout)
 {
+    auto const trtllmGenWorkspace = layout.trtllmGenWorkspaceSize == 0
+        ? torch::empty({0}, workspace.options().dtype(at::kByte))
+        : *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte);
     return TrtllmGenGenerationWorkspaceViews{
-        .trtllmGenWorkspace
-        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .trtllmGenWorkspace = trtllmGenWorkspace,
         .cuSeqlens = *makeWorkspaceView(workspace, layout.cuSeqlensOffset, layout.cuSeqlensSize, at::kInt),
         .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuKvSeqlensSize, at::kInt),
         .rotaryInvFreqBuf
@@ -756,13 +763,33 @@ public:
         if (op.mKVCacheQuantMode.hasKvCacheQuant() && kv_scale_orig_quant.has_value()
             && kv_scale_quant_orig.has_value())
         {
-            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
-            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
             if (op.mKVCacheQuantMode.hasFp4KvCache())
             {
-                TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
-                TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                if (op.isMLAEnabled())
+                {
+                    auto const& origQuantScale = kv_scale_orig_quant.value();
+                    auto const& quantOrigScale = kv_scale_quant_orig.value();
+                    TORCH_CHECK(origQuantScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_orig_quant must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.scalar_type() == torch::kFloat32,
+                        "kv_scale_quant_orig must have float32 dtype for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.is_contiguous(),
+                        "kv_scale_orig_quant must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.is_contiguous(),
+                        "kv_scale_quant_orig must be contiguous for MLA with FP4 KV cache");
+                    TORCH_CHECK(origQuantScale.dim() == 1 && origQuantScale.size(0) == 1,
+                        "kv_scale_orig_quant must have shape [1] for MLA with FP4 KV cache");
+                    TORCH_CHECK(quantOrigScale.dim() == 1 && quantOrigScale.size(0) == 1,
+                        "kv_scale_quant_orig must have shape [1] for MLA with FP4 KV cache");
+                }
+                else
+                {
+                    TORCH_CHECK(kv_scale_orig_quant.value().size(0) == 3);
+                    TORCH_CHECK(kv_scale_quant_orig.value().size(0) == 3);
+                }
             }
+            kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
+            kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
         // For FP8 output, out_scale represents the output scale.
         float const* out_scale_ptr = (op.mFP8ContextFMHA && !op.mFuseFp4Quant && out_scale.has_value())
@@ -816,8 +843,9 @@ public:
         {
             if (host_kv_cache_pool_pointers.has_value())
             {
-                auto* kvCachePool = reinterpret_cast<char*>(
-                    host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+                auto* kvCachePool = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().dim() == 3
+                        ? host_kv_cache_pool_pointers.value().index({pool_index, 0, 0}).item<int64_t>()
+                        : host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
                 if (sparse_attn_kv_lens.has_value())
                 {
                     // Deepseek V4 dynamic sparse MLA always uses the SWA pool for now.
@@ -830,7 +858,9 @@ public:
                 }
                 else
                 {
-                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = kvCachePool;
+                    op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = aux_kv_cache_pool_ptr.has_value()
+                        ? reinterpret_cast<char*>(aux_kv_cache_pool_ptr.value())
+                        : kvCachePool;
                 }
             }
         }
@@ -926,13 +956,6 @@ public:
                     cu_kv_seqlens->size(0) >= num_seqs + 1, "cu_kv_seqlens must have at least num_seqs + 1 elements.");
                 enqueue_params.cu_kv_seqlens = cu_kv_seqlens->data_ptr<int32_t>();
             }
-            // Pass V's actual token stride so the FMHA runner handles both
-            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
-            // kv.split() view) correctly.
-            if (v_ptr != nullptr && v.has_value())
-            {
-                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
-            }
             if (is_cross && cross_kv.has_value())
             {
                 auto const& cross_kv_tensor = cross_kv.value();
@@ -941,6 +964,17 @@ public:
                 // Kept in step with maxCrossKvLength in attention(), which sizes the workspace carved here.
                 enqueue_params.cross_kv_length
                     = host_past_key_value_lengths.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+            }
+            else if (is_cross)
+            {
+                // Later chunks of a chunked decoder prefill carry no encoder K/V and must read the cross KV cache.
+                // Only the fused kernel can do that; the unfused cross path builds K and V from cross_kv and would
+                // read a null pointer here. get_attention_op exempts cross attention from its paged-context check
+                // for exactly this reason, so this is the one place the requirement is enforced.
+                TLLM_CHECK_WITH_INFO(!op.isUnfusedCrossAttention(),
+                    "Cross attention without encoder K/V input requires a fused context FMHA kernel to read the "
+                    "cached cross KV, and this build has none for this configuration. Disable chunked prefill for "
+                    "this model, or use a build whose --cuda_architectures includes this device's SM.");
             }
 
             if (op.isMLAEnabled())
@@ -1105,6 +1139,37 @@ static std::shared_ptr<AttentionOp> get_attention_op(
         "Attention op for layer %lld is not cached, cache key: %s", local_layer_idx, to_string(cache_key).c_str());
     std::unique_lock<std::shared_mutex> lock{op_cache_mutex};
     op->initialize();
+    // initialize() ends with mEnableContextFMHA = mIsGenerationMLA || mFmhaDispatcher->isSupported(), so the flag
+    // reflects the exact Q/KV/output precision, mask type and page size this op will run with. Checking here rather
+    // than inside initialize() keeps the throw out of that noexcept function.
+    //
+    // Paged-context attention exists to attend to KV already in the cache. The unfused self-attention fallback
+    // builds K and V from the current chunk alone, so it drops the cached prefix and then overwrites it: without
+    // these checks a missing kernel produces a plausible wrong answer instead of an error.
+    //
+    // Cross attention is exempt from both checks. Its unfused path builds K and V from the encoder output
+    // (params.cross_kv) rather than from a cached prefix, so it is correct whenever cross_kv is supplied. The one
+    // cross case that must read the cache (later chunks of a chunked decoder prefill, which arrive without
+    // cross_kv) is checked per call in the context-stage enqueue (the is_cross branch without cross_kv).
+    bool const needs_fused_paged_context
+        = op->mPagedContextFMHA && op->mPagedKVCache && !op->mIsMLAEnabled && !op->mCrossAttention;
+    // Relative position embedding (T5) has no fused context FMHA implementation at all: initialize() clears
+    // mEnableContextFMHA for it before the kernel table is consulted ("Fall back to unfused MHA because of relative
+    // position embedding"). Report that as an unsupported feature combination, not as a missing kernel; no
+    // --cuda_architectures list can supply one. This check runs first so its message wins.
+    TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || !op->isRelativePosition(),
+        "Paged-context attention (chunked prefill, KV cache reuse or speculative draft tokens) is not supported with "
+        "relative position embedding: that attention always runs unfused, and the unfused path cannot attend to "
+        "cached KV. Disable chunked prefill, KV cache reuse and speculative decoding for this model. "
+        "Attention configuration: %s",
+        to_string(cache_key).c_str());
+    TLLM_CHECK_WITH_INFO(!needs_fused_paged_context || op->mEnableContextFMHA,
+        "Paged-context attention requires a fused context FMHA kernel, and this build has none for this "
+        "configuration. The unfused fallback cannot attend to cached KV. If the device's SM is not named in the "
+        "build's --cuda_architectures then the build carries no kernels for it at all; check that first. Otherwise "
+        "use another attention backend, or disable chunked prefill, KV cache reuse and speculative decoding. "
+        "Attention configuration: %s",
+        to_string(cache_key).c_str());
     runner->prepare(*op);
     auto [iter, _] = op_cache.try_emplace(cache_key, op);
     return iter->second;
@@ -1152,13 +1217,14 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
     int64_t sage_attn_num_elts_per_blk_q, int64_t sage_attn_num_elts_per_blk_k, int64_t sage_attn_num_elts_per_blk_v,
-    bool sage_attn_qk_int8, int64_t num_contexts, int64_t num_ctx_tokens, bool trtllm_gen_jit_warmup,
-    std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross, std::optional<torch::Tensor> cross_kv,
-    std::optional<torch::Tensor> relative_attention_bias, int64_t relative_attention_max_distance,
-    std::optional<int64_t> spec_decoding_target_max_draft_tokens, std::optional<torch::Tensor> quant_scale_qkv,
-    std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache, bool enable_dsv4_epilogue_fusion,
-    bool const force_prepare_spec_dec_tree_mask, std::optional<int64_t> const max_num_sequences,
-    std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps)
+    bool sage_attn_qk_int8, bool sage_attn_smooth_k, int64_t num_contexts, int64_t num_ctx_tokens,
+    bool trtllm_gen_jit_warmup, std::optional<int64_t> aux_kv_cache_pool_ptr, bool const is_cross,
+    std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> relative_attention_bias,
+    int64_t relative_attention_max_distance, std::optional<int64_t> spec_decoding_target_max_draft_tokens,
+    std::optional<torch::Tensor> quant_scale_qkv, std::optional<torch::Tensor> dsv4_inv_rope_cos_sin_cache,
+    bool enable_dsv4_epilogue_fusion, bool const force_prepare_spec_dec_tree_mask,
+    std::optional<int64_t> const max_num_sequences, std::optional<torch::Tensor> kv_norm_weight, double kv_norm_eps,
+    double skip_correction_threshold, std::optional<bool> uses_spcompress)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", local_layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -1172,12 +1238,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     TLLM_CHECK_WITH_INFO(
         update_kv_cache || is_cross, "KV cache update cannot be disabled now (except for cross attention).");
     auto qkv_or_q = q;
-    if (is_fused_qkv)
+    // MLA validates its separate Q/K/V or latent-cache inputs in Runner::run.
+    if (!is_mla_enable && is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache && !is_cross)
+    if (!is_mla_enable && !is_fused_qkv && update_kv_cache && !is_cross)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
@@ -1291,6 +1358,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
     op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
     op->mSageAttnQkInt8 = sage_attn_qk_int8;
+    op->mSageAttnSmoothK = sage_attn_smooth_k;
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
     op->mCrossAttention = is_cross;
@@ -1300,6 +1368,12 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
+    auto constexpr maxSkipCorrectionThreshold = 32.0;
+    TORCH_CHECK(skip_correction_threshold >= 0.0 && skip_correction_threshold <= maxSkipCorrectionThreshold,
+        "skip_correction_threshold must be in the range (0, 32] when enabled, or 0 when disabled.");
+    int const smVersion = op->smVersion();
+    bool const applySkipCorrection = is_mla_enable && (smVersion == 100 || smVersion == 103);
+    op->mSkipCorrectionThreshold = applySkipCorrection ? static_cast<float>(skip_correction_threshold) : 0.0F;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;
@@ -1307,7 +1381,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = is_spec_decoding_enabled;
     op->mUseSpecDecoding = use_spec_decoding;
     op->mIsSpecDecTree = is_spec_dec_tree;
-    // Include static tree length in the AttentionOp cache key.
+    // Include the tree length in the AttentionOp cache key.
     if (spec_decoding_target_max_draft_tokens.has_value() && op->mSpecDecodingTargetMaxGenLen == 0)
     {
         op->mSpecDecodingTargetMaxGenLen = static_cast<int32_t>(spec_decoding_target_max_draft_tokens.value()) + 1;
@@ -1358,12 +1432,15 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num), static_cast<int>(rope_append_value)};
 
+        op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
+            && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
         op->mFP8ContextMLA
             = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
-                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 120)
-            && op->mKVCacheQuantMode.hasFp8KvCache();
+                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 107
+                  || tensorrt_llm::common::getSMVersion() == 120)
+            && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
-        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
+        op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
         op->mUseGenFlashMLA = tensorrt_llm::common::getSMVersion() == 90 && tokens_per_block == 64 && head_size == 576;
 
@@ -1376,6 +1453,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         // For chunked prefill MLA, we need larger buffer size for k and v
         op->mChunkPrefillBufferBatchSize
             = chunked_prefill_buffer_batch_size.has_value() ? chunked_prefill_buffer_batch_size.value() : 1;
+    }
+
+    op->mUsesSpcompress = uses_spcompress.value_or(false);
+    if (op->mUsesSpcompress)
+    {
+        int const smVersionSpcompress = op->smVersion();
+        TORCH_CHECK(smVersionSpcompress == 107,
+            "uses_spcompress is only supported on SM107. Got SM version: ", smVersionSpcompress);
+        TORCH_CHECK(
+            op->mFP8ContextFMHA || op->mFP8ContextMLA, "uses_spcompress requires FP8 context FMHA or FP8 context MLA.");
     }
 
     op = get_attention_op(runner, op, local_layer_idx);
@@ -1424,8 +1511,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         if (workspace_.value().numel() < workspace_size)
         {
-            TLLM_LOG_WARNING("Attention workspace size is not enough, increase the size from %ld bytes to %ld bytes",
-                workspace_.value().numel(), workspace_size);
+            auto const capacity = workspace_.value().storage().nbytes();
+            if (capacity < static_cast<size_t>(workspace_size))
+            {
+                TLLM_LOG_WARNING(
+                    "Attention workspace size is not enough, increase the size from %zu bytes to %ld bytes", capacity,
+                    workspace_size);
+            }
             workspace_.value().resize_({workspace_size});
         }
         workspace = workspace_.value();

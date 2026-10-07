@@ -97,6 +97,10 @@ def top_k_top_p_sampling_batch(
         # the renormalization denominator below, after probs_sorted is masked.
         cumulative_probs = torch.cumsum(probs_sorted, dim=-1)
         mask_to_remove = cumulative_probs >= top_p
+        # NB: fp32 accumulation can leave every cumulative probability below
+        # top_p when top_p is very close to 1, so the search finds no 'True'
+        # and returns vocab_size. Clamping keeps the un-remove below a no-op,
+        # so such a row retains its full distribution (#19485).
         last_index_to_keep = torch.searchsorted(
             mask_to_remove.to(torch.int8, non_blocking=True),
             torch.ones((1,), dtype=torch.int8, device=mask_to_remove.device).expand(
@@ -104,7 +108,7 @@ def top_k_top_p_sampling_batch(
             ),
             right=False,
             out_int32=True,
-        )
+        ).clamp_(max=vocab_size - 1)
         mask_to_remove.scatter_(
             1,
             last_index_to_keep,
@@ -390,8 +394,8 @@ class Fusions:
             presence_prefix_cuda[prefix_slots, prefix_tokens] = True
 
     # --- Beam-search occurrence counts --------------------------------------
-    # Counterpart of the per-beam workspace handling in the C++ ``batchApplyPenalty``
-    # kernel (``penaltyKernels.cu:151-171``): a beam does not re-walk its history,
+    # Counterpart of the per-beam workspace handling in the former C++
+    # ``batchApplyPenalty`` kernel: a beam does not re-walk its history,
     # it inherits its parent beam's counts and appends the single token it just
     # emitted. ``counts_cuda`` is flat ``[num_slots * max_beam_width, vocab_size]``;
     # beam ``b`` of slot ``s`` owns row ``s * max_beam_width + b``, which collapses to

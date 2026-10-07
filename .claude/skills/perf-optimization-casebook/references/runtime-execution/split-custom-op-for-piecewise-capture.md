@@ -49,7 +49,7 @@ measured: []
   attention op as a partition boundary in `piecewise_optimizer.py`. Two enabling tricks
   keep the capturable half **unconditional**: a **constant-arity `register_fake`** (Op 1
   always returns the same number of tensors) and **forcing straight-line control flow
-  under compile** (`_should_use_short_mha()` returns `False` when `is_torch_compiling()`,
+  under compile** (`should_use_short_mha()` returns `False` when `is_torch_compiling()`,
   so a length-adaptive branch doesn't fork the traced graph).
 - **Generalizes to:** the pattern "**split a monolithic custom op at the
   graphable/non-graphable boundary — put the shape-static, metadata-free compute in its
@@ -84,9 +84,11 @@ measured: []
   or fall back to the single-op eager path. Trigger: capture errors, an accuracy
   mismatch, or the split adding net overhead.
 - **Prior art:** PRs #12503, #12186. Files:
-  `tensorrt_llm/_torch/modules/attention.py` (`trtllm::mla_dsa_proj` + `register_fake`,
-  `trtllm::mla_dsa_attn_inplace`, `forward_dsa_proj` / `forward_dsa_attn`,
-  `_should_use_short_mha`), `tensorrt_llm/_torch/compilation/piecewise_optimizer.py`,
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/custom_ops.py`
+  (`trtllm::mla_dsa_proj` + `register_fake`, `trtllm::mla_dsa_attn_inplace` +
+  `register_fake`), `tensorrt_llm/_torch/attention/backends/sparse/dsa/module.py`
+  (`forward_dsa_proj` / `_forward_dsa_attn`, `should_use_short_mha`),
+  `tensorrt_llm/_torch/compilation/piecewise_optimizer.py`,
   `tensorrt_llm/_torch/compilation/utils.py` (`inplace_info`). Owning specialist:
   **perf-torch-cuda-graph-specialist**. Related: the
   [piecewise CUDA graph case](piecewise-cuda-graph.md) (the consumer side of the same

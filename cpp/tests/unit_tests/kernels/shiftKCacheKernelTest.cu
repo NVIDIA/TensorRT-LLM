@@ -9,7 +9,6 @@
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/runtimeKernels.h"
 #include <numeric>
 #include <random>
 #include <type_traits>
@@ -18,7 +17,6 @@ using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::kernels;
 
 namespace tc = tensorrt_llm::common;
-namespace trk = tensorrt_llm::runtime::kernels;
 
 namespace
 {
@@ -266,7 +264,10 @@ public:
         // init data
         auto inputDataHostPtr = bufferCast<T>(*mInputDataHost);
         initRandom(inputDataHostPtr, batchSize * beamWidth * 2 * numHeads * maxAttentionWindow * headSize, -3.0f, 3.0f);
-        trk::invokeFill(*mKScaleQuantOrigDevice, float{1.0f}, *mStream);
+        // Single-element scale buffer initialised to 1.0f via a host round-trip.
+        auto kScaleQuantOrigHost = mBufferManager->pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
+        bufferCast<float>(*kScaleQuantOrigHost)[0] = 1.0f;
+        mBufferManager->copy(*kScaleQuantOrigHost, *mKScaleQuantOrigDevice);
 
         auto seqLengthsHostPtr = bufferCast<int32_t>(*mSeqLengthsHost);
         auto inputLengthsHostPtr = bufferCast<int32_t>(*mInputLengthsHost);

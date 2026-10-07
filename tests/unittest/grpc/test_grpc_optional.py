@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Optional-dependency and lifecycle tests for the SMG gRPC adapter.
+"""Optional-dependency and lifecycle tests for the gRPC gateway adapters.
 
-These run correctly with or without the dependency installed: the "missing" case is
+These run correctly with or without the dependencies installed: the "missing" case is
 simulated so it is meaningful in every environment, and the "present" case is
-guarded with ``importorskip``.
+guarded with ``importorskip``. OpenEngine's generated bindings and gRPC runtime
+are base TensorRT-LLM dependencies; the simulated missing-runtime case below
+checks recovery guidance for an incomplete installation.
 """
 
 import asyncio
@@ -24,9 +26,12 @@ import builtins
 import importlib
 import sys
 import types
+from collections.abc import Sequence
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from click.testing import CliRunner
 
 
 def test_smg_bindings_missing_gives_actionable_error(monkeypatch):
@@ -132,3 +137,94 @@ def test_smg_server_startup_failure_cleans_up(monkeypatch, failure_point):
 
     grpc_server.stop.assert_awaited_once_with(grace=5.0)
     llm.shutdown.assert_called_once_with()
+
+
+def test_openengine_server_missing_grpc_raises_import_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absent gRPC runtime surfaces as ImportError, which serve.py catches.
+
+    ``trtllm-serve --grpc --grpc_protocol openengine`` wraps the import of
+    ``tensorrt_llm.grpc.openengine.server`` in ``except ImportError`` to
+    re-raise it as a ClickException carrying direct grpcio recovery guidance.
+    If the module ever fails with something outside that hierarchy, the hint
+    silently stops reaching users, so pin the contract the handler depends on.
+    """
+    real_import = builtins.__import__
+
+    def import_without_grpc(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "grpc" or name.startswith("grpc."):
+            raise ModuleNotFoundError("No module named 'grpc'", name="grpc")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_grpc)
+
+    with pytest.raises(ImportError) as exc_info:
+        importlib.import_module("tensorrt_llm.grpc.openengine.server")
+
+    assert exc_info.value.name == "grpc"
+
+
+def test_serve_openengine_missing_grpc_shows_install_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The OpenEngine CLI path provides missing-runtime recovery guidance."""
+    import tensorrt_llm.commands.serve as serve_module
+
+    real_import = builtins.__import__
+
+    def import_without_grpc(
+        name: str,
+        globals_: Optional[dict] = None,
+        locals_: Optional[dict] = None,
+        fromlist: Sequence[str] = (),
+        level: int = 0,
+    ) -> types.ModuleType:
+        if name == "grpc" or name.startswith("grpc."):
+            raise ModuleNotFoundError("No module named 'grpc'", name="grpc")
+        return real_import(name, globals_, locals_, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "grpc", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine", raising=False)
+    monkeypatch.delitem(sys.modules, "tensorrt_llm.grpc.openengine.server", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_grpc)
+
+    monkeypatch.setattr(serve_module, "get_llm_args", lambda **_: ({}, None))
+    monkeypatch.setattr(serve_module, "get_is_diffusion_only_model", lambda _model: False)
+    monkeypatch.setattr(serve_module, "collect_explicit_cli_keys", lambda **_: set())
+    monkeypatch.setattr(
+        serve_module,
+        "update_llm_args_with_extra_dict",
+        lambda llm_args, _extra, **_: llm_args,
+    )
+    monkeypatch.setattr(
+        serve_module._command_telemetry,
+        "apply_raw_config_telemetry_opt_out",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "_apply_effective_telemetry_config",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        serve_module,
+        "parse_metadata_server_config_file",
+        lambda _path: None,
+    )
+
+    result = CliRunner().invoke(
+        serve_module.serve,
+        ["test-model", "--grpc", "--grpc-protocol", "openengine"],
+    )
+
+    assert result.exit_code == 1
+    assert 'python -m pip install "grpcio>=1.67.1,<2"' in result.output

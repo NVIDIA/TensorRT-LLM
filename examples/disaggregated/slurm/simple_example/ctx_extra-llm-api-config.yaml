@@ -3,4 +3,5 @@
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: UCX
+  transceiver_runtime: CPP
   max_tokens_in_buffer: 2048

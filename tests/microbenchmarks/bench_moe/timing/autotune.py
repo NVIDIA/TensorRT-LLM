@@ -65,7 +65,7 @@ def _run_autotune(
         tuner.repeat = saved_repeat
         tuner.stream_delay_micro_secs = saved_stream_delay
         if tactic_autotune:
-            from tensorrt_llm._torch.custom_ops.cute_dsl_megamoe_custom_op import (
+            from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
                 release_megamoe_profiling_scratch,
             )
 

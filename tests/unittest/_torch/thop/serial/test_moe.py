@@ -13,29 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-import sys
+from enum import Enum
 from typing import Tuple
 
 import pytest
 import torch
 import torch.nn.functional as F
+from utils.util import getSMVersion
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.moe.fused_moe import RoutingMethodType
+from tensorrt_llm._torch.utils import next_positive_power_of_2
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
 # NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
 # unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
 # and test_moe_module.py. Add new MoE tests there instead of here.
-
-from enum import Enum
-
-from utils.util import getSMVersion
-
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.modules.fused_moe import RoutingMethodType
-from tensorrt_llm._torch.utils import next_positive_power_of_2
-from tensorrt_llm.quantization.utils.fp4_utils import (
-    reorder_rows_for_gated_act_gemm, shuffle_matrix_a, shuffle_matrix_sf_a)
 
 
 # Keep this in sync with the ActType in cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
@@ -53,17 +47,39 @@ def test_act_type_enum_values_stable():
     assert ActType.SiTu.value == 3
 
 
-@pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
-    getSMVersion(),
-)
-@pytest.mark.parametrize("num_tokens", [1, 8, 512])
-def test_mxe4m3_mxe2m1_situ_runner_has_valid_configs(num_tokens):
+def _mxfp4_situ_tactics(num_tokens):
+    """MXFP8 activations x MXFP4 weights: group-32 scales, padded shapes."""
     runner = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
         ActType.SiTu.value, True)
-    tactics = runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
-    assert tactics, f"No valid SiTu tactic for num_tokens={num_tokens}"
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens, 512, 256)
+
+
+def _nvfp4_situ_tactics(num_tokens):
+    """NVFP4 in/out: group-16 scales, and no valid hidden/intermediate sizes
+    (padding is absorbed by the padded weight buffers instead)."""
+    runner = torch.classes.trtllm.FP4BlockScaleMoERunner(ActType.SiTu.value)
+    return runner.get_valid_configs(2, 512, 256, 8, num_tokens)
+
+
+@pytest.mark.skipif(
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("get_tactics",
+                         [_mxfp4_situ_tactics, _nvfp4_situ_tactics],
+                         ids=["mxfp4", "nvfp4"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 512])
+def test_situ_runner_has_valid_configs(num_tokens, get_tactics):
+    """Both fused SiTu FC1 cubin families must be reachable through tactic
+    selection. There is no standalone SiTu activation kernel, so an empty
+    tactic list here means the whole path is unreachable.
+
+    Numerics and launch evidence for both families live in
+    tests/unittest/_torch/moe/test_kimi_k3_situ_moe.py.
+    """
+    assert get_tactics(
+        num_tokens), f"No valid SiTu tactic for num_tokens={num_tokens}"
 
 
 class moe_args:
@@ -910,7 +926,7 @@ def are_groups_valid(top_k_groups, n_groups):
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -1048,7 +1064,7 @@ class TestMoeFP8:
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -1987,7 +2003,7 @@ class TestMoeFp4:
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
@@ -2216,7 +2232,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
 
 @pytest.mark.skip(
     reason=
-    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+    "Deprecated: covered by tests/unittest/_torch/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
 )
 @pytest.mark.skipif(
     getSMVersion() != 100,
@@ -2677,8 +2693,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The SiTu kernel only supports SM100/SM103. Current SM is %d." %
+    not (100 <= getSMVersion() < 110),
+    reason="The SiTu kernels are sm_100f (SM100 family). Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize("num_tokens", [1, 8, 256])

@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2096,
-    "total_files": 224
+    "total_violations": 2091,
+    "total_files": 222
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -155,13 +155,7 @@
     "D212": 1,
     "E402": 20
   },
-  "tensorrt_llm/_torch/attention_backend/sparse/kernel.py": {
-    "E731": 3
-  },
-  "tensorrt_llm/_torch/attention_backend/sparse/rocket.py": {
-    "E712": 2
-  },
-  "tensorrt_llm/_torch/attention_backend/trtllm.py": {
+  "tensorrt_llm/_torch/attention/backends/trtllm.py": {
     "E712": 1
   },
   "tensorrt_llm/_torch/compilation/patterns/residual_add_norm.py": {
@@ -214,24 +208,6 @@
     "E731": 1,
     "F821": 5
   },
-  "tensorrt_llm/_torch/modules/fused_moe/deep_ep_utils.py": {
-    "F821": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py": {
-    "E741": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/fused_moe_triton.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/interface.py": {
-    "E402": 3
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/moe_load_balancer.py": {
-    "E712": 2
-  },
-  "tensorrt_llm/_torch/modules/fused_moe/quantization.py": {
-    "E731": 1
-  },
   "tensorrt_llm/_torch/modules/mamba/selective_state_update.py": {
     "E731": 1
   },
@@ -245,6 +221,24 @@
     "E731": 3
   },
   "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
+    "E731": 1
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/deep_ep_utils.py": {
+    "F821": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/fused_moe_cute_dsl.py": {
+    "E741": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/fused_moe_triton.py": {
+    "F821": 1
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/interface.py": {
+    "E402": 3
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py": {
+    "E712": 2
+  },
+  "tensorrt_llm/_torch/moe/fused_moe/quantization.py": {
     "E731": 1
   },
   "tensorrt_llm/_torch/pyexecutor/model_loader.py": {

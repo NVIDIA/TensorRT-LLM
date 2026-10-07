@@ -32,8 +32,23 @@ __all__ = [
 class PostprocArgs:
     first_iteration: bool = True
     num_prompt_tokens: Optional[int] = None
+    # Subtracted from num_prompt_tokens when reporting usage. Lets servers
+    # exclude generation-prompt stub tokens the vendor accounting treats as
+    # pending output (e.g. Kimi K3's 3-token channel opener) without changing
+    # what the model sees. num_prompt_tokens itself is overwritten by the
+    # executor on the postproc-worker path, so the offset must be separate.
+    num_prompt_tokens_offset: int = 0
     tokenizer: Optional[TransformersTokenizer] = None
     ctx_usage: Optional[Any] = None
+    # Per-request speculative-decoding acceptance stats. Set on the base so
+    # every endpoint's args subclass inherits one opt-in path. Mirrors the
+    # server's per_request_spec_decode_stats setting; there is no per-request
+    # opt-in, so clients need send nothing.
+    return_spec_decode_stats: bool = False
+    # Fixed per-step draft bound, or None when draft_len_schedule makes it vary
+    # by batch size. Sizes the emitted acceptance histogram so its length is a
+    # function of configuration rather than of what a request happened to hit.
+    spec_decode_num_spec_tokens: Optional[int] = None
 
 
 @dataclass(kw_only=True)

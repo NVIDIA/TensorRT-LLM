@@ -16,16 +16,208 @@
 
 import json
 import logging
+import os
+import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import BaseModel, Field
 
 from tensorrt_llm.usage import usage_lib
+from tensorrt_llm.usage.config import UsageContext
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_telemetry_state():
+    """Keep process-scoped telemetry state isolated between unit tests."""
+    usage_lib._SESSION = None
+    usage_lib._SESSION_DISABLED = False
+    usage_lib._SESSION_LOCK = threading.Lock()
+    usage_lib._REPORTER_STARTED = False
+    usage_lib._REPORTER_ACTIVE = False
+    usage_lib._REPORTER_LOCK = threading.Lock()
+    usage_lib._HEARTBEAT_STOP = threading.Event()
+    usage_lib._PROCESS_PID = os.getpid()
+    yield
+    usage_lib._HEARTBEAT_STOP.set()
+    session = usage_lib._SESSION
+    if session is not None:
+        session.disable()
+        if isinstance(session.terminal_thread, threading.Thread):
+            session.terminal_thread.join(timeout=2)
+            assert not session.terminal_thread.is_alive()
+    usage_lib._SESSION = None
+    usage_lib._SESSION_DISABLED = False
+    usage_lib._REPORTER_STARTED = False
+    usage_lib._REPORTER_ACTIVE = False
+
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("attempts,created", [(0, 0), (1, 0), (2, 0), (1, 1)])
+@pytest.mark.parametrize("prestarted_sender", [False, True])
+def test_startup_context_is_correlated_and_conservative(
+    monkeypatch, enable_telemetry, attempts, created, prestarted_sender
+):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+    monkeypatch.setattr(
+        usage_lib, "bounded_gpu_fields", lambda deadline: {"gpuCount": 1, "gpuName": "GPU"}
+    )
+    usage_lib.apply_usage_session_config(
+        default_usage_context="cli_serve", lifecycle_phase="config_validation"
+    )
+    if prestarted_sender:
+        with usage_lib._REPORTER_LOCK:
+            usage_lib._start_terminal_sender(usage_lib._SESSION)
+        assert usage_lib._SESSION.terminal_thread is not None
+    if not attempts:
+        usage_lib._mark_llm_startup()
+    for _ in range(attempts):
+        usage_lib.record_llm_initialization_attempt()
+    usage_lib._capture_startup_context(
+        requested={
+            "backend": "pytorch",
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": True,
+            "dtype": "/home/private",
+            "model": "/home/private/model",
+        },
+    )
+    if created:
+        usage_lib.record_llm_initialized()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("exception", exit_code_known=True, exit_code=1))
+    assert len(sent) == 1
+    events = sent[0]["events"]
+    assert events[-1]["name"] == "trtllm_exit_report"
+    assert len(events) == (1 if created else 2)
+    if not created:
+        params = events[0]["parameters"]
+        meta = json.loads(params["llmApiConfigMetaJson"])
+        assert meta["report_context"] == "pre_initialization_exit"
+        assert params["tensorParallelSize"] == (2 if attempts <= 1 else 0)
+        assert params["pipelineParallelSize"] == 0
+        assert params["featuresJson"] == params["llmApiConfigJson"] == "{}"
+        assert params["gpuCount"] == 1
+        assert events[0]["ts"] == events[1]["ts"]
+        assert "private" not in json.dumps(sent)
+        assert not usage_lib._REPORTER_STARTED
+
+
+def test_startup_context_preserves_exit_on_collection_failure(monkeypatch, enable_telemetry):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+
+    def fail(deadline):
+        raise RuntimeError("optional discovery failed")
+
+    monkeypatch.setattr(usage_lib, "bounded_gpu_fields", fail)
+    usage_lib.record_llm_initialization_attempt()
+    usage_lib.report_exit(usage_lib.TerminalOutcome("unknown"))
+    assert [event["name"] for event in sent[0]["events"]] == ["trtllm_exit_report"]
+
+
+@pytest.mark.parametrize("case", ["help", "supervisor", "late_opt_out", "duplicate"])
+def test_startup_context_delivery_guards(monkeypatch, enable_telemetry, case):
+    sent = []
+    monkeypatch.setattr(usage_lib, "_send_to_gxt", sent.append)
+
+    def gpu_fields(deadline):
+        if case == "late_opt_out":
+            monkeypatch.setenv("TRTLLM_NO_USAGE_STATS", "1")
+        return {}
+
+    monkeypatch.setattr(usage_lib, "bounded_gpu_fields", gpu_fields)
+    usage_lib.apply_usage_session_config(
+        default_usage_context="cli_serve", lifecycle_phase="config_validation"
+    )
+    usage_lib._mark_llm_startup()
+    outcome = usage_lib.TerminalOutcome(
+        "clean" if case == "help" else "exception",
+        reporting_source="supervisor" if case == "supervisor" else "self",
+    )
+    assert usage_lib.report_exit(outcome)
+    assert not usage_lib.report_exit(outcome)
+    if case in ("help", "late_opt_out"):
+        assert not sent
+    else:
+        assert len(sent) == 1
+        assert len(sent[0]["events"]) == (1 if case == "supervisor" else 2)
+
+
+@pytest.mark.parametrize("mark_startup", [False, True])
+def test_startup_context_capture_does_not_enable_reporting(enable_telemetry, mark_startup):
+    usage_lib.apply_usage_session_config(lifecycle_phase="config_validation")
+    usage_lib._capture_startup_context(requested={"backend": "pytorch"})
+    if mark_startup:
+        usage_lib._mark_llm_startup()
+        usage_lib._mark_llm_startup()
+    snapshot, _ = usage_lib._SESSION.claim_terminal(usage_lib.TerminalOutcome("exception"))
+    assert ("startup_context" in snapshot) is mark_startup
+    if mark_startup:
+        assert snapshot["startup_context"] == {"backend": "pytorch"}
+
+
+@pytest.mark.parametrize("requested_snapshot", [False, True])
+def test_startup_context_validated_snapshot(enable_telemetry, requested_snapshot):
+    usage_lib.record_llm_initialization_attempt()
+    if requested_snapshot:
+        usage_lib._capture_startup_context(requested={"backend": "pytorch"})
+
+    class Args(BaseModel):
+        backend: Literal["pytorch"] = "pytorch"
+        dtype: Literal["float16"] = "float16"
+        model: str = "/home/private/model"
+
+    args = Args()
+    usage_lib._capture_startup_context(llm_args=args)
+    fields = usage_lib._SESSION.startup_context
+    assert fields["dtype"] == "float16"
+    assert json.loads(fields["llmApiConfigJson"]) == {"backend": "pytorch", "dtype": "float16"}
+    assert "private" not in json.dumps(fields)
+    assert json.loads(fields["llmApiConfigMetaJson"])["capture_succeeded"]
+    assert json.loads(fields["llmApiConfigMetaJson"])["source"] == "validated_pre_initialization"
+    assert "architectureClassName" not in fields
+    usage_lib._capture_startup_context(
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+    )
+    assert fields["architectureClassName"] == "LlamaForCausalLM"
+
+
+@pytest.mark.parametrize("stop", ["second_attempt", "initialized", "terminal", "disabled"])
+def test_startup_context_rejects_late_capture(monkeypatch, enable_telemetry, stop):
+    usage_lib.record_llm_initialization_attempt()
+    usage_lib._capture_startup_context(requested={"backend": "pytorch"})
+    session = usage_lib._SESSION
+
+    def collect_architecture(config):
+        if stop == "second_attempt":
+            session.record_llm_initialization_attempt()
+        elif stop == "initialized":
+            session.record_llm_initialized()
+        elif stop == "terminal":
+            session.claim_terminal(usage_lib.TerminalOutcome("exception"))
+        else:
+            session.disable()
+        return "LlamaForCausalLM", ""
+
+    monkeypatch.setattr(usage_lib, "_architecture_telemetry_fields", collect_architecture)
+    usage_lib._capture_startup_context(pretrained_config=object())
+    usage_lib._capture_startup_context(requested={"backend": "tensorrt"})
+    assert session.startup_context == ({} if stop == "second_attempt" else {"backend": "pytorch"})
+
+
+@pytest.fixture
+def reporter_session(enable_telemetry):
+    """Create the session required by the background reporter."""
+    assert usage_lib.apply_usage_session_config()
 
 
 # ---------------------------------------------------------------------------
@@ -73,11 +265,11 @@ class TestReportUsage:
             "tensorrt_llm.usage.usage_lib.threading.Thread", return_value=mock_thread
         ) as thread_cls:
             usage_lib.report_usage()
-            thread_cls.assert_called_once()
+            assert thread_cls.call_count == 2
             call_kwargs = thread_cls.call_args
             assert call_kwargs.kwargs["daemon"] is True
             assert call_kwargs.kwargs["name"] == "trtllm-usage-stats"
-            mock_thread.start.assert_called_once()
+            assert mock_thread.start.call_count == 2
 
     def test_noop_when_disabled(self, monkeypatch):
         """report_usage() does nothing when telemetry is disabled."""
@@ -139,7 +331,7 @@ class TestReportUsage:
 
 class TestDuplicateReporterGuard:
     def test_second_call_is_noop(self, monkeypatch, enable_telemetry):
-        """Calling report_usage() twice only spawns one thread."""
+        """Calling report_usage() twice starts each sender only once."""
         monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
         usage_lib._NOTIFICATION_SHOWN.set()
 
@@ -149,7 +341,7 @@ class TestDuplicateReporterGuard:
         ) as thread_cls:
             usage_lib.report_usage()
             usage_lib.report_usage()  # second call should be a no-op
-            assert thread_cls.call_count == 1
+            assert thread_cls.call_count == 2
 
     def test_guard_resets_on_thread_failure(self, monkeypatch, enable_telemetry):
         """_REPORTER_STARTED resets if thread creation fails, allowing retry."""
@@ -171,8 +363,8 @@ class TestDuplicateReporterGuard:
             "tensorrt_llm.usage.usage_lib.threading.Thread", return_value=mock_thread
         ) as thread_cls:
             usage_lib.report_usage()
-            thread_cls.assert_called_once()
-            mock_thread.start.assert_called_once()
+            assert thread_cls.call_count == 2
+            assert mock_thread.start.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +467,7 @@ class TestIngressPointReporter:
         mock_thread = MagicMock()
         mock_config = MagicMock()
         mock_config.disabled = False
-        mock_config.usage_context = MagicMock()
-        mock_config.usage_context.value = "cli_serve"
+        mock_config.usage_context = UsageContext.CLI_SERVE
 
         with patch(
             "tensorrt_llm.usage.usage_lib.threading.Thread",
@@ -300,23 +491,19 @@ class TestIngressPointReporter:
             call_args = thread_cls.call_args
             assert call_args.kwargs["args"][2] == ""
 
-    def test_report_usage_context_without_value_falls_back_to_str(
-        self, monkeypatch, enable_telemetry
-    ):
-        """usage_context without .value attribute falls back to str()."""
-        monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
-        usage_lib._NOTIFICATION_SHOWN.set()
+    @pytest.mark.parametrize(
+        "invalid_context",
+        ["plain_string", SimpleNamespace(value="cli_serve"), object()],
+    )
+    def test_arbitrary_usage_context_falls_back(self, invalid_context):
+        """Only enum-backed categorical ingress values reach telemetry."""
+        disabled, usage_context = usage_lib._telemetry_settings(
+            SimpleNamespace(disabled=False, usage_context=invalid_context),
+            default_usage_context=UsageContext.LLM_CLASS.value,
+        )
 
-        mock_thread = MagicMock()
-        mock_config = SimpleNamespace(disabled=False, usage_context="plain_string")
-
-        with patch(
-            "tensorrt_llm.usage.usage_lib.threading.Thread",
-            return_value=mock_thread,
-        ) as thread_cls:
-            usage_lib.report_usage(telemetry_config=mock_config)
-            call_args = thread_cls.call_args
-            assert call_args.kwargs["args"][2] == "plain_string"
+        assert disabled is False
+        assert usage_context == UsageContext.LLM_CLASS.value
 
     def test_report_usage_disabled_via_telemetry_config(self, monkeypatch):
         """report_usage with TelemetryConfig(disabled=True) is a no-op."""
@@ -331,6 +518,37 @@ class TestIngressPointReporter:
 
 
 # ---------------------------------------------------------------------------
+# Architecture privacy integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestArchitecturePrivacy:
+    """Verify the initial wire payload never contains an unknown raw name."""
+
+    def test_background_reporter_hashes_unknown_architecture(self, reporter_session: None) -> None:
+        private_architecture = "InternalCustomerModelForCausalLM"
+        pretrained_config = SimpleNamespace(architectures=[private_architecture])
+        captured = {}
+
+        def fake_send(payload: dict[str, object]) -> None:
+            captured.update(payload)
+
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
+        ):
+            usage_lib._background_reporter(None, pretrained_config, "")
+
+        params = captured["events"][0]["parameters"]
+        assert params["architectureClassName"] == ""
+        assert params["architectureClassHash"].startswith("sha256:")
+        assert private_architecture not in json.dumps(captured)
+
+
+# ---------------------------------------------------------------------------
 # _clamp_str integration tests
 # ---------------------------------------------------------------------------
 
@@ -338,7 +556,7 @@ class TestIngressPointReporter:
 class TestClampStrIntegration:
     """Verify _background_reporter() clamps long strings to schema limits."""
 
-    def test_background_reporter_clamps_long_platform_string(self):
+    def test_background_reporter_clamps_long_platform_string(self, reporter_session):
         """Long platform string does not cause ValidationError; len <= 256."""
         long_platform = "x" * 300
 
@@ -362,7 +580,7 @@ class TestClampStrIntegration:
                 },
             ),
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -379,7 +597,7 @@ class TestClampStrIntegration:
 class TestDisaggMetadata:
     """Verify _background_reporter() reads disagg env vars into initial report."""
 
-    def test_disagg_env_vars_appear_in_payload(self, monkeypatch):
+    def test_disagg_env_vars_appear_in_payload(self, monkeypatch, reporter_session):
         """Disagg env vars appear as disaggRole and deploymentId in payload."""
         monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
         monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "abc123")
@@ -394,7 +612,7 @@ class TestDisaggMetadata:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -403,7 +621,7 @@ class TestDisaggMetadata:
         assert params["disaggRole"] == "context"
         assert params["deploymentId"] == "abc123"
 
-    def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch):
+    def test_disagg_payload_includes_llm_api_config_json(self, monkeypatch, reporter_session):
         """Disagg payloads retain sanitized LLM API config JSON fields."""
 
         class _DisaggTelemetryArgs(BaseModel):
@@ -424,7 +642,7 @@ class TestDisaggMetadata:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(_DisaggTelemetryArgs(), None, "cli_serve")
 
@@ -441,7 +659,7 @@ class TestDisaggMetadata:
 class TestDisaggMetadataEmpty:
     """Verify empty defaults when disagg env vars are unset (non-disagg mode)."""
 
-    def test_disagg_fields_empty_when_unset(self, monkeypatch):
+    def test_disagg_fields_empty_when_unset(self, monkeypatch, reporter_session):
         """Without disagg env vars, disaggRole and deploymentId are empty strings."""
         monkeypatch.delenv("TRTLLM_DISAGG_ROLE", raising=False)
         monkeypatch.delenv("TRTLLM_DISAGG_DEPLOYMENT_ID", raising=False)
@@ -456,7 +674,7 @@ class TestDisaggMetadataEmpty:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=fake_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(None, None, "")
 
@@ -483,24 +701,48 @@ class TestRankGuard:
         """report_usage() is a no-op when mpi_rank() != 0."""
         self._setup_reporter(monkeypatch)
 
-        with patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls:
-            with patch("tensorrt_llm._utils.mpi_rank", return_value=1):
-                usage_lib.report_usage()
-            thread_cls.assert_not_called()
+        with (
+            patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls,
+            patch.object(usage_lib, "_is_reporting_rank", return_value=False),
+        ):
+            usage_lib.report_usage()
+        thread_cls.assert_not_called()
 
     def test_rank_zero_proceeds(self, monkeypatch, enable_telemetry):
         """report_usage() proceeds normally when mpi_rank() == 0."""
         self._setup_reporter(monkeypatch)
 
         mock_thread = MagicMock()
-        with patch(
-            "tensorrt_llm.usage.usage_lib.threading.Thread",
-            return_value=mock_thread,
-        ) as thread_cls:
-            with patch("tensorrt_llm._utils.mpi_rank", return_value=0):
-                usage_lib.report_usage()
-            thread_cls.assert_called_once()
-            mock_thread.start.assert_called_once()
+        with (
+            patch(
+                "tensorrt_llm.usage.usage_lib.threading.Thread",
+                return_value=mock_thread,
+            ) as thread_cls,
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+        ):
+            usage_lib.report_usage()
+            assert thread_cls.call_count == 2
+            assert mock_thread.start.call_count == 2
+
+    def test_pre_split_session_reports_after_becoming_subgroup_rank_zero(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Session setup before a communicator split does not fix its rank."""
+        self._setup_reporter(monkeypatch)
+
+        with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
+            assert not usage_lib._is_reporting_rank()
+            assert usage_lib.apply_usage_session_config()
+
+        mock_thread = MagicMock()
+        with (
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+            patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls,
+        ):
+            usage_lib.report_usage()
+
+        assert thread_cls.call_count == 2
+        assert mock_thread.start.call_count == 2
 
     def test_rank_import_fails_proceeds(self, monkeypatch, enable_telemetry):
         """report_usage() proceeds (fail-open) when mpi_rank import fails."""
@@ -516,8 +758,21 @@ class TestRankGuard:
                 {"tensorrt_llm._utils": None},
             ):
                 usage_lib.report_usage()
-            thread_cls.assert_called_once()
-            mock_thread.start.assert_called_once()
+            assert thread_cls.call_count == 2
+            assert mock_thread.start.call_count == 2
+
+    def test_rank_import_fails_skips_known_distributed_run(self, monkeypatch, enable_telemetry):
+        """An unknown rank cannot make every process in a known job report."""
+        self._setup_reporter(monkeypatch)
+        monkeypatch.setenv("WORLD_SIZE", "8")
+
+        with (
+            patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls,
+            patch.dict("sys.modules", {"tensorrt_llm._utils": None}),
+        ):
+            usage_lib.report_usage()
+
+        thread_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -526,10 +781,37 @@ class TestRankGuard:
 
 
 class TestReporterShutdown:
-    """Verify _REPORTER_STOP event exits the heartbeat loop."""
+    """Verify _HEARTBEAT_STOP event exits the heartbeat loop."""
 
-    def test_reporter_stop_event_exits_heartbeat_loop(self):
-        """Setting _REPORTER_STOP causes the heartbeat loop to exit."""
+    @pytest.mark.parametrize("sequence_limit", [usage_lib.schema._UINT32_MAX, 2])
+    def test_heartbeats_continue_until_stopped(self, reporter_session, sequence_limit):
+        """Long-lived sessions keep reporting without overflowing the wire counter."""
+        heartbeat_count = 10_001
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib.schema, "_UINT32_MAX", sequence_limit),
+            patch.object(usage_lib, "_get_heartbeat_interval", return_value=600),
+            patch.object(
+                usage_lib._HEARTBEAT_STOP,
+                "wait",
+                side_effect=[False] * heartbeat_count + [True],
+            ) as wait,
+        ):
+            usage_lib._background_reporter(None, None, "")
+
+        assert sent[0]["events"][0]["name"] == "trtllm_initial_report"
+        heartbeats = [payload["events"][0] for payload in sent[1:]]
+        assert len(heartbeats) == heartbeat_count
+        assert all(event["name"] == "trtllm_heartbeat" for event in heartbeats)
+        assert [event["parameters"]["seq"] for event in heartbeats] == [
+            min(seq, sequence_limit) for seq in range(heartbeat_count)
+        ]
+        assert wait.call_count == heartbeat_count + 1
+        assert all(call.kwargs == {"timeout": 600} for call in wait.call_args_list)
+
+    def test_reporter_stop_event_exits_heartbeat_loop(self, reporter_session):
+        """Setting _HEARTBEAT_STOP causes the heartbeat loop to exit."""
         send_count = {"n": 0}
 
         def counting_send(payload):
@@ -540,12 +822,42 @@ class TestReporterShutdown:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=counting_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=3600),
         ):
             usage_lib._background_reporter(None, None, "")
 
         assert send_count["n"] == 1
+
+    def test_heartbeat_reads_latest_counter_snapshot(self, enable_telemetry):
+        """A heartbeat reflects lifecycle changes made after session startup."""
+
+        class _OneHeartbeat:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout):
+                del timeout
+                self.wait_count += 1
+                return self.wait_count > 1
+
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        sent = []
+
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", _OneHeartbeat()),
+        ):
+            usage_lib._background_reporter(None, None, "llm_class")
+
+        assert [payload["events"][0]["name"] for payload in sent] == [
+            "trtllm_initial_report",
+            "trtllm_heartbeat",
+        ]
+        heartbeat = sent[1]["events"][0]["parameters"]
+        assert heartbeat["llmInstancesCreated"] == 1
+        assert heartbeat["activeLlmInstances"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +868,7 @@ class TestReporterShutdown:
 class TestHeartbeatFailSilent:
     """Verify transient heartbeat failure doesn't kill the loop."""
 
-    def test_heartbeat_continues_after_transient_failure(self):
+    def test_heartbeat_continues_after_transient_failure(self, reporter_session):
         """OSError on one heartbeat doesn't prevent subsequent heartbeats."""
         calls = []
 
@@ -571,7 +883,7 @@ class TestHeartbeatFailSilent:
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=tracking_send),
-            patch.object(usage_lib, "_REPORTER_STOP", stop),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop),
             patch.object(usage_lib, "_get_heartbeat_interval", return_value=0),
         ):
             usage_lib._background_reporter(None, None, "")
@@ -584,6 +896,75 @@ class TestHeartbeatFailSilent:
         )
 
 
+class TestBackgroundReporterOptOut:
+    def test_late_opt_out_prevents_initial_event(self, enable_telemetry):
+        """A reporter waking after session deactivation sends nothing."""
+        assert usage_lib.apply_usage_session_config()
+        usage_lib._deactivate_usage_session()
+
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            usage_lib._background_reporter(None, None, "")
+
+        send.assert_not_called()
+
+    def test_opt_out_after_initial_claim_cancels_delivery(self, monkeypatch, enable_telemetry):
+        """Opt-out between claiming and sending the initial event wins."""
+        assert usage_lib.apply_usage_session_config()
+        session = usage_lib._SESSION
+        claimed = threading.Event()
+        resume = threading.Event()
+        original_claim = session.claim_initial
+
+        def claim_then_pause():
+            result = original_claim()
+            claimed.set()
+            resume.wait(timeout=5)
+            return result
+
+        monkeypatch.setattr(session, "claim_initial", claim_then_pause)
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            reporter = threading.Thread(
+                target=usage_lib._background_reporter,
+                args=(None, None, ""),
+            )
+            reporter.start()
+            assert claimed.wait(timeout=5)
+            usage_lib._deactivate_usage_session()
+            resume.set()
+            reporter.join(timeout=5)
+
+        assert not reporter.is_alive()
+        send.assert_not_called()
+
+    def test_opt_out_before_heartbeat_cancels_delivery(self, enable_telemetry):
+        """A heartbeat prepared before late opt-out is not delivered afterward."""
+        assert usage_lib.apply_usage_session_config()
+
+        class _OptOutBeforeHeartbeat:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout):
+                del timeout
+                self.wait_count += 1
+                if self.wait_count == 1:
+                    usage_lib._deactivate_usage_session()
+                    return False
+                return True
+
+            def set(self):
+                pass
+
+        sent = []
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", _OptOutBeforeHeartbeat()),
+        ):
+            usage_lib._background_reporter(None, None, "")
+
+        assert [payload["events"][0]["name"] for payload in sent] == ["trtllm_initial_report"]
+
+
 # ---------------------------------------------------------------------------
 # Concurrent reporter start test
 # ---------------------------------------------------------------------------
@@ -593,7 +974,7 @@ class TestConcurrentReporterStart:
     """Verify _REPORTER_LOCK works under real thread contention."""
 
     def test_concurrent_calls_spawn_single_thread(self, monkeypatch, enable_telemetry):
-        """10 concurrent report_usage() calls produce exactly 1 reporter thread."""
+        """Concurrent report_usage() calls start one heartbeat and one exit sender."""
         monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
         usage_lib._NOTIFICATION_SHOWN.set()
 
@@ -613,7 +994,7 @@ class TestConcurrentReporterStart:
                 "threading",
                 wraps=threading,
             ) as mock_threading_mod,
-            patch("tensorrt_llm._utils.mpi_rank", return_value=0),
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
         ):
             mock_threading_mod.Thread = MagicMock(side_effect=counting_thread)
             mock_threading_mod.Lock = threading.Lock
@@ -631,4 +1012,595 @@ class TestConcurrentReporterStart:
             for t in pool:
                 t.join(timeout=5)
 
-        assert threads_started["count"] == 1
+        assert threads_started["count"] == 2
+
+
+class TestProcessTelemetrySession:
+    """Verify local session creation and terminal-event behavior."""
+
+    @staticmethod
+    def _reset_session(monkeypatch):
+        monkeypatch.setattr(usage_lib, "_SESSION", None)
+        monkeypatch.setattr(usage_lib, "_SESSION_DISABLED", False)
+        monkeypatch.setattr(usage_lib, "_HEARTBEAT_STOP", threading.Event())
+        monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
+        monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
+        usage_lib._NOTIFICATION_SHOWN.set()
+
+    def test_apply_session_config_is_local_only(self, monkeypatch, enable_telemetry):
+        """Session creation generates identity without threads or network I/O."""
+        self._reset_session(monkeypatch)
+        telemetry_config = SimpleNamespace(disabled=False, usage_context="cli_serve")
+
+        with (
+            patch.object(usage_lib.threading, "Thread") as thread_cls,
+            patch.object(usage_lib, "_send_to_gxt") as send,
+        ):
+            assert usage_lib.apply_usage_session_config(telemetry_config)
+
+        assert usage_lib._SESSION is not None
+        assert len(usage_lib._SESSION.session_id) == 32
+        assert usage_lib._SESSION.usage_context == "cli_serve"
+        thread_cls.assert_not_called()
+        send.assert_not_called()
+
+    def test_apply_session_config_does_not_publish_partial_session(
+        self, monkeypatch, enable_telemetry
+    ):
+        """A failed exit-hook registration cannot expose a partial session."""
+        monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", False)
+
+        with patch.object(
+            usage_lib.atexit,
+            "register",
+            side_effect=RuntimeError("registration failed"),
+        ):
+            assert not usage_lib.apply_usage_session_config()
+
+        assert usage_lib._SESSION is None
+        assert not usage_lib._PROCESS_EXIT_HOOK_REGISTERED
+
+    def test_initial_report_slot_can_be_claimed_once(self, enable_telemetry):
+        """Concurrent reporter starts cannot create two initial events."""
+        assert usage_lib.apply_usage_session_config()
+
+        assert usage_lib._SESSION.claim_initial()
+        assert not usage_lib._SESSION.claim_initial()
+
+    def test_counter_transitions_for_multiple_llms(self, enable_telemetry):
+        """Sequential lifecycle calls expose overlap and final active state."""
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+        assert usage_lib.record_llm_initialization_attempt()
+        assert usage_lib.record_llm_initialized()
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 2
+        assert snapshot["llmInstancesCreated"] == 2
+        assert snapshot["activeLlmInstances"] == 2
+        assert snapshot["maxConcurrentLlmInstances"] == 2
+
+        usage_lib.record_llm_shutdown()
+        usage_lib.record_llm_shutdown()
+        assert usage_lib._SESSION.snapshot()["activeLlmInstances"] == 0
+
+    def test_initialization_failure_updates_only_failure_counter(self, enable_telemetry):
+        """A failed constructor attempt does not create an active instance."""
+        assert usage_lib.record_llm_initialization_attempt()
+        usage_lib.record_llm_initialization_failure()
+
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == 1
+        assert snapshot["llmInitializationFailures"] == 1
+        assert snapshot["llmInstancesCreated"] == 0
+        assert snapshot["activeLlmInstances"] == 0
+
+    def test_monotonic_counters_saturate_at_uint32(self, enable_telemetry):
+        """Cumulative counters never exceed the SMS PositiveInt bound."""
+        assert usage_lib.apply_usage_session_config()
+        usage_lib._SESSION.llm_initialization_attempts = usage_lib.schema._UINT32_MAX
+
+        assert usage_lib._SESSION.record_llm_initialization_attempt()
+        snapshot = usage_lib._SESSION.snapshot()
+        assert snapshot["llmInitializationAttempts"] == usage_lib.schema._UINT32_MAX
+
+    def test_session_resets_when_process_id_changes(self, enable_telemetry):
+        """A forked child cannot reuse its parent's session identity or locks."""
+        assert usage_lib.apply_usage_session_config()
+        parent = usage_lib._SESSION
+        usage_lib._PROCESS_PID -= 1
+
+        assert usage_lib.apply_usage_session_config()
+        child = usage_lib._SESSION
+        assert child.session_id != parent.session_id
+        assert child.owner_pid == os.getpid()
+        assert child.terminal_thread is None
+        assert child.terminal_payload is None
+        assert child.terminal_ready is not parent.terminal_ready
+        assert child.terminal_completion is not parent.terminal_completion
+
+    def test_invalid_disabled_value_fails_closed(self, monkeypatch, enable_telemetry):
+        """An unvalidated opt-out value cannot accidentally enable telemetry."""
+        self._reset_session(monkeypatch)
+
+        assert not usage_lib.apply_usage_session_config({"disabled": "false"})
+        assert usage_lib._SESSION is None
+
+    def test_unvalidated_enabled_dict_fails_closed(self, enable_telemetry):
+        """Raw config dictionaries cannot opt in to early failure reporting."""
+        assert not usage_lib.apply_usage_session_config({"disabled": False})
+        assert usage_lib._SESSION is None
+
+    def test_late_config_opt_out_deactivates_early_session(self, enable_telemetry):
+        """A parsed config opt-out overrides an earlier CLI-only decision."""
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
+        stale_session = usage_lib._SESSION
+
+        assert not usage_lib.apply_usage_session_config({"disabled": True})
+        assert usage_lib._SESSION is None
+        assert usage_lib._HEARTBEAT_STOP.is_set()
+        assert not stale_session.claim_initial()
+        assert (
+            stale_session.claim_terminal(usage_lib.TerminalOutcome(termination_kind="unknown"))
+            is None
+        )
+
+    def test_explicit_opt_out_remains_sticky_after_fork_reset(self, enable_telemetry):
+        """Resetting inherited locks cannot discard an explicit user opt-out."""
+        assert usage_lib.apply_usage_session_config()
+        assert not usage_lib.apply_usage_session_config({"disabled": True})
+        usage_lib._PROCESS_PID -= 1
+
+        assert not usage_lib.apply_usage_session_config()
+        assert usage_lib._SESSION is None
+
+    def test_rank_transition_keeps_local_session_but_skips_emission(self, enable_telemetry):
+        """Early global rank selection cannot suppress a later subgroup rank 0."""
+        with patch.object(usage_lib, "_is_reporting_rank", return_value=True):
+            assert usage_lib.apply_usage_session_config()
+
+        with (
+            patch.object(usage_lib, "_is_reporting_rank", return_value=False),
+            patch("tensorrt_llm.usage.usage_lib.threading.Thread") as thread_cls,
+        ):
+            assert usage_lib.apply_usage_session_config()
+            usage_lib.report_usage()
+
+        assert usage_lib._SESSION is not None
+        assert not usage_lib._HEARTBEAT_STOP.is_set()
+        thread_cls.assert_not_called()
+
+    def test_nonreporting_rank_does_not_claim_terminal_slot(self, enable_telemetry):
+        """A later subgroup rank 0 can still emit the process terminal event."""
+        assert usage_lib.apply_usage_session_config()
+
+        with patch.object(usage_lib, "_is_reporting_rank", return_value=False):
+            assert not usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
+            )
+
+        sent = []
+        with (
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+            patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append),
+        ):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
+            )
+
+        assert len(sent) == 1
+
+    def test_first_termination_observation_is_preserved(self, enable_telemetry):
+        """A later shutdown symptom cannot replace the original failure cause."""
+        assert usage_lib.apply_usage_session_config()
+        usage_lib.record_termination_observation(
+            usage_lib.TerminalOutcome(
+                termination_kind="worker_failure",
+                component="engine_worker",
+                reporting_source="executor_proxy",
+                exit_code_known=True,
+                exit_code=137,
+                signal_number=9,
+            ),
+            lifecycle_phase="serving",
+        )
+        usage_lib.record_termination_observation(
+            usage_lib.TerminalOutcome(
+                termination_kind="signal",
+                component="server",
+            ),
+            lifecycle_phase="unknown",
+        )
+
+        session = usage_lib._get_session()
+        assert session is not None
+        terminal = session.claim_terminal(
+            usage_lib.TerminalOutcome(
+                termination_kind="signal",
+                component="server",
+                exit_code_known=True,
+                exit_code=130,
+                signal_number=2,
+            )
+        )
+        assert terminal is not None
+        snapshot, outcome = terminal
+        assert snapshot["lifecyclePhase"] == "serving"
+        assert outcome == usage_lib.TerminalOutcome(
+            termination_kind="worker_failure",
+            component="engine_worker",
+            reporting_source="executor_proxy",
+            exit_code_known=True,
+            exit_code=137,
+            signal_number=9,
+        )
+
+    def test_terminal_observer_does_not_create_a_missing_session(self, enable_telemetry):
+        """Late observers cannot bypass an earlier opt-out or rank decision."""
+        assert not usage_lib.report_exit(
+            usage_lib.TerminalOutcome(
+                termination_kind="exception",
+                component="server",
+                exit_code_known=True,
+                exit_code=1,
+            ),
+            lifecycle_phase="serving",
+        )
+        assert usage_lib._SESSION is None
+
+    def test_terminal_event_uses_shared_session_id(self, monkeypatch, enable_telemetry):
+        """Initial and terminal payloads can be joined by sessionId."""
+        self._reset_session(monkeypatch)
+        telemetry_config = SimpleNamespace(disabled=False, usage_context="cli_serve")
+        assert usage_lib.apply_usage_session_config(telemetry_config)
+        session_id = usage_lib._SESSION.session_id
+        monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0)
+
+        mock_thread = MagicMock()
+        with patch.object(usage_lib.threading, "Thread", return_value=mock_thread) as thread_cls:
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="signal",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=130,
+                    signal_number=2,
+                ),
+                lifecycle_phase="serving",
+                telemetry_config=telemetry_config,
+            )
+
+        (session,) = thread_cls.call_args.kwargs["args"]
+        payload = session.terminal_payload.payload
+        event = payload["events"][0]
+        assert payload["sessionId"] == session_id
+        assert event["name"] == "trtllm_exit_report"
+        assert event["parameters"]["ingressPoint"] == "cli_serve"
+        assert event["parameters"]["exitCode"] == 130
+
+    def test_terminal_event_contains_correlation_and_counter_snapshot(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Terminal-only sessions carry enough state for independent analysis."""
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "ctx0")
+        monkeypatch.setenv("TRTLLM_DISAGG_DEPLOYMENT_ID", "deployment")
+        assert usage_lib.record_llm_initialization_attempt(default_usage_context="cli_serve")
+        usage_lib.record_llm_initialization_failure()
+
+        sent = []
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="disagg_worker",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
+                lifecycle_phase="model_initialization",
+            )
+
+        params = sent[0]["events"][0]["parameters"]
+        assert params["deploymentId"] == "deployment"
+        assert params["disaggRole"] == "ctx0"
+        assert params["llmInitializationAttempts"] == 1
+        assert params["llmInitializationFailures"] == 1
+        assert params["llmInstancesCreated"] == 0
+
+    def test_unknown_exit_code_uses_zero_sentinel(self, enable_telemetry):
+        """Unknown exit status cannot leak a guessed or stale numeric code."""
+        assert usage_lib.apply_usage_session_config()
+        sent = []
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="unknown",
+                    exit_code_known=False,
+                    exit_code=137,
+                )
+            )
+
+        params = sent[0]["events"][0]["parameters"]
+        assert params["exitCodeKnown"] is False
+        assert params["exitCode"] == 0
+
+    def test_repeated_terminal_calls_send_once(self, monkeypatch, enable_telemetry):
+        """The first terminal caller wins and later calls are no-ops."""
+        self._reset_session(monkeypatch)
+        telemetry_config = SimpleNamespace(disabled=False, usage_context="llm_class")
+        assert usage_lib.apply_usage_session_config(telemetry_config)
+        sent = []
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=sent.append):
+            first = usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="clean",
+                    component="llm",
+                    exit_code_known=False,
+                ),
+                lifecycle_phase="serving",
+                telemetry_config=telemetry_config,
+            )
+            second = usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="llm",
+                    exit_code_known=False,
+                ),
+                lifecycle_phase="serving",
+                telemetry_config=telemetry_config,
+            )
+
+        assert first is True
+        assert second is False
+        assert len(sent) == 1
+        assert sent[0]["events"][0]["parameters"]["terminationKind"] == "clean"
+
+    def test_terminal_claim_survives_sender_thread_failure(self, enable_telemetry):
+        """Delivery setup failure cannot reopen the terminal-event slot."""
+        assert usage_lib.apply_usage_session_config()
+
+        with patch.object(usage_lib.threading, "Thread", side_effect=RuntimeError("no threads")):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    exit_code_known=True,
+                    exit_code=1,
+                )
+            )
+
+        assert not usage_lib.report_exit(
+            usage_lib.TerminalOutcome(
+                termination_kind="clean",
+                exit_code_known=True,
+            )
+        )
+
+    def test_terminal_prestart_failure_does_not_prevent_heartbeats(self, enable_telemetry):
+        """Normal reporting survives a failed exit-sender start; exit can retry later."""
+        background = MagicMock()
+        with patch.object(
+            usage_lib.threading, "Thread", side_effect=[RuntimeError("no thread"), background]
+        ):
+            usage_lib.report_usage()
+        background.start.assert_called_once()
+        assert usage_lib._SESSION.terminal_thread is None
+        with patch.object(usage_lib, "_send_to_gxt") as send:
+            assert usage_lib.report_exit(usage_lib.TerminalOutcome(termination_kind="unknown"))
+            send.assert_called_once()
+
+    def test_terminal_wait_is_bounded(self, monkeypatch, enable_telemetry):
+        """A blocked network send cannot hold shutdown past the configured bound."""
+        self._reset_session(monkeypatch)
+        monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0.01)
+        assert usage_lib.apply_usage_session_config(default_usage_context="llm_class")
+        release_send = threading.Event()
+        terminal_threads = []
+        real_thread = threading.Thread
+
+        def blocking_send(payload):
+            del payload
+            release_send.wait(timeout=1)
+
+        def track_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            terminal_threads.append(thread)
+            return thread
+
+        started = time.monotonic()
+        with (
+            patch.object(usage_lib, "_send_to_gxt", side_effect=blocking_send),
+            patch.object(usage_lib.threading, "Thread", side_effect=track_thread),
+        ):
+            assert usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="llm",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
+                lifecycle_phase="model_initialization",
+                default_usage_context="llm_class",
+            )
+        elapsed = time.monotonic() - started
+        release_send.set()
+        assert len(terminal_threads) == 1
+        terminal_threads[0].join(timeout=1)
+
+        assert elapsed < 0.2
+        assert not terminal_threads[0].is_alive()
+
+    @pytest.mark.parametrize("reporter_state", ["initial", "heartbeat", "finished"])
+    def test_atexit_delivery_is_independent_of_reporter(self, reporter_state, enable_telemetry):
+        """Real interpreter shutdown uses the existing exit worker, even after heartbeats end."""
+        script = r"""
+import json
+import os
+import sys
+import threading
+import types
+
+package = types.ModuleType("tensorrt_llm")
+package.__path__ = [sys.argv[1]]
+sys.modules["tensorrt_llm"] = package
+from tensorrt_llm.usage import usage_lib
+
+state = sys.argv[2]
+ready = threading.Event()
+blocked = threading.Event()
+usage_lib._is_reporting_rank = lambda: True
+usage_lib._OPT_OUT_FILE = None
+usage_lib._get_heartbeat_interval = lambda: 0.001
+usage_lib._collect_gpu_info = lambda: {}
+
+def send(payload):
+    name = payload["events"][0]["name"]
+    if name == "trtllm_exit_report":
+        print(json.dumps(payload), flush=True)
+    elif name == {"initial": "trtllm_initial_report", "heartbeat": "trtllm_heartbeat"}.get(state):
+        ready.set()
+        blocked.wait(30)
+
+usage_lib._send_to_gxt = send
+usage_lib.report_usage()
+if state == "finished":
+    usage_lib._HEARTBEAT_STOP.set()
+    for thread in threading.enumerate():
+        if thread.name == "trtllm-usage-stats":
+            thread.join(5)
+            assert not thread.is_alive()
+else:
+    assert ready.wait(5)
+# No explicit report_exit: exercise the registered process-exit callback.
+"""
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(Path(usage_lib.__file__).parents[1]),
+                reporter_state,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert child.returncode == 0, child.stderr
+        payloads = [json.loads(line) for line in child.stdout.splitlines() if line.startswith("{")]
+        assert len(payloads) == 1, child.stderr
+        assert payloads[0]["events"][0]["name"] == "trtllm_exit_report"
+
+    @pytest.mark.parametrize("blocked_event", ["trtllm_initial_report", "trtllm_heartbeat"])
+    def test_terminal_bypasses_blocked_reporter(self, monkeypatch, enable_telemetry, blocked_event):
+        """A prestarted exit sender works even when the other transport is blocked."""
+        self._reset_session(monkeypatch)
+        monkeypatch.setattr(usage_lib, "_get_heartbeat_interval", lambda: 0.001)
+        blocked = threading.Event()
+        release = threading.Event()
+        sent = []
+
+        def send(payload):
+            if payload["events"][0]["name"] == blocked_event:
+                blocked.set()
+                release.wait(timeout=5)
+            sent.append(payload)
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=send):
+            usage_lib.report_usage()
+            reporters = [t for t in threading.enumerate() if t.name == "trtllm-usage-stats"]
+            try:
+                assert blocked.wait(timeout=2)
+                with patch.object(
+                    usage_lib.threading, "Thread", side_effect=RuntimeError("interpreter shutdown")
+                ):
+                    assert usage_lib.report_exit(
+                        usage_lib.TerminalOutcome(termination_kind="unknown")
+                    )
+                assert usage_lib._SESSION.terminal_completion.wait(timeout=2)
+                assert sent[-1]["events"][0]["name"] == "trtllm_exit_report"
+                assert not release.is_set()
+            finally:
+                release.set()
+                for reporter in reporters:
+                    reporter.join(timeout=2)
+                    assert not reporter.is_alive()
+
+    def test_opt_out_cancels_queued_terminal_and_releases_waiter(
+        self, monkeypatch, enable_telemetry
+    ):
+        """Opt-out between publication and transport suppresses the exit payload."""
+        self._reset_session(monkeypatch)
+        assert usage_lib.apply_usage_session_config()
+        session = usage_lib._SESSION
+        ready = threading.Event()
+        release = threading.Event()
+        original_send = usage_lib._send_if_session_active
+
+        def delayed_send(*args):
+            ready.set()
+            release.wait(timeout=5)
+            return original_send(*args)
+
+        monkeypatch.setattr(usage_lib, "_TERMINAL_FLUSH_TIMEOUT", 0)
+        with (
+            patch.object(usage_lib, "_send_if_session_active", side_effect=delayed_send),
+            patch.object(usage_lib, "_send_to_gxt") as send,
+        ):
+            try:
+                assert usage_lib.report_exit(
+                    usage_lib.TerminalOutcome(termination_kind="exception", exit_code=1)
+                )
+                assert ready.wait(timeout=2)
+                usage_lib._deactivate_usage_session()
+                assert session.terminal_completion.is_set()
+            finally:
+                release.set()
+                session.terminal_thread.join(timeout=2)
+                assert not session.terminal_thread.is_alive()
+            send.assert_not_called()
+
+    def test_concurrent_terminal_calls_send_once(self, monkeypatch, enable_telemetry):
+        """Racing shutdown paths still produce one terminal event."""
+        self._reset_session(monkeypatch)
+        assert usage_lib.apply_usage_session_config(default_usage_context="cli_serve")
+        sent = []
+        sent_lock = threading.Lock()
+        barrier = threading.Barrier(10)
+        results = []
+
+        def capture_send(payload):
+            with sent_lock:
+                sent.append(payload)
+
+        def call_report_exit():
+            barrier.wait()
+            result = usage_lib.report_exit(
+                usage_lib.TerminalOutcome(
+                    termination_kind="exception",
+                    component="server",
+                    exit_code_known=True,
+                    exit_code=1,
+                ),
+                lifecycle_phase="serving",
+                default_usage_context="cli_serve",
+            )
+            with sent_lock:
+                results.append(result)
+
+        with patch.object(usage_lib, "_send_to_gxt", side_effect=capture_send):
+            callers = [threading.Thread(target=call_report_exit) for _ in range(10)]
+            for caller in callers:
+                caller.start()
+            for caller in callers:
+                caller.join(timeout=2)
+
+        assert results.count(True) == 1
+        assert len(sent) == 1

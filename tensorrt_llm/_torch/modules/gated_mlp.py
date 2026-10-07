@@ -5,16 +5,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
 from .linear import (Linear, TensorParallelMode, WeightMode,
                      WeightsLoadingConfig, is_static_nvfp4_input_eligible)
-from .swiglu import swiglu
+from .swiglu import swiglu, swiglu_2in
 
 
 class GatedMLP(nn.Module):
@@ -38,6 +40,7 @@ class GatedMLP(nn.Module):
         swiglu_limit: Optional[float] = None,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
+        split_gate_up: bool = False,
     ):
 
         super().__init__()
@@ -46,6 +49,14 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        # Keeps each projection's own calibrated scale, which fusing would
+        # discard. Off by default.
+        self.split_gate_up = split_gate_up
+        # Whether gate and up may consume one quantized activation. Decided by
+        # post_load_weights() from the loaded scales, so a model whose loader
+        # never reaches GatedMLP simply does not share. Necessary, not
+        # sufficient: _can_share_gate_up_quantization() adds the per-call gates.
+        self._maybe_share_gate_up_quantize = False
         self.swiglu_limit = float(
             swiglu_limit) if swiglu_limit is not None else None
         # SwiGLU-OAI shape parameters, left None for plain SwiGLU, where the
@@ -70,6 +81,7 @@ class GatedMLP(nn.Module):
                 gpus_per_node=self.mapping.gpus_per_node,
                 tp_size=tp_size,
                 pp_size=pp_size,
+                enable_attention_dp=self.mapping.enable_attention_dp,
             )
         else:
             mapping = config.mapping
@@ -103,27 +115,50 @@ class GatedMLP(nn.Module):
             'up': (local_intermediate_start, local_intermediate_end),
         }
 
-        self.gate_up_proj = Linear(
-            self.hidden_size,
-            self.intermediate_size * 2,
+        _common_proj_kwargs = dict(
             bias=bias,
             dtype=dtype,
             mapping=mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
-            weights_loading_config=WeightsLoadingConfig(
-                weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
             quant_config=config.get_quant_config(),
             reduce_output=False,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+            # The fused CuteDSL NVFP4 SwiGLU epilogue applies no clamp, so a
+            # layer carrying a real ``swiglu_limit`` must stay on the Triton
+            # kernel. ``_is_plain_swiglu`` deliberately covers only alpha/beta;
+            # the limit is gated here (as on ``rubin-advance``). Without this
+            # the clamp is silently dropped -- wrong numerics, no error.
+            use_cute_dsl_nvfp4_swiglu_blackwell=(
+                use_cute_dsl_blockscaling_mm and activation == F.silu
+                and not bias
+                and (swiglu_limit is None or swiglu_limit == float("inf"))),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
             disable_deep_gemm=disable_deep_gemm,
-            fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
-            override_tp_sharding=override_tp_sharding,
         )
+
+        if self.split_gate_up:
+            # Each Linear owns one checkpoint tensor and its own scale, so no
+            # fused weight mode, no shard-index mapping, and no gate/up-keyed
+            # override_tp_sharding -- Linear asserts that a dict tp_sharding
+            # only ever reaches a fused weight mode.
+            self.gate_proj = Linear(self.hidden_size, self.intermediate_size,
+                                    **_common_proj_kwargs)
+            self.up_proj = Linear(self.hidden_size, self.intermediate_size,
+                                  **_common_proj_kwargs)
+        else:
+            self.gate_up_proj = Linear(
+                self.hidden_size,
+                self.intermediate_size * 2,
+                weights_loading_config=WeightsLoadingConfig(
+                    weight_mode=WeightMode.FUSED_GATE_UP_LINEAR),
+                fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
+                override_tp_sharding=override_tp_sharding,
+                **_common_proj_kwargs,
+            )
 
         if is_shared_expert:
             down_type = LoraModuleType.SHARED_EXPERT_4H_TO_H
@@ -210,19 +245,107 @@ class GatedMLP(nn.Module):
         return ((self.swiglu_alpha is None or self.swiglu_alpha == 1.0)
                 and (self.swiglu_beta is None or self.swiglu_beta == 0.0))
 
+    def _apply_activation_2in(self, gate, up):
+        """Activation for the split path: gate and up arrive as two tensors.
+
+        Mirrors _apply_activation, including emitting FP8 directly when down_proj
+        consumes FP8 -- concatenating the pair first would cost a full
+        intermediate-sized copy.
+        """
+        if self.activation is not F.silu:
+            raise NotImplementedError(
+                f"split_gate_up requires SwiGLU activation, got {self.activation}"
+            )
+        # As in _can_share_gate_up_quantization: a method running this call in
+        # higher precision needs a 16-bit activation, so do not emit FP8 for it.
+        down_proj_is_fp8 = (
+            self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8
+        ) and not self.down_proj.requires_unquantized_activation
+        if down_proj_is_fp8:
+            return swiglu_2in(gate,
+                              up,
+                              quant_scale=self.down_proj.input_scale,
+                              quant_type=torch.float8_e4m3fn,
+                              swiglu_limit=self.swiglu_limit,
+                              swiglu_alpha=self.swiglu_alpha,
+                              swiglu_beta=self.swiglu_beta)
+        return swiglu_2in(gate,
+                          up,
+                          swiglu_limit=self.swiglu_limit,
+                          swiglu_alpha=self.swiglu_alpha,
+                          swiglu_beta=self.swiglu_beta)
+
+    def _can_share_gate_up_quantization(self, x) -> bool:
+        """Whether gate and up can consume one quantized activation.
+
+        Reads no tensor values: that would sync the device every forward and
+        make the graph data-dependent. Scale equality is checked at load.
+        """
+        if not self._maybe_share_gate_up_quantize:
+            return False
+        if isinstance(x, Fp4QuantizedTensor) or x.dtype == torch.float8_e4m3fn:
+            return False
+        # requires_unquantized_activation is per-call state rather than a
+        # property of the checkpoint.
+        return not self.gate_proj.requires_unquantized_activation
+
+    def _split_gate_up_forward(self, x):
+        """Run the split projections, quantizing their shared input once.
+
+        gate and up consume the same activation. With static per-tensor FP8 each
+        Linear would otherwise quantize it again, so quantize once here and hand
+        both the FP8 tensor -- FP8QDQLinearMethod.apply passes a pre-quantized
+        input straight through.
+        """
+        if self._can_share_gate_up_quantization(x):
+            shape = x.shape
+            x2d = x.reshape(-1, shape[-1]) if x.dim() > 2 else x
+            qx, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                x2d, self.gate_proj.input_scale)
+            x = qx.reshape(*shape[:-1], shape[-1]) if x.dim() > 2 else qx
+        return self._apply_activation_2in(self.gate_proj(x), self.up_proj(x))
+
+    def post_load_weights(self) -> None:
+        """Settle the shared-activation decision here, never in forward().
+
+        gate and up each apply their own input_scale in the GEMM epilogue, so
+        quantizing once with gate's scale is only correct when both agree.
+        Reading the scales on the hot path would sync the device and break
+        fullgraph compilation, so it happens once, here.
+
+        A checkpoint whose scales disagree quantizes each projection instead
+        of loading incorrectly.
+        """
+        self._maybe_share_gate_up_quantize = False
+        # Sharing hands both GEMMs a tensor quantized with the stored scale, so
+        # a dynamic scale computed per call has no way to reach them.
+        if not (self.split_gate_up and self.gate_proj.has_fp8_qdq
+                and self.up_proj.has_fp8_qdq
+                and not self.gate_proj.force_dynamic_quantization):
+            return
+        gate_scale, up_scale = (self.gate_proj.input_scale,
+                                self.up_proj.input_scale)
+        if gate_scale is None or up_scale is None:
+            return
+        if not torch.equal(gate_scale, up_scale):
+            logger.warning(
+                "gate/up carry different calibrated input_scales "
+                f"({gate_scale.item()} vs {up_scale.item()}) at layer_idx="
+                f"{self.layer_idx}; quantizing each projection separately "
+                "instead of sharing one quantized activation.")
+            return
+        self._maybe_share_gate_up_quantize = True
+
     def _can_fuse_gate_up_swiglu(self):
         """Check if fused GEMM + SwiGLU path is available.
 
-        Returns True when all conditions are met:
-        - CuteDSL blockscaling mode is enabled (implies Blackwell + CuteDSL)
-        - Activation is plain SwiGLU (F.silu), see _is_plain_swiglu
-        - gate_up_proj uses NVFP4 quantization
-        - gate_up_proj has no bias (bias not supported in fused kernel)
+        The projection owns the capability predicate because weight loading
+        must make exactly the same decision as forward dispatch.
         """
-        return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
-                and self._is_plain_swiglu()
-                and self.gate_up_proj.has_nvfp4_activation_quantization
-                and not self.gate_up_proj.has_bias)
+        if self.split_gate_up:  # no fused projection to fuse into
+            return False
+        return (self.activation == F.silu and self._is_plain_swiglu()
+                and self.gate_up_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell())
 
     def _can_fuse_gate_up_swiglu_fp4out(self):
         """Check if fused GEMM + SwiGLU with FP4 output path is available.
@@ -235,6 +358,22 @@ class GatedMLP(nn.Module):
         if not self._can_fuse_gate_up_swiglu():
             return False
         return is_static_nvfp4_input_eligible(self.down_proj)
+
+    def _can_fuse_swiglu_fp8_quant(self) -> bool:
+        """Check whether down projection can consume fused SwiGLU FP8 output."""
+        # silu_and_mul_fp8_quantize_1x128_packed_ue8m0 takes the limit but has
+        # no alpha/beta, so a parameterized SwiGLU must stay unfused. MiniMax
+        # M3 SwiGLU-OAI reaches here with plain F.silu plus swiglu_alpha and
+        # swiglu_beta, so the activation check alone does not exclude it.
+        if not (self.activation == F.silu and self._is_plain_swiglu()
+                and self.down_proj.has_fp8_block_scales):
+            return False
+        if get_sm_version() == 107:
+            return (IS_CUTLASS_DSL_RUBIN_AVAILABLE
+                    and (self.down_proj.use_cute_dsl_blockscaling_mm
+                         or self.down_proj.disable_deep_gemm))
+        return (is_sm_100f() and not self.down_proj.use_cute_dsl_blockscaling_mm
+                and not self.down_proj.disable_deep_gemm)
 
     def _fused_gate_up_swiglu(self, x, fp4_out=False):
         """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
@@ -311,9 +450,26 @@ class GatedMLP(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if bool(lora_params):
+            if self.split_gate_up:
+                # forward_lora fuses gate/up LoRA into one projection, which the
+                # split path does not have. Not implemented rather than
+                # unsupported-by-accident: FP8 LoRA already falls back to BF16
+                # activation (see _apply_activation), so a split FP8 + LoRA path
+                # would need the FP8 LoRA grouped GEMM first.
+                raise NotImplementedError(
+                    "GatedMLP: LoRA is not supported with split_gate_up=True "
+                    f"(layer_idx={self.layer_idx}); build the fused topology "
+                    "if LoRA is required")
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
+        if self.split_gate_up:
+            h2 = self._split_gate_up_forward(x)
+            return self.down_proj(h2,
+                                  all_reduce_params=final_all_reduce_params,
+                                  layer_idx=self.layer_idx)
+
+        fused_output_shape = None
         if self._can_fuse_gate_up_swiglu_fp4out():
             # During torch.compile the token dim is a SymInt, so `m >= MIN_M`
             # would create a SymBool guard that breaks piecewise CUDA graph
@@ -332,11 +488,21 @@ class GatedMLP(nn.Module):
             h2 = self._fused_gate_up_swiglu(x)
         else:
             h1 = self.gate_up_proj(x)
-            h2 = self._apply_activation(h1)
+            if self._can_fuse_swiglu_fp8_quant():
+                if h1.dim() > 2:
+                    fused_output_shape = h1.shape[:-1]
+                    h1 = h1.reshape(-1, h1.shape[-1])
+                use_r128c4_layout = get_sm_version() == 107
+                h2 = torch.ops.trtllm.silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+                    h1, self.swiglu_limit, use_r128c4_layout)
+            else:
+                h2 = self._apply_activation(h1)
 
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 layer_idx=self.layer_idx)
+        if fused_output_shape is not None:
+            output = output.reshape(*fused_output_shape, output.shape[-1])
         return output
 
     def forward_lora(

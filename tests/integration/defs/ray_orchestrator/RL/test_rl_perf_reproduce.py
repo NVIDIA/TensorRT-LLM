@@ -16,7 +16,7 @@ def test_rl_perf_reproduce(llm_venv, tp_size, num_instances):
     script_path = (
         integration_path() / "defs" / "ray_orchestrator" / "RL" / "run_rl_perf_reproduce.py"
     )
-    model_dir = f"{llm_models_root()}/Qwen2-7B-Instruct"
+    model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
 
     if tp_size == 2:
         max_batch_size = 512

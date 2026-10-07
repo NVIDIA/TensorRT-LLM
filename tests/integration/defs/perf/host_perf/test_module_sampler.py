@@ -186,9 +186,8 @@ GREEDY_SCENARIOS = [
 ]
 
 STOP_WORD_SCENARIOS = [
-    # 3 stop words of varying lengths, format: (flat_words, cumulative_lengths)
-    # Stop words: [29871, 13], [29871, 13, 13], [29871, 13, 13, 13, 13]
-    ("stopwords_bs32", 32, ([29871, 13, 29871, 13, 13, 29871, 13, 13, 13, 13], [2, 5, 10, -1])),
+    # 3 stop words of varying lengths, each a plain list of token ids
+    ("stopwords_bs32", 32, [[29871, 13], [29871, 13, 13], [29871, 13, 13, 13, 13]]),
 ]
 
 

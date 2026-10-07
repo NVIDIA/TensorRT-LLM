@@ -20,7 +20,9 @@ backend — compose around a real backend (VANILLA/TRTLLM/FA4/CUTEDSL).
 
 """
 
+from itertools import count
 from typing import TYPE_CHECKING, Callable, ClassVar, Dict, Optional
+from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
@@ -31,15 +33,292 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
 
-from ...attention_backend.interface import PredefinedAttentionMask
+from ...attention.backends.interface import PredefinedAttentionMask
+from .flash_attn4 import _install_cutlass_dsl_compatibility
 from .interface import AttentionBackend, AttentionTensorLayout
 
 _flash_attn_combine_import_error = None
 try:
+    _install_cutlass_dsl_compatibility()
     from flash_attn.cute.interface import flash_attn_combine as _flash_attn_combine
 except (ImportError, OSError) as e:
     _flash_attn_combine = None
     _flash_attn_combine_import_error = e
+
+
+_REPLICATED_KV_KWARGS = (
+    "replicated_k",
+    "replicated_v",
+    "replicated_k_lengths",
+    "global_generated_seq_len",
+)
+
+
+def _pop_replicated_kv(kwargs):
+    replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len = (
+        kwargs.pop(key, None) for key in _REPLICATED_KV_KWARGS
+    )
+    required_values = (replicated_k, replicated_v, global_generated_seq_len)
+    if any(value is not None for value in required_values) and not all(
+        value is not None for value in required_values
+    ):
+        raise ValueError(
+            "Replicated K/V requires replicated_k, replicated_v, and global_generated_seq_len."
+        )
+    if replicated_k_lengths is not None and replicated_k is None:
+        raise ValueError("Replicated K/V lengths require replicated K/V tensors.")
+    # None means every sample uses the complete, already-trimmed replicated cache.
+    return replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len
+
+
+@torch.compiler.disable
+def _run_attention_with_replicated_kv(
+    inner_backend: AttentionBackend,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replicated_k: torch.Tensor,
+    replicated_v: torch.Tensor,
+    replicated_k_lengths: torch.Tensor,
+    valid_generated_seq_len: int,
+    kwargs: dict[str, object],
+    *,
+    context_start: int = 0,
+    context_end: Optional[int] = None,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Run attention with exact generated and replicated K/V prefixes.
+
+    Replicated text precedes generated K/V, matching unsharded Cosmos3 attention.
+    Unequal prefixes are evaluated per sample so backends never receive padded
+    keys or a dense padding mask. The helper is outside ``torch.compile`` so
+    prompt-length values do not specialize generator-block graphs.
+    """
+    if k.ndim != 4 or replicated_k.ndim != 4:
+        raise ValueError("Generated and replicated K/V must use [B, S, H, D] layout.")
+    if k.shape != v.shape:
+        raise ValueError(f"Generated k and v shapes must match, got {k.shape} and {v.shape}.")
+    if replicated_k.shape != replicated_v.shape:
+        raise ValueError(
+            "Replicated k and v shapes must match, got "
+            f"{replicated_k.shape} and {replicated_v.shape}."
+        )
+    if k.shape[0] != replicated_k.shape[0] or k.shape[2:] != replicated_k.shape[2:]:
+        raise ValueError(
+            "Generated and replicated K/V batch, head, and head-dim shapes must match, got "
+            f"{k.shape} and {replicated_k.shape}."
+        )
+    if k.device != replicated_k.device or k.dtype != replicated_k.dtype:
+        raise ValueError("Generated and replicated K/V must have the same device and dtype.")
+    if replicated_k_lengths.device.type != "cpu":
+        raise ValueError("Replicated K/V lengths must be cached on the CPU.")
+    if replicated_k_lengths.ndim != 1 or replicated_k_lengths.shape[0] != k.shape[0]:
+        raise ValueError(
+            f"Expected {k.shape[0]} replicated K/V lengths, got "
+            f"shape {tuple(replicated_k_lengths.shape)}."
+        )
+    if not 0 <= valid_generated_seq_len <= k.shape[1]:
+        raise ValueError(
+            "valid_generated_seq_len must be within the generated K/V sequence, got "
+            f"{valid_generated_seq_len} for length {k.shape[1]}."
+        )
+
+    total_context_len = replicated_k.shape[1]
+    context_end = total_context_len if context_end is None else context_end
+    if not 0 <= context_start <= context_end <= total_context_len:
+        raise ValueError(
+            f"Invalid replicated K/V slice [{context_start}, {context_end}) for "
+            f"length {total_context_len}."
+        )
+    replicated_k_lengths_host = replicated_k_lengths.tolist()
+    if any(not 0 <= int(length) <= total_context_len for length in replicated_k_lengths_host):
+        raise ValueError(
+            f"Replicated K/V lengths must be in [0, {total_context_len}], got "
+            f"{replicated_k_lengths_host}."
+        )
+    context_slice_len = context_end - context_start
+    valid_context_lens = [
+        min(max(int(length) - context_start, 0), context_slice_len)
+        for length in replicated_k_lengths_host
+    ]
+
+    if kwargs.get("key_padding_mask") is not None:
+        raise ValueError("Replicated K/V cannot be combined with an existing key_padding_mask.")
+    base_kwargs = dict(kwargs)
+    base_kwargs.pop("key_padding_mask", None)
+    runner = inner_backend.forward_with_lse if return_lse else inner_backend.forward
+    inner_layout = inner_backend.preferred_layout
+
+    def _to_inner_layout(
+        q_batch: torch.Tensor,
+        k_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if inner_layout == AttentionTensorLayout.HND:
+            return (
+                q_batch.transpose(1, 2),
+                k_batch.transpose(1, 2),
+                v_batch.transpose(1, 2),
+            )
+        return q_batch, k_batch, v_batch
+
+    def _call(
+        q_batch: torch.Tensor,
+        k_batch: torch.Tensor,
+        v_batch: torch.Tensor,
+        call_kwargs: dict[str, object],
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        q_batch, k_batch, v_batch = _to_inner_layout(q_batch, k_batch, v_batch)
+        call_kwargs.update(
+            {
+                "batch_size": q_batch.shape[0],
+                "seq_len": q.shape[1],
+                "seq_len_kv": k_batch.shape[2]
+                if inner_layout == AttentionTensorLayout.HND
+                else k_batch.shape[1],
+            }
+        )
+        return runner(q=q_batch, k=k_batch, v=v_batch, **call_kwargs)
+
+    if all(length == valid_context_lens[0] for length in valid_context_lens):
+        context_len = valid_context_lens[0]
+        k_all = torch.cat(
+            [
+                replicated_k[:, context_start : context_start + context_len],
+                k[:, :valid_generated_seq_len],
+            ],
+            dim=1,
+        )
+        v_all = torch.cat(
+            [
+                replicated_v[:, context_start : context_start + context_len],
+                v[:, :valid_generated_seq_len],
+            ],
+            dim=1,
+        )
+        return _call(q, k_all, v_all, base_kwargs)
+
+    outputs: list[torch.Tensor] = []
+    lses: list[torch.Tensor] = []
+    batch_size = q.shape[0]
+    for batch_idx, context_len in enumerate(valid_context_lens):
+        k_all = torch.cat(
+            [
+                replicated_k[
+                    batch_idx : batch_idx + 1,
+                    context_start : context_start + context_len,
+                ],
+                k[batch_idx : batch_idx + 1, :valid_generated_seq_len],
+            ],
+            dim=1,
+        )
+        v_all = torch.cat(
+            [
+                replicated_v[
+                    batch_idx : batch_idx + 1,
+                    context_start : context_start + context_len,
+                ],
+                v[batch_idx : batch_idx + 1, :valid_generated_seq_len],
+            ],
+            dim=1,
+        )
+        call_kwargs = {
+            key: value[batch_idx : batch_idx + 1]
+            if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == batch_size
+            else value
+            for key, value in base_kwargs.items()
+        }
+        result = _call(
+            q[batch_idx : batch_idx + 1],
+            k_all,
+            v_all,
+            call_kwargs,
+        )
+        if return_lse:
+            output, lse = result
+            outputs.append(output)
+            lses.append(lse)
+        else:
+            outputs.append(result)
+
+    output = torch.cat(outputs, dim=0)
+    if return_lse:
+        return output, torch.cat(lses, dim=0)
+    return output
+
+
+_replicated_kv_backend_ids = count()
+_replicated_kv_backends: WeakValueDictionary[int, AttentionBackend] = WeakValueDictionary()
+
+
+@torch.library.custom_op(
+    "trtllm::visual_gen_replicated_kv_attention",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor replicated_k, Tensor replicated_v, "
+        "Tensor replicated_k_lengths, int valid_generated_seq_len, int backend_id, "
+        "bool is_hnd, str[] tensor_kwarg_names, Tensor[] tensor_kwarg_values, "
+        "Dict(str, Any) scalar_kwargs) -> Tensor"
+    ),
+)
+def _compiled_attention_with_replicated_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replicated_k: torch.Tensor,
+    replicated_v: torch.Tensor,
+    replicated_k_lengths: torch.Tensor,
+    valid_generated_seq_len: int,
+    backend_id: int,
+    is_hnd: bool,
+    tensor_kwarg_names: list[str],
+    tensor_kwarg_values: list[torch.Tensor],
+    scalar_kwargs: dict[str, object],
+) -> torch.Tensor:
+    """Keep exact-prefix attention opaque without introducing a graph break.
+
+    The owning Ulysses wrapper keeps the selected backend alive. Weak references
+    avoid retaining unloaded models, and monotonic IDs cannot alias a new backend.
+    Tensor kwargs are explicit operator inputs so functionalization sees them.
+    """
+    kwargs = dict(scalar_kwargs)
+    kwargs.update(zip(tensor_kwarg_names, tensor_kwarg_values))
+    output = _run_attention_with_replicated_kv(
+        _replicated_kv_backends[backend_id],
+        q,
+        k,
+        v,
+        replicated_k,
+        replicated_v,
+        replicated_k_lengths,
+        valid_generated_seq_len,
+        kwargs,
+    )
+    # Hoist the existing _output_a2a normalization into the operator so its
+    # output strides do not depend on whether runtime text lengths are equal.
+    if is_hnd:
+        output = output.transpose(1, 2)
+    elif output.ndim == 3:
+        output = output.view(q.shape)
+    return output.contiguous()
+
+
+@_compiled_attention_with_replicated_kv.register_fake
+def _compiled_attention_with_replicated_kv_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    replicated_k: torch.Tensor,
+    replicated_v: torch.Tensor,
+    replicated_k_lengths: torch.Tensor,
+    valid_generated_seq_len: int,
+    backend_id: int,
+    is_hnd: bool,
+    tensor_kwarg_names: list[str],
+    tensor_kwarg_values: list[torch.Tensor],
+    scalar_kwargs: dict[str, object],
+) -> torch.Tensor:
+    return q.new_empty(q.shape)
 
 
 def post_permute_5d_to_4d(out_5d, P):
@@ -67,9 +346,9 @@ class UlyssesAttention(AttentionBackend):
 
     Wraps any attention backend with sequence parallelism via all-to-all.
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
-    Fully transparent to backend-specific kwargs: everything in ``**kwargs``
-    is forwarded to the inner backend unchanged (except ``seq_len`` which is
-    overridden with the post-all-to-all value).
+    Backend-specific kwargs are forwarded to the inner backend. Sequence
+    lengths are updated after all-to-all, and VSA gates are redistributed with
+    the same sequence/head mapping as Q before they are forwarded.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -98,12 +377,15 @@ class UlyssesAttention(AttentionBackend):
         self.inner_backend = inner_backend
         self.process_group = process_group
         self._preferred_layout = AttentionTensorLayout.NHD
+        self._replicated_kv_backend_id = next(_replicated_kv_backend_ids)
+        _replicated_kv_backends[self._replicated_kv_backend_id] = inner_backend
 
         self.head_dim = inner_backend.head_dim
         self.sharded_num_heads = inner_backend.num_heads
         self.sharded_num_kv_heads = getattr(inner_backend, "num_kv_heads", self.sharded_num_heads)
 
         self.world_size = torch.distributed.get_world_size(group=process_group)
+        self._ulysses_rank = torch.distributed.get_rank(group=process_group)
 
         self.num_heads = self.sharded_num_heads * self.world_size
         self.num_kv_heads = self.sharded_num_kv_heads * self.world_size
@@ -166,6 +448,8 @@ class UlyssesAttention(AttentionBackend):
         v: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if any(kwargs.get(key) is not None for key in _REPLICATED_KV_KWARGS):
+            raise ValueError("Replicated K/V is only supported by unfused Ulysses attention.")
         gate_compress = kwargs.pop("gate_compress", None)
         gate_fine = kwargs.pop("gate_fine", None)
 
@@ -209,6 +493,9 @@ class UlyssesAttention(AttentionBackend):
         # Q/K/V so they arrive at the inner backend in the same (full-S, sharded-H) layout.
         gate_compress = kwargs.pop("gate_compress", None)
         gate_fine = kwargs.pop("gate_fine", None)
+        replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len = (
+            _pop_replicated_kv(kwargs)
+        )
 
         batch_size = q.shape[0]
         q = all_to_all_4d(q, scatter_dim=2, gather_dim=1, process_group=self.process_group)
@@ -225,6 +512,81 @@ class UlyssesAttention(AttentionBackend):
 
         seq_len_full = q.shape[1]
         kv_seq_len_full = k.shape[1]
+
+        if replicated_k is not None:
+            head_start = self._ulysses_rank * self.sharded_num_kv_heads
+            head_end = head_start + self.sharded_num_kv_heads
+            if replicated_k.shape[2] != self.num_kv_heads:
+                raise ValueError(
+                    "Replicated K/V head count must match the pre-Ulysses head count, got "
+                    f"{replicated_k.shape[2]} and {self.num_kv_heads}."
+                )
+            replicated_k = replicated_k[:, :, head_start:head_end]
+            replicated_v = replicated_v[:, :, head_start:head_end]
+
+            if isinstance(self.inner_backend, Attention2DAttention):
+                kwargs.update(
+                    {
+                        "replicated_k": replicated_k,
+                        "replicated_v": replicated_v,
+                        "replicated_k_lengths": replicated_k_lengths,
+                        "global_generated_seq_len": global_generated_seq_len,
+                    }
+                )
+            elif replicated_k_lengths is None:
+                if not 0 <= global_generated_seq_len <= k.shape[1]:
+                    raise ValueError(
+                        "global_generated_seq_len must be within the generated K/V "
+                        f"sequence, got {global_generated_seq_len} for length {k.shape[1]}."
+                    )
+                k = torch.cat(
+                    [replicated_k, k[:, :global_generated_seq_len]],
+                    dim=1,
+                )
+                v = torch.cat(
+                    [replicated_v, v[:, :global_generated_seq_len]],
+                    dim=1,
+                )
+                kv_seq_len_full = k.shape[1]
+            elif torch.compiler.is_compiling():
+                tensor_kwargs = {
+                    key: value for key, value in kwargs.items() if torch.is_tensor(value)
+                }
+                scalar_kwargs = {
+                    key: value.value if isinstance(value, PredefinedAttentionMask) else value
+                    for key, value in kwargs.items()
+                    if not torch.is_tensor(value)
+                }
+                output = _compiled_attention_with_replicated_kv(
+                    q,
+                    k,
+                    v,
+                    replicated_k,
+                    replicated_v,
+                    replicated_k_lengths,
+                    global_generated_seq_len,
+                    self._replicated_kv_backend_id,
+                    self.inner_backend.preferred_layout == AttentionTensorLayout.HND,
+                    list(tensor_kwargs),
+                    list(tensor_kwargs.values()),
+                    scalar_kwargs,
+                )
+                return all_to_all_4d(
+                    output, scatter_dim=1, gather_dim=2, process_group=self.process_group
+                )
+            else:
+                output = _run_attention_with_replicated_kv(
+                    self.inner_backend,
+                    q,
+                    k,
+                    v,
+                    replicated_k,
+                    replicated_v,
+                    replicated_k_lengths,
+                    global_generated_seq_len,
+                    kwargs,
+                )
+                return self._output_a2a(output, batch_size, seq_len_full)
 
         if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
@@ -338,6 +700,23 @@ class UlyssesAttention(AttentionBackend):
         self._join_async()
         q_5d, k_5d, v_5d = recv["q"], recv["k"], recv["v"]
 
+        gate_compress = attn_kwargs.pop("gate_compress", None)
+        gate_fine = attn_kwargs.pop("gate_fine", None)
+        if gate_compress is not None:
+            gate_compress = all_to_all_4d(
+                gate_compress,
+                scatter_dim=2,
+                gather_dim=1,
+                process_group=self.process_group,
+            )
+        if gate_fine is not None:
+            gate_fine = all_to_all_4d(
+                gate_fine,
+                scatter_dim=2,
+                gather_dim=1,
+                process_group=self.process_group,
+            )
+
         # Fast path: one fused kernel replaces the eager post-A2A chain
         # (6 ops for HND target: permute+reshape+contig + transpose+contig
         # per Q/K/V; 3 ops for NHD target). bf16-only because the kernel is
@@ -363,8 +742,19 @@ class UlyssesAttention(AttentionBackend):
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()
 
+        if is_hnd:
+            if gate_compress is not None:
+                gate_compress = gate_compress.transpose(1, 2)
+            if gate_fine is not None:
+                gate_fine = gate_fine.transpose(1, 2)
+
+        attn_kwargs["batch_size"] = B
         attn_kwargs["seq_len"] = seq_len_full
         attn_kwargs["seq_len_kv"] = seq_len_kv_full
+        if gate_compress is not None:
+            attn_kwargs["gate_compress"] = gate_compress
+        if gate_fine is not None:
+            attn_kwargs["gate_fine"] = gate_fine
         output = self.inner_backend.forward(q=q_out, k=k_out, v=v_out, **attn_kwargs)
         return self._output_a2a(output, B, seq_len_full)
 
@@ -505,6 +895,7 @@ class Attention2DAttention(AttentionBackend):
 
         self.row_group_size = torch.distributed.get_world_size(group=row_process_group)
         self.col_group_size = torch.distributed.get_world_size(group=col_process_group)
+        self._column_rank = torch.distributed.get_rank(group=row_process_group)
         # Always NHD: all-gather kernels operate on [B, S/P, H, D]. Any HND conversion
         # needed by the inner backend is handled internally in forward.
         self._preferred_layout = AttentionTensorLayout.NHD
@@ -554,6 +945,9 @@ class Attention2DAttention(AttentionBackend):
         B, shard_seq_q, H_q, D = q.shape
         _, shard_seq_kv, H_kv, D_kv = k.shape
         attention_mask = kwargs.get("attention_mask", None)
+        replicated_k, replicated_v, replicated_k_lengths, global_generated_seq_len = (
+            _pop_replicated_kv(kwargs)
+        )
 
         if D_kv != D:
             raise ValueError(
@@ -612,13 +1006,74 @@ class Attention2DAttention(AttentionBackend):
             )
 
         seq_len = q.shape[1]
+        if replicated_k is not None:
+            # Each Attention2D column owns one disjoint text slice. The row
+            # reduction combines those partial attentions, so every text key
+            # participates exactly once without sequence-sharding the cache.
+            context_len = replicated_k.shape[1]
+            context_start = context_len * self._column_rank // self.row_group_size
+            context_end = context_len * (self._column_rank + 1) // self.row_group_size
 
-        if self._inner_layout == AttentionTensorLayout.HND:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+            # K/V were gathered over rows at fixed column. Their generated
+            # chunks correspond to CP ranks r * num_columns + column_rank.
+            valid_generated_seq_len = 0
+            for row_rank in range(self.col_group_size):
+                cp_rank = row_rank * self.row_group_size + self._column_rank
+                shard_start = cp_rank * shard_seq_kv
+                valid_generated_seq_len += min(
+                    max(global_generated_seq_len - shard_start, 0), shard_seq_kv
+                )
 
-        output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
+            if replicated_k_lengths is None:
+                k = torch.cat(
+                    [
+                        replicated_k[:, context_start:context_end],
+                        k[:, :valid_generated_seq_len],
+                    ],
+                    dim=1,
+                )
+                v = torch.cat(
+                    [
+                        replicated_v[:, context_start:context_end],
+                        v[:, :valid_generated_seq_len],
+                    ],
+                    dim=1,
+                )
+                kv_seq_len = k.shape[1]
+                if self._inner_layout == AttentionTensorLayout.HND:
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                kwargs.update(
+                    {
+                        "batch_size": B,
+                        "seq_len": seq_len,
+                        "seq_len_kv": kv_seq_len,
+                    }
+                )
+                output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
+            else:
+                output, lse = _run_attention_with_replicated_kv(
+                    self.inner_backend,
+                    q,
+                    k,
+                    v,
+                    replicated_k,
+                    replicated_v,
+                    replicated_k_lengths,
+                    valid_generated_seq_len,
+                    kwargs,
+                    context_start=context_start,
+                    context_end=context_end,
+                    return_lse=True,
+                )
+        else:
+            if self._inner_layout == AttentionTensorLayout.HND:
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+
+            output, lse = self.inner_backend.forward_with_lse(q=q, k=k, v=v, **kwargs)
 
         if self._inner_layout == AttentionTensorLayout.HND:
             output = output.transpose(1, 2).contiguous()

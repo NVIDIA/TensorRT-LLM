@@ -20,10 +20,13 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm._utils import ENABLE_MULTI_DEVICE, mpi_comm, mpi_disabled, print_all_stacks
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
 
 # 137 == 128 + SIGKILL(9): the exit code a shell reports for a SIGKILL'd process.
 _HARD_KILL_EXIT_CODE = 137
@@ -32,6 +35,8 @@ _HARD_KILL_EXIT_CODE = 137
 # whole world. Negative disables the kill entirely (escape hatch).
 RANK_CRASH_KILL_GRACE_ENV = "TLLM_RANK_CRASH_HARD_KILL_GRACE"
 _RANK_CRASH_KILL_GRACE_DEFAULT = 10.0
+
+_SYMMETRIC_CRASH_PROBE_POLL_S = 0.05
 
 
 def _best_effort_flush_streams() -> None:
@@ -59,7 +64,12 @@ def _best_effort_log_debug(message: str) -> None:
         pass
 
 
-def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
+def propagate_hard_kill(
+    exit_code: int = _HARD_KILL_EXIT_CODE,
+    *,
+    diagnostics: bool = True,
+    communicator: Optional["MPI.Comm"] = None,
+) -> None:
     """Hard-kill this rank and propagate the kill to peer ranks.
 
     Cross-rank propagation is the load-bearing part: a peer blocked in an NCCL
@@ -71,27 +81,43 @@ def propagate_hard_kill(exit_code: int = _HARD_KILL_EXIT_CODE) -> None:
     - Fallback: self-``SIGKILL``. The launcher (``mpirun`` propagates by default;
       ``srun`` needs ``--kill-on-bad-exit``) then tears down peers.
 
-    All flushing and logging is best-effort: a closed/broken stdout, stderr, or
-    logger must never prevent reaching ``MPI_Abort`` or ``os.kill``.
+    Diagnostic exceptions are ignored. Deadline-driven callers also disable
+    diagnostics so a blocked stream or logging lock cannot delay termination.
+
+    Args:
+        exit_code: Error code supplied to MPI when aborting the worker world.
+        diagnostics: Whether to flush streams and log before termination. Disable
+            for deadline-driven containment, which cannot wait for logging locks
+            or a blocked stream. Existing crash handling keeps its diagnostics.
+        communicator: An executor world captured by a caller before starting a
+            background thread. Defaults to the calling thread's MPI communicator.
     """
-    _best_effort_flush_streams()
+    if diagnostics:
+        _best_effort_flush_streams()
     try:
         if ENABLE_MULTI_DEVICE and not mpi_disabled():
             from mpi4py import MPI
 
-            if MPI.Is_initialized() and MPI.Query_thread() == MPI.THREAD_MULTIPLE:
-                _best_effort_log_error(
-                    "HangDetector: propagating hard-kill to all ranks via MPI_Abort."
-                )
-                mpi_comm().Abort(exit_code)
+            if (
+                MPI.Is_initialized()
+                and not MPI.Is_finalized()
+                and MPI.Query_thread() == MPI.THREAD_MULTIPLE
+            ):
+                if diagnostics:
+                    _best_effort_log_error(
+                        "HangDetector: propagating hard-kill to all ranks via MPI_Abort."
+                    )
+                (mpi_comm() if communicator is None else communicator).Abort(exit_code)
                 return  # not reached; Abort does not return
     except Exception as e:  # noqa: BLE001 - last-resort path must not raise
+        if diagnostics:
+            _best_effort_log_error(
+                f"HangDetector: MPI_Abort propagation failed ({e}); falling back to self-SIGKILL."
+            )
+    if diagnostics:
         _best_effort_log_error(
-            f"HangDetector: MPI_Abort propagation failed ({e}); falling back to self-SIGKILL."
+            "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
         )
-    _best_effort_log_error(
-        "HangDetector: self-SIGKILL; relying on the launcher to propagate to peer ranks."
-    )
     os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -160,6 +186,68 @@ def _wait_out_kill_grace(remaining: float, cancelled: Optional[threading.Event])
             time.sleep(remaining)
         return True
     return not cancelled.wait(remaining)
+
+
+def all_ranks_crashed(world_size: int, timeout: Optional[float] = None) -> bool:
+    """Best-effort probe: did EVERY rank crash out of the same phase?
+
+    A crashed rank cannot tell locally whether its peers are stranded in a
+    collective (the case the cross-rank hard kill exists for) or crashed the
+    same way (a symmetric failure -- a bad config, an OOM every rank hits).
+    This probe answers it: every rank that crashed posts a nonblocking
+    barrier, so the barrier completes within ``timeout`` if and only if all
+    ranks reached their crash handler. A stranded peer never posts, the
+    probe times out, and the caller arms the kill exactly as before.
+
+    Returns True only on a proven symmetric crash. Every uncertain state --
+    single rank, MPI unavailable or not thread-safe to call from here, a
+    communicator that does not span ``world_size``, the hard kill disabled, a
+    probe error, a timeout -- returns False, so the failure mode of the probe
+    itself is "kill as before", never "leave stranded peers unkilled".
+
+    On timeout the barrier request is left outstanding: the caller is about
+    to arm the hard kill, and the world it would desynchronize is being torn
+    down.
+
+    ``timeout`` defaults to half the crash-kill grace, so a False verdict
+    still leaves the grace's error-reporting window mostly intact.
+    """
+    try:
+        if world_size <= 1:
+            return False
+        if not ENABLE_MULTI_DEVICE or mpi_disabled():
+            return False
+        from mpi4py import MPI
+
+        if not MPI.Is_initialized() or MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+            return False
+        comm = mpi_comm()
+        if comm.Get_size() != world_size:
+            # Peers outside this communicator (e.g. DWDP ranks counted via
+            # COMM_WORLD) cannot be probed here; stay on the kill path.
+            return False
+        grace = _rank_crash_kill_grace()
+        if grace is None:
+            # The hard kill is disabled, so no kill follows a False verdict to
+            # tear the world down. Posting Ibarrier here would leave it
+            # outstanding in a surviving world (start_rank_crash_kill_watchdog
+            # likewise declines), desynchronizing later collectives -- so skip
+            # the probe entirely and stay on the (disabled) kill path.
+            return False
+        if timeout is None:
+            timeout = grace / 2.0
+        request = comm.Ibarrier()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if request.Test():
+                return True
+            time.sleep(_SYMMETRIC_CRASH_PROBE_POLL_S)
+        return False
+    except Exception as e:  # noqa: BLE001 - probe must fail toward the kill
+        _best_effort_log_error(
+            f"all_ranks_crashed probe failed (treating crash as asymmetric): {e!r}"
+        )
+        return False
 
 
 def hard_kill_on_rank_crash(
@@ -328,17 +416,35 @@ def start_rank_crash_kill_watchdog(
 class HangDetector:
     """Watchdog that fires when the executor loop stops checkpointing.
 
-    When ``timeout`` seconds pass without a ``checkpoint()``, all thread stacks
-    are dumped for diagnosis and ``on_detected`` runs (the hard-kill +
-    cross-rank propagation path).
+    Contract:
+
+    - ``timeout`` seconds without a ``checkpoint()`` dumps all thread stacks for
+      diagnosis and runs ``on_detected`` (the hard-kill + cross-rank
+      propagation path).
+    - Continued checkpointing never fires it. A false positive hard-kills a
+      healthy job, so this bound is as load-bearing as detection itself.
+    - ``start()`` leaves detection disarmed; the first ``checkpoint()`` arms it,
+      so the start-to-first-checkpoint window is not hang-eligible.
+    - ``pause()`` suppresses detection in scope and re-arms on exit. It does
+      not nest: leaving an inner ``pause()`` re-arms while an outer one is
+      still open.
+    - Detection never stops while active: not after firing, and not if
+      ``on_detected`` raises an ``Exception``. ``on_detected`` is not
+      idempotent, so a single lapse invokes it once.
+    - ``checkpoint()`` is one clock read and one float store, and does no
+      cross-thread work. The executor loop calls it three times per iteration.
     """
 
     def __init__(
-        self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
-    ):
+        self,
+        timeout: Optional[int] = None,
+        on_detected: Optional[Callable[[], None]] = None,
+        report_context: Optional[str] = None,
+    ) -> None:
         self.timeout = timeout if timeout is not None else 300
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
+        self.report_context = report_context
         self.task = None
         self.loop = None
         self.loop_thread = None
@@ -346,6 +452,9 @@ class HangDetector:
         self.active = False
         self._detected = False
         self._status_providers: list[Callable[[], str]] = []
+        # Monotonic stamp the watcher compares against; ``inf`` means disarmed.
+        # A plain float store is the entire cost of ``checkpoint()``.
+        self._deadline = math.inf
 
     def start(self):
         """Enable hang detection."""
@@ -354,24 +463,98 @@ class HangDetector:
             asyncio.set_event_loop(self.loop)
             self.loop.run_forever()
 
-        self.active = True
+        with self.lock:
+            # Locked, not a bare check: concurrent callers could both observe
+            # ``active`` false and schedule a watcher, and watchers share
+            # ``_deadline``, so a second one reports the same lapse twice and
+            # propagates two hard kills.
+            if self.active:
+                _best_effort_log_error(
+                    "HangDetector.start() called while already active; ignoring."
+                )
+                return
+            # Disarmed until the first checkpoint so startup does not lapse.
+            # Stored before ``active`` is published so a checkpoint racing this
+            # call cannot have its arm overwritten here.
+            self._deadline = math.inf
+            self.active = True
+
         self.loop = asyncio.new_event_loop()
         self.loop_thread = threading.Thread(target=run_loop, daemon=True, name="hang_detector_loop")
         self.loop_thread.start()
+        # One long-lived watcher, scheduled once; the hot path only moves
+        # ``_deadline``.
+        self.task = asyncio.run_coroutine_threadsafe(self._watch(), self.loop)
 
     def register_status_provider(self, provider: Callable[[], str]) -> None:
         """Register a nonblocking callable that returns status to dump on hang detection."""
         with self.lock:
             self._status_providers.append(provider)
 
-    async def _detect_hang(self) -> None:
-        await asyncio.sleep(self.timeout)
+    async def _watch(self) -> None:
+        """Sleep until the deadline lapses, report, and keep watching.
+
+        Waking early is normal: ``checkpoint()`` pushes ``_deadline`` forward
+        without touching this task, so each wake-up either finds time left and
+        sleeps again, or finds the deadline passed and reports. Every sleep is
+        clamped to ``timeout`` because ``checkpoint()`` only stores a float and
+        never wakes this loop, so an unclamped sleep would not notice a later
+        arm.
+
+        This task never writes ``_deadline``; the lapse it last reported is
+        watcher-local.
+
+        This task outlives a report, and outlives a report that raises. A
+        watchdog that quietly stopped watching would be the exact failure it
+        exists to catch, and ``on_detected`` is the cross-rank hard kill, which
+        can itself fail on an already-degraded job.
+        """
+        # The deadline whose lapse already ran ``on_detected``. Compared by
+        # identity, not equality: ``checkpoint()`` publishes a fresh float, so a
+        # re-arm that lands on the same value still reports.
+        reported = None
+        while self.active:
+            # Clock first: a checkpoint can land between these two reads, and
+            # whichever is read first is the stale one. A stale deadline fires
+            # at work that was checkpointed in time; a stale clock only defers.
+            now = time.monotonic()
+            deadline = self._deadline
+            remaining = deadline - now
+            if remaining > 0:
+                await asyncio.sleep(min(remaining, self.timeout))
+                continue
+            if deadline is reported:
+                # ``on_detected`` is not idempotent, so one lapse runs it once.
+                # Nothing wakes this loop, so poll for the next arm.
+                await asyncio.sleep(self.timeout)
+                continue
+            reported = deadline
+            try:
+                await self._report_hang()
+            except Exception as error:  # noqa: BLE001 - the watcher must survive
+                _best_effort_log_error(
+                    f"HangDetector: reporting failed with {type(error).__name__}: {error}"
+                )
+
+    async def _report_hang(self) -> None:
         with self.lock:
             status_providers = tuple(self._status_providers)
 
         # All diagnostics are best-effort: nothing may prevent on_detected()
         # (hard-kill propagation) from firing.
-        _best_effort_log_error(f"Hang detected after {self.timeout} seconds.")
+        if self.report_context is None:
+            report_message = f"Hang detected after {self.timeout} seconds."
+        else:
+            report_message = (
+                f"{self.report_context}: no checkpoint for {self.timeout} seconds; "
+                "dumping all thread stacks."
+            )
+        _best_effort_log_error(report_message)
+        try:
+            print_all_stacks()
+        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
+            pass
+
         for provider in status_providers:
             try:
                 status = provider()
@@ -381,10 +564,6 @@ class HangDetector:
                 _best_effort_log_error(
                     f"HangDetector: status provider failed with {type(error).__name__}: {error}"
                 )
-        try:
-            print_all_stacks()
-        except Exception:  # noqa: BLE001 - stack dump must not block hard kill
-            pass
 
         # Set _detected last so observers (and tests) see it only once
         # diagnostics are done and on_detected is about to fire.
@@ -399,21 +578,28 @@ class HangDetector:
 
     def checkpoint(self):
         """Reset hang detection timer."""
-        self.cancel_task()
         if self.active:
-            self.task = asyncio.run_coroutine_threadsafe(self._detect_hang(), self.loop)
+            self._deadline = time.monotonic() + self.timeout
 
-    def cancel_task(self):
-        """Cancel the hang detection task."""
-        if self.task is not None and not self.task.done():
-            self.task.cancel()
-            self.task = None
+    def disarm(self) -> None:
+        """Disarm hang detection until the next checkpoint."""
+        self._deadline = math.inf
+
+    def cancel_task(self) -> None:
+        """Compatibility alias for :meth:`disarm`.
+
+        The watcher is long-lived and has no task to cancel, but the old name is
+        load-bearing for the cache-transceiver precheck and its SLURM example.
+        Delegating rather than aliasing keeps a subclass override of ``disarm``
+        effective through this name.
+        """
+        self.disarm()
 
     @contextmanager
     def pause(self):
         """Pause hang detection in scope."""
+        self.disarm()
         try:
-            self.cancel_task()
             yield
         finally:
             self.checkpoint()
@@ -421,7 +607,7 @@ class HangDetector:
     def stop(self):
         """Stop hang detection."""
         self.active = False
-        self.cancel_task()
+        self.disarm()
         if self.loop is not None:
             # Cancel all pending tasks before stopping the loop
             def cancel_all_tasks():

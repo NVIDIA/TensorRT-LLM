@@ -47,6 +47,32 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+// >>> BOLT profile-bundle overlay -- ships INERT (dead code) >>>
+// Master gate. While false (the default, i.e. the scaffolding PR), buildImage
+// behaves EXACTLY as before: the raw build is published straight to the canonical
+// tag and NONE of the overlay code runs. The follow-up "enable BOLT" PR flips this
+// on (defaultValue below and/or the release/nightly trigger passing it true).
+BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "false").toString() == "true"
+// When enabled, a missing/empty bundle is FATAL rather than silently shipping a
+// profile-less canonical image (the contract: a canonical image, if produced,
+// carries profiles). Left false until the enable PR wires it true for the
+// release/nightly path; premerge/new-branch stays lenient (retag plain build).
+BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// Separate from the two above: those govern the profile BUNDLE baked in as a
+// thin layer (Dockerfile.bolt), which documents how to reproduce a BOLTed build
+// but does NOT optimize the binaries the image actually installs. This one
+// governs the INSTALLED wheel -- when true, the wheel unpacked from the build
+// tarball is BOLT-optimized in the image build, before the release stage pip
+// installs it. Kept independent so it can be rolled back on its own.
+BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
+// The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
+// because overlayBoltBundle runs well below the scope globalVars is passed into.
+// Empty means unpinned, i.e. take whatever `latest` is.
+BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
+// <<< BOLT profile-bundle overlay <<<
+
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
@@ -67,12 +93,22 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
 ]
 
 @Field
@@ -252,14 +288,48 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
-        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
-        return ""
-    }
+    // Whether THIS image has to ship a BOLT-optimized wheel. Answered before the
+    // gates below, and deliberately not subject to them.
+    //
+    // Optimizing the installed wheel is only possible on this path: the wheel is
+    // BOLTed by get_wheel_from_package.py as it is unpacked from the build
+    // tarball, so an image that compiles its own wheel in-container has nothing
+    // to optimize. That makes the two gates below load-bearing for BOLT, and
+    // both are unreliable for reasons that have nothing to do with BOLT:
+    //
+    //   useWheelFromBuildStage -- a kill switch added for nvbug 5433581 in Aug
+    //       2025 and never reverted. It was also read without being declared, so
+    //       it was not merely false but incapable of being true.
+    //   triggerType -- read from env and not a declared parameter of this job,
+    //       so whether it survives the launch is a property of job registration
+    //       rather than of this repo. When it does not, TRIGGER_TYPE is "manual"
+    //       and this returns early no matter what the caller asked for.
+    //
+    // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
+    // off it and let a BOLT request carry itself past both gates. The bypass is
+    // deliberately narrow -- one arch, one dockerfile stage, only when BOLT was
+    // asked for -- so the nvbug's blast radius stays at the SBSA release image
+    // instead of being reopened for every image this job builds.
+    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && dockerfileStage == "release"
 
-    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
-        echo "Trigger type does not use the build stage wheel"
-        return ""
+    if (!boltWheelRequired) {
+        if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+            echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
+            return ""
+        }
+
+        if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+            echo "Trigger type does not use the build stage wheel"
+            return ""
+        }
+    } else if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE ||
+               !(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        // Say so rather than doing it quietly: this is the one place the image
+        // build departs from what its parameters literally asked for.
+        echo "[BOLT] boltOptimizeWheel is set for the ${arch} release image, so the " +
+             "build-stage wheel path runs even though useWheelFromBuildStage=" +
+             "${ENABLE_USE_WHEEL_FROM_BUILD_STAGE} and triggerType=${TRIGGER_TYPE} would " +
+             "otherwise skip it. Optimizing the installed wheel is not possible any other way."
     }
 
     if (!dockerfileStage || !arch) {
@@ -273,8 +343,171 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path " + env.uploadPath
+    // UPLOAD_PATH, not env.uploadPath: they agree whenever the parent passed the
+    // parameter, but an unset env leaves the raw reference interpolating to
+    // "null" and the download then polls .../null/<tarball> until it times out.
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path ${UPLOAD_PATH}"
+
+    // Only aarch64 has a promoted profile bundle, so only the SBSA image has
+    // anything to apply; x86 installs the wheel as built.
+    if (BOLT_OPTIMIZE_WHEEL && arch == "sbsa") {
+        // The branch whose promoted bundle to apply, resolved the same way the
+        // image overlay resolves it: an explicit override, else this build's own
+        // branch, else main. Deliberately NOT this run's own profiles -- those
+        // are not published until BoltProfileGen finishes, hours after this
+        // build starts, and waiting on them would serialize every release
+        // behind a multi-hour GPU job. get_wheel_from_package.py tries these in
+        // order and fails if none has a bundle.
+        def branches = [params.boltProfileBranch, LLM_BRANCH, "main"]
+            .collect { it?.toString()?.trim() }
+            .findAll { it }
+            .unique()
+        // Pinned, the candidate list collapses to the branch the pin came from:
+        // the ref names one immutable bundle under one promote directory, so
+        // falling through to another branch would optimize the image's wheel
+        // with different profiles than the release wheel and the tested build.
+        if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+            branches = [BOLT_PINNED_BRANCH]
+            wheelArgs += " --bolt-profile-ref ${BOLT_PINNED_REF}"
+            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+        }
+        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
+        wheelArgs += " --bolt-branch ${branches.join(',')}"
+    }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
+// Whether a docker build that failed WITH the downloaded-wheel args may be
+// retried without them. The retry rebuilds the wheel from source in-container,
+// which is a fine recovery for an ordinary build but silently defeats the point
+// when that build was also responsible for optimizing the wheel -- the retry
+// would produce an unoptimized release image that looks identical.
+def mayRetryWithoutBuildStageWheel(arch) {
+    return !(BOLT_OPTIMIZE_WHEEL && arch == "sbsa")
+}
+
+// Produce each CANONICAL image from its raw `-noprofiles` build by
+// overlaying the merged LLVM BOLT profile bundle as a thin layer (docker/
+// Dockerfile.bolt via the docker/Makefile `bolt_overlay` target). Canonical is
+// written ONLY here, so a profile-less image can never masquerade as canonical.
+// Called from buildImage AFTER the raw build+push and BEFORE the pipeline's nspect
+// scan/register stage, so the scanned+registered artifact already carries the
+// bundle (no republish of an already-released image).
+//
+// `pairs` is a list of [raw: <-noprofiles tag>, canon: <canonical tag>]. Per pair:
+//   - bundle present  -> overlay raw -> canon (canonical carries profiles)
+//   - no bundle + BOLT_PROFILES_REQUIRED -> FATAL: refuse to publish a profile-less
+//       canonical (enforces the contract; no silent profile-less release)
+//   - no bundle + not required (pre-enable / BOLT off) -> retag raw -> canon so a
+//       canonical still exists (expected: profiles not required yet)
+//
+// The bundle is arch-specific (only aarch64-linux-gnu today) but baked into every
+// variant by design -- on x86 the files are inert until an x86/merged bundle
+// exists. Fetched via anonymous curl (artifactory.sh pull-latest) WITH RETRIES, so
+// a transient miss isn't mistaken for "no bundle".
+def overlayBoltBundle(pairs, arch, action) {
+    if (!pairs) { return }
+    def triple = "aarch64-linux-gnu"
+    def llmAbs = sh(script: "cd ${LLM_ROOT} && pwd", returnStdout: true).trim()
+    def ctxDir = "${llmAbs}/bolt_overlay_ctx"
+    def bundleSub = "bolt_bundle"
+    def push = (action == "push") ? "1" : "0"
+
+    // Which branch's promoted bundle to consume. The BuildDockerImages helper job is
+    // branch-agnostic; the branch is a RUNTIME value, resolved in order:
+    //   1) boltProfileBranch param -- explicit override; the parent (which has the
+    //      full git context) may pass the MR target branch here;
+    //   2) LLM_BRANCH -- the build's own branch (already correct via params.branch);
+    //      has a promoted bundle for main/release, or a dev branch that gen-promoted
+    //      to itself;
+    //   3) "main" -- mainline fallback, so a dev/PR branch with NO bundle of its own
+    //      still gets profiles.
+    // Profiles are host-layout-stable + .yaml (function-name-keyed, -infer-stale), so
+    // consuming a nearby branch's bundle is valid; the bolt-profiles-ref LABEL records
+    // exactly which commit's profiles were baked in.
+    def candidates = [params.boltProfileBranch, LLM_BRANCH, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+
+    // 1) Try each candidate branch in order (with retries per branch so a transient
+    //    network/Artifactory blip isn't misread as "no bundle"). Verify non-empty
+    //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
+    def haveBundle = false
+    def branch = null
+    // The overlay is a consumer like any other, so it takes the pipeline's pin
+    // rather than resolving `latest` when it happens to run. Without this the
+    // released image could carry a profile bundle that no other artifact in the
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+    }
+    for (cand in candidates) {
+        for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
+            def rc = sh(script: """
+                rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
+                cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
+            """, returnStatus: true)
+            if (rc == 0) {
+                def ok = sh(script: """
+                    test -f ${ctxDir}/${bundleSub}/manifest.json && \
+                    test -n "\$(find ${ctxDir}/${bundleSub} -type f \\( -name '*.yaml' -o -name '*.fdata' \\) 2>/dev/null | head -1)"
+                """, returnStatus: true)
+                if (ok == 0) { haveBundle = true; branch = cand; break }
+                echo "[BOLT] bundle for ${cand}/${triple} pulled but empty/invalid (attempt ${attempt})"
+            } else {
+                echo "[BOLT] pull-latest ${cand}/${triple} failed (attempt ${attempt}, rc=${rc})"
+            }
+        }
+        if (haveBundle) { break }
+        echo "[BOLT] no usable bundle for ${cand}/${triple}; trying next candidate branch"
+    }
+
+    // 2) No usable bundle from ANY candidate: fail-closed when required, else retag
+    //    raw -> canonical (so a canonical image still exists; expected pre-enable /
+    //    when BOLT off / dev-PR with no promoted profiles anywhere).
+    if (!haveBundle) {
+        def tried = candidates.join(", ")
+        if (BOLT_PROFILES_REQUIRED) {
+            error("[BOLT] required profile bundle missing for ${triple} (tried branches: ${tried}) -- refusing to publish a profile-less canonical image " +
+                  "(promote a bundle via BoltProfileGen, or set boltProfilesRequired=false to allow a plain canonical)")
+        }
+        echo "[BOLT] no bundle for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        pairs.each { p ->
+            stage ("BOLT retag (no bundle) (${arch}): ${p.canon}") {
+                def retagCmd = "docker tag ${p.raw} ${p.canon}"
+                if (push == "1") { retagCmd += " && docker push ${p.canon}" }
+                trtllm_utils.llmExecStepWithRetry(this, script: retagCmd, numRetries: 3)
+            }
+        }
+        return
+    }
+    echo "[BOLT] using promoted bundle from ${branch}/${triple} for overlay"
+
+    // 3) Provenance: record the bundle's source ref (manifest.json). python3 may be
+    //    absent on the build pod -> fall back to "unknown".
+    def ref = sh(
+        script: "cd ${ctxDir}/${bundleSub} && (python3 -c \"import json;print(json.load(open('manifest.json'))['ref'])\" 2>/dev/null || echo unknown)",
+        returnStdout: true).trim()
+
+    // 4) Overlay each raw image into its CANONICAL tag (canonical carries profiles).
+    pairs.each { p ->
+        stage ("BOLT overlay (${arch}): ${p.canon}") {
+            trtllm_utils.llmExecStepWithRetry(this, script: """
+            cd ${LLM_ROOT} && make -C docker bolt_overlay \
+                BOLT_BASE_IMAGE=${p.raw} \
+                BOLT_OUTPUT_IMAGE=${p.canon} \
+                BOLT_CTX_DIR=${ctxDir} \
+                BOLT_BUNDLE_DIR=${bundleSub} \
+                BOLT_PROFILES_REF=${ref} \
+                BOLT_PUSH=${push}
+            """, numRetries: 3)
+        }
+    }
 }
 
 def buildImage(config, imageKeyToTag, versionOverride)
@@ -402,6 +635,16 @@ def buildImage(config, imageKeyToTag, versionOverride)
         BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
         TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
+        // Gated by BOLT_OVERLAY_ENABLED: when the overlay is enabled the
+        // raw build is published to <tag>-noprofiles and the CANONICAL <tag> is
+        // produced ONLY by the overlay (below), so a profile-less image can never
+        // masquerade as canonical. When disabled (default), the suffix is empty ->
+        // raw == canonical -> byte-for-byte the pre-BOLT behavior (dead code).
+        def noprofilesSuffix = BOLT_OVERLAY_ENABLED ? "-noprofiles" : ""
+        def rawImageTag = "${imageWithTag}${noprofilesSuffix}"
+        def rawDependentTag = "${dependentImageWithTag}${noprofilesSuffix}"
+        def rawCustomTag = "${customImageWithTag}${noprofilesSuffix}"
+
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
                 def randomSleep = (Math.random() * 600 + 600).toInteger()
@@ -411,11 +654,11 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${dependentImageWithTag} \
+                IMAGE_WITH_TAG=${rawDependentTag} \
                 STAGE=${dependent.dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-                args += " DEVEL_IMAGE=${dependentImageWithTag}"
+                args += " DEVEL_IMAGE=${rawDependentTag}"
                 if (target == "ngc-release") {
                     imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
                 }
@@ -441,7 +684,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -451,6 +694,11 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 if (buildWheelArgs.trim().isEmpty()) {
                     throw ex
                 }
+                if (!mayRetryWithoutBuildStageWheel(arch)) {
+                    echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
+                         "NOT retrying from source (that would publish an unoptimized release image)"
+                    throw ex
+                }
                 echo "Build failed with wheel arguments, retrying without them"
                 buildWheelArgs = ""
                 trtllm_utils.llmExecStepWithRetry(this, script: """
@@ -458,7 +706,7 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${imageWithTag} \
+                IMAGE_WITH_TAG=${rawImageTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
@@ -475,11 +723,33 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 BASE_IMAGE=${BASE_IMAGE} \
                 TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${customImageWithTag} \
+                IMAGE_WITH_TAG=${rawCustomTag} \
                 STAGE=${dockerfileStage} \
                 BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
                 """
             }
+        }
+
+        // Gated: produce the CANONICAL tag(s) from the raw -noprofiles
+        // build by overlaying the BOLT profile bundle. When BOLT_OVERLAY_ENABLED is
+        // false this whole block is skipped and the raw build above already IS the
+        // canonical image (rawImageTag == imageWithTag) -- i.e. inert dead code.
+        // When enabled, canonical is written EXCLUSIVELY here, so it always carries
+        // profiles (or, when required and no bundle exists, the build fails rather
+        // than silently shipping a profile-less canonical). Runs inside the
+        // docker-login scope and before the pipeline's nspect stage.
+        //
+        // Applied to EVERY image variant this job builds (NGC devel/release,
+        // internal release, and all CI/OS-variant images) by DESIGN -- deliberately
+        // not scoped, to avoid maintaining an allowlist. On images with no BOLT
+        // consumer the bundle is just an inert extra layer. If that proves
+        // undesirable, add a per-config opt-out here (e.g. a `boltOverlay` field on
+        // buildConfigs) rather than special-casing targets.
+        if (BOLT_OVERLAY_ENABLED) {
+            def boltPairs = [[raw: rawImageTag, canon: imageWithTag]]
+            if (dependent) { boltPairs.add([raw: rawDependentTag, canon: dependentImageWithTag]) }
+            if (customTag) { boltPairs.add([raw: rawCustomTag, canon: customImageWithTag]) }
+            overlayBoltBundle(boltPairs, arch, action)
         }
     }
 }
@@ -487,6 +757,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -600,7 +872,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageSBSAUbuntu, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
@@ -691,6 +963,31 @@ pipeline {
             defaultValue: true,
             description: "Build NGC devel and release images (x86_64 and SBSA)"
         )
+        booleanParam(
+            name: "boltOverlayEnabled",
+            defaultValue: false,
+            description: "Publish the raw build as <tag>-noprofiles and produce the canonical <tag> by overlaying the merged BOLT profile bundle. While false (the default), images are built exactly as before and none of the overlay code runs."
+        )
+        booleanParam(
+            name: "boltProfilesRequired",
+            defaultValue: false,
+            description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
+        )
+        booleanParam(
+            name: "useWheelFromBuildStage",
+            defaultValue: false,
+            description: "Install the wheel from the build-stage tarball instead of compiling one inside the image. Read since Aug 2025 but never DECLARED, so params.useWheelFromBuildStage was always null and prepareWheelFromBuildStage() returned early on every run -- see nvbug 5433581, whose temporary kill switch was never reverted. Declared here so the flag is at least capable of being set; it stays false by default, and nothing turns it on. boltOptimizeWheel does NOT depend on it: a BOLT request carries itself past this gate for the SBSA release image only."
+        )
+        booleanParam(
+            name: "boltOptimizeWheel",
+            defaultValue: false,
+            description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
+        )
+        string(
+            name: "boltProfileBranch",
+            defaultValue: "",
+            description: "Branch whose promoted BOLT bundle the overlay should consume. Empty -> resolve automatically: try the build branch (LLM_BRANCH), then fall back to main. Set explicitly (e.g. the MR target branch, passed by the parent) to consume a specific branch's profiles. Only used when boltOverlayEnabled is true."
+        )
     }
     options {
         // Check the valid options at: https://www.jenkins.io/doc/book/pipeline/syntax/
@@ -703,6 +1000,10 @@ pipeline {
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        // Picked up by docker/Makefile and handed to `docker buildx build` as a
+        // BuildKit secret, which authenticates the github.com clones inside the
+        // image build (docker/common/github_auth.sh).
+        GITHUB_CLONE_TOKEN = credentials('github_read_public_only_token')
     }
     stages {
         stage("Setup Environment") {
@@ -848,7 +1149,7 @@ pipeline {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
                             def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
                             def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
                             if (override_commit) {
@@ -867,6 +1168,9 @@ pipeline {
                                 """
                             if (params.register_images) {
                                 cmd += "--add_version "
+                                if (params.release_type_id) {
+                                    cmd += "--release_type_id ${params.release_type_id} "
+                                }
                             }
                             if (params.osrb_ticket) {
                                 cmd += "--osrb_ticket ${params.osrb_ticket} "

@@ -72,10 +72,6 @@ PROMPT_BLOCKS = 2
 CHURN_REQUESTS = 100
 
 
-@unittest.skipUnless(
-    kv_test.KV_CACHE_MANAGER_V2_BACKEND == "cpp",
-    "the Python backend carries its own copy of this logic and is not fixed yet",
-)
 class TestNvBug6625710(unittest.TestCase):
     """Evicting an unheld SSM snapshot must not detach a still-referenced block."""
 
@@ -152,7 +148,7 @@ class TestNvBug6625710(unittest.TestCase):
         # the attention pages were evicted too, which is not the case under test.
         probe = self.manager.create_kv_cache(input_tokens=list(prompt))
         reusable = probe.num_committed_tokens
-        attn_only = probe._get_num_tokens_before_hybrid_pruning()
+        attn_only = probe._get_num_reusable_tokens_before_hybrid_pruning()
         probe.close()
         self.assertLess(
             reusable,

@@ -39,7 +39,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 
 from ..llm_request import LlmRequest
 from .ops.vanilla import Fusions, occurrence_penalized_logits
-from .sampler_common import _get_max_beam_width, _unwrap_singleton
+from .sampler_common import _get_max_beam_width
 
 __all__ = [
     "PenaltyHandler",
@@ -55,9 +55,9 @@ __all__ = [
 
 def has_occurrence_penalty(request: LlmRequest) -> bool:
     sampling_config = request.sampling_config
-    repetition = _unwrap_singleton(sampling_config.repetition_penalty)
-    presence = _unwrap_singleton(sampling_config.presence_penalty)
-    frequency = _unwrap_singleton(sampling_config.frequency_penalty)
+    repetition = sampling_config.repetition_penalty
+    presence = sampling_config.presence_penalty
+    frequency = sampling_config.frequency_penalty
     return (
         (repetition is not None and repetition != 1.0)
         or (presence is not None and presence != 0.0)
@@ -244,8 +244,8 @@ class PenaltyHandler:
     force a logit to -inf (min_length, bad words, no-repeat-ngram) are a different
     kind of transform and live in ``TokenBanHandler``.
 
-    The implementation follows the C++ ``batchApplyPenalty`` kernel
-    (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as driven by ``PenaltyLayer``.
+    The implementation follows the semantics of the former C++
+    ``batchApplyPenalty`` kernel as driven by ``PenaltyLayer``.
     Its persistent device state lives in :class:`PenaltyStore`, which documents the
     workspace semantics. Per-slot parameter buffers are filled once per request,
     batched across all requests admitted in a step (``prepare_for_new_request``
@@ -313,10 +313,10 @@ class PenaltyHandler:
             return
 
         sampling_config = request.sampling_config
-        repetition = _unwrap_singleton(sampling_config.repetition_penalty)
-        presence = _unwrap_singleton(sampling_config.presence_penalty)
-        frequency = _unwrap_singleton(sampling_config.frequency_penalty)
-        prompt_ignore_length = _unwrap_singleton(sampling_config.prompt_ignore_length)
+        repetition = sampling_config.repetition_penalty
+        presence = sampling_config.presence_penalty
+        frequency = sampling_config.frequency_penalty
+        prompt_ignore_length = sampling_config.prompt_ignore_length
         # min(prompt_ignore_length, inputLen), matching the C++ kernel.
         prompt_ignore_length = min(
             prompt_ignore_length if prompt_ignore_length is not None else 0,

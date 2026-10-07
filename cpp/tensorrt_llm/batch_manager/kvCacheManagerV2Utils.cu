@@ -169,17 +169,17 @@ CUresult launchBatchedCopy(bool lowBandwidth, std::vector<MMTask> const& tasks, 
     }
 }
 
-CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyHostToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
-CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDeviceToHost(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(true, tasks, numBytes, stream);
 }
 
-CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+CUresult copyDeviceToDevice(std::vector<MMTask> const& tasks, ssize_t numBytes, CUstream stream)
 {
     return launchBatchedCopy(false, tasks, numBytes, stream);
 }

@@ -244,8 +244,13 @@ class VmmBounceTransport(BounceTransport):
         neighboring slot."""
         total = 0
         has_state_group = False
-        for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups):
-            if int(block_ids.size) == 0:
+        # Block tables are positional with -1 holes (see Chunk); only the
+        # slots the receiver actually accepts are written into the region.
+        valid_counts = [
+            int((block_ids >= 0).sum()) for block_ids in recv_req.block_ids_per_layer_groups
+        ]
+        for g, n_valid in enumerate(valid_counts):
+            if n_valid == 0:
                 continue
             if g >= len(self._block_bytes_per_group):
                 return self._skip_bounce(
@@ -257,7 +262,7 @@ class VmmBounceTransport(BounceTransport):
                 # its size is accounted for by extra_bytes below, not per-block math.
                 has_state_group = True
                 continue
-            total += int(block_ids.size) * self._block_bytes_per_group[g]
+            total += n_valid * self._block_bytes_per_group[g]
         if has_state_group and num_writers > 1:
             # Fan-in with recurrent-state groups is unsafe: each writer may
             # append its own state fragments (different PP stages hold different
@@ -286,7 +291,7 @@ class VmmBounceTransport(BounceTransport):
         # TODO(TRTLLM-15194): investigate whether the byte-only gate is
         # safe (or better) for plain-KV payloads too, so this special case can be removed and
         # both payload kinds share one gate.
-        nblocks = sum(int(a.size) for a in recv_req.block_ids_per_layer_groups)
+        nblocks = sum(valid_counts)
         if extra_bytes > 0:
             if total < self._min_bytes:
                 return self._skip_bounce(
@@ -313,8 +318,8 @@ class VmmBounceTransport(BounceTransport):
             # Exclude None entries (STATE groups) — they are already guarded above.
             present_slot_bytes = {
                 self._block_bytes_per_group[g]
-                for g, block_ids in enumerate(recv_req.block_ids_per_layer_groups)
-                if int(block_ids.size) > 0 and self._block_bytes_per_group[g]
+                for g, n_valid in enumerate(valid_counts)
+                if n_valid > 0 and self._block_bytes_per_group[g]
             }
             if len(present_slot_bytes) > 1:
                 return self._skip_bounce(
@@ -378,6 +383,13 @@ class VmmBounceTransport(BounceTransport):
         The write can't be aborted, so quarantine the region (reclaimed later) rather than releasing
         or leaking it. Idempotent; a no-op once the transfer has settled."""
         self._apply(rid_slice, lambda ctx: ctx.mark_orphaned())
+
+    def abort_publication(self, rid_slice: RidSlice, published_writers: set[int]) -> None:
+        """Retain a failed fan-out until every successfully published writer drains."""
+        self._apply(
+            rid_slice,
+            lambda ctx: ctx.abort_publication(published_writers),
+        )
 
     def _apply(self, rid_slice: RidSlice, mutate: Callable[[TransferContext], None]) -> None:
         """Mutate the state under the lock, then do what it asks (scatter or settle) with the lock
@@ -525,6 +537,9 @@ class NoBounceTransport(BounceTransport):
         pass
 
     def orphan_reservation(self, rid_slice) -> None:
+        pass
+
+    def abort_publication(self, rid_slice, published_writers: set[int]) -> None:
         pass
 
     def record_result(

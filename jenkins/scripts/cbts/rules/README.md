@@ -11,10 +11,11 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (each excl. `.md`) |
 | `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
 | `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
+| `modeling_v2_rule.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. `.md`) |
 | `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
+| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
 
 ## WaivesRule
@@ -50,6 +51,15 @@ For each file under `tests/` in the diff:
    - file-level anchor `path` (any line lands at module scope, AST parse
      fails, or the file is unreadable — the latter covers .yaml/.txt/
      .json/etc. data files).
+   Decorator lines count as part of what they decorate: `_scope_start_line`
+   extends each node's range up over its `decorator_list`, so editing
+   `@pytest.mark.parametrize` stays at method level and a class-level
+   `@skip_pre_blackwell` stays at class level instead of dropping to
+   module scope.
+   Python helper modules instead query the shared `RepositoryReferenceIndex`.
+   A complete set of direct `test_*.py` importers becomes the anchors; an
+   ambiguous, dynamic, transitive, or non-test importer retains the directory
+   fallback.
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
@@ -58,13 +68,51 @@ For each file under `tests/` in the diff:
    `unittest/api_stability/references/llmapi.yaml` lifts to
    `unittest/api_stability/`.
 
-`accuracy/references/*.yaml` gets a finer-grained refinement: each
-top-level YAML key is a HF model name, mapped (via AST scan of
-`accuracy/test_*.py` for `MODEL_NAME = "<hf>"` literals) to test
-classes. A diff under `meta-llama/Llama-3.1-8B-Instruct:` narrows to
-`accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
-`accuracy/` subtree. Models with no matching test class fall back to
-the dir-level anchor.
+### Deletion-only diffs
+
+Deleted lines have no post-image position. `iter_diff_post_line_numbers`
+anchors them to the next surviving line, which can land outside the scope
+they were deleted from — between two classes for a `.py` file, or on the
+next model section for a reference YAML. Rather than widening to
+file/dir level, both paths re-read the deleted side from the diff's own
+pre-image view (`iter_diff_pre_image`: context + `-` lines, in-hunk
+order), where a deleted class's `class` statement or a deleted section's
+key line is directly visible:
+
+- `.py`: `_recover_deleted_scope_anchors` runs only after post-image
+  mapping already failed, so modification diffs keep their finer
+  method-level anchors. `_py_class_scopes_from_deletions` attributes at
+  class level — a method-level walk would have to guess which `def` a
+  stray decorator line belongs to.
+- reference YAML: `_yaml_top_keys_from_deletions` reads `-` lines,
+  `iter_diff_added_post_line_numbers` reads `+` lines off the post-image.
+
+Both return `None` — forcing the file-level fallback — when a `-` line's
+owning scope is not visible inside its hunk, since only 3 context lines
+are guaranteed. Pre-image *line numbers* are never used:
+`strip_noop_diff_lines` drops blank / comment-only `-` lines, which
+shifts every later pre-image number.
+
+### accuracy/references/*.yaml
+
+Top-level keys name what a section is a reference for, and resolve to
+anchors under `accuracy/test_*.py` so the lineage walk matches every
+parametrization:
+
+- HF model name (15 of the 16 files) → test classes carrying that
+  `MODEL_NAME = "<hf>"` literal. A diff under
+  `meta-llama/Llama-3.1-8B-Instruct:` narrows to
+  `accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
+  `accuracy/` subtree.
+- `TestC::test_m` id (`acceptance_length.yaml` only) → that method in
+  every module defining `TestC`.
+
+Resolving to *no* anchor is a zero-impact claim, not a failure, when the
+changed keys are also absent from the post-PR YAML: that is the shape of
+a test-pruning PR, which drops a reference section and its test in one
+commit, so nothing left in the tree can read it. Keys that survive in
+the YAML but resolve to no test keep the dir-level fallback — some test
+this rule failed to resolve may still read them.
 
 Outcomes:
 
@@ -75,10 +123,11 @@ Outcomes:
   - basename is conftest / `__init__` / a helper / data file: unhandled
     — Selector reports it and falls back. Could be implicitly imported
     (top-level conftest, sys-path helpers, test input fixtures).
-- Path is in-namespace but no YAML-covered ancestor exists at any
-  walk-up level: claimed as no-narrow contribution (`scope=noop` if
-  all paths are like this; a miss-note in the reason on partial-narrow
-  runs).
+- Path is in-namespace but its anchors match no YAML entry — no
+  YAML-covered ancestor at any walk-up level, or a zero-impact claim
+  from the accuracy-reference path: claimed as no-narrow contribution
+  (`scope=noop` if all paths are like this; a miss-note in the reason
+  on partial-narrow runs).
 - Block-filter coverage ≥ `BLAST_RADIUS_FRACTION` (0.8) of total YAML
   blocks: `scope=None` (rule cannot usefully narrow — fallback).
 - `sanity_relevant` / `perfsanity_relevant` follow from the matched
@@ -107,48 +156,6 @@ Outcomes:
 - Some added entries resolved → `scope=testlistonly`; unresolved entries
   are noted in the reason and ignored for narrowing.
 
-## AutoDeployRule
-
-Path-only rule. Claims source files under `examples/auto_deploy/` and
-`tensorrt_llm/_torch/auto_deploy/` (excluding `.md`, which
-`OutOfScopeRule` claims as noop). Other suffixes — including images —
-are NOT excluded: a binary asset under an AD path could be a test
-fixture, so the rule keeps claiming them and forces AD stages to
-re-run.
-
-Block selection — entry-based, two cases:
-- **Primary**: blocks where `condition.terms.backend == 'autodeploy'`.
-  Covers the 9 AD-conditioned blocks across all yamls.
-- **Supplementary**: blocks containing entries with
-  `test_llm_api_autodeploy.py` in the path or `_autodeploy-` in the
-  parametrize id. Covers 3 entries that live in `backend: pytorch`
-  blocks (l0_l40s, l0_perf) because Jenkins has no `L40S-AutoDeploy-*`
-  / `H100-Perf-AutoDeploy-*` stage to consume a proper AD-conditioned
-  block. The two patterns are stable conventions
-  (`test_llm_api_autodeploy.py` is the AD accuracy filename;
-  `_autodeploy-` is the cross-codebase backend parametrize value).
-
-For each matched block, `block_filters` keeps only the AD entries
-(every entry for AD-conditioned blocks; only entries matching the
-supplementary patterns for leaker blocks). Non-AD siblings in leaker
-blocks stay governed by other rules.
-
-Outcomes:
-- No AD source files in the diff → rule returns `None`.
-- AD source touched → `scope=autodeployonly`; sanity off
-  (AD changes don't affect wheel sanity); perfsanity on iff a
-  matched block lives in `l0_perf` or `*perf_sanity*`.
-- AD source touched but no AD block found anywhere (defensive) →
-  `scope=None` (fallback).
-
-Why narrowing is safe: AD is a beta backend isolated from the main
-PyTorch backend. The 7 reverse imports of AD from non-AD code in
-`bench/`, `executor/`, `commands/serve.py` are all lazy, guarded by
-`if backend == "_autodeploy"`, so AD-only changes don't affect tests
-that use the default PyTorch backend.
-`scripts/check_auto_deploy_imports.py` enforces AD's outbound import
-discipline statically.
-
 ## VisualGenRule
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
@@ -173,7 +180,7 @@ live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
 
-Outward-facing fallback: unlike AutoDeploy, VG public symbols and
+Outward-facing fallback: VisualGen public symbols and
 `tensorrt_llm.media.*` are imported eagerly by non-VG startup paths such
 as `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py`. Both package prefixes
@@ -248,6 +255,72 @@ Outcomes:
 - Spec-dec source touched but no spec-dec block found anywhere
   (defensive) → `scope=None` (fallback).
 
+## ModelingV2Rule
+
+Path-only rule. Claims non-documentation source changes under
+`tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
+path (one flat forward per checkpoint/arch/parallel triple, assembled
+from a catalog of op wrappers).
+
+`.md` exclusion carries more weight here than elsewhere: every catalog
+entry ships a contract document, so roughly a fifth of the subtree is
+Markdown. Claiming those would let a documentation-only PR pull in
+multi-GPU GB300 stages. Other suffixes are NOT excluded — a data file
+under the subtree could be a fixture, so the rule keeps claiming it
+(safe over-run).
+
+Block selection — entry-pattern based only:
+modeling_v2 has no `condition.terms.backend` of its own; its entries sit
+in `backend: pytorch` blocks beside everything else. A block belongs to
+modeling_v2 iff one of its `tests:` entries matches
+`_MV2_ENTRY_PATTERNS`:
+
+- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
+  as whole-directory entries (one on `l0_gb300`, one on
+  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `test_modeling_v2_` — the accuracy gates, and any future unit file.
+
+Both markers are exact by construction rather than by luck: every test
+file in the subtree is named `test_modeling_v2_*` precisely so it cannot
+collide with the upstream test of the same op. So unlike `SpecDecRule`'s
+`mtp_nextn`, no substring here can claim an unrelated entry and no
+carve-out is needed.
+
+Outward fallback: not needed, and by design rather than by accident.
+Nothing imports the subtree unless `TRTLLM_MODELING_V2` is set —
+`AutoModelForCausalLM._resolve_class` calls `modeling_v2_resolve`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The one caller outside the subtree,
+`tensorrt_llm/_torch/models/modeling_auto.py`, is deliberately left
+unclaimed: a change to the shared resolver falls back to baseline, which
+is what it deserves.
+
+`sanity_relevant=False` — the subtree ships no user-facing entry point
+and is not imported by `trtllm-serve` or by `import tensorrt_llm`, so
+none of it is what PackageSanityCheck verifies about the wheel.
+`perfsanity_relevant` is dynamic (True only if a matched block lives in
+a `*_perf_sanity*` yaml); there are no modeling_v2 perf-sanity entries
+today, so it aggregates to False.
+
+Source changed but no modeling_v2 block in any yaml (defensive) →
+`scope=None` (fallback).
+
+## OpenEngineRule
+
+Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
+entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
+they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
+unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
+pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
+adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
+TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
+OpenEngine's private bindings and gRPC runtime are base package dependencies, so no stage-name guard
+decides which gateway a shard can import. If no OpenEngine test entry is registered, the rule
+returns `scope=None` and falls back to the baseline rather than silently skipping coverage.
+
+Tests under `tests/unittest/grpc/openengine/` remain owned by `TestsDefRule`;
+source-plus-test changes combine through the `testsonly` scope family.
+
 ## OutOfScopeRule
 
 Pure pattern match. Claims a changed file as `scope=noop` when it lives
@@ -278,7 +351,9 @@ in `out_of_scope_rule.py` list the patterns.
 | Helper | Used by | Purpose |
 |---|---|---|
 | `iter_diff_changes(diff)` | waives, testlist | Yields `(sign, body)` for each `+`/`-` content line. |
-| `iter_diff_post_line_numbers(diff)` | testdef | Yields post-image (`+`) line numbers for AST scope mapping. |
+| `iter_diff_post_line_numbers(diff)` | testdef | Yields post-image line numbers for AST scope mapping; `-` lines anchor to the next surviving line. |
+| `iter_diff_added_post_line_numbers(diff)` | testdef | Same, but `+` lines only — for callers reading meaning off the post-image. |
+| `iter_diff_pre_image(diff)` | testdef | Yields `(sign, body)` reconstructing each hunk's pre-image (`-` + context); `("@", "")` marks a hunk boundary. |
 | `lookup_ids_into_block_filters` | waives, testlist | Runs `find_match_for_waive` over a set of test ids; returns block_filters and miss set. |
 | `lookup_paths_into_block_filters` | testdef | Runs `find_match_for_path` over a set of anchors; returns block_filters and miss set. |
 | `resolve_affected_stages` | all narrowing rules | Maps `block_filters` keys to stage names via `stages_by_yaml_stem`. |

@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused QKV prep for Gemma4: per-head RMSNorm + RoPE + FP8 quant in one kernel.
+"""Fused QKV prep for Gemma4: per-head RMSNorm + RoPE in one kernel.
 
-Replaces the unfused chain executed per layer per step on the FlashInfer
-FP8-KV path:
+Replaces the unfused QKV preparation executed per layer per step. On the
+FlashInfer FP8-KV path, that chain is:
 
     split_qkv (strided views) -> reshape copies (3x direct_copy)
     -> q_norm / k_norm / v_norm (3x rmsnorm)
@@ -25,7 +25,9 @@ FP8-KV path:
 with a single Triton kernel that reads the packed QKV GEMM output directly
 (per-head strided access, no contiguous intermediate), normalizes each head,
 applies neox-style RoPE to Q/K heads from the module's fp32 cos/sin table,
-and writes packed FP8 (or BF16) Q, K, V.
+and writes separate FP8 Q/K/V or packed BF16 QKV. FlashInfer consumes the
+FP8 outputs directly; native TRTLLM consumes the packed BF16 output before
+its existing KV-cache quantization and append preprocessing.
 
 Numerics deliberately replicate the unfused path: fp32 accumulation with a
 round to bf16 after the norm and again after RoPE, so the final FP8 values
@@ -45,7 +47,7 @@ support (KV-shared layers, non-FP8 KV cache, custom-mask multimodal
 prefill, torch.compile).
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -55,14 +57,17 @@ import triton.language as tl
 @triton.jit
 def _gemma4_qkv_norm_rope_quant_kernel(
     qkv_ptr,  # [N, W] bf16, row stride SW; heads packed [q | k | v], head h at col h*HD
-    q_out_ptr,  # [N, NQ*HD] fp8/bf16 contiguous
-    k_out_ptr,  # [N, NK*HD]
-    v_out_ptr,  # [N, NK*HD]
+    q_out_ptr,  # [N, NQ*HD] fp8/bf16, possibly a view of packed QKV
+    k_out_ptr,  # [N, NK*HD], possibly a view of packed QKV
+    v_out_ptr,  # [N, NK*HD], possibly a view of packed QKV
     pos_ptr,  # [N] int positions
     cos_sin_ptr,  # [max_pos, 2, HALF] fp32: [:, 0, :]=cos, [:, 1, :]=sin
     qw_ptr,  # [HD] bf16 q_norm weight
     kw_ptr,  # [HD] bf16 k_norm weight
     SW,  # qkv row stride (elements)
+    Q_OUT_SW: tl.constexpr,
+    K_OUT_SW: tl.constexpr,
+    V_OUT_SW: tl.constexpr,
     NQ,  # num q heads
     NK,  # num kv heads
     EPS,
@@ -99,9 +104,9 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         o1 = (y1 * cos - y2 * sin).to(tl.bfloat16)
         o2 = (y2 * cos + y1 * sin).to(tl.bfloat16)
         if h < NQ:
-            out = q_out_ptr + rows[:, None] * (NQ * HD) + h * HD + offs[None, :]
+            out = q_out_ptr + rows[:, None] * Q_OUT_SW + h * HD + offs[None, :]
         else:
-            out = k_out_ptr + rows[:, None] * (NK * HD) + (h - NQ) * HD + offs[None, :]
+            out = k_out_ptr + rows[:, None] * K_OUT_SW + (h - NQ) * HD + offs[None, :]
         if OUT_FP8:
             tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
             tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
@@ -114,7 +119,7 @@ def _gemma4_qkv_norm_rope_quant_kernel(
         # v_norm-before-k_norm ordering for K=V layers).
         o1 = (x1 * rms[:, None]).to(tl.bfloat16)
         o2 = (x2 * rms[:, None]).to(tl.bfloat16)
-        out = v_out_ptr + rows[:, None] * (NK * HD) + (h - NQ - NK) * HD + offs[None, :]
+        out = v_out_ptr + rows[:, None] * V_OUT_SW + (h - NQ - NK) * HD + offs[None, :]
         if OUT_FP8:
             tl.store(out, o1.to(tl.float8e4nv), mask=rmask[:, None])
             tl.store(out + HALF, o2.to(tl.float8e4nv), mask=rmask[:, None])
@@ -134,7 +139,8 @@ def gemma4_fused_qkv_norm_rope_quant(
     num_kv_heads: int,
     head_dim: int,
     out_fp8: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    packed_output: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Run the fused per-head norm + rope + quant over a packed QKV tensor.
 
     Args:
@@ -147,11 +153,19 @@ def gemma4_fused_qkv_norm_rope_quant(
         eps: shared RMSNorm epsilon.
         out_fp8: emit float8_e4m3fn outputs (KV-cache dtype) when True,
             bf16 otherwise.
+        packed_output: emit one contiguous BF16 packed-QKV tensor instead of
+            separate Q/K/V tensors. Packed FP8 is not supported because the
+            native TRTLLM preprocessing contract consumes BF16 packed QKV.
 
     Returns:
-        (q, k, v): contiguous [N, q_size], [N, kv_size], [N, kv_size] in the
-        requested output dtype; q/k are roped, v is norm-only.
+        Separate mode returns contiguous ``(q, k, v)`` tensors in the
+        requested output dtype. Packed mode returns ``(qkv, None, None)``
+        with contiguous BF16 QKV. In both modes q/k are roped and v is
+        norm-only.
     """
+    if packed_output and out_fp8:
+        raise ValueError("packed_output requires BF16 output")
+
     assert qkv.dim() == 2 and qkv.stride(-1) == 1
     assert qkv.dtype == torch.bfloat16
     assert cos_sin.is_contiguous() and cos_sin.dtype == torch.float32
@@ -163,10 +177,25 @@ def gemma4_fused_qkv_norm_rope_quant(
 
     n = qkv.shape[0]
     out_dtype = torch.float8_e4m3fn if out_fp8 else torch.bfloat16
-    q_out = torch.empty((n, q_size), dtype=out_dtype, device=qkv.device)
-    k_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
-    v_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
+    packed_qkv = None
+    if packed_output:
+        packed_qkv = torch.empty(
+            (n, q_size + 2 * kv_size),
+            dtype=out_dtype,
+            device=qkv.device,
+        )
+        q_out, k_out, v_out = packed_qkv.split(
+            [q_size, kv_size, kv_size],
+            dim=-1,
+        )
+    else:
+        q_out = torch.empty((n, q_size), dtype=out_dtype, device=qkv.device)
+        k_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
+        v_out = torch.empty((n, kv_size), dtype=out_dtype, device=qkv.device)
     if n == 0:
+        if packed_output:
+            assert packed_qkv is not None
+            return packed_qkv, None, None
         return q_out, k_out, v_out
 
     # ~2k-element tiles keep every thread on wide vectorized accesses without
@@ -185,6 +214,9 @@ def gemma4_fused_qkv_norm_rope_quant(
         q_weight,
         k_weight,
         qkv.stride(0),
+        q_out.stride(0),
+        k_out.stride(0),
+        v_out.stride(0),
         num_q_heads,
         num_kv_heads,
         eps,
@@ -195,4 +227,7 @@ def gemma4_fused_qkv_norm_rope_quant(
         BLOCK_N=block_n,
         num_warps=8,
     )
+    if packed_output:
+        assert packed_qkv is not None
+        return packed_qkv, None, None
     return q_out, k_out, v_out

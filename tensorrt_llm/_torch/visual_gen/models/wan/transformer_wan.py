@@ -351,6 +351,7 @@ class WanBlock(nn.Module):
             config=model_config,
             layer_idx=_layer_idx,
             async_ulysses=self._use_async_ulysses,
+            separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
 
@@ -406,7 +407,7 @@ class WanBlock(nn.Module):
             reduce_output=(tp_size != 1),
         )
 
-        # VSA gates (CUTEDSL backend, sparse_attention_config.algorithm == "vsa").
+        # VSA gates are shared by the backend-specific fine-stage implementations.
         # G_c weights the coarse branch; G_f weights the fine branch.
         self.to_gate_compress = None
         self.to_gate_fine = None
@@ -414,7 +415,6 @@ class WanBlock(nn.Module):
         _sa_cfg = getattr(_attn_cfg, "sparse_attention_config", None) if _attn_cfg else None
         _is_vsa = (
             _attn_cfg is not None
-            and getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
@@ -432,6 +432,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
             self.to_gate_fine = Linear(
                 hidden_size,
@@ -444,6 +448,10 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=gate_tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(
+                    self.attn1.local_q_dim_start,
+                    self.attn1.local_q_dim_end,
+                ),
             )
 
         # I2V: Additional K/V projections for image embeddings.
@@ -588,7 +596,12 @@ class WanBlock(nn.Module):
         # so each V/Q/K GEMM + norm + RoPE overlaps with the peer push on the
         # side stream; both paths return 3D [B, S, H*D].
         if self._use_async_ulysses:
-            attn1_out = self.attn1.forward_async(normed, freqs=freqs, timestep=timestep)
+            attn1_out = self.attn1.forward_async(
+                normed,
+                freqs=freqs,
+                timestep=timestep,
+                **attn1_kwargs,
+            )
         else:
             attn1_out = self.attn1(normed, freqs=freqs, timestep=timestep, **attn1_kwargs)
 
@@ -614,8 +627,8 @@ class WanBlock(nn.Module):
                 _x_2d = x.reshape(-1, x.shape[-1])
                 norm_x = apply_fused_layernorm_affine_quant(
                     _x_2d,
-                    self.norm2.weight.to(x.dtype),
-                    self.norm2.bias.to(x.dtype),
+                    self.norm2.weight,
+                    self.norm2.bias,
                     self._norm2_fp4_scale,
                     eps=self.norm2.variance_epsilon,
                 )
@@ -756,6 +769,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 "in_channels": in_channels,
                 "out_channels": out_channels,
                 "num_layers": num_layers,
+                "expand_timesteps": getattr(config, "expand_timesteps", False),
             },
         )()
 
@@ -921,6 +935,10 @@ class WanTransformer3DModel(BaseDiffusionModel):
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))
+            if self.config.expand_timesteps:
+                # x is already sequence-sharded; uniform T2V timesteps only need
+                # a local broadcast view for fused AdaLN.
+                temb_proj = temb_proj.unsqueeze(1).expand(-1, x.shape[1], -1, -1)
 
         # I2V: Concatenate image and text embeddings if image embeddings are provided
         if encoder_hidden_states_image is not None:

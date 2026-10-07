@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -141,8 +141,13 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
 endif()
 
 add_subdirectory(common)
+
+add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
+set_target_properties(
+  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_subdirectory(kernels)
-add_subdirectory(layers)
 add_subdirectory(runtime)
 
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
@@ -197,9 +202,9 @@ set(TRTLLM_LINK_LIBS
     gemm_swiglu_sm90_src
     cutlass_src
     cute_dsl_src
-    layers_src
     runtime_src
     compressorKernels_src
+    fusedSamplingKernels_src
     mhcKernels_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
@@ -249,8 +254,17 @@ add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
   ${SHARED_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+
+# Keep statically linked NVRTC symbols local so they cannot be interposed by a
+# dynamic NVRTC loaded elsewhere in the process.
+if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
+  target_link_options(
+    ${SHARED_TARGET} PRIVATE
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_LIB}>"
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_BUILTINS_LIB}>")
+endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
@@ -300,6 +314,10 @@ add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_PYT AND BUILD_NCCL_EXTENSIONS)
+  add_subdirectory(nccl_extensions)
 endif()
 
 if(BUILD_DEEP_GEMM)

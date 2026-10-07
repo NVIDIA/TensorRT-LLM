@@ -11,7 +11,7 @@ reset without per-forward `torch.randint`.
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     PythonMambaCacheManager,
     _allocate_mamba_seed_buffer,
     _compute_deterministic_mamba_seed,
@@ -160,7 +160,9 @@ def _build_cpp_hybrid(*, spec_config, use_replay: bool, sr: bool, max_batch_size
     layer.  Mirrors test_mamba_cache_manager._build_hybrid_with_mamba_layer
     but parameterizes the replay / SR flags so we can exercise the
     non-replay MTP SR layer-cache hand-off path."""
-    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        CppMambaHybridCacheManager,
+    )
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 

@@ -1,7 +1,9 @@
 import pytest
-from apps.chat import LLM, AutoTokenizer, LlmConsole, SamplingParams
 
 from ..test_llm import llama_model_path
+
+__extra_import_path__ = ["~/examples"]
+from apps.chat import LLM, AutoTokenizer, LlmConsole, SamplingParams
 
 
 @pytest.fixture

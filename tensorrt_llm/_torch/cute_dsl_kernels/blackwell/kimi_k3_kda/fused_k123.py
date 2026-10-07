@@ -22,23 +22,25 @@ Grid: (NUM_SMS, 1, 1) — 148 persistent blocks, each loops over work units
   Total work units = (NT/4) * H * B, distributed round-robin across SMs
   Block i processes work units i, i+NUM_SMS, i+2*NUM_SMS, ...
 Block: 992 threads (31 warps), warp-specialized with setmaxnreg:
-  Warps 0-15:  TMA+K1 fused (8×2, vec2, prefetch pipeline) – 4 WGs, 56 regs
-  Warps 16-26: K2 MMA compute (10 active + warp 26 as TMA producer) – 72 regs
+  Warps 0-15:  K1 compute (8×2, vec2) – 4 WGs, 56 regs
+  Warps 16-25: K2 MMA compute – 72 regs
+  Warp 26:     Dedicated TMA producer (TMA_WARP_ID) – 72 regs
   Warps 27-30: Store/Inversion warps – 24 regs
 
 Pipeline (single for_generate, warp groups separated by if-blocks):
   per work unit:
-    Warps 0-15:  prefetch chunk 0→stage 0 (warp 0), then loop:
-                    TMA next chunk (warp 0), wait cur chunk, K1 compute, arrive(k1_done)
-    Warps 16-26: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warps 0-15:  wait(tma), K1 cumsum, arrive(k1_done),
+                    Pass 2b Q/K reads and scaling, arrive(stage_reuse)
+    Warps 16-25: wait(k1_done)+wait(store_done), MMA, arrive(mma_done+stage_reuse)
+    Warp 26:     wait(stage_reuse), TMA Q/K/G for each chunk, signal(tma)
     Warps 27-30: wait(mma_done), store sAqk/sAkk→GMEM, arrive(store_done)
   All warp-group invariants are computed inside each group's if-block (not hoisted)
   to eliminate cross-group register pressure — same budget as the _all version.
   Mbarrier phases self-reset after 4 iterations (2 stages × 2 phases).
 
 Mbarriers:
-  tma_mbars[2]:          count=1, warp 0 lane 0 → K1+MMA wait for TMA data
-  stage_reuse_mbars[2]:  count=320, MMA(10 warps) → warp 0 waits before TMA reuse
+  tma_mbars[2]:          count=1, TMA_WARP_ID (26) lane 0 → K1+MMA wait for TMA data
+  stage_reuse_mbars[2]:  count=832, K1(16)+MMA(10 warps) → TMA waits before reuse
   k1_done_mbars[2]:      count=512, K1(16 warps) → MMA waits for g_cumsum ready
   mma_done_mbars[2]:     count=320, MMA(10 warps) → Store waits for sAqk/sAkk ready
   store_done_mbars[2]:   count=128, Store(4 warps) → MMA waits for sAqk/sAkk stage free
@@ -49,10 +51,10 @@ SMEM: ~215KB (q+k+g × [64,128] bf16 × 2 stages + g_cumsum [64,136] fp32 × 2 s
 
 Inputs:
   g       [B,T,H,K]   bf16  raw gate
-  k       [B,T,H,K]   bf16
-  q       [B,T,H,K]   bf16
+  k       [B,T,H,K]   bf16  normalized by caller
+  q       [B,T,H,K]   bf16  normalized by caller
   A_log   [H]          fp32  per-head log decay
-  beta    [B,T,H]      bf16  used for Akk unit lower triangular
+  beta    [B,T,H]      bf16/fp32, activated in-kernel when requested
   scale                fp32  1/sqrt(K)
 
 Outputs (g_cumsum stays in SMEM, not written to GMEM):
@@ -941,6 +943,7 @@ def fused_kernel123(
     tma_tensor_G: cute.Tensor,
     mA_log: cute.Tensor,
     mBeta: cute.Tensor,
+    mBetaActivated: cute.Tensor,
     scale: cutlass.Float32,
     mKscaled: cute.Tensor,
     mKg: cute.Tensor,
@@ -969,6 +972,8 @@ def fused_kernel123(
     lower_bound: cutlass.Float32,
     HAS_BIAS: cutlass.Constexpr[int],
     USE_SAFE_GATE: cutlass.Constexpr[int],
+    valid_tokens: cutlass.Int32,
+    USE_BETA_SIGMOID: cutlass.Constexpr[int],
     VARLEN_PURE: cutlass.Constexpr[int] = 0,
 ):
     block_id, _, _ = cute.arch.block_idx()
@@ -999,6 +1004,8 @@ def fused_kernel123(
     )
     sG = smem.allocate_tensor(cutlass.BFloat16, g_smem_layout, 128)
     sGcum = smem.allocate_tensor(cutlass.Float32, g_cumsum_layout, 128)
+    beta_layout = cute.make_layout((BT, NUM_STAGES), stride=(1, BT))
+    sBeta = smem.allocate_tensor(cutlass.BFloat16, beta_layout, 128)
     partial_last_layout = cute.make_layout((K1_ROW_GROUPS, PARTIAL_COLS), stride=(PARTIAL_COLS, 1))
     sPartialLast = smem.allocate_tensor(cutlass.Float32, partial_last_layout, 128)
 
@@ -1016,11 +1023,6 @@ def fused_kernel123(
     sAkk = smem.allocate_tensor(cutlass.BFloat16, akk_tile_layout, 128)
     # sAkk_pkd / sTemp removed: akk_inv runs as a separate kernel call (chained back-to-back).
 
-    # sBeta staging removed: its only consumer (K1 Pass 2b) moved beta fusion
-    # into the akk_inv epilogue, and the dead staging loop kept reading
-    # mBeta[chunk_start .. chunk_start+63] unguarded — OOB past the tensor
-    # end for the final partial chunk of a varlen batch.
-
     # =====================================================================
     # Mbarrier allocation & init
     # =====================================================================
@@ -1035,8 +1037,11 @@ def fused_kernel123(
     if tidx == 0:
         for s in range(NUM_STAGES):
             cute.arch.mbarrier_init(tma_mbars + s, 1)
-            # TMA warp is waiter (not arriver) on stage_reuse; and it skips mma_done arrive
-            cute.arch.mbarrier_init(stage_reuse_mbars + s, (NUM_MMA_WARPS - 1) * 32)
+            # Both K1 Pass 2b and MMA read Q/K before TMA can reuse a stage.
+            # The dedicated TMA warp does not arrive on either barrier.
+            cute.arch.mbarrier_init(
+                stage_reuse_mbars + s, (NUM_MMA_WARPS - 1 + NUM_K1_TMA_WARPS) * 32
+            )
             cute.arch.mbarrier_init(k1_done_mbars + s, NUM_K1_TMA_WARPS * 32)
             cute.arch.mbarrier_init(mma_done_mbars + s, (NUM_MMA_WARPS - 1) * 32)
             cute.arch.mbarrier_init(store_done_mbars + s, NUM_STORE_WARPS * 32)
@@ -1070,8 +1075,8 @@ def fused_kernel123(
     cute.arch.barrier()
 
     # =====================================================================
-    # Pre-arrive (MMA warps only)
-    # stage_reuse_mbars: warp 0 waits before MMA arrives → pre-arrive all 10 MMA warps
+    # Pre-arrive before the first TMA load and MMA store
+    # stage_reuse_mbars: pre-arrive all 16 K1 and 10 MMA reader warps
     # store_done_mbars:  MMA waits before Store arrives → pre-arrive first 4 MMA warps
     # =====================================================================
     if (
@@ -1084,6 +1089,10 @@ def fused_kernel123(
             cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
             if mma_warp_tmp < NUM_STORE_WARPS:
                 cute.arch.mbarrier_arrive(store_done_mbars + s)
+
+    if warp_idx < NUM_K1_TMA_WARPS:
+        for s in range(NUM_STAGES):
+            cute.arch.mbarrier_arrive(stage_reuse_mbars + s)
 
     # =================================================================
     # Persistent outer loop. Single for_generate at top level (required).
@@ -1182,6 +1191,44 @@ def fused_kernel123(
                 )
                 for vi in cutlass.range_constexpr(VEC):
                     rAcc[vi] = cutlass.Float32(0.0)
+
+                # Activate beta once per token/head and retain the bf16
+                # result in this stage for K2. The activated GMEM scratch is
+                # consumed by akk_inv, beta's second pipeline consumer.
+                if k1_warp < 2:
+                    beta_row = k1_warp * 32 + lane_id
+                    beta_t = chunk_start + beta_row
+                    beta_value = cutlass.Float32(0.0)
+                    if IS_VARLEN:
+                        if chunk_idx < num_chunks and beta_t < ci_eos:
+                            beta_value = mBeta[i_b, beta_t, i_h].to(cutlass.Float32)
+                            if USE_BETA_SIGMOID:
+                                beta_value = fast_rcp(
+                                    cutlass.Float32(1.0)
+                                    + cute.exp2(
+                                        -beta_value * LOG2E,
+                                        fastmath=True,
+                                    )
+                                )
+                                mBetaActivated[i_b, beta_t, i_h] = beta_value.to(cutlass.BFloat16)
+                    else:
+                        if beta_t < valid_tokens:
+                            beta_value = mBeta[i_b, beta_t, i_h].to(cutlass.Float32)
+                            if USE_BETA_SIGMOID:
+                                beta_value = fast_rcp(
+                                    cutlass.Float32(1.0)
+                                    + cute.exp2(
+                                        -beta_value * LOG2E,
+                                        fastmath=True,
+                                    )
+                                )
+                        if USE_BETA_SIGMOID:
+                            # Eqlen padding is allocated storage, so publish
+                            # explicit zeros for its invalid tail. Applying
+                            # sigmoid to the padded zero logits would produce
+                            # 0.5 and corrupt the recurrent state.
+                            mBetaActivated[i_b, beta_t, i_h] = beta_value.to(cutlass.BFloat16)
+                    sBeta[beta_row, cur_stage] = beta_value.to(cutlass.BFloat16)
 
                 for ri in cutlass.range_constexpr(ROWS_PER_K1_WARP):
                     row = k1_row_start + ri
@@ -1327,9 +1374,13 @@ def fused_kernel123(
                     else:
                         cute.autovec_copy(rGkOut, mGkLast[i_b, chunk_idx, i_h, col_vec_idx, None])
 
+                # K1 still reads Q/K in Pass 2b after signaling k1_done.
+                # TMA may reuse this stage only once those reads finish too.
+                cute.arch.mbarrier_arrive(stage_reuse_mbars + cur_stage)
+
         # =============================================================
         # Warp 26 (TMA_WARP_ID): dedicated TMA producer.
-        # Waits stage_reuse (gated by MMA arrives), issues TMA for Q/K/G,
+        # Waits stage_reuse (K1 and MMA readers), issues TMA for Q/K/G,
         # signals tma_mbar. Decouples MMA -> TMA dependency from K1 compute.
         # =============================================================
         if warp_idx == TMA_WARP_ID:
@@ -1489,7 +1540,6 @@ def fused_kernel123(
                 phase = chunk_iter // NUM_STAGES % 2
                 chunk_idx = chunk_base + chunk_iter
                 chunk_start = cutlass.Int32(0)
-                mma_eos = cutlass.Int32(0)
                 if IS_VARLEN:
                     if chunk_idx < num_chunks:
                         _sid = cutlass.Int32(mChunkIndices[chunk_idx, 0])
@@ -1497,7 +1547,6 @@ def fused_kernel123(
                             cutlass.Int32(mCuSeqlens[_sid])
                             + cutlass.Int32(mChunkIndices[chunk_idx, 1]) * BT
                         )
-                        mma_eos = cutlass.Int32(mCuSeqlens[_sid + 1])
                 else:
                     chunk_start = chunk_idx * BT
 
@@ -1513,31 +1562,11 @@ def fused_kernel123(
 
                     _z = cutlass.Float32(0.0)
 
-                    # Varlen non-pure: a partial chunk's rows past the
-                    # sequence end must not be read — for the batch's final
-                    # chunk they lie past the end of the beta tensor
-                    # entirely (OOB read; NaN/IMA under memory pressure).
-                    # Their A-row contributions are discarded downstream, so
-                    # beta=0 is safe. Eqlen and VARLEN_PURE inputs are
-                    # padded/aligned upstream — load unconditionally there.
-                    beta_row0 = _z
-                    beta_row1 = _z
-                    if IS_VARLEN and not VARLEN_PURE:
-                        if chunk_start + q_row_base + row0 < mma_eos:
-                            beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(
-                                cutlass.Float32
-                            )
-                        if chunk_start + q_row_base + row1 < mma_eos:
-                            beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(
-                                cutlass.Float32
-                            )
-                    else:
-                        beta_row0 = mBeta[i_b, chunk_start + q_row_base + row0, i_h].to(
-                            cutlass.Float32
-                        )
-                        beta_row1 = mBeta[i_b, chunk_start + q_row_base + row1, i_h].to(
-                            cutlass.Float32
-                        )
+                    # K1 stages activated beta with invalid rows set to zero.
+                    # Reading it from SMEM also avoids repeating sigmoid for
+                    # every lower-triangular K2 tile that shares a query row.
+                    beta_row0 = sBeta[q_row_base + row0, s].to(cutlass.Float32)
+                    beta_row1 = sBeta[q_row_base + row1, s].to(cutlass.Float32)
 
                     acc_aqk_n0_0, acc_aqk_n0_1, acc_aqk_n0_2, acc_aqk_n0_3 = _z, _z, _z, _z
                     acc_aqk_n1_0, acc_aqk_n1_1, acc_aqk_n1_2, acc_aqk_n1_3 = _z, _z, _z, _z
@@ -2089,7 +2118,15 @@ def fused_kernel123(
 # Host function
 # =========================================================================
 def make_host_function(
-    B, NT, H, is_varlen=False, T_padded=None, has_bias=False, use_safe_gate=False, varlen_pure=False
+    B,
+    NT,
+    H,
+    is_varlen=False,
+    T_padded=None,
+    has_bias=False,
+    use_safe_gate=False,
+    use_beta_sigmoid=False,
+    varlen_pure=False,
 ):
     """
     `varlen_pure=True` asserts that all seq lengths in the batch are multiples
@@ -2102,6 +2139,7 @@ def make_host_function(
     _IS_VARLEN = 1 if is_varlen else 0
     _HAS_BIAS = 1 if has_bias else 0
     _USE_SAFE_GATE = 1 if use_safe_gate else 0
+    _USE_BETA_SIGMOID = 1 if use_beta_sigmoid else 0
     _VARLEN_PURE = 1 if (is_varlen and varlen_pure) else 0
     if is_varlen:
         assert B == 1, "Varlen requires B=1"
@@ -2124,6 +2162,7 @@ def make_host_function(
         mG,
         mA_log,
         mBeta,
+        mBetaActivated,
         scale,
         mKscaled,
         mKg,
@@ -2138,6 +2177,7 @@ def make_host_function(
         rt_nt: cutlass.Int32,
         rt_b: cutlass.Int32,
         rt_t_total: cutlass.Int32,
+        valid_tokens: cutlass.Int32,
         # Launch stream — a runtime argument (the executor runs the model on
         # a dedicated non-blocking torch stream; launching on the DSL default
         # stream races with the caller's stream). See _launch_fused_k123_inv.
@@ -2246,6 +2286,7 @@ def make_host_function(
             BT * K_DIM * 2 * 2 * NUM_STAGES
             + BT * K_DIM * 2 * NUM_STAGES
             + BT * K_STRIDE * 4 * NUM_STAGES
+            + BT * NUM_STAGES * 2  # sBeta bf16
             + K1_ROW_GROUPS * PARTIAL_COLS * 4
             + BT * AQK_TILE_STRIDE * 2 * NUM_STAGES  # sAqk bf16 (64x72 row-major)
             + BT * AKK_STRIDE * 2 * NUM_STAGES  # sAkk bf16
@@ -2266,6 +2307,7 @@ def make_host_function(
             tma_tensor_G,
             mA_log,
             mBeta,
+            mBetaActivated,
             scale,
             mKscaled_v2,
             mKg_v2,
@@ -2294,6 +2336,8 @@ def make_host_function(
             lower_bound_val,
             _HAS_BIAS,
             _USE_SAFE_GATE,
+            valid_tokens,
+            _USE_BETA_SIGMOID,
             _VARLEN_PURE,
         ).launch(
             grid=(_grid_x, 1, 1),

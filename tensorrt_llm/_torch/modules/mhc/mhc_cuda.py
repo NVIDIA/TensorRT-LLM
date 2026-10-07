@@ -17,7 +17,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, List
 
 import torch
@@ -36,7 +36,7 @@ from tensorrt_llm._utils import get_sm_version
 
 @lru_cache(maxsize=1)
 def _fused_hc_mma_supported() -> bool:
-    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100.
+    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require the SM100 family.
 
     They also require BUILD_DEEP_GEMM=ON so the C++ extension compiles the
     DeepGEMM-backed TF32 kernels. On unsupported builds or GPU generations, only
@@ -211,28 +211,34 @@ def mhc_gemm_rms_fma_cuda(
 # ---------------------------------------------------------------------------
 
 
-def _mhc_gen_tuning_buckets(x: int):
-    """Generate M-dimension tuning buckets for MHC pre_mapping.
+_MHC_FINE_GRAINED_TUNING_LIMIT = 8192
+_MHC_COARSE_TUNING_STEP = 1024
 
-    Buckets: 1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 768, 1024, ...
-    Small M uses powers-of-2 for fine granularity; large M uses 128 steps.
-    """
+
+def _mhc_gen_tuning_buckets(x: int, *, large_m_step: int | None = None) -> tuple[int, ...]:
+    """Generate fine-grained buckets, optionally extending above 8192 with coarser steps."""
+    if large_m_step is not None:
+        # Cover the rounded-up runtime bucket even for non-aligned warmup sizes.
+        x = _mhc_map_to_tuning_bucket(x, large_m_step=large_m_step)
     buckets = (1, 2, 4, 8, 16, 32, 64, 128)
     if x >= 128:
-        x = min(x, 8192)
-        x = max(x, 1024)
-        buckets += tuple(range(256, x + 1, 128))
+        fine_upper = max(1024, min(x, _MHC_FINE_GRAINED_TUNING_LIMIT))
+        buckets += tuple(range(256, fine_upper + 1, 128))
+    if large_m_step is not None and x > _MHC_FINE_GRAINED_TUNING_LIMIT:
+        coarse_start = (_MHC_FINE_GRAINED_TUNING_LIMIT // large_m_step + 1) * large_m_step
+        buckets += tuple(range(coarse_start, x + 1, large_m_step))
     return buckets
 
 
-def _mhc_map_to_tuning_bucket(x: int) -> int:
+def _mhc_map_to_tuning_bucket(x: int, *, large_m_step: int | None = None) -> int:
     """Map an inference-time M to the nearest tuning bucket (round up)."""
     if x <= 128:
         v = 1
         while v < x:
             v *= 2
         return min(v, 128)
-    return ((x + 127) // 128) * 128
+    step = large_m_step if large_m_step is not None and x > _MHC_FINE_GRAINED_TUNING_LIMIT else 128
+    return ((x + step - 1) // step) * step
 
 
 _FMA_TILE_N_OPTIONS = (1, 2, 3, 4, 6, 8, 12, 24)
@@ -263,8 +269,12 @@ class MhcPreMappingRunner(TunableRunner):
             DynamicTensorSpec(
                 input_idx=0,
                 dim_idx=0,
-                gen_tuning_buckets=_mhc_gen_tuning_buckets,
-                map_to_tuning_buckets=_mhc_map_to_tuning_bucket,
+                gen_tuning_buckets=partial(
+                    _mhc_gen_tuning_buckets, large_m_step=_MHC_COARSE_TUNING_STEP
+                ),
+                map_to_tuning_buckets=partial(
+                    _mhc_map_to_tuning_bucket, large_m_step=_MHC_COARSE_TUNING_STEP
+                ),
             ),
         ),
         # residual (input[2]) dim 0 = M, same as x (input[0]) dim 0
@@ -538,8 +548,8 @@ def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
 
     Phase 4 layer_input has a scalar-vec tail (H_VEC_END logic in
     fused_tf32_pmap_gemm.cuh) so `hidden % (warps_per_tok * warp * bf16_vec)
-    == 0` is no longer required; only `hidden % bf16_vec == 0` plus
-    `h_tiles % ks == 0` remain.
+    == 0` is no longer required; only `hidden % bf16_vec == 0` plus an even
+    split remain, except for the two measured H=7168 uneven split counts.
     """
     if hidden_size not in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES:
         return False
@@ -550,7 +560,11 @@ def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
     if hidden_size % block_k != 0:
         return False
     h_tiles = hidden_size // block_k
-    if h_tiles % ks != 0:
+    if ks > h_tiles:
+        return False
+    even_split = h_tiles % ks == 0
+    single_wave_split = hidden_size == 7168 and ks in (53, 106)
+    if not (even_split or single_wave_split):
         return False
     return hidden_size % bf16_vec == 0
 
@@ -581,10 +595,13 @@ _FUSED_HC_HALF_FMA_TN_KS = (
 # the same ks across the full range. Includes high-KS divisors of HIDDEN/64
 # for hidden=7168 (h_tiles=112): 7, 14, 28, 56, 112. _fused_hc_mma_ks_supported
 # filters per (hidden, ks) — entries that don't divide h_tiles drop out.
-_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
+# KS=53/106 are uneven splits: at H=7168 they give an exact single-wave grid on
+# a 212-SM device for M=256/128. _fused_hc_target_mma_ks only offers them on
+# SM107; main's ladder can never select them (see its docstring).
+_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 53, 56, 64, 106, 112)
 # Tactics for Path D (all-in-one MMA): (num_k_splits,). No bigfuse_bs — the
 # bigfuse runs inline inside the single kernel and uses fixed parameters.
-_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
+_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 53, 56, 64, 106, 112)
 # Tactics for Path F (all-in-one FMA): (tile_n, num_k_splits, tile_m).
 # Must stay in sync with the C++ pickFhcFmaAllInOne() table.
 _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
@@ -611,15 +628,34 @@ def _fused_hc_mma_ks_options(hidden_size: int) -> tuple[int, ...]:
     return tuple(ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(hidden_size, ks))
 
 
-def _fused_hc_target_mma_ks(hidden_size: int, M: int) -> int | None:
-    """Pick the measured splitK ridge for the MMA fused_hc paths."""
+def _fused_hc_target_mma_ks(
+    hidden_size: int, M: int, sm_count: int = 128, is_sm107: bool = False
+) -> int | None:
+    """Pick the measured splitK ridge for the MMA fused_hc paths.
+
+    The pre-SM107 ladder is kept verbatim. Its reachable targets are
+    ``128 // m_tiles``, none of which falls in [53, 55] or [106, 111], so the
+    uneven split counts stay unreachable off SM107.
+    """
     valid = _fused_hc_mma_ks_options(hidden_size)
     if not valid:
         return None
     m_tiles = max(1, (M + 63) // 64)
-    target = max(1, 128 // m_tiles)
-    candidates = tuple(ks for ks in valid if ks <= target)
-    return candidates[-1] if candidates else valid[0]
+    if not is_sm107:
+        target = max(1, 128 // m_tiles)
+        candidates = tuple(ks for ks in valid if ks <= target)
+        return candidates[-1] if candidates else valid[0]
+    # Small/mid-M targets one full device wave; large prefill has enough work
+    # per CTA to want roughly five. Pick the closest compiled split count, but
+    # only among splits whose grid the caller will accept -- picking the nearest
+    # split unconditionally can land just above the bound and leave the shape
+    # with no tactic at all.
+    max_ctas = sm_count * 5
+    target_ctas = sm_count * (5 if M >= 8192 else 1)
+    schedulable = tuple(ks for ks in valid if m_tiles * ks <= max_ctas)
+    if not schedulable:
+        return valid[0]
+    return min(schedulable, key=lambda ks: (abs(m_tiles * ks - target_ctas), -ks))
 
 
 def _fused_hc_mma_bigfuse_bs_options(M: int) -> tuple[int, ...]:
@@ -840,13 +876,16 @@ class MhcFusedHcRunner(TunableRunner):
                     add(("fused_half_fma", tn, ks, bs, 1))
 
         if mma_ok and M >= 32:
-            ks = _fused_hc_target_mma_ks(self.hidden_size, M)
+            props = torch.cuda.get_device_properties(inputs[0].device)
+            is_sm107 = (props.major, props.minor) == (10, 7)
+            ks = _fused_hc_target_mma_ks(self.hidden_size, M, props.multi_processor_count, is_sm107)
             if ks is not None:
                 m_tiles = (M + 63) // 64
-                if m_tiles * ks <= 148 * 4:
+                max_grid_ctas = props.multi_processor_count * 5 if is_sm107 else 148 * 4
+                if m_tiles * ks <= max_grid_ctas:
                     for bs in _fused_hc_mma_bigfuse_bs_options(M):
                         add(("fused_half_mma", 0, ks, bs, 1))
-                    if M >= 64:
+                    if M >= 64 and ks in _FUSED_HC_ALL_MMA_KS:
                         add(("fused_all_mma", 0, ks, 0, 1))
 
         if not mma_ok and M > 32:

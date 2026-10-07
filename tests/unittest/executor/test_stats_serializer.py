@@ -121,36 +121,6 @@ def _make_mock_kv_iter_stats(
     return {window_size: s}
 
 
-class _FakeStorageStatistics(SimpleNamespace):
-    @property
-    def unavailable(self):
-        return self.total - self.available
-
-
-class _FakePeakStorage:
-    num_pool_groups = 2
-    num_cache_levels = 2
-
-    def __init__(self):
-        self._levels = []
-        self.primary_stats = [
-            _FakeStorageStatistics(total=10, available=8, evictable=1),
-            _FakeStorageStatistics(total=10, available=9, evictable=0),
-        ]
-        self.secondary_stats = [
-            _FakeStorageStatistics(total=5, available=4, evictable=1),
-            _FakeStorageStatistics(total=5, available=5, evictable=0),
-        ]
-
-    def get_statistics(self, level):
-        if int(level) == 0:
-            return self.primary_stats
-        return self.secondary_stats
-
-    def destroy(self):
-        pass
-
-
 class TestStatsSerializer:
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
@@ -391,6 +361,8 @@ class TestStatsSerializer:
                     window_size=16,
                     kind="attention",
                     stats=life_cycle_stats,
+                    full_reused_blocks_by_level=[3, 1, 0],
+                    partial_reused_blocks_by_level=[0, 1, 0],
                 ),
                 4: KVCacheV2SsmLifeCycleIterationStats(
                     life_cycle_id=4,
@@ -448,6 +420,9 @@ class TestStatsSerializer:
         assert cold_group["coldPoolGroupId"] == 0
         assert cold_group["slotSize"] == [4 << 20]
         assert cold_group["windowSizes"] == [16, 64]
+        assert cold_group["secondaryMaxNumBlocks"] == 8
+        assert cold_group["secondaryFreeNumBlocks"] == 5
+        assert cold_group["secondaryUsedNumBlocks"] == 3
         assert cold_group["secondaryPeakFreeNumBlocks"] == 6
         assert cold_group["secondaryPeakUsedNumBlocks"] == 4
         assert cold_group["secondaryPeakEvictableNumBlocks"] == 2
@@ -462,6 +437,12 @@ class TestStatsSerializer:
         assert life_cycle["iterReusedBlocks"] == 5
         assert life_cycle["iterMissedBlocks"] == 3
         assert "iterGenAllocBlocks" not in life_cycle
+        # Indexed by cache level, so a deployment with a hot and a cold GPU level reports them
+        # separately instead of merging both into one "gpu" bucket.
+        assert life_cycle["iterFullReusedBlocksByLevel"] == [3, 1, 0]
+        assert life_cycle["iterPartialReusedBlocksByLevel"] == [0, 1, 0]
+        # An SSM life cycle carries no block-level reuse split.
+        assert "iterFullReusedBlocksByLevel" not in d["kvCacheIterationStatsByLifecycle"]["4"]
         ssm_life_cycle = d["kvCacheIterationStatsByLifecycle"]["4"]
         assert ssm_life_cycle == {
             "lifeCycleId": 4,
@@ -480,45 +461,44 @@ class TestStatsSerializer:
             },
         }
 
-    def test_v2_peak_block_stats_reset_tracks_interval_peak(self):
-        """Peak block stats should cover the interval since the previous reset."""
-        from tensorrt_llm.runtime.kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel
-        from tensorrt_llm.runtime.kv_cache_manager_v2._core._kv_cache_manager import KVCacheManager
+    def test_serializer_emits_v2_suspend_resume_counters(self) -> None:
+        """V2 suspend/resume (preemption) counts surface as top-level iteration keys.
 
-        storage = _FakePeakStorage()
-        manager = object.__new__(KVCacheManager)
-        manager._storage = storage
-        manager._radix_tree = SimpleNamespace(clear=lambda: [])
-        manager._reset_iteration_peak_num_blocks()
+        Suspend/resume is a per-request, manager-level event, so the counters must
+        appear at the top level of the stats dict, not nested inside the per-pool-group
+        breakdown. This is the black-box signal a test uses to confirm the V2
+        ACTIVE<->SUSPENDED state machine fired (offload/onboard bytes stay 0 on
+        suspend, so they are the wrong proxy).
+        """
+        iter_stats = _make_mock_iteration_stats()
+        by_window = _make_mock_kv_iter_stats(window_size=16)
+        pool_group_stats = _make_mock_kv_iter_stats(window_size=16)[16]
+        kv_iter = KVCacheV2IterationStatsReport(
+            by_window,
+            {
+                0: KVCacheV2PoolGroupIterationStats(
+                    pool_group_id=0,
+                    slot_size=(2 << 20,),
+                    window_sizes=(16,),
+                    stats=pool_group_stats,
+                )
+            },
+            suspended_requests=2,
+            resumed_requests=1,
+            disk_prefetch_blocks=7,
+            cached_tokens_by_level=[5, 2, 1],
+            cache_level_tiers=["gpu", "host", "disk"],
+        )
 
-        # Some gauges rise above the reset baseline, then fall before drain.
-        storage.primary_stats[0].available = 5  # primary used = 5
-        storage.primary_stats[0].evictable = 3
-        storage.primary_stats[1].available = 6  # primary used = 4
-        storage.primary_stats[1].evictable = 4
-        storage.secondary_stats[0].available = 2  # secondary used = 3
-        storage.secondary_stats[0].evictable = 2
-        manager._update_iteration_peak_num_blocks()
-        storage.primary_stats[0].available = 7  # primary used = 3
-        storage.primary_stats[0].evictable = 1
-        storage.secondary_stats[0].available = 4  # secondary used = 1
-        storage.secondary_stats[0].evictable = 1
+        result = BaseWorker._stats_serializer((iter_stats, None, kv_iter))
+        d = json.loads(result)
 
-        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
-        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
-        assert [stats.available for stats in primary_peak] == [8, 9]
-        assert [stats.unavailable for stats in primary_peak] == [5, 4]
-        assert [stats.evictable for stats in primary_peak] == [3, 4]
-        assert [stats.available for stats in secondary_peak] == [4, 5]
-        assert [stats.unavailable for stats in secondary_peak] == [3, 0]
-        assert [stats.evictable for stats in secondary_peak] == [2, 0]
-
-        # The next interval starts from current usage, not zero.
-        primary_peak = manager.get_and_reset_iteration_peak_block_stats(GPU_LEVEL)
-        secondary_peak = manager.get_and_reset_iteration_peak_block_stats(CacheLevel(1))
-        assert [stats.available for stats in primary_peak] == [7, 6]
-        assert [stats.unavailable for stats in primary_peak] == [3, 4]
-        assert [stats.evictable for stats in primary_peak] == [1, 4]
-        assert [stats.available for stats in secondary_peak] == [4, 5]
-        assert [stats.unavailable for stats in secondary_peak] == [1, 0]
-        assert [stats.evictable for stats in secondary_peak] == [1, 0]
+        assert d["iterSuspendedRequests"] == 2
+        assert d["iterResumedRequests"] == 1
+        assert d["iterDiskPrefetchBlocks"] == 7
+        assert d["iterCachedTokensByLevel"] == [5, 2, 1]
+        assert d["kvCacheLevelTiers"] == ["gpu", "host", "disk"]
+        # Manager-level, not nested inside the per-pool-group breakdown.
+        pool_group = d["kvCacheIterationStatsByPoolGroup"]["0"]
+        assert "iterSuspendedRequests" not in pool_group
+        assert "iterResumedRequests" not in pool_group

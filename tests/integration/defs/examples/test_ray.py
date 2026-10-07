@@ -19,6 +19,7 @@ except ImportError:
 import pytest
 from defs.common import venv_check_call, wait_for_server
 from defs.conftest import get_device_count, llm_models_root
+from defs.disaggregated.test_disaggregated import get_ucx_tls
 from defs.trt_test_alternative import popen
 
 
@@ -30,7 +31,7 @@ def ray_example_root(llm_root):
 
 def test_llm_inference_async_ray(ray_example_root, llm_venv):
     script_path = os.path.join(ray_example_root, "llm_inference_async_ray.py")
-    model_path = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
     venv_check_call(llm_venv, [script_path, "--model", model_path])
 
 
@@ -63,7 +64,7 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
         model_dir = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
         cmd.extend(["--model_dir", model_dir])
     else:
-        model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+        model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
         cmd.extend(["--model_dir", model_dir])
 
     venv_check_call(llm_venv, cmd)
@@ -170,7 +171,7 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
 
     disagg_dir = os.path.join(ray_example_root, "disaggregated")
     script_path = os.path.join(disagg_dir, "disagg_serving_local.sh")
-    model_dir = f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_dir = f"{llm_models_root()}/Qwen3/Qwen3-0.6B"
 
     try:
         runtime_env = {
@@ -188,7 +189,12 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
         env_copy = os.environ.copy()
         env_copy.update({
             "RAY_ADDRESS": f"localhost:{ray_port}",
-            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0"
+            "TLLM_RAY_FORCE_LOCAL_CLUSTER": "0",
+            # UCX transport allowlist must match test_disaggregated.py: with
+            # UCX auto-selection the NIXL agent AM channel can pick an IB
+            # loopback path that times out on some DGX nodes, turning into a
+            # permanent request hang (https://nvbugs/6670614).
+            "UCX_TLS": get_ucx_tls(),
         })
         with popen(
             [
@@ -223,7 +229,7 @@ def _run_completion_requests():
 
     async def send_request(session, prompt):
         payload = {
-            "model": "TinyLlama-1.1B-Chat-v1.0",
+            "model": "Qwen3-0.6B",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -275,11 +281,14 @@ def _run_completion_requests():
         print(f"Request {index} response: {text}")
 
     content = "\n".join(generated_texts)
-    for expected_string in [
-            "The capital of Germany is Berlin",
-            "Asyncio is a Python library",
-    ]:
-        assert expected_string in content, (
-            f"Expected string {expected_string!r} not found in responses")
+    assert "The capital of Germany is Berlin" in content, (
+        "Expected string 'The capital of Germany is Berlin' not found in responses"
+    )
+    # Different models (and sampling runs) phrase the continuation of the raw
+    # asyncio prompt differently, so match case-insensitively on the prompt's
+    # own keyword instead of an exact phrase (see test_disaggregated.py's
+    # run_client_tests for the same rationale).
+    assert "asyncio" in content.lower(), (
+        "Expected 'asyncio' not found in responses")
     assert "Berlin Berlin" not in content, (
         "Unexpected string 'Berlin Berlin' found in responses")

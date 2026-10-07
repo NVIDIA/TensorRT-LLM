@@ -18,6 +18,10 @@ from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
+)
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
@@ -62,10 +66,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._strip_gen_message_history = config.gen_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
+        self._subagent_affinity_scope = config.subagent_affinity_scope
 
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        # Token counting is stateless and cheap, so it is spread over the
+        # context workers round-robin rather than going through the router,
+        # which would charge the pick against KV-cache-aware load accounting.
+        self._count_tokens_rr_counter = 0
 
         match self._config.schedule_style:
             case "generation_first":
@@ -109,6 +118,29 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
+
+    async def anthropic_count_tokens(
+        self, request: AnthropicCountTokensRequest
+    ) -> AnthropicCountTokensResponse:
+        """Forward count-tokens to a context worker with the real tokenizer.
+
+        The disaggregated server holds no tokenizer of its own, so counting has
+        to happen on a worker. Context workers are the ones that tokenize
+        prompts, so the count they return is the one that will actually be used.
+        """
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._ctx_router.servers
+        if not servers:
+            raise RuntimeError("No context servers are available")
+        server = servers[self._count_tokens_rr_counter % len(servers)]
+        self._count_tokens_rr_counter += 1
+        return await self._ctx_client.post_json(
+            "v1/messages/count_tokens",
+            request,
+            AnthropicCountTokensResponse,
+            server,
+        )
 
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -165,6 +197,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             # benchmark-only path above is the only trusted source here.
             if not benchmark_gen_only:
                 gen_req = request.model_copy(update={"disaggregated_params": None})
+        self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
@@ -195,19 +228,28 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        ctx_request = request.model_copy(
-            update={
-                "disaggregated_params": DisaggregatedParams(
-                    request_type="context_only",
-                    disagg_request_id=disagg_request_id,
-                    schedule_style=self._schedule_style,
-                    return_prompt_token_ids_b64=self._tokids_ctxbytes,
-                ),
-                "stream": False,
-                "stream_options": None,
-            }
-        )
+        update = {
+            "disaggregated_params": DisaggregatedParams(
+                request_type="context_only",
+                disagg_request_id=disagg_request_id,
+                schedule_style=self._schedule_style,
+                return_prompt_token_ids_b64=self._tokids_ctxbytes,
+            ),
+            "stream": False,
+            "stream_options": None,
+        }
+        # Isolate context affinity from the generation request's shallow copy.
+        if request.conversation_params is not None:
+            update["conversation_params"] = request.conversation_params.model_copy()
+        ctx_request = request.model_copy(update=update)
         return ctx_request
+
+    def _strip_gen_subagent_affinity(self, gen_req: UCompletionRequest) -> None:
+        """Keep generation parent affinity only for the "both" scope."""
+        if self._subagent_affinity_scope == "both":
+            return
+        if gen_req.conversation_params is not None:
+            gen_req.conversation_params.subagent_affinity_id = None
 
     def _get_gen_request(
         self,
@@ -395,6 +437,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             disagg_request_id=disagg_request_id,
             ctx_server_info=ctx_server_info,
         )
+        self._strip_gen_subagent_affinity(gen_req)
 
         if request.stream and need_ctx:
             # For streaming gen_first requests, the gen client returns a lazy

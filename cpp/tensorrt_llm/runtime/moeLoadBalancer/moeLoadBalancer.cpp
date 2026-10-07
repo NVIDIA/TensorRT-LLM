@@ -18,7 +18,7 @@
 #include "hostAccessibleDeviceAllocator.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceKernels.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceKernels.h"
 #include "topologyDetector.h"
 #include <algorithm>
 #include <atomic>

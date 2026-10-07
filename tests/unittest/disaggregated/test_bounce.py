@@ -379,8 +379,15 @@ def _make_transport(
 
 
 def _recv_req(block_counts, rid=1, slice_id=0):
+    # Positional block tables: `n` held slots followed by one -1 hole, which
+    # the reserve sizing must not count.
     return SimpleNamespace(
-        block_ids_per_layer_groups=[SimpleNamespace(size=n) for n in block_counts],
+        block_ids_per_layer_groups=[
+            np.concatenate([np.arange(n, dtype=np.int64), np.array([-1], dtype=np.int64)])
+            if n
+            else np.array([], dtype=np.int64)
+            for n in block_counts
+        ],
         unique_rid=rid,
         slice_id=slice_id,
         bounce_dst_base=None,
@@ -692,10 +699,10 @@ class TestFanInReserve:
 # replicated per rank.
 _K3_MLA_BLOCK_BYTES = 32 * 576 * 2 * 24  # tpb x (kv_lora_rank+rope) x bf16 x 24 layers = 884,736
 _K3_KDA_LAYERS = 69
-_K3_CONV_SLOT_BYTES = 294_912  # [3*H*hd, W] bf16 per layer
+_K3_CONV_SLOT_BYTES = 221_184  # [3*H*hd, W-1] bf16 per layer
 _K3_SSM_SLOT_BYTES = 6_291_456  # [H, hd, hd] fp32 per layer (95.5% of the state)
 _K3_KDA_PAYLOAD_BYTES = (
-    454_459_392  # 69 x (conv + delta) per request per rank, from the geometry above
+    449_372_160  # 69 x (conv + delta) per request per rank, from the geometry above
 )
 
 
@@ -735,6 +742,7 @@ def _k3_page_table() -> KVCachePageTable:
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=_K3_CONV_SLOT_BYTES,
+            section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
         ),
         PoolView(
             pool_idx=1,
@@ -744,14 +752,13 @@ def _k3_page_table() -> KVCachePageTable:
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=_K3_SSM_SLOT_BYTES,
+            bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
         ),
     ]
     mamba = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=local_layers,
         pool_views=pool_views,
-        conv_section_bytes=[_K3_CONV_SLOT_BYTES // 3] * 3,
-        ssm_bytes_per_head=_K3_SSM_SLOT_BYTES // 4,
     )
     return KVCachePageTable(
         tokens_per_block=32,
@@ -780,7 +787,7 @@ class TestHybridK3Bounce:
 
     def test_reserve_engages_on_k3_mixed_layout(self, monkeypatch):
         # Regression pin: a K3 recv request always carries a trailing EMPTY entry for
-        # the mamba layer group (transceiver._create_kv_slice), which used to trip the
+        # the mamba layer group (transceiver._create_chunk), which used to trip the
         # unknown-slot-size guard and silently push every K3 request onto the per-fragment
         # (~0.4 GB/s host-staged) path. It must engage bounce, sized for MLA KV + KDA state.
         t = _make_transport(
@@ -977,6 +984,29 @@ class TestLifecycle:
         assert ret.disposition is bcore.Disposition.RELEASE  # all drained -> free, not quarantine
         assert ret.success is False
         assert c.state is bcore.TransferState.FAILED
+
+    def test_partial_publication_waits_for_published_writers_without_scatter(self):
+        c = self._ctx(2)
+        c.record_writer_result(7, succeeded=True, src_base=0, **self._dst())
+
+        c.abort_publication(published_writers={7})
+
+        assert not c.ready_to_scatter()
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
+        assert c.state is bcore.TransferState.FAILED
+
+    def test_failed_publication_with_no_published_writer_settles_immediately(self):
+        c = self._ctx(2)
+
+        c.abort_publication(published_writers=set())
+
+        assert c.ready_to_settle()
+        ret = c.settle()
+        assert ret.disposition is bcore.Disposition.RELEASE
+        assert ret.success is False
 
     def test_orphan_quarantines(self):
         c = self._ctx(2)

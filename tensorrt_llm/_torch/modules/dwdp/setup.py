@@ -41,6 +41,7 @@ no-op (returns the existing manager stored on the model).
 
 from __future__ import annotations
 
+import traceback
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -66,6 +67,22 @@ _EXPERT_WEIGHT_NAMES = (
     "w3_w1_weight_scale",
     "w2_weight_scale",
 )
+
+
+def _release_during_rollback(resource, what: str) -> None:
+    """Release a partially built resource without masking the in-flight error.
+
+    Rollback runs while an exception is propagating. A raise from ``release()``
+    would replace that exception, so the caller would see the cleanup failure
+    instead of the reason setup failed.
+    """
+    try:
+        resource.release()
+    except BaseException:  # noqa: BLE001 - cleanup must never mask the original
+        logger.error(
+            f"[DWDP Setup] {what} release failed during rollback\n"
+            f"{traceback.format_exc()}"
+        )
 
 
 def setup_dwdp(
@@ -110,7 +127,7 @@ def setup_dwdp(
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
-        The manager is also stored on ``model._dwdp_weight_manager`` so that
+        The manager is also stored on ``model.dwdp_weight_manager`` so that
         a second call returns the cached instance (idempotent).
     """
     # --- Guard: DWDP not enabled ---
@@ -210,58 +227,76 @@ def setup_dwdp(
 
     # 5. WeightBuffer: composite VA layout
     logger.info("[DWDP Setup] Creating weight buffer (composite VA layout)...")
-    weight_buffer = WeightBuffer.create(
-        layer_weight_specs=layer_weight_specs,
-        handles=transport.get_handle_set(),
-        local_start=local_start,
-        local_end=local_end,
-        dwdp_size=mapping.dwdp_size,
-        device_id=device_id,
-    )
+    try:
+        weight_buffer = WeightBuffer.create(
+            layer_weight_specs=layer_weight_specs,
+            handles=transport.get_handle_set(),
+            local_start=local_start,
+            local_end=local_end,
+            dwdp_size=mapping.dwdp_size,
+            device_id=device_id,
+        )
+    except BaseException:
+        _release_during_rollback(transport, "transport")
+        raise
     logger.info("[DWDP Setup] Weight buffer created successfully.")
 
     # 6. Fill edge bytes
     logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
     peer_ranges = transport.get_peer_ranges()
-    fill_edge_bytes(
-        weight_buffer=weight_buffer,
-        peer_views=transport.get_peer_views(),
-        local_start=local_start,
-        local_end=local_end,
-        peer_ranges=peer_ranges,
-    )
+    try:
+        fill_edge_bytes(
+            weight_buffer=weight_buffer,
+            peer_views=transport.get_peer_views(),
+            local_start=local_start,
+            local_end=local_end,
+            peer_ranges=peer_ranges,
+        )
+    except BaseException:
+        _release_during_rollback(weight_buffer, "weight buffer")
+        _release_during_rollback(transport, "transport")
+        raise
     logger.info("[DWDP Setup] Edge bytes filled.")
 
     # 7. WeightManager
     logger.info("[DWDP Setup] Creating weight manager...")
-    weight_manager = DWDPWeightManager(
-        weight_buffer=weight_buffer,
-        peer_views=transport.get_peer_views(),
-        peer_ranges=peer_ranges,
-        moe_layer_indices=layer_indices,
-        weight_names=list(weight_names),
-        dwdp_rank=mapping.dwdp_rank,
-        dwdp_size=mapping.dwdp_size,
-        contention_opt=contention_opt,
-    )
+    try:
+        weight_manager = DWDPWeightManager(
+            weight_buffer=weight_buffer,
+            peer_views=transport.get_peer_views(),
+            peer_ranges=peer_ranges,
+            moe_layer_indices=layer_indices,
+            weight_names=list(weight_names),
+            dwdp_rank=mapping.dwdp_rank,
+            dwdp_size=mapping.dwdp_size,
+            contention_opt=contention_opt,
+        )
+    except BaseException:
+        _release_during_rollback(weight_buffer, "weight buffer")
+        _release_during_rollback(transport, "transport")
+        raise
+    # Transfer resource ownership before backend fixup so every later failure
+    # can be rolled back through one idempotent manager release.
+    weight_manager._transport = transport
     logger.info("[DWDP Setup] Weight manager created.")
 
     # 8. Patch MoE backends
     logger.info("[DWDP Setup] Patching MoE backends...")
-    fixup_moe_backends(
-        model,
-        layer_indices,
-        num_experts_total,
-        comm,
-        mapping.dwdp_rank,
-        mapping.dwdp_size,
-        num_experts_per_worker=num_experts_per_worker,
-        peer_ranges=peer_ranges,
-    )
+    try:
+        fixup_moe_backends(
+            model,
+            layer_indices,
+            num_experts_total,
+            comm,
+            mapping.dwdp_rank,
+            mapping.dwdp_size,
+            num_experts_per_worker=num_experts_per_worker,
+            peer_ranges=peer_ranges,
+        )
+    except BaseException:
+        _release_during_rollback(weight_manager, "weight manager")
+        raise
     logger.info("[DWDP Setup] MoE backends patched.")
-
-    # 9. Keep transport alive (its handles underpin the VA mappings)
-    weight_manager._transport = transport
 
     # Store on both the top-level model (for idempotent retrieval) and the
     # inner decoder model (where DeepseekV3Model.forward() reads it).
@@ -270,6 +305,48 @@ def setup_dwdp(
 
     logger.info("[DWDP Setup] Setup complete.")
     return weight_manager
+
+
+def teardown_dwdp(
+    model: nn.Module,
+    expected_manager: Optional[DWDPWeightManager] = None,
+) -> None:
+    """Detach and release a model's DWDP runtime state.
+
+    Both the top-level model and its decoder hold the same manager so forward
+    can reach it without a global lookup. Clear those references before
+    unmapping the composite VA, then release the manager exactly once.
+    """
+    decoder_model = _get_decoder_model(model)
+    managers = []
+    for owner in (model, decoder_model):
+        manager = getattr(owner, _DWDP_SETUP_DONE, None)
+        if manager is not None and (
+            expected_manager is None or manager is expected_manager
+        ) and all(manager is not item for item in managers):
+            managers.append(manager)
+        if hasattr(owner, _DWDP_SETUP_DONE) and (
+            expected_manager is None or manager is expected_manager
+        ):
+            setattr(owner, _DWDP_SETUP_DONE, None)
+
+    if expected_manager is not None and all(
+        expected_manager is not item for item in managers
+    ):
+        managers.append(expected_manager)
+
+    first_error = None
+    for manager in managers:
+        try:
+            manager.release()
+        except BaseException as exc:  # noqa: BLE001 - every manager must be tried
+            logger.error(
+                f"[DWDP Teardown] Manager release failed\n{traceback.format_exc()}"
+            )
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise first_error
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +708,20 @@ def fixup_moe_backends(
             target.num_slots = num_experts_total
             target.initial_local_expert_ids = list(range(num_experts_total))
             target.initial_global_assignments = list(range(num_experts_total))
+
+        # ``expert_size_per_partition`` just changed, and it sizes every
+        # PER_EXPERT_TENSOR activation constant. This function is the layout's
+        # last writer, so re-materialize them here. Backend only: the wrapper
+        # declares no ``activation_support`` of its own. Imported locally because
+        # ``fused_moe`` reads the DWDP manager, so a module-scope import here
+        # would close that cycle. Spelled absolute rather than relative: this
+        # module sits one level deeper than ``modules/``, so the relative form
+        # needs three dots, and getting that wrong resolves to a package that
+        # does not exist without any static check noticing.
+        from tensorrt_llm._torch.moe.fused_moe.activation import install_activation_params
+
+        if getattr(experts_module, "activation", None) is not None:
+            install_activation_params(experts_module)
 
         logger.debug(
             f"[DWDP Setup] Layer {layer_idx}: patched "
