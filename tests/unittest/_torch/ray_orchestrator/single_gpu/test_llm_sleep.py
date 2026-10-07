@@ -71,7 +71,7 @@ def test_llm_sleep(process_gpu_memory_info_available):
 
 def test_llm_sleep_kv_cache_prefix_reuse():
     """Destructive KV-cache release invalidates reusable prefixes in V1."""
-    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         max_tokens=16384,
