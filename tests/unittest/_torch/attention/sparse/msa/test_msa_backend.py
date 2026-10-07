@@ -792,7 +792,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         msa_decode_span = None
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
-        msa_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
+        msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
@@ -911,7 +911,7 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
-        msa_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
+        msa_prefill_proxy_kv_indices = torch.arange(num_tokens, dtype=torch.int32)
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
@@ -1362,6 +1362,52 @@ def test_plan_rows_narrow_to_the_rows_fmha_sm100_still_runs():
     # No generation row, so the proxy scores every row.
     assert prefill._msa_proxy_plan_rows() == (0, 2)
     assert prefill._msa_attn_plan_rows() == (0, 2)
+
+
+@pytest.mark.cpu_only
+def test_long_prefix_chunk_gets_a_split_proxy_plan_over_its_own_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chunk after a long cached prefix gets a segmented, KV-split proxy plan.
+
+    Its page table is gathered from the context row's pages only, never the
+    generation rows'.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend, msa_indexer
+
+    def fmha_sm100_plan(qo_lens, kv_lens, **kwargs):
+        return dict(qo_lens=qo_lens.tolist(), **kwargs)
+
+    monkeypatch.setattr(
+        msa_backend, "require_msa_module", lambda: SimpleNamespace(fmha_sm100_plan=fmha_sm100_plan)
+    )
+    monkeypatch.setattr(msa_backend, "_cache_device", lambda metadata: torch.device("cpu"))
+    monkeypatch.setattr(msa_indexer, "_num_sms", lambda: 148)
+    # 1025 new tokens over 131072 cached, then two generation rows.
+    metadata = _span_metadata(num_contexts=1, qo_lens=(1025, 1, 1), kv_lens=(132097, 50000, 60000))
+    metadata._set_decode_span()
+    metadata._msa_fields_ready = True
+    metadata._msa_params = SimpleNamespace(
+        sharded_index_head_count=lambda mapping: 1,
+        sharded_head_counts=lambda mapping: (8, 2),
+        topk=16,
+    )
+    metadata.kv_cache_manager = SimpleNamespace(tokens_per_block=128, dtype=DataType.FP8)
+    # The context row owns pages 0-1032; the generation rows' pages follow.
+    metadata.msa_kv_indices = torch.arange(1033 + 391 + 469, dtype=torch.int32) + 7
+
+    metadata._build_step_plans()
+
+    proxy = metadata.msa_prefill_proxy_plan
+    assert proxy["qo_lens"] == [128] * 8 + [1]
+    assert proxy["num_kv_splits"] == 16 and proxy["output_maxscore"]
+    # Segment i reads its row's leading ceil(kv_len_i / 128) pages.
+    expected = torch.cat(
+        [torch.arange(7, 7 + 1025 + i) for i in range(8)] + [torch.arange(7, 7 + 1033)]
+    )
+    assert torch.equal(metadata.msa_prefill_proxy_kv_indices, expected.to(torch.int32))
+    # The attention plans still cover the context row whole.
+    assert metadata.msa_prefill_dense_plan["qo_lens"] == [1025]
 
 
 @pytest.mark.parametrize("head_major", [False, True])

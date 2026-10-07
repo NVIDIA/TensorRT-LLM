@@ -965,7 +965,7 @@ def test_piecewise_attention_boundary_preserves_indexer_cache_contract(
         msa_write_idx_k=Mock(),
         msa_prefill_proxy_plan=None,
         msa_prefill_n_valid_blocks=None,
-        msa_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
+        msa_prefill_proxy_kv_indices=torch.tensor([0, 1], dtype=torch.int32),
         msa_qo_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_kv_lens_cpu=torch.tensor([2], dtype=torch.int32),
         msa_qo_offset_cpu=torch.tensor([0], dtype=torch.int32),
