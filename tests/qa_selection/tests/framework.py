@@ -20,7 +20,7 @@
     run.selected          the node ids the run kept, in collection order
     run.record            <machine>.json, when the run named --selection-out-dir={out}
     run.outcome(nodeid)   one test's entry in that record
-    run.ids(rung)         one published identifier list; rung of None is <machine>.ids
+    run.ids(rung)         one rung's published identifier list
     run.written           every file name the run left in its output directory
 
 `selection.refuse(...)` is the same call for a run that must fail as a usage
@@ -61,7 +61,6 @@ class SelectionRun:
     #: Spelled out, never imported from `collection.ArtifactNames`: these are
     #: the tripwire for a rename of the plugin's own output.
     RECORD = "{machine}.json"
-    IDS = "{machine}.ids"
     RUNG_IDS = "{machine}-{rung}gpu.ids"
 
     #: The plugin's terminal block: a section, then `f"{label:<14}{value}"` lines.
@@ -90,16 +89,9 @@ class SelectionRun:
         """`<machine>.json`, parsed."""
         return json.loads(self.artifact(self.RECORD.format(machine=self.machine)).read_text())
 
-    def ids(self, rung: Optional[int] = None) -> List[str]:
-        """One published identifier list, in the order it was written.
-
-        A rung's list, or -- with `rung` of None -- `<machine>.ids`.
-        """
-        name = (
-            self.IDS.format(machine=self.machine)
-            if rung is None
-            else self.RUNG_IDS.format(machine=self.machine, rung=rung)
-        )
+    def ids(self, rung: int) -> List[str]:
+        """One rung's published identifier list, in the order it was written."""
+        name = self.RUNG_IDS.format(machine=self.machine, rung=rung)
         return self.artifact(name).read_text(encoding="utf-8").splitlines()
 
     @property
