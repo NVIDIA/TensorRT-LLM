@@ -13,10 +13,12 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     get_all_rank_num_tokens,
     get_padding_params,
     get_top_level_model,
+    make_scheduled_inputs,
     prepare_multimodal_indices,
     set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 pytestmark = pytest.mark.cpu_only
@@ -205,3 +207,26 @@ def test_ship_multimodal_indices_copies_and_extends_text_indices(
     else:
         arange.assert_not_called()
         cat.assert_not_called()
+
+
+@pytest.mark.parametrize("returns_context_logits", [False, True])
+def test_make_scheduled_inputs_gathers_context_logits_from_context_requests(
+    returns_context_logits: bool,
+) -> None:
+    batch = ScheduledRequests()
+    batch.context_requests_chunking = [SimpleNamespace(py_return_context_logits=False)]
+    batch.context_requests_last_chunk = [
+        SimpleNamespace(py_return_context_logits=returns_context_logits)
+    ]
+    batch.generation_requests = [SimpleNamespace(py_return_context_logits=True)]
+    new_tensors_device = object()
+
+    inputs = make_scheduled_inputs(
+        batch, new_tensors_device, None, enable_spec_decode=True, runtime_draft_len=3
+    )
+
+    assert inputs.batch is batch
+    assert inputs.new_tensors_device is new_tensors_device
+    assert inputs.cache_indirection_buffer is None
+    assert inputs.gather_context_logits is returns_context_logits
+    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 3)

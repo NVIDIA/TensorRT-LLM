@@ -478,6 +478,29 @@ class TestLTX2BatchSupport:
             assert torch_shape[0] == batch_size
 
     @pytest.mark.cpu_only
+    def test_video_scale_factors_follow_tensor_axis_order(self):
+        """Asymmetric scale factors map to time, height, and width axes."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.patchifier import get_pixel_coords
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.types import (
+            SpatioTemporalScaleFactors,
+            VideoLatentShape,
+            VideoPixelShape,
+        )
+
+        scale_factors = SpatioTemporalScaleFactors(time=2, height=4, width=8)
+        pixel_shape = VideoPixelShape(batch=1, frames=9, height=16, width=32, fps=24.0)
+        latent_shape = VideoLatentShape.from_pixel_shape(
+            pixel_shape, latent_channels=128, scale_factors=scale_factors
+        )
+
+        assert latent_shape[2:] == (5, 4, 4)
+        assert latent_shape.upscale(scale_factors)[2:] == (9, 16, 32)
+
+        latent_bounds = torch.tensor([[[[1, 2]], [[1, 2]], [[1, 2]]]])
+        pixel_bounds = get_pixel_coords(latent_bounds, scale_factors)
+        assert pixel_bounds.tolist() == [[[[2, 4]], [[4, 8]], [[8, 16]]]]
+
+    @pytest.mark.cpu_only
     def test_prompt_normalization(self):
         """forward() normalizes str prompt to List[str] and computes batch_size."""
         # Simulate the normalization logic from forward()

@@ -44,9 +44,17 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once after the first successful LLM initialization. Contains system info
-and the first successfully reported LLM's serving configuration. A process that
-fails earlier can send a terminal report without an initial report.
+Normally sent after the first successful LLM initialization with system information
+and serving configuration. If startup fails, it can instead be sent alongside the
+exit report with as much information as is available (**partial context**).
+These partial reports are marked with
+`llmApiConfigMetaJson.report_context == "pre_initialization_exit"` and do not
+indicate successful initialization.
+
+For dashboards, the top-level event parameter `llmInstancesCreated >= 1`
+confirms successful LLM initialization; partial reports have `llmInstancesCreated == 0`.
+Do not count initial reports alone as successful deployments. Treat a missing
+counter in older records as unknown, not zero.
 
 #### System fields
 
@@ -68,6 +76,10 @@ fails earlier can send a terminal report without an initial report.
 | `cudaVersion` | ShortString | CUDA toolkit version. | `"12.4"` |
 
 #### Parallelism fields
+
+In partial reports, `0` for `tensorParallelSize`, `pipelineParallelSize`, or
+`contextParallelSize` means unknown (not captured), not a real parallelism degree;
+exclude these sentinel values from parallelism averages and distributions.
 
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|

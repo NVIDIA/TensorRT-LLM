@@ -13,8 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-# torch.ops.trtllm MoE ops, grouped like kernels/moe/ (marlin/ is thop-only). No
-# target of its own: everything here compiles into th_common, defined in
-# ../CMakeLists.txt. moeOp.cpp holds the primary TORCH_LIBRARY(trtllm) block.
+# torch.ops.trtllm MoE ops, grouped like kernels/moe/ (marlin/ is thop-only).
+# The parent defines th_common_moe; moeOp.cpp holds the primary
+# TORCH_LIBRARY(trtllm) block.
 file(GLOB_RECURSE SRC_CPP CONFIGURE_DEPENDS *.cpp)
-target_sources(th_common PRIVATE ${SRC_CPP})
+target_sources(th_common_moe PRIVATE ${SRC_CPP})

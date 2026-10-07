@@ -679,6 +679,43 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
 
+    def test_hyphenated_function_name(self):
+        """Test that function names containing hyphens are parsed."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get-weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        tool_call = ('<|tool_call_begin|>functions.get-weather:0'
+                     '<|tool_call_argument_begin|>{"location":"Tokyo"}'
+                     '<|tool_call_end|>')
+
+        result = KimiK2ToolParser().detect_and_parse(
+            '<|tool_calls_section_begin|>' + tool_call +
+            '<|tool_calls_section_end|>', tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+        parser = KimiK2ToolParser()
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>', tools)
+        result = parser.parse_streaming_increment(tool_call, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
