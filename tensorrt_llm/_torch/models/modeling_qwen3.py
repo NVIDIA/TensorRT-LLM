@@ -1,5 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 from torch import nn
@@ -274,6 +288,13 @@ class Qwen3Model(DecoderModel):
 @register_auto_model("Qwen3ForCausalLM")
 class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen3."""
+        return "V2"
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3Config],
@@ -312,6 +333,13 @@ class Qwen3ForTextEmbedding(DecoderModelForCausalLM[Qwen3Model, Qwen3Config]):
     pipeline (Transformer -> Pooling[last-token] -> Normalize) and SGLang's
     `Pooler(PoolingType.LAST, normalize=True)`.
     """
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen3 embedding models."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[Qwen3Config]):
         # lm_head is intentionally not allocated: like Qwen2ForRewardModel we call

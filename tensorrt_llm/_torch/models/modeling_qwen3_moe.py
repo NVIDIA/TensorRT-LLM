@@ -1,5 +1,19 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 from torch import nn
@@ -418,6 +432,13 @@ class Qwen3MoEModel(DecoderModel):
 @register_auto_model("Qwen3MoeForCausalLM")
 class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
                                                       Qwen3MoeConfig]):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen3 MoE."""
+        return "V2"
 
     def __init__(
         self,

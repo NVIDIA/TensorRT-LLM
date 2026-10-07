@@ -1,4 +1,18 @@
-from typing import Optional, Tuple
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -248,6 +262,13 @@ class QwenModel(DecoderModel):
 @register_auto_model("Qwen2ForCausalLM")
 class Qwen2ForCausalLM(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen2 and Qwen2.5."""
+        return "V2"
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen2Config],
@@ -294,6 +315,13 @@ class Qwen2ForProcessRewardModel(DecoderModelForCausalLM[QwenModel,
     output) e.g. for Named-Entity-Recognition (NER) tasks.
     """
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen2 process reward models."""
+        return "V2"
+
     def __init__(self, model_config: ModelConfig[Qwen2Config]):
         nn.Module.__init__(self)
         self.model_config = model_config
@@ -336,6 +364,13 @@ class Qwen2ForRewardModel(DecoderModelForCausalLM[QwenModel, Qwen2Config]):
     """
     Qwen/Qwen2.5-Math-RM
     """
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen2 reward models."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[Qwen2Config]):
         nn.Module.__init__(self)

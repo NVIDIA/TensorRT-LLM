@@ -5,7 +5,7 @@ import copy
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -2407,6 +2407,13 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen2-VL."""
+        return "V2"
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
         # NOTE: Since Qwen2-VL is outdated model, we leave it as HF implementation.
@@ -2534,6 +2541,13 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(cls,
+                                               pretrained_config: object
+                                               | None = None) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen2.5-VL."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
