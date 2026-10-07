@@ -1176,8 +1176,9 @@ def test_KvCacheConfig_swa_endpoint_rewind_requires_reuse_and_v2(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("preference", [None, "V1", "V2"])
-def test_swa_endpoint_rewind_auto_manager_selection(
-        preference: str | None) -> None:
+@pytest.mark.parametrize("auto_select", [False, True], ids=["default", "auto"])
+def test_swa_endpoint_rewind_manager_selection(preference: str | None,
+                                               auto_select: bool) -> None:
 
     class Model:
 
@@ -1186,11 +1187,16 @@ def test_swa_endpoint_rewind_auto_manager_selection(
                 config: object) -> str | None:
             return preference
 
-    args = TorchLlmArgs(
-        model="dummy",
-        kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
-            swa_endpoint_rewind_tokens=1024)))
-    if preference == "V2":
+    config: dict[str, Any] = {
+        "block_reuse_config": {
+            "swa_endpoint_rewind_tokens": 1024
+        }
+    }
+    if auto_select:
+        config["use_kv_cache_manager_v2"] = "auto"
+    args = TorchLlmArgs(model="dummy",
+                        kv_cache_config=KvCacheConfig.model_validate(config))
+    if not auto_select or preference == "V2":
         assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
     else:
         with pytest.raises(ValueError, match="swa_endpoint_rewind_tokens"):
