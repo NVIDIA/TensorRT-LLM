@@ -19,16 +19,10 @@
 `CollectedTest` is a framework-neutral view of a pytest `Item`: a node id and
 its marks, closest level first.
 
-Marker precedence, reproducing the fixtures that consume each one:
-
-    skipif                     every level; any match drops the test
-    skip_device_not_contain    closest marker only
-    skip_less_device_memory    every level
-    skip_less_host_memory      not evaluated
-
-The two GPU-count markers, `skip_less_device` and `skip_less_mpi_world_size`,
-are not read here: `allocation.py` decides GPU count once, against the run's
-ladder.
+Every `skipif` is read at every level, and any match drops the test. The
+resource markers bounding `device_name` and `device_memory_mib` are read as
+`markers.json` declares them. GPU-count markers are not read here:
+`allocation.py` decides GPU count once, against the run's ladder.
 
 A reason string with no rule keeps the test. The table is curated, so its
 silence is a decision, not a gap: nothing is recorded and nothing is reported.
@@ -38,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from .machines import MachineProfile
+from .markers import ResourceMarker, ResourceMarkers, default_markers
 from .rules import SkipRuleTable, default_rule_table
 
 
@@ -72,14 +67,16 @@ class CollectedTest:
         """Every mark of this name, closest level first."""
         return (mark for mark in self.marks if mark.name == name)
 
-    def closest_marker(self, name: str) -> Optional[Mark]:
-        """The nearest mark of this name, or None."""
-        return next(self.iter_markers(name), None)
+    def requirements(self, marker: ResourceMarker) -> Tuple[Any, ...]:
+        """What `marker` asks of this test, closest level first.
 
-    def closest_requirement(self, name: str) -> Optional[Any]:
-        """What the nearest `name` marker asks for, as get_closest_marker does."""
-        mark = self.closest_marker(name)
-        return mark.requirement if mark is not None else None
+        The nearest mark's alone, as `get_closest_marker` reads it, or every
+        level's, as `iter_markers` does, by the marker's `read`.
+        """
+        marks = list(self.iter_markers(marker.name))
+        if not marker.every_level:
+            marks = marks[:1]
+        return tuple(mark.requirement for mark in marks if mark.requirement is not None)
 
 
 @dataclass(frozen=True)
@@ -97,9 +94,15 @@ class Selector:
     Built once per machine, then asked about many tests.
     """
 
-    def __init__(self, profile: MachineProfile, rules: Optional[SkipRuleTable] = None) -> None:
+    def __init__(
+        self,
+        profile: MachineProfile,
+        rules: Optional[SkipRuleTable] = None,
+        markers: Optional[ResourceMarkers] = None,
+    ) -> None:
         self.profile = profile
         self.rules = rules if rules is not None else default_rule_table()
+        self.markers = markers if markers is not None else default_markers()
 
     def decide(self, test: CollectedTest) -> Decision:
         """Return the selection decision for one test, listing every blocker."""
@@ -128,25 +131,25 @@ class Selector:
         return blockers
 
     def resource_blockers(self, test: CollectedTest) -> List[str]:
-        """Apply the per-card resource markers, each in its production precedence."""
+        """Apply the per-card resource markers, each read as `markers.json` declares."""
         return self.device_name_blockers(test) + self.device_memory_blockers(test)
 
     def device_name_blockers(self, test: CollectedTest) -> List[str]:
-        """Report skip_device_not_contain when no keyword matches the device."""
-        keywords = test.closest_requirement("skip_device_not_contain")
-        if keywords is None or any(keyword in self.profile.device_name for keyword in keywords):
-            return []
+        """Report each keyword list that matches nothing in the device name."""
+        device_name = self.profile.device_name
         return [
-            f"skip_device_not_contain: {self.profile.device_name!r} "
-            f"contains none of {list(keywords)}"
+            f"{marker.name}: {device_name!r} contains none of {list(keywords)}"
+            for marker in self.markers.bounding(ResourceMarker.DEVICE_NAME)
+            for keywords in test.requirements(marker)
+            if not any(keyword in device_name for keyword in keywords)
         ]
 
     def device_memory_blockers(self, test: CollectedTest) -> List[str]:
-        """Report every level's demand; a method's marker does not replace its class's."""
+        """Report each memory demand above the card's."""
         available = self.profile.device_memory_mib
         return [
-            f"skip_less_device_memory: needs {int(mark.requirement)} MiB, "
-            f"target has {available} MiB"
-            for mark in test.iter_markers("skip_less_device_memory")
-            if mark.requirement is not None and available < int(mark.requirement)
+            f"{marker.name}: needs {int(required)} MiB, target has {available} MiB"
+            for marker in self.markers.bounding(ResourceMarker.DEVICE_MEMORY_MIB)
+            for required in test.requirements(marker)
+            if available < int(required)
         ]
