@@ -561,16 +561,16 @@ class CuDNNAttention(AttentionBackend):
         v_t = graph.tensor(
             name="v", dim=kv_container_dims, stride=list(s.page_stride), data_type=io
         )
-        pt_t = graph.tensor(
+        page_table_t = graph.tensor(
             name="page_table",
             dim=table_dims,
             stride=_row_major_stride(*table_dims),
             data_type=i32,
         )
-        lq_t = graph.tensor(
+        length_q_t = graph.tensor(
             name="seq_len_q", dim=length_dims, stride=_row_major_stride(*length_dims), data_type=i32
         )
-        lkv_t = graph.tensor(
+        length_kv_t = graph.tensor(
             name="seq_len_kv",
             dim=length_dims,
             stride=_row_major_stride(*length_dims),
@@ -585,10 +585,10 @@ class CuDNNAttention(AttentionBackend):
             is_inference=True,
             attn_scale=sm_scale,
             use_padding_mask=True,
-            seq_len_q=lq_t,
-            seq_len_kv=lkv_t,
-            paged_attention_k_table=pt_t,
-            paged_attention_v_table=pt_t,
+            seq_len_q=length_q_t,
+            seq_len_kv=length_kv_t,
+            paged_attention_k_table=page_table_t,
+            paged_attention_v_table=page_table_t,
             paged_attention_max_seq_len_kv=s.table_len * s.tokens_per_page,
         )
         o_t.set_output(True).set_dim(q_dims).set_stride(o_strides).set_data_type(io)
@@ -597,9 +597,9 @@ class CuDNNAttention(AttentionBackend):
             "q": q_t,
             "k": k_t,
             "v": v_t,
-            "page_table": pt_t,
-            "seq_len_q": lq_t,
-            "seq_len_kv": lkv_t,
+            "page_table": page_table_t,
+            "seq_len_q": length_q_t,
+            "seq_len_kv": length_kv_t,
         }
         return _CuDNNGraphBundle(
             graph=graph,
@@ -677,14 +677,18 @@ class CuDNNAttention(AttentionBackend):
             )
         num_causal_blocks = num_tokens // causal_block_size
         device = q.device
-        if q.dtype != kv_cache.kv_buffer(self.layer_idx).dtype:
-            raise TypeError(f"q is {q.dtype} but the cache holds {kv_cache.kv_buffer(0).dtype}")
+        buf = kv_cache.kv_buffer(self.layer_idx)
+        if q.dtype != buf.dtype:
+            raise TypeError(f"q is {q.dtype} but the cache holds {buf.dtype}")
         kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size)
+        # The cache keeps lengths and page-table rows for every causal block of a full
+        # chunk, in device tensors that commit() refreshes in place. A shorter forward
+        # (the first chunk, or a short last one) uses the leading blocks; the slices are
+        # views, so a captured graph keeps reading the live values.
         seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
         seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
 
         q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
-        buf = kv_cache.kv_buffer(self.layer_idx)
         page_table = kv_cache.page_table(causal_block_size)[:num_causal_blocks]
         num_pages, _, h_kv, tokens_per_page, _ = buf.shape
         shape = _CuDNNPagedShape(
