@@ -160,8 +160,22 @@ inline bool asyncJITWarmupEnabled()
     return sEnabled;
 }
 
+// Whether getAsyncJITWarmupWorker() has created the process-wide worker. Lets
+// drain paths (the pre-capture barrier, kernel destruction) skip the worker
+// entirely when no sweep was ever queued, instead of creating one just to
+// find it idle.
+inline std::atomic<bool>& asyncJITWarmupWorkerCreated()
+{
+    static std::atomic<bool> sCreated{false};
+    return sCreated;
+}
+
 // Process-wide worker for the background JIT warmup sweeps. See
-// fmhaJitWarmup.h for the lifetime and shutdown-ordering contract.
+// fmhaJitWarmup.h for the lifetime and shutdown-ordering contract. Every
+// dependency a queued sweep reads is either leaked (the registry, the
+// interface and selection mutexes, the install path) or constructed at library
+// load (the export library's globals), and kernel objects drain the worker in
+// their destructor, so it does not matter which path creates the worker first.
 inline TllmGenFmhaAsyncWarmupWorker& getAsyncJITWarmupWorker()
 {
     static TllmGenFmhaAsyncWarmupWorker* const sWorker = []()
@@ -182,11 +196,10 @@ inline TllmGenFmhaAsyncWarmupWorker& getAsyncJITWarmupWorker()
                         "run() will drain this worker before any CUDA graph capture.");
                 }
             });
-        // The worker is first created from the first warmup forward, after every
-        // static a sweep depends on has been constructed, so this handler drains
-        // and joins the worker before any of them is destroyed. The object itself
-        // is intentionally leaked.
+        // Drains and joins the worker at process exit so no sweep is still running
+        // during static destruction. The object itself is intentionally leaked.
         std::atexit([]() { getAsyncJITWarmupWorker().shutdown(); });
+        asyncJITWarmupWorkerCreated().store(true, std::memory_order_release);
         return worker;
     }();
     return *sWorker;
@@ -268,12 +281,11 @@ public:
 
     ~TllmGenFmhaKernel()
     {
-        // A queued background warmup task captures `this`. At process exit the
-        // worker's atexit handler has already drained and joined it (see
-        // fmhaJitWarmup.h); draining here as well covers a kernel object destroyed
-        // while the process keeps running. The worker is leaked, so this is safe
-        // during static destruction too.
-        if (asyncJITWarmupEnabled())
+        // A queued background warmup task captures `this`, so no such task may
+        // outlive this object: wait for it here, whether this object dies while
+        // the process keeps running or during static destruction (the worker and
+        // everything a sweep reads are leaked, so waiting is safe either way).
+        if (asyncJITWarmupEnabled() && asyncJITWarmupWorkerCreated().load(std::memory_order_acquire))
         {
             getAsyncJITWarmupWorker().drain();
         }
@@ -541,8 +553,7 @@ private:
             fmhaConfig.mCtaDim = ctaDim;
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
-            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
-            recordJITKernelKey(fmhaConfig);
+            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
@@ -613,20 +624,27 @@ private:
         return *sRegistry;
     }
 
-    // Keys of every NVRTC kernel configuration requested from the export library
-    // so far, hashed exactly as its kernel cache keys them: a key seen for the
-    // first time is a compile. Intentionally leaked. Guarded by
-    // getFmhaInterfaceMutex(), which both request sites already hold.
-    static std::unordered_set<size_t>& getRequestedJITKernelKeys()
+    // Tally of the export library's kernel-cache results (one per
+    // generateAndCompileKernel() call). Intentionally leaked.
+    static TllmGenFmhaJitCompileStats& getJITCompileStats()
     {
-        static auto* const sKeys = new std::unordered_set<size_t>();
-        return *sKeys;
+        static auto* const sStats = new TllmGenFmhaJitCompileStats();
+        return *sStats;
     }
 
-    // Must be called with getFmhaInterfaceMutex() held, after generateAndCompileKernel().
-    static void recordJITKernelKey(FmhaConfig const& fmhaConfig)
+    static void recordJITCacheResult(FmhaInterface::KernelCacheStatus status)
     {
-        getRequestedJITKernelKeys().insert(std::hash<fmha::KernelConfigBase>{}(fmhaConfig.mOptions));
+        using CacheResult = TllmGenFmhaJitCompileStats::CacheResult;
+        CacheResult result = CacheResult::kUnknown;
+        if (status == FmhaInterface::KernelCacheStatus::CacheHit)
+        {
+            result = CacheResult::kHit;
+        }
+        else if (status == FmhaInterface::KernelCacheStatus::CacheMiss)
+        {
+            result = CacheResult::kMiss;
+        }
+        getJITCompileStats().record(result);
     }
 
     // Registers a warmup sweep for this kernel object on the current device;
@@ -690,7 +708,8 @@ private:
     // populated kernel cache.
     void maybeWaitForAsyncJITWarmup(cudaStream_t stream) const
     {
-        if (!asyncJITWarmupEnabled() || getAsyncJITWarmupWorker().numPendingTasks() == 0)
+        if (!asyncJITWarmupEnabled() || !asyncJITWarmupWorkerCreated().load(std::memory_order_acquire)
+            || getAsyncJITWarmupWorker().numPendingTasks() == 0)
         {
             return;
         }
@@ -741,10 +760,6 @@ private:
 
         if (asyncJITWarmupEnabled())
         {
-            // The install-path string is a function-local static that the sweep reads
-            // on the worker thread. Construct it on this thread, before the worker and
-            // its atexit shutdown exist (lifetime note in fmhaJitWarmup.h).
-            (void) getExecPath();
             uint64_t const fingerprint = jitWarmupFingerprint(warmupParams);
             int const deviceId = tensorrt_llm::common::getDevice();
             TLLM_LOG_INFO(
@@ -842,7 +857,10 @@ public:
         {
             return 0;
         }
-        getAsyncJITWarmupWorker().drain();
+        if (asyncJITWarmupWorkerCreated().load(std::memory_order_acquire))
+        {
+            getAsyncJITWarmupWorker().drain();
+        }
 
         struct RestoreDevice
         {
@@ -864,15 +882,21 @@ public:
         return numVerified;
     }
 
-    // Number of distinct NVRTC kernel configurations requested from the export
-    // library in this process (keyed as its kernel cache keys them). Grows only
-    // when a configuration is requested for the first time, i.e. on a compile, so
-    // a value that is stable across the first request after readiness proves no
-    // request-time JIT.
-    static int64_t numRequestedJITKernelKeys()
+    // Number of kernel-cache misses, i.e. NVRTC compiles, reported by the export
+    // library in this process. A value that is stable across the first request
+    // after readiness proves no request-time JIT; the same key compiled again
+    // after an LRU eviction counts again.
+    static int64_t numJITCacheMisses()
     {
-        std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
-        return static_cast<int64_t>(getRequestedJITKernelKeys().size());
+        return getJITCompileStats().numMisses();
+    }
+
+    // Number of generateAndCompileKernel() calls whose cache result the export
+    // library did not report. Non-zero means the miss count is not a complete
+    // measure of compilation.
+    static int64_t numJITUnknownCacheResults()
+    {
+        return getJITCompileStats().numUnknown();
     }
 
     void run(RunnerParams const& params)
@@ -983,8 +1007,7 @@ public:
             fmhaConfig.mCtaDim = ctaDim;
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
-            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
-            recordJITKernelKey(fmhaConfig);
+            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
@@ -1255,9 +1278,15 @@ private:
             info);
     }
 
-    std::string const& getExecPath() const
+public:
+    // Install path handed to the export library for NVRTC compilation. Depends on
+    // no instance state. The string is intentionally leaked: a background warmup
+    // sweep may read it at any point up to process exit, whichever path created
+    // the worker (see fmhaJitWarmup.h).
+    static std::string const& getExecPath()
     {
-        static std::string execPathStr;
+        static auto* const execPathPtr = new std::string();
+        std::string& execPathStr = *execPathPtr;
         if (execPathStr.empty())
         {
             // Get build directory relative path from CMake macro
@@ -1388,6 +1417,7 @@ private:
         return execPathStr;
     }
 
+private:
     // Prepare pointers for TMA descriptors.
     static std::tuple<void const*, void const*, void const*> getDevicePtrs(
         TllmGenFmhaRunnerParams const& runnerParams, int32_t bitsPerElt)

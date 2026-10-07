@@ -36,6 +36,7 @@ namespace
 
 using tensorrt_llm::kernels::JITWarmupState;
 using tensorrt_llm::kernels::TllmGenFmhaAsyncWarmupWorker;
+using tensorrt_llm::kernels::TllmGenFmhaJitCompileStats;
 using tensorrt_llm::kernels::TllmGenFmhaJitWarmupRegistry;
 
 // Stand-ins for the kernel object and the sweep parameters the registry stores.
@@ -307,6 +308,32 @@ TEST(TllmGenFmhaJitWarmupRegistry, ClaimAnyUnverifiedServesTheDrainAndVerifyBarr
     EXPECT_EQ(registry.numUnverified(), 0);
     EXPECT_EQ(registry.state(0xA), JITWarmupState::kVerified);
     EXPECT_EQ(registry.state(0xB), JITWarmupState::kVerified);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Compile stats
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+TEST(TllmGenFmhaJitCompileStats, CountsEveryMissIncludingRepeatsOfTheSameKey)
+{
+    using CacheResult = TllmGenFmhaJitCompileStats::CacheResult;
+    TllmGenFmhaJitCompileStats stats;
+    EXPECT_EQ(stats.numMisses(), 0);
+    EXPECT_EQ(stats.numHits(), 0);
+    EXPECT_EQ(stats.numUnknown(), 0);
+
+    stats.record(CacheResult::kMiss); // first compile of a key
+    stats.record(CacheResult::kHit);  // same key served from the cache
+    stats.record(CacheResult::kMiss); // same key compiled again after an LRU eviction
+    EXPECT_EQ(stats.numMisses(), 2);
+    EXPECT_EQ(stats.numHits(), 1);
+    EXPECT_EQ(stats.numUnknown(), 0);
+
+    // An unreported result is neither a hit nor a miss; it must stay visible so a
+    // test cannot read "no misses" as "no compiles".
+    stats.record(CacheResult::kUnknown);
+    EXPECT_EQ(stats.numMisses(), 2);
+    EXPECT_EQ(stats.numUnknown(), 1);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

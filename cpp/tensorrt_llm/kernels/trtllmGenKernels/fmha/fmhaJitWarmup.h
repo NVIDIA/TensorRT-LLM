@@ -49,16 +49,17 @@ namespace kernels
 // anyway (its kernel cache is not thread-safe), so a pool would add no
 // parallelism.
 //
-// Lifetime: the process-wide instance is leaked and shut down through a
-// std::atexit handler registered when the worker is first created, i.e. from
-// the first warmup forward. atexit handlers run before the destruction of any
-// static object whose initialization completed earlier, so a sweep still in
-// flight at process exit finishes while everything it reads (the export
-// library's globals, the kernel objects, the mutexes, the install-path string)
-// is still alive. The one caveat is a static that the sweep itself constructs
-// lazily on the worker thread: such a static would be destroyed before the
-// handler runs. fmhaKernels.h therefore touches those on the registering
-// thread before the first task is queued.
+// Lifetime: the process-wide instance is leaked and shut down (drained, then
+// joined) through a std::atexit handler registered when the worker is first
+// created, so no sweep is still running during static destruction. The
+// ordering of that handler against other statics is not relied upon: every
+// object a sweep reads is either leaked (the sweep registry, the export
+// library's interface and selection mutexes, the install-path string) or
+// constructed when the library is loaded (the export library's own globals),
+// and each kernel object drains the worker in its destructor before a sweep
+// that captured it could outlive it. Whichever path creates the worker first,
+// and however late a sweep is queued, a pending sweep therefore finishes with
+// everything it touches alive.
 class TllmGenFmhaAsyncWarmupWorker
 {
 public:
@@ -334,6 +335,55 @@ private:
     mutable std::mutex mMutex;
     std::unordered_map<uint64_t, Entry> mEntries;
     std::atomic<int> mNumUnverified{0};
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Process-wide tally of the export library's kernel-cache results, one entry
+// per generateAndCompileKernel() call. A cache miss is a compile, so a miss
+// count that does not change across a request proves the request compiled
+// nothing; the same key compiled again after an LRU eviction is a second
+// miss. An Unknown result means the library did not report, which a test
+// must treat as a failure to measure rather than as "no compile".
+class TllmGenFmhaJitCompileStats
+{
+public:
+    enum class CacheResult : int
+    {
+        kUnknown = 0,
+        kHit,
+        kMiss,
+    };
+
+    void record(CacheResult result)
+    {
+        switch (result)
+        {
+        case CacheResult::kHit: mNumHits.fetch_add(1, std::memory_order_relaxed); break;
+        case CacheResult::kMiss: mNumMisses.fetch_add(1, std::memory_order_relaxed); break;
+        case CacheResult::kUnknown: mNumUnknown.fetch_add(1, std::memory_order_relaxed); break;
+        }
+    }
+
+    int64_t numMisses() const
+    {
+        return mNumMisses.load(std::memory_order_relaxed);
+    }
+
+    int64_t numHits() const
+    {
+        return mNumHits.load(std::memory_order_relaxed);
+    }
+
+    int64_t numUnknown() const
+    {
+        return mNumUnknown.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<int64_t> mNumMisses{0};
+    std::atomic<int64_t> mNumHits{0};
+    std::atomic<int64_t> mNumUnknown{0};
 };
 
 } // namespace kernels

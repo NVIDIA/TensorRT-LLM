@@ -42,8 +42,9 @@ _CHILD = textwrap.dedent("""
     from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
     model_dir = sys.argv[1]
-    keys = torch.ops.trtllm.trtllm_gen_fmha_jit_num_requested_kernel_keys
-    result = {"keys_before": keys()}
+    misses = torch.ops.trtllm.trtllm_gen_fmha_jit_num_cache_misses
+    unknown = torch.ops.trtllm.trtllm_gen_fmha_jit_num_unknown_cache_results
+    result = {"misses_before": misses()}
     llm = LLM(
         model=model_dir,
         attn_backend="TRTLLM",
@@ -56,7 +57,7 @@ _CHILD = textwrap.dedent("""
     with llm:
         result["async_enabled"] = bool(
             torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled())
-        result["keys_ready"] = keys()
+        result["misses_ready"] = misses()
         prompts = [
             "The capital of France is",
             "Write one sentence about the ocean.",
@@ -67,7 +68,8 @@ _CHILD = textwrap.dedent("""
         result["num_outputs"] = len(outputs)
         result["all_generated"] = all(
             len(o.outputs[0].token_ids) > 0 for o in outputs)
-        result["keys_after_first_requests"] = keys()
+        result["misses_after_first_requests"] = misses()
+        result["unknown_cache_results"] = unknown()
     print("RESULT " + json.dumps(result))
 """)
 
@@ -110,17 +112,25 @@ def test_first_requests_after_readiness_do_not_jit_compile(
     assert result["async_enabled"] is async_warmup
     assert result["num_outputs"] == 4 and result["all_generated"]
 
-    # The warmup must have gone through the NVRTC path, otherwise the
-    # invariant below would hold vacuously.
-    assert result["keys_ready"] > result["keys_before"], (
-        "warmup requested no NVRTC kernel configurations; this model/config "
-        "does not exercise the TRTLLM-Gen JIT path"
+    # Every compile request must have come back with a reported cache result;
+    # otherwise the miss count is not a complete measure and the invariants
+    # below could hold while compiles went uncounted.
+    assert result["unknown_cache_results"] == 0, (
+        f"{result['unknown_cache_results']} compile request(s) returned an "
+        "unknown cache status; the miss count cannot be trusted"
     )
 
-    # No configuration was requested for the first time after readiness, i.e.
-    # the first requests compiled nothing: every kernel they needed was
-    # compiled (and, for the async arm, verified) before capture.
-    assert result["keys_after_first_requests"] == result["keys_ready"], (
-        f"{result['keys_after_first_requests'] - result['keys_ready']} kernel "
-        "configuration(s) were compiled by the first requests after readiness"
+    # The warmup must have gone through the NVRTC path, otherwise the
+    # invariant below would hold vacuously.
+    assert result["misses_ready"] > result["misses_before"], (
+        "warmup reported no kernel-cache misses; this model/config does not "
+        "exercise the TRTLLM-Gen JIT path"
+    )
+
+    # No cache miss after readiness, i.e. the first requests compiled nothing:
+    # every kernel they needed was compiled (and, for the async arm, verified)
+    # before capture. A key evicted and recompiled would count as a miss too.
+    assert result["misses_after_first_requests"] == result["misses_ready"], (
+        f"{result['misses_after_first_requests'] - result['misses_ready']} "
+        "kernel(s) were compiled by the first requests after readiness"
     )

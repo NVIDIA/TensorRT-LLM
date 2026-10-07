@@ -36,13 +36,19 @@ int64_t trtllmGenFmhaJitWarmupDrainAndVerify()
     return tensorrt_llm::kernels::TllmGenFmhaKernel::drainAndVerifyAllJITWarmups();
 }
 
-// Number of distinct TRTLLM-Gen FMHA NVRTC kernel configurations requested in
-// this process so far. A configuration is compiled the first time it is
-// requested, so a value that does not change across a request proves that the
-// request compiled nothing.
-int64_t trtllmGenFmhaJitNumRequestedKernelKeys()
+// Number of TRTLLM-Gen FMHA kernel-cache misses (NVRTC compiles) the export
+// library reported in this process so far. A value that does not change across
+// a request proves that the request compiled nothing.
+int64_t trtllmGenFmhaJitNumCacheMisses()
 {
-    return tensorrt_llm::kernels::TllmGenFmhaKernel::numRequestedJITKernelKeys();
+    return tensorrt_llm::kernels::TllmGenFmhaKernel::numJITCacheMisses();
+}
+
+// Number of compile requests whose cache result the export library did not
+// report. Non-zero means the miss count above is not a complete measure.
+int64_t trtllmGenFmhaJitNumUnknownCacheResults()
+{
+    return tensorrt_llm::kernels::TllmGenFmhaKernel::numJITUnknownCacheResults();
 }
 
 // Whether this process runs the TRTLLM-Gen FMHA JIT warmup on the background
@@ -60,8 +66,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("trtllm_gen_fmha_jit_warmup_drain_and_verify() -> int",
         &tensorrt_llm::torch_ext::trtllmGenFmhaJitWarmupDrainAndVerify);
-    m.def("trtllm_gen_fmha_jit_num_requested_kernel_keys() -> int",
-        &tensorrt_llm::torch_ext::trtllmGenFmhaJitNumRequestedKernelKeys);
+    m.def("trtllm_gen_fmha_jit_num_cache_misses() -> int", &tensorrt_llm::torch_ext::trtllmGenFmhaJitNumCacheMisses);
+    m.def("trtllm_gen_fmha_jit_num_unknown_cache_results() -> int",
+        &tensorrt_llm::torch_ext::trtllmGenFmhaJitNumUnknownCacheResults);
     m.def("trtllm_gen_fmha_async_jit_warmup_enabled() -> bool",
         &tensorrt_llm::torch_ext::trtllmGenFmhaAsyncJitWarmupEnabled);
 }
