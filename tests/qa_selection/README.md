@@ -11,23 +11,21 @@ during collection instead.
 
 Functional tests only; perf runs are selected by their own configuration.
 
-```bash
-# What can B200 run? Writes B200.json and one list, B200-8gpu.ids.
-pytest --collect-only -q -p qa_selection.plugin \
-       --machine=B200 --selection-out-dir=out/
+## Usage
 
-# How does a 1-, 4- and 8-GPU allocation policy divide it? One list per rung.
-pytest --collect-only -q -p qa_selection.plugin \
-       --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
+```bash
+pytest --collect-only -q -p qa_selection.plugin --machine=B200 --ladder=1,4,8 --selection-out-dir=out/
 ```
 
-A machine and a ladder are the whole command. The ladder chooses the question:
+The ladder chooses the question:
 
-| question | command | publishes |
+| question | options | writes |
 |---|---|---|
-| what can this machine run? | `--machine=B200` | `B200-8gpu.ids` |
-| what can one N-GPU allocation of it run? | `--machine=B200 --ladder=N` | `B200-<N>gpu.ids` |
-| how does an allocation policy divide it? | `--machine=B200 --ladder=1,4,8` | one list per rung |
+| what can this machine run? | `--machine=B200` | `B200.json`, `B200-8gpu.ids` |
+| what can one N-GPU allocation of it run? | `--machine=B200 --ladder=N` | `B200.json`, `B200-<N>gpu.ids` |
+| how does an allocation policy divide it? | `--machine=B200 --ladder=1,4,8` | `B200.json`, one list per rung |
+
+Without `--selection-out-dir` nothing is written.
 
 `pytest -p qa_selection.plugin --help` documents the three options. `-p` needs `tests/`
 importable: the integration suite's ini `pythonpath` provides it, elsewhere set
@@ -37,110 +35,66 @@ importable: the integration suite's ini `pythonpath` provides it, elsewhere set
 
 ```text
 qa_selection/
-  plugin.py        the options, the markers, the item adapter, the six hooks;
-                   the `-p` entry point, and the only module importing pytest
-  core/            the decisions -- stdlib only, never pytest
-    ladder.py        what a legal ladder is
-    machines.py      the machines selection can target
-    rules.py         the curated skip rules, and what holds
-    markers.py       the marks whose first argument is a need
-    selector.py      do the rules allow this test on this card
-    allocation.py    how many GPUs it needs, which rung holds it
-    artifacts.py     what the output files are called
-    request.py       what one run was asked for
-    selection.py     what it decided about every test
+  plugin.py        the pytest hooks and options
+  core/            the selection logic
+    selection.py     one run's request, and its outcome per test
     report.py        the .ids lists and the JSON record
-  tests/           the behaviour suite -- no GPU, no container, no wheel
+    ladder.py        --ladder: which rung holds a test
+    machine.py       --machine: may the machine's card run a test
+    marks.py         what a test asks for, read from its marks
+  tests/           the acceptance tests
 ```
 
-`core/` takes plain values and raises `SelectionError`; `plugin.py` reads them off pytest's
-config and raises `pytest.UsageError`. So every decision can be exercised without pytest, and a
-reader who only wants to know what the plugin *does to collection* has one file to read. Imports
-point downward only, and nothing imports `plugin.py`.
+`core/` takes plain values and raises `SelectionError`; `plugin.py` reads the options from pytest
+and reports that error as a `pytest.UsageError`.
 
 ## How the pieces connect
 
-**At config time** `plugin.py` registers the options and resolves them once into a
-`SelectionRequest`: a machine name becomes a `MachineProfile` read from `profiles.json`, a ladder
-becomes a validated `Ladder`, one rung of the machine's GPUs per node when none is given. An
-output directory is created here too, and refused if it already holds files of this machine's
-that this run would not overwrite — a leftover list from a different ladder. Every usage error
-surfaces here, before a test module is imported.
+**Before collection** the options become a request: the machine's profile and a ladder,
+`[max_gpu_per_node]` when `--ladder` is absent. An unknown machine, a rung above the node, or a
+leftover list of this machine's in the output directory is a usage error, raised before any test
+module is imported.
 
-**At collection time** the hook is declared `trylast` and is not a wrapper, so it runs after
-the integration conftest's own `hookwrapper` has applied `--test-list`, waives and regex
-filtering. It therefore decides the filtered set rather than the whole suite.
+**During collection** the plugin runs after the integration conftest's `--test-list`, waive and
+regex filtering, so it decides the filtered list. A test is kept when neither question blocks it:
 
-Each item then crosses one boundary. `ItemView` copies a mark's name, a resource marker's first
-argument and a `skipif`'s `reason=` — nothing else — producing the `CollectedTest` that `core/`
-reads. A `skipif` condition was frozen against the collecting host when the conftest was
-imported, so it describes the wrong machine and is never evaluated.
+| question | answered from |
+|---|---|
+| may the machine's card run it? | its `skipif` reasons, looked up in `rules.json`, and its device-name and memory markers, against the profile |
+| does a rung hold it, and which? | its GPU-count markers: the smallest rung at least that large, or none above the largest |
 
-`core/` answers two independent questions about it:
+A `skipif`'s condition is never evaluated: it describes the host that collected it. Deselected
+tests go through pytest's own deselection hook.
 
-| question | asked of | answer |
-|---|---|---|
-| do the rules allow it on this card? | `selector.py`, against the profile | `Decision` |
-| does a rung hold it, and which? | `allocation.py`, from marks and the ladder | `GpuDemand`, rung |
-
-The rules are asked first and the GPU count second, and an `Assignment` keeps both answers'
-blockers; a test with none is selected. The selector never reads a GPU-count marker and demand
-never consults the profile, so each question is answered once. `selection.py` holds one answer
-per test in collection order, so `partition` can split the item list by position: whatever is
-not selected goes to pytest's own deselection hook and is removed from the list in place.
-
-**After collection** `report.py` turns those decisions into the per-rung `.ids` lists the
-pipeline filters with `awk` and a JSON record. Nothing is written unless `--selection-out-dir`
-was given. `plugin.py` prints the same report, so a live run without files can still see why
-each test was dropped:
-
-```text
-qa selection: B200 (sm 100, 8 GPUs/node), ladder 1,4        <- session header; -q hides it
-...
------------------------------- qa selection ------------------------------
-target        B200, ladder 1,4
-candidates    4
-selected      2
-  1gpu        1
-  4gpu        1
-deselected    2
-  1  skip_less_device(8): needs 8 GPUs, largest rung is 4
-  1  skip_less_mpi_world_size(8): needs 8 GPUs, largest rung is 4
-written       out/: B200.json B200-1gpu.ids B200-4gpu.ids
-```
-
-`-v` lists each reason's node ids beneath it. `candidates` and `deselected` count this plugin's
-decisions only; pytest's own `deselected` also counts the test-list and waive filtering.
+**After collection** `<machine>.json` records the counts and each test's outcome, and each rung's
+`.ids` list holds its selected node ids. The terminal shows the counts by rung and by reason; `-v`
+adds node ids. Its `deselected` counts this plugin's decisions only, while pytest's own also
+counts the test-list and waive filtering.
 
 ## Acceptance tests
-
-Seven criteria, one module each. Every expected value was derived from the production decorators
-before the plugin was run, so a test states a command line and the answer expected back — what
-the plugin decides, and how to drive it.
 
 ```bash
 pytest tests/qa_selection/tests      # 36 tests, no GPU, no container, no wheel
 ```
 
-| | guarantee | proved by |
+Each test states a command line and the answer expected back, derived from the production
+decorators.
+
+| | principle | criteria |
 |---|---|---|
-| **AC-1** | The target's **architecture** decides what is selected, wherever the mark sits — `sm`, CPU arch and device memory, on a function, a class or one `pytest.param`, read from the profile and never from the collecting host | [`test_arch.py`](tests/test_arch.py) (7) |
-| **AC-2** | The ladder's **largest rung** is the GPU count: the ladder defaults to one rung of the machine's GPUs per node, and no other value states one | [`test_gpu_count.py`](tests/test_gpu_count.py) (7) |
-| **AC-3** | Each selected test lands on the **smallest rung** that holds it, and every rung publishes one `<machine>-<rung>gpu.ids` list, empty or not | [`test_ladder.py`](tests/test_ladder.py) (6) |
-| **AC-4** | A **machine and a ladder** are the whole command — the three questions above — and the tests a run keeps are exactly the tests its lists hold | [`test_options.py`](tests/test_options.py) (5) |
-| **AC-5** | A test **above the largest rung** is deselected, in no list, with one blocker naming its demand, its markers and that rung — the same reason for a small node and a short ladder | [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
-| **AC-6** | Without `--machine`, loading the plugin **changes nothing**, so it can be loaded unconditionally | [`test_inert.py`](tests/test_inert.py) (2) |
-| **AC-7** | A run **explains itself** in the terminal: the header names the target, and the block breaks selected tests down by rung and deselected tests by reason, with node ids at `-v` | [`test_summary.py`](tests/test_summary.py) (5) |
+| **Before collection** | A machine and a ladder are the whole command, and without a machine the plugin changes nothing | AC-4 [`test_options.py`](tests/test_options.py) (5), AC-6 [`test_inert.py`](tests/test_inert.py) (2) |
+| **During collection** | The target decides, never the collecting host: its architecture, wherever the mark sits, and its largest rung as the GPU count; a test above that rung is deselected with one reason | AC-1 [`test_arch.py`](tests/test_arch.py) (7), AC-2 [`test_gpu_count.py`](tests/test_gpu_count.py) (7), AC-5 [`test_largest_rung.py`](tests/test_largest_rung.py) (4) |
+| **After collection** | Each kept test is in exactly one list, its smallest rung's, and the terminal explains the run | AC-3 [`test_ladder.py`](tests/test_ladder.py) (6), AC-7 [`test_summary.py`](tests/test_summary.py) (5) |
 
 ## Config
 
-Three JSON files under `core/`, each read by the module beside it. `rules.json` and
-`markers.json` are copies of what the integration suite owns — selection must not share a source
-of truth with the code it decides about. [`scripts/check_qa_selection_rules.py`](../../scripts/check_qa_selection_rules.py),
-wired into pre-commit, fails when a copy drifts.
+Three JSON files in `core/`. `rules.json` and `markers.json` mirror the integration suite's
+`defs/conftest.py` and `defs/pytest.ini`;
+[`scripts/check_qa_selection_rules.py`](../../scripts/check_qa_selection_rules.py) runs in
+pre-commit and fails when they drift.
 
 | file | holds |
 |---|---|
-| `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch`. `max_gpu_per_node` is the machine's one GPU count — the default ladder, read by no rule |
-| `rules.json` | the curated skip rules, each keyed by the exact `skipif` reason string it decides; a rule must turn on a permanent property of the machine |
-| `markers.json` | the marks whose first argument is a *requirement* rather than a condition: the description each is declared with, the machine fact it `bounds` (`gpus`, `device_memory_mib`, `device_name`, or null when not evaluated), and whether the conftest `read`s it at the closest level or every level. No code names a marker; the check verifies each `read` against `defs/conftest.py` |
+| `profiles.json` | one entry per machine: `sm`, `device_name`, `device_memory_mib`, `max_gpu_per_node`, `cpu_arch` |
+| `rules.json` | one rule per `skipif` reason: the profile values that skip it |
+| `markers.json` | each resource marker's declaration, the profile fact it bounds, and whether the conftest reads its closest mark or every level's |

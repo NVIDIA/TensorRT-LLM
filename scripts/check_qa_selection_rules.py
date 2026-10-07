@@ -79,8 +79,8 @@ class RepoPaths:
 
 RepoPaths.enable_package_import()
 
-from qa_selection.core.markers import ResourceMarker, ResourceMarkers, default_markers  # noqa: E402
-from qa_selection.core.rules import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
+from qa_selection.core.machine import SkipRule, SkipRuleTable, default_rule_table  # noqa: E402
+from qa_selection.core.marks import ResourceMarker, ResourceMarkers, default_markers  # noqa: E402
 
 
 @dataclass(frozen=True)
