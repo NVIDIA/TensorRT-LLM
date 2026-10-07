@@ -2629,6 +2629,9 @@ class DFlashWorker(SpecWorkerBase):
                         slots,
                         gen_rows_out,
                     )
+                    # k3_ctx_kv adds the accepted tokens in the kernel; empty the dummy slot after
+                    # it, as _advance_ctx_len does after the add on the torch path.
+                    self._ctx_len[self._dummy_slot].zero_()
             if has_target_features and not fused_ctx_kv:
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
