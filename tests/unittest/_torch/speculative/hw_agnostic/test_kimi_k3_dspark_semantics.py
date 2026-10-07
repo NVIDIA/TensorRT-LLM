@@ -22,6 +22,7 @@ confidence_proj weights load without being used.
 import math
 import re
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -235,7 +236,9 @@ CTX_LEN = 24  # > SWA_WINDOW so the window binds
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dspark: bool, *, published_spelling: bool = False, mask_token_id: int = VOCAB - 2):
+def _tiny_config(
+    dspark: bool, *, published_spelling: bool = False, mask_token_id: Optional[int] = VOCAB - 2
+):
     """Tiny drafter config.
 
     ``published_spelling`` reproduces the two public K3 DSpark checkpoints
@@ -248,7 +251,9 @@ def _tiny_config(dspark: bool, *, published_spelling: bool = False, mask_token_i
     from transformers import Qwen3Config
 
     cfg = dict(TINY)
-    dflash = {"mask_token_id": mask_token_id, "target_layer_ids": [0, 1]}
+    dflash = {"target_layer_ids": [0, 1]}
+    if mask_token_id is not None:
+        dflash["mask_token_id"] = mask_token_id
     if dspark and published_spelling:
         cfg.update(
             markov_rank=RANK,
@@ -330,7 +335,7 @@ def _build_drafter(
     *,
     published_spelling: bool = False,
     dflash_attention_backend: str = "VANILLA",
-    mask_token_id: int = VOCAB - 2,
+    mask_token_id: Optional[int] = VOCAB - 2,
 ):
     from tensorrt_llm._torch.model_config import ModelConfig
 
@@ -521,7 +526,7 @@ def test_gqa_dspark_mask_row_takes_the_drafter_dtype_and_device_at_load():
 @pytest.mark.parametrize(
     "width, mask_token_id, message",
     [
-        (TINY["hidden_size"], VOCAB, f"mask_token_id {VOCAB} is not a row"),
+        (TINY["hidden_size"], VOCAB + 1, f"mask_token_id {VOCAB + 1} is not a row"),
         (TINY["hidden_size"], -1, "mask_token_id -1 is not a row"),
         (
             TINY["hidden_size"] + 8,
@@ -540,6 +545,17 @@ def test_gqa_dspark_rejects_a_mask_row_the_shipped_embedding_does_not_have(
     weights["embed_tokens.weight"] = torch.zeros(VOCAB, width, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=message):
         _build_drafter(True, weights, mask_token_id=mask_token_id)
+
+
+@needs_gpu
+def test_gqa_dspark_keeps_no_mask_row_when_its_config_names_no_mask_token():
+    """A drafter config that names no mask token leaves DFlash's default id (vocab_size), one past the shipped rows.
+    The drafter keeps no row and loads; the speculative config can still name the mask token."""
+    weights = _tiny_weights()
+    weights["embed_tokens.weight"] = torch.zeros(VOCAB, TINY["hidden_size"], dtype=torch.bfloat16)
+    drafter = _build_drafter(True, weights, mask_token_id=None)
+    assert drafter.mask_token_id == VOCAB
+    assert getattr(drafter, "mask_token_embedding", None) is None
 
 
 @needs_gpu

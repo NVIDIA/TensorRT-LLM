@@ -2692,7 +2692,8 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         differs from the target's, and the shipped ``lm_head`` is bit-exact with the target's.
 
         Raises:
-            ValueError: the embedding is not ``[rows, hidden_size]``, or ``mask_token_id`` is not one of its rows.
+            ValueError: the embedding is not ``[rows, hidden_size]``, or the mask id the drafter config names is not
+                one of its rows.
         """
         names = [k for k in ("embed_tokens.weight", "model.embed_tokens.weight") if k in weights]
         if not names:
@@ -2705,12 +2706,16 @@ class GQADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 f"{type(self).__name__}: the checkpoint's {name} has shape {list(weight.shape)}, "
                 f"expected [rows, hidden_size={hidden_size}]."
             )
-        if not 0 <= self.mask_token_id < weight.shape[0]:
-            raise ValueError(
-                f"{type(self).__name__}: the drafter's mask_token_id {self.mask_token_id} is not a row of the "
-                f"checkpoint's {name} ({weight.shape[0]} rows)."
-            )
-        return weight[self.mask_token_id]
+        if 0 <= self.mask_token_id < weight.shape[0]:
+            return weight[self.mask_token_id]
+        if self.mask_token_id == self.config.vocab_size:
+            # DFlash's default when the drafter config names no mask token in a key the drafter reads. The speculative
+            # config may still name one (a user value, or a key only it reads), so there is no known row to keep.
+            return None
+        raise ValueError(
+            f"{type(self).__name__}: the drafter's mask_token_id {self.mask_token_id} is not a row of the "
+            f"checkpoint's {name} ({weight.shape[0]} rows)."
+        )
 
 
 class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
