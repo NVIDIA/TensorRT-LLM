@@ -291,6 +291,70 @@ def test_zero_values_clears_v_of_the_range_only(cache):
             torch.testing.assert_close(v_back, v_want, rtol=0, atol=0)
 
 
+def row_stamps(cache, layer, size, i, plane):
+    """Stamps block ``i``'s row presents to the kernel for its cached tokens, in row
+    order, from the K (0) or V (1) plane."""
+    buf = cache.kv_buffer(layer)
+    rows = cache.page_table(size)
+    n = cache.cached_tokens(size)[i]
+    pos = torch.arange(n, device=DEVICE)
+    page = rows[i].long()[pos // cache.tokens_per_page]
+    slot = pos % cache.tokens_per_page
+    return buf[page, plane, 0, slot, 0].float()
+
+
+def test_edits_to_committed_tokens_reach_the_private_copies(cache):
+    """write_range and zero_values on committed tokens update the private copies the
+    block rows read, not only the home slots. Chunk tokens and other layers stay."""
+    chunk = cache.chunk_tokens
+    sizes = (chunk, chunk // 4)
+    open_with_fixed(cache, 20)
+    for _ in range(3):  # past the window, so both the fixed tail and the window edge are copies
+        cache.commit()
+    assert cache.history_tokens > cache.window_tokens
+    past = cache.past_tokens
+    positions = torch.arange(past + chunk, device=DEVICE)
+    for layer in range(NUM_LAYERS):
+        k, v = stamped_kv(positions, layer)
+        cache.write_range(layer, 0, k[:past], v[:past])
+        cache.write_chunk(layer, k[past:], v[past:])
+    cache.commit()  # the copies are rebuilt here: the known-good path
+    past = cache.past_tokens
+    for layer in range(NUM_LAYERS):  # the next chunk, so the earlier-block copies hold real tokens
+        k, v = stamped_kv(torch.arange(past, past + chunk, device=DEVICE), layer)
+        for size in sizes:
+            cache.write_chunk(layer, -k, -v, size)  # negative K stamps mark chunk tokens
+    before = {
+        (layer, size, i, plane): row_stamps(cache, layer, size, i, plane)
+        for layer in range(NUM_LAYERS)
+        for size in sizes
+        for i in range(chunk // size)
+        for plane in (0, 1)
+    }
+
+    def committed(layer, size, i):  # row entries holding committed tokens: positive K stamps
+        return before[(layer, size, i, 0)] > 0
+
+    edited = 1
+    k_now, v_now = read_kv(cache, edited, torch.arange(past, device=DEVICE))
+    cache.write_range(edited, 0, -k_now, -v_now)
+    for (layer, size, i, plane), old in before.items():
+        new = row_stamps(cache, layer, size, i, plane)
+        want = old.clone()
+        if layer == edited:
+            want[committed(layer, size, i)] *= -1
+        torch.testing.assert_close(new, want, rtol=0, atol=0)
+
+    cache.zero_values(edited, 0, past)
+    for (layer, size, i, plane), old in before.items():
+        new = row_stamps(cache, layer, size, i, plane)
+        want = old.clone()
+        if layer == edited:
+            hit = committed(layer, size, i)
+            want[hit] = 0 if plane == 1 else -want[hit]
+        torch.testing.assert_close(new, want, rtol=0, atol=0)
+
+
 def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     """Content check across many chunks with a fixed region that shares a page with the history."""
     fixed = 13

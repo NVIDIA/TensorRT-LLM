@@ -334,6 +334,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._host_piece_src: Optional[np.ndarray] = None
         self._host_piece_dst: Optional[np.ndarray] = None
         self._piece_offsets: Optional[torch.Tensor] = None  # [layers * 2H] pool rows
+        self._mirrors = (0, 0)  # live commit-time pieces whose sources are resident tokens
         # [chunk_tokens] int64 slot ids (view_page * tokens_per_page + slot) of the
         # chunk's logical positions, the shared pages later blocks and chunks read.
         self._chunk_slots: Optional[torch.Tensor] = None
@@ -685,6 +686,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._copy_pieces(0, num_refill)
         if num_pieces > num_refill:
             self._copy_pieces(num_refill, num_pieces)
+        self._mirrors = (num_refill, num_pieces)
 
     def _queue_refill(self, refill: Optional[Tuple[int, int]]) -> int:
         """Queue the fixed region's tail slots from the shared page's old copy to its
@@ -838,8 +840,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
 
         Eager, host-addressed: a partial page at either end is one copy each, whole
-        pages go one group of physically consecutive pages at a time. For the fixed
-        region and for tests; the per-forward write is ``write_chunk``.
+        pages go one group of physically consecutive pages at a time. Committed tokens
+        that block rows read through a private copy are updated in those copies too.
+        For the fixed region and for tests; the per-forward write is ``write_chunk``.
         """
         if v.shape != k.shape:
             raise ValueError(f"k/v shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}")
@@ -854,10 +857,16 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 buf, page, count, k[t0:t1], v[t0:t1]
             ),
         )
+        pieces = self._mirror_pieces(start, k.shape[0])
+        if pieces.size:
+            src, dst = self._piece_rows(pieces, layer_idx, (0, 1))
+            pool_rows = self.kv_buffer(0).view(-1, buf.shape[-1])
+            pool_rows.index_copy_(0, dst, pool_rows.index_select(0, src))
 
     def zero_values(self, layer_idx: int, start: int, num_tokens: int) -> None:
         """Zero the V vectors (all heads) of logical ``[start, start + num_tokens)`` in
-        one layer, leaving K as written. Eager, host-addressed, like ``write_range``."""
+        one layer, leaving K as written, in the home slots and in every private copy
+        block rows read. Eager, host-addressed, like ``write_range``."""
         buf = self.kv_buffer(layer_idx)
         vs = self.page_view_scale
 
@@ -868,6 +877,38 @@ class CausalKVCacheManager(KVCacheManagerV2):
             buf[page * vs : (page + count) * vs : vs, 1].zero_()
 
         self._for_each_page_run(start, num_tokens, slots, whole)
+        pieces = self._mirror_pieces(start, num_tokens)
+        if pieces.size:
+            _, dst = self._piece_rows(pieces, layer_idx, (1,))
+            self.kv_buffer(0).view(-1, buf.shape[-1]).index_fill_(0, dst, 0)
+
+    def _mirror_pieces(self, start: int, num_tokens: int) -> np.ndarray:
+        """Indices of the live commit-time pieces whose source token lies in logical
+        ``[start, start + num_tokens)``: the private copies an edit of those tokens
+        must reach. The refill pieces are excluded; their sources are a page the
+        table no longer points at."""
+        lo, hi = self._mirrors
+        if lo == hi or num_tokens == 0:
+            return np.empty(0, dtype=np.int64)
+        tpb, rpp = self.tokens_per_page, self._rows_per_page
+        pos = np.arange(start, start + num_tokens)
+        home = self._host_table[pos // tpb] * rpp + pos % tpb
+        return lo + np.flatnonzero(np.isin(self._host_piece_src[lo:hi], home))
+
+    def _piece_rows(
+        self, pieces: np.ndarray, layer_idx: int, planes: Sequence[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Device index tensors ``(src, dst)`` of the pool rows ``pieces`` occupy in
+        ``layer_idx`` for the given planes (0 = K, 1 = V), every head."""
+        tpb, rpp, heads = self.tokens_per_page, self._rows_per_page, self._kv_heads_local
+        offsets = np.array(
+            [layer_idx * rpp + (plane * heads + h) * tpb for plane in planes for h in range(heads)],
+            dtype=np.int64,
+        )
+        src = (self._host_piece_src[pieces][:, None] + offsets).reshape(-1)
+        dst = (self._host_piece_dst[pieces][:, None] + offsets).reshape(-1)
+        device = self._table.device
+        return torch.from_numpy(src).to(device), torch.from_numpy(dst).to(device)
 
     def _for_each_page_run(self, start: int, n: int, on_slots, on_whole_pages) -> None:
         """Walk logical ``[start, start + n)`` as page runs: ``on_slots(page, slot, t0,
