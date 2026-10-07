@@ -141,44 +141,44 @@ def test_reference_warmup_cache_key_preserves_count_and_ordered_shapes() -> None
     )
 
 
-def test_warmup_records_the_reference_carrying_request_key() -> None:
-    """A reference-carrying request must be able to match a warmed shape.
-
-    The warmup side used to build a 2-tuple while the request side built a
-    4-tuple, so every /v1/images/edits request looked un-warmed and its graph
-    compiled inside the first measured request.
-    """
+@pytest.mark.parametrize(
+    "height,width,reference_shape",
+    [(1024, 1024, (1024, 1024)), (70, 100, (64, 96)), (1024, 2048, (720, 1440))],
+)
+def test_warmup_runs_and_records_reference_request_shape(
+    height: int,
+    width: int,
+    reference_shape: tuple[int, int],
+) -> None:
     pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
     pipeline.vae_scale_factor = 8
-    shapes = [(h, w, f) for (h, w) in pipeline.default_warmup_resolutions for f in [1]]
+    pipeline.image_processor = Flux2ImageProcessor(vae_scale_factor=16)
+    pipeline.pipeline_config = SimpleNamespace(torch_dtype=torch.float32)
+    pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.empty(0)]))
+    pipeline.forward = MagicMock()
 
-    warmed = pipeline.warmup_cache_keys(shapes)
+    pipeline._run_warmup(height, width, num_frames=1, steps=2)
 
-    height, width, _frames = shapes[0]
+    assert pipeline.forward.call_count == 2
+    text_call, reference_call = pipeline.forward.call_args_list
+    assert "_condition_images" not in text_call.kwargs
+    assert text_call.kwargs["height"] == reference_call.kwargs["height"] == height
+    assert text_call.kwargs["width"] == reference_call.kwargs["width"] == width
+    (reference,) = reference_call.kwargs["_condition_images"]
+    assert reference.shape == (1, 3, *reference_shape)
+
+    warmed = pipeline.warmup_cache_keys([(height, width, 1)])
     req = SimpleNamespace(
         params=SimpleNamespace(height=height, width=width, num_frames=None),
-        prepared_inputs={"condition_images": [torch.zeros(1, 3, height, width)]},
+        prepared_inputs={
+            "condition_images": pipeline._preprocess_reference_images(
+                [PIL.Image.new("RGB", (width, height))]
+            )
+        },
     )
     assert pipeline.request_warmup_cache_key(req) in warmed
-
-    text_only = SimpleNamespace(
-        params=SimpleNamespace(height=height, width=width, num_frames=None),
-        prepared_inputs={},
-    )
-    assert pipeline.request_warmup_cache_key(text_only) in warmed
-
-
-def test_warmup_reference_shape_floors_to_the_preprocessor_multiple() -> None:
-    """The warmed reference size must be one a real request can produce.
-
-    ``_preprocess_reference_images`` floors each side to ``vae_scale_factor * 2``,
-    so a warmed key built from an unfloored size could never be matched.
-    """
-    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
-    pipeline.vae_scale_factor = 8
-
-    assert pipeline._warmup_reference_shape(1024, 1024) == (1024, 1024)
-    assert pipeline._warmup_reference_shape(70, 100) == (64, 96)
+    req.prepared_inputs = {}
+    assert pipeline.request_warmup_cache_key(req) in warmed
 
 
 @pytest.mark.parametrize("cache_backend", ["teacache", "cache_dit"])
