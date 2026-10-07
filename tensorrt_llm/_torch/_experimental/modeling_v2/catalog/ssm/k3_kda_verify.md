@@ -8,8 +8,8 @@ receipts:
 **Wraps** `torch.ops.trtllm.k3_kda_verify` (one call).
 
 Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens (a golden token and its drafts), from the fused
-projection rows to the gated-norm core output, committing the state after every verify token so that the next round
-starts from the drafts the sampler accepted instead of replaying them.
+projection rows to the gated-norm core output, committing the golden token's state and every draft's records, from
+which the next round replays the drafts the sampler accepted.
 
 ## Semantics
 
@@ -18,7 +18,7 @@ starts from the drafts the sampler accepted instead of replaying them.
 CTAs per (head, request), each owning 16 V rows. For request n on slot `s = slots[n]`, with `P = pending[s]`:
 
 ```
-S = ssm[s] if P == 0 else state_tok[s, P - 1]                 # the state after the last accepted token
+S = ssm[s]; for d = 0..P-1: S = decay_d * S + vn_d (beta k)_d^T   # the accepted drafts, from their records
 window = conv caches cs_*[s] columns P..P+2                    # raw inputs at positions -3..-1
 per token t = 0..num_spec:
   g = bf16(f_a[t] @ w_fb^T)     (or g_ext[t]: the unfused f_b output)
@@ -26,14 +26,15 @@ per token t = 0..num_spec:
   beta = sigmoid(b[t]);  decay = exp(lower_bound * sigmoid(exp(a_log) * (g + dt_bias)))
   S *= decay (per key);  S += beta (v - S k) k^T;  o = S q
   out[t] = o * rsqrt(mean(o^2) + eps) * onorm_w * sigmoid(og[t])
-ssm[s] = the state after t = 0 (the golden token);  state_tok[s, t - 1] = the state after draft t
+ssm[s] = the state after t = 0 (the golden token)
+state_tok[s] = the records of drafts t = 1..num_spec: vn = v - (decay S) k, beta k, decay
 cs_*[s] = the raw inputs at positions -2..num_spec around the golden token
 ```
 
 Returns `out` bf16 `[N (1 + num_spec), H, 128]`. The recurrence is `kda_mtp_decode`'s V-split arithmetic over the
 verify tokens, unrolled: with `g_ext` the op is bit-exact against `kda_mtp_decode` fed the same gate and replaying the
 same accepted drafts (the op's own test). Certified here against a float64 verify over each request's committed
-history: every round's outputs within 2e-2 relative (bf16) and the committed states within 1e-3, the per-draft states
+history: every round's outputs within 2e-2 relative (bf16) and the committed states within 1e-3, the drafts' records
 and conv caches through the next round, which starts from them. Repeated runs, and graph replays against eager runs,
 are bit-identical.
 
@@ -74,7 +75,7 @@ def k3_kda_verify(
 | `onorm_w` | `[K]` | fp32 | dense | CUDA |
 | `cs_q`, `cs_k`, `cs_v` | `[pool, H K, 3 + num_spec]` | fp32 | channel stride 1 (dim-contiguous) | CUDA |
 | `ssm` | `[pool, H, K, K]` (V rows, K contiguous) | fp32 | each slot dense, slots at any stride | CUDA |
-| `state_tok` | `[pool, num_spec, H, K, K]` | fp32 | contiguous | CUDA |
+| `state_tok` | `[pool, 3, num_spec, H, K]`: the drafts' records vn, beta k, decay | fp32 | contiguous | CUDA |
 | `slots` | `[N]` | int32 | any element offset | CUDA |
 | `pending` | `[pool]`: drafts the sampler accepted last round, per slot | int32 | any element offset | CUDA |
 | `num_spec` | drafts per request | Python int | — | — |
@@ -99,8 +100,9 @@ its slots: certified on a real manager, the other slots bit-unchanged.
 
 **Call-order invariant.** Per layer, one call per verify round, in round order, with `pending` updated between rounds
 (after the sampler accepts) and not during one. A call reads what the previous round's call on that layer left at the
-slot: the state after the last accepted token (`ssm` if none was accepted, else `state_tok[s, P - 1]`) and the conv
-window starting at column P. The per-draft states of a round are read only by the next round.
+slot: the golden token's state (`ssm`) and the records of the P accepted drafts (`state_tok[s]`), from which it
+rebuilds the state after the last accepted token, and the conv window starting at column P. A round's records are
+read only by the next round.
 
 **The PDL rule.** The kernel reads the slot, P, the starting state and the conv window before its grid-dependency
 wait, and lets its dependents launch in its prologue, before that wait. So a launch must not follow another launch on

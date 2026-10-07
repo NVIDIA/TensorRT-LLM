@@ -181,7 +181,7 @@ def k3_kda_attn(
         or not w_fb.is_contiguous()
         or num_spec != NT - 1
         or tuple(ssm.shape[1:]) != (6, 128, 128)
-        or tuple(state_tok.shape[1:]) != (num_spec, 6, 128, 128)
+        or tuple(state_tok.shape[1:]) != (3, num_spec, 6, 128)
         or ssm.stride()[1:] != (128 * 128, 128, 1)
         or not state_tok.is_contiguous()
         or cs_q.shape[-1] != 3 + num_spec

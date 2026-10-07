@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Kimi K3 KDA speculative verify as one kernel: the forget-gate up-projection (f_b), the per-token pre-compute and
-the delta-rule recurrence over the 1 + NUM_SPEC verify tokens, with a state committed after every verify token so
-the next round starts from the accepted one instead of replaying the accepted drafts.
+the delta-rule recurrence over the 1 + NUM_SPEC verify tokens. It commits the golden token's state and each draft's
+records (vn, beta * k, decay), from which the next round replays the accepted drafts.
 
 Grid (H, N, 8), cluster (1, 1, 8), 256 threads. CTA (h, n, s) owns V rows [16 s, 16 s + 16) of local head h for
 request n; warp w owns rows 16 s + 2 w and 16 s + 2 w + 1, and lane l keys k = 32 i + l (i < 4) of each.
 
 Before ``griddepcontrol.wait`` (written by the previous verify step, or constant):
-  the slot and P, the drafts the sampler accepted last round; the starting state into registers (P == 0: the pool
-  state, committed after the last golden token; else ``state_tok[slot, P - 1]``); the raw conv inputs at positions
+  the slot and P, the drafts the sampler accepted last round; the starting state into registers (the pool state,
+  committed after the last golden token, with P drafts replayed from their records); the raw conv inputs at positions
   -3..-1 before the first new token (conv-cache columns P..P+2) for q and k (128 channels) and v (this CTA's 16);
   the conv weights, dt_bias, A_log and the output-norm weight; the head's W_fb^T block by TMA.
 After the wait (this step's fused projection rows [q | k | v | onorm gate | f_a | b]): the new tokens' raw q, k, v,
@@ -30,8 +30,8 @@ f_b:          g[t, c] = bf16(sum_i f_a[t, i] W_fb[128 h + c, i]), rounded as the
 Pre-compute:  warp t = verify token t: q, k = l2norm(silu(conv4(u))) (q also scaled), the lower-bound gate, beta and
               this CTA's 16 v channels.
 Recurrence:   the arithmetic of ``kda_mtp_decode``'s V-split path over the verify tokens, unrolled; the state after
-              token 0 (the golden token) is committed to the pool, the state after token t >= 1 to
-              ``state_tok[slot, t - 1]``.
+              token 0 (the golden token) is committed to the pool; token t >= 1 leaves its draft's records (vn,
+              beta * k, decay) in ``state_tok[slot]``.
 Epilogue:     the gated RMSNorm of the outputs over V (per-token sums of squares stored into every peer's shared
               memory, one cluster barrier), bf16 output rows; CTA 0 rewrites the q/k conv cache (the window at the
               golden token and the raw inputs of the drafts), every CTA the same for its v channels.
@@ -230,7 +230,7 @@ def k3_kda_verify_kernel(
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
     ssm: cutlass.Array,  # fp32 [pool][H][V][K] at slot stride ssm_stride: the state after the last golden token
-    state_tok: cutlass.Array,  # fp32 [pool][NUM_SPEC][H][V][K]: the state after draft t + 1 of the last round
+    state_tok: cutlass.Array,  # fp32 [pool][3][NUM_SPEC][H][K]: the records of the last round's drafts
     slots: cutlass.Array,  # int32 [N]
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [T][H][V]
@@ -353,17 +353,17 @@ def k3_kda_verify_kernel(
     exp_a = cute.math.exp(a_log.load(idx=h), fastmath=True)
     row_a = v0 + warp * ROWS
     # The warp owns both rows and lane l keys 32 i + l (the arithmetic of kda_mtp_decode).
-    # The drafts' records, in each slot's per-token state region in place of their full states: the row innovations
-    # vn [NUM_SPEC][H][V], then beta * k and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the
-    # pool's (the golden token's) with each accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the
-    # recurrence's own arithmetic, so it is bit-identical to the one the drafts reached. k3_kda_attn uses the same
-    # records.
+    # The drafts' records, in each slot's region of state_tok: the row innovations vn [NUM_SPEC][H][V], then beta * k
+    # and the decay [NUM_SPEC][H][K]. The state after the accepted drafts is the pool's (the golden token's) with each
+    # accepted draft's update replayed, S = fma(decay, S, vn * (beta * k)): the recurrence's own arithmetic, so it is
+    # bit-identical to the one the drafts reached. k3_kda_attn uses the same records.
     CT_VN = 0
     CT_WB = NUM_SPEC * H * V
     CT_WD = CT_WB + NUM_SPEC * H * K
-    # The slot's pool state and per-token region from their first element: the slot offset in 64 bits, once.
+    CT_SLOT = CT_WD + NUM_SPEC * H * K  # a slot's records
+    # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
     pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
-    tok = state_tok.subview(cutlass.Int64(slot) * (NUM_SPEC * H * V * K))
+    tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
     st_base = (h * V + row_a) * K
     for r in cutlass.range_constexpr(ROWS):
         for i in cutlass.range_constexpr(VEC):

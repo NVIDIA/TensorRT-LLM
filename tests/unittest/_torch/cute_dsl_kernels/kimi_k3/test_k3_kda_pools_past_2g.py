@@ -17,12 +17,13 @@ whose last slot starts past element 2^31, at the per-rank TP16 shape (6 heads, K
 
 The Mamba cache manager coalesces a rank's KDA layers inside each slot, so a layer's state pool is a view at slot
 stride layers x 98,304 fp32 elements (its conv pool at layers x 6,912 bf16): with enough slots the pools reach past
-2^31 elements. Here each pool is the last layer's view of such a pool ([slots, layers, ...] underneath), and the
-per-token verify states are dense at 7 x 98,304 elements per slot; 3,122 slots put the last slot of each past 2^31.
+2^31 elements. Here each pool is the last layer's view of such a pool ([slots, layers, ...] underneath); 3,122 slots
+put the last slot of each past 2^31. The drafts' records are dense at 3 x 7 x 768 elements per slot, so their last
+slot stays far below it (a layer's records reach 2^31 elements only past 133,000 slots).
 
 Each op runs once on requests in the pools' first, middle and last slots (``k3_kda_attn``: one request, the last slot)
 and once on small pools holding copies of those slots; the outputs and every slot the call updates must agree bit for
-bit. About 19 GB of device memory.
+bit. About 14 GB of device memory.
 
   pytest test_k3_kda_pools_past_2g.py
 """
@@ -92,9 +93,9 @@ def verify_pools() -> dict:
         for name in ("cs_q", "cs_k", "cs_v")
     }
     p["ssm"] = layer_view(SSM_LAYERS, (H, V, K), torch.float32)
-    p["state_tok"] = torch.zeros(SLOTS, NUM_SPEC, H, V, K, device="cuda")
+    p["state_tok"] = torch.zeros(SLOTS, 3, NUM_SPEC, H, K, device="cuda")
     p["pending"] = torch.zeros(SLOTS, dtype=torch.int32, device="cuda")
-    assert last_slot_offset(p["ssm"]) >= TWO_G and last_slot_offset(p["state_tok"]) >= TWO_G
+    assert last_slot_offset(p["ssm"]) >= TWO_G
     return p
 
 
@@ -105,7 +106,7 @@ def fill_verify_slots(p: dict, used: list, pending: list, seed: int) -> dict:
         for name in ("cs_q", "cs_k", "cs_v"):
             p[name][s] = torch.randn(HK, W - 1 + NUM_SPEC, generator=g, device="cuda") * 0.5
         p["ssm"][s] = torch.randn(H, V, K, generator=g, device="cuda") * 0.05
-        p["state_tok"][s] = torch.rand(NUM_SPEC, H, V, K, generator=g, device="cuda") * 0.5
+        p["state_tok"][s] = torch.rand(3, NUM_SPEC, H, K, generator=g, device="cuda") * 0.5
         p["pending"][s] = pending[i]
     small = {
         name: torch.stack([p[name][s].t() for s in used]).transpose(1, 2)

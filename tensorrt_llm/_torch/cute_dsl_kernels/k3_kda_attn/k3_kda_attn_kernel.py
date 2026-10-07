@@ -118,15 +118,15 @@ VEC = HD // 32  # keys per lane
 R_Q = REC_ROWS * VEC
 R_OP = R_Q + REC_ROWS
 REC_REGS = R_OP + REC_ROWS + 4 * VEC
-# The drafts' records, in each slot's per-token state region (fp32 words from the slot's start) in place of their
-# full states: the row innovations vn [NUM_SPEC][H][V], then beta * k and the decay [NUM_SPEC][H][K]. The next launch
-# rebuilds the state after the accepted drafts from the pool (the golden token's state) with the update's own
-# arithmetic, S = fma(decay, S, vn * (beta * k)) draft by draft, so it is bit-identical to the one the drafts reached.
+# The drafts' records, in each slot's region of state_tok (fp32 words from the slot's start): the row innovations
+# vn [NUM_SPEC][H][V], then beta * k and the decay [NUM_SPEC][H][K]. The next launch rebuilds the state after the
+# accepted drafts from the pool (the golden token's state) with the update's own arithmetic,
+# S = fma(decay, S, vn * (beta * k)) draft by draft, so it is bit-identical to the one the drafts reached.
 # k3_kda_verify writes and reads the same records.
 CT_VN = 0
 CT_WB = NUM_SPEC * H_LOCAL * HD
 CT_WD = CT_WB + NUM_SPEC * H_LOCAL * HD
-CT_SLOT = NUM_SPEC * H_LOCAL * HD * HD  # a slot's per-token state region
+CT_SLOT = CT_WD + NUM_SPEC * H_LOCAL * HD  # a slot's records
 REC_CTA = (
     V_CTA + 2 * HD
 )  # one draft's records a verify CTA replays: vn of its 32 rows, beta * k and decay of 128 keys
@@ -799,7 +799,7 @@ def _head_role(
     )
     exp_a = cute.math.exp(a_raw, fastmath=True)
     row_w = v0 + warp * REC_ROWS
-    # The slot's pool state and per-token region from their first element: the slot offset in 64 bits, once.
+    # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
     pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
     tok = state_tok.subview(cutlass.Int64(slot) * CT_SLOT)
     st_base = (h * HD + row_w) * HD
@@ -1136,8 +1136,8 @@ def _head_role(
     # loop is software-pipelined so that consecutive tokens overlap: iteration tr reduces token tr - 1's q-dot
     # partials over the warp beside token tr's k-dot butterflies (the chain that carries the state) and loads token
     # tr + 1's operands. Every sum is formed from the same values in the same order as before (bit-identical).
-    # This lane's first state element in the pool (the golden token's state) and in the first draft's per-token
-    # state; element (r, i) sits (r HD + 32 i) floats past either.
+    # This lane's first state element in the pool (the golden token's state); element (r, i) sits (r HD + 32 i)
+    # floats past it.
     pool_ptr = pool.subview(st_base + lane).data_ptr().toint()
     # Lanes 0-3 store the warp's row innovations, one row each (a lane's address beyond them is never stored to).
     vn_ptr = tok.subview(CT_VN + h * HD + row_w + lane).data_ptr().toint()
@@ -1414,7 +1414,7 @@ def k3_kda_attn_fused_kernel(
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
     ssm: cutlass.Array,  # fp32 [pool][6][128][128]: the state after the last golden token
-    state_tok: cutlass.Array,  # fp32 [pool][7][6][128][128]: the state after each draft of the last round
+    state_tok: cutlass.Array,  # fp32 [pool][3][7][6][128]: the records of the last round's drafts
     slots: cutlass.Array,  # int32 [1]
     pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [8][6][128]

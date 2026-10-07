@@ -4,12 +4,12 @@
 
 Kimi K3's KDA speculative verify of R requests of 1 + num_spec tokens, at the TP16 rank slice (6 heads, K = V = 128,
 conv width 4), on the verify pools of a real ``MambaHybridCacheManagerV2`` built with MTP-style speculation, the KDA
-replay caches and per-token states (``_kda_cells.build_manager``): every layer's conv caches (fp32, dim-contiguous),
-its fp32 state (strided by the manager's per-slot coalescing) and per-draft states, and the accepted-draft record all
-layers share (``prev_num_accepted_tokens``), at the slots the manager assigned.
+replay caches and the drafts' records (``_kda_cells.build_manager``): every layer's conv caches (fp32,
+dim-contiguous), its fp32 state (strided by the manager's per-slot coalescing) and draft records, and the
+accepted-draft record all layers share (``prev_num_accepted_tokens``), at the slots the manager assigned.
 
 The reference is a float64 verify over each request's committed history (``_kda_cells.F64Verify``): every round's
-outputs and the state committed after each golden token against it; the per-draft states and the conv caches are
+outputs and the state committed after each golden token against it; the draft records and the conv caches are
 checked through the next round, which starts from the drafts the sampler accepted. Call sequences: layers x rounds,
 a captured round replayed against the same rounds run eagerly, the schedule twice; negative controls.
 
@@ -184,7 +184,7 @@ def test_swapped_rounds_are_silently_wrong(managers) -> None:
 
 
 def test_rejects_out_of_contract(managers) -> None:
-    """Per-draft states for another draft count, and an int64 record, are refused before anything is written."""
+    """Draft records for another draft count, and an int64 record, are refused before anything is written."""
     mgr, all_slots = managers[kc.NUM_SPEC]
     slots = all_slots[:2]
     p = kc.layer_pools(mgr, 0)
@@ -193,7 +193,7 @@ def test_rejects_out_of_contract(managers) -> None:
         before = kc.snapshot(p)
         wt = kc.make_weights(630)
         proj = _proj(2, kc.NT, torch.Generator(device="cuda").manual_seed(63))
-        short = dict(p, state_tok=p["state_tok"][:, : kc.NUM_SPEC - 1].contiguous())
+        short = dict(p, state_tok=p["state_tok"][:, :, : kc.NUM_SPEC - 1].contiguous())
         with pytest.raises(ValueError, match="unsupported call"):
             _verify(wt, short, proj, slots, kc.NUM_SPEC)
         with pytest.raises(ValueError, match="unsupported call"):

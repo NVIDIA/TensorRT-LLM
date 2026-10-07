@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``trtllm::k3_kda_verify``: Kimi K3's KDA speculative verify for 1 + num_spec tokens per request, from the fused
-projection rows to the gated-norm core output, with a committed state per verify token.
+projection rows to the gated-norm core output, with the drafts' records for the next round.
 
 State contract (differs from ``trtllm::kda_mtp_decode``'s replay caches): after a call the pool ``ssm`` holds the
-state after each request's golden token and ``state_tok[slot, t - 1]`` the state after its draft t; the conv caches
-hold the raw inputs at positions -2..num_spec around the golden token. The next call reads the state after the
-drafts the sampler accepted (``pending[slot]``) directly, so nothing is replayed. The kernel compiles on the first
-call for each configuration, which must happen outside CUDA-graph capture.
+state after each request's golden token and ``state_tok[slot]`` the records of its drafts: the row innovations vn
+[num_spec][H][V], then beta * k and the decay [num_spec][H][K]. The conv caches hold the raw inputs at positions
+-2..num_spec around the golden token. The next call starts from the pool state with the drafts the sampler accepted
+(``pending[slot]``) replayed from their records, S = fma(decay, S, vn (beta k)), the recurrence's own arithmetic.
+The kernel compiles on the first call for each configuration, which must happen outside CUDA-graph capture.
 """
 
 from __future__ import annotations
@@ -108,8 +109,8 @@ def k3_kda_verify(
     ``w_fb`` bf16 [H K, K], the f_b weight (out, in); ``w_q/w_k/w_v`` fp32 [H K, 4]; ``a_log`` fp32 [H];
     ``dt_bias`` fp32 [H K]; ``onorm_w`` fp32 [V]; ``cs_*`` fp32 [pool, H K, 3 + num_spec] (dim-contiguous);
     ``ssm`` fp32 [pool, H, V, K] (each slot dense, slots at any stride); ``state_tok`` fp32
-    [pool, num_spec, H, V, K]; ``slots`` int32 [N]; ``pending`` int32 [pool]. With ``g_ext`` (bf16 [T, H K], the
-    unfused f_b output) the gate is read instead of computed from f_a."""
+    [pool, 3, num_spec, H, K], the drafts' records (vn, beta * k, decay); ``slots`` int32 [N]; ``pending`` int32
+    [pool]. With ``g_ext`` (bf16 [T, H K], the unfused f_b output) the gate is read instead of computed from f_a."""
     import cuda.bindings.driver as cuda_driver
 
     from . import k3_kda_verify_kernel as kernel
@@ -130,7 +131,7 @@ def k3_kda_verify(
         or not w_fb.is_contiguous()
         or v_dim != K
         or tuple(ssm.shape[1:]) != (num_heads, K, K)
-        or tuple(state_tok.shape[1:]) != (num_spec, num_heads, K, K)
+        or tuple(state_tok.shape[1:]) != (3, num_spec, num_heads, K)
         or ssm.stride()[1:] != (K * K, K, 1)
         or ssm.dtype != torch.float32
         or not state_tok.is_contiguous()

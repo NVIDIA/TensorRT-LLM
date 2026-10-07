@@ -424,7 +424,7 @@ def make_verify_pools(seed: int) -> dict:
     p = {name: (torch.randn(POOL, W - 1 + NUM_SPEC, HK, generator=g, device="cuda") * 0.5).transpose(1, 2)
          for name in ("cs_q", "cs_k", "cs_v")}  # fmt: skip
     p["state"] = torch.randn(POOL, H, V, K, generator=g, device="cuda") * 0.05
-    p["state_tok"] = torch.zeros(POOL, NUM_SPEC, H, V, K, device="cuda")
+    p["state_tok"] = torch.zeros(POOL, 3, NUM_SPEC, H, K, device="cuda")
     p["pending"] = torch.zeros(POOL, dtype=torch.int32, device="cuda")
     return p
 

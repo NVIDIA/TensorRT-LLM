@@ -22,7 +22,7 @@ y = x @ w^T
 #    q, k, f_a: bf16 of the four split-K partials of a cluster, summed in rank order
 #    v, og, b:  bf16(half_0 + half_1), the fp32 sums of the two K halves
 # 2. verify (exactly ssm/k3_kda_verify on y with the gate folded in, g_ext = None):
-#    starting state S = ssm[slot] if P == 0 else state_tok[slot, P - 1],   P = pending[slot]
+#    starting state S = ssm[slot] with its P = pending[slot] accepted drafts replayed from their records
 #    per token t = 0..7: g = bf16(f_a @ w_fb^T); q, k, v = SiLU(conv4(window, new raw)); q, k L2-normalized,
 #    q *= scale; beta = sigmoid(b); decay = exp(lower_bound * sigmoid(exp(a_log) * (g + dt_bias)));
 #    S *= decay (per key); S += beta (v - S k) k^T; o = S q;
@@ -32,7 +32,8 @@ y = x @ w^T
 and returns `out` bf16 `[8, 6, 128]`, the gated-norm core output. In place, at the request's slot:
 
 - `ssm[slot]` = the state after the golden token (t = 0);
-- `state_tok[slot, t - 1]` = the state after draft t, t = 1..7;
+- `state_tok[slot]` = the records of drafts t = 1..7 (vn, beta k, decay), from which the next round replays the
+  accepted ones;
 - `cs_q` / `cs_k` / `cs_v[slot]` = the raw inputs at positions -2..7 around the golden token (the next round's
   window starts at column P).
 
@@ -85,7 +86,7 @@ def k3_kda_qkvg(x: torch.Tensor, w: torch.Tensor, buffers: K3KdaBuffers) -> None
 | `onorm_w` | `[128]` | fp32 | dense | CUDA |
 | `cs_q`, `cs_k`, `cs_v` | `[pool, 768, 3 + num_spec]` | fp32 | channel stride 1 (dim-contiguous) | CUDA |
 | `ssm` | `[pool, 6, 128, 128]` (V rows, K contiguous) | fp32 | each slot dense, slots at any stride | CUDA |
-| `state_tok` | `[pool, num_spec, 6, 128, 128]` | fp32 | contiguous | CUDA |
+| `state_tok` | `[pool, 3, num_spec, 6, 128]`: the drafts' records vn, beta k, decay | fp32 | contiguous | CUDA |
 | `slots` | `[1]`: the request's slot | int32 | any element offset | CUDA |
 | `pending` | `[pool]`: drafts the sampler accepted last round, per slot | int32 | any element offset | CUDA |
 | `buffers` | `K3KdaBuffers` made with `ctas=FUSED_CTAS` (128) | — | — | CUDA |

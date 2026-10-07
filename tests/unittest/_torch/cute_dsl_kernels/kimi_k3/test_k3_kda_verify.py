@@ -174,11 +174,11 @@ class MainPath:
 
 
 class K3Path:
-    """k3_kda_verify: a committed state per verify token, a per-slot pending count."""
+    """k3_kda_verify: the golden token's state and the drafts' records per slot, a per-slot pending count."""
 
     def __init__(self, wt, pools, slots, num_spec):
         self.wt, self.p, self.slots, self.num_spec = wt, pools, slots, num_spec
-        self.p["state_tok"] = torch.zeros(POOL, num_spec, H, V, K, device="cuda")
+        self.p["state_tok"] = torch.zeros(POOL, 3, num_spec, H, K, device="cuda")
         self.p["pending"] = torch.zeros(POOL, dtype=torch.int32, device="cuda")
 
     def __call__(self, proj, g_ext=None):
@@ -355,7 +355,7 @@ def test_strided_fold(num_requests, steps):
 
 @pytest.mark.parametrize("num_requests,steps", [(4, 8), (8, 2)])
 def test_isolation(num_requests, steps):
-    """A change in request 0's rows changes only request 0's outputs, pool state and per-token states."""
+    """A change in request 0's rows changes only request 0's outputs, pool state and draft records."""
     _ops()
     with torch.inference_mode():
         num_spec = steps - 1

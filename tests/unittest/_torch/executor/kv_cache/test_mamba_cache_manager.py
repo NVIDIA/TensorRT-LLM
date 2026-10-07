@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
-import math
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -3672,8 +3671,8 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
 @skip_no_cuda
 @pytest.mark.parametrize("kda_replay_num_spec", [2, None])
 def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spec):
-    """With the replay caches, ``kda_token_states`` adds the fp32 state after every
-    draft of each slot, per layer; without them it allocates nothing."""
+    """With the replay caches, ``kda_token_states`` adds the fp32 records of every draft
+    of each slot (vn, beta * k, decay), per layer; without them it allocates nothing."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         max_batch_size=4,
         num_mamba_layers=2,
@@ -3696,7 +3695,8 @@ def test_v2_kda_token_states_allocated_with_the_replay_caches(kda_replay_num_spe
             layer_cache = mgr.mamba_layer_cache(layer_idx)
             cache_size = layer_cache.temporal.shape[0]
             states = layer_cache.kda_state_tok
-            assert states.shape == (cache_size, 2, *layer_cache.temporal.shape[1:])
+            num_heads, _, head_dim = layer_cache.temporal.shape[1:]
+            assert states.shape == (cache_size, 3, 2, num_heads, head_dim)
             assert states.dtype is torch.float32
             assert states.data_ptr() == mgr.kda_state_tok[layer_idx].data_ptr()
             assert not states.any()
@@ -3754,7 +3754,7 @@ def test_v2_kda_replay_validates_configuration(
 def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     kda_token_states, enable_block_reuse, at_floor
 ):
-    """The per-token KDA states take memory per SSM slot outside the cache quota. Without block reuse the SSM pool
+    """The KDA drafts' records take memory per SSM slot outside the cache quota. Without block reuse the SSM pool
     keeps only its live floor and attention gets the rest of the quota; otherwise (replay caches only, or block reuse)
     the typical step's ratio sizes it."""
     mgr = object.__new__(MambaHybridCacheManagerV2)
@@ -3785,8 +3785,8 @@ def test_v2_kda_token_states_keep_ssm_pool_at_live_floor(
     mgr._attention_cache_bytes_per_token = lambda: 8
     mgr._use_kda_replay_update = True
     mgr._kda_token_states = kda_token_states
-    # The per-token states count in each slot's state bytes (_mamba_state_bytes_per_slot): num_spec fp32 states of
-    # the SSM state shape, 2 MiB each here.
+    # The drafts' records count in each slot's state bytes (_mamba_state_bytes_per_slot): per draft, vn, beta * k
+    # and the decay, fp32 [H, K] each (24 KiB here).
     mgr._kda_replay_num_spec = 2
     mgr.ssm_state_shape = [8, 256, 256]
     mgr.kv_cache_config = KvCacheConfig(
@@ -3958,7 +3958,8 @@ def test_v2_kda_token_states_relocate_with_their_slot():
 
 @skip_no_cuda
 def test_v2_kda_token_states_count_in_the_per_slot_budget():
-    """The capacity math sees the per-token states: a slot costs one more fp32 SSM state per draft and layer."""
+    """The capacity math sees the drafts' records: per draft and layer, a slot costs vn, beta * k and the decay, fp32
+    [H, K] each."""
     kwargs = dict(
         num_mamba_layers=2,
         spec_config=MTPDecodingConfig(max_draft_len=2),
@@ -3976,7 +3977,8 @@ def test_v2_kda_token_states_count_in_the_per_slot_budget():
         plain.shutdown()
     with_states = _build_v2_hybrid_with_mamba_layer(kda_token_states=True, **kwargs)
     try:
-        per_token = 2 * 2 * math.prod(with_states.ssm_state_shape) * 4
+        num_heads, _, head_dim = with_states.ssm_state_shape
+        per_token = 2 * 2 * 3 * num_heads * head_dim * 4
         assert with_states._mamba_state_bytes_per_slot() == plain_bytes + per_token
     finally:
         with_states.shutdown()

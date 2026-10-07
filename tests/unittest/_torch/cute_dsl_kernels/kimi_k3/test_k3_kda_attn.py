@@ -90,7 +90,7 @@ def make_pools(seed: int, layout: str) -> dict:
         view.copy_(state)
         state = view
     p["state"] = state
-    p["state_tok"] = torch.zeros(POOL, NUM_SPEC, H, V, K, device="cuda")
+    p["state_tok"] = torch.zeros(POOL, 3, NUM_SPEC, H, K, device="cuda")
     p["pending"] = torch.zeros(POOL, dtype=torch.int32, device="cuda")
     return p
 

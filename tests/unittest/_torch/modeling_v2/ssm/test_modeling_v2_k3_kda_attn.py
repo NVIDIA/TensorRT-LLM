@@ -5,9 +5,9 @@ caller-owned K3KdaBuffers.
 
 Kimi K3's fused KDA projection + speculative verify of one request's golden token and 7 drafts, at the TP16 rank
 slice, on the verify pools of a real ``MambaHybridCacheManagerV2`` built with MTP-style speculation of 7 drafts, the
-KDA replay caches and per-token states (``_kda_cells.build_manager``): the layer's conv caches (fp32, dim-contiguous),
-its fp32 state (strided by the manager's per-slot coalescing), its per-draft states and the accepted-draft record
-every layer shares (``prev_num_accepted_tokens``), at the slots the manager assigned.
+KDA replay caches and the drafts' records (``_kda_cells.build_manager``): the layer's conv caches (fp32,
+dim-contiguous), its fp32 state (strided by the manager's per-slot coalescing), its draft records and the
+accepted-draft record every layer shares (``prev_num_accepted_tokens``), at the slots the manager assigned.
 
 The reference, as the op's own test: the projection stream alone (``k3_kda_qkvg``, its Lamport buffers decoded into
 rows) and the ``ssm/k3_kda_verify`` entry on them, on a copy of the pools: outputs and every pool bit for bit. Layer 0

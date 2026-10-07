@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens, from the fused projection rows to the
-gated-norm core output, committing the state after every verify token."""
+gated-norm core output, committing the golden token's state and every draft's records."""
 
 from typing import Optional
 

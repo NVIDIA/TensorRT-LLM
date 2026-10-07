@@ -195,7 +195,7 @@ entries:
 
   - path: ssm/k3_kda_attn.py
     impl: torch.ops.trtllm.k3_kda_attn
-    summary: "Kimi K3's KDA layer for one speculative-decoding request in one launch: the fused input projection of its golden token and 7 drafts and the KDA verify of ssm/k3_kda_verify on it, bit for bit the unfused pair, writing the slot's state, per-draft states and conv window in place, over a caller-owned K3KdaBuffers (three Lamport buffers and per-CTA indices, one set per device shared with ssm/k3_kda_decode_attn, its launches one at a time in stream order); the head CTAs read the slot's pools before the grid-dependency wait, so a launch must not directly follow another on the same pools; sibling: k3_kda_qkvg (the projection stream alone, a 104-CTA set of its own)"
+    summary: "Kimi K3's KDA layer for one speculative-decoding request in one launch: the fused input projection of its golden token and 7 drafts and the KDA verify of ssm/k3_kda_verify on it, bit for bit the unfused pair, writing the slot's state, its drafts' records and conv window in place, over a caller-owned K3KdaBuffers (three Lamport buffers and per-CTA indices, one set per device shared with ssm/k3_kda_decode_attn, its launches one at a time in stream order); the head CTAs read the slot's pools before the grid-dependency wait, so a launch must not directly follow another on the same pools; sibling: k3_kda_qkvg (the projection stream alone, a 104-CTA set of its own)"
 
   - path: ssm/k3_kda_decode_attn.py
     impl: torch.ops.trtllm.k3_kda_decode_attn
@@ -203,7 +203,7 @@ entries:
 
   - path: ssm/k3_kda_verify.py
     impl: torch.ops.trtllm.k3_kda_verify
-    summary: "Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens from the fused projection rows to the gated-norm core output, starting each request from the state after the drafts the sampler accepted last round (the per-token states of the V2 hybrid manager, selected by prev_num_accepted_tokens, read before the grid-dependency wait) and committing the state after every verify token, so the next round needs no replay"
+    summary: "Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens from the fused projection rows to the gated-norm core output, starting each request from the golden token's state with the drafts the sampler accepted last round replayed from their records (the V2 hybrid manager's kda_state_tok, counted by prev_num_accepted_tokens, read before the grid-dependency wait), and committing the golden token's state and every draft's records for the next round"
 
   # ─── moe ───────────────────────────────────────────────────────
   - path: moe/noaux_tc_op.py

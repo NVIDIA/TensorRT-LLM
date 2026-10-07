@@ -50,7 +50,7 @@ def load_ops():
 # ---------------------------------------------------------------------------------------------------------------
 def build_manager(num_layers: int, num_spec: int | None = None, max_batch_size: int = 8):
     """A real MambaHybridCacheManagerV2 with ``num_layers`` KDA layers (and one attention layer). With ``num_spec``:
-    MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the per-token states
+    MTP-style speculation of ``num_spec`` drafts, the KDA replay caches and the drafts' records
     (``kda_token_states``) that k3_kda_verify / k3_kda_attn read and write."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
         MambaHybridCacheManagerV2,
@@ -101,7 +101,7 @@ def request_slots(mgr, count: int, first_id: int) -> torch.Tensor:
 def layer_pools(mgr, layer: int) -> dict:
     """The manager's views of one KDA layer's pools: ``conv`` bf16 [slots, 3 HK, W - 1] (q | k | v channels) and
     ``ssm`` fp32 [slots, H, V, K] (plain decode); with the replay caches also ``cs_q`` / ``cs_k`` / ``cs_v`` fp32
-    [slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32 [slots, num_spec, H, V, K] and ``pending``,
+    [slots, HK, W - 1 + num_spec] (dim-contiguous), ``state_tok`` fp32 [slots, 3, num_spec, H, K] and ``pending``,
     the accepted-draft record every layer shares (``prev_num_accepted_tokens``)."""
     pools = {"conv": mgr.get_conv_states(layer), "ssm": mgr.get_ssm_states(layer)}
     if mgr.use_kda_replay_update:
