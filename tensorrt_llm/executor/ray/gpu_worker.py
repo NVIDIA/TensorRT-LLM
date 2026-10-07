@@ -306,8 +306,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
-    @control_action_decorator
-    def sleep(self, sleep_tags: List[str]):
+    def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
 
@@ -325,13 +324,14 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         self.engine.begin_sleep_transition(tags)
         mutation_started = False
         try:
-            torch.cuda.synchronize()
-            mutation_started = True
-            self._invalidate_v1_prefix_cache_for_sleep(tags)
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+            with self.engine.control_action():
+                torch.cuda.synchronize()
+                mutation_started = True
+                self._invalidate_v1_prefix_cache_for_sleep(tags)
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
         except Exception:
             if mutation_started:
                 self.engine.fail_sleep_wakeup_transition()
