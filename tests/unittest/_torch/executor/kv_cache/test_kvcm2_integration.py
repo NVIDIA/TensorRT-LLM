@@ -69,7 +69,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheManager,
     KVCacheManagerConfig,
     LayerId,
+    ReuseScope,
     SsmLayerConfig,
+    _introspection,
 )
 
 TOKENS_PER_BLOCK = 4
@@ -134,6 +136,113 @@ def test_create_kv_cache_swa_endpoint_priority(
     assert ("custom_priority_callback" in kwargs) is enabled
     if enabled:
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
+
+
+def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
+    """Run a prompt through a real cache and release it, leaving its pages reusable."""
+    cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
+    try:
+        assert cache.resume(CudaStream(torch.cuda.current_stream().cuda_stream))
+        # Grow capacity only: commit() advances the history itself. Advancing
+        # the history first (resize(len, len)) marks out-of-window pages stale
+        # before they are committed, so they would never become reusable.
+        assert cache.resize(len(prompt))
+        uncommitted = prompt[cache.num_committed_tokens :]
+        if uncommitted:
+            cache.commit(uncommitted)
+    finally:
+        cache.close()
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("with_callback", [True, False], ids=["endpoint-priority", "lru-baseline"])
+def test_swa_endpoint_priority_steers_real_eviction(with_callback: bool) -> None:
+    """Priority-based eviction of real pages must follow the endpoint callback.
+
+    A four-block SWA prompt is committed and released: with window 8 and rewind
+    4 its block 0 lies before the protected endpoint span (priority 0) while
+    blocks 1-3 overlap it (priority 70). A second request then reuses block 0,
+    re-releasing it as the most recently used page. Bounded pressure (exactly
+    one page beyond capacity) must evict:
+
+    * with the callback: block 0, the lowest-priority page, despite being MRU;
+    * without it (LRU baseline): block 1, the oldest page, an endpoint page.
+
+    The baseline leg proves recency alone sacrifices the endpoint page here, so
+    the endpoint-priority leg fails if the core ignores the callback or applies
+    its priorities incorrectly.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    # The sibling tests reach the core through the pyexecutor manager, whose
+    # constructor touches the torch CUDA runtime and thereby binds the primary
+    # context to this thread. This test constructs the raw core first, so bind
+    # the context explicitly or construction fails with CUDA error 201.
+    torch.cuda.synchronize()
+    window_size = 2 * TOKENS_PER_BLOCK
+    rewind_tokens = TOKENS_PER_BLOCK
+    prompt = list(range(4 * TOKENS_PER_BLOCK))
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=TOKENS_PER_BLOCK,
+            cache_tiers=[GpuCacheTierConfig(quota=2 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=65536),
+                        BufferConfig(role=Role.VALUE, size=65536),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            ],
+        )
+    )
+
+    def priority_callback(prompt_length: int):
+        if not with_callback:
+            return None
+        return _swa_endpoint_priority(prompt_length, TOKENS_PER_BLOCK, rewind_tokens)
+
+    pins = []
+    try:
+        _commit_released_prompt(core, prompt, priority_callback(len(prompt)))
+
+        # Reuse block 0 so its page is re-released after blocks 1-3. The touch
+        # request's one new page lies inside its own endpoint span, so it stays
+        # priority 70 under the callback and never absorbs the pressure.
+        touch_prompt = prompt[:TOKENS_PER_BLOCK] + [1000 + i for i in range(TOKENS_PER_BLOCK)]
+        _commit_released_prompt(core, touch_prompt, priority_callback(len(touch_prompt)))
+
+        swa_lc_id = _introspection.swa_life_cycle_ids(core)[0]
+        _, pages = _introspection.reuse_match_pages(core, ReuseScope(), prompt, swa_lc_id)
+        assert len(pages) == 4
+        # The all-reusable premise: out-of-window pages stay reusable until evicted.
+        assert all(page is not None for page in pages)
+
+        # Bounded pressure: pin every free page with held (unevictable)
+        # allocations, then demand one more page, forcing exactly one eviction.
+        stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+        free_pages = core.get_storage_statistics()[0].free
+        for _ in range(free_pages + 1):
+            pin = core.create_kv_cache()
+            pins.append(pin)
+            assert pin.resume(stream)
+            assert pin.resize(TOKENS_PER_BLOCK)
+
+        _, pages = _introspection.reuse_match_pages(core, ReuseScope(), prompt, swa_lc_id)
+        if with_callback:
+            assert pages[0] is None, "the intermediate page must be evicted first"
+            assert all(page is not None for page in pages[1:]), "endpoint pages must be retained"
+        else:
+            assert pages[0] is not None, "pure LRU keeps the recently touched page"
+            assert pages[1] is None, "pure LRU evicts the oldest endpoint page"
+            assert all(page is not None for page in pages[2:])
+    finally:
+        for pin in pins:
+            pin.close()
+        core.shutdown()
 
 
 class _CacheTierInitError(Exception):
@@ -595,6 +704,42 @@ def test_zero_size_filter_rejects_empty_local_cache() -> None:
 
     with pytest.raises(ValueError, match="at least one non-empty local cache layer"):
         manager._remove_zero_size_buffers(config)
+
+
+@pytest.mark.parametrize("sliding_window_size", [None, 8])
+@pytest.mark.parametrize("attention_first", [False, True])
+def test_event_window_sizes_filter_attention_without_backend_internals(
+    sliding_window_size: int | None, attention_first: bool
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.max_seq_len = MAX_SEQ_LEN
+    manager.kv_cache_manager_py_config = SimpleNamespace(
+        layers=[
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[BufferConfig(role=Role.KEY, size=128)],
+                sliding_window_size=sliding_window_size,
+            ),
+            SsmLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[BufferConfig(role=DataRole("ssm_state"), size=128)],
+            ),
+        ]
+    )
+    # Match the C++ binding surface: layer_grouping is public, while the
+    # Python implementation's private _life_cycles registry is absent.
+    manager.impl = SimpleNamespace(layer_grouping=[[0], [1]] if attention_first else [[1], [0]])
+
+    attention_group_id = 0 if attention_first else 1
+    window_size = MAX_SEQ_LEN if sliding_window_size is None else sliding_window_size
+    # SSM must be excluded even when its window ties with full attention's window.
+    assert manager._get_event_window_sizes_by_layer_group(attention_only=True) == {
+        attention_group_id: window_size
+    }
+    assert manager._get_event_window_sizes_by_layer_group() == {
+        attention_group_id: window_size,
+        1 - attention_group_id: MAX_SEQ_LEN,
+    }
 
 
 def test_draft_token_relocation_uses_local_cache_layout(monkeypatch: pytest.MonkeyPatch) -> None:

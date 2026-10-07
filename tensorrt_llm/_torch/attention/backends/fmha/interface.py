@@ -60,6 +60,7 @@ _STATIC_CONFIG_DIRECT_ARGS = (
     "sage_attn_num_elts_per_blk_k",
     "sage_attn_num_elts_per_blk_v",
     "sage_attn_qk_int8",
+    "sage_attn_smooth_k",
     "skip_correction_threshold",
     "uses_spcompress",
 )
@@ -106,6 +107,7 @@ class StaticAttentionConfig:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
     quant_mode: QuantMode = 0
     skip_correction_threshold: float = 0.0
 
@@ -198,6 +200,7 @@ class StaticAttentionConfig:
             sage_attn_num_elts_per_blk_k=fwd.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=fwd.sage_attn_num_elts_per_blk_v,
             sage_attn_qk_int8=fwd.sage_attn_qk_int8,
+            sage_attn_smooth_k=fwd.sage_attn_smooth_k,
             quant_mode=quant_mode,
             skip_correction_threshold=skip_correction_threshold,
         )

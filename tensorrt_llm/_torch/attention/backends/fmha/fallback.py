@@ -294,6 +294,7 @@ class FallbackFmha(PhasedFmha):
         sage_attn_num_elts_per_blk_k: int = 0,
         sage_attn_num_elts_per_blk_v: int = 0,
         sage_attn_qk_int8: bool = False,
+        sage_attn_smooth_k: bool = False,
         num_contexts: int = 0,
         num_ctx_tokens: int = 0,
         trtllm_gen_jit_warmup: bool = False,

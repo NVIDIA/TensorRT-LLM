@@ -176,6 +176,7 @@ def test_legacy_fallback_dispatch_uses_native_phase_params(
     def get_op(config, device):
         assert config.skip_correction_threshold == pytest.approx(0.25)
         assert config.uses_spcompress is True
+        assert config.sage_attn_smooth_k is True
         assert device == q.device
         return op
 
@@ -248,6 +249,7 @@ def test_legacy_fallback_dispatch_uses_native_phase_params(
         kv_norm_eps=1e-5,
         skip_correction_threshold=0.25,
         uses_spcompress=True,
+        sage_attn_smooth_k=True,
     )
     if fused_epilogue:
         arguments.update(kv_lora_rank=448, qk_rope_head_dim=64, v_head_dim=512, rope_append=False)

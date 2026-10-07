@@ -800,6 +800,24 @@ public:
         return mCfg;
     }
 
+    [[nodiscard]] bool sageAttnRequested() const
+    {
+        return mCfg.sage_attn_num_elts_per_blk_q > 0 || mCfg.sage_attn_num_elts_per_blk_k > 0
+            || mCfg.sage_attn_num_elts_per_blk_v > 0;
+    }
+
+    [[nodiscard]] bool useSageAttn() const
+    {
+        return sageAttnRequested() && mFP8ContextFMHA && !mCfg.is_mla_enable && !mCfg.use_kv_cache;
+    }
+
+    [[nodiscard]] bool useHopperSageAttn() const
+    {
+        return useSageAttn() && mSM == kernels::kSM_90 && mCfg.sage_attn_qk_int8
+            && mCfg.sage_attn_num_elts_per_blk_q == 2 && mCfg.sage_attn_num_elts_per_blk_k == 16
+            && mCfg.sage_attn_num_elts_per_blk_v == 1;
+    }
+
     [[nodiscard]] tensorrt_llm::kernels::MlaMetaParams const& mlaMeta() const
     {
         return mMLAParams;
