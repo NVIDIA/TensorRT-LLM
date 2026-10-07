@@ -305,6 +305,91 @@ TEST_F(ProfilerScopeTest, CallbackWithoutInputsDoesNotInspectMetadata)
     EXPECT_TRUE(observation().inputsEmpty);
 }
 
+#if TRTLLM_ENABLE_NCCL_PROFILING
+//! Evaluate NCCL fields only for an active callback that requests inputs.
+TEST_F(ProfilerScopeTest, NcclMetadataExtractionIsLazy)
+{
+    int fields{0};
+    {
+        CallbackGuard callback{false};
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName(
+            []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
+        EXPECT_EQ(observation().starts, 1);
+        EXPECT_TRUE(observation().inputsEmpty);
+    }
+    EXPECT_EQ(fields, 0);
+    tc::RecordFunctionWithMetadata inactive{tc::ProfilerRegion::kNccl};
+    inactive.startWithLazyName(
+        []() -> std::string { return "trtllm::nccl_metadata"; }, [&](tc::ProfilerMetadata&) { ++fields; });
+    EXPECT_EQ(fields, 0);
+    CallbackGuard callback;
+    {
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName([]() -> std::string { return "trtllm::nccl_metadata"; },
+            [&](tc::ProfilerMetadata& metadata)
+            {
+                ++fields;
+                metadata.add("nccl.operation", "all_gather");
+            });
+    }
+    EXPECT_EQ(fields, 1);
+    EXPECT_EQ(observation().starts, 1);
+    EXPECT_EQ(observation().ends, 1);
+    EXPECT_EQ(observation().name, "trtllm::nccl_metadata");
+    EXPECT_EQ(observation().metadata, R"(TRTLLM1:4:nccl{"nccl.operation":"all_gather"})");
+}
+
+//! Verify inactive NCCL probes skip both name allocation and metadata extraction.
+TEST_F(ProfilerScopeTest, NcclInactiveScopeNeverConstructsItsOwningName)
+{
+    int names{0};
+    int fields{0};
+    tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+    scope.startWithLazyName(
+        [&]() -> std::string
+        {
+            ++names;
+            throw std::bad_alloc{};
+        },
+        [&](tc::ProfilerMetadata&) { ++fields; });
+    EXPECT_EQ(names, 0);
+    EXPECT_EQ(fields, 0);
+}
+
+//! Check that a throwing name factory leaves the operation and its exception unchanged.
+TEST_F(ProfilerScopeTest, NcclThrowingNameDoesNotPreventBodyOrMaskItsException)
+{
+    CallbackGuard callback;
+    int names{0};
+    int fields{0};
+    bool bodyRan{false};
+    try
+    {
+        tc::RecordFunctionWithMetadata scope{tc::ProfilerRegion::kNccl};
+        scope.startWithLazyName(
+            [&]() -> std::string
+            {
+                ++names;
+                // Deterministic factory failure, without modifying the process allocator.
+                throw std::bad_alloc{};
+            },
+            [&](tc::ProfilerMetadata&) { ++fields; });
+        bodyRan = true;
+        throw std::logic_error("original operation failure");
+    }
+    catch (std::logic_error const& error)
+    {
+        EXPECT_STREQ(error.what(), "original operation failure");
+    }
+    EXPECT_TRUE(bodyRan);
+    EXPECT_EQ(names, 1);
+    EXPECT_EQ(fields, 0);
+    EXPECT_EQ(observation().starts, 0);
+    EXPECT_EQ(observation().ends, 0);
+}
+#endif
+
 //! Verify missing callbacks and excluded regions both bypass name and metadata factories.
 TEST_F(ProfilerScopeTest, InactiveAndUnselectedScopesDoNotEvaluateFactories)
 {

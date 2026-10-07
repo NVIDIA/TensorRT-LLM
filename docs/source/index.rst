@@ -107,6 +107,7 @@ Welcome to TensorRT LLM's Documentation!
    developer-guide/perf-analysis.md
    developer-guide/profiler-metadata.md
    developer-guide/workflow-profiler-regions.md
+   developer-guide/nccl-profiler-metadata.md
    developer-guide/perf-benchmarking.md
    developer-guide/moe-perf-guide.md
    developer-guide/ci-overview.md

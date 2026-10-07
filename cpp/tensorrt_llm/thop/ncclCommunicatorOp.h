@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,6 +36,9 @@ public:
     void recv(th::Tensor& tensor, int64_t fromRank) const;
 
 private:
+#if TRTLLM_ENABLE_NCCL_PROFILING && ENABLE_MULTI_DEVICE
+    int32_t mWorldSize;
+#endif
     int32_t mRank;
     std::shared_ptr<tensorrt_llm::runtime::NcclCommunicator> mPipelineComm;
 };
