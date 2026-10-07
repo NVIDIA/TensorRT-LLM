@@ -43,11 +43,13 @@ def _args() -> SimpleNamespace:
     )
 
 
-@pytest.mark.parametrize("base_role", [None, "producer", "consumer"])
+@pytest.mark.parametrize(
+    "base_role", [None, "producer", "consumer", "recording_producer", "recording_consumer"]
+)
 def test_restore_from_another_owner(
     example: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, base_role: str | None
 ) -> None:
-    """Restore across owners and base/ADP examples into different block IDs."""
+    """Restore across owners, base/ADP examples and the integration backend."""
     monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
     producer = example.PersistentKvCacheConnectorLeader(_args())
     consumer = example.PersistentKvCacheConnectorLeader(_args())
@@ -55,6 +57,16 @@ def test_restore_from_another_owner(
         producer = example.BaseConnectorLeader(_args())
     elif base_role == "consumer":
         consumer = example.BaseConnectorLeader(_args())
+    elif base_role in ("recording_producer", "recording_consumer"):
+        backend_dir = Path(__file__).resolve().parents[2] / "integration/defs/llmapi"
+        monkeypatch.syspath_prepend(str(backend_dir))
+        from connector_test_backend import RecordingConnectorScheduler
+
+        monkeypatch.delenv("CONNECTOR_TEST_ASYNC", raising=False)
+        if base_role == "recording_producer":
+            producer = RecordingConnectorScheduler(_args())
+        else:
+            consumer = RecordingConnectorScheduler(_args())
     src_worker = example.PersistentKvCacheConnectorWorker(_args())
     dst_worker = example.PersistentKvCacheConnectorWorker(_args())
     src_cache = torch.arange(12, dtype=torch.float32).reshape(3, 4)

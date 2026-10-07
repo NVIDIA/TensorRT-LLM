@@ -8,9 +8,9 @@ import os
 from pathlib import Path
 
 import torch
+from llm_kv_cache_connector import PersistentKvCacheConnectorMetadata
 from llm_kv_cache_connector_adp import (
     PersistentKvCacheConnectorLeader,
-    PersistentKvCacheConnectorMetadata,
     PersistentKvCacheConnectorWorker,
 )
 
