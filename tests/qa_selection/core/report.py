@@ -24,7 +24,6 @@ the hooks and renders the summary through pytest's terminal reporter.
 
 import json
 import subprocess
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -95,7 +94,6 @@ class Outcome:
     required_gpus: int
     required_gpus_from: Tuple[str, ...]
     rung: Optional[int]
-    unassignable: bool
 
     @classmethod
     def of(cls, assignment: Assignment) -> "Outcome":
@@ -107,7 +105,6 @@ class Outcome:
             required_gpus=assignment.demand.required_gpus,
             required_gpus_from=assignment.demand.required_gpus_from,
             rung=assignment.rung,
-            unassignable=assignment.unassignable,
         )
 
     def to_mapping(self) -> Dict[str, object]:
@@ -119,7 +116,6 @@ class Outcome:
             "required_gpus": self.required_gpus,
             "required_gpus_from": list(self.required_gpus_from),
             "rung": self.rung,
-            "unassignable": self.unassignable,
         }
 
 
@@ -163,20 +159,6 @@ class SelectionReport:
         }
 
     @property
-    def unassignable(self) -> Tuple[Outcome, ...]:
-        """Tests this machine can run that no rung fits.
-
-        Feasible only: an infeasible test is not waiting for an allocation.
-        Never folded into the largest rung.
-
-        Reachable by design. A ladder shorter than the machine -- `1,4` on an
-        8-GPU node -- is a caller running only the small work there, not a
-        mistake, so it is not refused. What it strands lands in no `.ids` file,
-        which is why the record lists these by node id and the run warns.
-        """
-        return tuple(outcome for outcome in self.feasible if outcome.unassignable)
-
-    @property
     def unclassified_rung(self) -> int:
         """Where a consumer routes an identifier this run never collected.
 
@@ -212,7 +194,6 @@ class SelectionReport:
             "candidates": len(self.outcomes),
             "feasible": len(self.feasible),
             "deselected": len(self.outcomes) - len(self.feasible),
-            "unassignable": len(self.unassignable),
             "unclassified": 0,
         }
 
@@ -226,12 +207,6 @@ class SelectionReport:
             "nodeid_form": NodeIds.FORM,
             "counts": self.counts,
             "rungs": {str(rung): len(outcomes) for rung, outcomes in self.rungs.items()},
-            # Named, not just counted: these appear in no `.ids` file, so the
-            # record is the only place a caller can find out which they are.
-            "unassignable": {
-                "largest_rung": self.ladder.largest,
-                "nodeids": NodeIds.of(self.unassignable),
-            },
             "unclassified": {"route_to_rung": self.unclassified_rung, "nodeids": []},
         }
         # Omitted entirely when nothing was dropped, as the terminal summary
@@ -241,31 +216,6 @@ class SelectionReport:
             record["deselected_by_reason"] = deselected
         record["tests"] = [outcome.to_mapping() for outcome in self.outcomes]
         return record
-
-
-class UnassignableWarning(UserWarning):
-    """Feasible tests that no rung of the ladder can hold.
-
-    Not an error. A ladder shorter than the machine is a legitimate way to run
-    only part of the suite on it, so the run continues -- but the tests it
-    strands are written to no `.ids` file, and would otherwise be dropped in
-    silence. This is what makes the silence audible in a job log.
-    """
-
-    @classmethod
-    def issue_for(cls, report: "SelectionReport") -> None:
-        """Warn when this run stranded anything; say nothing when it did not."""
-        stranded = report.unassignable
-        if not stranded:
-            return
-        warnings.warn(
-            cls(
-                f"{len(stranded)} feasible test(s) need more than {report.ladder.largest} "
-                f"GPUs and fit no rung of --ladder={report.ladder}, so they are in no "
-                f".ids file; they are listed under 'unassignable' in {report.machine}.json"
-            ),
-            stacklevel=2,
-        )
 
 
 class Artifacts:
@@ -359,7 +309,6 @@ class TerminalSummary:
             cls.line("feasible", f"{counts['feasible']}  ({counts['deselected']} deselected)"),
             cls.line("rungs", cls.rung_counts(report)),
         ]
-        lines += cls.unassignable_line(report)
         lines += [cls.line("written", path) for path in output.written]
         return lines
 
@@ -377,21 +326,3 @@ class TerminalSummary:
     def rung_counts(report: SelectionReport) -> str:
         """One count per rung, in ladder order."""
         return "  ".join(f"{rung}: {len(outcomes)}" for rung, outcomes in report.rungs.items())
-
-    @classmethod
-    def unassignable_line(cls, report: SelectionReport) -> List[str]:
-        """The one unresolved population a reader can act on, when it has members.
-
-        A skipif the rule table has no rule for is not among them: the table is
-        curated, so keeping the test is already the whole answer.
-        """
-        count = report.counts["unassignable"]
-        if not count:
-            return []
-        return [
-            cls.line(
-                "unassignable",
-                f"{count}  -- above every rung, in no .ids file; "
-                f"see 'unassignable' in {report.machine}.json",
-            )
-        ]
