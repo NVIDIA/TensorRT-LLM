@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,89 @@ def test_workload_admission_rejects_changed_artifact_bytes(tmp_path: Path, artif
         load_confidence_workload_admission(
             receipt_path,
             expected_receipt_sha256=receipt_sha256,
+            sps_cost_table_path=sps_path,
+            live_engine_fingerprint_path=fingerprint_path,
+            physical_k=5,
+        )
+
+
+def test_workload_admission_parses_the_pinned_receipt_bytes(tmp_path: Path, monkeypatch) -> None:
+    receipt_path, sps_path, fingerprint_path, receipt, receipt_sha256 = _write_workload_admission(
+        tmp_path
+    )
+    replacement = deepcopy(receipt)
+    replacement["admission"]["gross_compact_value_ms_lower_bound"] = 170.0
+    replacement["admission_sha256"] = hashlib.sha256(
+        json.dumps(replacement["admission"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    replacement_bytes = json.dumps(replacement).encode()
+    original_open = Path.open
+    replaced = False
+
+    class ReplaceOnClose:
+        def __init__(self, file):
+            self.file = file
+
+        def __enter__(self):
+            return self.file.__enter__()
+
+        def __exit__(self, *args):
+            result = self.file.__exit__(*args)
+            with original_open(receipt_path, "wb") as file:
+                file.write(replacement_bytes)
+            return result
+
+    def open_with_replacement(path, mode="r", *args, **kwargs):
+        nonlocal replaced
+        file = original_open(path, mode, *args, **kwargs)
+        if path == receipt_path and mode == "rb" and not replaced:
+            replaced = True
+            return ReplaceOnClose(file)
+        return file
+
+    monkeypatch.setattr(Path, "open", open_with_replacement)
+    admission = load_confidence_workload_admission(
+        receipt_path,
+        expected_receipt_sha256=receipt_sha256,
+        sps_cost_table_path=sps_path,
+        live_engine_fingerprint_path=fingerprint_path,
+        physical_k=5,
+    )
+
+    assert replaced is True
+    assert receipt_path.read_bytes() == replacement_bytes
+    assert admission.gross_compact_value_ms_lower_bound == 160.0
+
+
+def test_workload_admission_rejects_cost_table_over_runtime_cell_limit(tmp_path: Path) -> None:
+    receipt_path, sps_path, fingerprint_path, receipt, _ = _write_workload_admission(tmp_path)
+    sps_payload = json.loads(sps_path.read_text())
+    budgets = [0, 64, 128, 192, 256, 320, 352]
+    times = [6.0, 5.9, 5.8, 5.7, 5.6, 5.5, 5.2]
+    sps_payload["cost_tables"]["64"] = {"token_counts": budgets, "step_time_ms": times}
+    sps_payload["measurements"] = [
+        {
+            "rank_local_graph_batch_size": int(graph_batch_size),
+            "rank_local_verifier_budget": budget,
+            "step_time_ms": step_time,
+            "source_result_sha256": "c" * 64,
+        }
+        for graph_batch_size, cells in sps_payload["cost_tables"].items()
+        for budget, step_time in zip(cells["token_counts"], cells["step_time_ms"])
+    ]
+    sps_path.write_text(json.dumps(sps_payload))
+    receipt["admission"]["sps_cost_table_sha256"] = hashlib.sha256(
+        sps_path.read_bytes()
+    ).hexdigest()
+    receipt["admission_sha256"] = hashlib.sha256(
+        json.dumps(receipt["admission"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt_path.write_text(json.dumps(receipt))
+
+    with pytest.raises(ValueError, match="production limit.*compact V cells per G"):
+        load_confidence_workload_admission(
+            receipt_path,
+            expected_receipt_sha256=hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
             sps_cost_table_path=sps_path,
             live_engine_fingerprint_path=fingerprint_path,
             physical_k=5,

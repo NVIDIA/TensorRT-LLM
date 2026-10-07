@@ -372,7 +372,12 @@ def load_runtime_sps_cost_table(
     max_draft_len: int,
     live_engine_fingerprint_path: str | Path | None = None,
 ) -> tuple[ExactSpsCostTable, dict[str, object]]:
-    """Load an authenticated schema-v2 exact ``T(G,V)`` table."""
+    """Load an authenticated schema-v2 exact ``T(G,V)`` table.
+
+    The source-head pin is intentional: a TRT-LLM version can cover source
+    changes that alter measured step costs. A changed source identity requires
+    requalification of the cost table and its workload-admission receipt.
+    """
     payload = _read_sps_cost_payload(path)
     schema_version = payload.get("schema_version")
     if type(schema_version) is not int or schema_version != 2:
@@ -961,15 +966,12 @@ _WORKLOAD_ADMISSION_ENVELOPE_FIELDS = {
 }
 
 
-def _sha256_file(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _read_pinned_bytes(path: str | Path) -> tuple[bytes, str]:
+    data = Path(path).read_bytes()
+    return data, hashlib.sha256(data).hexdigest()
 
 
-def _read_strict_json_object(path: str | Path, *, name: str) -> dict[str, object]:
+def _parse_strict_json_object(data: bytes, *, name: str) -> dict[str, object]:
     def reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
         parsed = {}
         for key, value in pairs:
@@ -978,8 +980,7 @@ def _read_strict_json_object(path: str | Path, *, name: str) -> dict[str, object
             parsed[key] = value
         return parsed
 
-    with Path(path).open(encoding="utf-8") as file:
-        payload = json.load(file, object_pairs_hook=reject_duplicate_fields)
+    payload = json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicate_fields)
     if not isinstance(payload, dict):
         raise TypeError(f"{name} must contain a JSON object")
     return payload
@@ -1005,11 +1006,11 @@ def load_confidence_workload_admission(
         expected_receipt_sha256,
         field="expected confidence workload admission receipt SHA256",
     )
-    receipt_sha256 = _sha256_file(path)
+    receipt_bytes, receipt_sha256 = _read_pinned_bytes(path)
     if receipt_sha256 != expected_receipt_sha256:
         raise ValueError("Confidence workload admission receipt does not match its pinned SHA256")
     envelope = _validate_exact_fields(
-        _read_strict_json_object(path, name="confidence workload admission receipt"),
+        _parse_strict_json_object(receipt_bytes, name="confidence workload admission receipt"),
         name="confidence workload admission receipt",
         fields=_WORKLOAD_ADMISSION_ENVELOPE_FIELDS,
     )
@@ -1049,15 +1050,19 @@ def load_confidence_workload_admission(
         _require_sha256(admission[field_name], field=f"confidence workload {field_name}")
     if admission["selector_identity_sha256"] != EXACT_SPS_SELECTOR_IDENTITY_SHA256:
         raise ValueError("Confidence workload admission selector identity is stale or unknown")
-    if admission["sps_cost_table_sha256"] != _sha256_file(sps_cost_table_path):
+    sps_bytes, sps_sha256 = _read_pinned_bytes(sps_cost_table_path)
+    if admission["sps_cost_table_sha256"] != sps_sha256:
         raise ValueError("Confidence workload admission SPS cost-table SHA256 does not match")
-    if admission["live_engine_fingerprint_sha256"] != _sha256_file(live_engine_fingerprint_path):
+    live_fingerprint_bytes, live_fingerprint_sha256 = _read_pinned_bytes(
+        live_engine_fingerprint_path
+    )
+    if admission["live_engine_fingerprint_sha256"] != live_fingerprint_sha256:
         raise ValueError(
             "Confidence workload admission live-engine fingerprint SHA256 does not match"
         )
 
     live_fingerprint = _validate_exact_fields(
-        _read_strict_json_object(live_engine_fingerprint_path, name="live engine fingerprint"),
+        _parse_strict_json_object(live_fingerprint_bytes, name="live engine fingerprint"),
         name="live engine fingerprint",
         fields=_V2_FINGERPRINT_FIELDS,
     )
@@ -1076,13 +1081,14 @@ def load_confidence_workload_admission(
         if not isinstance(admission[field_name], str) or not admission[field_name]:
             raise TypeError(f"confidence workload {field_name} must be a non-empty string")
 
-    sps_payload = _read_strict_json_object(sps_cost_table_path, name="SPS cost artifact")
+    sps_payload = _parse_strict_json_object(sps_bytes, name="SPS cost artifact")
     validate_sps_cost_table_payload(
         sps_payload,
         graph_batch_sizes=live_fingerprint["rank_local_graph_batch_sizes"],
         max_draft_len=physical_k,
         live_engine_fingerprint=live_fingerprint,
     )
+    _build_exact_sps_cost_table(sps_payload, max_draft_len=physical_k)
     admitted, net_value_ms = evaluate_confidence_workload_admission(
         policy_steps=admission["policy_steps"],
         compact_choices=admission["compact_choices"],
