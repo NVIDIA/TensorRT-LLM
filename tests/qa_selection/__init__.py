@@ -14,26 +14,13 @@
 # limitations under the License.
 """Select the tests a target machine can run, before Slurm allocates it.
 
-    plugin.py        the options, the markers, the item adapter, the six hooks;
-                     the `-p qa_selection.plugin` entry point, and the only
-                     module here that imports pytest
-
-    core/            the decisions -- stdlib only, never pytest
-      ladder.py      what a legal ladder is                    -> Ladder
-      machines.py    the machines selection can target         -> MachineProfile
-      rules.py       the curated skip rules, and what holds    -> SkipRuleTable
-      markers.py     the marks whose first argument is a need  -> ResourceMarkers
-      selector.py    can this machine run this test            -> Decision
-      allocation.py  how much it wants, which rung takes it    -> GpuDemand, Assignment
-      artifacts.py   what the output files are called          -> ArtifactNames
-      request.py     what one run was asked for                -> SelectionRequest
-      selection.py   what it decided about every test          -> Selection
+    plugin.py        the pytest hooks and options, loaded with `-p qa_selection.plugin`
+    core/
+      selection.py   one run's request, and its outcome per test
       report.py      the .ids lists and the JSON record
-
-Three of those read a JSON file beside them: `machines.py` reads
-`profiles.json`, `rules.py` reads `rules.json`, `markers.py` reads
-`markers.json`. Every `core/` module imports only the ones above it, and
-nothing imports `plugin.py`.
+      ladder.py      --ladder: which rung holds a test
+      machine.py     --machine: may the machine's card run a test
+      marks.py       what a test asks for, read from its marks
 
 No executable statements: pytest imports this package before any conftest, to
 load the plugin.

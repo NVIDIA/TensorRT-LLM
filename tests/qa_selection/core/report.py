@@ -12,115 +12,49 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Everything selection records once collection is over.
+"""What a run concluded: the record, the `.ids` lists, and their file names.
 
-    SelectionOutput.of(selection, rootdir) -> SelectionReport -> Artifacts.write(report, out_dir)
+    SelectionOutput.of(report, out_dir)                      -> the report, and the files written
+    SelectionReport.of(profile, ladder, outcomes, rootdir)   -> the record
+    ArtifactNames.written_by(machine, ladder)                -> every file a run writes
+    ArtifactNames.orphans_in(out_dir, machine, ladder)       -> this machine's stale files
 
-Two formats from one record: `.ids` files the pipeline filters with `awk`, and
-a JSON record holding the counts and the per-test outcome. `plugin.py` renders
-the same report in the terminal.
+`<machine>.json` holds the counts and each test's outcome; `<machine>-<rung>gpu.ids`
+holds one rung's selected node ids, one per line.
 """
 
+from __future__ import annotations
+
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .allocation import Assignment
-from .artifacts import ArtifactNames
 from .ladder import Ladder
-from .machines import MachineProfile
-from .selection import Selection
-
-
-class NodeIds:
-    """The identifier form this package emits.
-
-    Node ids are unprefixed, matching the test lists on disk; a consumer
-    joining against prefixed artifacts adds the prefix itself.
-    """
-
-    FORM = "unprefixed"
-
-    @staticmethod
-    def of(outcomes: Tuple["Outcome", ...]) -> List[str]:
-        """Bare node ids, in collection order.
-
-        No `TIMEOUT (N)`/`SKIP`/`XFAIL` suffix is added: a consumer filters its
-        own list by first field, so the suffixes it carries survive.
-        """
-        return [outcome.nodeid for outcome in outcomes]
-
-
-class SourceRevision:
-    """The checkout the marks were read from.
-
-    The commit alone: no timestamp, so regenerating produces no diff unless a
-    `skip_*` decorator changed.
-    """
-
-    COMMAND = ("git", "rev-parse", "HEAD")
-    TIMEOUT_S = 5
-
-    @classmethod
-    def of(cls, rootdir: Path) -> Optional[str]:
-        """The checkout's commit, or None when it cannot be read."""
-        try:
-            done = subprocess.run(
-                cls.COMMAND,
-                cwd=str(rootdir),
-                capture_output=True,
-                text=True,
-                timeout=cls.TIMEOUT_S,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-        return done.stdout.strip() or None if done.returncode == 0 else None
+from .machine import MachineProfile
 
 
 @dataclass(frozen=True)
-class Outcome:
-    """One collected test, as the record states it.
+class SelectionOutput:
+    """One run's report, and the files it was written to."""
 
-    `required_gpus` is read from a lower bound, never declared, so it always
-    travels with the markers it was read from.
-    """
-
-    nodeid: str
-    selected: bool
-    blockers: Tuple[str, ...]
-    required_gpus: int
-    required_gpus_from: Tuple[str, ...]
-    rung: Optional[int]
+    report: SelectionReport
+    written: Tuple[Path, ...]
 
     @classmethod
-    def of(cls, assignment: Assignment) -> "Outcome":
-        """One assignment, flattened into the fields the record writes."""
+    def of(cls, report: SelectionReport, out_dir: Optional[Path]) -> SelectionOutput:
+        """`report`, written to `out_dir` when one was named."""
         return cls(
-            nodeid=assignment.nodeid,
-            selected=assignment.selected,
-            blockers=assignment.blockers,
-            required_gpus=assignment.demand.required_gpus,
-            required_gpus_from=assignment.demand.required_gpus_from,
-            rung=assignment.rung,
+            report=report,
+            written=tuple(Artifacts.write(report, out_dir)) if out_dir is not None else (),
         )
-
-    def to_mapping(self) -> Dict[str, object]:
-        """This outcome as the record's JSON object."""
-        return {
-            "nodeid": self.nodeid,
-            "selected": self.selected,
-            "blockers": list(self.blockers),
-            "required_gpus": self.required_gpus,
-            "required_gpus_from": list(self.required_gpus_from),
-            "rung": self.rung,
-        }
 
 
 @dataclass(frozen=True)
 class SelectionReport:
-    """What one invocation decided, counted once for every output."""
+    """What one run decided, as every output reads it."""
 
     machine: str
     profile: MachineProfile
@@ -129,15 +63,16 @@ class SelectionReport:
     outcomes: Tuple[Outcome, ...]
 
     @classmethod
-    def of(cls, selection: Selection, rootdir: Path) -> "SelectionReport":
-        """Build the record from one collection run's decisions."""
-        request = selection.request
+    def of(
+        cls, profile: MachineProfile, ladder: Ladder, outcomes: Tuple[Outcome, ...], rootdir: Path
+    ) -> SelectionReport:
+        """The record of `outcomes`, decided for `profile` on `ladder`."""
         return cls(
-            machine=request.machine,
-            profile=request.profile,
-            ladder=request.ladder,
+            machine=profile.name,
+            profile=profile,
+            ladder=ladder,
             source_revision=SourceRevision.of(rootdir),
-            outcomes=tuple(Outcome.of(assignment) for assignment in selection.assignments),
+            outcomes=outcomes,
         )
 
     @property
@@ -147,11 +82,7 @@ class SelectionReport:
 
     @property
     def rungs(self) -> Dict[int, Tuple[Outcome, ...]]:
-        """The selected tests partitioned by rung, empty rungs included.
-
-        Every rung, not only the one a caller is running: one collection
-        carries what all of them need.
-        """
+        """The selected outcomes by rung, for every rung of the ladder."""
         return {
             rung: tuple(outcome for outcome in self.selected if outcome.rung == rung)
             for rung in self.ladder
@@ -159,27 +90,12 @@ class SelectionReport:
 
     @property
     def unclassified_rung(self) -> int:
-        """Where a consumer routes an identifier this run never collected.
-
-        The smallest rung. Always empty here: a collect run cannot see what it
-        did not collect.
-        """
+        """Where a consumer routes a node id this run did not collect: the smallest rung."""
         return self.ladder.smallest
 
     @property
     def deselected_by_reason(self) -> Dict[str, List[str]]:
-        """The dropped tests, grouped by the blocker that dropped each one.
-
-        Answers the first question anyone asks of the record -- why did my test
-        not run -- without the reader writing a grouper. Every reason here is
-        one the curated table decided, by construction: a skip the table
-        declines to encode produces no blocker and drops nothing.
-
-        A test with several blockers appears under each of them, because
-        "which rule dropped this" has as many answers as it has blockers.
-        Built from the same outcomes as `tests[]`, in collection order, so it
-        cannot disagree with them and the file stays byte-stable across runs.
-        """
+        """Deselected node ids by blocker, in collection order; a test is under each one."""
         grouped: Dict[str, List[str]] = {}
         for outcome in self.outcomes:
             for blocker in outcome.blockers:
@@ -208,8 +124,7 @@ class SelectionReport:
             "rungs": {str(rung): len(outcomes) for rung, outcomes in self.rungs.items()},
             "unclassified": {"route_to_rung": self.unclassified_rung, "nodeids": []},
         }
-        # Omitted entirely when nothing was dropped, as the terminal summary
-        # omits a population with no members.
+        # Omitted when nothing was deselected.
         deselected = self.deselected_by_reason
         if deselected:
             record["deselected_by_reason"] = deselected
@@ -217,13 +132,38 @@ class SelectionReport:
         return record
 
 
-class Artifacts:
-    """The files `--selection-out-dir` receives.
+@dataclass(frozen=True)
+class Outcome:
+    """One test's outcome: its blockers, its GPU demand and its source, its rung.
 
-    The JSON is the record; the `.ids` files need no parser:
-
-        awk 'NR==FNR{keep[$0];next} ($1 in keep)' B200-4gpu.ids list.txt
+    `blockers` lists the card's first, then the GPU count's; a test with none is selected.
     """
+
+    nodeid: str
+    blockers: Tuple[str, ...]
+    required_gpus: int
+    required_gpus_from: Tuple[str, ...]
+    rung: Optional[int]
+
+    @property
+    def selected(self) -> bool:
+        """True when neither the rules nor the GPU count drop this test."""
+        return not self.blockers
+
+    def to_mapping(self) -> Dict[str, object]:
+        """This outcome as the record's JSON object."""
+        return {
+            "nodeid": self.nodeid,
+            "selected": self.selected,
+            "blockers": list(self.blockers),
+            "required_gpus": self.required_gpus,
+            "required_gpus_from": list(self.required_gpus_from),
+            "rung": self.rung,
+        }
+
+
+class Artifacts:
+    """Writes the record and the `.ids` lists to the output directory."""
 
     INDENT = 2
 
@@ -252,31 +192,90 @@ class Artifacts:
 
     @staticmethod
     def id_lists(report: SelectionReport) -> Dict[str, List[str]]:
-        """Filename -> node ids, for every list this run emits.
-
-        One `<machine>-<rung>gpu.ids` per rung, written even when empty. The
-        names come from `ArtifactNames`, the same source the configure-time
-        guard checked the output directory against.
-        """
+        """File name -> node ids, one list per rung, empty ones included."""
         return {
             ArtifactNames.rung_ids(report.machine, rung): NodeIds.of(outcomes)
             for rung, outcomes in report.rungs.items()
         }
 
 
-@dataclass(frozen=True)
-class SelectionOutput:
-    """The record one run produced, and the files it went to."""
+class ArtifactNames:
+    """The filenames a run produces, and which files in a directory are its own."""
 
-    report: SelectionReport
-    written: Tuple[Path, ...]
+    RECORD_SUFFIX = ".json"
+    IDS_SUFFIX = ".ids"
+    RUNG_UNIT = "gpu"
 
     @classmethod
-    def of(cls, selection: Selection, rootdir: Path) -> "SelectionOutput":
-        """Build the record, and write it when an output directory was named."""
-        report = SelectionReport.of(selection, rootdir)
-        out_dir = selection.request.out_dir
-        return cls(
-            report=report,
-            written=tuple(Artifacts.write(report, out_dir)) if out_dir is not None else (),
+    def record(cls, machine: str) -> str:
+        """The JSON record, written on every run."""
+        return f"{machine}{cls.RECORD_SUFFIX}"
+
+    @classmethod
+    def rung_ids(cls, machine: str, rung: int) -> str:
+        """One rung's identifier list."""
+        return f"{machine}-{rung}{cls.RUNG_UNIT}{cls.IDS_SUFFIX}"
+
+    @classmethod
+    def written_by(cls, machine: str, ladder: Ladder) -> Tuple[str, ...]:
+        """Every file a run for `machine` on `ladder` writes."""
+        return (cls.record(machine),) + tuple(cls.rung_ids(machine, r) for r in ladder)
+
+    @classmethod
+    def shapes_of(cls, machine: str) -> Tuple[re.Pattern, ...]:
+        """This machine's file-name patterns, anchored so `B200` does not match `B200X.ids`.
+
+        The record, a rung's list, and `<machine>.ids`, which no run writes.
+        """
+        name = re.escape(machine)
+        return (
+            re.compile(rf"^{name}{re.escape(cls.RECORD_SUFFIX)}$"),
+            re.compile(rf"^{name}{re.escape(cls.IDS_SUFFIX)}$"),
+            re.compile(rf"^{name}-[0-9]+{cls.RUNG_UNIT}{re.escape(cls.IDS_SUFFIX)}$"),
         )
+
+    @classmethod
+    def orphans_in(cls, out_dir: Path, machine: str, ladder: Ladder) -> List[str]:
+        """This machine's files in `out_dir` that a run on `ladder` would not write."""
+        written = set(cls.written_by(machine, ladder))
+        shapes = cls.shapes_of(machine)
+        return sorted(
+            entry.name
+            for entry in out_dir.iterdir()
+            if entry.is_file()
+            and entry.name not in written
+            and any(shape.match(entry.name) for shape in shapes)
+        )
+
+
+class NodeIds:
+    """The node-id form the lists use: unprefixed, as in the test lists."""
+
+    FORM = "unprefixed"
+
+    @staticmethod
+    def of(outcomes: Tuple[Outcome, ...]) -> List[str]:
+        """Bare node ids in collection order, with no `TIMEOUT`/`SKIP`/`XFAIL` suffix."""
+        return [outcome.nodeid for outcome in outcomes]
+
+
+class SourceRevision:
+    """The commit the marks were read from; no timestamp, so a rerun writes the same record."""
+
+    COMMAND = ("git", "rev-parse", "HEAD")
+    TIMEOUT_S = 5
+
+    @classmethod
+    def of(cls, rootdir: Path) -> Optional[str]:
+        """The checkout's commit, or None when it cannot be read."""
+        try:
+            done = subprocess.run(
+                cls.COMMAND,
+                cwd=str(rootdir),
+                capture_output=True,
+                text=True,
+                timeout=cls.TIMEOUT_S,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() or None if done.returncode == 0 else None

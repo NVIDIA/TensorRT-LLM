@@ -18,6 +18,7 @@
     "'sm' is major * 10 + minor: Ada 89, Hopper 90, Blackwell 100,",
     "Blackwell-Ultra 103, Rubin 107.",
     "",
+    "A rule turns on a permanent property of the machine, never on its software.",
     "A decorator absent from this file is kept for every machine."
   ],
 
