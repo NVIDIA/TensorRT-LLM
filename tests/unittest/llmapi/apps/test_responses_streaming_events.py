@@ -408,14 +408,12 @@ def test_termination_cause_and_client_facing_detail(exc, cause, detail):
     assert describe_stream_termination(exc, cause) == detail
 
 
-@pytest.mark.parametrize("events_sent", [2, 610])
-def test_terminal_events_are_numbered_after_the_frames_sent(events_sent):
+@pytest.mark.parametrize("events_sent, expected", [(None, [2, 3]), (610, [610, 611])])
+def test_terminal_events_are_numbered_after_the_frames_sent(events_sent, expected):
     processor = _processor()
+    processor.get_initial_responses()
     events = processor.get_stream_failed_events("internal_error", "ValueError", events_sent)
-    assert [_event_data(frame)["sequence_number"] for frame in events] == [
-        events_sent,
-        events_sent + 1,
-    ]
+    assert [_event_data(frame)["sequence_number"] for frame in events] == expected
 
 
 def test_the_failed_snapshot_says_failed_and_carries_no_content():

@@ -2911,16 +2911,19 @@ class ResponsesStreamingProcessor:
 
         return [self._send_event(event) for event in event_generator]
 
-    def get_stream_failed_events(self,
-                                 cause: str,
-                                 detail: str,
-                                 events_sent: int = 0) -> List[str]:
+    def get_stream_failed_events(
+            self,
+            cause: str,
+            detail: str,
+            events_sent: Optional[int] = None) -> List[str]:
         """``error`` and ``response.failed`` for a stream that stopped early.
 
-        ``events_sent`` is the number of frames that reached the wire; the
-        terminal events are numbered after them.
+        ``events_sent`` is the number of frames that reached the wire, which
+        the terminal events are numbered after; without it they continue this
+        processor's own numbering.
         """
-        self.sequence_number = events_sent
+        if events_sent is not None:
+            self.sequence_number = events_sent
         error_event = self._send_event(
             ResponseErrorEvent(
                 type="error",
