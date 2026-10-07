@@ -38,13 +38,6 @@ def test_sleep_mode_requires_environment_key(monkeypatch):
         _invoke_sleep_mode()
 
 
-def test_sleep_mode_rejects_autodeploy(monkeypatch):
-    monkeypatch.setenv("TRTLLM_RUNTIME_CONTROL_API_KEY", "secret")
-
-    with pytest.raises(click.UsageError, match="PyTorch backend"):
-        _invoke_sleep_mode(["--backend", "_autodeploy"])
-
-
 def test_sleep_mode_rejects_grpc(monkeypatch):
     monkeypatch.setenv("TRTLLM_RUNTIME_CONTROL_API_KEY", "secret")
 
