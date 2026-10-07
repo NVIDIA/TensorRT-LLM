@@ -698,7 +698,7 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
         index_cache = torch.empty((2, 1, 128, 128), dtype=torch.float8_e4m3fn)
         slots = torch.empty((4096,), dtype=torch.int32)
         q, idx_q = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer(
-            hidden, positions, kv_cache, index_cache, slots, "3"
+            hidden, positions, kv_cache, index_cache, None, slots, "3"
         )
     for output, width in ((q, 1024), (idx_q, 128)):
         assert output.shape[0].node.expr == num_tokens.node.expr
@@ -707,8 +707,9 @@ def test_piecewise_captured_producer_preserves_symbolic_shapes(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kv_dtype", ["fp8", "nvfp4"])
 def test_piecewise_captures_horizontal_producer_before_attention(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, kv_dtype: str
 ) -> None:
     """Run the captured producer before eager sparse attention consumes caches."""
     backend = object.__new__(MiniMaxM3MsaSparseAttention)
@@ -719,19 +720,21 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     output = torch.empty((4, 3), dtype=torch.bfloat16)
     kv_cache = torch.empty(8, dtype=torch.float8_e4m3fn)
     index_cache = torch.empty_like(kv_cache)
+    scale_cache = torch.empty(8, dtype=torch.uint8) if kv_dtype == "nvfp4" else None
     slots = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
     metadata = Mock(
         spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         num_tokens=2,
         kv_cache_manager=None,
-        msa_layer_cache_tensors={3: (kv_cache, index_cache)},
+        msa_layer_cache_tensors={3: (kv_cache, index_cache, scale_cache)},
         msa_out_cache_loc=slots,
     )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
         register_to_config=True,
         attn=backend,
-        _emit_fp8_main_qkv=lambda: True,
+        main_kv_is_fp8=kv_dtype == "fp8",
+        main_kv_is_nvfp4=kv_dtype == "nvfp4",
         layer_idx=3,
         layer_idx_str="3",
         qkv_proj=Mock(return_value=packed),
@@ -751,7 +754,7 @@ def test_piecewise_captures_horizontal_producer_before_attention(
     assert result is output
     layer.qkv_proj.assert_called_once_with(hidden)
     layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once_with(
-        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, slots)
+        packed, positions, metadata, cache_tensors=(kv_cache, index_cache, scale_cache, slots)
     )
     layer._forward_attention_core.assert_called_once_with(q, None, None, idx_q, None, metadata)
 
@@ -774,20 +777,21 @@ def test_piecewise_captured_producer_rejects_unavailable_fusion(
             torch.arange(2),
             torch.zeros(4),
             torch.zeros(4),
+            None,
             torch.arange(2, dtype=torch.int32),
             "3",
         )
-    assert str(exc.value) == (
-        "MiniMax-M3 piecewise graph requires the fused FP8 sparse QKV producer."
-    )
+    assert str(exc.value) == "MiniMax-M3 piecewise graph requires the fused sparse QKV producer."
     layer._fused_fp8_qkv_indexer_norm_rope_kv_insert.assert_called_once()
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("nvfp4", [False, True])
 @pytest.mark.parametrize("restore_inplace", [False, True])
 def test_piecewise_captured_producer_declares_cache_mutations(
     monkeypatch: pytest.MonkeyPatch,
     restore_inplace: bool,
+    nvfp4: bool,
 ) -> None:
     """Real custom-op schema/AOT checks with CPU cache writes in place of CUDA math."""
 
@@ -796,15 +800,17 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         positions: torch.Tensor,
         metadata: object,
         *,
-        cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        cache_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Emulate native cache writes using only the explicit tensor arguments."""
-        kv_cache, index_cache, slots = cache_tensors
+        kv_cache, index_cache, scale_cache, slots = cache_tensors
         # Deliberately use only the explicit caches, not the runtime metadata.
         valid = slots >= 0
         indices = slots[valid].long()
         kv_cache.index_copy_(0, indices, packed[valid, :3].float())
         index_cache.index_copy_(0, indices, packed[valid, :1].float() + 1)
+        if scale_cache is not None:
+            scale_cache.index_copy_(0, indices, packed[valid, :1].float() + 2)
         return packed[:, :3].to(torch.float8_e4m3fn), packed[:, :1].to(torch.float8_e4m3fn)
 
     layer = SimpleNamespace(
@@ -819,13 +825,14 @@ def test_piecewise_captured_producer_declares_cache_mutations(
     op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer.default
     assert {
         arg.name for arg in op._schema.arguments if arg.alias_info and arg.alias_info.is_write
-    } == {"kv_cache", "index_k_cache"}
+    } == {"kv_cache", "index_k_cache", "kv_scale_cache"}
     hidden = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     positions = torch.arange(4)
     kv_cache = torch.zeros(8, 3)
     index_cache = torch.zeros(8, 1)
+    scale_cache = torch.zeros(8, 1) if nvfp4 else None
     slots = torch.tensor([1, 3, -1, -1], dtype=torch.int32)
-    args = (hidden, positions, kv_cache, index_cache, slots, "3")
+    args = (hidden, positions, kv_cache, index_cache, scale_cache, slots, "3")
     assert all(result == "SUCCESS" for result in torch.library.opcheck(op, args).values())
 
     def run(
@@ -833,11 +840,13 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         positions: torch.Tensor,
         main: torch.Tensor,
         index: torch.Tensor,
+        scales: torch.Tensor | None,
         slots: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Expose query results and immediate observations of both live caches."""
-        q, idx_q = op(hidden, positions, main, index, slots, "3")
-        return q.float(), idx_q.float(), main.clone(), index.clone()
+    ) -> tuple[torch.Tensor, ...]:
+        """Expose query results and immediate observations of the live caches."""
+        q, idx_q = op(hidden, positions, main, index, scales, slots, "3")
+        observed_scales = () if scales is None else (scales.clone(),)
+        return q.float(), idx_q.float(), main.clone(), index.clone(), *observed_scales
 
     optimized_graphs = []
 
@@ -852,6 +861,8 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         # the producer: MSA's eager boundary must observe the original pools.
         assert producer_nodes[0].kwargs["kv_cache"].op == "placeholder"
         assert producer_nodes[0].kwargs["index_k_cache"].op == "placeholder"
+        scale_arg = producer_nodes[0].kwargs["kv_scale_cache"]
+        assert (scale_arg.op == "placeholder") if nvfp4 else (scale_arg is None)
         assert all(
             node.target not in (auto_functionalized, auto_functionalized_v2)
             for node in gm.graph.nodes
@@ -869,8 +880,10 @@ def test_piecewise_captured_producer_declares_cache_mutations(
     for offset in (0, 4):
         kv_cache.zero_()
         index_cache.zero_()
-        q, idx_q, observed_main, observed_index = compiled(
-            hidden + offset, positions, kv_cache, index_cache, slots
+        if nvfp4:
+            scale_cache.zero_()
+        q, idx_q, observed_main, observed_index, *observed_scales = compiled(
+            hidden + offset, positions, kv_cache, index_cache, scale_cache, slots
         )
         packed = hidden + offset + 2
         expected_main = torch.zeros_like(kv_cache)
@@ -881,6 +894,13 @@ def test_piecewise_captured_producer_declares_cache_mutations(
         torch.testing.assert_close(index_cache, expected_index)
         torch.testing.assert_close(observed_main, expected_main)
         torch.testing.assert_close(observed_index, expected_index)
+        if nvfp4:
+            expected_scales = torch.zeros_like(scale_cache)
+            expected_scales[[1, 3]] = packed[:2, :1] + 2
+            torch.testing.assert_close(scale_cache, expected_scales)
+            torch.testing.assert_close(observed_scales, [expected_scales])
+        else:
+            assert observed_scales == []
         torch.testing.assert_close(q, packed[:, :3].to(torch.float8_e4m3fn).float())
         torch.testing.assert_close(idx_q, packed[:, :1].to(torch.float8_e4m3fn).float())
         torch.testing.assert_close(slots, torch.tensor([1, 3, -1, -1], dtype=torch.int32))
@@ -1937,7 +1957,7 @@ def _make_fused_qk_norm_rope_test_config():
 def test_horizontal_producer_explicit_caches_match_manager(
     monkeypatch: pytest.MonkeyPatch, kv_dtype: str
 ) -> None:
-    """Exercise real producer dispatch and replay the FP8 PCG custom op."""
+    """Exercise real producer dispatch and replay the PCG custom op."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
     _, model_cfg = _make_fused_qk_norm_rope_test_config()
@@ -1988,37 +2008,39 @@ def test_horizontal_producer_explicit_caches_match_manager(
     expected = snapshot(expected_outputs)
     for cache in (main, index, scales):
         cache.zero_()
+    explicit_scales = scales if nvfp4 else None
     outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
-        packed, positions, metadata, cache_tensors=(main, index, slots)
+        packed, positions, metadata, cache_tensors=(main, index, explicit_scales, slots)
     )
     assert outputs is not None
     for actual, reference in zip(snapshot(outputs), expected):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    # The explicit caches replace every manager lookup.
     manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
+    assert manager.get_block_scale_buffers.call_count == int(nvfp4)
     metadata.msa_idx_k_cache.assert_called_once_with(3)
 
-    if not nvfp4:
-        monkeypatch.setattr(
-            modeling_minimaxm3,
-            "_extract_minimax_m3_attention_extra_attrs",
-            lambda _: (metadata, layer),
-        )
-        op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer
-        args = (packed, positions, main, index, slots, "3")
-        op(*args)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            replay_outputs = op(*args)
-        packed.mul_(-0.5)
-        for cache in (main, index):
-            cache.zero_()
-        graph.replay()
-        replay = snapshot(replay_outputs)
-        for cache in (main, index):
-            cache.zero_()
-        eager = snapshot(op(*args))
-        for actual, reference in zip(replay, eager):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_extract_minimax_m3_attention_extra_attrs",
+        lambda _: (metadata, layer),
+    )
+    op = torch.ops.trtllm.minimax_m3_fused_sparse_qkv_producer
+    args = (packed, positions, main, index, explicit_scales, slots, "3")
+    op(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_outputs = op(*args)
+    packed.mul_(-0.5)
+    for cache in (main, index, scales):
+        cache.zero_()
+    graph.replay()
+    replay = snapshot(replay_outputs)
+    for cache in (main, index, scales):
+        cache.zero_()
+    eager = snapshot(op(*args))
+    for actual, reference in zip(replay, eager):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 @pytest.mark.gpu
