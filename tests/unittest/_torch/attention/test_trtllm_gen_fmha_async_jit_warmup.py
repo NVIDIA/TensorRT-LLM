@@ -88,10 +88,11 @@ def _run_arm(model_dir: Path, async_warmup: bool) -> dict:
     assert proc.returncode == 0, (
         f"engine subprocess failed (async_warmup={async_warmup}):\n"
         f"--- stdout ---\n{proc.stdout[-4000:]}\n"
-        f"--- stderr ---\n{proc.stderr[-4000:]}")
-    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+        f"--- stderr ---\n{proc.stderr[-4000:]}"
+    )
+    lines = [line for line in proc.stdout.splitlines() if line.startswith("RESULT ")]
     assert lines, f"no RESULT line in child stdout:\n{proc.stdout[-4000:]}"
-    return json.loads(lines[-1][len("RESULT "):])
+    return json.loads(lines[-1][len("RESULT ") :])
 
 
 @pytest.fixture(scope="module")
@@ -100,10 +101,10 @@ def model_dir() -> Path:
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("async_warmup", [True, False],
-                         ids=["async_warmup", "sync_warmup"])
+@pytest.mark.parametrize("async_warmup", [True, False], ids=["async_warmup", "sync_warmup"])
 def test_first_requests_after_readiness_do_not_jit_compile(
-        model_dir: Path, async_warmup: bool) -> None:
+    model_dir: Path, async_warmup: bool
+) -> None:
     result = _run_arm(model_dir, async_warmup)
 
     assert result["async_enabled"] is async_warmup
@@ -113,11 +114,13 @@ def test_first_requests_after_readiness_do_not_jit_compile(
     # invariant below would hold vacuously.
     assert result["keys_ready"] > result["keys_before"], (
         "warmup requested no NVRTC kernel configurations; this model/config "
-        "does not exercise the TRTLLM-Gen JIT path")
+        "does not exercise the TRTLLM-Gen JIT path"
+    )
 
     # No configuration was requested for the first time after readiness, i.e.
     # the first requests compiled nothing: every kernel they needed was
     # compiled (and, for the async arm, verified) before capture.
     assert result["keys_after_first_requests"] == result["keys_ready"], (
         f"{result['keys_after_first_requests'] - result['keys_ready']} kernel "
-        "configuration(s) were compiled by the first requests after readiness")
+        "configuration(s) were compiled by the first requests after readiness"
+    )

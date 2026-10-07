@@ -2669,13 +2669,22 @@ class PyTorchModelEngine(ModelEngine):
         """
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
+        if not torch.ops.trtllm.trtllm_gen_fmha_async_jit_warmup_enabled():
+            return
         with self._warmup_timer.phase("attention_jit_drain_and_verify"):
             num_verified = torch.ops.trtllm.trtllm_gen_fmha_jit_warmup_drain_and_verify(
             )
-        if num_verified:
-            logger.info(
-                f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} background "
-                "warmup sweep(s) before CUDA graph capture.")
+            if num_verified:
+                logger.info(
+                    f"TRTLLM-Gen FMHA JIT warmup: verified {num_verified} "
+                    "background warmup sweep(s) before CUDA graph capture.")
+            # Each rank only waited for its own compilation. The capture forwards
+            # below run collectives under the steady-state MoE all-to-all budget,
+            # so a rank that enters one while a peer is still compiling could
+            # exhaust that budget waiting. Meet the peers here first.
+            allgather = self._warmup_agreement_allgather()
+            if allgather is not None:
+                allgather(1)
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
         """Warm up or capture CUDA graphs for the configured graph shapes."""
