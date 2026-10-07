@@ -20,11 +20,18 @@ window a conversation has spent and to decide when to compact; without it a
 long session keeps appending turns until it overflows the context window.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm.serve.responses_utils import _create_usage
+from tensorrt_llm.serve.openai_protocol import PromptTokensDetails, ResponsesRequest, UsageInfo
+from tensorrt_llm.serve.responses_utils import (
+    ResponsesStreamingProcessor,
+    _count_reasoning_tokens,
+    _create_output_content,
+    _create_usage,
+)
 
 # The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
 # test in the file is deselected, which pytest reports as exit code 5 and the
@@ -134,205 +141,156 @@ def test_usage_validates_inside_a_streamed_completion_event():
 
 
 # ---------------------------------------------------------------------------
-# reasoning_tokens
-#
-# Reported as a hardcoded zero until now. The count is rebuilt from the text
-# the reasoning parser itself claimed, rather than by searching the generated
-# token ids for `</think>`, and these tests are the reason: GLM breaks a
-# marker search three separate ways under agent workloads, and each of them
-# was observed live before it was tested here.
+# Disaggregated serving: the context phase's usage comes with the handoff
+# ---------------------------------------------------------------------------
+
+
+def _ctx_usage(prompt_tokens, cached_tokens):
+    return UsageInfo(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=1,
+        total_tokens=prompt_tokens + 1,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens),
+    )
+
+
+def _handed_off(ctx_usage, prompt_tokens=100, completion_tokens=5):
+    """A generation-worker result: the whole prompt arrived as transferred KV."""
+    result = _generation(prompt_tokens, completion_tokens, cached_tokens=prompt_tokens)
+    result.outputs[0].disaggregated_params = SimpleNamespace(ctx_usage=ctx_usage)
+    return result
+
+
+@pytest.mark.parametrize(
+    "ctx_usage, input_tokens, cached_tokens",
+    [
+        (_ctx_usage(96, 32), 96, 32),
+        (_ctx_usage(100, 0), 100, 0),
+        (_ctx_usage(100, 40).model_dump(), 100, 40),
+        (UsageInfo(prompt_tokens=100, completion_tokens=1, total_tokens=101), 100, 0),
+    ],
+    ids=["warm", "cold", "as_dict", "no_details"],
+)
+def test_the_context_phase_decides_prompt_and_cached_tokens(ctx_usage, input_tokens, cached_tokens):
+    usage = _create_usage(_handed_off(ctx_usage), num_prompt_tokens=100)
+    assert usage.input_tokens == input_tokens
+    assert usage.input_tokens_details.cached_tokens == cached_tokens
+    assert usage.output_tokens == 5
+
+
+# ---------------------------------------------------------------------------
+# reasoning_tokens: re-encoded from the text the reasoning parser claimed
 # ---------------------------------------------------------------------------
 
 
 class _WordTokenizer:
-    """One token per whitespace-separated word. Enough to count with."""
+    """One token per whitespace-separated word."""
 
     def encode(self, text, add_special_tokens=False):
         return text.split()
 
 
-def _reasoning_tokens(text, parser="glm", tokenizer=_WordTokenizer(), tools=None):
-    """Run the real parser, then count what it called reasoning."""
-    from tensorrt_llm.serve.responses_utils import _count_reasoning_tokens, _create_output_content
-
+@pytest.mark.parametrize(
+    "text, parser, tokenizer, expected",
+    [
+        ("one two three</think>four five", "glm", _WordTokenizer(), 3),
+        ("one two</think>three four</think><tool_call>x</tool_call>", "glm", _WordTokenizer(), 2),
+        ("planning the call<tool_call>{}</tool_call>", "glm", _WordTokenizer(), 3),
+        ("still thinking about it", "glm", _WordTokenizer(), 4),
+        ("one two three", None, _WordTokenizer(), 0),
+        ("one two three", "glm", None, 0),
+    ],
+    ids=["closed", "first_close_counts", "implicit_end", "never_closed", "no_parser", "no_tok"],
+)
+def test_reasoning_tokens_count_what_the_parser_called_reasoning(text, parser, tokenizer, expected):
     _items, _messages, reasoning_texts = _create_output_content(
-        SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text)]),
-        reasoning_parser=parser,
-        tool_parser=None,
-        tools=tools,
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text)]), reasoning_parser=parser
     )
-    return _count_reasoning_tokens(tokenizer, reasoning_texts, 10_000)
-
-
-def test_reasoning_tokens_counts_up_to_the_closing_tag():
-    # The ordinary shape: reasoning, close, answer.
-    assert _reasoning_tokens("one two three</think>four five") == 3
-
-
-def test_reasoning_tokens_stop_at_the_first_close_not_the_last():
-    # GLM closes the block more than once (reasoning_parser.py:370-388). The
-    # parser splits at the first close and drops the stray one; a search for
-    # `</think>` in token space that took the last match -- which is what
-    # ThinkingBudgetLogitsProcessor does, for its own good reasons -- would
-    # count the middle stretch as reasoning too.
-    text = "one two</think>three four five</think><tool_call>x</tool_call>"
-    assert _reasoning_tokens(text) == 2
-
-
-def test_reasoning_tokens_end_at_an_implicit_tool_call():
-    # Observed live: 26,055 characters over 169 frames with no closing tag at
-    # all and one well-formed <tool_call>. Counting to the missing `</think>`
-    # would have called the entire turn reasoning.
-    text = "planning the call<tool_call>{}</tool_call>"
-    assert _reasoning_tokens(text) == 3
-
-
-def test_reasoning_tokens_covers_a_turn_that_never_leaves_the_block():
-    # `<think>` is prefilled by the template, so output starts inside the
-    # block; with no terminator the whole turn really is reasoning.
-    assert _reasoning_tokens("still thinking about it") == 4
-
-
-def test_reasoning_tokens_are_zero_without_a_reasoning_parser():
-    assert _reasoning_tokens("one two three", parser=None) == 0
-
-
-def test_reasoning_tokens_are_zero_without_a_tokenizer():
-    assert _reasoning_tokens("one two three", tokenizer=None) == 0
+    assert _count_reasoning_tokens(tokenizer, reasoning_texts, 10_000) == expected
 
 
 def test_reasoning_tokens_never_exceed_generated_tokens():
-    # Re-encoding a detokenized substring need not reproduce the tokenization
-    # it came from, and usage claiming more reasoning than output is visibly
-    # wrong to a client budgeting a context window.
-    from tensorrt_llm.serve.responses_utils import _count_reasoning_tokens
-
     assert _count_reasoning_tokens(_WordTokenizer(), ["a b c d e"], 3) == 3
 
 
-def test_usage_reports_the_reasoning_tokens_it_counts():
+def test_usage_reports_reasoning_tokens_within_the_output_tokens():
     usage = _create_usage(
         _generation(prompt_tokens=7, completion_tokens=9),
         tokenizer=_WordTokenizer(),
         reasoning_texts=["one two three four"],
     )
     assert usage.output_tokens_details.reasoning_tokens == 4
-    # Reasoning tokens are part of the generated total, not additional to it.
-    assert usage.output_tokens == 9
-    assert usage.total_tokens == 16
+    assert (usage.output_tokens, usage.total_tokens) == (9, 16)
+    assert _create_usage(_generation()).output_tokens_details.reasoning_tokens == 0
 
 
-def test_usage_still_defaults_to_zero_reasoning_tokens():
-    usage = _create_usage(_generation())
-    assert usage.output_tokens_details.reasoning_tokens == 0
+def test_a_streamed_response_counts_reasoning_tokens():
+    request = ResponsesRequest(model="m", input="hi", stream=True)
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="m",
+        use_harmony=False,
+        reasoning_parser="glm",
+    )
+    output = SimpleNamespace(
+        index=0,
+        text="one two</think>answer",
+        text_diff="one two</think>answer",
+        finish_reason="stop",
+        token_ids=[1, 2, 3],
+        disaggregated_params=None,
+    )
+    result = SimpleNamespace(outputs=[output], _done=True, prompt_token_ids=[1], cached_tokens=0)
+    processor.process_single_output(result)
+    frame = processor.get_final_response_non_store(result, tokenizer=_WordTokenizer())
+    usage = json.loads(frame.split("data: ", 1)[1])["response"]["usage"]
+    assert usage["output_tokens_details"]["reasoning_tokens"] == 2
 
 
 # ---------------------------------------------------------------------------
-# input_image degradation
+# input_image parts degrade to a text placeholder
 # ---------------------------------------------------------------------------
 
+_PNG = "data:image/png;base64,AAAA"
 
-def test_an_image_part_degrades_to_a_text_placeholder():
-    """Regression: an input_image part 400'd the whole request.
 
-    Codex attaches screenshots as `input_image` (base64). The input union has
-    no image member, so validation fell through to ResponseInputTextParam and
-    rejected the request -- deterministically, so the client's retries all
-    failed and the campaign died on its backoff limit. Measured: 2 of the
-    first 182 Kernel-Trace campaigns, each with the full base64 body echoed
-    into the stop reason.
-    """
-    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
-
-    req = ResponsesRequest(
-        model="m",
-        input=[
+@pytest.mark.parametrize(
+    "item, key",
+    [
+        (
+            {"role": "user", "content": [{"type": "input_image", "image_url": _PNG}]},
+            "content",
+        ),
+        (
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "look at this"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
-                ],
+                "content": [{"type": "input_image", "image_url": {"url": _PNG}}],
             },
-            # And as a bare top-level part, which clients also send.
-            {"type": "input_image", "image_url": "data:image/png;base64,BB"},
-        ],
-    )
-    dumped = req.model_dump()["input"]
-    texts = []
-    for item in dumped:
-        parts = item.get("content") if isinstance(item.get("content"), list) else [item]
-        for p in parts:
-            assert p.get("type") != "input_image", "image part survived"
-            if isinstance(p.get("text"), str):
-                texts.append(p["text"])
-    assert any("image omitted" in t and "image/png" in t for t in texts)
-    # The placeholder must not carry the base64 payload.
-    assert not any("AAAA" in t for t in texts)
-
-
-def test_an_image_in_a_tool_output_degrades_too():
-    """Regression: tool results carry parts under "output", not "content".
-
-    An agent that plots something gets the PNG back through the tool: Codex
-    sends `custom_tool_call_output` whose `output` list ends with an
-    `input_image` part. The first degrade pass only walked `content` and the
-    top level, so this shape still 400'd the whole request -- measured at 114
-    Kernel-Trace campaigns in the 24h after the content/top-level fix went
-    live (2026-09-23). Shape taken verbatim from a traced rejected request.
-    """
-    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
-
-    req = ResponsesRequest(
-        model="m",
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "plot it"},
-                ],
-            },
-            {
-                "type": "custom_tool_call",
-                "id": "ctc_1",
-                "call_id": "call_1",
-                "name": "exec",
-                "input": "python plot.py",
-            },
+            "content",
+        ),
+        (
             {
                 "type": "custom_tool_call_output",
                 "call_id": "call_1",
-                "output": [
-                    {"type": "input_text", "text": "Script completed\n"},
-                    {"type": "input_text", "text": "layout-a2 image"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,CCCC"},
-                ],
+                "output": [{"type": "input_image", "image_url": _PNG}],
             },
-        ],
-    )
-    out = req.model_dump()["input"][2]["output"]
-    assert all(p.get("type") != "input_image" for p in out), (
-        "image part survived inside tool output"
-    )
-    joined = " ".join(p.get("text", "") for p in out)
-    assert "image omitted" in joined and "image/png" in joined
-    assert "CCCC" not in joined
-    # A plain-string tool output must pass through untouched.
-    req2 = ResponsesRequest(
-        model="m",
-        input=[
-            {
-                "type": "custom_tool_call",
-                "id": "ctc_2",
-                "call_id": "call_2",
-                "name": "exec",
-                "input": "true",
-            },
-            {
-                "type": "custom_tool_call_output",
-                "call_id": "call_2",
-                "output": "Script completed\n",
-            },
-        ],
-    )
-    assert req2.model_dump()["input"][1]["output"] == "Script completed\n"
+            "output",
+        ),
+        ({"type": "input_image", "image_url": _PNG}, None),
+    ],
+    ids=["message_part", "url_object", "tool_output", "top_level"],
+)
+def test_an_image_degrades_to_a_text_placeholder(item, key):
+    request = ResponsesRequest(model="m", input=[item])
+    dumped = request.model_dump()["input"][0]
+    (part,) = dumped[key] if key else [dumped]
+    assert part["type"] == "input_text"
+    assert part["text"].startswith("[image omitted: image/png, ")
+    assert "AAAA" not in part["text"]
+
+
+def test_a_string_tool_output_is_not_degraded():
+    item = {"type": "custom_tool_call_output", "call_id": "call_2", "output": "done\n"}
+    request = ResponsesRequest(model="m", input=[item])
+    assert request.model_dump()["input"][0]["output"] == "done\n"

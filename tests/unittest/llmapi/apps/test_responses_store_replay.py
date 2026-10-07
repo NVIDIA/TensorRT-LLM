@@ -12,31 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Offline tests: the Responses store must not lose tool calls or prior context.
-
-Three ways a multi-turn tool conversation lost its thread, each pinned here:
-
-* The store writer only attached tool calls to the reasoning message, so a
-  turn that called tools without reasoning stored them nowhere - and a turn
-  that was *nothing but* tool calls stored no assistant message at all.
-* A stored reasoning+calls turn survived storage but not replay: the replay
-  filter dropped the whole message for its "reasoning" key, calls included, so
-  the client's tool RESULT replayed with no call before it - an orphan the
-  model cannot pair.
-* The server folded ``request.store`` into the one flag it hands
-  preprocessing, so a follow-up sent with ``store=false`` had its
-  ``previous_response_id`` loaded and validated - and then generated with no
-  history at all, silently.
-"""
+"""Offline tests for Responses storage and replay, and the endpoint up to preprocessing."""
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from openai.types.responses import ResponseFunctionToolCall
 
-from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+from tensorrt_llm.serve.openai_protocol import DisaggregatedParams, ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ConversationHistoryStore,
     _create_input_messages,
@@ -44,9 +29,6 @@ from tensorrt_llm.serve.responses_utils import (
     request_preprocess,
 )
 
-# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
-# test in the file is deselected, which pytest reports as exit code 5 and the
-# stage reports as a failure.
 pytestmark = pytest.mark.cpu_only
 
 
@@ -77,34 +59,36 @@ def _contents(text=None, reasoning=None, calls=()):
 # The store writer: a tool-call-bearing turn is an assistant turn
 # ---------------------------------------------------------------------------
 
-
-def test_a_tool_only_turn_is_stored():
-    """No text, no reasoning - the calls alone used to store nothing."""
-    messages = _create_output_messages(_contents(calls=[_call()]))
-    assert len(messages) == 1
-    assert messages[0]["role"] == "assistant"
-    assert messages[0]["tool_calls"][0]["id"] == "call_1"
-    assert messages[0]["tool_calls"][0]["function"]["name"] == "exec"
+_STORED_CALL = {
+    "id": "call_1",
+    "type": "function",
+    "function": {"name": "exec", "arguments": '{"cmd": "ls"}'},
+}
 
 
-def test_a_text_turn_keeps_its_calls():
-    """Text plus calls without reasoning stored the text and dropped the calls."""
-    messages = _create_output_messages(_contents(text="Running it.", calls=[_call()]))
-    carried = [m for m in messages if m.get("tool_calls")]
-    assert carried and carried[0]["content"] == "Running it."
+@pytest.mark.parametrize(
+    "contents, expected",
+    [
+        (
+            _contents(calls=[_call()]),
+            [{"role": "assistant", "content": None, "tool_calls": [_STORED_CALL]}],
+        ),
+        (
+            _contents(text="Running it.", calls=[_call()]),
+            [{"role": "assistant", "content": "Running it.", "tool_calls": [_STORED_CALL]}],
+        ),
+        (_contents(text="Hello."), [{"role": "assistant", "content": "Hello."}]),
+    ],
+    ids=["calls_only", "text_and_calls", "text_only"],
+)
+def test_a_turn_is_stored_with_its_calls(contents, expected):
+    assert _create_output_messages(contents) == expected
 
 
-def test_a_text_only_turn_stores_the_old_shape():
-    assert _create_output_messages(_contents(text="Hello.")) == [
-        {"role": "assistant", "content": "Hello."}
-    ]
-
-
-def test_a_reasoning_turn_still_carries_reasoning_and_calls():
-    """The path that already worked, kept byte-compatible."""
+def test_a_reasoning_turn_carries_reasoning_and_calls():
     (message,) = _create_output_messages(_contents(reasoning="think", calls=[_call()]))
     assert message["reasoning"] == "think"
-    assert message["tool_calls"][0]["id"] == "call_1"
+    assert message["tool_calls"] == [_STORED_CALL]
 
 
 # ---------------------------------------------------------------------------
@@ -125,22 +109,20 @@ def test_replaying_a_reasoning_call_turn_preserves_the_calls():
     assert carried and carried[0]["tool_calls"][0]["id"] == "call_1"
 
 
-def test_replaying_a_reasoning_only_turn_still_drops_it():
-    stored = _create_output_messages(_contents(reasoning="think"))
-    replayed = _replay(stored)
-    assert all("reasoning" not in m and not m.get("tool_calls") for m in replayed)
-
-
-def test_a_plain_assistant_call_message_replays_byte_identical():
-    plain = {
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [
-            {"id": "call_9", "type": "function", "function": {"name": "exec", "arguments": "{}"}}
-        ],
-    }
-    replayed = _replay([plain])
+def test_replay_drops_a_reasoning_only_turn_and_keeps_others_as_stored():
+    plain = {"role": "assistant", "content": None, "tool_calls": [_STORED_CALL]}
+    replayed = _replay(_create_output_messages(_contents(reasoning="think")) + [plain])
     assert replayed[0] is plain
+    assert replayed[1:] == [{"role": "user", "content": "hi"}]
+
+
+def test_trimming_a_stored_conversation_leaves_the_callers_messages_whole():
+    store = ConversationHistoryStore(resp_capacity=1)
+    messages = [{"role": ("user", "assistant")[i % 2], "content": str(i)} for i in range(8)]
+    original = list(messages)
+    asyncio.run(store.store_messages("resp_1", messages, None))
+    assert messages == original
+    assert len(store.conversations[store.response_to_conversation["resp_1"]]) < len(original)
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +146,6 @@ async def _chain(output_contents, call_id):
         model="m",
         input=[_tool_result_item(call_id=call_id)],
         previous_response_id="resp_first",
-        # The follow-up itself opting out of storage must not cost it the
-        # history it names.
         store=False,
         request_id="resp_second",
     )
@@ -203,13 +183,7 @@ def test_the_stored_call_precedes_its_result_on_replay(contents, call_id):
 
 
 async def _preprocess(monkeypatch, store_flag):
-    """Run the real request_preprocess with the heavy leaves faked.
-
-    Chat-template rendering and sampling-params construction need a tokenizer
-    and the engine bindings; the gates under test - fetch prior context, then
-    persist or not - sit above both, so those leaves are replaced with
-    recorders and the store itself stays real.
-    """
+    """Run the real request_preprocess with rendering faked; the store is real."""
     import tensorrt_llm.serve.responses_utils as ru
 
     store = ConversationHistoryStore()
@@ -254,9 +228,6 @@ async def _preprocess(monkeypatch, store_flag):
         request=request,
         prev_response=None,
         conversation_store=store,
-        # The server-side switch, which is all the server passes: retrieval is
-        # gated downstream on previous_response_id, persistence on
-        # request.store.
         enable_store=True,
         use_harmony=False,
         tokenizer=None,
@@ -269,26 +240,15 @@ async def _preprocess(monkeypatch, store_flag):
     return saw_prior, persisted
 
 
-def test_store_false_still_sees_prior_context_and_is_not_persisted(monkeypatch):
-    saw_prior, persisted = asyncio.run(_preprocess(monkeypatch, store_flag=False))
-    assert saw_prior, "previous_response_id was loaded and then ignored"
-    assert not persisted
-
-
-def test_store_true_sees_prior_context_and_is_persisted(monkeypatch):
-    saw_prior, persisted = asyncio.run(_preprocess(monkeypatch, store_flag=True))
+@pytest.mark.parametrize("store_flag", [False, True])
+def test_prior_context_is_read_whether_or_not_the_turn_is_stored(monkeypatch, store_flag):
+    saw_prior, persisted = asyncio.run(_preprocess(monkeypatch, store_flag=store_flag))
     assert saw_prior
-    assert persisted
+    assert persisted == store_flag
 
 
-def test_the_endpoint_hands_preprocess_the_server_switch(monkeypatch):
-    """A store=false request must not flip the flag preprocessing receives.
-
-    The endpoint used to pass ``enable_store and request.store``, which reads
-    as one switch but gates two: it suppressed retrieval of the prior context
-    along with persistence. Only the wiring is under test, so preprocessing is
-    replaced with a recorder that stops the handler right after the handoff.
-    """
+def _server_up_to_preprocess(monkeypatch):
+    """An OpenAIServer whose /v1/responses handler stops at preprocessing."""
     import tensorrt_llm.serve.openai_server as server_module
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -301,6 +261,7 @@ def test_the_endpoint_hands_preprocess_the_server_switch(monkeypatch):
     server.model_config = None
     server.processor = None
     server.tool_parser = None
+    server.metrics_collector = None
     server.generator = SimpleNamespace(
         args=SimpleNamespace(reasoning_parser=None, num_postprocess_workers=0)
     )
@@ -318,17 +279,49 @@ def test_the_endpoint_hands_preprocess_the_server_switch(monkeypatch):
         raise RuntimeError("stop after the handoff")
 
     monkeypatch.setattr(server_module, "responses_api_request_preprocess", fake_preprocess)
-
-    request = ResponsesRequest(
-        model="test-model", input="hi", previous_response_id="resp_prev", store=False
-    )
     raw_request = SimpleNamespace(
         state=SimpleNamespace(),
         headers={},
         url=SimpleNamespace(path="/v1/responses"),
         json=AsyncMock(return_value={}),
     )
+    return server, raw_request, captured
+
+
+def test_the_endpoint_hands_preprocess_the_server_switch(monkeypatch):
+    """A store=false request must not flip the flag preprocessing receives."""
+    server, raw_request, captured = _server_up_to_preprocess(monkeypatch)
+    request = ResponsesRequest(
+        model="test-model", input="hi", previous_response_id="resp_prev", store=False
+    )
     asyncio.run(server.openai_responses(request, raw_request))
 
     assert captured.get("enable_store") is True
     assert captured["request"].store is False
+
+
+def test_protected_disagg_fields_are_checked_before_anything_is_rendered(monkeypatch):
+    server, raw_request, captured = _server_up_to_preprocess(monkeypatch)
+    server._validate_internal_disagg_request = Mock(side_effect=ValueError("unsigned"))
+    request = ResponsesRequest(
+        model="test-model",
+        input="hi",
+        disaggregated_params=DisaggregatedParams(request_type="generation_only"),
+    )
+    response = asyncio.run(server.openai_responses(request, raw_request))
+
+    assert response.status_code == 400
+    assert captured == {}
+
+
+@pytest.mark.parametrize(
+    "fields, warned",
+    [({}, False), ({"parallel_tool_calls": True}, False), ({"parallel_tool_calls": False}, True)],
+)
+def test_unenforced_parallel_tool_calls_is_logged_only_when_requested(monkeypatch, fields, warned):
+    server, raw_request, _ = _server_up_to_preprocess(monkeypatch)
+    request = ResponsesRequest(model="test-model", input="hi", **fields)
+    with patch("tensorrt_llm.serve.openai_server.logger") as mock_logger:
+        asyncio.run(server.openai_responses(request, raw_request))
+    keys = [c.kwargs.get("key") for c in mock_logger.warning_once.call_args_list]
+    assert ("responses_parallel_tool_calls_unenforced" in keys) is warned

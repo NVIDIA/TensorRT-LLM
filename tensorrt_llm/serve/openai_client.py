@@ -88,17 +88,10 @@ class _SerializableRequest(Protocol):
 
 
 def _encode_request_body(request: _SerializableRequest) -> bytes:
-    """Encode a request forwarded to a worker, under its wire field names.
+    """Encode a request forwarded to a worker.
 
-    Where a field carries an alias the internal and wire names differ, and
-    the worker validates the wire name. ``schema`` is the case that bites:
-    pydantic cannot hold a field of that name, so the model declares
-    ``schema_`` aliased to ``schema``. Without ``by_alias`` a Responses
-    ``text.format`` JSON schema reached the worker as ``schema_``, every
-    member of the format union failed validation, and the request came back
-    400 -- every structured-output call made through a disaggregated server.
-    The workers set ``populate_by_name=True``, so either spelling is accepted;
-    the alias is the one that is correct on the wire.
+    Fields go out under their wire names, e.g. ``schema``, which the model
+    holds as ``schema_``.
     """
     return _msgpack_encoder.encode(
         request.model_dump(mode="json", exclude_unset=True, by_alias=True)
@@ -184,13 +177,7 @@ class OpenAIClient(ABC):
         response_type: Type[_ResponseT],
         server: str,
     ) -> _ResponseT:
-        """Read a worker's bodyless GET endpoint.
-
-        The counterpart to post_json for endpoints that describe the worker
-        rather than ask it to do anything -- /v1/models being the one that
-        matters. Same exemption from routing state, and no request body to
-        serialise.
-        """
+        """GET a worker endpoint, outside routing state, like post_json."""
         ...
 
     async def shutdown(self) -> None: ...

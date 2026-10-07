@@ -66,11 +66,6 @@ def test_custom_tool_is_offered_with_a_named_string_parameter():
 
 
 def test_custom_tool_names_are_collected():
-    """A custom tool classifies custom; a plain function does not.
-
-    The resolution map replaced _custom_tool_names; this file referenced the
-    removed helper and failed on import ever since - nothing in CI ran it.
-    """
     tools = [_custom_tool(), SimpleNamespace(type="function", name="shell")]
     resolution = _tool_resolution(tools)
     assert resolution["apply_patch"][2] is True
@@ -86,10 +81,6 @@ def test_no_tools_yields_no_custom_names():
 # ---------------------------------------------------------------------------
 
 
-# _tool_call_output_item takes the resolution map (every spelling ->
-# (namespace, bare, custom)) since the tool-resolution refactor; these tests
-# were written against the removed set/map pair and failed on import or call
-# ever since - nothing in CI ran this file.
 _CUSTOM_RES = {"apply_patch": (None, "apply_patch", True)}
 
 

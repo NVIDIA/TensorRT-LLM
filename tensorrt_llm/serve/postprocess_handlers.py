@@ -1088,8 +1088,6 @@ def responses_api_post_processor(
         reasoning_parser=args.reasoning_parser,
         tool_parser=args.tool_parser,
         num_prompt_tokens=args.num_prompt_tokens,
-        # Set on every PostprocArgs by the worker (postproc_worker.py:195);
-        # used here only to count reasoning tokens for usage.
         tokenizer=args.tokenizer,
     )
 

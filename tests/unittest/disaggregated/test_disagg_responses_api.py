@@ -14,35 +14,47 @@
 # limitations under the License.
 """Offline tests for the Responses API on the disaggregated path.
 
-The disaggregated orchestrator holds no tokenizer and no engine: it splits one
-client request into a context request and a generation request, relays a
-KV-cache handle between two workers, and streams the second worker's bytes
-back. These tests pin the parts of that split that differ for Responses,
-because the Completions and Chat Completions shapes carry the handoff on
-``choices[0]`` and a Responses response has no ``choices`` at all.
+A Responses response has no ``choices``, so the context-to-generation handoff
+that completions and chat carry on ``choices[0]`` sits at its top level.
 """
 
 import asyncio
+import base64
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import aiohttp
+import numpy as np
 import pytest
+from fastapi import HTTPException
 
-from tensorrt_llm.serve.openai_disagg_service import _ctx_handoff_slots, _drop_ctx_handoff
+from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
+from tensorrt_llm.serve.openai_disagg_service import (
+    OpenAIDisaggregatedService,
+    _ctx_handoff_slots,
+    _ctx_usage_info,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     DisaggregatedParams,
+    ModelCard,
+    ModelList,
+    PromptTokensDetails,
     ResponsesRequest,
     ResponsesResponse,
+    UsageInfo,
+)
+from tensorrt_llm.serve.responses_utils import (
+    create_response_non_store,
+    finish_reason_mapping,
+    responses_done_generator,
 )
 
-# The CPU-* CI stages run pytest with -m 'cpu_only'. Without this marker every
-# test in the file is deselected, which pytest reports as exit code 5 and the
-# stage reports as a failure.
 pytestmark = pytest.mark.cpu_only
 
 
-def _responses_response(
-    finish_reason="length", disagg=True, prompt_token_ids=None, status="incomplete"
-):
+def _responses_response(finish_reason="length", status="incomplete"):
     return ResponsesResponse(
         model="m",
         output=[],
@@ -57,395 +69,277 @@ def _responses_response(
         top_logprobs=0,
         truncation="disabled",
         finish_reason=finish_reason,
-        prompt_token_ids=prompt_token_ids,
+        prompt_token_ids=[1, 2],
+        prompt_token_ids_b64="AQAAAAIAAAA=",
         disaggregated_params=DisaggregatedParams(
-            request_type="context_only",
-            ctx_request_id=7,
-            disagg_request_id=7,
-        )
-        if disagg
-        else None,
+            request_type="context_only", ctx_request_id=7, disagg_request_id=7
+        ),
     )
 
 
+def _service(**attrs):
+    service = OpenAIDisaggregatedService.__new__(OpenAIDisaggregatedService)
+
+    async def ready():
+        return True
+
+    service.is_ready = ready
+    for name, value in attrs.items():
+        setattr(service, name, value)
+    return service
+
+
 # ---------------------------------------------------------------------------
-# The handoff carrier
+# The handoff
 # ---------------------------------------------------------------------------
 
 
-def test_responses_response_carries_the_handoff_at_top_level():
-    """No ``choices`` to hang it on, so the orchestrator reads it directly."""
-    response = _responses_response()
-    slots = _ctx_handoff_slots(response)
-    assert slots == [response]
-    assert slots[0].disaggregated_params.ctx_request_id == 7
-
-
-def test_chat_response_still_carries_the_handoff_per_choice():
-    """The pre-existing shape must keep working unchanged."""
-    response = ChatCompletionResponse(
+def test_the_handoff_is_read_per_choice_for_chat_and_top_level_for_responses():
+    chat = ChatCompletionResponse(
         model="m",
         choices=[
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": "hi"},
                 "finish_reason": "length",
-                "disaggregated_params": {
-                    "request_type": "context_only",
-                    "ctx_request_id": 3,
-                },
+                "disaggregated_params": {"request_type": "context_only", "ctx_request_id": 3},
             }
         ],
         usage={"prompt_tokens": 1, "total_tokens": 2, "completion_tokens": 1},
     )
-    slots = _ctx_handoff_slots(response)
-    assert len(slots) == 1
-    assert slots[0].disaggregated_params.ctx_request_id == 3
-
-
-def test_dropping_the_handoff_clears_it():
-    """A response that never reaches a generation worker must not leak it.
-
-    The field names an internal KV-cache transfer; relaying it to the client
-    would describe a transfer that never happens.
-    """
+    assert [s.disaggregated_params.ctx_request_id for s in _ctx_handoff_slots(chat)] == [3]
     response = _responses_response()
-    _drop_ctx_handoff(response)
-    assert response.disaggregated_params is None
+    assert _ctx_handoff_slots(response) == [response]
 
 
-# ---------------------------------------------------------------------------
-# finish_reason: why `status` is not enough
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "finish_reason, need_gen", [("length", True), ("not_finished", True), ("stop", False)]
+)
+def test_a_finished_context_response_goes_to_the_client_without_the_handoff(
+    finish_reason, need_gen
+):
+    response = _responses_response(finish_reason=finish_reason)
+    assert _service()._need_gen(response) is need_gen
+    handoff = (
+        response.disaggregated_params,
+        response.prompt_token_ids,
+        response.prompt_token_ids_b64,
+        response.finish_reason,
+    )
+    if need_gen:
+        assert all(field is not None for field in handoff)
+    else:
+        assert handoff == (None, None, None, None)
 
 
-def test_finish_reason_is_carried_unmapped():
-    """``status`` cannot express the distinction the orchestrator needs.
-
-    "length" and "not_finished" both map onto the public status "incomplete",
-    but only the raw value tells the orchestrator a generation phase is still
-    pending, and ``finish_reason_mapping`` used to raise outright on
-    "not_finished".
-    """
-    response = _responses_response(finish_reason="not_finished")
-    assert response.status == "incomplete"
-    assert response.finish_reason == "not_finished"
-
-
-def test_not_finished_maps_to_incomplete_rather_than_raising():
-    """Regression: the context worker is capped at one token.
-
-    It hands the request off without finishing, so the engine reports
-    "not_finished" -- a value the mapping did not handle, which surfaced as a
-    500 from the context worker rather than a completed handoff.
-    """
-    from tensorrt_llm.serve.responses_utils import finish_reason_mapping
-
-    assert finish_reason_mapping("not_finished") == "incomplete"
-    assert finish_reason_mapping("length") == "incomplete"
-    assert finish_reason_mapping("stop") == "completed"
+@pytest.mark.parametrize(
+    "finish_reason, status",
+    [("not_finished", "incomplete"), ("length", "incomplete"), ("stop", "completed")],
+)
+def test_finish_reason_mapping(finish_reason, status):
+    assert finish_reason_mapping(finish_reason) == status
 
 
 def test_an_unknown_finish_reason_names_itself():
-    from tensorrt_llm.serve.responses_utils import finish_reason_mapping
-
     with pytest.raises(RuntimeError, match="wat"):
         finish_reason_mapping("wat")
 
 
-# ---------------------------------------------------------------------------
-# The relayed prompt
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "fields, expected",
+    [
+        ({"prompt_token_ids": [1, 2, 3]}, [1, 2, 3]),
+        (
+            {
+                "prompt_token_ids_b64": base64.b64encode(
+                    np.asarray([5, 6, 7], dtype=np.int32).tobytes()
+                ).decode("ascii")
+            },
+            [5, 6, 7],
+        ),
+        ({}, None),
+    ],
+)
+def test_the_generation_worker_uses_the_relayed_prompt(fields, expected):
+    request = ResponsesRequest(model="m", input="hi", **fields)
+    assert request.relayed_prompt_token_ids() == expected
+    assert request.prompt_token_ids == fields.get("prompt_token_ids")
 
 
-def test_relayed_prompt_token_ids_are_used_verbatim():
-    """The generation worker must not re-render the chat template.
-
-    Re-rendering is not merely wasted work: a template that varies per render
-    would produce a prompt the context worker never prefilled, and the
-    relayed KV cache would not correspond to it.
-    """
-    from tensorrt_llm.serve.responses_utils import _relayed_prompt_token_ids
-
-    request = ResponsesRequest(model="m", input="hi", prompt_token_ids=[1, 2, 3])
-    assert _relayed_prompt_token_ids(request) == [1, 2, 3]
-
-
-def test_relayed_prompt_token_ids_b64_round_trips():
-    """The orchestrator relays one base64 string instead of an int list."""
-    import base64
-
-    import numpy as np
-
-    from tensorrt_llm.serve.responses_utils import _relayed_prompt_token_ids
-
-    encoded = base64.b64encode(np.asarray([5, 6, 7], dtype=np.int32).tobytes()).decode("ascii")
-    request = ResponsesRequest(model="m", input="hi", prompt_token_ids_b64=encoded)
-    assert _relayed_prompt_token_ids(request) == [5, 6, 7]
-
-
-def test_an_ordinary_client_request_has_no_relayed_prompt():
-    """A client sends neither field, so the worker tokenizes as usual."""
-    from tensorrt_llm.serve.responses_utils import _relayed_prompt_token_ids
-
-    assert _relayed_prompt_token_ids(ResponsesRequest(model="m", input="hi")) is None
-
-
-# ---------------------------------------------------------------------------
-# Streaming a request that never reached a generation worker
-# ---------------------------------------------------------------------------
-
-
-def _drain(generator):
-    async def collect():
-        return [chunk async for chunk in generator]
-
-    return asyncio.run(collect())
-
-
-def test_ctx_only_stream_ends_with_a_terminal_event():
-    """Regression: the completions terminator hangs a Responses client.
-
-    The Responses protocol has no ``[DONE]`` sentinel -- a client watches for
-    a terminal event. Emitting ``data: [DONE]`` leaves it waiting for an
-    event that never arrives, and drops the answer the context worker already
-    produced. A response that ran to its natural end terminates with
-    ``response.completed``.
-    """
-    from tensorrt_llm.serve.responses_utils import responses_done_generator
-
-    chunks = _drain(
-        responses_done_generator(_responses_response(finish_reason="stop", status="completed"))
+@pytest.mark.parametrize(
+    "usage, expected",
+    [
+        (
+            SimpleNamespace(
+                input_tokens=96,
+                input_tokens_details=SimpleNamespace(cached_tokens=64),
+                output_tokens=1,
+                total_tokens=97,
+            ),
+            (96, 1, 64),
+        ),
+        (
+            SimpleNamespace(
+                input_tokens=96, input_tokens_details=None, output_tokens=1, total_tokens=97
+            ),
+            (96, 1, 0),
+        ),
+    ],
+)
+def test_the_context_usage_is_handed_off_as_usage_info(usage, expected):
+    carried = _ctx_usage_info(SimpleNamespace(usage=usage))
+    assert (
+        carried.prompt_tokens,
+        carried.completion_tokens,
+        carried.prompt_tokens_details.cached_tokens,
+    ) == expected
+    already = UsageInfo(
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=0),
     )
-    body = b"".join(chunks).decode("utf-8")
-
-    assert "event: response.completed" in body
-    assert "[DONE]" not in body
-    # A well-formed run opens before it closes.
-    assert body.index("response.created") < body.index("response.completed")
+    assert _ctx_usage_info(SimpleNamespace(usage=already)) is already
 
 
-def test_ctx_only_truncated_replay_terminates_as_incomplete():
-    """A replayed response cut off at its token budget says so.
-
-    The terminal event is chosen by status, exactly as on every other
-    completed stream (_stream_terminal_event): a ``response.completed``
-    around a status of "incomplete" asserts the one thing its payload
-    denies. The fixture's default is the truncated shape this generator
-    replays when the context phase finished the whole request.
-    """
-    from tensorrt_llm.serve.responses_utils import responses_done_generator
-
-    chunks = _drain(responses_done_generator(_responses_response()))
-    body = b"".join(chunks).decode("utf-8")
-
-    assert "event: response.incomplete" in body
-    assert "max_output_tokens" in body
-    assert "[DONE]" not in body
-    assert body.index("response.created") < body.index("response.incomplete")
-
-
-def test_ctx_only_stream_events_are_sse_framed():
-    from tensorrt_llm.serve.responses_utils import responses_done_generator
-
-    chunks = _drain(responses_done_generator(_responses_response()))
-    for chunk in chunks:
-        text = chunk.decode("utf-8")
-        assert text.startswith("event: ")
-        assert "\ndata: " in text
-        assert text.endswith("\n\n")
+@pytest.mark.parametrize("use_harmony", [False, True])
+def test_a_context_only_response_carries_the_handoff(use_harmony):
+    """The single handoff token is not a complete Harmony message to parse."""
+    request = ResponsesRequest(
+        model="m", input="hi", disaggregated_params=DisaggregatedParams(request_type="context_only")
+    )
+    output = SimpleNamespace(
+        index=0, text="", token_ids=[7], finish_reason="length", disaggregated_params=None
+    )
+    result = SimpleNamespace(outputs=[output], prompt_token_ids=[1, 2], cached_tokens=0)
+    with patch(
+        "tensorrt_llm.serve.responses_utils._create_output_content_harmony",
+        side_effect=AssertionError("parsed a context-only output"),
+    ):
+        response = create_response_non_store(
+            generation_result=result,
+            request=request,
+            sampling_params=request.to_sampling_params(),
+            model_name="m",
+            use_harmony=use_harmony,
+        )
+    assert response.output == []
+    assert (response.finish_reason, response.prompt_token_ids) == ("length", [1, 2])
 
 
 # ---------------------------------------------------------------------------
-# Routing a Responses request to the right worker endpoint
-# ---------------------------------------------------------------------------
-
-
-def test_client_dispatches_responses_requests_to_v1_responses():
-    """The endpoint is chosen by request type; an unmapped type raises.
-
-    Without this branch a Responses request reaching the client raised
-    "Invalid request type", which is how the route would have failed had only
-    the orchestrator side been wired up.
-    """
-    import inspect
-
-    from tensorrt_llm.serve.openai_client import OpenAIClient
-
-    source = inspect.getsource(OpenAIClient.send_request)
-    assert "ResponsesRequest" in source
-    assert "v1/responses" in source
-
-
-# ---------------------------------------------------------------------------
-# Fields the orchestrator needs on the wire
+# Streaming a request the context phase finished
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "field",
+    "finish_reason, status, terminal, details",
     [
-        "disaggregated_params",
-        "conversation_params",
-        "prompt_token_ids",
-        "prompt_token_ids_b64",
+        ("stop", "completed", "response.completed", None),
+        ("length", "incomplete", "response.incomplete", {"reason": "max_output_tokens"}),
     ],
 )
-def test_request_carries_the_orchestrator_fields(field):
-    """``_wrap_entry_point`` and the split read these off every request.
+def test_a_context_finished_stream_replays_the_response(finish_reason, status, terminal, details):
+    response = _responses_response(finish_reason=finish_reason, status=status)
+    if details:
+        response.incomplete_details = details
 
-    ``conversation_params`` in particular is read unconditionally by
-    conversation-id resolution, so its absence is an AttributeError on the
-    first request rather than a missing feature.
-    """
-    request = ResponsesRequest(model="m", input="hi")
-    assert hasattr(request, field)
-    assert getattr(request, field) is None
+    async def collect():
+        return [chunk.decode() async for chunk in responses_done_generator(response)]
 
-
-def test_request_fields_survive_serialization_to_a_worker():
-    """The client serializes with exclude_unset, so set fields must persist."""
-    request = ResponsesRequest(model="m", input="hi")
-    request.disaggregated_params = DisaggregatedParams(
-        request_type="generation_only", ctx_request_id=11
-    )
-    request.prompt_token_ids = [1, 2]
-
-    payload = request.model_dump_json(exclude_unset=True)
-    assert "generation_only" in payload
-    assert "prompt_token_ids" in payload
-
-    revived = ResponsesRequest.model_validate_json(payload)
-    assert revived.disaggregated_params.ctx_request_id == 11
-    assert revived.prompt_token_ids == [1, 2]
+    frames = asyncio.run(collect())
+    assert all(f.startswith("event: ") and f.endswith("\n\n") for f in frames)
+    events = [json.loads(f.split("data: ", 1)[1]) for f in frames]
+    assert [e["type"] for e in events] == ["response.created", "response.in_progress", terminal]
+    assert [e["sequence_number"] for e in events] == [0, 1, 2]
+    assert events[-1]["response"]["incomplete_details"] == details
 
 
 # ---------------------------------------------------------------------------
-# `store` on a disaggregated server
+# What the orchestrator does with a Responses request
 # ---------------------------------------------------------------------------
-def _store_warnings(caplog):
-    return [r for r in caplog.records if "'store' is ignored" in r.getMessage()]
 
 
-def test_store_left_at_its_default_does_not_warn(caplog):
-    """`store` defaults to True, so the value alone cannot justify a warning.
+@pytest.mark.parametrize("store, warned", [(None, False), (False, False), (True, True)])
+def test_store_is_forwarded_off_and_an_explicit_request_for_it_is_logged(store, warned):
+    sent = []
 
-    Warning on the value would fire for every request that never mentioned the
-    field -- which is most of them -- and a warning on every request is one
-    nobody reads.
-    """
-    import logging
+    async def send(request, hooks):
+        sent.append(request)
+        return "relayed"
 
-    caplog.set_level(logging.WARNING)
-    request = ResponsesRequest(model="m", input="hi")
-
-    assert request.store is True
-    assert "store" not in request.model_fields_set
-
-
-def test_store_set_explicitly_is_a_request_that_goes_unmet():
-    """A client that wrote `store` down asked for something it will not get.
-
-    Unlike `previous_response_id` this does not stop the request being served,
-    so it is a warning rather than a 400 -- but it must not be silent: the
-    Responses protocol has no field for "served, but one thing you asked for
-    was dropped".
-    """
-    request = ResponsesRequest(model="m", input="hi", store=True)
-
-    assert "store" in request.model_fields_set
-    assert request.store is True
+    request = ResponsesRequest(model="m", input="hi", **({} if store is None else {"store": store}))
+    with patch("tensorrt_llm.serve.openai_disagg_service.logger") as mock_logger:
+        assert asyncio.run(_service(_send_disagg_request=send).openai_responses(request)) == (
+            "relayed"
+        )
+    assert sent[0].store is False
+    assert mock_logger.warning_once.called is warned
 
 
-def test_store_false_is_not_an_unmet_request():
-    """Nothing was asked for, so there is nothing to report."""
-    request = ResponsesRequest(model="m", input="hi", store=False)
-
-    assert "store" in request.model_fields_set
-    assert request.store is False
+def test_previous_response_id_is_rejected_with_a_400():
+    request = ResponsesRequest(model="m", input="hi", previous_response_id="resp_1")
+    with pytest.raises(HTTPException) as raised:
+        asyncio.run(_service().openai_responses(request))
+    assert raised.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------
-# /v1/models on a disaggregated server
+# /v1/models
 # ---------------------------------------------------------------------------
+
+
 class _StubCtxClient:
-    """Records what the service asked a worker for."""
-
-    def __init__(self, result=None, error=None):
-        self.result, self.error = result, error
-        self.calls = []
+    def __init__(self, error=None):
+        self.error = error
+        self.servers = []
 
     async def get_json(self, endpoint, response_type, server):
-        self.calls.append((endpoint, server))
+        assert endpoint == "v1/models"
+        self.servers.append(server)
         if self.error is not None:
             raise self.error
-        return self.result
+        return ModelList(data=[ModelCard(id="served-name")])
 
 
-class _StubRouter:
-    def __init__(self, servers):
-        self.servers = servers
+def _models_service(client, servers=("w0:8001", "w1:8001")):
+    return _service(
+        _ctx_client=client,
+        _ctx_router=SimpleNamespace(servers=list(servers)),
+        _count_tokens_rr_counter=0,
+    )
 
 
-def _service_with(ctx_client, servers=("w0:8001", "w1:8001"), ready=True):
-    """A service object with only the pieces get_model touches."""
-    from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
-    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
-
-    svc = OpenAIDisaggregatedService.__new__(OpenAIDisaggregatedService)
-    svc._ctx_client = ctx_client
-    svc._ctx_router = _StubRouter(list(servers))
-    svc._count_tokens_rr_counter = 0
-
-    async def _ready():
-        return ready
-
-    svc.is_ready = _ready
-    return svc, ModelList, ModelCard
+def test_models_are_listed_by_a_context_worker_round_robin():
+    client = _StubCtxClient()
+    service = _models_service(client)
+    assert asyncio.run(service.get_model()).data[0].id == "served-name"
+    asyncio.run(service.get_model())
+    assert client.servers == ["w0:8001", "w1:8001"]
 
 
-def test_get_model_asks_a_context_worker():
-    """The orchestrator has no model of its own to report.
-
-    DisaggServerConfig carries no model name -- the working deployments on hand
-    do not set one -- so answering from config would work for some clusters and
-    404 for the rest. The worker knows the name requests are served under.
-    """
-    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
-
-    expected = ModelList(data=[ModelCard(id="GLM-5.3")])
-    client = _StubCtxClient(result=expected)
-    svc, _, _ = _service_with(client)
-
-    got = asyncio.run(svc.get_model())
-
-    assert got.data[0].id == "GLM-5.3"
-    assert client.calls == [("v1/models", "w0:8001")]
-
-
-def test_get_model_round_robins_context_workers():
-    """Shares the counter with count-tokens, so two calls hit two workers."""
-    from tensorrt_llm.serve.openai_protocol import ModelCard, ModelList
-
-    client = _StubCtxClient(result=ModelList(data=[ModelCard(id="m")]))
-    svc, _, _ = _service_with(client)
-
-    asyncio.run(svc.get_model())
-    asyncio.run(svc.get_model())
-
-    assert [s for _, s in client.calls] == ["w0:8001", "w1:8001"]
-
-
-def test_get_model_without_a_context_worker_is_an_error_not_an_empty_list():
-    """An empty list would read as "this server has no models", which is false.
-
-    The model exists; there is currently nobody to ask. The server turns this
-    into a 503 so the client retries rather than concluding the deployment is
-    empty.
-    """
-    client = _StubCtxClient(result=None)
-    svc, _, _ = _service_with(client, servers=())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(svc.get_model())
-    assert client.calls == []
+@pytest.mark.parametrize(
+    "client, servers, status",
+    [
+        (_StubCtxClient(), (), 503),
+        (
+            _StubCtxClient(
+                aiohttp.ClientResponseError(
+                    SimpleNamespace(real_url="http://w0:8001/v1/models"),
+                    (),
+                    status=404,
+                    message="Not Found",
+                )
+            ),
+            ("w0:8001",),
+            404,
+        ),
+    ],
+    ids=["no_context_worker", "worker_error"],
+)
+def test_a_models_failure_is_an_error_response(client, servers, status):
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._service = _models_service(client, servers)
+    response = asyncio.run(server.get_model())
+    assert response.status_code == status
+    assert json.loads(response.body)["code"] == status

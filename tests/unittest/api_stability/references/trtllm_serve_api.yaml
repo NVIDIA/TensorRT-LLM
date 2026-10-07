@@ -514,12 +514,6 @@ models:
         default: null
         status: stable
         required: true
-      parallel_tool_calls:
-        kind: openai
-        type: Optional[bool]
-        default: null
-        status: stable
-        required: false
       prompt_token_ids:
         kind: extension
         type: Optional[List[int]]

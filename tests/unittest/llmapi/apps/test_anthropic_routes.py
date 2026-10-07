@@ -273,20 +273,12 @@ def test_messages_route_reframes_streaming_response(server_kind):
 
 @pytest.fixture
 def prometheus_multiproc_dir(tmp_path, monkeypatch):
-    """A multiprocess metrics directory that does not outlive the test.
+    """PROMETHEUS_MULTIPROC_DIR for one test.
 
-    Setting PROMETHEUS_MULTIPROC_DIR cannot be undone by unsetting it. The
-    first metric built while it is set makes prometheus_client choose
-    ``values.ValueClass`` for the whole process and cache it; monkeypatch then
-    restores the environment at teardown but cannot put the class back. Every
-    later metric in that process is built by MultiProcessValue with no
-    directory to write into and dies with "expected str, bytes or
-    os.PathLike object, not NoneType".
-
-    The damage lands on whichever file runs next, which makes it look like
-    that file's bug: test_disagg_openai_client.py passes alone and fails
-    wholesale -- 14 failures, 11 errors -- when this one precedes it. So the
-    class is restored here, not just the environment.
+    prometheus_client picks and caches its value class the first time a metric
+    is built with the variable set, so the class is restored as well as the
+    environment; otherwise later metrics in the process fail without a
+    directory.
     """
     import prometheus_client.values
 
@@ -299,10 +291,9 @@ def prometheus_multiproc_dir(tmp_path, monkeypatch):
 
 
 def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
-    # register_routes mounts a prometheus multiprocess collector, which needs
-    # PROMETHEUS_MULTIPROC_DIR to name a real directory: building the server
-    # with object.__new__ skips the startup that would normally create one.
-    # See the fixture for why setting the variable is not enough to undo.
+    # register_routes mounts a prometheus multiprocess collector, which needs a
+    # real PROMETHEUS_MULTIPROC_DIR; object.__new__ skips the startup that
+    # creates one.
 
     standard = object.__new__(OpenAIServer)
     standard.app = FastAPI()
@@ -345,10 +336,6 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
         paths = {route.path for route in server.app.routes}
         assert "/v1/messages/count_tokens" in paths
 
-    # The disaggregated server reached parity with the aggregated one on these
-    # two only recently, and both were client-visible outages: Responses-API
-    # clients got a 404 on /v1/responses, and any client doing model discovery
-    # got one on /v1/models and had to be told the model name out of band.
     disagg_paths = {route.path for route in disagg.app.routes}
     assert "/v1/responses" in disagg_paths
     assert "/v1/models" in disagg_paths

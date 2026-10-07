@@ -1533,24 +1533,18 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
-        def _degrade_image(part):
-            """Replace an image content part with a text placeholder.
+        def _degrade_image(part: Any) -> Any:
+            """Replace an ``input_image`` part with a text placeholder.
 
-            The Codex CLI attaches screenshots as ``input_image`` parts -- an
-            agent that plots something and views it sends the PNG back as
-            base64. The models served here are text-only, and the vendored
-            input union has no image member, so validation fell through to
-            ``ResponseInputTextParam`` and failed the WHOLE request with
-            "Field required: text" -- with the full base64 body echoed into
-            the error. The client retries a deterministic 400 until its
-            backoff limit and the campaign dies: 2 of the first 182
-            Kernel-Trace campaigns went exactly this way (2026-09-22).
-
-            A placeholder keeps the turn -- and with it the session -- alive,
-            and says what was dropped instead of leaking megabytes of base64.
+            The vendored input union has no image member, so an image would
+            fail the whole request; the placeholder says what was dropped.
             """
             if isinstance(part, dict) and part.get("type") == "input_image":
                 url = part.get("image_url") or ""
+                if isinstance(url, dict):
+                    url = url.get("url") or ""
+                if not isinstance(url, str):
+                    url = ""
                 kind = url.split(";", 1)[0].removeprefix("data:") or "image"
                 return {
                     "type":
@@ -1566,23 +1560,11 @@ class ResponsesRequest(OpenAIBaseModel):
             # A client may send a bare content part as a top-level item, not
             # only nested inside a message.
             item = _with_annotations(_degrade_image(item))
-            if isinstance(item, dict) and isinstance(item.get("content"), list):
-                item = {
-                    **item,
-                    "content":
-                    [_degrade_image(part) for part in item["content"]],
-                }
-            # Tool results carry their parts under "output", not "content"
-            # (custom_tool_call_output / function_call_output). An agent that
-            # plots something gets the PNG back through the tool and Codex
-            # ships it as an input_image part in there -- 114 Kernel-Trace
-            # campaigns died on exactly this shape (2026-09-23) after the
-            # content/top-level shapes were already handled.
-            if isinstance(item, dict) and isinstance(item.get("output"), list):
-                item = {
-                    **item,
-                    "output": [_degrade_image(part) for part in item["output"]],
-                }
+            # Message parts live under "content", tool-result parts under
+            # "output".
+            for key in ("content", "output"):
+                if isinstance(item, dict) and isinstance(item.get(key), list):
+                    item = {**item, key: [_degrade_image(p) for p in item[key]]}
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:
@@ -1663,10 +1645,8 @@ class ResponsesRequest(OpenAIBaseModel):
     )
 
     # doc: begin-responses-extra-params
-    # TensorRT-LLM extensions, mirroring ChatCompletionRequest. These are not
-    # part of the OpenAI Responses schema; they carry the disaggregated-serving
-    # handoff between the orchestrator and the context/generation workers, so a
-    # client never sets them.
+    # TensorRT-LLM extensions carrying the disaggregated-serving handoff between
+    # the orchestrator and the workers; clients do not set them.
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
@@ -1675,14 +1655,22 @@ class ResponsesRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for multi-turn conversation routing"),
     )
-    # Set by the orchestrator from the context worker's response so the
-    # generation worker skips re-rendering the chat template and re-tokenizing
-    # an input it has already been given as token ids.
+    # The context worker's tokenized prompt, so the generation worker does not
+    # render it again; the _b64 form is a base64 int32 buffer.
     prompt_token_ids: Optional[List[int]] = None
-    # base64 int32 buffer alternative to prompt_token_ids, relayed by the
-    # orchestrator from the ctx response. Not for clients.
     prompt_token_ids_b64: Optional[str] = None
+
     # doc: end-responses-extra-params
+
+    def relayed_prompt_token_ids(self) -> Optional[List[int]]:
+        """The prompt the orchestrator relayed from the context worker, if any."""
+        if self.prompt_token_ids is not None:
+            return self.prompt_token_ids
+        if not self.prompt_token_ids_b64:
+            return None
+        import numpy as np
+        return np.frombuffer(base64.b64decode(self.prompt_token_ids_b64),
+                             dtype=np.int32).tolist()
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1741,32 +1729,27 @@ class ResponsesRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def hoist_additional_tools(cls, data):
-        """Move an `additional_tools` input item into `tools`.
+    def hoist_additional_tools(cls, data: Any) -> Any:
+        """Move the tools of an ``additional_tools`` input item into ``tools``.
 
-        Codex declares its tools this way rather than in `tools`. The item
-        carries no text, so the input-item conversion dropped it as
-        unrecognised and the model was offered nothing to call.
-
-        The payload is already what `tools` accepts -- namespace entries whose
-        nested tools are flattened to `namespace.tool` downstream -- so it is
-        moved here, before validation, and the entries are validated as tools
-        like any other. Hoisting at the protocol boundary rather than in the
-        prompt builder keeps the response side in agreement: a call can only
-        be reported back with its namespace if the tool was in `tools` when
-        the reply was parsed.
+        Codex declares its tools that way; hoisted here, they are validated as
+        tools and resolve when the reply's calls are parsed. Malformed shapes
+        are left in place for validation to reject.
         """
         if not isinstance(data, dict):
             return data
         items = data.get("input")
-        if not isinstance(items, list):
+        tools = data.get("tools")
+        if not isinstance(items, list) or not isinstance(
+                tools, (list, type(None))):
             return data
         hoisted = []
         kept = []
         for item in items:
-            if isinstance(item,
-                          dict) and item.get("type") == "additional_tools":
-                hoisted.extend(item.get("tools") or [])
+            if (isinstance(item, dict)
+                    and item.get("type") == "additional_tools"
+                    and isinstance(item.get("tools"), list)):
+                hoisted.extend(item["tools"])
             else:
                 kept.append(item)
         if not hoisted:
@@ -1845,10 +1828,6 @@ class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # The SDK's own shape: reason is an enum naming why the response stopped
-    # short. Set by the response builder when a generation was cut at its
-    # token budget, so the non-streaming JSON body explains its "incomplete"
-    # status the way the streaming terminal event already does.
     incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
@@ -1874,18 +1853,13 @@ class ResponsesResponse(OpenAIBaseModel):
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
 
-    # TensorRT-LLM extensions for disaggregated serving; see the matching block
-    # on ResponsesRequest. A context-only response carries the KV-cache handle
-    # and first generated token here, plus the tokenized prompt so the
-    # generation worker does not have to render the chat template again.
+    # TensorRT-LLM extensions, set only on a context-only response: the
+    # disaggregated handoff, and the engine's raw finish reason, which tells the
+    # orchestrator whether a generation phase is pending ("length" and
+    # "not_finished" both map to status "incomplete").
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     prompt_token_ids: Optional[List[int]] = None
     prompt_token_ids_b64: Optional[str] = None
-    # The engine's raw finish reason, which `status` cannot express. The
-    # orchestrator decides whether a generation phase is still pending by
-    # looking for "length"/"not_finished", and `status` maps both of those onto
-    # "incomplete" while `finish_reason_mapping` raises outright on
-    # "not_finished". Carrying the unmapped value keeps that decision exact.
     finish_reason: Optional[str] = None
 
     @classmethod

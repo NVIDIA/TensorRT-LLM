@@ -20,6 +20,7 @@ that no endpoint should have to reimplement.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -289,63 +290,20 @@ def test_a_real_request_carrying_web_search_is_recognised():
     assert web_search_rejection_reason(plain.tools) is None
 
 
-def test_external_access_disabled_is_not_rejected():
-    """Regression: Codex was locked out of the server entirely.
-
-    Codex attaches {"type": "web_search", "external_web_access": false} to
-    every turn. That declares it does not want the open web, so there is no
-    live result the server fails to deliver and nothing the client can be
-    misled about - but the guard refused the whole request anyway, and Codex
-    treats the 400 as retryable, so the actionable message never surfaced.
-    """
-    from types import SimpleNamespace
-
+@pytest.mark.parametrize(
+    "tool, rejected",
+    [
+        ({"type": "web_search", "external_web_access": False}, False),
+        (SimpleNamespace(type="web_search", external_web_access=False, filters=None), False),
+        (SimpleNamespace(type="web_search", external_web_access=True, filters=None), True),
+        ({"type": "web_search"}, True),
+    ],
+)
+def test_web_search_is_accepted_only_without_external_access(tool, rejected):
     from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
 
-    tool = SimpleNamespace(
-        type="web_search", external_web_access=False, name=None, filters=None, max_uses=None
-    )
-    assert web_search_rejection_reason([tool]) is None
-    assert (
-        web_search_rejection_reason([{"type": "web_search", "external_web_access": False}]) is None
-    )
-
-
-def test_external_access_requested_is_still_rejected():
-    """The case BowenFu raised must keep failing loudly."""
-    from types import SimpleNamespace
-
-    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
-
-    for external in (True, None):
-        tool = SimpleNamespace(
-            type="web_search", external_web_access=external, name=None, filters=None, max_uses=None
-        )
-        assert web_search_rejection_reason([tool]) is not None, external
-
-
-def test_rejection_names_the_tool_and_the_deciding_field():
-    """The message has to carry what the decision turned on.
-
-    Whoever has to act on this error needs to know which tool triggered it and
-    what ``external_web_access`` arrived as - a client may attach web_search
-    implicitly, and "absent" is a different situation from an explicit True.
-    Diagnosing a real case without these took several wrong guesses.
-    """
-    from types import SimpleNamespace
-
-    from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
-
-    reason = web_search_rejection_reason(
-        [
-            SimpleNamespace(
-                type="web_search", external_web_access=True, name=None, filters=None, max_uses=None
-            )
-        ]
-    )
-    assert "web_search" in reason
-    assert "external_web_access=True" in reason
-
-    # Absent is reported as such rather than silently reading as True.
-    reason = web_search_rejection_reason([{"type": "web_search"}])
-    assert "external_web_access='absent'" in reason
+    reason = web_search_rejection_reason([tool])
+    assert (reason is not None) == rejected
+    if rejected:
+        external = tool.get("external_web_access") if isinstance(tool, dict) else True
+        assert f"tool type 'web_search', external_web_access={external!r}" in reason

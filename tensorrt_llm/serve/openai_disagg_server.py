@@ -347,11 +347,6 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
         self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
-        # GET, and forwarded to a worker rather than answered from config:
-        # the orchestrator has no model of its own and DisaggServerConfig
-        # carries no model name. Clients that do model discovery -- Codex
-        # among them -- got a 404 here and had to be told the name out of
-        # band.
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
@@ -447,26 +442,16 @@ class OpenAIDisaggServer:
                 if req.stream:
                     stream = response_or_generator
                     if isinstance(req, ResponsesRequest):
-                        # Only the Responses protocol: a stream that stops
-                        # before response.completed loses everything it
-                        # produced, because that event is the only place the
-                        # full text is repeated. The other protocols carry
-                        # their content entirely in deltas and end on a
-                        # sentinel, so a truncation there is already visible.
-                        #
-                        # A bare `error` event rather than the worker's
-                        # `response.failed`: this is a byte relay with no view
-                        # of the response being assembled. It does count the
-                        # events it forwarded, so the sequence number is exact
-                        # -- and it is zero for the failures that never
-                        # reached a worker at all, which otherwise end with
-                        # an entirely empty body.
+                        # A relayed Responses stream that fails early ends with
+                        # an `error` event; other protocols end on a sentinel.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
                     return StreamingResponse(
                         content=stream,
                         media_type="text/event-stream")
-                return JSONResponse(content=response_or_generator.model_dump())
+                # by_alias: e.g. text.format.schema goes out under its wire name.
+                return JSONResponse(
+                    content=response_or_generator.model_dump(by_alias=True))
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
@@ -524,37 +509,24 @@ class OpenAIDisaggServer:
             exclude_none=True))
 
     async def get_model(self) -> Response:
-        """List the served model, asking a context worker for the name.
-
-        Error shape is OpenAI's, not Anthropic's, because this is an OpenAI
-        route -- a client that model-discovers here parses OpenAI errors.
-        """
+        """List the served model, as a context worker reports it."""
         try:
-            response = await self._service.get_model()
+            return JSONResponse(
+                content=(await self._service.get_model()).model_dump())
         except aiohttp.ClientResponseError as error:
-            return JSONResponse(
-                status_code=error.status or 500,
-                content={
-                    "object": "error",
-                    "message": _upstream_error_message(error),
-                    "type": ("invalid_request_error"
-                             if 400 <= (error.status or 500) < 500 else "api_error"),
-                    "code": error.status or 500,
-                },
-            )
+            status, message = error.status or 500, _upstream_error_message(
+                error)
         except (RuntimeError, ValueError) as error:
-            # No worker to ask yet. 503 says "retry", which is true: the answer
-            # exists as soon as a context worker registers.
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "object": "error",
-                    "message": str(error),
-                    "type": "api_error",
-                    "code": 503,
-                },
-            )
-        return JSONResponse(content=response.model_dump())
+            # No context worker yet; the client may retry.
+            status, message = 503, str(error)
+        return JSONResponse(
+            status_code=status,
+            content=ErrorResponse(
+                message=message,
+                type=("invalid_request_error"
+                      if 400 <= status < 500 else "api_error"),
+                code=status,
+            ).model_dump())
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:

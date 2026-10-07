@@ -1149,18 +1149,7 @@ class TestSelectiveTransientTcpRetry:
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
-    """`schema` must not reach a worker spelled `schema_`.
-
-    pydantic cannot hold a field called `schema` -- it shadows
-    `BaseModel.schema` -- so the model declares `schema_` with `schema` as its
-    alias. Serialising without `by_alias` sends the internal name, every
-    member of the format union fails to validate on the worker, and the
-    request comes back 400. That was 43 of 195 Responses requests in one
-    campaign round: every structured-output call the agents made.
-
-    Only disaggregated serving re-serialises a request, so only it is
-    affected. The body is decoded exactly as the worker decodes it.
-    """
+    """`schema` must not reach a worker spelled `schema_`, its pydantic name."""
     request = ResponsesRequest.model_validate(
         {
             "model": "m",
@@ -1180,5 +1169,4 @@ def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
 
     assert body["text"]["format"]["schema"] == {"type": "object"}
     assert "schema_" not in body["text"]["format"]
-    # And the worker can rebuild the request from what it was sent.
     assert ResponsesRequest.model_validate(body).text.format.schema_ == {"type": "object"}

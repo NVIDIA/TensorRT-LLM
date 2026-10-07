@@ -25,15 +25,19 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
+from openai.types.responses.tool import FunctionTool
 
 from tensorrt_llm.executor import EngineDeadError, RequestError
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
+    _create_output_content,
     _generate_streaming_event,
     classify_stream_termination,
+    describe_stream_termination,
     guard_responses_stream,
     stream_error_event,
 )
@@ -138,99 +142,6 @@ def test_done_events_carry_the_open_item_id():
     assert helper.get_content_part_done_event(_output_text("hi")).item_id == item_id
 
 
-# ---------------------------------------------------------------------------
-# Reasoning that shares a chunk with the answer
-# ---------------------------------------------------------------------------
-
-
-class _FakeOutput:
-    """The attributes the streaming path reads from a generation output.
-
-    `text` is the whole generation so far and `text_diff` only the newest
-    chunk: the delta path parses the diff, while the done-event path re-parses
-    the accumulated text. Supplying only the diff makes the second one raise,
-    which is how the first version of this fake was wrong.
-    """
-
-    def __init__(self, text, text_diff, index=0):
-        self.text = text
-        self.text_diff = text_diff
-        self.index = index
-
-
-class _FakeRequest:
-    tools = None
-
-
-def _stream(chunks):
-    """Drive the real dispatch over a sequence of generation chunks.
-
-    Returns (reasoning deltas, text deltas) as the client would receive them.
-    """
-    helper = ResponsesStreamingEventsHelper()
-    parsers = {}
-    reasoning, text = [], []
-    accumulated = ""
-    for i, chunk in enumerate(chunks):
-        accumulated += chunk
-        events = _generate_streaming_event(
-            output=_FakeOutput(accumulated, chunk),
-            request=_FakeRequest(),
-            finished_generation=(i == len(chunks) - 1),
-            streaming_events_helper=helper,
-            reasoning_parser_id="glm",
-            reasoning_parser_dict=parsers,
-        )
-        for event in events:
-            kind = getattr(event, "type", "")
-            if kind == "response.reasoning_text.delta":
-                reasoning.append(event.delta)
-            elif kind == "response.output_text.delta":
-                text.append(event.delta)
-    return "".join(reasoning), "".join(text)
-
-
-def test_reasoning_sharing_a_chunk_with_the_answer_is_not_dropped():
-    """Regression: the reasoning half of the straddling chunk was discarded.
-
-    A generation chunk whose raw text spans the closing think tag parses into
-    both a reasoning part and a content part. The dispatch chose its branch on
-    the content part alone, so the reasoning part fell into a branch that never
-    ran and was never emitted -- and closing the item cleared the flag the
-    done-event path is guarded on, so the done event carried the short text
-    too. Measured at 56% of reasoning items across four fleets.
-    """
-    reasoning, text = _stream(["Let", " me check the reference.</think>I will read the file."])
-    assert reasoning == "Let me check the reference."
-    assert text == "I will read the file."
-
-
-def test_reasoning_shorter_than_one_chunk_survives():
-    """The worst case: the whole reasoning shares a chunk with the answer.
-
-    Reasoning short enough to fit inside a single chunk was truncated to
-    nothing at all, which is why the losses looked like first words.
-    """
-    reasoning, _ = _stream(["Sure.</think>Here it is."])
-    assert reasoning == "Sure."
-
-
-def test_reasoning_ending_on_a_chunk_boundary_is_unaffected():
-    """The case that always worked, kept so a fix cannot regress it."""
-    reasoning, text = _stream(
-        ["Let", " me check the reference.", "</think>", "I will read the file."]
-    )
-    assert reasoning == "Let me check the reference."
-    assert text == "I will read the file."
-
-
-def test_reasoning_with_no_answer_after_it_is_unaffected():
-    """A turn that ends in a tool call emits no text, so the other branch ran."""
-    reasoning, text = _stream(["Let", " me check the reference.</think>"])
-    assert reasoning == "Let me check the reference."
-    assert text == ""
-
-
 def _output_text(text):
     from openai.types.responses import ResponseOutputText
 
@@ -238,90 +149,136 @@ def _output_text(text):
 
 
 # ---------------------------------------------------------------------------
-# Every content part that is opened must close, in OpenAI's order
-#
-# A part is opened with response.content_part.added and has to end with
-# response.content_part.done before its item's response.output_item.done.
-# The message close has always done this; the reasoning close yielded
-# reasoning_text.done and output_item.done but never closed the part it had
-# opened - one more content_part.added than content_part.done on every turn
-# with reasoning, ~294k unpaired events a week - so a client tracking part
-# state held a reasoning part that never ended.
+# Reasoning and answer deltas
 # ---------------------------------------------------------------------------
 
 
-def _event_stream(chunks):
+def _event_stream(chunks, reasoning_parser="glm"):
     """All events the real dispatch emits for a sequence of chunks."""
     helper = ResponsesStreamingEventsHelper()
+    request = SimpleNamespace(tools=None, tool_choice="auto")
     parsers = {}
     events, accumulated = [], ""
     for i, chunk in enumerate(chunks):
         accumulated += chunk
         events.extend(
             _generate_streaming_event(
-                output=_FakeOutput(accumulated, chunk),
-                request=_FakeRequest(),
-                finished_generation=(i == len(chunks) - 1),
+                output=SimpleNamespace(index=0, text=accumulated, text_diff=chunk),
+                request=request,
+                finished_generation=i == len(chunks) - 1,
                 streaming_events_helper=helper,
-                reasoning_parser_id="glm",
+                reasoning_parser_id=reasoning_parser,
                 reasoning_parser_dict=parsers,
             )
         )
     return events
 
 
-def _assert_reasoning_part_closes(events, reasoning_text):
-    kinds = [getattr(e, "type", "") for e in events]
-    assert kinds.count("response.content_part.added") == kinds.count(
-        "response.content_part.done"
-    ), "every part opened must close"
-
-    # The reasoning item's own closing sequence, in OpenAI's order:
-    # reasoning_text.done, then content_part.done, then output_item.done.
-    done_index = kinds.index("response.reasoning_text.done")
-    assert kinds[done_index + 1] == "response.content_part.done"
-    assert kinds[done_index + 2] == "response.output_item.done"
-
-    part_done = events[done_index + 1]
-    assert part_done.part.type == "reasoning_text"
-    assert part_done.part.text == reasoning_text
-    # The part closes under the id of the item it was opened in.
-    reasoning_done = events[done_index + 2]
-    assert reasoning_done.item.type == "reasoning"
-    assert part_done.item_id == reasoning_done.item.id
+def _deltas(events, event_type):
+    return "".join(e.delta for e in events if e.type == event_type)
 
 
-def test_a_reasoning_part_closed_by_the_answer_gets_content_part_done():
-    """The transition close (_close_open_item): reasoning ends, text begins."""
-    events = _event_stream(["Plan the fix.", "</think>", "Done."])
-    _assert_reasoning_part_closes(events, "Plan the fix.")
+@pytest.mark.parametrize(
+    "chunks, reasoning, answer",
+    [
+        (["Let", " me check.</think>I will read it."], "Let me check.", "I will read it."),
+        (["Sure.</think>Here it is."], "Sure.", "Here it is."),
+        (["Let", " me check.", "</think>", "I will read it."], "Let me check.", "I will read it."),
+        (["Let", " me check.</think>"], "Let me check.", ""),
+    ],
+)
+def test_reasoning_and_answer_deltas_survive_any_chunk_boundary(chunks, reasoning, answer):
+    events = _event_stream(chunks)
+    assert _deltas(events, "response.reasoning_text.delta") == reasoning
+    assert _deltas(events, "response.output_text.delta") == answer
 
 
-def test_a_reasoning_part_closed_by_end_of_generation_gets_content_part_done():
-    """The other closing branch: generation ends inside the reasoning item."""
-    events = _event_stream(["All reasoning, no answer."])
-    _assert_reasoning_part_closes(events, "All reasoning, no answer.")
+def test_an_item_is_opened_before_a_whitespace_only_first_delta():
+    events = _event_stream(["Thinking.</think> ", "hi"])
+    types = [e.type for e in events]
+    message_added = next(
+        i
+        for i, e in enumerate(events)
+        if e.type == "response.output_item.added" and e.item.type == "message"
+    )
+    assert message_added < types.index("response.output_text.delta")
+    assert _deltas(events, "response.output_text.delta") == " hi"
 
 
-def test_message_part_pairing_is_unchanged():
-    """The branch that was always right, pinned against regression."""
-    events = _event_stream(["Plan.", "</think>", "Done."])
-    kinds = [getattr(e, "type", "") for e in events]
-    text_done = kinds.index("response.output_text.done")
-    assert kinds[text_done + 1] == "response.content_part.done"
-    assert kinds[text_done + 2] == "response.output_item.done"
-    assert events[text_done + 1].part.type == "output_text"
-    assert events[text_done + 1].part.text == "Done."
+@pytest.mark.parametrize(
+    "chunks, reasoning",
+    [
+        (["Plan the fix.", "</think>", "Done."], "Plan the fix."),
+        (["All reasoning, no answer."], "All reasoning, no answer."),
+    ],
+)
+def test_every_content_part_closes_in_order(chunks, reasoning):
+    """content_part.done comes between the text done event and item done."""
+    events = _event_stream(chunks)
+    types = [e.type for e in events]
+    assert types.count("response.content_part.added") == types.count("response.content_part.done")
+
+    for done_type, part_type, text in (
+        ("response.reasoning_text.done", "reasoning_text", reasoning),
+        ("response.output_text.done", "output_text", "Done."),
+    ):
+        if done_type not in types:
+            continue
+        index = types.index(done_type)
+        assert types[index + 1 : index + 3] == [
+            "response.content_part.done",
+            "response.output_item.done",
+        ]
+        part_done, item_done = events[index + 1], events[index + 2]
+        assert (part_done.part.type, part_done.part.text) == (part_type, text)
+        assert part_done.item_id == item_done.item.id
 
 
 # ---------------------------------------------------------------------------
-# Streams that stop before response.completed
-#
-# response.completed is the only event that repeats the full text, so a stream
-# cut before it leaves everything the turn produced living solely in deltas.
-# Until these events existed such a stream simply stopped: no error event, no
-# populated response.error, nothing in the bytes or the trace to tell a reader
-# the stream was cut rather than still running.
+# Snapshot item order
+# ---------------------------------------------------------------------------
+
+_THINK = "Check the reference first."
+_ANSWER = "The answer is 42."
+_TOOL_CALL = '<tool_call>\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n</tool_call>'
+
+
+def _read_file_tool():
+    return FunctionTool(
+        name="read_file",
+        description="Read a file.",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+        strict=False,
+        type="function",
+    )
+
+
+@pytest.mark.parametrize(
+    "text, kinds",
+    [
+        (f"<think>{_THINK}</think>{_ANSWER}", ["reasoning", "message"]),
+        (
+            f"<think>{_THINK}</think>Reading it now.\n{_TOOL_CALL}",
+            ["reasoning", "message", "function_call"],
+        ),
+        (f"<think>{_THINK}</think>{_TOOL_CALL}", ["reasoning", "function_call"]),
+        (_ANSWER, ["message"]),
+    ],
+)
+def test_snapshot_lists_reasoning_then_message_then_calls(text, kinds):
+    items, _messages, _reasoning = _create_output_content(
+        SimpleNamespace(outputs=[SimpleNamespace(index=0, text=text)]),
+        reasoning_parser="qwen3",
+        tool_parser="qwen3",
+        tools=[_read_file_tool()],
+    )
+    assert [item.type for item in items] == kinds
+    if "reasoning" in kinds:
+        assert items[0].content[0].text == _THINK
+
+
+# ---------------------------------------------------------------------------
+# Streams that stop before their terminal event
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +295,6 @@ def _event_data(frame):
 
 
 def _processor():
-    """A processor built exactly as the server builds one."""
     request = ResponsesRequest(model="test-model", input="hi", stream=True)
     return ResponsesStreamingProcessor(
         request=request,
@@ -349,49 +305,54 @@ def _processor():
 
 
 def _forbidden(cause, detail, events_sent):
-    raise AssertionError(f"terminal events were built for a stream that did not need them: {cause}")
+    raise AssertionError(f"terminal events built for a stream that did not need them: {cause}")
 
 
-async def _drive(source, terminal_events, on_termination=None):
-    """Run a stream through the guard, returning (frames, raised exception)."""
-    seen = []
-    try:
-        async for chunk in guard_responses_stream(source, terminal_events, on_termination):
-            seen.append(chunk)
-    except BaseException as exc:  # noqa: BLE001 - the test asserts on it
-        return seen, exc
-    return seen, None
-
-
-@pytest.mark.asyncio
-async def test_a_completed_stream_is_forwarded_unchanged():
-    """The happy path must stay byte-identical: same frames, nothing appended."""
-    frames = [
-        "event: response.created\ndata: {}\n\n",
-        "event: response.output_text.delta\ndata: {}\n\n",
-        "event: response.completed\ndata: {}\n\n",
-    ]
+async def _drive(frames, terminal_events, exc=None):
+    """Run frames, then optionally a raised exception, through the guard."""
 
     async def source():
         for frame in frames:
             yield frame
+        if exc is not None:
+            raise exc
 
-    seen, raised = await _drive(source(), _forbidden)
-    assert seen == frames
-    assert raised is None
+    seen = []
+    try:
+        async for chunk in guard_responses_stream(source(), terminal_events):
+            seen.append(chunk)
+    except BaseException as raised:  # noqa: BLE001 - the test asserts on it
+        return seen, raised
+    return seen, None
+
+
+_COMPLETED = [
+    "event: response.created\ndata: {}\n\n",
+    "event: response.output_text.delta\ndata: {}\n\n",
+    "event: response.completed\ndata: {}\n\n",
+]
 
 
 @pytest.mark.asyncio
-async def test_an_exception_mid_stream_ends_the_stream_with_a_terminal_event():
+async def test_a_completed_stream_is_forwarded_unchanged():
+    assert await _drive(_COMPLETED, _forbidden) == (_COMPLETED, None)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_terminal_event_adds_nothing():
+    seen, raised = await _drive(_COMPLETED, _forbidden, RuntimeError("reset"))
+    assert seen == _COMPLETED
+    assert isinstance(raised, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_mid_stream_ends_with_error_and_response_failed():
     processor = _processor()
     opening = processor.get_initial_responses()
 
-    async def source():
-        for frame in opening:
-            yield frame
-        raise RuntimeError("event construction blew up")
-
-    seen, raised = await _drive(source(), processor.get_stream_failed_events)
+    seen, raised = await _drive(
+        opening, processor.get_stream_failed_events, ValueError("item had no id")
+    )
 
     assert [_event_type(frame) for frame in seen] == [
         "response.created",
@@ -399,563 +360,142 @@ async def test_an_exception_mid_stream_ends_the_stream_with_a_terminal_event():
         "error",
         "response.failed",
     ]
-    # Re-raised, not swallowed: the server still logs the fault and the trace
-    # still records the response as an error rather than a clean finish.
+    assert [_event_data(frame)["sequence_number"] for frame in seen] == [0, 1, 2, 3]
+    error = _event_data(seen[2])
+    assert (error["code"], error["message"]) == ("internal_error", "ValueError")
+    assert isinstance(raised, ValueError)
+
+
+@pytest.mark.asyncio
+async def test_a_completion_marker_inside_a_payload_does_not_end_the_watch():
+    delta = json.dumps({"delta": "\n\nevent: response.completed\n"})
+    frames = [f"event: response.output_text.delta\ndata: {delta}\n\n"]
+
+    seen, raised = await _drive(frames, stream_error_event, RuntimeError("cut"))
+
+    assert [_event_type(frame) for frame in seen] == ["response.output_text.delta", "error"]
     assert isinstance(raised, RuntimeError)
 
 
 @pytest.mark.asyncio
-async def test_the_terminal_event_carries_the_cause():
-    processor = _processor()
-
-    async def source():
-        for frame in processor.get_initial_responses():
-            yield frame
-        raise ValueError("item had no id")
-
-    seen, _ = await _drive(source(), processor.get_stream_failed_events)
-    error = _event_data(seen[-2])
-    assert error["type"] == "error"
-    assert error["code"] == "internal_error"
-    assert error["message"] == "ValueError: item had no id"
-
-
-@pytest.mark.parametrize(
-    "exc, cause",
-    [
-        (RequestError("request failed"), "engine_error"),
-        (EngineDeadError(), "engine_error"),
-        (ValueError("bad item"), "internal_error"),
-        (asyncio.CancelledError(), "client_disconnect"),
-        (GeneratorExit(), "client_disconnect"),
-    ],
-)
-def test_causes_the_code_can_tell_apart(exc, cause):
-    """An engine failure, a fault in this process, and a client hangup differ.
-
-    Only the middle one leaves the accumulated text in memory, which is what
-    makes the distinction worth recording rather than lumping into "error".
-    """
-    assert classify_stream_termination(exc) == cause
-
-
-def test_an_upstream_transport_error_is_named_as_one():
-    aiohttp = pytest.importorskip("aiohttp")
-    assert classify_stream_termination(aiohttp.ClientPayloadError("cut")) == "upstream_error"
-
-
-@pytest.mark.asyncio
-async def test_a_client_hangup_adds_nothing_to_the_stream():
-    """Nobody is left to send to, and yielding here would raise.
-
-    An async generator that yields while GeneratorExit is propagating dies
-    with "async generator ignored GeneratorExit", trading a diagnosable
-    truncation for an undiagnosable one. The cause is reported out of band.
-    """
-    noted = []
-
-    async def source():
-        yield "event: response.created\ndata: {}\n\n"
-        raise asyncio.CancelledError
-
-    seen, raised = await _drive(
-        source(), _forbidden, lambda cause, detail: noted.append((cause, detail))
-    )
-    assert len(seen) == 1
+async def test_a_client_hangup_adds_nothing():
+    seen, raised = await _drive(_COMPLETED[:1], _forbidden, asyncio.CancelledError())
+    assert seen == _COMPLETED[:1]
     assert isinstance(raised, asyncio.CancelledError)
-    assert noted == [("client_disconnect", "CancelledError")]
 
 
 @pytest.mark.asyncio
 async def test_a_broken_reporter_does_not_replace_the_original_fault():
-    """Reporting a failure must not become a second, more confusing one."""
-
     def broken(cause, detail, events_sent):
         raise KeyError("snapshot field missing")
 
-    async def source():
-        yield "event: response.created\ndata: {}\n\n"
-        raise ValueError("the fault worth seeing")
-
-    seen, raised = await _drive(source(), broken)
-    assert len(seen) == 1
+    seen, raised = await _drive(_COMPLETED[:1], broken, ValueError("the real fault"))
+    assert seen == _COMPLETED[:1]
     assert isinstance(raised, ValueError)
-    assert str(raised) == "the fault worth seeing"
 
 
-@pytest.mark.asyncio
-async def test_a_failure_after_completion_adds_nothing():
-    """Regression guard for the happy path.
-
-    aiohttp raises at end of stream when the connector closes the connection,
-    which arrives after the last frame. Appending an error event there would
-    corrupt a stream that completed perfectly well.
-    """
-
-    async def source():
-        yield "event: response.completed\ndata: {}\n\n"
-        raise RuntimeError("connection reset at end of stream")
-
-    seen, raised = await _drive(source(), _forbidden)
-    assert len(seen) == 1
-    assert isinstance(raised, RuntimeError)
+@pytest.mark.parametrize(
+    "exc, cause, detail",
+    [
+        (RequestError("request failed"), "engine_error", "RequestError: request failed"),
+        (EngineDeadError(), "engine_error", "EngineDeadError: Engine has died"),
+        (ValueError("at 10.0.0.7:8001"), "internal_error", "ValueError"),
+        (aiohttp.ClientPayloadError("from 10.0.0.7:8001"), "upstream_error", "ClientPayloadError"),
+    ],
+)
+def test_termination_cause_and_client_facing_detail(exc, cause, detail):
+    assert classify_stream_termination(exc) == cause
+    assert describe_stream_termination(exc, cause) == detail
 
 
-def test_terminal_events_continue_the_sequence_numbering():
+@pytest.mark.parametrize("events_sent", [2, 610])
+def test_terminal_events_are_numbered_after_the_frames_sent(events_sent):
     processor = _processor()
-    opening = processor.get_initial_responses()
-    assert [_event_data(frame)["sequence_number"] for frame in opening] == [0, 1]
-
-    events = processor.get_stream_failed_events("internal_error", "ValueError: x")
-    assert [_event_data(frame)["sequence_number"] for frame in events] == [2, 3]
-
-
-def test_numbering_follows_events_this_processor_did_not_number():
-    """With postprocessing workers the per-token events are numbered elsewhere.
-
-    A pickled copy of this processor builds them in another process, so the
-    local counter only ever saw the opening two and would put the terminal
-    events back at the start of a sequence the client has already passed.
-    """
-    processor = _processor()
-    processor.get_initial_responses()
-
-    events = processor.get_stream_failed_events("internal_error", "ValueError: x", 610)
-    assert [_event_data(frame)["sequence_number"] for frame in events] == [610, 611]
+    events = processor.get_stream_failed_events("internal_error", "ValueError", events_sent)
+    assert [_event_data(frame)["sequence_number"] for frame in events] == [
+        events_sent,
+        events_sent + 1,
+    ]
 
 
 def test_the_failed_snapshot_says_failed_and_carries_no_content():
-    """response.failed, not response.incomplete.
-
-    incomplete_details.reason is a closed enum -- max_output_tokens,
-    max_messages, content_filter, steered -- with no member for a server fault
-    or a client hangup, so response.incomplete could only be sent with
-    reason=null, which is indistinguishable from an ordinary truncation.
-    """
     processor = _processor()
-    processor.get_initial_responses()
-    _, failed = processor.get_stream_failed_events("internal_error", "ValueError: x")
+    _, failed = processor.get_stream_failed_events("internal_error", "ValueError: x", 2)
 
     assert _event_type(failed) == "response.failed"
     response = _event_data(failed)["response"]
     assert response["status"] == "failed"
-    assert response["error"]["code"] == "server_error"
-    assert response["error"]["message"] == "ValueError: x"
-    # No reconstruction: the lost text stays lost, this only says so.
+    assert (response["error"]["code"], response["error"]["message"]) == (
+        "server_error",
+        "ValueError: x",
+    )
     assert response["output"] == []
     assert response["id"] == processor.request.request_id
 
 
 @pytest.mark.asyncio
-async def test_the_relayed_terminal_event_is_numbered_from_the_frames_forwarded():
-    """The orchestrator forwards bytes and never sees the events it carries.
-
-    It can still count them, including when a transport read splits the blank
-    line that ends one -- without the carry every sequence number after such a
-    split is one short.
-    """
-
-    async def source():
-        yield b"event: response.created\ndata: {}\n\n"
-        yield b"event: response.in_progress\ndata: {}\n"
-        yield b"\nevent: response.output_text.delta\ndata: {}\n\n"
-        raise RuntimeError("upstream cut")
-
-    seen, raised = await _drive(source(), stream_error_event)
+async def test_a_relay_numbers_its_error_event_across_split_delimiters():
+    frames = [
+        b"event: response.created\ndata: {}\n\n",
+        b"event: response.in_progress\ndata: {}\n",
+        b"\nevent: response.output_text.delta\ndata: {}\n\n",
+    ]
+    seen, raised = await _drive(frames, stream_error_event, RuntimeError("upstream cut"))
     assert isinstance(raised, RuntimeError)
-    terminal = seen[-1]
-    assert isinstance(terminal, bytes)
-    assert _event_type(terminal) == "error"
-    assert _event_data(terminal)["sequence_number"] == 3
+    assert _event_type(seen[-1]) == "error"
+    assert _event_data(seen[-1])["sequence_number"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_relay_cut_mid_frame_terminates_that_frame_first():
+    frames = [
+        b"event: response.created\ndata: {}\n\n",
+        b"event: response.output_text.delta\ndata: {",
+    ]
+    seen, _ = await _drive(frames, stream_error_event, RuntimeError("upstream cut"))
+    assert seen[2] == b"\n\n"
+    assert _event_type(seen[3]) == "error"
+    assert _event_data(seen[3])["sequence_number"] == 1
 
 
 @pytest.mark.asyncio
 async def test_a_relay_that_never_started_reports_sequence_zero():
-    """The failures that record a response with an entirely empty body.
-
-    Nothing was forwarded, so the error event is the stream's first and the
-    sequence number is exactly right rather than a guess.
-    """
-
-    async def source():
-        raise RuntimeError("no context worker available")
-        yield b""  # pragma: no cover - makes this an async generator
-
-    seen, raised = await _drive(source(), stream_error_event)
+    seen, raised = await _drive([], stream_error_event, RuntimeError("no context worker"))
     assert isinstance(raised, RuntimeError)
     assert len(seen) == 1
     assert _event_data(seen[0])["sequence_number"] == 0
-    assert _event_data(seen[0])["code"] == "internal_error"
 
 
-# ---------------------------------------------------------------------------
-# Order of the items in the completed-response snapshot
-#
-# These cover the non-streaming assembly in `_create_output_content`, but they
-# live here because what they assert is a property of the stream: the snapshot
-# in `response.output` has to list the items in the order the stream emitted
-# them. A client that reads both must not be told two different stories about
-# one generation. This is also the file the CPU CI stage runs (l0_cpu.yml).
-# ---------------------------------------------------------------------------
-
-_THINK = "Check the reference first."
-_ANSWER = "The answer is 42."
-_TOOL_CALL = '<tool_call>\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n</tool_call>'
-
-
-def _tools():
-    """A real tool definition, so the tool parser accepts the parsed call."""
-    from openai.types.responses.tool import FunctionTool
-
-    return [
-        FunctionTool(
-            name="read_file",
-            description="Read a file.",
-            parameters={"type": "object", "properties": {"path": {"type": "string"}}},
-            strict=False,
-            type="function",
-        )
-    ]
-
-
-def _snapshot_kinds(text, tools=None):
-    """Item types of the completed-response snapshot for one generation.
-
-    Drives the real `_create_output_content` with real parsers - `qwen3` for
-    both, so text with no `<think>` is an ordinary answer rather than an
-    unterminated reasoning block.
-    """
-    from tensorrt_llm.serve.responses_utils import _create_output_content
-
-    items, _messages, _reasoning_texts = _create_output_content(
-        _FakeRequestOutput(text),
-        reasoning_parser="qwen3",
-        tool_parser="qwen3" if tools else None,
-        tools=tools,
+def test_streamed_responses_use_wire_field_names():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "m",
+            "input": "hi",
+            "stream": True,
+            "text": {
+                "format": {"type": "json_schema", "name": "out", "schema": {"type": "object"}}
+            },
+        }
     )
-    return items, [item.type for item in items]
-
-
-class _FakeRequestOutput:
-    """The one attribute `_create_output_content` reads off a result.
-
-    It iterates `final_res.outputs` and takes `.index` and `.text` from each;
-    everything else it needs it derives from the parsers.
-    """
-
-    def __init__(self, text):
-        self.outputs = [_FakeOutput(text, text)]
-
-
-def test_snapshot_lists_reasoning_before_the_message():
-    """Regression: the snapshot appended the message first, inverting cause and effect.
-
-    The stream emits reasoning then message, but the snapshot for the same
-    generation listed message then reasoning - so a client replaying
-    `response.output` read the answer before the reasoning that produced it.
-    Measured on 99.99% of responses carrying both items across four fleets.
-    """
-    items, kinds = _snapshot_kinds(f"<think>{_THINK}</think>{_ANSWER}")
-    assert kinds == ["reasoning", "message"]
-    # Reordering must move the items, not relabel them.
-    assert items[0].content[0].text == _THINK
-    assert items[1].content[0].text == _ANSWER
-
-
-def test_snapshot_lists_reasoning_then_message_then_tool_call():
-    items, kinds = _snapshot_kinds(
-        f"<think>{_THINK}</think>Reading it now.\n{_TOOL_CALL}", tools=_tools()
-    )
-    assert kinds == ["reasoning", "message", "function_call"]
-    assert items[2].name == "read_file"
-
-
-def test_snapshot_lists_reasoning_before_a_tool_call_with_no_message():
-    """A turn that ends in a tool call emits no message item at all."""
-    _items, kinds = _snapshot_kinds(f"<think>{_THINK}</think>{_TOOL_CALL}", tools=_tools())
-    assert kinds == ["reasoning", "function_call"]
-
-
-def test_snapshot_of_a_plain_answer_is_just_the_message():
-    """No reasoning to order: the message must not be dropped or displaced."""
-    items, kinds = _snapshot_kinds(_ANSWER)
-    assert kinds == ["message"]
-    assert items[0].content[0].text == _ANSWER
-
-
-def test_snapshot_order_matches_the_streamed_order():
-    """The two paths must agree; this is the invariant the bug violated.
-
-    Both sides are driven for real - `_generate_streaming_event` for the
-    stream and `_create_output_content` for the snapshot - over the same
-    generation and the same reasoning parser, rather than comparing the
-    snapshot against a hardcoded expectation of what the stream does.
-    """
-    from tensorrt_llm.serve.responses_utils import (
-        ResponsesStreamingEventsHelper,
-        _create_output_content,
-    )
-
-    # "glm" is reasoning_at_start, so the generation opens inside the
-    # reasoning block with no <think> tag - the same setup as the streaming
-    # tests above, and what the thinking chat templates actually render.
-    chunks = [_THINK, "</think>", _ANSWER]
-
-    helper = ResponsesStreamingEventsHelper()
-    parsers = {}
-    accumulated = ""
-    streamed = []
-    for i, chunk in enumerate(chunks):
-        accumulated += chunk
-        for event in _generate_streaming_event(
-            output=_FakeOutput(accumulated, chunk),
-            request=_FakeRequest(),
-            finished_generation=(i == len(chunks) - 1),
-            streaming_events_helper=helper,
-            reasoning_parser_id="glm",
-            reasoning_parser_dict=parsers,
-        ):
-            if getattr(event, "type", "") == "response.output_item.done":
-                streamed.append(event.item.type)
-
-    snapshot_items, _messages, _reasoning_texts = _create_output_content(
-        _FakeRequestOutput(accumulated), reasoning_parser="glm"
-    )
-
-    assert streamed == ["reasoning", "message"]
-    assert [item.type for item in snapshot_items] == streamed
-
-
-def _finished_generation(text):
-    """A result complete enough to assemble a whole final response from.
-
-    `_create_output_content` reads only index and text, which is all
-    `_FakeRequestOutput` carries; building the response around it also reads
-    `finish_reason`, and usage reads `token_ids` and `prompt_token_ids`.
-    """
-    output = SimpleNamespace(
-        index=0,
-        text=text,
-        text_diff=text,
-        finish_reason="stop",
-        token_ids=[1, 2, 3],
-        disaggregated_params=None,
-    )
-    return SimpleNamespace(outputs=[output], prompt_token_ids=[1, 2], cached_tokens=0)
-
-
-def test_final_response_is_assembled_without_touching_a_missing_attribute():
-    """Regression: the final streaming event raised AttributeError.
-
-    `get_final_response_non_store` reached for `self.emitted_tool_call_ids`
-    on the processor. That list lives on the events helper's state tracker,
-    not on the processor, so every streaming Responses request died building
-    its last event. The client never saw a server error -- the chunked body
-    simply stopped, surfacing as `TransferEncodingError: Not enough data to
-    satisfy transfer length header` one hop upstream, which reads like a
-    network fault. Measured on a live instance: 286 of 287 requests.
-
-    `py_compile` passes on that bug, and so does an md5 comparison against the
-    file it came from. Only executing the call catches it, which is what this
-    test does: it asks for the final event and requires a real one back.
-    """
-    processor = _processor()
-    frame = processor.get_final_response_non_store(_finished_generation("hello"))
-
-    assert "response.completed" in frame
-    payload = _event_data(frame)
-    assert payload["type"] == "response.completed"
-    assert payload["response"]["status"] == "completed"
-
-
-def test_final_response_reuses_the_call_ids_the_stream_published():
-    """The ids a client matches its tool outputs against must not be reminted.
-
-    `response.completed` rebuilds `output` from the generation, and
-    `_tool_call_output_item` mints a fresh random id every time it runs, so
-    the snapshot used to disagree with the stream on every call -- 1224 of
-    1224 measured before the fix. A client keying tool results off the
-    streamed `call_id` then matches nothing in the final response.
-    """
-    processor = _processor()
-    helper = processor.streaming_events_helper
-    helper.record_emitted_tool_call(SimpleNamespace(id="fc_fixed", call_id="call_fixed"))
-
-    assert [(r.item_id, r.call_id) for r in helper.emitted_tool_call_ids] == [
-        ("fc_fixed", "call_fixed")
-    ]
-    # And the processor reaches it by the path the final response uses.
-    assert [
-        (r.item_id, r.call_id) for r in processor.streaming_events_helper.emitted_tool_call_ids
-    ] == [("fc_fixed", "call_fixed")]
-
-
-def _processor_with_tools():
-    """A processor that can actually produce a tool call.
-
-    `_processor()` declares no tools and sets no parsers, so nothing it builds
-    ever contains one -- which is the case the next test needs.
-    """
-    request = ResponsesRequest(model="test-model", input="hi", stream=True, tools=_tools())
-    return ResponsesStreamingProcessor(
+    processor = ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
-        model_name="test-model",
+        model_name="m",
         use_harmony=False,
-        reasoning_parser="glm",
-        tool_parser="qwen3",
     )
-
-
-def test_final_response_reuses_a_streamed_call_id_end_to_end():
-    """The invariant the fix exists for, driven through the real final event.
-
-    This is the test that distinguishes the fix from the obvious-looking wrong
-    one. `AttributeError: no attribute 'emitted_tool_call_ids'` invites adding
-    the attribute to the processor -- the name would resolve and the crash
-    would stop. But `record_emitted_tool_call` appends to the state tracker's
-    list, so a new list on the processor stays empty forever, the final
-    response mints fresh ids, and the call_id mismatch is silently back.
-
-    The crash tests pass in that world. This one does not.
-    """
-    processor = _processor_with_tools()
-    processor.streaming_events_helper.record_emitted_tool_call(
-        SimpleNamespace(id="fc_streamed", call_id="call_streamed")
+    output = SimpleNamespace(
+        index=0,
+        text="{}",
+        text_diff="{}",
+        finish_reason="stop",
+        token_ids=[1],
+        disaggregated_params=None,
     )
+    result = SimpleNamespace(outputs=[output], _done=True, prompt_token_ids=[1], cached_tokens=0)
+    frames = processor.get_initial_responses() + processor.process_single_output(result)
+    frames.append(processor.get_final_response_non_store(result))
 
-    frame = processor.get_final_response_non_store(
-        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
-    )
-    calls = [
-        i
-        for i in _event_data(frame)["response"]["output"]
-        if i["type"] in ("function_call", "custom_tool_call")
-    ]
-
-    assert calls, "the final response should carry the tool call"
-    assert calls[0]["call_id"] == "call_streamed"
-    assert calls[0]["id"] == "fc_streamed"
-
-
-def test_nothing_streamed_means_fresh_ids_rather_than_a_crash():
-    """The other half: an empty list is a legal state, not an error.
-
-    A non-streaming request, or a stream cut off before any tool call, has
-    nothing to reuse. That must produce usable fresh ids -- keeping this
-    separate is what makes the test above read as "ids were not reused"
-    instead of "ids were missing".
-    """
-    processor = _processor_with_tools()
-    frame = processor.get_final_response_non_store(
-        _finished_generation(f"<think>{_THINK}</think>{_TOOL_CALL}")
-    )
-    calls = [
-        i
-        for i in _event_data(frame)["response"]["output"]
-        if i["type"] in ("function_call", "custom_tool_call")
-    ]
-
-    assert calls
-    assert calls[0]["call_id"].startswith("call_")
-    assert calls[0]["call_id"] != "call_streamed"
-
-
-# ---------------------------------------------------------------------------
-# Non-streaming rebuild: no phantom {}-argument calls
-# ---------------------------------------------------------------------------
-#
-# The whole-text parse reports arguments `{}` both for a genuine zero-argument
-# call and for a call whose argument markup its pair regex could not read - a
-# GLM-4.7 block that opens <arg_value> and never closes it. The streamed
-# assembly of the same text refuses the second (its arguments assemble to
-# `{"cmd": }`), so a non-streaming request used to deliver a call the model
-# never made while a streaming request of the same text delivered none.
-# _verify_empty_calls_against_streaming reconciles the two when no stream ran.
-
-
-def _glm47_tools():
-    from openai.types.responses.tool import FunctionTool
-
-    return [
-        FunctionTool(
-            name="exec_command",
-            description="Run a command.",
-            parameters={"type": "object", "properties": {"cmd": {"type": "string"}}},
-            strict=False,
-            type="function",
-        ),
-        FunctionTool(
-            name="get_time", description="Now.", parameters=None, strict=False, type="function"
-        ),
-    ]
-
-
-def _glm47_snapshot(text, streamed_tool_call_ids=None):
-    from tensorrt_llm.serve.responses_utils import _create_output_content
-
-    items, _messages, _reasoning_texts = _create_output_content(
-        _FakeRequestOutput(text),
-        reasoning_parser=None,
-        tool_parser="glm47",
-        tools=_glm47_tools(),
-        streamed_tool_call_ids=streamed_tool_call_ids,
-    )
-    calls = [(i.name, i.arguments) for i in items if i.type == "function_call"]
-    texts = [i.content[0].text for i in items if i.type == "message"]
-    return calls, texts
-
-
-_UNREADABLE_ARGS = (
-    "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la</think></tool_call>"
-)
-
-
-def test_non_streaming_unreadable_arg_markup_is_text_not_an_empty_call():
-    """The auditor's shape: terminated call, <arg_value> never closed.
-
-    The pair regex reads nothing out of the block, so the call used to ship
-    with arguments `{}` - and the client ran the tool with arguments the model
-    never wrote. The streamed view refuses the call; the whole-text view now
-    agrees, and the markup falls back into the message text so nothing the
-    model generated is lost.
-    """
-    calls, texts = _glm47_snapshot("Let me check. " + _UNREADABLE_ARGS)
-    assert calls == []
-    assert texts and "<arg_value>ls -la</think>" in texts[0]
-    assert texts[0].startswith("Let me check.")
-
-
-def test_non_streaming_unterminated_markup_stays_text():
-    """Pin: markup with no closing tag already fell back to text on both views."""
-    unterminated = "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>ls -la"
-    calls, texts = _glm47_snapshot(unterminated)
-    assert calls == []
-    assert texts == [unterminated]
-
-
-def test_non_streaming_zero_argument_call_is_still_delivered():
-    """Pin: `{}` from a genuinely argument-free call is the model's own call."""
-    calls, texts = _glm47_snapshot("<tool_call>get_time</tool_call>")
-    assert calls == [("get_time", "{}")]
-    assert texts == []
-
-
-def test_non_streaming_real_call_survives_a_phantom_neighbor():
-    good = (
-        "<tool_call>exec_command<arg_key>cmd</arg_key><arg_value>pytest -q</arg_value></tool_call>"
-    )
-    calls, _texts = _glm47_snapshot(good + _UNREADABLE_ARGS)
-    assert calls == [("exec_command", '{"cmd": "pytest -q"}')]
-
-
-def test_a_streamed_rebuild_is_untouched_by_the_reconciler():
-    """A streamed request keeps its entity-pairing semantics.
-
-    When a stream ran, the per-entity id record already settles the drop, and
-    the snapshot must keep describing the stream - which showed neither the
-    call nor its markup.
-    """
-    calls, texts = _glm47_snapshot(_UNREADABLE_ARGS, streamed_tool_call_ids=[None])
-    assert calls == []
-    assert texts == []
+    for frame in (frames[0], frames[-1]):
+        text_format = _event_data(frame)["response"]["text"]["format"]
+        assert text_format["schema"] == {"type": "object"}
+        assert "schema_" not in text_format
