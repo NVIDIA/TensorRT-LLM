@@ -12,13 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Everything selection does that is not pytest: stdlib only, no pytest import.
+"""The selection logic: plain values in, `SelectionError` on a usage error.
 
-These modules take plain values and raise `SelectionError`; turning that into a
-`pytest.UsageError` is `plugin.py`'s job, and `plugin.py` is the only module in
-the package that imports pytest. So every decision here can be exercised
-without pytest.
-
-`qa_selection/__init__.py` lists the modules in import order; each one imports
-only the ones above it.
+`selection.py` is the entry `plugin.py` calls.
 """

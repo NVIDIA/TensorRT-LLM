@@ -26,13 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
-from .core.artifacts import ArtifactNames
-from .core.machines import ProfileConfigError, default_catalog
-from .core.markers import default_markers
-from .core.report import SelectionOutput, SelectionReport
-from .core.request import SelectionError, SelectionRequest
-from .core.selection import Selection
-from .core.selector import CollectedTest, Mark
+from .core.marks import CollectedTest, Mark, default_markers
+from .core.report import ArtifactNames, SelectionOutput, SelectionReport
+from .core.selection import Selection, SelectionError, SelectionRequest
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -84,7 +80,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     selection = config.stash.get(SelectionStash.SELECTION, None)
     if selection is None:
         return
-    output = SelectionOutput.of(selection, Path(str(config.rootpath)))
+    output = selection.report(Path(str(config.rootpath)))
     config.stash[SelectionStash.OUTPUT] = output
 
 
@@ -204,7 +200,7 @@ class SelectionOptions:
             dest=cls.MACHINE,
             metavar="NAME",
             default=None,
-            choices=cls.machine_choices(),
+            choices=SelectionRequest.machines(),
             help="target machine to select for, from the profile catalogue. "
             "Absent leaves collection untouched, so loading this plugin "
             "without it changes nothing",
@@ -235,17 +231,6 @@ class SelectionOptions:
         )
 
     @classmethod
-    def machine_choices(cls) -> Optional[List[str]]:
-        """Valid machine names, or None when the catalogue cannot be read.
-
-        None leaves `--machine` unconstrained rather than failing the run.
-        """
-        try:
-            return sorted(default_catalog())
-        except (ProfileConfigError, OSError):
-            return None
-
-    @classmethod
     def request_from(cls, config: pytest.Config) -> Optional[SelectionRequest]:
         """This run's request, or None when no machine is named.
 
@@ -262,7 +247,7 @@ class SelectionOptions:
 
 
 class ItemView:
-    """Reduces a pytest item to the framework-neutral view the selector reads.
+    """Reduces a pytest item to the `CollectedTest` that `core/` reads.
 
     Three fields cross this boundary: a mark's name, a resource marker's
     requirement, and a skipif's `reason=`. A skipif's condition is dropped,
@@ -284,7 +269,7 @@ class ItemView:
         if default_markers().carries_requirement(mark.name):
             args = tuple(mark.args[:1])
 
-        # Keyword form only; `selector.py` keys its rules on this string.
+        # Keyword form only; `MachineCheck` keys its rules on this string.
         reason = mark.kwargs.get("reason")
         kwargs: Dict[str, Any] = {"reason": reason} if isinstance(reason, str) else {}
         return Mark(name=mark.name, args=args, kwargs=kwargs)
