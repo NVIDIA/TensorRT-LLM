@@ -1923,6 +1923,158 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
 
+def _make_spec_recompute_manager(
+    policy: str,
+    context_recompute_tail: int,
+    manager_cls: type[KVCacheManagerV2] = KVCacheManagerV2,
+) -> KVCacheManagerV2:
+    """A real target manager with a DFlash spec config carrying the tail."""
+    spec = DFlashDecodingConfig(
+        max_draft_len=4,
+        speculative_model="draft",
+        context_recompute_tail=context_recompute_tail,
+    )
+    return manager_cls(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_gpu_total_bytes=16 << 20,
+            max_attention_window=[MAX_SEQ_LEN],
+            max_util_for_resume=1.0,
+            block_reuse_config=BlockReuseConfig(policy=policy),
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=spec,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+
+
+def _drive_context_chunks(
+    manager: KVCacheManagerV2,
+    batch: ScheduledRequests,
+    request: _ContextRequest,
+) -> None:
+    """Finish *request* in single-block chunks, updating resources per chunk."""
+    position = request.context_current_position
+    while position < request.prompt_len:
+        chunk = min(TOKENS_PER_BLOCK, request.prompt_len - position)
+        assert manager.resize_context(request, num_tokens=chunk)
+        position += chunk
+        request.context_current_position = position
+        request.context_remaining_length = request.prompt_len - position
+        _update_context_resources(manager, batch)
+        request.is_first_context_chunk = False
+
+
+@pytest.mark.parametrize("policy", ["per_request", "per_conversation"])
+def test_deferred_commit_policies_disable_the_spec_recompute_tail(policy: str) -> None:
+    """Deferred-commit policies resize cache history to the context cursor
+    after every chunk (update_context_resources -> _resize_context_history),
+    and KvCache.resize refuses to decrease history length. A rewound cache-hit
+    request whose first chunk ends below the matched length would therefore
+    raise mid-flight. The manager disables the recompute tail for these
+    policies at construction; a chunked cache-hit request must then run start
+    to finish with its cursor held at the matched prefix.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = _make_spec_recompute_manager(policy, context_recompute_tail=-1)
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == 0
+
+        _run_context(manager, request_a)
+        assert manager.kv_cache_map[request_a.py_request_id].num_committed_tokens > 0
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        matched = request_b.prepopulated_prompt_len
+        assert matched > 0, "the second identical prompt must take a prefix hit"
+        # No rewind: the cursor stays at the matched prefix, so no later chunk
+        # can ask the history marker to decrease.
+        assert request_b.context_current_position == matched
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
+    """Under ALL_REUSABLE the recompute tail stays enabled: a cache-hit request
+    is rewound (here to a full re-prefill) while its blocks stay reused, and
+    chunked prefill completes because this policy never resizes history to the
+    cursor (try_commit_blocks skips re-commits below the committed watermark).
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = _make_spec_recompute_manager("all_reusable", context_recompute_tail=-1)
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == -1
+
+        _run_context(manager, request_a)
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        # Blocks are reused (the match was claimed)...
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens > 0
+        # ...but the cursor is rewound to a full re-prefill.
+        assert request_b.context_current_position == 0
+        assert request_b.prepopulated_prompt_len == 0
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("has_recurrent_state,expected_tail", [(False, 6), (True, -1)])
+def test_recurrent_state_managers_allow_only_a_full_reprefill_tail(
+    has_recurrent_state: bool, expected_tail: int
+) -> None:
+    """A positive tail rewinds to 0 < T < matched length, and on a hybrid
+    Mamba/GDN target the recurrent slot already summarizes the whole matched
+    prefix, so the mixers would apply [T, matched) twice. Managers with
+    recurrent state coerce a positive tail to a full re-prefill (T == 0);
+    attention-only managers keep it.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    class _RecurrentManager(KVCacheManagerV2):
+        _has_recurrent_state = True
+
+    manager_cls = _RecurrentManager if has_recurrent_state else KVCacheManagerV2
+    manager = _make_spec_recompute_manager(
+        "all_reusable", context_recompute_tail=6, manager_cls=manager_cls
+    )
+    try:
+        assert manager._spec_recompute_tail == expected_tail
+    finally:
+        manager.shutdown()
+
+
 def test_live_storage_stats_use_the_manager_api() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")

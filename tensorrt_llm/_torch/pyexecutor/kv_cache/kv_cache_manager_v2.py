@@ -1160,8 +1160,9 @@ def _spec_recompute_target(
     drafter's inputs.
 
     ``tail`` is the manager's ``_spec_recompute_tail``, resolved at
-    construction from the spec config's ``context_recompute_tail`` (which the
-    draft model config fills when unset): each cache-hit request starts its
+    construction from the spec config's ``context_recompute_tail`` (0 — off —
+    by default; an explicit None resolves from the draft model config): each
+    cache-hit request starts its
     context at a block-aligned position leaving at least that many prompt
     tokens to recompute. For a drafter whose context attention
     is windowed (e.g. DFlash2 ``swa_window_size``), a tail of the window
@@ -1200,6 +1201,12 @@ class KVCacheManagerV2(BaseResourceManager):
     # running __init__ (which overwrites it from the spec config). Zero
     # disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
+    # Mamba/GDN managers override this: a reused request's recurrent slot
+    # already summarizes the matched prefix, so a partial rewind would apply
+    # the tokens between the rewind target and the matched length to that
+    # state a second time. Only a full re-prefill (rewind target 0) is safe.
+    _has_recurrent_state: bool = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -1280,7 +1287,35 @@ class KVCacheManagerV2(BaseResourceManager):
         # auto value never resolved; recompute everything rather than
         # silently serving a degraded drafter.
         tail = getattr(spec_config, "context_recompute_tail", 0)
-        self._spec_recompute_tail = -1 if tail is None else int(tail)
+        tail = -1 if tail is None else int(tail)
+        if tail and self.block_reuse_policy is not BlockReusePolicy.ALL_REUSABLE:
+            # Deferred-commit policies advance the cache's history marker to
+            # the context cursor after every chunk (update_context_resources
+            # -> _resize_context_history). A rewound first chunk can end below
+            # the matched history, and KvCache.resize refuses to decrease
+            # history length, so the rewind and these policies are mutually
+            # exclusive.
+            logger.warning(
+                "context_recompute_tail requires block_reuse_config.policy="
+                f"'{BlockReusePolicy.ALL_REUSABLE}' (got "
+                f"'{self.block_reuse_policy}'): deferred-commit policies "
+                "resize cache history to the context cursor each chunk and a "
+                "rewound cursor cannot decrease it. Disabling the spec "
+                "recompute tail."
+            )
+            tail = 0
+        if tail > 0 and self._has_recurrent_state:
+            # A partial rewind double-applies the rewound span to the
+            # recurrent state (see _has_recurrent_state); only a full
+            # re-prefill rebuilds that state from scratch.
+            logger.warning(
+                "context_recompute_tail > 0 is unsupported on recurrent-state "
+                "cache managers: a partial rewind would apply reused tokens "
+                "to the conv/SSM state twice. Forcing a full re-prefill "
+                "(context_recompute_tail=-1)."
+            )
+            tail = -1
+        self._spec_recompute_tail = tail
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {idx: offset for offset, idx in enumerate(self.pp_layers)}
         self.max_beam_width = max_beam_width

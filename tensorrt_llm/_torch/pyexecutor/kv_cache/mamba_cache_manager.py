@@ -1636,6 +1636,12 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     Does not support block reuse / prefix caching for mamba states.
     """
 
+    # The recurrent (conv/SSM) state of a reused request summarizes the whole
+    # matched prefix, so a partial spec-recompute rewind would apply the
+    # rewound span to it twice; only a full re-prefill is safe. See
+    # _has_recurrent_state on the attention-only base classes.
+    _has_recurrent_state = True
+
     def __init__(
         self,
         # mamba cache parameters
@@ -2215,6 +2221,12 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     manager preference override and legacy disaggregated routing.
 
     """
+
+    # The recurrent (conv/SSM) state of a reused request summarizes the whole
+    # matched prefix, so a partial spec-recompute rewind would apply the
+    # rewound span to it twice; only a full re-prefill is safe. See
+    # _has_recurrent_state on the attention-only base classes.
+    _has_recurrent_state = True
 
     def __init__(
         self,
@@ -2977,6 +2989,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Recurrent-state snapshots use a specialized commit/history protocol, so
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
+
+    # The recurrent (conv/SSM) state of a reused request summarizes the whole
+    # matched prefix, so a partial spec-recompute rewind would apply the
+    # rewound span to it twice; only a full re-prefill is safe. See
+    # _has_recurrent_state on the attention-only base classes.
+    _has_recurrent_state = True
 
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
     # model — and any partially-constructed instance that sets only the fields it
