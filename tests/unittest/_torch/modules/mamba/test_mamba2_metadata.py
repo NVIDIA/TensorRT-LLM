@@ -162,9 +162,11 @@ class TestMamba2Metadata:
         assert metadata.chunk_indices is not None
         assert metadata.chunk_offsets is not None
 
-    def test_prepare_skips_an_unchanged_state_index_upload(self):
+    def test_prepare_skips_an_unchanged_state_index_upload(self, monkeypatch):
         """A decode step whose state indices (a list from the cache manager) did not change enqueues no upload: the
         device buffer keeps values the host never sent. A changed step uploads again."""
+        # The test writes the buffer behind prepare() to see the skip, which the check of skipped copies reports.
+        monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", False)
         manager = _StateIndexCacheManager([3, 1])
         metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
         attn_metadata = _decode_attn_metadata(manager)
@@ -200,6 +202,20 @@ class TestMamba2Metadata:
             metadata.prepare(attn_metadata)
             torch.cuda.synchronize()
             assert metadata.state_indices[:2].tolist() == expected
+
+    def test_check_of_skipped_copies_reports_a_write_behind_prepare(self, monkeypatch):
+        """With the check of skipped copies on (TLLM_DEBUG_MODE=1, or the unit-test fixture), a state index buffer
+        that something other than prepare() wrote fails the next prepare() whose indices did not change."""
+        monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", True)
+        manager = _StateIndexCacheManager([3, 1])
+        metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
+        attn_metadata = _decode_attn_metadata(manager)
+
+        metadata.prepare(attn_metadata)
+        metadata.prepare(attn_metadata)
+        metadata.state_indices[:2].copy_(torch.tensor([5, 6], dtype=torch.int32))
+        with pytest.raises(AssertionError, match="holds \\[5, 6\\] instead of \\[3, 1\\]"):
+            metadata.prepare(attn_metadata)
 
     def test_prepare_replay_work_items_write_first(self):
         class ReplayCacheManager:

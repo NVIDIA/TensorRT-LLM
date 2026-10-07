@@ -816,6 +816,9 @@ class PyTorchModelEngine(ModelEngine):
             self.draft_tokens_cuda = torch.empty((max_num_draft_tokens, ),
                                                  dtype=torch.int,
                                                  device='cuda')
+            # Only copy_to_device_if_changed writes this buffer: it skips
+            # values it already copied here, so another write would leave
+            # stale values.
             self.gather_ids_cuda = torch.empty((self.max_num_tokens, ),
                                                dtype=torch.int,
                                                device='cuda')

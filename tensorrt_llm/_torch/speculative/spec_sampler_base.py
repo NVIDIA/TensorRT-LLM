@@ -309,6 +309,8 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._slot_table: Optional[torch.Tensor] = None
         if spec_step_copies.is_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
+            # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another
+            # write would leave stale values.
             self._slot_table = torch.zeros((seq_slots,), dtype=torch.int32, device="cuda")
         # Recorded after the last step's host copies of the stores, which read
         # them on the D2H side stream.

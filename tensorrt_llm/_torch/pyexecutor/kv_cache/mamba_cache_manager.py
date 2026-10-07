@@ -2952,6 +2952,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                                   device):
             return
 
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self._dummy_request_mask = torch.zeros(self.max_batch_size,
                                                dtype=torch.bool,
                                                device=device)
@@ -3236,6 +3238,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self.cuda_state_indices = torch.zeros([state_index_capacity],
                                               dtype=torch.int32,
                                               device="cuda")
@@ -4153,6 +4157,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         mask_capacity = self._host_state_indices.shape[0]
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self._dummy_request_mask = torch.zeros(mask_capacity,
                                                dtype=torch.bool,
                                                device=device)

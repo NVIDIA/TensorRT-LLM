@@ -3842,9 +3842,12 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
 
 
 @skip_no_cuda
-def test_v2_state_index_setup_skips_unchanged_uploads():
+def test_v2_state_index_setup_skips_unchanged_uploads(monkeypatch):
     """A step whose state indices and dummy flags did not change enqueues no upload of either: the device buffers
     keep values the host never sent. A changed step uploads both again."""
+    # The test writes the buffers behind _setup_state_indices to see the skip, which the check of skipped copies
+    # reports.
+    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", False)
 
     class StateCache:
         def __init__(self, slot: int) -> None:

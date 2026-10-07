@@ -15,7 +15,8 @@
 """``copy_to_device_if_changed``: which calls copy and what the buffer then holds.
 
 The skip decision does not depend on the device, so the buffer here is a host tensor: a skipped copy shows as a
-sentinel written behind the function's back that survives the call.
+sentinel written behind the function's back that survives the call. Such a write is what the debug check of a skipped
+copy reports, so these tests turn the check off, except the ones that test it.
 """
 
 import pytest
@@ -26,6 +27,11 @@ from tensorrt_llm._utils import copy_to_device_if_changed
 pytestmark = pytest.mark.cpu_only
 
 SENTINEL = -7
+
+
+@pytest.fixture(autouse=True)
+def _no_skipped_copy_check(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", False)
 
 
 def _host(values: list[int]) -> torch.Tensor:
@@ -117,3 +123,21 @@ def test_two_dimensional_values_are_flattened() -> None:
     _tamper(dst)
     copy_to_device_if_changed(dst, _host([1, 2, 3, 4]))
     assert dst.eq(SENTINEL).all()
+
+
+def test_debug_check_passes_a_buffer_only_the_function_wrote(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", True)
+    dst = torch.zeros(8, dtype=torch.int64)
+    copy_to_device_if_changed(dst, _host([5, 6, 7, 8]))
+    copy_to_device_if_changed(dst, _host([5, 6, 7, 8]))
+    copy_to_device_if_changed(dst, _host([5, 6]))
+    assert dst[:4].tolist() == [5, 6, 7, 8]
+
+
+def test_debug_check_reports_a_write_by_anything_else(monkeypatch) -> None:
+    monkeypatch.setattr("tensorrt_llm._utils._verify_skipped_device_copies", True)
+    dst = torch.zeros(8, dtype=torch.int32)
+    copy_to_device_if_changed(dst, _host([3, 1]))
+    dst[:2].copy_(_host([5, 6]))
+    with pytest.raises(AssertionError, match="holds \\[5, 6\\] instead of \\[3, 1\\]"):
+        copy_to_device_if_changed(dst, _host([3, 1]))

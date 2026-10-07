@@ -490,6 +490,8 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
+        # would leave stale values.
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -1046,6 +1048,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
+        # would leave stale values.
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))

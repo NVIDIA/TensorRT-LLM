@@ -371,6 +371,9 @@ class Mamba2Metadata:
         self.state_indices_cpu = torch.zeros(max_batch_size,
                                              dtype=torch.int32,
                                              pin_memory=prefer_pinned())
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
+        # prepare() aliases a cache manager's own device buffer instead.
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
