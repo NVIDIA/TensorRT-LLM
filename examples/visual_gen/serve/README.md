@@ -507,12 +507,11 @@ audio. Start the generator with the appropriate config from
 [Starting the server](#starting-the-server), then set `enable_audio: true` in
 the request below.
 
-The `--revision fp8` flag is optional: include it to use the static FP8
-checkpoint, or omit it to use the default revision. Substitute
-`nvidia/Cosmos3-Super` for Super:
+For static FP8, use the single-GPU config that sets `revision: fp8`.
+Substitute `nvidia/Cosmos3-Super` for Super; the request is unchanged:
 
 ```bash
-trtllm-serve nvidia/Cosmos3-Nano --enable_visual_gen --revision fp8
+trtllm-serve nvidia/Cosmos3-Nano --visual_gen_args ../configs/cosmos3-fp8-1gpu.yaml
 ```
 
 ```bash
