@@ -38,7 +38,6 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
-    apply_minimax_h3_rope_bf16,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -55,11 +54,6 @@ class MiniMaxH3TransformerOutput:
 
     sample: torch.Tensor
     audio_sample: torch.Tensor
-
-
-# Dispatch switch for the fused per-head QK-norm + RoPE kernel (tests compare
-# against the separate norm and RoPE path by turning it off).
-FUSE_QK_NORM_ROPE = True
 
 
 @dataclass
@@ -81,30 +75,13 @@ def apply_minimax_h3_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]``."""
+    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]`` (eager path)."""
 
     rotary_dim = cos.shape[-1]
     if rotary_dim > hidden_states.shape[-1] or rotary_dim % 2:
         raise ValueError(
             f"Invalid rotary dimension {rotary_dim} for head dimension {hidden_states.shape[-1]}."
         )
-
-    if (
-        hidden_states.is_cuda
-        and hidden_states.dtype == torch.bfloat16
-        and hidden_states.ndim == 4
-        and cos.shape == (hidden_states.shape[1], rotary_dim)
-        and sin.shape == cos.shape
-        and cos.device == hidden_states.device
-        and sin.device == hidden_states.device
-        and cos.dtype in (torch.float32, torch.bfloat16)
-        and sin.dtype in (torch.float32, torch.bfloat16)
-        and not (
-            torch.is_grad_enabled()
-            and (hidden_states.requires_grad or cos.requires_grad or sin.requires_grad)
-        )
-    ):
-        return apply_minimax_h3_rope_bf16(hidden_states, cos, sin)
 
     hidden_states_rotary = hidden_states[..., :rotary_dim]
     hidden_states_pass = hidden_states[..., rotary_dim:]
@@ -162,54 +139,45 @@ class MiniMaxH3Attention(Attention):
             qk_norm_mode="per_head",
             eps=qk_norm_eps,
             bias=False,
-            # H3 rotates a leading split-half region and passes the tail through.
-            # The shared fused kernel currently implements a different layout.
-            fuse_qk_norm_rope=False,
+            # H3 rotates a leading split-half region and passes the tail through, which
+            # the shared fused kernel does not implement; the flag drives H3's own kernel
+            # (fused_rope.py) through the override of forward() below.
+            fuse_qk_norm_rope=True,
             interleave=False,
             config=model_config,
             layer_idx=layer_idx,
             module_name=module_name,
         )
 
-    def _can_fuse_qk_norm_rope(
+    def _use_fused_qk_norm_rope(
         self,
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> bool:
-        """Return whether the fused per-head RMSNorm + RoPE kernel applies.
+        """Decide between the fused per-head RMSNorm + RoPE kernel and the eager path.
 
-        The kernel reads Q and K from the packed QKV projection, so it needs the
-        fused-QKV layout with equal Q and K head counts, CUDA BF16 activations, an
-        un-sharded plain RMSNorm with BF16 weights, head dimension 128 and a rotary
-        width that is a multiple of 32. Everything else keeps the separate eager path.
+        Only what selects the path is checked here: the per-instance flag, the packed-QKV
+        layout the kernel reads (equal Q/K head counts, head dimension 128), an un-sharded
+        plain RMSNorm with BF16 weights, CUDA BF16 activations, a rotary width that is a
+        multiple of 32 and no autograd. ``apply_minimax_h3_qk_norm_rope_bf16`` raises on
+        anything else.
         """
-        if not FUSE_QK_NORM_ROPE or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
+        if not self.fuse_qk_norm_rope or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
             return False
         if self.local_num_attention_heads != self.local_num_key_value_heads or self.head_dim != 128:
             return False
-        cos, sin = rotary_emb
         for norm in (self.norm_q, self.norm_k):
-            if (
-                getattr(norm, "allreduce", None) is not None
-                or getattr(norm, "use_gemma", False)
-                or norm.weight.dtype != torch.bfloat16
-                or norm.weight.shape != (self.head_dim,)
-                or norm.variance_epsilon != self.norm_q.variance_epsilon
-            ):
+            if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
                 return False
+        cos, sin = rotary_emb
         if (
             not hidden_states.is_cuda
             or hidden_states.dtype != torch.bfloat16
             or hidden_states.ndim != 3
-            or cos.ndim != 2
-            or cos.shape[0] != hidden_states.shape[1]
-            or cos.shape[1] % 32
-            or cos.shape[1] > self.head_dim
+            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
             or sin.shape != cos.shape
-            or cos.device != hidden_states.device
-            or sin.device != hidden_states.device
-            or cos.dtype not in (torch.float32, torch.bfloat16)
-            or sin.dtype not in (torch.float32, torch.bfloat16)
+            or cos.shape[-1] % 32
+            or cos.shape[-1] > self.head_dim
         ):
             return False
         if torch.is_grad_enabled() and any(
@@ -227,7 +195,7 @@ class MiniMaxH3Attention(Attention):
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
-        if rotary_emb is not None and self._can_fuse_qk_norm_rope(hidden_states, rotary_emb):
+        if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
             # One launch normalizes and rotates Q and K from the packed projection
             # output; V stays a view of the same buffer.
             qkv = self.qkv_proj(hidden_states)
