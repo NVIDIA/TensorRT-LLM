@@ -31,7 +31,7 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "meta-llama/Llama-3.1-8B": "llama-3.1-model/Meta-Llama-3.1-8B",
     "nvidia/Llama-3.1-8B-Instruct-FP8": "Llama-3.1-8B-Instruct-FP8",
     "nvidia/Llama-3.1-8B-Instruct-NVFP4": "Llama-3.1-8B-Instruct-NVFP4",
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Qwen/Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
     "mistralai/Mistral-Small-3.1-24B-Instruct-2503": "Mistral-Small-3.1-24B-Instruct-2503",
     "Qwen/Qwen3-30B-A3B": "Qwen3/Qwen3-30B-A3B",
     "deepseek-ai/DeepSeek-V3": "DeepSeek-V3",
