@@ -221,12 +221,20 @@ def test_blocklist_extension_on_another_sm_uses_the_probe():
         assert metadata.use_paged_context_fmha
 
 
-def test_unblocked_combination_is_never_probed():
+@pytest.mark.parametrize(
+    "head_dim,kv_dtype",
+    [(128, DataType.BF16), (576, DataType.FP8)],
+    ids=["dense_128", "mla_576"],
+)
+def test_unblocked_combination_is_never_probed(head_dim, kv_dtype):
     """Off the blocklist, the gate must not consult the kernel lookup at
     all: the lookup is a fixed-convention diagnostic (dense causal
     Q_PAGED_KV, inferred Q/output precision) that does not model every
     configuration the op can run (MLA, cross attention), so probing
-    unconditionally would refuse configurations the op serves correctly."""
+    unconditionally would refuse configurations the op serves correctly.
+    head_dim 576 is the MLA KV-cache width (DeepSeek), which the lookup's
+    dense-MHA convention does not model -- the probe must stay scoped to
+    the blocklisted head dims even on the FP8-KV multi-variant path."""
     with (
         mock.patch(_FALLBACK_SM_VERSION_TARGET, return_value=103),
         mock.patch.object(
@@ -238,7 +246,7 @@ def test_unblocked_combination_is_never_probed():
             max_num_requests=4,
             max_num_tokens=1024,
             kv_cache_manager=SimpleNamespace(
-                head_dim=128, dtype=DataType.BF16, tokens_per_block=32
+                head_dim=head_dim, dtype=kv_dtype, tokens_per_block=32
             ),
             runtime_features=ALL_FEATURES,
         )
