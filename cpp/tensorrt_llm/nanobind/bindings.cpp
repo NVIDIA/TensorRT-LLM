@@ -107,6 +107,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
                     name, option);
             }
         };
+        warnUnavailable(
+            tc::ProfilerRegion::kNanobind, ENABLE_NANOBIND_PROFILING != 0, "nanobind", "ENABLE_NANOBIND_PROFILING");
         warnUnavailable(tc::ProfilerRegion::kNccl, TRTLLM_ENABLE_NCCL_PROFILING != 0, "nccl", "ENABLE_NCCL_PROFILING");
     }
 #endif
@@ -203,6 +205,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
     buildInfo.attr("ENABLE_NCCL_PROFILING") = nb::bool_(TRTLLM_ENABLE_NCCL_PROFILING);
+    buildInfo.attr("ENABLE_NANOBIND_PROFILING") = nb::bool_(ENABLE_NANOBIND_PROFILING != 0);
 
     auto const toTuple = [](std::vector<int> const& architectures)
     {
