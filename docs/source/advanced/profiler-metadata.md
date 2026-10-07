@@ -40,11 +40,10 @@ Native initialization is thread safe; probes stay inactive until it succeeds.
 Do not initialize from a collective, profiler callback, ABI entry point or
 shared-library static initializer.
 
-The native loader integration is intentionally deferred until native feature
-consumers are added: NCCL and nanobind integrations must arrange safe startup
-validation before installing their probes. `ENABLE_NCCL_PROFILING` and
-`ENABLE_NANOBIND_PROFILING` are default-OFF build scaffolding. Runtime selection
-cannot enable instrumentation omitted at build time.
+`ENABLE_NCCL_PROFILING` and `ENABLE_NANOBIND_PROFILING` default to OFF.
+Builds enabling either option validate native selection once at the Python
+module's exception-handling startup boundary, before registering bindings.
+Runtime selection cannot enable instrumentation omitted at build time.
 
 ## TRTLLM1 envelope
 
@@ -160,3 +159,65 @@ the callable, group factory and payload inspection run only inside the selected,
 active shared scope. Metadata is observational and capture-safe for direct
 shape/stride inspection, but it does not trace tensor contents or asynchronous
 communication completion. Profiling introduces scope and metadata overhead.
+
+## Nanobind binding coverage and compatibility
+
+Build with `ENABLE_NANOBIND_PROFILING=ON`; no NCCL profiling dependency is
+required. `tensorrt_llm.bindings.BuildInfo.ENABLE_NANOBIND_PROFILING` is a Python
+bool in both configurations. OFF builds retain the upstream dispatch paths.
+ON scopes are named `trtllm::nanobind::<module>.<qualname>`. All four pinned
+function vectorcall paths are covered, including rejected arguments and
+exceptions. Bound methods and constructors delegate to those paths without
+adding a second scope. Native startup and probes use the existing shared
+`th_common` implementation, not a second embedded selector.
+
+Names are extracted only for active callbacks. Direct Tensor positional and
+keyword arguments are inspected only when callbacks request inputs; nested
+containers are not traversed. Metadata uses region `nanobind` and the fields
+`nanobind.tensor_count` (int64) and `nanobind.tensor.<index>.shape` (int64 list),
+`.stride` (int64 list for strided tensors), `.dtype` and `.device` (strings).
+Indices follow positional arguments then keyword values, including self when
+it is a Tensor. Tensor handles are copied without reading data or synchronizing
+devices; Python Tensor subclasses are recognized by their concrete C subtype.
+Symbolic shape/stride failures can omit the observational scope, never the call.
+
+The isolated private Tensor adapter is restricted to PyTorch 2.14 and the full,
+GIL-enabled CPython API. Its checked ABI preparation used
+`2.14.0a0+4fdf77b940.nv26.08` with pinned nanobind
+`a0ed2587f1089ef7657e2ed49ad6756b01c74e9f`. Other Torch minors, stable Python ABI
+and free-threaded Python are not supported by this instrumentation. Revalidate
+the private headers, link against that installation's `torch_python`, and run
+adapter/vectorcall regressions when updating the pin or Torch. OFF builds do
+not include the private adapter. Source overrides bypass FetchContent patching:
+apply the checked-in patch once to an owned pinned vendor copy before using an
+override, and verify its contents.
+
+Setup and cleanup preserve the current Python error type, value and traceback;
+name extraction, metadata and profiler failures remain observational. The
+scopes cover host binding dispatch, not GPU execution or graph replay. They do
+not replace the runtime profiler manager or its executor-thread start/stop.
+
+### Measured inactive binding cost
+
+A standalone tiny-extension benchmark compared OFF and ON Release builds
+(`-O3 -DNDEBUG`) with the checked Torch 2.14 build and nanobind pin above,
+`TLLM_PROFILE_CUSTOM_REGIONS=nanobind`, and no active profiler. Five paired
+fresh-process trials on `cpu-0036`, pinned to CPU 16, retained 400 block samples:
+20 blocks of 1,000,000 calls per workload per process after 100,000 warmup calls.
+The Python loop, inputs and single-thread settings were identical.
+
+| Workload | OFF median (ns/call) | ON median (ns/call) | Mean paired increase (ns/call) |
+| --- | ---: | ---: | ---: |
+| Zero arguments | 43.579 | 138.235 | 94.601 (about 95) |
+| One preallocated CPU Tensor | 44.858 | 135.917 | 91.038 (about 91) |
+
+OFF/ON values are medians of the five process block medians; increases are
+means of paired differences, not differences of those marginal medians.
+Retained independent fixture artifacts `measurement.md`, `measurement.json`
+and `timing.py` (job `7775138`, source revision `5b2b764a8e0be158e44a47712139d2035e28d310`)
+provide the raw samples and provenance. This one-node, five-pair result includes
+the Python loop and tiny binding dispatch; it is not an inference, GPU,
+product-binding or active-metadata-serialization measurement, and does not
+establish a platform-wide cost. ON is not zero-cost. Product binding timings
+and the full supported OFF/ON native matrix remain separate release validation
+gates, not inferred from this fixture.
