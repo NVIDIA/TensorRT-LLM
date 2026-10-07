@@ -48,7 +48,6 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
-from .models.modeling import BaseDiffusionModel
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
 if TYPE_CHECKING:
@@ -286,10 +285,6 @@ class PipelineLoader:
         logger.info("Creating pipeline with MetaInitMode")
         with MetaInitMode():
             pipeline = AutoPipeline.from_config(config, checkpoint_dir)
-        for name in pipeline.transformer_components:
-            transformer = getattr(pipeline, name, None)
-            if isinstance(transformer, BaseDiffusionModel):
-                transformer.check_tp_layout_applied()
 
         # Convert meta tensors to their runtime devices. Offloaded submodules
         # stay on CPU until they are explicitly staged.

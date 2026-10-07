@@ -51,13 +51,7 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
-    """Attention module for visual generation models.
-
-    ``forward`` and ``attend`` take batch and sequence lengths from the projected ``q`` (not
-    from the input), so the projections may change the token count: under token-sharded TP
-    the input is this rank's tokens and the converted ``qkv_proj`` / ``to_q`` return all of
-    them. ``forward_async`` (async Ulysses) reads them from its input.
-    """
+    """Attention module for visual generation models."""
 
     def __init__(
         self,
@@ -94,8 +88,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
-        # SEPARATE_QKV only: True when to_k / to_v read the hidden states (self-attention)
-        # rather than encoder states (cross-attention).
+        # Read by the token-sharded TP converter (parallel/token_sharded_modules.py).
         self.separate_qkv_is_self_attention = separate_qkv_is_self_attention
         self.bias = bias
 
@@ -424,7 +417,8 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.qkv_mode == QKVMode.FUSE_QKV:
-            q, k, v = self.split_qkv(self.qkv_proj(hidden_states))
+            qkv = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
         else:
             kv_source = (
                 encoder_hidden_states if encoder_hidden_states is not None else hidden_states
@@ -432,18 +426,7 @@ class Attention(nn.Module):
             q = self.to_q(hidden_states)
             k = self.to_k(kv_source)
             v = self.to_v(kv_source)
-            if encoder_hidden_states is None and q.shape[:-1] != k.shape[:-1]:
-                raise ValueError(
-                    f"{type(self).__name__}: self-attention q {tuple(q.shape)} and k "
-                    f"{tuple(k.shape)} cover different tokens. Under token-sharded TP a "
-                    "SEPARATE_QKV self-attention needs separate_qkv_is_self_attention=True, so "
-                    "that to_k / to_v gather the tokens too."
-                )
         return q, k, v
-
-    def split_qkv(self, qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split a fused (FUSE_QKV) projection output [..., q + 2 * kv] into this rank's q, k, v."""
-        return qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
@@ -650,35 +633,17 @@ class Attention(nn.Module):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
-            q, k, v = self.split_qkv(qkv)
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
             return self.to_out[0](out)
 
-        # Unfused path: projections, then separate QK norm → separate RoPE → attention
+        # Unfused path: separate QK norm → separate RoPE → attention
         q, k, v = self.get_qkv(hidden_states, encoder_hidden_states)
-        return self.to_out[0](self.attend(q, k, v, freqs=freqs, timestep=timestep, **kwargs))
-
-    def attend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        timestep: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """QK-norm → RoPE (when ``freqs`` is given) → attention on projected q/k/v.
-
-        q/k/v are this rank's [B, S, H_local * head_dim] / [B, S_kv, KV_local * head_dim]
-        projections (e.g. from ``get_qkv`` or ``split_qkv``). Returns the attention output
-        [B, S, H_local * head_dim] *before* ``to_out``, for callers that apply the output
-        projection themselves.
-        """
         q, k = self.apply_qk_norm(q, k)
 
         # Apply RoPE if provided (model handles RoPE, not attention backend)
         if freqs is not None:
+            # From q/k, not hidden_states: a token-sharded TP projection gathers all tokens.
             batch_size, seq_len = q.shape[:2]
             kv_seq_len = k.shape[1]
             freqs_cos, freqs_sin = freqs
@@ -691,7 +656,9 @@ class Attention(nn.Module):
             q = q.flatten(2)
             k = k.flatten(2)
 
-        return self._attn_impl(q, k, v, timestep=timestep, **kwargs)
+        out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
+        out = self.to_out[0](out)
+        return out
 
     def forward_async(
         self,

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for token-sharded TP as a layout: the SequenceSharder mode and the converter.
+"""CPU tests for token-sharded TP as a layout: the model's sharder and the converter.
 
 No process group: the sharder uses a simulated helper whose plan is already cached, so
 ``shard`` runs no collective (``gather`` is covered by the gloo tests in
@@ -40,20 +40,23 @@ from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (
     classify,
     convert_to_token_sharded_tp,
 )
-from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardPlan
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
+    TokenShardedSequenceSharder,
+    TokenShardedTP,
+    TokenShardPlan,
+)
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.visual_gen.args import ParallelConfig
 
 pytestmark = pytest.mark.cpu_only
 
-_SHAPES = [(1, 6, 2), (1, 5, 2), (2, 8, 2), (2, 9, 4), (3, 7, 2), (2, 9, 3)]
+# (1, 5, 4): the last rank holds only padding.
+_SHAPES = [(1, 6, 2), (1, 5, 2), (2, 8, 2), (2, 9, 4), (3, 7, 2), (2, 9, 3), (1, 5, 4)]
 
 
 def _token_sharded(batch, seq, tp, rank):
     plan = TokenShardPlan.build(batch, seq, tp, rank)
-    sharder = SequenceSharder(size=1, rank=0, group=None)
-    sharder.use_token_sharded_tp(simulated_helper(plan))
-    return sharder, plan
+    return TokenShardedSequenceSharder(simulated_helper(plan)), plan
 
 
 def _sample_ids(batch, seq, dim=4):
@@ -62,7 +65,7 @@ def _sample_ids(batch, seq, dim=4):
 
 
 # =============================================================================
-# Stream and per-token tables: this rank's rows, as whole-sample groups
+# Stream and per-token tables: this rank's rows, as sample groups
 # =============================================================================
 
 
@@ -110,18 +113,15 @@ def test_shard_per_sample_matches_each_group(batch, seq, tp):
                 assert torch.equal(got[j], table[sample])
 
 
-def test_attention_inputs_stay_whole():
-    """RoPE tables, positions, masks and attention-side K/V are not sharded: attention
-    sees all tokens after the column projection's all-gather."""
+def test_rope_stays_whole():
+    """RoPE tables stay whole: attention sees all tokens after the column all-gather."""
     sharder, _ = _token_sharded(2, 8, 2, 1)
     cos, sin = torch.randn(8, 16), torch.randn(8, 16)
     rope = sharder.shard_rope((cos, sin), seq_len=8, seq_dim=0)
     assert rope[0] is cos and rope[1] is sin
-    ids = torch.randn(8, 3)
-    assert sharder.shard_attention_input(ids, dim=0) is ids
 
 
-def test_mode_flags_keep_their_sequence_parallel_meaning():
+def test_sequence_parallel_state_stays_inactive():
     sharder, _ = _token_sharded(2, 8, 2, 0)
     assert sharder.token_sharded_tp is True
     # Ulysses-only code (padding to multiples of size, K/V sharding) keys on these.
@@ -129,7 +129,7 @@ def test_mode_flags_keep_their_sequence_parallel_meaning():
     assert sharder.size == 1
 
 
-def test_token_sharded_mode_shards_only_the_sequence_dim():
+def test_token_sharded_sharder_shards_only_the_sequence_dim():
     sharder, _ = _token_sharded(2, 8, 2, 0)
     assert sharder.shard(None, dim=1) is None
     other = torch.randn(2, 5, 4)  # a field whose seq axis is not the stream's
@@ -143,19 +143,17 @@ def test_tables_follow_the_stream_plan():
     match it rather than re-plan the forward."""
     sharder, _ = _token_sharded(2, 8, 2, 0)
     sharder.shard(torch.randn(2, 8, 4), dim=1)
-    with pytest.raises(ValueError, match="token stream"):
+    with pytest.raises(ValueError, match=r"expected a \[B=2, S=8"):
         sharder.shard(torch.randn(4, 8, 6, 4), dim=1, expected_seq_len=8)
 
 
 # =============================================================================
-# Sequence mode (Ulysses / Ring / Attention2D) and inactive sharders are unchanged
+# The base SequenceSharder (Ulysses / Ring / Attention2D, or inactive) is unchanged
 # =============================================================================
 
 
-def test_sequence_mode_shards_attention_inputs_too():
+def test_base_sharder_keeps_per_sample_tables():
     sharder = SequenceSharder(size=2, rank=1, group=None)
-    t = torch.arange(24.0).view(2, 4, 3)
-    assert torch.equal(sharder.shard_attention_input(t, dim=1), sharder.shard(t, dim=1))
     table = torch.randn(2, 6, 8)
     assert sharder.shard_per_sample(table) is table
     assert sharder.token_sharded_tp is False
@@ -165,17 +163,9 @@ def test_inactive_sharder_passes_everything_through():
     sharder = SequenceSharder(size=1, rank=0, group=None)
     t = torch.randn(2, 4, 3)
     assert sharder.shard(t, dim=1) is t
-    assert sharder.shard_attention_input(t, dim=1) is t
     assert sharder.shard_per_sample(t) is t
     assert sharder.gather(t, dim=1) is t
     assert sharder.token_sharded_tp is False
-
-
-def test_token_sharded_mode_excludes_sequence_parallelism():
-    plan = TokenShardPlan.build(1, 8, 2, 0)
-    sharder = SequenceSharder(size=2, rank=0, group=None)
-    with pytest.raises(ValueError, match="cannot be combined with sequence parallelism"):
-        sharder.use_token_sharded_tp(simulated_helper(plan))
 
 
 # =============================================================================
@@ -342,8 +332,8 @@ def test_block_without_row_projections_is_rejected():
 
 
 def test_adapter_classes_convert_like_their_kind():
-    """An exception (or registry entry) naming an adapter class prepares the module as the
-    kind does: a row stops all-reducing."""
+    """An exception naming an adapter class prepares the module as the kind does: a row
+    stops all-reducing."""
     model = _Model(_WanLikeBlock())
     convert_to_token_sharded_tp(model, _helper(), exceptions={"attn1.to_out.0": TokenShardedRow})
     row = model.blocks[0].attn1.to_out[0]
@@ -365,14 +355,11 @@ class _TokenShardedJoint(TokenShardedAdapter):
         module.allreduce = None  # reduce-scatters in forward instead
 
 
-def test_registered_adapters_prepare_their_module(monkeypatch):
-    from tensorrt_llm._torch.visual_gen.parallel import token_sharded_modules
-
-    monkeypatch.setitem(token_sharded_modules._REGISTRY, _JointProjection, _TokenShardedJoint)
+def test_custom_adapters_prepare_their_module():
     block = _WanLikeBlock()
     block.joint = _JointProjection()
     model = _Model(block)
-    convert_to_token_sharded_tp(model, _helper())
+    convert_to_token_sharded_tp(model, _helper(), exceptions={"joint": _TokenShardedJoint})
     assert isinstance(model.blocks[0].joint, _TokenShardedJoint)
     assert model.blocks[0].joint.allreduce is None
 
@@ -427,55 +414,13 @@ def test_plain_tp_model_is_left_unchanged(layout):
     assert model.sharder.token_sharded_tp is False
     assert not any(isinstance(m, TokenShardedAdapter) for m in model.modules())
     assert model.blocks[0].attn1.to_out[0].reduce_output is True
-    model.check_tp_layout_applied()
 
 
-class _ForgetfulDiT(BaseDiffusionModel):
-    """Declares support but never calls _apply_tp_layout()."""
-
-    _supports_token_sharded_tp = True
-
-    def __init__(self, model_config, with_sharder=True):
-        super().__init__(model_config)
-        if with_sharder:
-            self.sharder = SequenceSharder(size=1, rank=0, group=None)
-        self.blocks = nn.ModuleList([_WanLikeBlock()])
-
-
-def test_a_supporting_model_must_apply_the_layout():
+def test_token_sharded_model_gets_the_sharder_and_converted_blocks(monkeypatch):
+    monkeypatch.setattr(TokenShardedTP, "from_model_config", staticmethod(lambda _: _helper()))
     config = DiffusionModelConfig(parallel=ParallelConfig(tp_size=_TP, tp_layout="token_sharded"))
-    with pytest.raises(RuntimeError, match="_apply_tp_layout"):
-        _ForgetfulDiT(config).check_tp_layout_applied()
-    with pytest.raises(AttributeError, match="sharder"):
-        _ForgetfulDiT(config, with_sharder=False)._apply_tp_layout()
-
-
-# =============================================================================
-# Attention: a self-attention whose q and k would cover different tokens
-# =============================================================================
-
-
-class _GatheringProjection(nn.Module):
-    """Stands in for a converted projection: returns all tokens (here: twice the shard)."""
-
-    def forward(self, x):
-        return torch.cat([x, x], dim=1)
-
-
-def test_self_attention_rejects_q_and_k_over_different_tokens():
-    attn = Attention(
-        hidden_size=64,
-        num_attention_heads=4,
-        qkv_mode=QKVMode.SEPARATE_QKV,
-        config=DiffusionModelConfig(),
-    )
-    attn.to_q, attn.to_k, attn.to_v = nn.Identity(), nn.Identity(), nn.Identity()
-    x = torch.randn(1, 4, 64)
-    q, k, v = attn.get_qkv(x)
-    assert q.shape == k.shape == v.shape == x.shape
-    attn.to_q = _GatheringProjection()  # to_q converted, to_k / to_v not: a misbinding
-    with pytest.raises(ValueError, match="separate_qkv_is_self_attention"):
-        attn.get_qkv(x)
-    # Cross-attention: k / v read the encoder states, so their token count differs.
-    q, k, _ = attn.get_qkv(x, encoder_hidden_states=torch.randn(1, 3, 64))
-    assert (q.shape[1], k.shape[1]) == (8, 3)
+    model = _ToyDiT(config)
+    assert isinstance(model.sharder, TokenShardedSequenceSharder)
+    assert isinstance(model.blocks[0].attn1.to_out[0], TokenShardedRow)
+    # The sharder's begin() picks the plan the adapters read: one helper for both.
+    assert model.sharder._tp is model.blocks[0].attn1.to_out[0]._token_sharded_tp

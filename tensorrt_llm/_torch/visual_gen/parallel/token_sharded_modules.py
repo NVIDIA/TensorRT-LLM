@@ -12,35 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token-sharded TP for a model's existing tensor-parallel modules.
+"""Token-sharded TP adapters for a model's existing tensor-parallel modules.
 
-Under ``parallel_config.tp_layout='token_sharded'`` a block's residual stream holds this TP
-rank's tokens (``TokenShardPlan``). A model built exactly as for plain TP is converted in
-place, module by module:
+:func:`convert_to_token_sharded_tp` converts the blocks of a model built as for plain TP, in
+place: a column-parallel projection that reads the token-sharded residual stream all-gathers its
+input first (:class:`TokenShardedColumn`), a row-parallel projection that writes it
+reduce-scatters instead of all-reducing (:class:`TokenShardedRow`), and an MLP whose
+``down_proj`` writes it does both around the whole MLP (:class:`TokenShardedMLP`). The modules
+to convert follow from their TP metadata (rules R1-R3 in :func:`classify`); the converter's
+``exceptions`` override the rules.
 
-* a column-parallel projection that reads the stream all-gathers its input first
-  (:class:`TokenShardedColumn`);
-* a row-parallel projection whose output returns to the stream reduce-scatters it instead of
-  all-reducing (:class:`TokenShardedRow`);
-* an MLP whose down-projection returns to the stream does both, around the whole MLP
-  (:class:`TokenShardedMLP`): its fused GELU paths call the up-projection's quant method
-  directly, and it must run on real rows only (pad rows would perturb a dynamic amax).
-
-Each adapter is a subclass of the module's own class, swapped in with ``module.__class__``
-(as PyTorch's FSDP2 ``fully_shard`` does) and cached per base class: parameters, state-dict
-names, quant methods and ``isinstance`` checks are unchanged, the GEMM and its quantization
-stay the module's own (``super().forward``), and one compiled block graph still serves
-every block. This is where projection-local optimizations of the layout belong (fused
-GEMM + reduce-scatter, overlapped or quantized all-gathers): one adapter changes, no model
-does. Deepcopy and pickle of a converted model are not supported.
-
-Which modules to convert follows from the TP metadata the modules already carry (rules R1-R3
-in :func:`classify`); a model lists only what the rules cannot decide in its
-``_token_sharded_tp_exceptions``, and registers adapters for its own module classes with
-:func:`register_token_sharded_adapter`.
+Each adapter is a subclass of the module's own class, swapped in through ``module.__class__``
+(as FSDP2's ``fully_shard`` does) and cached per base class: parameters, state-dict names, quant
+methods and ``isinstance`` checks are unchanged, the GEMM stays the module's own
+(``super().forward``), and all blocks share one compiled graph. Deepcopy and pickle of a
+converted model are not supported.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING
 
@@ -69,7 +58,6 @@ __all__ = [
     "TokenShardedRow",
     "classify",
     "convert_to_token_sharded_tp",
-    "register_token_sharded_adapter",
 ]
 
 COLUMN, ROW, MLP_KIND, KEEP = "column", "row", "mlp", "keep"
@@ -81,7 +69,13 @@ COLUMN, ROW, MLP_KIND, KEEP = "column", "row", "mlp", "keep"
 
 
 class TokenShardedAdapter:
-    """Base of the token-sharded adapters; ``_token_sharded_tp`` is set by the converter."""
+    """Base of the token-sharded adapters; ``_token_sharded_tp`` is set by the converter.
+
+    A module the rules cannot read (e.g. a joint projection with its own all-reduce) converts
+    by naming a subclass, whose ``forward`` wraps the module's, in the converter's
+    ``exceptions``. The rules still classify its submodules; name the ones its ``forward``
+    handles as ``"keep"``.
+    """
 
     _token_sharded_tp: "TokenShardedTP"
 
@@ -98,7 +92,9 @@ class TokenShardedColumn(TokenShardedAdapter):
     """Column-parallel projection reading the token stream: all-gather, then the GEMM.
 
     Takes this rank's rows (``[n, g, K]`` or ``[m, K]``, bf16 or a static-scale NVFP4
-    ``Fp4QuantizedTensor``) and returns ``[B, S, N_local]`` for all tokens.
+    ``Fp4QuantizedTensor``) and returns ``[B, S, N_local]`` for all tokens, so code after it
+    must take batch and sequence lengths from its output, not from the block input
+    (``Attention._attn_impl`` re-derives them from ``q`` / ``k``).
     """
 
     @classmethod
@@ -121,8 +117,9 @@ class TokenShardedRow(TokenShardedAdapter):
     """Row-parallel projection writing the token stream: the GEMM, then a reduce-scatter.
 
     Takes all tokens (``[B, S, K_local]`` or ``[B * S, K_local]``) and returns this rank's
-    reduced rows as ``[n, g, N]``. The GEMM input is padded per sample first (the GEMM then
-    runs on ``B * S_pad`` rows, whose pad rows carry only rank 0's bias).
+    reduced rows as ``[n, g, N]``. A padded plan zero-pads the GEMM input per sample (cheaper
+    than padding the output partial; zero rows leave a dynamic amax unchanged), so the output's
+    pad rows hold only rank 0's bias and are dropped at the next gather.
     """
 
     @classmethod
@@ -137,10 +134,12 @@ class TokenShardedRow(TokenShardedAdapter):
 
 
 class TokenShardedMLP(TokenShardedAdapter):
-    """MLP whose down-projection writes the token stream: all-gather, the MLP, reduce-scatter.
+    """MLP whose ``down_proj`` writes the token stream: all-gather, the MLP, reduce-scatter.
 
-    The MLP runs on the ``B * S`` real rows; its output partial is padded per sample before
-    the reduce-scatter.
+    Converted whole rather than per projection because its fused GELU paths call the
+    up-projection's quant method directly. The MLP runs on the ``B * S`` real rows only (pad
+    rows are non-zero after a norm and would perturb a dynamic amax); its output partial is
+    padded per sample before the reduce-scatter.
     """
 
     @classmethod
@@ -174,8 +173,11 @@ def _check_linear(module: nn.Module | None, name: str, mode: TensorParallelMode,
 
 
 def _stop_all_reduce(linear: Linear, name: str) -> None:
-    """Leave ``linear`` in the state ``reduce_output=False`` builds: the quant methods'
-    ``apply()`` paths key on ``all_reduce`` too (NCCL-window output buffers, bias-in-GEMM)."""
+    """Leave ``linear`` in the state ``reduce_output=False`` builds.
+
+    The quant methods' ``apply()`` paths key on ``all_reduce`` too (NCCL-window output
+    buffers, bias-in-GEMM).
+    """
     if linear.use_fused_gemm_allreduce:
         # create_weights() already chose the quant method and workspace for the fused op.
         raise ValueError(
@@ -186,20 +188,7 @@ def _stop_all_reduce(linear: Linear, name: str) -> None:
     linear.all_reduce = None
 
 
-_REGISTRY: dict[type, type] = {}
 _ADAPTED: dict[tuple[type, type], type] = {}
-
-
-def register_token_sharded_adapter(module_cls: type, adapter: type) -> None:
-    """Convert every ``module_cls`` instance in a block with ``adapter`` (a subclass of
-    :class:`TokenShardedAdapter` whose ``forward`` wraps ``module_cls.forward``).
-
-    For custom module classes the rules cannot read (e.g. a joint projection with its own
-    all-reduce); registered by the package that owns ``module_cls``.
-    """
-    if not issubclass(adapter, TokenShardedAdapter):
-        raise TypeError(f"{adapter!r} is not a TokenShardedAdapter subclass.")
-    _REGISTRY[module_cls] = adapter
 
 
 def _adapted_class(adapter: type, base: type) -> type:
@@ -237,7 +226,7 @@ def _stream_projections(attn: Attention) -> list[str]:
 def _classify_block(block: nn.Module, exceptions: Mapping[str, object]) -> dict[str, object]:
     """``{relative module name: kind or adapter class}`` for one block."""
     kinds: dict[str, object] = {}
-    covered: list[str] = []  # converted modules whose descendants are theirs
+    covered: list[str] = []  # modules converted whole; their submodules are skipped
 
     def inside(name: str) -> bool:
         return any(name.startswith(prefix + ".") for prefix in covered)
@@ -245,11 +234,7 @@ def _classify_block(block: nn.Module, exceptions: Mapping[str, object]) -> dict[
     for name, m in block.named_modules():
         if not name or inside(name):
             continue
-        adapter = _REGISTRY.get(type(m))
-        if adapter is not None:
-            kinds[name] = adapter
-            covered.append(name)
-        elif isinstance(m, (MLP, GatedMLP)) and _all_reduces(m.down_proj):
+        if isinstance(m, (MLP, GatedMLP)) and _all_reduces(m.down_proj):
             kinds[name] = MLP_KIND
             covered.append(name)
         elif _all_reduces(m):
@@ -296,19 +281,15 @@ def _check_block(
         if not handled:
             raise ValueError(
                 f"token-sharded TP: {where}.{name} all-reduces outside the projections the "
-                "rules convert; under this layout it would reduce a token shard. Register an "
-                "adapter for its module class, or list it in the model's "
-                "_token_sharded_tp_exceptions."
+                "rules convert; under this layout it would reduce a token shard. Name it in the "
+                "converter's exceptions."
             )
 
 
 def classify(
-    root: nn.Module,
-    *,
-    containers: Iterable[str] = ("blocks",),
-    exceptions: Mapping[str, object] | None = None,
+    root: nn.Module, *, exceptions: Mapping[str, object] | None = None
 ) -> dict[str, object]:
-    """Which modules of ``root``'s blocks convert, without converting them.
+    """Which modules of ``root.blocks`` convert, without converting them.
 
     Rules, from the TP metadata the modules already carry:
 
@@ -317,42 +298,35 @@ def classify(
     * R2: an ``MLP`` / ``GatedMLP`` whose ``down_proj`` all-reduces converts whole (``"mlp"``);
     * R3: a VisualGen ``Attention``'s projections that read the hidden states all-gather
       first (``"column"``): ``qkv_proj``, ``to_q``, and ``to_k`` / ``to_v`` when
-      ``separate_qkv_is_self_attention``;
-    * modules of a class registered with :func:`register_token_sharded_adapter` take that
-      adapter; ``exceptions`` (``{module-name pattern: kind, adapter or "keep"}``, relative
-      to a block) override the rules.
+      ``separate_qkv_is_self_attention``.
+
+    ``exceptions`` (``{block-relative module-name pattern: kind, adapter class or "keep"}``)
+    override the rules.
 
     Raises ``ValueError`` when a block has nothing to convert, when an all-reduce would act
     on a token shard (anything but a converted projection's own, a TP-aware RMSNorm's
-    per-token head reduction, or a column ``Linear``'s unused one), or when the blocks of a
-    container would convert differently.
+    per-token head reduction, or a column ``Linear``'s unused one), when an exception names an
+    unknown kind or matches no module, or when two blocks would convert differently.
 
     Returns:
         ``{qualified module name: kind or adapter class}``.
     """
     exceptions = dict(exceptions or {})
     result: dict[str, object] = {}
-    for container_name in containers:
-        container = root.get_submodule(container_name)
-        blocks = (
-            list(container.named_children())
-            if isinstance(container, (nn.ModuleList, nn.Sequential))
-            else [("", container)]
-        )
-        first = None
-        for index, block in blocks:
-            where = f"{container_name}.{index}" if index else container_name
-            kinds = _classify_block(block, exceptions)
-            _check_block(block, where, kinds, exceptions)
-            if first is None:
-                first = (where, kinds)
-            elif kinds != first[1]:
-                raise ValueError(
-                    f"token-sharded TP: {where} and {first[0]} convert differently "
-                    f"({sorted(kinds)} vs {sorted(first[1])}); blocks of one container share "
-                    "one compiled graph and one conversion."
-                )
-            result.update({f"{where}.{name}": kind for name, kind in kinds.items()})
+    first = None
+    for index, block in root.blocks.named_children():
+        where = f"blocks.{index}"
+        kinds = _classify_block(block, exceptions)
+        _check_block(block, where, kinds, exceptions)
+        if first is None:
+            first = (where, kinds)
+        elif kinds != first[1]:
+            raise ValueError(
+                f"token-sharded TP: {where} and {first[0]} convert differently "
+                f"({sorted(kinds)} vs {sorted(first[1])}); the blocks share one compiled graph "
+                "and one conversion."
+            )
+        result.update({f"{where}.{name}": kind for name, kind in kinds.items()})
     return result
 
 
@@ -372,18 +346,13 @@ def convert_to_token_sharded_tp(
     root: nn.Module,
     tp: "TokenShardedTP",
     *,
-    containers: Iterable[str] = ("blocks",),
     exceptions: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Convert ``root``'s blocks in place (see :func:`classify`); returns what converted."""
-    containers = tuple(containers)
-    for container_name in containers:
-        for name, m in root.get_submodule(container_name).named_modules():
-            if isinstance(m, TokenShardedAdapter):
-                raise ValueError(
-                    f"token-sharded TP: {container_name}.{name} is already token-sharded."
-                )
-    plan = classify(root, containers=containers, exceptions=exceptions)
+    """Convert ``root.blocks`` in place (see :func:`classify`); returns what converted."""
+    for name, m in root.blocks.named_modules():
+        if isinstance(m, TokenShardedAdapter):
+            raise ValueError(f"token-sharded TP: blocks.{name} is already token-sharded.")
+    plan = classify(root, exceptions=exceptions)
     for name, kind in plan.items():
         _convert(root.get_submodule(name), kind, tp, name)
     counts: dict[str, int] = {}

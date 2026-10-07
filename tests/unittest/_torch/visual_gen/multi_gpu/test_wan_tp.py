@@ -158,10 +158,7 @@ _WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 def _make_model_config(
     pretrained_dict, tp_size=1, ulysses_size=1, backend="VANILLA", tp_layout=None
 ):
-    """Create DiffusionModelConfig for testing with TP and/or Ulysses.
-
-    tp_layout="token_sharded" enables the token-sharded TP layout (needs tp_size > 1).
-    """
+    """Create DiffusionModelConfig for testing with TP and/or Ulysses."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = tp_size * ulysses_size
     if ws > 1 and dist.is_initialized():
@@ -177,11 +174,7 @@ def _make_model_config(
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
-        parallel=ParallelConfig(
-            tp_size=tp_size,
-            ulysses_size=ulysses_size,
-            tp_layout=tp_layout,
-        ),
+        parallel=ParallelConfig(tp_size=tp_size, ulysses_size=ulysses_size, tp_layout=tp_layout),
         cache=None,
         attention_metadata_state=(
             create_attention_metadata_state() if backend.upper() == "TRTLLM" else None

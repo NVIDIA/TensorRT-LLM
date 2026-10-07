@@ -12,55 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token-sharded tensor parallelism (Megatron-style sequence parallelism) for VisualGen DiT blocks.
+"""Token-sharded tensor parallelism for VisualGen DiT blocks (``tp_layout='token_sharded'``).
 
-With plain tensor parallelism (TP) every row-parallel projection ends in an
-all-reduce and every rank holds the full, replicated residual stream. With
-``parallel_config.tp_layout='token_sharded'`` the residual stream between projections is
-instead *token-sharded* across the TP group:
+Megatron-style sequence parallelism inside the TP group: between projections each TP rank holds
+only its rows of the residual stream (:class:`TokenShardPlan`). Each row-parallel all-reduce
+becomes a reduce-scatter to those rows, and the next column-parallel projection all-gathers them
+first (as NVFP4 when that projection has a static NVFP4 input scale). Only row-local ops
+(residual adds, norms, modulation, quantization) run on the shard; attention, QK-norm and RoPE
+see all tokens, with heads sharded as in plain TP. This is not Ulysses / ring / attn2d, which
+shard the sequence through attention, and cannot be combined with them yet.
 
-Layout
-    The ``B`` samples of ``S`` tokens are padded per sample to ``S_pad`` tokens
-    (``S_pad = S`` unless ``B * S`` is not divisible by ``tp``, see
-    :class:`TokenShardPlan`) and flattened to ``[B * S_pad]`` rows. TP rank ``r``
-    owns rows ``[r * m, (r + 1) * m)`` with ``m = B * S_pad / tp``.
+Numerics: the reduce-scatter may sum the K-partials in another order and with another NCCL
+algorithm than the all-reduce. At ``tp >= 8`` on NVSwitch systems NCCL's default runs the
+all-reduce as NVLS but the reduce-scatter as a ring (bf16 rounding per hop), which is measurably
+less precise; ``NCCL_ALGO="ReduceScatter:NVLS"`` restores bitwise parity at a latency cost.
 
-The three boundaries of a DiT block
-    Every all-reduce after a row-parallel projection (attention ``to_out``,
-    cross-attention ``to_out``, MLP ``down_proj``) becomes::
-
-        row-parallel GEMM (K-partials, [B*S_pad, N]) -> reduce-scatter -> [m, N]
-        row-local residual (+gate), LayerNorm (+AdaLN) (+static NVFP4 quantize) on m rows
-        all-gather (bf16, or NVFP4 payload + scaling factors) -> column-parallel GEMM on B*S rows
-
-Invariant
-    Only row-local ops (residual adds, norms, modulation, quantization) run on the
-    shard. Token-mixing ops (self/cross attention, QK-norm, RoPE) always see the full
-    ``[B, S]`` token set with heads sharded exactly as in plain TP, and every GEMM runs
-    on all tokens (the row-parallel output projections see ``B * S_pad`` rows when a
-    shape is padded).
-
-Numerics
-    Token-sharded TP differs from the all-reduce path in its collectives: the reduce-scatter may
-    sum the K-partials in a different order *and with a different NCCL algorithm*. With
-    NCCL's default tuning at ``tp >= 8`` on NVSwitch systems the all-reduce runs as NVLS
-    while the reduce-scatter runs as a ring, which rounds to bf16 after each hop, so
-    Token-sharded TP is then measurably less precise than all-reduce TP (``NCCL_ALGO=
-    "ReduceScatter:NVLS"`` restores bitwise parity at a latency cost). The row-local
-    norms and residual adds are the model's own code, run on the shard.
-
-This is not Ulysses or Ring attention (``ulysses_size`` / ``ring_size`` /
-``attn2d_size``): those shard the sequence *through* attention; this only shards it
-*between* projections inside a TP group, and is exclusive with them for now.
-
-This module holds :class:`TokenShardPlan` and :class:`TokenShardedTP`: the plan cache,
-``shard`` / ``unshard``, per-shard modulation tables, ``reduce_scatter`` / ``all_gather``
-(bf16, or NVFP4 with the scaling-factor regroup) and the adapters' input preparation.
-Models do not call it directly: ``SequenceSharder.use_token_sharded_tp`` carries the
-layout through a model's existing sharder call sites, and
-``token_sharded_modules`` converts its TP modules.
-
-See ``TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md`` next to this file.
+A model opts in with ``_supports_token_sharded_tp = True`` and ``self._apply_tp_layout()`` at
+the end of ``__init__``, which replaces its ``self.sharder`` with a
+:class:`TokenShardedSequenceSharder` and converts the TP modules of its ``self.blocks``
+(``token_sharded_modules``).
+Its forward routes the residual stream through ``sharder.shard`` / ``gather``, per-token tables
+through ``shard(..., expected_seq_len=S)`` and per-sample tables through ``shard_per_sample``,
+while ``shard_rope`` leaves RoPE whole. Code between projections must be row-local.
 """
 
 import math
@@ -75,46 +48,43 @@ import torch.nn.functional as F
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ...modules.linear import Linear, is_static_nvfp4_input_eligible
 from ...utils import Fp4QuantizedTensor, compute_swizzled_sf_shape
+from ..utils import SequenceSharder
 
 if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
 
 __all__ = [
-    "NVFP4_SF_VEC_SIZE",
-    "TokenShardedTP",
     "TokenShardPlan",
+    "TokenShardedSequenceSharder",
+    "TokenShardedTP",
     "quantize_nvfp4",
     "regroup_swizzled_sf",
     "static_nvfp4_input_scale",
     "swizzled_sf_numel",
 ]
 
-NVFP4_SF_VEC_SIZE = 16
-
 # A column projection's input: bf16 rows or a static-scale NVFP4 tensor.
 Activation = torch.Tensor | Fp4QuantizedTensor
 
 
 # =============================================================================
-# Plan (pure Python ints: CPU-testable, torch.compile / CUDA-graph safe)
+# Plan
 # =============================================================================
 
 
 @dataclass(frozen=True)
 class TokenShardPlan:
-    """Static token-shard plan for one ``(batch_size, seq_len)`` on one TP rank.
+    """Which rows of the flattened ``[B * S_pad]`` token stream one TP rank holds.
 
-    Python ints only, so it is compile/graph safe; cached per shape by
-    :meth:`TokenShardedTP.begin`.
-
-    Padding rule: with ``d = gcd(tp, B)`` and ``t' = tp / d`` every sample is padded at
-    its end to ``S_pad = round_up(S, t')`` tokens. Then every aligned group of
-    ``rows_per_entry = S_pad / t'`` local rows lies inside one sample, so a
-    per-sample modulation table needs only ``B / d <= B`` entries on every rank
-    (``entry_batch``), for every shape. Padding happens iff ``B * S % tp != 0``.
+    Each sample is zero-padded at its end to ``S_pad`` (only when ``B * S % tp != 0``) so that
+    every aligned group of ``g`` local rows lies inside one sample: the shard views as
+    ``[n, g, D]`` and a per-sample table needs only ``n = B / gcd(tp, B)`` entries on every rank.
+    Python ints only (compile / CUDA-graph safe); each new ``(B, S)`` specializes the compiled
+    blocks (eager past Dynamo's ``cache_size_limit``), so warm up every served shape.
     """
 
     batch_size: int  # B
@@ -190,7 +160,7 @@ class TokenShardPlan:
 
 
 # =============================================================================
-# Pure row-local and layout functions (no process group)
+# NVFP4 helpers
 # =============================================================================
 
 
@@ -203,15 +173,11 @@ def swizzled_sf_numel(rows: int, sf_cols: int) -> int:
 def regroup_swizzled_sf(sf_cat: torch.Tensor, plan: TokenShardPlan, sf_cols: int) -> torch.Tensor:
     """Re-tile ``tp`` gathered per-rank swizzled SF buffers into one buffer for ``B * S`` rows.
 
-    Each rank's buffer is the 128x4 layout for ``pad128(m)`` rows (pad rows
-    uninitialized), where element ``(row, k)`` sits at
-    ``[row // 128][k // 4][row % 32][(row % 128) // 32][k % 4]``. The result is the same
-    layout for the ``B * S`` real rows: each rank's 128-row tile padding and the
-    per-sample token padding are dropped.
-
-    Zero-copy fast path (a slice of ``sf_cat``) when ``m % 128 == 0`` and the plan is
-    unpadded or ``B == 1``: a row's offset does not depend on the total row count.
-    Otherwise views/permutes/pads only (one gather-copy kernel under Inductor).
+    Each rank's buffer is the 128x4 layout for ``pad128(m)`` rows, element ``(row, k)`` at
+    ``[row // 128][k // 4][row % 32][(row % 128) // 32][k % 4]``; the per-rank tile padding and
+    the per-sample token padding are dropped. A slice of ``sf_cat`` (zero-copy) when
+    ``m % 128 == 0`` and the plan is unpadded or ``B == 1``, since a row's offset does not
+    depend on the total row count.
     """
     tp, m = plan.tp_size, plan.local_rows
     if m % 128 == 0 and (not plan.is_padded or plan.batch_size == 1):
@@ -232,14 +198,12 @@ def regroup_swizzled_sf(sf_cat: torch.Tensor, plan: TokenShardPlan, sf_cols: int
 
 
 def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
-    """The consumer's static (calibrated) NVFP4 ``input_scale``, or None.
+    """``linear``'s static NVFP4 ``input_scale``, or None.
 
-    Non-None iff ``linear`` quantizes its input to NVFP4 with 16-element blocks from a
-    calibrated scale (no AWQ ``pre_quant_scale``, no forced dynamic quantization), i.e.
-    iff a row-local quantize with this scale yields exactly the bytes the Linear would
-    produce itself, so the activation can be all-gathered as NVFP4. The column and MLP
-    adapters quantize before their all-gather by this rule, and models that fuse the
-    quantize into their norm (Wan) wire the norm's scale from it.
+    Non-None iff quantizing each rank's rows with this scale gives exactly the bytes ``linear``
+    would produce on all rows (calibrated scale, 16-element blocks, no AWQ ``pre_quant_scale``,
+    no forced dynamic quantization), so its input can be all-gathered as NVFP4. Inputs of other
+    consumers are gathered as BF16.
     """
     if not is_static_nvfp4_input_eligible(linear):
         return None
@@ -249,12 +213,11 @@ def static_nvfp4_input_scale(linear: nn.Module | None) -> torch.Tensor | None:
 
 
 def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTensor:
-    """Static-scale NVFP4 quantize of ``h`` ([..., K] -> [rows, K/2] + swizzled SF).
+    """Static-scale NVFP4 quantize of ``h`` (``[..., K]`` -> ``[rows, K/2]`` + swizzled SF).
 
-    Pinned to ``trtllm::fp4_quantize``, the op ``NVFP4LinearMethod._input_prepare`` uses
-    without tuning, even when VisualGen tunes the Linear's quantize: the tunable op may pick
-    FlashInfer's kernel, which shuffles rows and scaling factors in 128-row tiles, while
-    the all-gather and :func:`regroup_swizzled_sf` need plain row order and the 128x4 layout.
+    Pinned to ``trtllm::fp4_quantize`` even when VisualGen tunes the Linears' quantize: the
+    tunable op may pick FlashInfer's kernel, which shuffles rows and SF in 128-row tiles, while
+    the all-gather and :func:`regroup_swizzled_sf` need plain row order.
     """
     h2 = h.reshape(-1, h.shape[-1]).contiguous()
     fp4, sf = torch.ops.trtllm.fp4_quantize(h2, input_scale, NVFP4_SF_VEC_SIZE, False)
@@ -262,7 +225,7 @@ def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTe
 
 
 # =============================================================================
-# Private collective seam (the only place a communication primitive is chosen)
+# Collectives
 # =============================================================================
 
 
@@ -286,18 +249,17 @@ def _reduce_scatter_rows(y: torch.Tensor, group_name: str) -> torch.Tensor:
 
 
 class TokenShardedTP:
-    """Megatron-style sequence parallelism inside a VisualGen TP group (see module docstring).
+    """The token plan and collectives of one transformer's TP group (see the module docstring).
 
-    Not an nn.Module (no parameters/state_dict; safe under MetaInitMode). One instance
-    per transformer (per token stream); blocks hold a plain reference. The model forward
-    calls ``begin(B, S)`` and ``shard`` eagerly before the blocks and ``unshard`` after
-    them; the blocks read the cached :class:`TokenShardPlan` through ``plan``.
+    The model's :class:`TokenShardedSequenceSharder` calls :meth:`begin` and :meth:`shard`
+    eagerly before the blocks and :meth:`unshard` after them; the adapters inside the blocks
+    read :attr:`plan`. One instance per token stream: models with several streams (e.g. MMDiT
+    text + image) are not supported. Not an ``nn.Module``, so the adapters hold it as a plain
+    attribute.
 
     Args:
-        group: The TP process group (any ``torch.distributed`` group with >= 2 ranks).
-            The group rank order is the token-shard order.
-        tp_rank: Optional expected rank of this process in ``group``; a mismatch raises
-            (catches a mapping whose TP rank differs from the group's rank order).
+        group: The TP process group; its rank order is the token-shard order.
+        tp_rank: Expected rank of this process in ``group``; a mismatch raises.
     """
 
     def __init__(self, group: dist.ProcessGroup | None, *, tp_rank: int | None = None) -> None:
@@ -328,53 +290,25 @@ class TokenShardedTP:
         self._plan: TokenShardPlan | None = None
 
     @classmethod
-    def from_model_config(cls, model_config: "DiffusionModelConfig") -> "TokenShardedTP | None":
-        """The helper for a VisualGen model, or None unless ``tp_layout`` is ``'token_sharded'``.
-
-        Re-validates the mapping and cache backend for callers that build a
-        ``DiffusionModelConfig`` directly (the ``VisualGenArgs`` validators cover the
-        user-facing path).
-        """
-        parallel = getattr(model_config, "parallel", None)
-        if not getattr(parallel, "token_sharded_tp", False):
-            return None
+    def from_model_config(cls, model_config: "DiffusionModelConfig") -> "TokenShardedTP":
+        """The helper for the TP group of ``model_config.visual_gen_mapping``."""
         vgm = model_config.visual_gen_mapping
         if vgm is None:
             raise ValueError(
                 "TokenShardedTP: tp_layout='token_sharded' needs a VisualGenMapping "
                 "(model_config.visual_gen_mapping is None)."
             )
-        if vgm.tp_size <= 1 or vgm.seq_size > 1:
-            raise ValueError(
-                "TokenShardedTP: tp_layout='token_sharded' needs a VisualGenMapping "
-                f"with tp_size > 1 and seq_size == 1 (got tp_size={vgm.tp_size}, "
-                f"seq_size={vgm.seq_size}: ulysses={vgm.ulysses_size}, ring={vgm.ring_size}, "
-                f"attn2d={vgm.attn2d_row_size}x{vgm.attn2d_col_size})."
-            )
-        if model_config.cache_backend == "cache_dit":
-            raise ValueError(
-                "TokenShardedTP: tp_layout='token_sharded' does not support "
-                "cache_backend='cache_dit' (per-block skip decisions would see "
-                "token-sharded hidden states)."
-            )
         return cls(vgm.tp_group_pg, tp_rank=vgm.tp_rank)
 
     # --- plan -----------------------------------------------------------------------
 
     def begin(self, batch_size: int, seq_len: int) -> TokenShardPlan:
-        """Select (and cache) the plan for this forward's ``(B, S)``; call eagerly.
+        """Select and cache this rank's plan for ``(batch_size, seq_len)``.
 
-        The first use of a shape checks with one ``all_gather_object`` that all TP ranks
-        run the same shape (a mismatch would otherwise hang or corrupt the NCCL
-        collectives). Later calls with a cached shape skip the check, so a rank that
-        reuses a cached shape while a peer runs a new one is not detected.
-
-        Args:
-            batch_size: ``B``, samples in this forward (e.g. 2 for batched CFG).
-            seq_len: ``S``, tokens per sample.
-
-        Returns:
-            This rank's :class:`TokenShardPlan`, also available as ``self.plan``.
+        Call eagerly, and for a new shape before any CUDA-graph capture: the first use of a
+        shape checks with an ``all_gather_object`` that all TP ranks run that shape (a mismatch
+        would hang or corrupt the collectives). Later uses skip the check, so a rank that reuses
+        a cached shape while a peer starts a new one is not detected.
         """
         key = (batch_size, seq_len)
         plan = self._plans.get(key)
@@ -408,8 +342,8 @@ class TokenShardedTP:
     def plan(self) -> TokenShardPlan:
         if self._plan is None:
             raise RuntimeError(
-                "TokenShardedTP.begin(batch_size, seq_len) must be called (in the model "
-                "forward) before the first block runs."
+                "TokenShardedTP.begin(batch_size, seq_len) must be called before the first block "
+                "runs; shard the token stream with the model's sharder.shard() first."
             )
         return self._plan
 
@@ -438,7 +372,7 @@ class TokenShardedTP:
                 "shard(), or call begin() for another shape in between?"
             )
 
-    # --- entry / exit / per-token metadata (once per forward) ---------------------------
+    # --- shard / unshard / per-shard tables -------------------------------------------
 
     def _local_pieces(self, t: torch.Tensor, op: str) -> list[torch.Tensor]:
         p = self.plan
@@ -472,11 +406,12 @@ class TokenShardedTP:
         return out.view(p.batch_size, p.seq_len, -1)
 
     def local_view(self, t: torch.Tensor) -> torch.Tensor:
-        """This rank's ``[m, *rest]`` rows -> ``[n, g, *rest]`` sample groups (a view).
+        """This rank's ``[m, *rest]`` rows as ``[n, g, *rest]`` sample groups (a view).
 
-        ``n = len(plan.entry_batch)`` and ``g = plan.rows_per_entry``: every group lies inside
-        one sample, so a per-sample ``[n, 1, D]`` table (:meth:`per_sample_table`) broadcasts
-        over the shard as a ``[B, 1, D]`` table does over ``[B, S, D]``.
+        Every group lies inside one sample, so a per-sample ``[n, 1, D]`` table
+        (:meth:`per_sample_table`) broadcasts over the shard as a ``[B, 1, D]`` table does over
+        ``[B, S, D]``: block code written for ``[B, S, D]`` runs unchanged on the shard, and a
+        fused AdaLN kernel reads ``seq_len_per_batch = g`` from the shapes.
         """
         p = self.plan
         return t.view(len(p.entry_batch), p.rows_per_entry, *t.shape[1:])
@@ -503,8 +438,22 @@ class TokenShardedTP:
             scale = static_nvfp4_input_scale(consumer)
             if scale is not None:
                 act = quantize_nvfp4(act, scale)
-        self._check_fp4_consumer(consumer, act, "gather_input", "the consuming projection")
+        self._check_fp4_consumer(consumer, act)
         return self.all_gather(act)
+
+    @staticmethod
+    def _check_fp4_consumer(consumer: object, act: Activation) -> None:
+        # An NVFP4-gathered activation is only valid for a consumer that would quantize
+        # with the same static input_scale (a Linear silently uses its own alpha).
+        if (
+            isinstance(act, Fp4QuantizedTensor)
+            and isinstance(consumer, Linear)
+            and static_nvfp4_input_scale(consumer) is None
+        ):
+            raise ValueError(
+                "TokenShardedTP.gather_input: got an NVFP4 activation, but the consuming "
+                "projection has no static NVFP4 input_scale; gather BF16 for it."
+            )
 
     def pad_row_input(self, act: torch.Tensor) -> torch.Tensor:
         """A row projection's input for all tokens -> ``[B * S_pad, K]`` (zero rows per sample).
@@ -557,14 +506,10 @@ class TokenShardedTP:
     # --- primitives -------------------------------------------------------------------
 
     def reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
-        """K-partial sums -> this rank's reduced ``[m, N]`` rows.
+        """Row-parallel K-partials -> this rank's reduced ``[m, N]`` rows.
 
-        Args:
-            partial: ``[B * S_pad, N]`` (padded stream) or ``[B * S, N]`` / ``[B, S, N]``
-                (padded here) partial sums of a row-parallel GEMM.
-
-        Returns:
-            ``[m, N]``.
+        ``partial`` is the padded ``[B * S_pad, N]`` stream, or ``[B * S, N]`` / ``[B, S, N]``,
+        which is padded here.
         """
         p = self.plan
         n = partial.shape[-1]
@@ -578,16 +523,10 @@ class TokenShardedTP:
         return _reduce_scatter_rows(partial, self.group_name)
 
     def all_gather(self, act_loc: Activation) -> Activation:
-        """This rank's ``[m, K]`` rows -> all ``[B * S, K]`` rows (padding dropped).
+        """This rank's ``[m, K]`` rows -> all ``[B * S, K]`` rows, padding dropped.
 
-        Args:
-            act_loc: ``[m, K]`` bf16/fp32 rows, or an :class:`Fp4QuantizedTensor` from a
-                static-scale quantize (payload ``[m, K/2]``, 128x4-swizzled SF for ``m``
-                rows), which is gathered as NVFP4.
-
-        Returns:
-            ``[B * S, K]``, or an :class:`Fp4QuantizedTensor` with payload
-            ``[B * S, K/2]`` and the SF regrouped for ``B * S`` rows.
+        A static-scale :class:`Fp4QuantizedTensor` (payload ``[m, K/2]``, 128x4-swizzled SF for
+        ``m`` rows) is gathered as NVFP4 and returned with its SF regrouped for ``B * S`` rows.
         """
         p = self.plan
         if isinstance(act_loc, Fp4QuantizedTensor):
@@ -604,17 +543,14 @@ class TokenShardedTP:
         m = self.plan.local_rows
         if a.reciprocal_scale is not None:
             raise ValueError(
-                "TokenShardedTP.all_gather: cannot gather an Fp4QuantizedTensor with a "
-                "per-rank dynamic scale (reciprocal_scale is set): each rank used a different "
-                "global scale. Gather the BF16 activation, or quantize with the consumer's "
-                "static input_scale."
+                "TokenShardedTP.all_gather: cannot gather an Fp4QuantizedTensor with a per-rank "
+                "dynamic scale (reciprocal_scale is set); gather BF16, or quantize with the "
+                "consumer's static input_scale."
             )
         if a.unquantized_hidden_states is not None:
             raise ValueError(
-                "TokenShardedTP.all_gather: the Fp4QuantizedTensor carries a local "
-                "unquantized_hidden_states side-car, which cannot be gathered with it; drop "
-                "the side-car (gather payload + scaling factors only) or gather the BF16 "
-                "activation."
+                "TokenShardedTP.all_gather: cannot gather the unquantized_hidden_states side-car "
+                "of an Fp4QuantizedTensor; drop it or gather BF16."
             )
         payload = a.fp4_tensor
         if payload.dtype != torch.uint8 or payload.dim() != 2 or payload.shape[0] != m:
@@ -633,18 +569,63 @@ class TokenShardedTP:
             )
         return payload, a.scaling_factor.reshape(-1), k
 
-    # --- consumer checks ----------------------------------------------------------------
 
-    @staticmethod
-    def _check_fp4_consumer(consumer: object, act: Activation, op: str, what: str) -> None:
-        # An NVFP4-gathered activation is only valid for a consumer that would quantize
-        # with the same static input_scale (a Linear silently uses its own alpha).
-        if (
-            isinstance(act, Fp4QuantizedTensor)
-            and isinstance(consumer, Linear)
-            and static_nvfp4_input_scale(consumer) is None
-        ):
+# =============================================================================
+# TokenShardedSequenceSharder
+# =============================================================================
+
+
+class TokenShardedSequenceSharder(SequenceSharder):
+    """A model's ``SequenceSharder`` under token-sharded TP (set by ``_apply_tp_layout``).
+
+    ``shard`` gives this TP rank its rows of a ``[B, S, ...]`` tensor as ``[n, g, ...]``
+    sample groups, ``shard_per_sample`` slices a ``[B, ...]`` table to those groups and
+    ``gather`` restores ``[B, S, ...]``. The sequence-parallel state (``is_active``, ``size``,
+    ``group``) stays inactive, so RoPE stays whole and Ulysses-only code paths stay off.
+    """
+
+    token_sharded_tp = True
+
+    def __init__(self, tp: TokenShardedTP):
+        super().__init__(size=1, rank=0, group=None)
+        self._tp = tp
+
+    def shard(
+        self,
+        tensor: torch.Tensor | None,
+        dim: int = 1,
+        *,
+        expected_seq_len: int | None = None,
+        pad_to_multiple: bool = False,
+    ) -> torch.Tensor | None:
+        """As :meth:`SequenceSharder.shard`, to this rank's ``[n, g, ...]`` sample groups.
+
+        The token stream (no ``expected_seq_len``) selects the forward's plan from its
+        ``[B, S]``; per-token tables are sharded with that plan. ``pad_to_multiple`` is ignored:
+        the plan pads each sample and ``gather`` drops the padding.
+        """
+        if tensor is None:
+            return None
+        if dim != 1:
             raise ValueError(
-                f"TokenShardedTP.{op}: got an NVFP4 activation, but {what} has no static "
-                "NVFP4 input_scale (static_nvfp4_input_scale() is None); gather BF16 for it."
+                "token-sharded TP shards the token dimension of [B, S, ...] tensors (dim=1); "
+                f"got dim={dim}."
             )
+        if expected_seq_len is None:
+            self._tp.begin(tensor.shape[0], tensor.shape[1])
+        elif tensor.shape[1] != expected_seq_len:
+            return tensor
+        return self._tp.local_view(self._tp.shard(tensor))
+
+    def shard_per_sample(self, table: torch.Tensor | None) -> torch.Tensor | None:
+        return None if table is None else self._tp.per_sample_table(table)
+
+    def gather(
+        self, tensor: torch.Tensor, dim: int = 1, *, unpad_to: int | None = None
+    ) -> torch.Tensor:
+        if dim != 1:
+            raise ValueError(
+                f"token-sharded TP gathers the token dimension (dim=1); got dim={dim}."
+            )
+        out = self._tp.unshard(tensor.reshape(self._tp.plan.local_rows, *tensor.shape[2:]))
+        return out if unpad_to is None else out[:, :unpad_to]

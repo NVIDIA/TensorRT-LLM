@@ -12,16 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared references for the TokenShardedTP tests (CPU, collective and kernel files).
-
-* An independent element-by-element model of the 128x4-swizzled NVFP4 scaling-factor
-  layout (``swizzle_ref`` / ``unswizzle_ref``), written from
-  ``get_sf_out_offset_128x4`` in ``cpp/.../quantization.cuh`` rather than from the
-  helper's ``regroup_swizzled_sf``.
-* ``simulated_helper``: a ``TokenShardedTP`` bound to one simulated rank's plan
-  without a process group, for row-local ops (no collective is called).
-* ``padded_rows``: the global padded ``[B * S_pad]`` stream a plan shards.
-"""
+"""Shared helpers for the token-sharded TP tests (CPU, collective and kernel files)."""
 
 import torch
 
@@ -36,7 +27,8 @@ from tensorrt_llm.math_utils import pad_up
 def sf_offsets(rows: int, sf_cols: int, device: torch.device | str = "cpu") -> torch.Tensor:
     """Flat ``[rows * sf_cols]`` element offsets of the 128x4-swizzled SF layout.
 
-    ``get_sf_out_offset_128x4``: ``[m // 128][k // 4][m % 32][(m % 128) // 32][k % 4]``.
+    From ``get_sf_out_offset_128x4`` (quantization.cuh), independent of ``regroup_swizzled_sf``:
+    ``[m // 128][k // 4][m % 32][(m % 128) // 32][k % 4]``.
     """
     num_k_tiles = pad_up(sf_cols, 4) // 4
     m = torch.arange(rows, device=device).view(-1, 1)
@@ -66,16 +58,18 @@ def unswizzle_ref(buf: torch.Tensor, rows: int, sf_cols: int) -> torch.Tensor:
 
 
 def simulated_helper(plan: TokenShardPlan) -> TokenShardedTP:
-    """A TokenShardedTP bound to one simulated rank's plan (no process group).
+    """A TokenShardedTP for one simulated rank's plan, without a process group.
 
-    Only row-local methods (shard, tables, residual, norm, padding) may be called.
+    Only calls that run no collective work: ``begin`` for the plan's own shape, shard,
+    local_view, per_sample_table, pad_row_input, the padding helpers and the collectives'
+    shape checks.
     """
-    sp = TokenShardedTP.__new__(TokenShardedTP)
-    sp.group, sp.group_name = None, "simulated"
-    sp.tp_size, sp.tp_rank = plan.tp_size, plan.tp_rank
-    sp._plans = {(plan.batch_size, plan.seq_len): plan}
-    sp._plan = plan
-    return sp
+    ts = TokenShardedTP.__new__(TokenShardedTP)
+    ts.group, ts.group_name = None, "simulated"
+    ts.tp_size, ts.tp_rank = plan.tp_size, plan.tp_rank
+    ts._plans = {(plan.batch_size, plan.seq_len): plan}
+    ts._plan = plan
+    return ts
 
 
 def padded_rows(t: torch.Tensor, plan: TokenShardPlan) -> torch.Tensor:

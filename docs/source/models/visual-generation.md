@@ -56,13 +56,13 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 
 ### Feature Matrix
 
-| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism | VSA |
+| Model | FP8 blockwise | NVFP4 | TeaCache | Cache-DiT | CPU Offloading | CFG Parallelism | Ulysses Parallelism | Parallel VAE | CUDA Graph | torch.compile | trtllm-serve | Attention2D | Ring Attention | Tensor Parallelism\* | VSA |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **FLUX.1** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FLUX.2** | Yes | Yes | Yes | Yes | No | No | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | No |
-| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes [^wan-tp-sp] | No |
+| **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **Wan 2.1 VSA** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes | Yes |
-| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes [^wan-tp-sp] | No |
+| **Wan 2.2** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No |
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
@@ -73,7 +73,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **HunyuanVideo 1.5** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 | **GlmImage** | Yes | Yes | No | No | No | No | No | No | No | No | Yes | No | No | No | No |
 
-[^wan-tp-sp]: Wan also supports `tp_layout: token_sharded` (token-sharded TP); see [Multi-GPU Parallelism](#multi-gpu-parallelism).
+\* Wan 2.1 and Wan 2.2 (not VSA) also support a token-sharded TP layout (prototype), enabled with `parallel_config.tp_layout: token_sharded`; see [Multi-GPU Parallelism](#multi-gpu-parallelism).
 
 ## Quick Start
 
@@ -413,14 +413,7 @@ Configured under `VisualGenArgs.parallel_config`. Modes can be combined:
     - **Attention2D** (`attn2d_size: [N, M]`): Shards the sequence axis across an `N × M` device mesh (CP degree = `N · M`; total SP degree = `N · M · ulysses_size`).
     - **Ring Attention** (`ring_size: N`): Shards the sequence axis across a 1D ring of `N` ranks, streaming K/V blocks (CP degree = `N`; total SP degree = `N · ulysses_size`; mutually exclusive with Attention2D).
 - **Tensor Parallelism** (`tp_size: N`): Splits attention heads and transformer MLPs across GPUs for faster compute and reduced memory usage.
-    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the transformer's residual stream token-sharded across the TP group between projections, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization in between run on `1/tp_size` of the tokens. It targets `tp_size ≥ 2` within one NVLink domain. With **static (calibrated) NVFP4** checkpoints the activations between projections are all-gathered as NVFP4 (about 3.5x fewer bytes than BF16); dynamic NVFP4 (`dynamic: true`), FP8 and BF16 models all-gather BF16. At `tp_size ≥ 8` NCCL's default reduce-scatter is slightly less precise than the all-reduce it replaces (see the developer guide). Supported for Wan 2.1/2.2 only; not combinable with `ulysses_size`/`ring_size`/`attn2d_size`, Cache-DiT or VSA. CFG parallelism composes; TeaCache is accepted but not yet tested at runtime. Token counts that do not split evenly over `tp_size` are padded per sample. See the [developer guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/parallel/TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md).
-
-      ```yaml
-      parallel_config:
-        cfg_size: 2
-        tp_size: 4
-        tp_layout: token_sharded
-      ```
+    - **Token-sharded TP** (`tp_layout: token_sharded` in `parallel_config`, prototype): Keeps the residual stream sharded by tokens across the TP group, so each all-reduce becomes a reduce-scatter plus an all-gather and the norms, modulation and quantization between projections run on `1/tp_size` of the tokens. Requires `tp_size > 1`; composes with CFG parallelism, not with Ulysses, Ring Attention, Attention2D or VSA. Supported for Wan 2.1 and Wan 2.2.
 
 For multi-node execution, VisualGen relies on the external launcher to terminate
 the remaining ranks when any rank exits. `torchrun` provides this behavior. With
@@ -481,7 +474,3 @@ After these steps, the framework automatically handles:
 - Multi-GPU execution via `DiffusionExecutor`
 - Cache acceleration (if you call `self._setup_cache_acceleration(self.transformer, coefficients=...)` in `post_load_weights()`; supports both TeaCache and Cache-DiT via `VisualGenArgs.cache_config`)
 - Serving via `trtllm-serve` with the full endpoint set
-
-#### Using token-sharded TP in your own DiT
-
-`parallel_config.tp_layout: token_sharded` runs a model's existing forward on a token shard. The model's `SequenceSharder` (the call sites it already has for Ulysses) shards the residual stream and the per-token tables, and a converter turns its tensor-parallel projections into token-sharded adapters. Attention projections that read the hidden states all-gather first; row-parallel projections and MLPs reduce-scatter instead of all-reducing. The model is built exactly as for plain TP. A `BaseDiffusionModel` subclass opts in with `_supports_token_sharded_tp = True` and a call to `self._apply_tp_layout()` at the end of `__init__`. The co-located [developer guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/visual_gen/parallel/TOKEN_SHARDED_TP_DEVELOPER_GUIDE.md) covers the layout, the conversion rules, exceptions and validation, padding and modulation, quantization, and the torch.compile / CUDA-graph rules.

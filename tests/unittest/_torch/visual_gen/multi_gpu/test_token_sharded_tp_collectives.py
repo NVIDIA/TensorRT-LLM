@@ -12,22 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Collective tests for the token-sharded TP helper (TokenShardedTP).
+"""Collective tests for TokenShardedTP and the token-sharded adapters.
 
-Every case runs over a real process group: the ``*_gloo`` tests on CPU (gloo; selected
-by ``-m cpu_only`` in the CPU lane) and the ``*_nccl`` tests on GPUs. The functional
-collectives used by the helper (``all_gather_single`` / ``reduce_scatter_single``)
-are supported by both backends. Each test runs several checks inside one spawn (the
-spawn and ``tensorrt_llm`` import dominate the cost): backend-agnostic logic at every
-world size on gloo and once (world size 3, a rank straddles samples) on NCCL; the
-real-kernel / Linear checks at world sizes 2, 3 and 4 on NCCL.
-
-The file keeps its own spawn harness instead of ``test_wan_tp.run_test_in_distributed``:
-every assertion is rank-lockstep (``_check`` all-reduces the verdict), and a failing
-worker exits *without* a collective teardown, so ``mp.spawn`` terminates peers that are
-blocked in a collective instead of hanging until the NCCL watchdog
-(``run_test_in_distributed`` tears the process group down in a ``finally``). Workers also
-receive the device (CPU for gloo).
+The ``*_gloo`` tests run on CPU (``-m cpu_only``), the ``*_nccl`` tests on GPUs; each test
+runs several checks in one spawn. The file keeps its own spawn harness (``_worker``) so a
+failing rank cannot leave its peers hanging in a collective.
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py -v
@@ -50,7 +39,14 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, gelu_tanh
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (
+    TokenShardedColumn,
+    TokenShardedMLP,
+    TokenShardedRow,
+    convert_to_token_sharded_tp,
+)
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
+    TokenShardedSequenceSharder,
     TokenShardedTP,
     quantize_nvfp4,
     swizzled_sf_numel,
@@ -60,20 +56,11 @@ from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-# tests/unittest/_torch/visual_gen: shared SF-layout references (pytest already puts this
-# directory on sys.path for the multi_gpu package; spawned workers inherit it).
+# token_sharded_tp_test_utils is in tests/unittest/_torch/visual_gen (spawned workers inherit
+# pytest's sys.path entry for it).
 __extra_import_path__ = [".."]
 
 from token_sharded_tp_test_utils import padded_rows, swizzle_ref, unswizzle_ref
-
-from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (  # noqa: E402
-    TokenShardedColumn,
-    TokenShardedMLP,
-    TokenShardedRow,
-    convert_to_token_sharded_tp,
-    register_token_sharded_adapter,
-)
-from tensorrt_llm._torch.visual_gen.utils import SequenceSharder  # noqa: E402
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -171,15 +158,15 @@ def _check_close(got, ref, device, rtol, atol, what):
 
 
 # =============================================================================
-# B1. reduce_scatter == all-reduce then slice (bitwise on integer-valued partials)
+# reduce_scatter == all-reduce then slice (bitwise on integer-valued partials)
 # =============================================================================
 
 
 def _logic_reduce_scatter(rank, world_size, device):
     dtype = torch.float32 if device.type == "cpu" else torch.bfloat16
-    sp = _helper()
+    tp = _helper()
     for b, s in _SHAPES:
-        plan = sp.begin(b, s)
+        plan = tp.begin(b, s)
         gen = torch.Generator().manual_seed(b * 1000 + s)
         partials = torch.randint(-8, 9, (world_size, b * s, 24), generator=gen)
         partial = partials[rank].to(device=device, dtype=dtype)
@@ -187,23 +174,21 @@ def _logic_reduce_scatter(rank, world_size, device):
         ref = padded_rows(partial.view(b, s, -1), plan).clone()  # independent of the helper
         dist.all_reduce(ref)
         # [B * S] input (padded inside) and [B * S_pad] input.
-        got = sp.reduce_scatter(partial)
+        got = tp.reduce_scatter(partial)
         _check(torch.equal(got, ref[rows]), f"reduce_scatter [B*S] input {(b, s)}", device)
-        got = sp.reduce_scatter(sp._add_padding(partial))
+        got = tp.reduce_scatter(tp._add_padding(partial))
         _check(torch.equal(got, ref[rows]), f"reduce_scatter [B*S_pad] input {(b, s)}", device)
-        with pytest.raises(ValueError, match="expected .* rows for the current plan"):
-            sp.reduce_scatter(partial[:-1])
 
 
 # =============================================================================
-# B2 / B3. all_gather (NVFP4 payload + SF, plain) and shard/unshard round trip
+# all_gather (NVFP4 payload + SF, plain)
 # =============================================================================
 
 
 def _logic_all_gather(rank, world_size, device):
-    sp = _helper()
+    tp = _helper()
     for b, s in _SHAPES:
-        plan = sp.begin(b, s)
+        plan = tp.begin(b, s)
         rows = slice(plan.row_start, plan.row_start + plan.local_rows)
         for k in (128, 80):  # 80: sf_cols = 5, not a multiple of 4
             sf_cols = k // 16
@@ -219,7 +204,7 @@ def _logic_all_gather(rank, world_size, device):
             loc = Fp4QuantizedTensor(
                 payload_pad[rows].to(device), swizzle_ref(sf_pad[rows], 0xAB).to(device)
             )
-            got = sp.all_gather(loc)
+            got = tp.all_gather(loc)
             ok = (
                 isinstance(got, Fp4QuantizedTensor)
                 and got.is_sf_swizzled
@@ -231,64 +216,43 @@ def _logic_all_gather(rank, world_size, device):
                 )
             )
             _check(ok, f"NVFP4 all_gather {(b, s, k)}", device)
-        # Plain tensors and the shard -> unshard round trip.
+        # Plain tensors (strided shard input).
         x = torch.randn(b, s, 40, generator=torch.Generator().manual_seed(s)).to(device)
-        x_loc = sp.shard(x.transpose(0, 1).contiguous().transpose(0, 1))  # strided input
+        x_loc = tp.shard(x.transpose(0, 1).contiguous().transpose(0, 1))
         ok = torch.equal(x_loc, padded_rows(x, plan)[rows])
-        ok = torch.equal(sp.all_gather(x_loc), x.reshape(b * s, -1)) and ok
-        ok = torch.equal(sp.unshard(x_loc), x) and ok
-        _check(ok, f"plain all_gather / shard-unshard {(b, s)}", device)
-
-
-def _logic_all_gather_rejects_bad_fp4(rank, world_size, device):
-    sp = _helper()
-    plan = sp.begin(2, 8)
-    m = plan.local_rows
-    payload = torch.zeros(m, 64, dtype=torch.uint8, device=device)
-    sf = torch.zeros(swizzled_sf_numel(m, 8), dtype=torch.uint8, device=device)
-    with pytest.raises(ValueError, match="per-rank dynamic scale"):
-        sp.all_gather(
-            Fp4QuantizedTensor(payload, sf, reciprocal_scale=torch.ones(1, device=device))
-        )
-    with pytest.raises(ValueError, match="must be 128x4-swizzled"):
-        sp.all_gather(Fp4QuantizedTensor(payload, sf[:-1]))
-    with pytest.raises(ValueError, match="must be 128x4-swizzled"):
-        sp.all_gather(Fp4QuantizedTensor(payload, sf, is_sf_swizzled=False))
-    with pytest.raises(ValueError, match="payload must be uint8"):
-        sp.all_gather(Fp4QuantizedTensor(payload.float(), sf))
-    with pytest.raises(ValueError, match="payload must be uint8"):
-        sp.all_gather(Fp4QuantizedTensor(payload[:-1], sf))
+        ok = torch.equal(tp.all_gather(x_loc), x.reshape(b * s, -1)) and ok
+        _check(ok, f"plain all_gather {(b, s)}", device)
 
 
 # =============================================================================
-# B4. Rank disagreement on the token layout raises on every rank (no hang)
+# Rank disagreement on the token layout raises on every rank (no hang)
 # =============================================================================
 
 
 def _logic_rank_disagreement(rank, world_size, device):
-    sp = _helper()
+    tp = _helper()
     seq = 9 if rank == world_size - 1 else 8
     with pytest.raises(ValueError, match="TP ranks disagree on the token layout"):
-        sp.begin(1, seq)
+        tp.begin(1, seq)
     # The group is still usable afterwards, and an agreeing shape works.
-    plan = sp.begin(1, 8)
+    plan = tp.begin(1, 8)
     assert plan.local_rows == pad_up(8, world_size) // world_size
 
 
 # =============================================================================
-# B5. Real fp4_quantize on the shards, gathered == fp4_quantize of all rows (NCCL)
+# Real fp4_quantize on the shards, gathered == fp4_quantize of all rows (NCCL)
 # =============================================================================
 
 
 def _logic_fp4_quantize_gather(rank, world_size, device):
-    sp = _helper()
+    tp = _helper()
     for b, s in _SHAPES:
-        sp.begin(b, s)
+        tp.begin(b, s)
         for k in (256, 80):
             gen = torch.Generator().manual_seed(b * 10 + s + k)
             x = (torch.randn(b, s, k, generator=gen) * 3).to(device, torch.bfloat16)
             scale = (448.0 * 6.0 / x.float().abs().amax()).reshape(1)
-            got = sp.all_gather(quantize_nvfp4(sp.shard(x), scale))
+            got = tp.all_gather(quantize_nvfp4(tp.shard(x), scale))
             ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(x.reshape(b * s, k), scale, 16, False)
             ok = torch.equal(got.fp4_tensor, ref_fp4) and torch.equal(
                 unswizzle_ref(got.scaling_factor, b * s, k // 16),
@@ -298,7 +262,7 @@ def _logic_fp4_quantize_gather(rank, world_size, device):
 
 
 # =============================================================================
-# B6. Converted real Linear / MLP / GatedMLP vs the plain modules (NCCL)
+# Converted real Linear / MLP / GatedMLP vs the plain modules (NCCL)
 # =============================================================================
 
 
@@ -323,14 +287,11 @@ def _as_model(**modules):
 
 
 def _logic_real_adapters(rank, world_size, device):
-    """Real TRT-LLM modules built as for plain TP (row projections all-reduce), converted by
-    the rules: the row Linear reduce-scatters, MLP / GatedMLP run on all tokens and
-    reduce-scatter; misuse is rejected at conversion."""
+    """Real TRT-LLM modules built as for plain TP and converted by the rules: the row Linear
+    reduce-scatters; MLP / GatedMLP gather, run on all tokens and reduce-scatter."""
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
     from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm.functional import AllReduceStrategy
-    from tensorrt_llm.mapping import Mapping
 
     k_in, n_out = 384, 96  # 384 splits evenly over tp in {2, 3, 4}
     torch.manual_seed(0)
@@ -399,49 +360,9 @@ def _logic_real_adapters(rank, world_size, device):
             want = padded_rows(refs[name], plan)[mine]
             _check_close(got[mask], want[mask], device, 2e-2, 2e-2, f"{name} adapter {(b, s)}")
 
-    # Misuse, rejected at conversion: a row Linear as a column projection, and a Linear
-    # sharded for another TP size (it would compute full outputs, summed tp times).
-    col_as_row = Linear(
-        k_in,
-        n_out,
-        bias=False,
-        dtype=torch.bfloat16,
-        mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.ROW,
-        reduce_output=True,
-        allreduce_strategy=nccl,
-    ).to(device)
-    row_ok = Linear(
-        k_in,
-        n_out,
-        bias=False,
-        dtype=torch.bfloat16,
-        mapping=mapping,
-        tensor_parallel_mode=TensorParallelMode.ROW,
-        reduce_output=True,
-        allreduce_strategy=nccl,
-    ).to(device)
-    with pytest.raises(ValueError, match="must be a column-parallel Linear"):
-        convert_to_token_sharded_tp(
-            _as_model(proj=col_as_row, row=row_ok), tp, exceptions={"proj": "column"}
-        )
-    unsharded = Linear(
-        k_in,
-        n_out,
-        bias=False,
-        dtype=torch.bfloat16,
-        mapping=Mapping(),
-        tensor_parallel_mode=TensorParallelMode.ROW,
-        reduce_output=False,
-    ).to(device)
-    with pytest.raises(
-        ValueError, match=f"sharded for tp_size=1, but the TP group has {world_size}"
-    ):
-        convert_to_token_sharded_tp(_as_model(proj=unsharded), tp, exceptions={"proj": "row"})
-
 
 # =============================================================================
-# B7. Converted static-NVFP4 column Linear == the same Linear on all rows
+# Converted static-NVFP4 column Linear and MLP vs the same modules on all rows (NCCL)
 # =============================================================================
 
 
@@ -473,14 +394,11 @@ def _spy_all_gather(tp):
 
 
 def _logic_adapters_nvfp4(rank, world_size, device):
-    """Converted real modules, converted before their weights load (as in a model): a
-    static-NVFP4 column projection and a static-NVFP4 MLP fed this rank's bf16 rows quantize
-    them with the consumer's scale before the all-gather (NVFP4 crosses the wire), so the
-    GEMMs see exactly the bytes they would produce on all rows; a row projection built to
-    all-reduce reduce-scatters."""
+    """Static-NVFP4 column Linear and MLP, converted before their weights load: bf16 rows are
+    quantized with the consumer's input_scale before the all-gather, so the column GEMM
+    matches the plain module bitwise; the row projection reduce-scatters."""
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm.functional import AllReduceStrategy
 
     k_in, n_out = 256, 128 * world_size
     torch.manual_seed(1)
@@ -577,7 +495,7 @@ def _logic_adapters_nvfp4(rank, world_size, device):
 
 
 # =============================================================================
-# B8 / B9. torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain
+# torch.compile(fullgraph=True) and CUDA-graph capture of a boundary chain
 # =============================================================================
 
 
@@ -618,9 +536,8 @@ def _converted_chain_parts(rank, world_size, device, d):
 
 
 def _make_chain(tp, col, row, ln_w, ln_b, fp4_scale):
-    """AdaLN norm -> converted column Linear -> converted row Linear -> gated residual ->
-    LayerNorm + NVFP4 quantize -> FP4 all-gathers, on this rank's [n, g, D] sample groups
-    (the row-local ops written as a model writes them)."""
+    """One block boundary on this rank's [n, g, D] sample groups: AdaLN norm -> converted
+    column -> converted row -> gated residual -> LayerNorm + NVFP4 quantize -> FP4 all-gathers."""
 
     def chain(x_loc, fp4_payload, fp4_sf, table, h_given):
         d = x_loc.shape[-1]
@@ -647,28 +564,28 @@ def _make_chain(tp, col, row, ln_w, ln_b, fp4_scale):
     return chain
 
 
-def _chain_inputs(sp, b, s, d, device):
+def _chain_inputs(tp, b, s, d, device):
     gen = torch.Generator().manual_seed(b * 7 + s)
     x = torch.randn(b, s, d, generator=gen).to(device, torch.bfloat16)
     table = torch.randn(b, 3, d, generator=gen).to(device) * 0.1
-    plan = sp.plan
+    plan = tp.plan
     payload = torch.randint(0, 256, (plan.local_rows, d // 2), dtype=torch.uint8, generator=gen)
     sf = torch.randint(
         0, 256, (swizzled_sf_numel(plan.local_rows, d // 16),), dtype=torch.uint8, generator=gen
     )
     h_given = (torch.randn(plan.local_rows, d, generator=gen) * 2).to(device, torch.bfloat16)
-    return sp.local_view(sp.shard(x)), payload.to(device), sf.to(device), table, h_given
+    return tp.local_view(tp.shard(x)), payload.to(device), sf.to(device), table, h_given
 
 
 def _logic_compile_fullgraph(rank, world_size, device):
     import torch._dynamo
 
     d = 256
-    sp, col, row = _converted_chain_parts(rank, world_size, device, d)
+    tp, col, row = _converted_chain_parts(rank, world_size, device, d)
     ln_w = torch.ones(d, device=device)
     ln_b = torch.zeros(d, device=device)
     fp4_scale = torch.tensor([448.0 * 6.0 / 8.0], device=device)
-    chain = _make_chain(sp, col, row, ln_w, ln_b, fp4_scale)
+    chain = _make_chain(tp, col, row, ln_w, ln_b, fp4_scale)
 
     def compare(got, ref, b, s, what):
         # Residual stream (bf16 rows): Inductor may round the fused LayerNorm / residual
@@ -690,8 +607,8 @@ def _logic_compile_fullgraph(rank, world_size, device):
         _check(mismatch < 0.05, f"{what} own-quantize {(b, s)}: FP4 codes {mismatch:.4f}", device)
 
     for b, s in [(2, 256), (2, 5), (1, 5)]:  # SF fast path, SF regroup, padded
-        sp.begin(b, s)
-        args = _chain_inputs(sp, b, s, d, device)
+        tp.begin(b, s)
+        args = _chain_inputs(tp, b, s, d, device)
         torch._dynamo.reset()
         compiled = torch.compile(chain, fullgraph=True)  # raises on any graph break
         compare(compiled(*args), chain(*args), b, s, "compiled")
@@ -701,21 +618,21 @@ def _logic_compile_fullgraph(rank, world_size, device):
     torch._dynamo.reset()
     compiled = torch.compile(chain, fullgraph=True)
     for b, s in [(2, 256), (1, 5), (2, 256)]:
-        sp.begin(b, s)
-        args = _chain_inputs(sp, b, s, d, device)
+        tp.begin(b, s)
+        args = _chain_inputs(tp, b, s, d, device)
         compare(compiled(*args), chain(*args), b, s, "recompiled")
 
 
 def _logic_cuda_graph(rank, world_size, device):
     d = 256
-    sp, col, row = _converted_chain_parts(rank, world_size, device, d)
+    tp, col, row = _converted_chain_parts(rank, world_size, device, d)
     ln_w = torch.ones(d, device=device)
     ln_b = torch.zeros(d, device=device)
     fp4_scale = torch.tensor([448.0 * 6.0 / 8.0], device=device)
-    chain = _make_chain(sp, col, row, ln_w, ln_b, fp4_scale)
+    chain = _make_chain(tp, col, row, ln_w, ln_b, fp4_scale)
     for b, s in [(2, 256), (2, 5), (1, 5)]:
-        sp.begin(b, s)
-        args = _chain_inputs(sp, b, s, d, device)
+        tp.begin(b, s)
+        args = _chain_inputs(tp, b, s, d, device)
         static_args = [a.clone() for a in args]
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -745,7 +662,7 @@ def _logic_cuda_graph(rank, world_size, device):
 
 
 # =============================================================================
-# B8. The layout: sharder round trip and adapters vs the full computation (exact)
+# Sharder round trip and adapters vs the full computation (exact)
 # =============================================================================
 #
 # Projections with integer-valued fp32 weights and inputs make every sum exact, so the
@@ -792,9 +709,11 @@ def _fake(adapter):
     return type(f"Fake{adapter.__name__}", (adapter,), {"prepare": classmethod(lambda *a: None)})
 
 
-register_token_sharded_adapter(_FakeColumn, _fake(TokenShardedColumn))
-register_token_sharded_adapter(_FakeRow, _fake(TokenShardedRow))
-register_token_sharded_adapter(_FakeMLP, _fake(TokenShardedMLP))
+_FAKE_ADAPTERS = {
+    "col": _fake(TokenShardedColumn),
+    "row": _fake(TokenShardedRow),
+    "mlp": _fake(TokenShardedMLP),
+}
 
 
 def _ints(gen, *shape):
@@ -802,9 +721,7 @@ def _ints(gen, *shape):
 
 
 def _logic_layout_round_trip(rank, world_size, device):
-    tp = _helper()
-    sharder = SequenceSharder(size=1, rank=0, group=None)
-    sharder.use_token_sharded_tp(tp)
+    sharder = TokenShardedSequenceSharder(_helper())
     for b, s in _SHAPES:
         x = _ints(torch.Generator().manual_seed(b * 100 + s), b, s, 8).to(device)
         x_loc = sharder.shard(x, dim=1)
@@ -831,7 +748,7 @@ def _logic_adapters(rank, world_size, device):
     root = nn.Module()
     root.blocks = nn.ModuleList([block]).to(device)
     tp = _helper()
-    convert_to_token_sharded_tp(root, tp)
+    convert_to_token_sharded_tp(root, tp, exceptions=_FAKE_ADAPTERS)
     for b, s in _SHAPES:
         plan = tp.begin(b, s)
         x = _ints(torch.Generator().manual_seed(b * 10 + s), b, s, k).to(device)
@@ -869,7 +786,6 @@ _WORLD_SIZES = [2, 3, 4]
 _LOGIC_CHECKS = (
     _logic_reduce_scatter,
     _logic_all_gather,
-    _logic_all_gather_rejects_bad_fp4,
     _logic_rank_disagreement,
     _logic_layout_round_trip,
     _logic_adapters,

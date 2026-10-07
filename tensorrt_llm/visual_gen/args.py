@@ -282,8 +282,6 @@ class ParallelConfig(StrictBaseModel):
     Attention (a 1D mesh); these two are mutually exclusive. Either can be
     combined with Ulysses head-sharding to form an outer × inner sequence
     parallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.
-    ``tp_layout='token_sharded'`` additionally token-shards the transformer's residual
-    stream between projections inside each tensor-parallel group.
     """
 
     parallel_vae_size: int = Field(
@@ -352,13 +350,10 @@ class ParallelConfig(StrictBaseModel):
         None,
         status="prototype",
         description=(
-            "Where the transformer's activations live between tensor-parallel projections. "
-            "'replicated': every TP rank holds all tokens and each row-parallel projection "
-            "all-reduces. 'token_sharded': each rank holds 1/tp_size of the tokens "
-            "(Megatron-style sequence parallelism; unrelated to ulysses/ring/attn2d), so each "
-            "all-reduce becomes a reduce-scatter plus an all-gather (NVFP4 when the next "
-            "projection has a static NVFP4 input scale); requires tp_size > 1 and no "
-            "ulysses/ring/attn2d. None lets the engine decide (currently 'replicated')."
+            "Activation layout between TP projections: 'replicated' (all-reduce TP; the default "
+            "when unset) or 'token_sharded' (each TP rank holds 1/tp_size of the tokens; each "
+            "all-reduce becomes a reduce-scatter plus an all-gather). 'token_sharded' requires "
+            "tp_size > 1 and no ulysses/ring/attn2d."
         ),
     )
 
@@ -835,20 +830,6 @@ class VisualGenArgs(StrictBaseModel):
         if isinstance(data, dict) and data.get("quant_config", "_sentinel") is None:
             data = {**data, "quant_config": QuantConfig()}
         return data
-
-    @model_validator(mode="after")
-    def _validate_token_sharded_tp_cache(self) -> "VisualGenArgs":
-        # Cache-DiT skips blocks based on per-block hidden states, which are token-sharded
-        # under tp_layout='token_sharded'; TeaCache wraps the whole forward and composes.
-        if self.parallel_config.token_sharded_tp and isinstance(self.cache_config, CacheDiTConfig):
-            raise ValueError(
-                "cache_config.cache_backend='cache_dit' is not supported with "
-                "parallel_config.tp_layout='token_sharded': Cache-DiT decides which blocks to "
-                "skip from per-block hidden states, which are token-sharded across TP ranks, so "
-                "ranks could decide differently and deadlock. Use TeaCache "
-                "(cache_backend='teacache') or unset tp_layout."
-            )
-        return self
 
     @property
     def cache_backend(self) -> Optional[CacheBackendName]:

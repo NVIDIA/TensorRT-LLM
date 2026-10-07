@@ -38,7 +38,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
 )
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.modules.rms_norm import RMSNormTPAware
-from tensorrt_llm._torch.visual_gen.parallel import static_nvfp4_input_scale
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
@@ -291,13 +290,6 @@ class WanBlock(nn.Module):
         _layer_idx: int,
         added_kv_proj_dim: int = None,
     ):
-        """Build one Wan transformer block.
-
-        Args:
-            model_config: The transformer's DiffusionModelConfig.
-            _layer_idx: Block index.
-            added_kv_proj_dim: Input dim of the I2V image K/V projections, or None.
-        """
         super().__init__()
         config = model_config.pretrained_config
 
@@ -426,12 +418,11 @@ class WanBlock(nn.Module):
             and _sa_cfg is not None
             and getattr(_sa_cfg, "algorithm", None) == "vsa"
         )
-        if _is_vsa and getattr(model_config.parallel, "token_sharded_tp", False):
+        if _is_vsa and model_config.parallel.token_sharded_tp:
             raise ValueError(
-                "Token-sharded TP does not support Video Sparse Attention "
-                "(sparse_attention_config.algorithm='vsa') yet: the VSA gates are projected "
-                "from the block input, which is token-sharded across TP ranks. Unset "
-                "parallel_config.tp_layout or disable VSA."
+                "Token-sharded TP does not support Video Sparse Attention yet: the VSA gates are "
+                "projected from the token-sharded block input. Unset parallel_config.tp_layout "
+                "or disable VSA."
             )
         if _is_vsa:
             q_dim = num_heads * head_dim
@@ -556,17 +547,6 @@ class WanBlock(nn.Module):
         freqs_sin,
         timestep=None,
     ):
-        # The modulation table must match x: per-sample [B, 6, D] or per-token [B, S, 6, D].
-        # Under token-sharded TP x is this rank's [n, g, D] sample groups and the tables must
-        # be the shard's (SequenceSharder.shard / shard_per_sample); a global table would mix
-        # samples (silently, in the fused AdaLN kernel). The shape check catches that unless
-        # n == B (gcd(tp, B) == 1, e.g. TP3 with B = 2), where only the sharder's table is right.
-        if temb.shape[: temb.ndim - 2] != x.shape[: temb.ndim - 2]:
-            raise ValueError(
-                f"WanBlock: modulation table {tuple(temb.shape)} does not match the hidden "
-                f"states {tuple(x.shape)}; under token-sharded TP pass the sharder's "
-                "per-shard tables."
-            )
         pertoken_adaln = self._pertoken_adaln.prepare(x, temb, self.scale_shift_table)
         if pertoken_adaln is None:
             if temb.ndim == 4:
@@ -657,10 +637,9 @@ class WanBlock(nn.Module):
             encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
             encoder_hidden_states_text = encoder_hidden_states[:, image_context_length:]
 
-        # Text cross-attention. Batch and sequence lengths come from q: under token-sharded TP
-        # norm_x is this rank's shard and the converted to_q returns all tokens.
+        # Text cross-attention
+        batch_size, seq_len = norm_x.shape[:2]
         q, k, v = self.attn2.get_qkv(norm_x, encoder_hidden_states_text)
-        batch_size, seq_len = q.shape[:2]
         q, k = self.attn2.apply_qk_norm(q, k)
         attn2_output = self.attn2._attn_impl(
             q,
@@ -847,8 +826,6 @@ class WanTransformer3DModel(BaseDiffusionModel):
         )
 
         self.__post_init__()
-        # parallel_config.tp_layout='token_sharded': convert the blocks' TP modules (the
-        # projections that read or write the residual stream) and switch self.sharder.
         self._apply_tp_layout()
 
     @property
@@ -925,8 +902,7 @@ class WanTransformer3DModel(BaseDiffusionModel):
         rope = self.sharder.shard_rope((freqs_cos, freqs_sin), seq_len=seq_len, seq_dim=1)
         if rope is not None:
             freqs_cos, freqs_sin = rope
-        # Under token-sharded TP the sharder gives each TP rank its tokens as [n, g, D]
-        # sample groups and leaves RoPE whole (attention sees all tokens).
+        # Token-sharded TP: x holds this rank's [n, g, D] sample groups; RoPE stays whole.
         token_sharded = self.sharder.token_sharded_tp
 
         # Time and text/image embeddings. WAN timestep embeddings use the
@@ -1094,32 +1070,11 @@ class WanTransformer3DModel(BaseDiffusionModel):
                 module.post_load_weights()
 
         # Wire each norm's fp4_scale from the first downstream Linear that consumes its output.
-        # The token-sharded TP path all-gathers these activations as NVFP4, so it uses the helper's
-        # documented eligibility rule (static_nvfp4_input_scale, which also requires NVFP4
-        # activation quantization); both rules agree for every current quant method.
-        fp4_input_scale = (
-            static_nvfp4_input_scale if self.sharder.token_sharded_tp else get_nvfp4_input_scale
-        )
         for block in self.blocks:
             if not isinstance(block, WanBlock):
                 continue
             # qkv_proj exists in FUSE_QKV mode; fall back to to_q in SEPARATE_QKV (async Ulysses).
             attn1_qkv = getattr(block.attn1, "qkv_proj", None) or getattr(block.attn1, "to_q", None)
-            block._norm1_fp4_scale = fp4_input_scale(attn1_qkv)
-            block._norm2_fp4_scale = fp4_input_scale(getattr(block.attn2, "to_q", None))
-            block._norm3_fp4_scale = fp4_input_scale(getattr(block.ffn, "up_proj", None))
-
-        if self.sharder.token_sharded_tp:
-            scales = [
-                getattr(block, f"_norm{i}_fp4_scale")
-                for block in self.blocks
-                if isinstance(block, WanBlock)
-                for i in (1, 2, 3)
-            ]
-            n_fp4 = sum(scale is not None for scale in scales)
-            logger.info_once(
-                f"Token-sharded TP: {n_fp4}/{len(scales)} block-boundary activations are "
-                "all-gathered as NVFP4 (static input_scale); the rest are gathered as BF16 "
-                "(dynamic, AWQ, FP8 or unquantized consumers).",
-                key=("token_sharded_tp_fp4_gather", n_fp4, len(scales)),
-            )
+            block._norm1_fp4_scale = get_nvfp4_input_scale(attn1_qkv)
+            block._norm2_fp4_scale = get_nvfp4_input_scale(getattr(block.attn2, "to_q", None))
+            block._norm3_fp4_scale = get_nvfp4_input_scale(getattr(block.ffn, "up_proj", None))

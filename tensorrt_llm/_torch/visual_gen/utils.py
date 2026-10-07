@@ -1,18 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utility functions for visual generation pipelines."""
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardedTP
 
 
 def make_noise_generator(seed: int, device: torch.device | str) -> torch.Generator:
@@ -145,17 +156,14 @@ class SequenceSharder:
     method is a no-op pass-through so the call sites do not need an
     ``if is_active`` guard.
 
-    The same call sites also carry token-sharded tensor parallelism
-    (``parallel_config.tp_layout='token_sharded'``, see :meth:`use_token_sharded_tp`):
-    ``shard`` / ``gather`` then move the residual stream and per-token tables
-    between ``[B, S, ...]`` and this TP rank's rows, while attention-side inputs
-    (``shard_rope``, ``shard_attention_input``) stay whole.
-
     The sharder is intentionally model-agnostic: dimensions are passed
     explicitly at every call site and no model-specific shape conventions
     leak in (the sole exception is :meth:`shard_rope`, which infers the
     seq axis from a ``seq_len`` argument).
     """
+
+    # True on TokenShardedSequenceSharder (parallel/token_sharded_tp.py).
+    token_sharded_tp = False
 
     def __init__(
         self,
@@ -176,8 +184,6 @@ class SequenceSharder:
                 f"gather_index must be a permutation of range({size}), got {gather_index}"
             )
         self._gather_index = gather_index
-        # TokenShardedTP helper when the TP layout is token-sharded (use_token_sharded_tp).
-        self._token_sharded_tp = None
 
     # ------------------------------------------------------------------
     # Factory
@@ -225,36 +231,12 @@ class SequenceSharder:
 
         return cls(size=size, rank=rank, group=group)
 
-    def use_token_sharded_tp(self, helper: TokenShardedTP) -> None:
-        """Switch these call sites to token-sharded tensor parallelism.
-
-        ``helper`` is the model's ``TokenShardedTP`` (``parallel/token_sharded_tp.py``).
-        ``shard`` then returns this TP rank's rows of a ``[B, S, ...]`` tensor as
-        ``[n, g, ...]`` whole-sample groups (``TokenShardPlan``), ``shard_per_sample``
-        slices ``[B, ...]`` per-sample tables to those groups, ``gather`` restores
-        ``[B, S, ...]``, and ``shard_rope`` / ``shard_attention_input`` leave tensors
-        whole (attention sees all tokens after the column projections' all-gather).
-        ``is_active``, ``size``, ``rank`` and ``group`` keep their sequence-parallel
-        meaning (inactive), so Ulysses-only code paths stay off.
-        """
-        if self.is_active:
-            raise ValueError(
-                "token-sharded TP cannot be combined with sequence parallelism "
-                f"(SequenceSharder size={self._size}): both shard the token dimension."
-            )
-        self._token_sharded_tp = helper
-
     # ------------------------------------------------------------------
     # State
     # ------------------------------------------------------------------
     @property
     def is_active(self) -> bool:
         return self._size > 1
-
-    @property
-    def token_sharded_tp(self) -> bool:
-        """True when these call sites carry token-sharded tensor parallelism."""
-        return self._token_sharded_tp is not None
 
     @property
     def size(self) -> int:
@@ -292,13 +274,7 @@ class SequenceSharder:
         with zeros to a multiple of ``size`` before sharding.  The matching
         :meth:`gather` call must then pass ``unpad_to`` to slice the padding
         back off.
-
-        Under token-sharded TP the call without ``expected_seq_len`` shards the token
-        stream and selects the forward's plan from its ``[B, S]``; tensors passed with
-        ``expected_seq_len`` (per-token tables) must match that plan.
         """
-        if tensor is not None and self._token_sharded_tp is not None:
-            return self._shard_tokens(tensor, dim, expected_seq_len)
         if tensor is None or not self.is_active:
             return tensor
 
@@ -328,58 +304,13 @@ class SequenceSharder:
         # batched CFG B=2); fused DiT kernels need a dense buffer. No-op at B==1.
         return tensor[tuple(idx)].contiguous()
 
-    def _shard_tokens(
-        self, tensor: torch.Tensor, dim: int, expected_seq_len: Optional[int]
-    ) -> torch.Tensor:
-        if dim != 1:
-            raise ValueError(
-                "token-sharded TP shards the token dimension of [B, S, ...] tensors (dim=1); "
-                f"got dim={dim}. Shard attention-side inputs with shard_rope() or "
-                "shard_attention_input(), which leave them whole in this layout."
-            )
-        if expected_seq_len is not None and tensor.shape[1] != expected_seq_len:
-            return tensor
-        tp = self._token_sharded_tp
-        if expected_seq_len is None:
-            tp.begin(tensor.shape[0], tensor.shape[1])  # the token stream: plans this forward
-        else:
-            p = tp.plan
-            if tuple(tensor.shape[:2]) != (p.batch_size, p.seq_len):
-                raise ValueError(
-                    f"token-sharded TP: a per-token tensor {tuple(tensor.shape)} does not match "
-                    f"the token stream's [B={p.batch_size}, S={p.seq_len}] plan; shard the "
-                    "stream first (without expected_seq_len)."
-                )
-        return tp.local_view(tp.shard(tensor))
-
-    def shard_attention_input(
-        self,
-        tensor: Optional[torch.Tensor],
-        dim: int = 1,
-        *,
-        expected_seq_len: Optional[int] = None,
-        pad_to_multiple: bool = False,
-    ) -> Optional[torch.Tensor]:
-        """Shard an attention-side input: positions, masks, attention K/V.
-
-        Sharded like :meth:`shard` under sequence parallelism (attention runs on local
-        tokens there); returned whole under token-sharded TP.
-        """
-        if self._token_sharded_tp is not None:
-            return tensor
-        return self.shard(
-            tensor, dim, expected_seq_len=expected_seq_len, pad_to_multiple=pad_to_multiple
-        )
-
     def shard_per_sample(self, table: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """A per-sample ``[B, ...]`` table for the local tokens.
+        """Return the per-sample ``[B, ...]`` table for the local tokens.
 
-        Under token-sharded TP: the entries of this rank's ``[n, g, ...]`` sample groups
-        (``[n, ...]``). Otherwise unchanged: every rank keeps all ``B`` samples.
+        Unchanged here: every rank holds all ``B`` samples (token-sharded TP slices it to the
+        rank's sample groups).
         """
-        if table is None or self._token_sharded_tp is None:
-            return table
-        return self._token_sharded_tp.per_sample_table(table)
+        return table
 
     def shard_rope(
         self,
@@ -422,8 +353,6 @@ class SequenceSharder:
         tensor's ``dim`` back to the given length; pair with
         ``shard(..., pad_to_multiple=True)`` to round-trip through padding.
         """
-        if self._token_sharded_tp is not None:
-            return self._gather_tokens(tensor, dim, unpad_to)
         if not self.is_active:
             return tensor
 
@@ -439,14 +368,3 @@ class SequenceSharder:
             idx[dim] = slice(0, unpad_to)
             out = out[tuple(idx)]
         return out
-
-    def _gather_tokens(
-        self, tensor: torch.Tensor, dim: int, unpad_to: Optional[int]
-    ) -> torch.Tensor:
-        if dim != 1:
-            raise ValueError(
-                f"token-sharded TP gathers the token dimension (dim=1); got dim={dim}."
-            )
-        tp = self._token_sharded_tp
-        out = tp.unshard(tensor.reshape(tp.plan.local_rows, *tensor.shape[2:]))
-        return out if unpad_to is None else out[:, :unpad_to]

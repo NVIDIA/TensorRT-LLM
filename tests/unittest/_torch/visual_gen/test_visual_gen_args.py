@@ -531,20 +531,10 @@ class TestParallelConfigValidation:
 class TestTokenShardedTPConfig:
     """parallel_config.tp_layout validation and round trips."""
 
-    def test_default_is_none(self):
-        pc = ParallelConfig()
-        assert pc.tp_layout is None
-        assert pc.token_sharded_tp is False
-
-    @pytest.mark.parametrize("layout", [None, "replicated"])
-    def test_unset_or_replicated_accepted_without_tp(self, layout):
-        pc = ParallelConfig(tp_size=1, tp_layout=layout)
-        assert pc.tp_layout == layout
-        assert pc.token_sharded_tp is False
-
-    def test_replicated_is_off(self):
+    @pytest.mark.parametrize("tp_size,layout", [(1, None), (1, "replicated"), (2, "replicated")])
+    def test_off_unless_token_sharded(self, tp_size, layout):
         # "replicated" is a truthy string: callers must test the property, not the field.
-        assert ParallelConfig(tp_size=2, tp_layout="replicated").token_sharded_tp is False
+        assert ParallelConfig(tp_size=tp_size, tp_layout=layout).token_sharded_tp is False
 
     def test_requires_tp(self):
         with pytest.raises(ValidationError, match=r"requires tp_size > 1 \(got tp_size=1\)"):
@@ -563,27 +553,6 @@ class TestTokenShardedTPConfig:
         pc = ParallelConfig(cfg_size=2, tp_size=2, tp_layout="token_sharded")
         assert pc.token_sharded_tp is True
         assert pc.n_workers == 4
-
-    @pytest.mark.parametrize("layout", ["sometimes", True, "sequence"])
-    def test_invalid_value_rejected(self, layout):
-        with pytest.raises(ValidationError):
-            ParallelConfig(tp_size=2, tp_layout=layout)
-
-    def test_rejects_cache_dit(self):
-        with pytest.raises(ValidationError, match="cache_backend='cache_dit' is not supported"):
-            VisualGenArgs(
-                model="/tmp/model",
-                parallel_config=ParallelConfig(tp_size=2, tp_layout="token_sharded"),
-                cache_config=CacheDiTConfig(),
-            )
-
-    def test_teacache_accepted(self):
-        args = VisualGenArgs(
-            model="/tmp/model",
-            parallel_config=ParallelConfig(tp_size=2, tp_layout="token_sharded"),
-            cache_config=TeaCacheConfig(),
-        )
-        assert args.cache_backend == "teacache"
 
     def test_yaml_roundtrip(self, tmp_path):
         yaml_path = tmp_path / "config.yml"

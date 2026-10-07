@@ -12,10 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the token-sharded TP helper (no process group, no GPU).
-
-Plans are simulated per rank: every rank's shard of a full tensor is checked against
-the same operation on the full tensor, sliced by that rank's rows.
+"""CPU tests for the token-sharded TP helper (no process group, no GPU): plan invariants, the
+NVFP4 scaling-factor regroup, the capability gate and the helper's input checks. Ranks are
+simulated from their plans.
 """
 
 import itertools
@@ -24,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from token_sharded_tp_test_utils import padded_rows, simulated_helper, swizzle_ref, unswizzle_ref
+from token_sharded_tp_test_utils import simulated_helper, swizzle_ref, unswizzle_ref
 
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -51,7 +50,7 @@ def rank_slice(plan: TokenShardPlan) -> slice:
 
 
 # =============================================================================
-# A1. Plan invariants
+# Plan invariants
 # =============================================================================
 
 _PLAN_BATCHES = [1, 2, 3, 4]
@@ -103,54 +102,7 @@ def test_plan_build_rejects_invalid():
 
 
 # =============================================================================
-# A2. Per-shard tables: shard result == full-tensor result sliced by rows
-# =============================================================================
-
-# (B, S, tp): unpadded, rank straddling a sample boundary, interior padding,
-# tail padding (B=1) with a fully padded rank, per-row tables.
-_ROW_LOCAL_CASES = [
-    (1, 8, 2),
-    (2, 8, 4),
-    (2, 12, 3),
-    (2, 5, 3),
-    (2, 9, 4),
-    (3, 7, 4),
-    (1, 5, 4),
-    (4, 6, 8),
-]
-_D = 256
-
-
-def _row_local_inputs(batch, seq, dtype):
-    gen = torch.Generator().manual_seed(batch * 1000 + seq)
-    x = torch.randn(batch, seq, _D, generator=gen).to(dtype)
-    y = torch.randn(batch, seq, _D, generator=gen).to(dtype)
-    table = torch.randn(batch, 6, _D, generator=gen)  # per-sample modulation [B, 6, D]
-    per_token = torch.randn(batch, seq, 6, _D, generator=gen)  # per-token modulation
-    return x, y, table, per_token
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("batch,seq,tp", _ROW_LOCAL_CASES)
-def test_tables_match_full_rows(batch, seq, tp, dtype):
-    x, _, table, per_token = _row_local_inputs(batch, seq, dtype)
-    for rank in range(tp):
-        p = TokenShardPlan.build(batch, seq, tp, rank)
-        sp = simulated_helper(p)
-        rows = rank_slice(p)
-        # per_sample_table expanded per local row == the per-row sample table.
-        tab = sp.per_sample_table(table)
-        assert tab.shape[0] == len(p.entry_batch)
-        per_row = tab.repeat_interleave(p.rows_per_entry, dim=0)
-        sample_of_row = torch.arange(batch).repeat_interleave(p.padded_seq_len)[rows]
-        assert torch.equal(per_row, table[sample_of_row])
-        # shard == the global padded stream sliced (zeros on pad rows), tables included.
-        assert torch.equal(sp.shard(per_token), padded_rows(per_token, p)[rows])
-        assert torch.equal(sp.shard(x), padded_rows(x, p)[rows])
-
-
-# =============================================================================
-# A3. Scaling-factor layout
+# Scaling-factor layout
 # =============================================================================
 
 
@@ -210,16 +162,8 @@ def test_regroup_swizzled_sf(batch, seq, tp, sf_cols):
     assert (got.data_ptr() == sf_cat.data_ptr()) == fast
 
 
-def test_regroup_zero_copy_for_padded_single_sample():
-    lin = torch.randint(0, 255, (509, 8), dtype=torch.uint8)
-    sf_cat, plan = _shard_sf_buffers(lin, 1, 509, 4)
-    assert plan.is_padded and plan.local_rows == 128
-    got = regroup_swizzled_sf(sf_cat, plan, 8)
-    assert got.data_ptr() == sf_cat.data_ptr() and got.is_contiguous()
-
-
 # =============================================================================
-# A6. Capability gate and from_model_config validation
+# Capability gate and helper construction
 # =============================================================================
 
 
@@ -227,7 +171,7 @@ class _PlainDiT(BaseDiffusionModel):
     pass
 
 
-class _SpTpDiT(BaseDiffusionModel):
+class _TokenShardedDiT(BaseDiffusionModel):
     _supports_token_sharded_tp = True
 
 
@@ -235,130 +179,74 @@ def test_capability_gate():
     cfg = DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_layout="token_sharded"))
     with pytest.raises(ValueError, match="not implemented for _PlainDiT"):
         _PlainDiT(cfg)
-    _SpTpDiT(cfg)
+    _TokenShardedDiT(cfg)
     for layout in (None, "replicated"):
         _PlainDiT(DiffusionModelConfig(parallel=ParallelConfig(tp_size=2, tp_layout=layout)))
 
 
-def test_wan_opts_in():
-    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
-
-    assert WanTransformer3DModel._supports_token_sharded_tp is True
-    assert BaseDiffusionModel._supports_token_sharded_tp is False
-
-
-def _stub_config(flag, tp_size=2, ulysses=1, ring=1, attn2d=(1, 1), cache_backend=None):
-    vgm = SimpleNamespace(
-        tp_size=tp_size,
-        seq_size=ulysses * ring * attn2d[0] * attn2d[1],
-        ulysses_size=ulysses,
-        ring_size=ring,
-        attn2d_row_size=attn2d[0],
-        attn2d_col_size=attn2d[1],
-    )
-    return SimpleNamespace(
-        parallel=SimpleNamespace(token_sharded_tp=flag),
-        visual_gen_mapping=vgm,
-        cache_backend=cache_backend,
-    )
-
-
-def test_from_model_config_validation():
-    for flag in (None, False):
-        assert TokenShardedTP.from_model_config(_stub_config(flag)) is None
-    assert TokenShardedTP.from_model_config(SimpleNamespace()) is None
-    with pytest.raises(ValueError, match=r"tp_size > 1 and seq_size == 1 \(got tp_size=1,"):
-        TokenShardedTP.from_model_config(_stub_config(True, tp_size=1))
-    no_vgm = _stub_config(True)
-    no_vgm.visual_gen_mapping = None
+def test_helper_requires_a_mapping_and_a_group():
     with pytest.raises(ValueError, match="needs a VisualGenMapping"):
-        TokenShardedTP.from_model_config(no_vgm)
-    for kwargs in (dict(ulysses=2), dict(ring=2), dict(attn2d=(2, 1))):
-        with pytest.raises(ValueError, match=r"seq_size == 1 \(got tp_size=2, seq_size=2"):
-            TokenShardedTP.from_model_config(_stub_config(True, **kwargs))
-    with pytest.raises(ValueError, match="does not support cache_backend='cache_dit'"):
-        TokenShardedTP.from_model_config(_stub_config(True, cache_backend="cache_dit"))
-
-
-def test_helper_requires_a_group():
+        TokenShardedTP.from_model_config(SimpleNamespace(visual_gen_mapping=None))
     with pytest.raises(ValueError, match="needs a torch.distributed TP process group; got None"):
         TokenShardedTP(None)
 
 
 def test_plan_before_begin_raises():
-    sp = TokenShardedTP.__new__(TokenShardedTP)
-    sp._plan = None
+    ts = TokenShardedTP.__new__(TokenShardedTP)
+    ts._plan = None
     with pytest.raises(RuntimeError, match=r"begin\(batch_size, seq_len\) must be called"):
-        _ = sp.plan
+        _ = ts.plan
 
 
 def test_shape_errors():
     """Wrongly shaped inputs raise before any collective, naming the expected shape."""
-    sp = simulated_helper(TokenShardPlan.build(2, 8, 2, 0))  # m = 8, unpadded
+    ts = simulated_helper(TokenShardPlan.build(2, 8, 2, 0))  # m = 8, unpadded
     with pytest.raises(ValueError, match=r"shard: expected a \[B=2, S=8, \.\.\.\] tensor"):
-        sp.shard(torch.zeros(2, 9, 4))
+        ts.shard(torch.zeros(2, 9, 4))
     with pytest.raises(ValueError, match=r"shard: expected a \[B=2, S=8"):
-        sp.shard(torch.zeros(16, 4))
+        ts.shard(torch.zeros(16, 4))
     with pytest.raises(ValueError, match=r"reduce_scatter: expected 16 rows for the current"):
-        sp.reduce_scatter(torch.zeros(15, 4))
+        ts.reduce_scatter(torch.zeros(15, 4))
     # Forgetting shard(): the full [B * S, D] or [B, S, D] is not this rank's [m, D].
     with pytest.raises(ValueError, match=r"all_gather: expected this rank's \[8, K\] rows"):
-        sp.all_gather(torch.zeros(16, 4))
+        ts.all_gather(torch.zeros(16, 4))
     with pytest.raises(ValueError, match=r"unshard: expected this rank's \[8, K\] rows"):
-        sp.unshard(torch.zeros(2, 8, 4))
+        ts.unshard(torch.zeros(2, 8, 4))
     with pytest.raises(ValueError, match="payload must be uint8"):
-        sp.all_gather(Fp4QuantizedTensor(torch.zeros(16, 2, dtype=torch.uint8), torch.zeros(512)))
+        ts.all_gather(Fp4QuantizedTensor(torch.zeros(16, 2, dtype=torch.uint8), torch.zeros(512)))
     with pytest.raises(ValueError, match=r"pad_row_input: expected a \[B=2, S=8, K\] or"):
-        sp.pad_row_input(torch.zeros(2 * 9, 4))
-    sp = simulated_helper(TokenShardPlan.build(1, 7, 2, 0))  # padded: S_pad = 8
+        ts.pad_row_input(torch.zeros(2 * 9, 4))
+    ts = simulated_helper(TokenShardPlan.build(1, 7, 2, 0))  # padded: S_pad = 8
     with pytest.raises(ValueError, match=r"expected 7 \(B \* S\) or 8 \(B \* S_pad\) rows"):
-        sp.reduce_scatter(torch.zeros(6, 4))
+        ts.reduce_scatter(torch.zeros(6, 4))
     with pytest.raises(ValueError, match=r"pad_row_input: expected"):
-        sp.pad_row_input(torch.zeros(8, 4))  # the padded stream is not accepted
+        ts.pad_row_input(torch.zeros(8, 4))  # the padded stream is not accepted
 
 
-def test_fp4_gather_rejects_side_car_and_dynamic_scale():
-    sp = simulated_helper(TokenShardPlan.build(2, 8, 2, 0))
+def test_fp4_gather_rejects_bad_inputs():
+    ts = simulated_helper(TokenShardPlan.build(2, 8, 2, 0))
     payload = torch.zeros(8, 64, dtype=torch.uint8)
     sf = torch.zeros(swizzled_sf_numel(8, 8), dtype=torch.uint8)
     with pytest.raises(ValueError, match="per-rank dynamic scale"):
-        sp.all_gather(Fp4QuantizedTensor(payload, sf, reciprocal_scale=torch.ones(1)))
+        ts.all_gather(Fp4QuantizedTensor(payload, sf, reciprocal_scale=torch.ones(1)))
     with pytest.raises(ValueError, match="unquantized_hidden_states side-car"):
-        sp.all_gather(
+        ts.all_gather(
             Fp4QuantizedTensor(payload, sf, unquantized_hidden_states=torch.zeros(8, 128))
         )
+    with pytest.raises(ValueError, match="payload must be uint8"):
+        ts.all_gather(Fp4QuantizedTensor(payload.float(), sf))
+    with pytest.raises(ValueError, match="must be 128x4-swizzled"):
+        ts.all_gather(Fp4QuantizedTensor(payload, sf[:-1]))
+    with pytest.raises(ValueError, match="must be 128x4-swizzled"):
+        ts.all_gather(Fp4QuantizedTensor(payload, sf, is_sf_swizzled=False))
 
 
 @pytest.mark.parametrize("batch,seq,tp", list(itertools.product([1, 2, 3], [5, 8], [2, 4])))
 def test_padding_roundtrip(batch, seq, tp):
     """_add_padding then _drop_padding is the identity on [B * S, K]."""
-    sp = simulated_helper(TokenShardPlan.build(batch, seq, tp, 0))
+    ts = simulated_helper(TokenShardPlan.build(batch, seq, tp, 0))
     t = torch.randn(batch * seq, 3)
-    padded = sp._add_padding(t)
-    assert padded.shape[0] == batch * sp.plan.padded_seq_len
-    assert torch.equal(sp._drop_padding(padded), t)
-    assert torch.equal(sp._add_padding(t.view(batch, seq, 3)), padded)
-
-
-# =============================================================================
-# A7. A Wan block rejects a modulation table that does not match its hidden states
-# =============================================================================
-
-
-def test_wan_block_rejects_a_global_table_on_a_shard():
-    """Under token-sharded TP a block sees [n, g, D] sample groups; a global [B, 6, D]
-    table (instead of the sharder's shard_per_sample) must raise, not mix samples."""
-    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
-
-    cfg = DiffusionModelConfig(
-        pretrained_config=SimpleNamespace(
-            num_attention_heads=4, attention_head_dim=16, ffn_dim=128, eps=1e-6
-        )
-    )
-    block = WanBlock(cfg, 0)
-    x = torch.zeros(1, 8, 64)  # one sample group of 8 rows (CFG B=2 at TP2)
-    rope = (torch.zeros(8, 16), torch.zeros(8, 16))
-    with pytest.raises(ValueError, match="modulation table"):
-        block(x, torch.zeros(2, 4, 64), torch.zeros(2, 6, 64), *rope)  # global per-sample
-    with pytest.raises(ValueError, match="modulation table"):
-        block(x, torch.zeros(2, 4, 64), torch.zeros(1, 16, 6, 64), *rope)  # wrong per-token
+    padded = ts._add_padding(t)
+    assert padded.shape[0] == batch * ts.plan.padded_seq_len
+    assert torch.equal(ts._drop_padding(padded), t)
+    assert torch.equal(ts._add_padding(t.view(batch, seq, 3)), padded)

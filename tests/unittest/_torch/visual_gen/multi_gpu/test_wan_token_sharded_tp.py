@@ -12,23 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-GPU tests for Wan with parallel_config.tp_layout='token_sharded' (token-sharded TP).
+"""Multi-GPU tests for Wan with parallel_config.tp_layout='token_sharded'.
 
-Token-sharded TP shards the residual stream's tokens inside the TP group (reduce-scatter +
-all-gather instead of all-reduce). Every model/block case compares three things with
-the same weights:
-
-* Token-sharded TP vs the all-reduce TP model whose three row-parallel all-reduces are replaced by
-  the helper's own reduce-scatter + all-gather (``_EmulatedAllReduce``): both paths then
-  reduce identically, so the transformer blocks' output must match bitwise and any wiring
-  difference (modulation tables, per-token rows, padding, norms, FP4 gathers) shows up;
-* Token-sharded TP vs the single-GPU model (relative L2, against rank 0's reference), with a
-  self-check that the bound is well below the effect of a modulation mix-up;
-* Token-sharded TP vs the real all-reduce TP model / an fp32-exact all-reduce (the only remaining
-  difference is the collective's reduction order and algorithm).
-
-Assertions are rank-lockstep (the verdict is all-reduced before asserting), so a failure
-on one rank does not leave its peers waiting in a collective.
+Each case compares the token-sharded model against, with the same weights: the plain-TP model
+whose all-reduces are replaced by the same reduce-scatter + all-gather (``_EmulatedAllReduce``;
+the blocks' output must match bitwise), the single-GPU model (relative L2), and the plain-TP
+model (only the collectives' reduction order differs).
 
 Run with (needs >= 4 GPUs; the TP8 block case needs 8):
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_wan_token_sharded_tp.py -v
@@ -53,13 +42,13 @@ from tensorrt_llm._torch.visual_gen.config import (
     TorchCompileConfig,
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-from tensorrt_llm._torch.visual_gen.parallel import (
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (
     TokenShardedAdapter,
     TokenShardedRow,
-    TokenShardedTP,
     classify,
     convert_to_token_sharded_tp,
 )
+from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardedTP
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import ParallelConfig
@@ -98,19 +87,19 @@ class _EmulatedAllReduce(nn.Module):
     """A row-parallel Linear's all-reduce done as the helper's reduce-scatter + all-gather.
 
     Put into an all-reduce TP model, it makes that model reduce exactly like token-sharded TP, so
-    the two must agree bitwise. Needs ``sp.begin(B, S)`` for the forward's shape.
+    the two must agree bitwise. Needs ``tp.begin(B, S)`` for the forward's shape.
     """
 
-    def __init__(self, sp):
+    def __init__(self, tp):
         super().__init__()
-        self.sp = sp
+        self.tp = tp
 
     def uses_nccl_symmetric_memory_window(self):
         return False
 
     def forward(self, output, all_reduce_params=None):
-        rows = self.sp.reduce_scatter(output.reshape(-1, output.shape[-1]))
-        return self.sp.all_gather(rows).reshape(output.shape)
+        rows = self.tp.reduce_scatter(output.reshape(-1, output.shape[-1]))
+        return self.tp.all_gather(rows).reshape(output.shape)
 
 
 class _ExactAllReduce(nn.Module):
@@ -126,12 +115,8 @@ class _ExactAllReduce(nn.Module):
 
 
 def _replace_all_reduce(model, make):
-    """Replace every all-reduce token-sharded TP turns into a reduce-scatter with ``make()``.
-
-    Driven by the converter's own rules (``classify`` on the plain-TP model's blocks), so it
-    covers whatever the conversion covers: the row projections' and the MLPs' all-reduces
-    (column projections have none).
-    """
+    """Replace the all-reduces that token-sharded TP turns into reduce-scatters (per
+    ``classify``: row projections and MLP down-projections) with ``make()``."""
     for name, kind in classify(model).items():
         if kind not in ("row", "mlp"):
             continue
@@ -150,7 +135,7 @@ _WAN_BLOCK_CONVERSION = {
 }
 
 
-def _check_wan_conversion(sp_model, ar_model):
+def _check_wan_conversion(ts_model, ar_model):
     """The rules convert exactly these five modules of every Wan block (T2V and I2V: the
     image K/V projections read the image embeddings, not the stream), and nothing else."""
     want = {
@@ -159,7 +144,7 @@ def _check_wan_conversion(sp_model, ar_model):
         for name, kind in _WAN_BLOCK_CONVERSION.items()
     }
     assert classify(ar_model) == want
-    converted = {n for n, m in sp_model.named_modules() if isinstance(m, TokenShardedAdapter)}
+    converted = {n for n, m in ts_model.named_modules() if isinstance(m, TokenShardedAdapter)}
     assert converted == set(want)
 
 
@@ -209,7 +194,7 @@ def _amplify_modulation(model, seed=11):
 
 
 def _build_models(rank, world_size, config_dict):
-    """Single-GPU reference, token-sharded TP model and all-reduce TP model with the same weights."""
+    """Single-GPU reference, token-sharded model and plain-TP model with the same weights."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
     device = torch.device(f"cuda:{rank}")
@@ -219,18 +204,18 @@ def _build_models(rank, world_size, config_dict):
     _stabilize_model_weights(ref)
     _amplify_modulation(ref)
     torch.manual_seed(123)
-    sp_cfg = _make_model_config(config_dict, tp_size=world_size, tp_layout="token_sharded")
-    sp_model = WanTransformer3DModel(sp_cfg).to(device).to(torch.bfloat16)
-    _copy_ref_weights_to_tp(ref, sp_model, rank, world_size, config_dict)
-    assert sp_model.sharder.token_sharded_tp
-    assert isinstance(sp_model.blocks[0].attn1.to_out[0], TokenShardedRow)
+    ts_cfg = _make_model_config(config_dict, tp_size=world_size, tp_layout="token_sharded")
+    ts_model = WanTransformer3DModel(ts_cfg).to(device).to(torch.bfloat16)
+    _copy_ref_weights_to_tp(ref, ts_model, rank, world_size, config_dict)
+    assert ts_model.sharder.token_sharded_tp
+    assert isinstance(ts_model.blocks[0].attn1.to_out[0], TokenShardedRow)
     torch.manual_seed(123)
     ar_cfg = _make_model_config(config_dict, tp_size=world_size)
     ar_model = WanTransformer3DModel(ar_cfg).to(device).to(torch.bfloat16)
     _copy_ref_weights_to_tp(ref, ar_model, rank, world_size, config_dict)
     assert not ar_model.sharder.token_sharded_tp
-    _check_wan_conversion(sp_model, ar_model)
-    return ref, sp_model, ar_model
+    _check_wan_conversion(ts_model, ar_model)
+    return ref, ts_model, ar_model
 
 
 def _inputs(device, batch, thw, timestep, image_dim=None, seed=456):
@@ -253,7 +238,7 @@ def _inputs(device, batch, thw, timestep, image_dim=None, seed=456):
 
 
 # =============================================================================
-# D1-D5. Token-sharded TP vs emulated / real all-reduce TP and vs single GPU
+# Model vs emulated all-reduce, plain TP and single GPU
 # =============================================================================
 
 # Token-sharded TP vs single GPU (rel-L2). A modulation mix-up must move the reference by more than
@@ -279,7 +264,7 @@ def _logic_vs_single_gpu(
     """One case. ``mixed_up_timestep``: timesteps whose reference output stands for a
     modulation mix-up (per-sample timesteps swapped, per-token made uniform)."""
     device = torch.device(f"cuda:{rank}")
-    ref, sp_model, ar_model = _build_models(rank, world_size, config_dict)
+    ref, ts_model, ar_model = _build_models(rank, world_size, config_dict)
     inputs = _inputs(device, batch, thw, timestep, image_dim)
     with torch.no_grad():
         # The tp=1 reference is only trusted on rank 0: without a device mesh its Mapping
@@ -287,8 +272,8 @@ def _logic_vs_single_gpu(
         # ffn.down_proj drops its bias. Every rank compares against rank 0's output.
         ref_out = ref(**inputs)
         dist.broadcast(ref_out, 0)
-        sp_blocks = _capture_head_input(sp_model)
-        sp_out = sp_model(**inputs)
+        ts_blocks = _capture_head_input(ts_model)
+        ts_out = ts_model(**inputs)
         ar_out = ar_model(**inputs)
         _use_eager_per_token_adaln(ar_model)
         emu = TokenShardedTP(ar_model.model_config.visual_gen_mapping.tp_group_pg)
@@ -302,26 +287,26 @@ def _logic_vs_single_gpu(
             mixed_out = ref(**mixed)
             dist.broadcast(mixed_out, 0)
             mixed_err = _rel_l2(mixed_out, ref_out)
-    ok = sp_out.shape == ref_out.shape == inputs["hidden_states"].shape
-    _check(ok and bool(torch.isfinite(sp_out).all()), f"{case}: shape/finite {sp_out.shape}")
+    ok = ts_out.shape == ref_out.shape == inputs["hidden_states"].shape
+    _check(ok and bool(torch.isfinite(ts_out).all()), f"{case}: shape/finite {ts_out.shape}")
     # Token-sharded TP only changes the transformer blocks: their output must be bitwise equal. The
     # replicated output head may still round differently when the all-reduce path hands it
     # a differently strided tensor (expand_timesteps broadcasts temb per token there).
     _check(
-        torch.equal(sp_blocks["x"], emu_blocks["x"]),
-        f"{case}: token-sharded TP blocks != all-reduce TP blocks with the same collectives (rel-L2 "
-        f"{_rel_l2(sp_blocks['x'], emu_blocks['x']):.3e})",
+        torch.equal(ts_blocks["x"], emu_blocks["x"]),
+        f"{case}: token-sharded blocks != plain-TP blocks with the same collectives (rel-L2 "
+        f"{_rel_l2(ts_blocks['x'], emu_blocks['x']):.3e})",
     )
-    err = _rel_l2(sp_out, emu_out)
+    err = _rel_l2(ts_out, emu_out)
     _check(err <= 1e-3, f"{case}: output vs all-reduce TP with the same collectives {err:.3e}")
-    err = _rel_l2(sp_out, ref_out)
+    err = _rel_l2(ts_out, ref_out)
     _check(err <= _SINGLE_GPU_REL_L2, f"{case}: token-sharded TP vs single GPU rel-L2 {err:.3e}")
     if mixed_err is not None:
         _check(
             mixed_err >= _SENSITIVITY * _SINGLE_GPU_REL_L2,
             f"{case}: a modulation mix-up moves the reference only by rel-L2 {mixed_err:.3e}",
         )
-    err = _rel_l2(sp_out, ar_out)
+    err = _rel_l2(ts_out, ar_out)
     _check(err <= _ALL_REDUCE_REL_L2, f"{case}: token-sharded TP vs all-reduce TP rel-L2 {err:.3e}")
 
 
@@ -350,27 +335,27 @@ def _per_token_timesteps(thw):
 
 
 _TP2_CASES = [
-    # D1: T2V, B=1.
+    # T2V, B=1.
     dict(
-        case="D1_t2v_b1",
+        case="t2v_b1",
         config_dict=_WAN_T2V_TEST_CONFIG,
         batch=1,
         thw=(2, 4, 4),
         timestep=torch.tensor([0.5]),
     ),
-    # D4: I2V image cross-attention through _cross_attention.
+    # I2V: image cross-attention (add_k_proj / add_v_proj read the image embeddings).
     dict(
-        case="D4_i2v",
+        case="i2v",
         config_dict=_WAN_I2V_TEST_CONFIG,
         batch=1,
         thw=(2, 4, 4),
         timestep=torch.tensor([0.5]),
         image_dim=_WAN_I2V_TEST_CONFIG["image_dim"],
     ),
-    # D5: 2-D per-token timesteps (temb [B, S, 6, D]), unpadded (S=8) and padded (S=9).
+    # Per-token timesteps (temb [B, S, 6, D]), unpadded (S=8) and padded (S=9).
     *[
         dict(
-            case=f"D5_per_token_S{thw[0] * thw[1] * thw[2] // 4}",
+            case=f"per_token_S{thw[0] * thw[1] * thw[2] // 4}",
             config_dict=_T2V_EXPAND,
             batch=1,
             thw=thw,
@@ -379,9 +364,9 @@ _TP2_CASES = [
         )
         for thw in ((2, 4, 4), (1, 6, 6))
     ],
-    # D5b: expand_timesteps=True with 1-D per-sample timesteps (token-sharded TP keeps temb [B, 6, D]).
+    # expand_timesteps with per-sample timesteps: the table stays [B, 6, D].
     dict(
-        case="D5b_expand_uniform",
+        case="expand_uniform",
         config_dict=_T2V_EXPAND,
         batch=2,
         thw=(2, 4, 4),
@@ -393,23 +378,19 @@ _TP2_CASES = [
 
 class TestWanTokenShardedTP:
     def test_tp2_cases(self):
-        """D1 (T2V B=1), D4 (I2V), D5 (per-token temb, S=8 and padded S=9), D5b
-        (expand_timesteps with per-sample temb), TP2, in one spawn."""
+        """T2V B=1, I2V, per-token temb (S=8, padded S=9) and expand_timesteps, TP2, one spawn."""
         run_test_in_distributed(
             world_size=2, test_fn=functools.partial(_logic_cases, cases=_TP2_CASES)
         )
 
     def test_t2v_tp3_b2_distinct_timesteps(self):
-        """D2: B=2 with distinct per-sample timesteps, TP3 (uneven heads 2+1+1).
-
-        S=8 -> S_pad=9; rank 1 straddles the two samples, so a sample mix-up in the
-        per-shard modulation table breaks the bitwise check and the single-GPU bound.
-        """
+        """B=2 with distinct timesteps, TP3 (heads 2+1+1): S=8 pads to 9 and rank 1 straddles
+        both samples, so a per-shard table mix-up fails the bitwise check."""
         run_test_in_distributed(
             world_size=3,
             test_fn=functools.partial(
                 _logic_vs_single_gpu,
-                case="D2_tp3_b2",
+                case="tp3_b2",
                 config_dict=_WAN_T2V_TEST_CONFIG,
                 batch=2,
                 thw=(2, 4, 4),
@@ -419,12 +400,12 @@ class TestWanTokenShardedTP:
         )
 
     def test_t2v_tp4_b2_interior_padding(self):
-        """D3: B=2, TP4, S=9 -> t'=2, S_pad=10: interior per-sample padding."""
+        """B=2, TP4, S=9 -> S_pad=10: per-sample interior padding."""
         run_test_in_distributed(
             world_size=4,
             test_fn=functools.partial(
                 _logic_vs_single_gpu,
-                case="D3_tp4_b2_padded",
+                case="tp4_b2_padded",
                 config_dict=_WAN_T2V_TEST_CONFIG,
                 batch=2,
                 thw=(1, 6, 6),
@@ -435,7 +416,7 @@ class TestWanTokenShardedTP:
 
 
 # =============================================================================
-# D6. Blocks compiled as the pipeline does (torch.compile per block)
+# Blocks compiled as the pipeline does (torch.compile per block)
 # =============================================================================
 
 
@@ -476,22 +457,22 @@ def _graphs_compiled(model, all_inputs, num_blocks):
 
 def _logic_compiled_blocks(rank, world_size):
     device = torch.device(f"cuda:{rank}")
-    _, sp_model, ar_model = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
+    _, ts_model, ar_model = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
     shapes = [(2, 4, 4), (1, 6, 6), (2, 4, 4)]  # S=8, S=9 (padded at TP2, B=1), revisit
     all_inputs = [
         _inputs(device, 1, thw, torch.tensor([0.5]), seed=10 + i) for i, thw in enumerate(shapes)
     ]
     with torch.no_grad():
-        eager = [sp_model(**inp) for inp in all_inputs]
+        eager = [ts_model(**inp) for inp in all_inputs]
     # One compiled block graph serves every block: the converted modules share one adapter
     # class per base class, so a second block adds no more graphs than in plain TP (a fresh
     # class per swap would recompile every block on type guards).
     extra = {
         name: _graphs_compiled(model, all_inputs, 2) - _graphs_compiled(model, all_inputs, 1)
-        for name, model in (("token-sharded", sp_model), ("plain", ar_model))
+        for name, model in (("token-sharded", ts_model), ("plain", ar_model))
     }
     _check(extra["token-sharded"] <= extra["plain"], f"graphs added by a second block: {extra}")
-    outs, sp_reasons, sp_graphs = _compiled_break_reasons(sp_model, all_inputs)
+    outs, ts_reasons, ts_graphs = _compiled_break_reasons(ts_model, all_inputs)
     for i, (out, ref) in enumerate(zip(outs, eager)):
         err = _rel_l2(out, ref)
         _check(err <= 1e-2, f"compiled vs eager token-sharded TP, input {i}: rel-L2 {err:.3e}")
@@ -499,23 +480,23 @@ def _logic_compiled_blocks(rank, world_size):
     # all-reduce path (the pre-existing QK-norm all-reduce / mesh lookup break).
     _, ar_reasons, ar_graphs = _compiled_break_reasons(ar_model, all_inputs)
     _check(
-        sp_reasons <= ar_reasons, f"token-sharded TP-only graph breaks: {sp_reasons - ar_reasons}"
+        ts_reasons <= ar_reasons, f"token-sharded TP-only graph breaks: {ts_reasons - ar_reasons}"
     )
     _check(
-        sp_graphs <= ar_graphs,
-        f"token-sharded TP compiled {sp_graphs} graphs, plain TP {ar_graphs}",
+        ts_graphs <= ar_graphs,
+        f"token-sharded TP compiled {ts_graphs} graphs, plain TP {ar_graphs}",
     )
 
 
 class TestWanTokenShardedTPCompile:
     def test_compiled_blocks_tp2(self):
-        """D6: per-block torch.compile (fullgraph=False), two shapes and a revisit, TP2:
-        matches eager token-sharded TP and adds no graph break beyond the all-reduce path's."""
+        """Per-block torch.compile at TP2, two shapes and a revisit: matches eager and adds no
+        graph break beyond plain TP's."""
         run_test_in_distributed(world_size=2, test_fn=_logic_compiled_blocks)
 
 
 # =============================================================================
-# D7. CUDAGraphRunner-wrapped forward
+# CUDAGraphRunner-wrapped forward
 # =============================================================================
 
 
@@ -526,19 +507,19 @@ def _logic_cuda_graph(rank, world_size):
     )
 
     device = torch.device(f"cuda:{rank}")
-    _, sp_model, _ = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
+    _, ts_model, _ = _build_models(rank, world_size, _WAN_T2V_TEST_CONFIG)
     # Key A: B=2, S=8 (unpadded); key B: B=1, S=9 (padded at TP2). Each key is captured
     # on first use and replayed after switching keys.
     key_a = [_inputs(device, 2, (2, 4, 4), torch.tensor([0.3, 0.7]), seed=s) for s in (1, 2)]
     key_b = [_inputs(device, 1, (1, 6, 6), torch.tensor([0.4]), seed=s) for s in (3, 4)]
     inputs = [key_a[0], key_a[1], key_b[0], key_a[0], key_b[1], key_b[0]]
-    eager_forward = sp_model.forward
+    eager_forward = ts_model.forward
     runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-    sp_model.forward = runner.wrap(sp_model.forward)
+    ts_model.forward = runner.wrap(ts_model.forward)
     try:
         with torch.no_grad():
             for i, inp in enumerate(inputs):
-                graph_out = sp_model(**inp).clone()
+                graph_out = ts_model(**inp).clone()
                 eager_out = eager_forward(**inp)
                 _check(
                     torch.equal(graph_out, eager_out),
@@ -554,13 +535,13 @@ def _logic_cuda_graph(rank, world_size):
 
 class TestWanTokenShardedTPCudaGraph:
     def test_cuda_graph_tp2(self):
-        """D7: CUDAGraphRunner-wrapped forward, two keys (one padded) with switches and
-        revisits, TP2 == eager token-sharded TP (bitwise)."""
+        """CUDAGraphRunner at TP2, two keys (one padded) with switches and revisits: bitwise
+        equal to eager."""
         run_test_in_distributed(world_size=2, test_fn=_logic_cuda_graph)
 
 
 # =============================================================================
-# D8. One D=5120 WanBlock with static NVFP4 (FP4 all-gather) vs the all-reduce block
+# One D=5120 static-NVFP4 WanBlock (FP4 all-gathers) vs the all-reduce block
 # =============================================================================
 
 _D5120_BLOCK = dict(
@@ -642,9 +623,8 @@ def _as_model(block):
     return model
 
 
-def _load_block(block, linear_weights, params, token_sharded=False):
+def _load_block(block, linear_weights, params):
     from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import get_nvfp4_input_scale
-    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import static_nvfp4_input_scale
 
     for name, module in block.named_modules():
         if not isinstance(module, Linear):
@@ -661,10 +641,9 @@ def _load_block(block, linear_weights, params, token_sharded=False):
         else:
             block.get_parameter(name).data.copy_(value)
     # Same wiring as WanTransformer3DModel.post_load_weights.
-    fp4_input_scale = static_nvfp4_input_scale if token_sharded else get_nvfp4_input_scale
-    block._norm1_fp4_scale = fp4_input_scale(block.attn1.qkv_proj)
-    block._norm2_fp4_scale = fp4_input_scale(block.attn2.to_q)
-    block._norm3_fp4_scale = fp4_input_scale(block.ffn.up_proj)
+    block._norm1_fp4_scale = get_nvfp4_input_scale(block.attn1.qkv_proj)
+    block._norm2_fp4_scale = get_nvfp4_input_scale(block.attn2.to_q)
+    block._norm3_fp4_scale = get_nvfp4_input_scale(block.ffn.up_proj)
 
 
 def _calibrate_amax(vgm, device, bf16_weights, params, block_inputs):
@@ -729,12 +708,12 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
 
     ar_block = WanBlock(_block_config(vgm, True, False), 0).to(device)
     _load_block(ar_block, fp4_weights, params)
-    sp_cfg = _block_config(vgm, True, True)
-    sp = TokenShardedTP.from_model_config(sp_cfg)
-    sp_block = WanBlock(sp_cfg, 0).to(device)
-    convert_to_token_sharded_tp(_as_model(sp_block), sp)
-    _load_block(sp_block, fp4_weights, params, token_sharded=True)
-    for blk in (ar_block, sp_block):
+    ts_cfg = _block_config(vgm, True, True)
+    tp = TokenShardedTP.from_model_config(ts_cfg)
+    ts_block = WanBlock(ts_cfg, 0).to(device)
+    convert_to_token_sharded_tp(_as_model(ts_block), tp)
+    _load_block(ts_block, fp4_weights, params)
+    for blk in (ar_block, ts_block):
         assert all(
             s is not None
             for s in (blk._norm1_fp4_scale, blk._norm2_fp4_scale, blk._norm3_fp4_scale)
@@ -752,28 +731,28 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
     # ffn: the fused GELU path calls up_proj's quant method directly (no module call),
     # so the check sits on the MLP input.
     for name, mod in (
-        ("attn1.qkv_proj", sp_block.attn1.qkv_proj),
-        ("attn2.to_q", sp_block.attn2.to_q),
-        ("ffn", sp_block.ffn),
+        ("attn1.qkv_proj", ts_block.attn1.qkv_proj),
+        ("attn2.to_q", ts_block.attn2.to_q),
+        ("ffn", ts_block.ffn),
     ):
         mod.register_forward_pre_hook(expect_fp4(name))
 
     with torch.no_grad():
         ref = ar_block(*block_inputs)
-        plan = sp.begin(batch, seq)
+        plan = tp.begin(batch, seq)
         # The block sees this rank's [n, g, D] sample groups and the shard's table.
-        out = sp_block(
-            sp.local_view(sp.shard(x)), enc, sp.per_sample_table(temb), *block_inputs[3:]
+        out = ts_block(
+            tp.local_view(tp.shard(x)), enc, tp.per_sample_table(temb), *block_inputs[3:]
         )
-        out = sp.unshard(out.reshape(plan.local_rows, -1))
-        _replace_all_reduce(_as_model(ar_block), lambda: _EmulatedAllReduce(sp))
+        out = tp.unshard(out.reshape(plan.local_rows, -1))
+        _replace_all_reduce(_as_model(ar_block), lambda: _EmulatedAllReduce(tp))
         emu = ar_block(*block_inputs)
         _replace_all_reduce(_as_model(ar_block), _ExactAllReduce)
         exact = ar_block(*block_inputs)
     fp4 = ["Fp4QuantizedTensor"]
     expected = {"attn1.qkv_proj": fp4, "attn2.to_q": fp4, "ffn": fp4}
     _check(seen == expected, f"boundary inputs {seen}")
-    desc = f"tp={world_size} B={batch} S={seq} padded={sp.plan.is_padded}"
+    desc = f"tp={world_size} B={batch} S={seq} padded={tp.plan.is_padded}"
     _check(torch.equal(out, emu), f"{desc}: token-sharded TP != emulated all-reduce block")
     cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
     err = _rel_l2(out, ref)
@@ -783,10 +762,10 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
     # Precision against a correctly rounded all-reduce: token-sharded TP's reduce-scatter may use a
     # different NCCL algorithm than the all-reduce (ring vs NVLS at TP8), but must stay
     # within 1.5x of the all-reduce block's error.
-    sp_err, ar_err = _rel_l2(out, exact), _rel_l2(ref, exact)
+    ts_err, ar_err = _rel_l2(out, exact), _rel_l2(ref, exact)
     _check(
-        sp_err <= 1.5 * ar_err + 1e-6,
-        f"{desc}: vs fp32-exact all-reduce: token-sharded TP rel-L2 {sp_err:.3e}, all-reduce TP {ar_err:.3e}",
+        ts_err <= 1.5 * ar_err + 1e-6,
+        f"{desc}: vs fp32-exact all-reduce: token-sharded {ts_err:.3e}, plain TP {ar_err:.3e}",
     )
 
 
@@ -797,8 +776,8 @@ class TestWanTokenShardedTPNVFP4Block:
         ids=["tp2_S256", "tp3_S105", "tp4_S105_padded", "tp8_S960"],
     )
     def test_static_nvfp4_block(self, world_size, batch, thw):
-        """D8: D=5120 static-NVFP4 WanBlock (FP4 all-gathers): bitwise vs the emulated
-        all-reduce block, close to the real one, within 1.5x of its fp32-exact error."""
+        """D=5120 static-NVFP4 WanBlock: bitwise vs the emulated all-reduce block, close to the
+        plain one, and within 1.5x of its error vs an fp32-exact all-reduce."""
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("NVFP4 requires SM100+")
         run_test_in_distributed(
@@ -808,7 +787,7 @@ class TestWanTokenShardedTPNVFP4Block:
 
 
 # =============================================================================
-# D9. VSA is rejected
+# VSA is rejected
 # =============================================================================
 
 
@@ -831,7 +810,7 @@ def _logic_vsa_rejected(rank, world_size):
 
 class TestWanTokenShardedTPRejections:
     def test_vsa_rejected(self):
-        """D9: token-sharded TP + VSA raises."""
+        """Token-sharded TP with VSA raises."""
         run_test_in_distributed(world_size=2, test_fn=_logic_vsa_rejected)
 
 

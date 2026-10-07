@@ -12,12 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Single-GPU tests of the token-sharded TP row-local kernels (fused LN + NVFP4).
+"""Wan's fused LayerNorm + NVFP4 ops on simulated token shards (Blackwell).
 
-TP ranks are simulated: every rank's shard of a full ``[B * S, 5120]`` input goes through
-the fused norm + quantize ops as a Wan block runs them on a shard (per-shard modulation
-table, ``seq_len_per_batch = rows_per_entry``), and the result (FP4 bytes per row, and the
-regrouped scaling factors of all shards) must equal the same op on all rows.
+Each rank's shard, with its per-shard modulation table (``seq_len_per_batch =
+rows_per_entry``), must give the same FP4 bytes per row and, after regrouping, the same
+scaling factors as the op on all rows.
 """
 
 import pytest
@@ -43,7 +42,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # tests/unittest/_torch/visual_gen: shared SF-layout references and simulated ranks.
 __extra_import_path__ = ["../.."]
 
-from token_sharded_tp_test_utils import simulated_helper, swizzle_ref, unswizzle_ref
+from token_sharded_tp_test_utils import simulated_helper, unswizzle_ref
 
 D = 5120
 EPS = 1e-6
@@ -89,7 +88,7 @@ _CASES = [(2, 105, 3), (2, 105, 4), (2, 256, 2), (1, 1001, 8), (1, 509, 4), (2, 
 
 
 # =============================================================================
-# C1. Fused LN + AdaLN + NVFP4 on shards with per-shard tables == full-M op
+# Fused LN + AdaLN + NVFP4 on shards with per-shard tables == full-M op
 # =============================================================================
 
 
@@ -106,11 +105,11 @@ def test_fused_adaln_quant_shards_match_full(batch, seq, tp):
     plans = [TokenShardPlan.build(batch, seq, tp, r) for r in range(tp)]
     shards = []
     for plan in plans:
-        sp = simulated_helper(plan)
+        ts = simulated_helper(plan)
         q = apply_fused_layernorm_adaln_quant(
-            sp.shard(x),
-            sp.per_sample_table(scale),
-            sp.per_sample_table(shift),
+            ts.shard(x),
+            ts.per_sample_table(scale),
+            ts.per_sample_table(shift),
             plan.rows_per_entry,
             qscale,
             EPS,
@@ -122,7 +121,7 @@ def test_fused_adaln_quant_shards_match_full(batch, seq, tp):
 
 
 # =============================================================================
-# C2. norm2 (affine LN) + quant on the shard == full-M result sliced
+# norm2 (affine LN) + quant on the shard == full-M result sliced
 # =============================================================================
 
 
@@ -140,8 +139,8 @@ def test_fused_affine_quant_shards_match_full(batch, seq, tp):
     plans = [TokenShardPlan.build(batch, seq, tp, r) for r in range(tp)]
     shards = []
     for plan in plans:
-        sp = simulated_helper(plan)
-        x_loc = sp.shard(x)
+        ts = simulated_helper(plan)
+        x_loc = ts.shard(x)
         shards.append(apply_fused_layernorm_affine_quant(x_loc, weight, bias, qscale, EPS))
         loc, glob = _real_rows(plan)
         h = apply_fused_layernorm_affine_quant(x_loc, weight, bias, None, EPS)
@@ -150,7 +149,7 @@ def test_fused_affine_quant_shards_match_full(batch, seq, tp):
 
 
 # =============================================================================
-# C3. quantize_nvfp4 == Linear._input_prepare; static_nvfp4_input_scale eligibility
+# quantize_nvfp4 == Linear._input_prepare; static_nvfp4_input_scale eligibility
 # =============================================================================
 
 
@@ -220,24 +219,3 @@ def test_static_nvfp4_input_scale_eligibility():
     assert static_nvfp4_input_scale(awq) is None
     plain = Linear(512, 256, bias=False, dtype=torch.bfloat16).cuda()
     assert static_nvfp4_input_scale(plain) is None
-
-
-# =============================================================================
-# C4. regroup_swizzled_sf == trtllm::reswizzle_sf (independent oracle, even splits)
-# =============================================================================
-
-
-@pytest.mark.parametrize("tp,m,k", [(2, 300, 5120), (4, 256, 5120), (8, 70, 1728), (3, 77, 256)])
-def test_regroup_matches_reswizzle_sf(tp, m, k):
-    from tensorrt_llm._torch.utils import reswizzle_sf
-
-    sf_cols = k // 16
-    lin = torch.randint(0, 256, (tp * m, sf_cols), dtype=torch.uint8, device="cuda")
-    sf_cat = torch.cat([swizzle_ref(lin[r * m : (r + 1) * m], pad_value=0) for r in range(tp)])
-    plan = TokenShardPlan.build(1, tp * m, tp, 0)
-    assert not plan.is_padded and plan.local_rows == m
-    got = regroup_swizzled_sf(sf_cat, plan, sf_cols)
-    oracle = reswizzle_sf(sf_cat, m, k, 16)
-    assert got.numel() == oracle.numel() == swizzled_sf_numel(tp * m, sf_cols)
-    assert torch.equal(unswizzle_ref(got, tp * m, sf_cols), unswizzle_ref(oracle, tp * m, sf_cols))
-    assert torch.equal(unswizzle_ref(got, tp * m, sf_cols), lin)

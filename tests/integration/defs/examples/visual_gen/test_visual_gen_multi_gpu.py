@@ -131,11 +131,7 @@ WAN22_LPIPS_TP_VARIANTS = [
         {"tp_size": 2, "attn2d_size": (2, 1)},
         WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD,
     ),
-    # Token-sharded TP (reduce-scatter + all-gather instead of all-reduce): same
-    # REDUCTION-REORDERING class as plain TP. One variant: at TP2 token-sharded TP is bitwise equal to
-    # all-reduce TP, so this checks the end-to-end wiring (the worker asserts the transformers
-    # were converted); the CI shape (S=4680) needs no token padding, the unit tests cover padding,
-    # batched CFG and TP3/4/8.
+    # Token-sharded TP: bitwise equal to all-reduce TP at TP2; the worker asserts it engaged.
     (
         "cfg2_tp2_ts",
         {"cfg_size": 2, "tp_size": 2, "tp_layout": "token_sharded"},

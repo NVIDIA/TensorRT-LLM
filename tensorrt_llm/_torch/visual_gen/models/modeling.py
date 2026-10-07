@@ -14,7 +14,7 @@
 # limitations under the License.
 """Base classes for VisualGen model components."""
 
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -30,74 +30,30 @@ if TYPE_CHECKING:
 class BaseDiffusionModel(nn.Module):
     """Base class for TRT-LLM VisualGen model components."""
 
-    # Models that implement parallel_config.tp_layout='token_sharded' (token-sharded residual
-    # stream inside the TP group, see parallel/token_sharded_tp.py) set this to True.
-    _supports_token_sharded_tp: ClassVar[bool] = False
-    # For that layout (parallel/token_sharded_modules.py): the module lists holding the
-    # transformer blocks, and {module-name pattern: kind, adapter or "keep"} for what the
-    # conversion rules cannot decide (relative to a block).
-    _token_sharded_tp_blocks: ClassVar[tuple[str, ...]] = ("blocks",)
-    _token_sharded_tp_exceptions: ClassVar[dict] = {}
+    # Set to True by models that implement parallel_config.tp_layout='token_sharded'.
+    _supports_token_sharded_tp = False
 
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
-        parallel = getattr(model_config, "parallel", None)
-        if (
-            getattr(parallel, "token_sharded_tp", False)
-            and not type(self)._supports_token_sharded_tp
-        ):
+        if model_config.parallel.token_sharded_tp and not self._supports_token_sharded_tp:
             raise ValueError(
                 "parallel_config.tp_layout='token_sharded' is not implemented for "
-                f"{type(self).__name__} (the model does not set "
-                "_supports_token_sharded_tp = True). Unset tp_layout to use "
-                "all-reduce tensor parallelism."
+                f"{type(self).__name__}; unset tp_layout to use all-reduce tensor parallelism."
             )
         self.model_config = model_config
         self.component_name = model_config.component_name
         self.pretrained_config = model_config.pretrained_config
 
     def _apply_tp_layout(self) -> None:
-        """Set up ``parallel_config.tp_layout``; call at the end of ``__init__``.
-
-        Token-sharded: switches ``self.sharder`` to the layout and converts the TP modules of
-        ``_token_sharded_tp_blocks`` in place (the model is built exactly as for plain TP).
-        Replicated (plain TP): nothing to do.
-        """
-        from ..parallel.token_sharded_modules import convert_to_token_sharded_tp
-        from ..parallel.token_sharded_tp import TokenShardedTP
-
-        if not self._wants_token_sharded_tp():
+        """Apply ``parallel_config.tp_layout``; call at the end of ``__init__``."""
+        if not self.model_config.parallel.token_sharded_tp:
             return
-        sharder = getattr(self, "sharder", None)
-        if sharder is None:
-            raise AttributeError(
-                f"{type(self).__name__}._apply_tp_layout(): token-sharded TP enters and exits "
-                "through self.sharder (a SequenceSharder); build it before this call."
-            )
+        from ..parallel.token_sharded_modules import convert_to_token_sharded_tp
+        from ..parallel.token_sharded_tp import TokenShardedSequenceSharder, TokenShardedTP
+
         tp = TokenShardedTP.from_model_config(self.model_config)
-        sharder.use_token_sharded_tp(tp)
-        convert_to_token_sharded_tp(
-            self,
-            tp,
-            containers=type(self)._token_sharded_tp_blocks,
-            exceptions=type(self)._token_sharded_tp_exceptions,
-        )
-
-    def check_tp_layout_applied(self) -> None:
-        """Raise if ``parallel_config.tp_layout`` is token-sharded but this model did not set
-        it up (it would silently run plain TP); the pipeline loader calls this."""
-        if self._wants_token_sharded_tp() and not getattr(
-            getattr(self, "sharder", None), "token_sharded_tp", False
-        ):
-            raise RuntimeError(
-                f"{type(self).__name__} sets _supports_token_sharded_tp but did not call "
-                "self._apply_tp_layout() at the end of __init__."
-            )
-
-    def _wants_token_sharded_tp(self) -> bool:
-        return bool(
-            getattr(getattr(self.model_config, "parallel", None), "token_sharded_tp", False)
-        )
+        self.sharder = TokenShardedSequenceSharder(tp)
+        convert_to_token_sharded_tp(self, tp)
 
     def forward(self, *args, timestep: torch.Tensor | None = None, **kwargs):
         """Run the diffusion transformer.
