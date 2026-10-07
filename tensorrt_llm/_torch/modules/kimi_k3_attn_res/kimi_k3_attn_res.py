@@ -399,4 +399,3 @@ class KimiK3AttnResidualOp(nn.Module):
     def precompile(self, verbose: bool = False) -> None:
         """No-op: the in-tree ``trtllm::attn_res_fwd`` op is pre-compiled."""
         del verbose
-

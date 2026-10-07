@@ -273,6 +273,7 @@ class KDAKernelDispatch:
         chunk_indices = None
         if use_optimized and cu_seqlens is not None:
             from fla.ops.utils.index import prepare_chunk_indices
+
             chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
             # The persistent K123 scheduler needs at least 4 total chunks
             # (cgs_per_head = NT // 4 cooperative groups per head). The
