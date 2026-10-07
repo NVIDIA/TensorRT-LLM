@@ -78,8 +78,7 @@ def test_unified_cache_respects_individual_overrides(
 def test_ray_deep_gemm_isolates_explicit_unified_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    pytest.importorskip("ray")
-    from tensorrt_llm.executor.ray.gpu_worker import _configure_deep_gemm_cache
+    from tensorrt_llm.executor.ray.utils import _configure_deep_gemm_cache
 
     cache_root = tmp_path / "unified"
     cache_dir = cache_root / "deep_gemm"
