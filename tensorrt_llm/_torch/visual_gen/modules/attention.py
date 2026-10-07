@@ -686,17 +686,22 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        kwargs.update(
-            {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "seq_len_kv": seq_len_kv,
-            }
-        )
+        # With a K/V cache the caller states seq_len, the real token count of the
+        # whole sequence: the rows here may include padding for the sequence
+        # exchange, and under Ulysses they are one rank's shard.
+        if kwargs.get("kv_cache") is None:
+            kwargs["seq_len"] = seq_len
+        elif kwargs.get("seq_len") is None:
+            raise ValueError("with a K/V cache, pass seq_len: the real token count of the chunk")
+        kwargs.update({"batch_size": batch_size, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
+        if kwargs.get("kv_cache") is not None and not self.attn.support_kv_cache():
+            raise NotImplementedError(
+                f"{type(self.attn).__name__} does not support a K/V cache; use CUDNN or TRTLLM."
+            )
         out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]

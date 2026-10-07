@@ -318,6 +318,9 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
+  - unittest/_torch/visual_gen/test_kv_causal_attention.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_rotate_rows.py
+  - unittest/_torch/thop/parallel_hw_agnostic/test_scatter_kv_slots.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
