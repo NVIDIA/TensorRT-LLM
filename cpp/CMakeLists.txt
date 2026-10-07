@@ -176,8 +176,8 @@ endif()
 
 # Directory holding the generated FMHA sources (fmha_v2_cu/*.cu and
 # cubin/fmha_cubin.{h,cpp}). fmha_cubin.h is included transitively by headers
-# used across several targets, so the directory must be on every target's include
-# path, not just the FMHA target's.
+# used across several targets, so the directory must be on every target's
+# include path, not just the FMHA target's.
 set(TRTLLM_FMHA_GEN_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/tensorrt_llm/kernels/contextFusedMultiHeadAttention"
     CACHE PATH "Directory containing generated FMHA sources")
