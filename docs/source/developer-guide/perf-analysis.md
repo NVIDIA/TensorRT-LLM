@@ -154,7 +154,7 @@ Capture adds overhead and trace size. Execution-trace capture enables shape
 recording and requests CUDA synchronization events when supported by PyTorch.
 Chrome-only capture retains its existing profiler options. CUDA graph replay does not expose every logical operator
 as a distinct execution node. Custom-region selection is independent of these
-capture settings; see [profiler regions](../advanced/workflow-profiler-regions.md)
+capture settings; see [profiler regions](workflow-profiler-regions.md)
 for metadata and selection semantics.
 
 For VisualGen, use `TLLM_PROFILE_VISUAL_GEN_START_STOP` instead. Numeric ranges select
