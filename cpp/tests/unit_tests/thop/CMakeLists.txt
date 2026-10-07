@@ -57,7 +57,15 @@ if(${BUILD_PYT})
     tllm::torch_utils
     LABELS
     "unit;runtime;thop;gpu")
-  foreach(family Sequence VisualGen Decoding GemmQuant Attention Moe)
+  foreach(
+    family
+    Sequence
+    VisualGen
+    Decoding
+    GemmQuant
+    Attention
+    Moe
+    Distributed)
     if(family STREQUAL "Sequence")
       set(family_target tllm::torch_sequence)
     elseif(family STREQUAL "VisualGen")
@@ -68,8 +76,10 @@ if(${BUILD_PYT})
       set(family_target tllm::torch_gemm_quant)
     elseif(family STREQUAL "Attention")
       set(family_target tllm::torch_attention)
-    else()
+    elseif(family STREQUAL "Moe")
       set(family_target tllm::torch_moe)
+    else()
+      set(family_target tllm::torch_distributed)
     endif()
     add_tllm_gtest(
       torch${family}RegistrationTest

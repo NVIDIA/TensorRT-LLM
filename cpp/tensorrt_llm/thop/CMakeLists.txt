@@ -58,8 +58,18 @@ target_link_libraries(
   PRIVATE tllm::torch_tensor_allocators tllm::common_op_utils
           tllm::common_nccl_comm)
 
+add_library(th_quantization STATIC fp4Quantize.cpp fp8Op.cpp)
+add_library(tllm::torch_quantization ALIAS th_quantization)
+set_property(TARGET th_quantization PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_compile_features(th_quantization PUBLIC cxx_std_20)
+target_link_libraries(
+  th_quantization
+  PUBLIC tllm::torch_utils
+  PRIVATE tllm::common_fp8 tllm::kernel_quantization
+          tllm::kernel_activation_quantization)
+
 function(add_th_common_family target)
-  cmake_parse_arguments(PARSE_ARGV 1 ARG "COMPONENT_LOCAL" ""
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "" ""
                         "SOURCES;LINK_LIBRARIES;OBJECT_LIBRARIES")
   if(ARG_UNPARSED_ARGUMENTS
      OR ARG_KEYWORDS_MISSING_VALUES
@@ -76,14 +86,10 @@ function(add_th_common_family target)
   foreach(backend IN LISTS ARG_OBJECT_LIBRARIES)
     target_sources(${target} INTERFACE $<TARGET_OBJECTS:${backend}>)
   endforeach()
-  if(NOT ARG_COMPONENT_LOCAL)
-    target_link_libraries(${target} PRIVATE ${SHARED_TARGET} pg_utils)
-  endif()
 endfunction()
 
 add_th_common_family(
   th_common_attention
-  COMPONENT_LOCAL
   SOURCES
   mlaPreprocessOp.cpp
   attentionOp.cpp
@@ -136,7 +142,6 @@ add_subdirectory(minimaxM3)
 
 add_th_common_family(
   th_common_gemm_quant
-  COMPONENT_LOCAL
   SOURCES
   cutlassScaledMM.cpp
   cublasScaledMMOp.cpp
@@ -145,13 +150,13 @@ add_th_common_family(
   marlinNvfp4MM.cpp
   marlinRepack.cpp
   cudaScaledMM.cpp
-  fp8Op.cpp
+  fp8QuantizationOp.cpp
   fp8PerTensorScalingTrtllmGenGemm.cpp
   fp4Op.cpp
   fp4Gemm.cpp
   fp4GemmTrtllmGen.cpp
   fp8BatchedGemmTrtllmGen.cpp
-  fp4Quantize.cpp
+  fp4QuantizeOp.cpp
   fp4BatchedQuantize.cpp
   fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
@@ -176,6 +181,7 @@ add_th_common_family(
   LINK_LIBRARIES
   tllm::torch_tensor_allocators
   tllm::torch_cublas
+  tllm::torch_quantization
   tllm::common_op_utils
   tllm::common_fp8
   tllm::common_nccl_comm
@@ -218,7 +224,6 @@ endif()
 # function signatures.
 add_th_common_family(
   th_common_moe
-  COMPONENT_LOCAL
   SOURCES
   fusedTopkSoftmax.cpp
   llama4MinLatency.cpp
@@ -276,11 +281,32 @@ add_th_common_family(
   userbuffersTensorOp.cpp
   virtualMemoryAllocator.cpp
   fusedGemmAllreduceOp.cpp
-  dwdpFabricGatherOp.cpp)
+  dwdpFabricGatherOp.cpp
+  LINK_LIBRARIES
+  tllm::torch_tensor_allocators
+  tllm::torch_quantization
+  tllm::common_op_utils
+  tllm::common_nccl
+  tllm::common_nccl_comm
+  tllm::common_mcast_registry
+  tllm::runtime_distributed
+  tllm::runtime_buffers
+  tllm::runtime_nccl
+  tllm::runtime_ipc_nvls
+  tllm::runtime_locality
+  tllm::runtime_multicast
+  tllm::kernel_custom_all_reduce
+  tllm::kernel_all_reduce_fusion
+  tllm::kernel_communication
+  tllm::kernel_moe_prepare
+  tllm::kernel_ulysses
+  tllm::kernel_userbuffers
+  tllm::kernel_gemm_all_reduce
+  pg_utils)
+add_library(tllm::torch_distributed ALIAS th_common_distributed)
 
 add_th_common_family(
   th_common_sequence
-  COMPONENT_LOCAL
   SOURCES
   causalConv1dOp.cpp
   gdnVerifyOp.cpp
@@ -303,7 +329,6 @@ add_library(tllm::torch_sequence ALIAS th_common_sequence)
 
 add_th_common_family(
   th_common_visual_gen
-  COMPONENT_LOCAL
   SOURCES
   fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
@@ -327,7 +352,6 @@ add_library(tllm::torch_visual_gen ALIAS th_common_visual_gen)
 
 add_th_common_family(
   th_common_decoding
-  COMPONENT_LOCAL
   SOURCES
   logitsBitmaskOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
@@ -372,7 +396,8 @@ target_link_libraries(
           ${SHARED_TARGET}
           pg_utils
           th_tensor_allocators
-          th_cublas)
+          th_cublas
+          th_quantization)
 
 if(BUILD_DEEP_GEMM)
   target_compile_definitions(th_common_decoding

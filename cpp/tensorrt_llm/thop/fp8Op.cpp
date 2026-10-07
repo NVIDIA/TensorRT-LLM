@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -232,7 +232,7 @@ inline uint8_t float_to_ue8m0(float value)
 }
 
 // Used in tests to quantize mxe4m3 tensors on host.
-std::tuple<Tensor, Tensor> quantize_mxe4m3_host(Tensor x_fp32, bool is_sf_swizzled_layout = true)
+std::tuple<Tensor, Tensor> quantize_mxe4m3_host(Tensor x_fp32, bool is_sf_swizzled_layout)
 {
     int32_t const sf_vec_size = 32;
     CHECK_CPU_INPUT(x_fp32, torch::kFloat32);
@@ -286,7 +286,7 @@ std::tuple<Tensor, Tensor> quantize_mxe4m3_host(Tensor x_fp32, bool is_sf_swizzl
 }
 
 // Used in tests to dequantize mxe4m3 tensors on host.
-Tensor dequantize_mxe4m3_host(Tensor value_e4m3, Tensor scale_ue8m08sf, bool is_sf_swizzled_layout = true)
+Tensor dequantize_mxe4m3_host(Tensor value_e4m3, Tensor scale_ue8m08sf, bool is_sf_swizzled_layout)
 {
     int32_t const sf_vec_size = 32;
     CHECK_CPU_INPUT(value_e4m3, at::ScalarType::Byte);
@@ -423,38 +423,3 @@ std::tuple<Tensor, Tensor> vectorized_per_token_fp8_quant(Tensor input)
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
-
-// Utility methods that may be useful for preprocessing weights in torch.
-TORCH_LIBRARY_FRAGMENT(tensorrt_llm, m)
-{
-    m.def("quantize_e4m3_weight(Tensor weight) -> (Tensor, Tensor)");
-    m.def("quantize_e4m3_activation(Tensor activation) -> (Tensor, Tensor)");
-    m.def("quantize_e4m3_per_tensor(Tensor input) -> (Tensor, Tensor)");
-    m.def("static_quantize_e4m3_weight(Tensor weight, Tensor scales) -> (Tensor, Tensor)");
-    m.def("static_quantize_e4m3_activation(Tensor activation, Tensor scales) -> (Tensor, Tensor)");
-    m.def("static_quantize_e4m3_per_tensor(Tensor input, Tensor scales) -> (Tensor, Tensor)");
-    m.def("dequantize_e4m3_weight(Tensor weight, Tensor scales) -> Tensor");
-    m.def("dequantize_e4m3_activation(Tensor activation, Tensor scales) -> Tensor");
-    m.def("dequantize_e4m3_per_tensor(Tensor input, Tensor scales) -> Tensor");
-    m.def("vectorized_per_token_fp8_quant(Tensor input) -> (Tensor, Tensor)");
-}
-
-TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
-{
-    m.impl("quantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_quantize_weight);
-    m.impl("quantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_quantize_activation);
-    m.impl("quantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_quantize_per_tensor);
-    m.impl("static_quantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_static_quantize_weight);
-    m.impl("static_quantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_static_quantize_activation);
-    m.impl("static_quantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_static_quantize_per_tensor);
-    m.impl("dequantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_dequantize_weight);
-    m.impl("dequantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_dequantize_activation);
-    m.impl("dequantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_dequantize_per_tensor);
-    m.impl("vectorized_per_token_fp8_quant", &tensorrt_llm::torch_ext::vectorized_per_token_fp8_quant);
-}
-
-static auto dequantize_mxe4m3_host = torch::RegisterOperators(
-    "tensorrt_llm::dequantize_mxe4m3_host", &tensorrt_llm::torch_ext::dequantize_mxe4m3_host);
-
-static auto quantize_mxe4m3_host
-    = torch::RegisterOperators("tensorrt_llm::quantize_mxe4m3_host", &tensorrt_llm::torch_ext::quantize_mxe4m3_host);
