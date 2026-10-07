@@ -32,6 +32,8 @@ from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.rope import LTXRopeTyp
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig, TorchCompileConfig
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
@@ -149,7 +151,7 @@ def _make_model_config(
         parallel=ParallelConfig(ulysses_size=ulysses_size),
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 
@@ -340,7 +342,7 @@ def _make_model_config_cfg(
         parallel=ParallelConfig(cfg_size=cfg_size, ulysses_size=ulysses_size),
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 

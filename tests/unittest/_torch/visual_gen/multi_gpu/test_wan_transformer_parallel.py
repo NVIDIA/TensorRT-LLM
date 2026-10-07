@@ -42,6 +42,7 @@ from tensorrt_llm._torch.visual_gen.config import (
 )
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
 from .tp_shard_utils import copy_tp_parameter
 
 try:
@@ -244,7 +245,7 @@ def _make_model_config(
         visual_gen_mapping=vgm,
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 

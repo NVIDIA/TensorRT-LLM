@@ -30,6 +30,8 @@ from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig
 
+from ._visual_gen_dist_utils import single_rank_llm_mapping
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
@@ -155,7 +157,7 @@ def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
         ),
         skip_create_weights_in_init=False,
     )
-    config.mapping = vgm.to_llm_mapping()
+    config.mapping = vgm.to_llm_mapping() if vgm.tp_size > 1 else single_rank_llm_mapping()
     return config
 
 
