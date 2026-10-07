@@ -121,7 +121,7 @@ class TestValidateUrl:
 
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=_dns("224.0.0.1"))
     def test_rejects_multicast(self, _):
-        with pytest.raises(RuntimeError, match="non-public"):
+        with pytest.raises(RuntimeError, match="multicast"):
             _validate_url("http://multicast.example/")
 
     @patch(
@@ -139,6 +139,87 @@ class TestValidateUrl:
     @patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=PUBLIC_DNS)
     def test_accepts_https(self, _):
         _validate_url("https://example.com/image.jpg")  # must not raise
+
+
+class TestAllowPrivateUrlsOptIn:
+    """TRTLLM_MEDIA_ALLOW_PRIVATE_URLS=1 relaxes the is_global requirement.
+
+    Default (unset / not "1") keeps the SSRF posture unchanged; the opt-in
+    admits private, loopback, link-local, and CGNAT addresses but never
+    multicast, non-http(s) schemes, or hostname-less URLs.
+    """
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "127.0.0.1",
+            "::1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.100",
+            "169.254.169.254",
+            "100.64.0.1",
+        ],
+    )
+    def test_env_set_allows_non_global_addresses(self, monkeypatch, ip):
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", "1")
+        with patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=_dns(ip)):
+            _validate_url("http://internal.host/media.jpg")  # must not raise
+
+    @pytest.mark.parametrize("env_value", [None, "0", "true", "yes", ""])
+    def test_default_and_non_1_values_still_reject(self, monkeypatch, env_value):
+        if env_value is None:
+            monkeypatch.delenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", env_value)
+        with patch(
+            "tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=_dns("10.0.0.1")
+        ):
+            with pytest.raises(RuntimeError, match="non-public"):
+                _validate_url("http://internal.corp/media.jpg")
+
+    def test_env_set_still_rejects_multicast(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", "1")
+        with patch(
+            "tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=_dns("224.0.0.1")
+        ):
+            with pytest.raises(RuntimeError, match="multicast"):
+                _validate_url("http://multicast.example/")
+
+    def test_env_set_still_rejects_non_http_scheme(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", "1")
+        with pytest.raises(RuntimeError, match="Only http"):
+            _validate_url("ftp://internal.host/file")
+
+    def test_env_set_allows_private_redirect_target(self, monkeypatch):
+        """The opt-in applies to redirect hops too (same validator)."""
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", "1")
+
+        def dns_side_effect(host, *args, **kwargs):
+            return _dns("192.168.1.1") if "internal" in str(host) else PUBLIC_DNS
+
+        redirect = _requests_response(
+            status_code=302,
+            headers={"Location": "http://internal.host/media.jpg"},
+            chunks=(),
+        )
+        final = _requests_response(chunks=(b"media",))
+        with (
+            patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", side_effect=dns_side_effect),
+            patch("tensorrt_llm.inputs.media_io.requests.get", side_effect=[redirect, final]),
+        ):
+            result = _safe_request_get("http://example.com/media.jpg")
+        assert result._content == b"media"
+
+    def test_default_rejects_private_url_in_safe_request_get(self, monkeypatch):
+        monkeypatch.delenv("TRTLLM_MEDIA_ALLOW_PRIVATE_URLS", raising=False)
+        with (
+            patch("tensorrt_llm.inputs.media_io.socket.getaddrinfo", return_value=_dns("10.0.0.1")),
+            patch("tensorrt_llm.inputs.media_io.requests.get") as mock_get,
+        ):
+            with pytest.raises(RuntimeError, match="non-public"):
+                _safe_request_get("http://internal.corp/image.jpg")
+            mock_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

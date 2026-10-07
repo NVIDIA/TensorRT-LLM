@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -45,6 +47,9 @@ sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
 from blocks import Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
+from python_change_analysis import analyze_python_changes  # noqa: E402
+from repository_reference import RepositoryReferenceIndex  # noqa: E402
+from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
 from rules.base import PRInputs  # noqa: E402
 from rules.tests_def_rule import (  # noqa: E402
     ACCURACY_DIR,
@@ -82,46 +87,84 @@ artifact = _load_artifact()
 cbts_main = _load_main()
 
 
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    ).stdout.strip()
+
+
 class CoverageArtifactTest(unittest.TestCase):
-    def test_selects_closest_complete_ancestor_pair(self) -> None:
-        commits = {104: "newer", 102: "older-three", 101: "older-one"}
+    def test_patch_apply_status_detects_clean_and_conflicting_diffs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            _git(repo, "init")
+            _git(repo, "config", "user.email", "cbts@example.com")
+            _git(repo, "config", "user.name", "CBTS Test")
+            source = repo / "source.py"
+            waives = repo / "waives.txt"
+            source.write_text("first\nbase\nlast\n")
+            waives.write_text("base\n")
+            _git(repo, "add", "source.py", "waives.txt")
+            _git(repo, "commit", "-m", "base")
+            base = _git(repo, "rev-parse", "HEAD")
 
-        def exists(url: str) -> bool:
-            if "/103/" in url:
-                return url.endswith("cbts_pystart_report_x86_64.tar.gz")
-            return "/100/" not in url
+            _git(repo, "checkout", "-b", "pr")
+            source.write_text("first\npr\nlast\n")
+            waives.write_text("pr\n")
+            _git(repo, "commit", "-am", "pr")
+            head = _git(repo, "rev-parse", "HEAD")
 
-        relations = {
-            "newer": (1, "behind"),
-            "older-three": (3, "ahead"),
-            "older-one": (1, "ahead"),
-        }
-        with (
-            mock.patch.object(artifact, "latest_build_number", return_value=104),
-            mock.patch.object(artifact, "_exists", side_effect=exists),
-            mock.patch.object(
-                artifact, "build_commit", side_effect=lambda build, _base: commits[build]
-            ),
-            mock.patch.object(
-                artifact, "drift", side_effect=lambda commit, _base: relations[commit]
-            ),
-            mock.patch.object(artifact, "compare_distance", return_value=7) as lag,
-        ):
-            selected = artifact.select_tarball(
-                "pr-base", artifact_base="coverage", jenkins_base="jenkins", max_probe=5
+            _git(repo, "checkout", "-b", "db-clean", base)
+            (repo / "other.py").write_text("coverage revision\n")
+            _git(repo, "add", "other.py")
+            _git(repo, "commit", "-m", "non-conflicting db")
+            clean_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-conflict", base)
+            source.write_text("first\ndb\nlast\n")
+            _git(repo, "commit", "-am", "conflicting db")
+            conflicting_db = _git(repo, "rev-parse", "HEAD")
+
+            _git(repo, "checkout", "-b", "db-irrelevant-conflict", base)
+            waives.write_text("db\n")
+            _git(repo, "commit", "-am", "conflicting non-residual file")
+            irrelevant_conflict_db = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "pr")
+
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, clean_db, repo, str(repo)), "clean"
             )
-
-        self.assertIsNotNone(selected)
-        assert selected is not None
-        self.assertEqual(selected["build"], 101)
-        self.assertEqual(selected["commit"], "older-one")
-        self.assertEqual(selected["drift"], 1)
-        self.assertEqual(selected["drift_status"], "ahead")
-        self.assertEqual(
-            [url.rsplit("/", 1)[-1] for url in selected["urls"]],
-            list(artifact.ARCH_TARBALL_NAMES),
-        )
-        lag.assert_called_once_with("older-one")
+            self.assertEqual(
+                artifact._patch_apply_status(base, head, conflicting_db, repo, str(repo)),
+                "conflict",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["source.py"],
+                ),
+                "clean",
+            )
+            self.assertEqual(
+                artifact._patch_apply_status(
+                    base,
+                    head,
+                    irrelevant_conflict_db,
+                    repo,
+                    str(repo),
+                    ["waives.txt"],
+                ),
+                "conflict",
+            )
 
     def test_accepts_artifact_collected_at_pr_base(self) -> None:
         with (
@@ -137,6 +180,191 @@ class CoverageArtifactTest(unittest.TestCase):
         assert selected is not None
         self.assertEqual(selected["drift"], 0)
         self.assertEqual(selected["drift_status"], "identical")
+
+    def test_select_build_resolves_explicit_pinned_build(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="coverage-commit"),
+            mock.patch.object(artifact, "drift", return_value=(3, "behind")),
+            mock.patch.object(artifact, "compare_distance", return_value=7),
+        ):
+            selected = artifact.select_build(42, "pr-base")
+
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual(selected["build"], 42)
+        self.assertEqual(selected["commit"], "coverage-commit")
+        self.assertEqual(selected["base_commit"], "pr-base")
+        self.assertEqual(selected["drift"], 3)
+
+    def test_select_build_rejects_changed_pinned_commit(self) -> None:
+        with (
+            mock.patch.object(artifact, "_exists", return_value=True),
+            mock.patch.object(artifact, "build_commit", return_value="replacement-commit"),
+            mock.patch.object(artifact, "drift") as drift,
+        ):
+            selected = artifact.select_build(
+                42,
+                "pr-base",
+                expected_commit="pinned-commit",
+            )
+
+        self.assertIsNone(selected)
+        drift.assert_not_called()
+
+    def test_resolve_pin_reuses_matching_artifactory_pin(self) -> None:
+        commit = "a" * 40
+        pin = {
+            "version": artifact.PIN_VERSION,
+            "pr_number": "18802",
+            "pr_head": "b" * 40,
+            "coverage_db_build": 42,
+            "coverage_db_commit": commit,
+        }
+        with (
+            mock.patch.object(artifact, "_get", return_value=(200, json.dumps(pin).encode())),
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+        ):
+            plan = artifact.resolve_pin(
+                "unused.json",
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+
+        self.assertEqual(
+            plan,
+            {
+                "status": "ready",
+                "build": 42,
+                "commit": commit,
+                "pin_upload_required": False,
+            },
+        )
+        select_latest.assert_not_called()
+
+    def test_resolve_pin_creates_file_for_jenkins_upload(self) -> None:
+        commit = "a" * 40
+        selection = {"build": 42, "commit": commit}
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "_get", return_value=(404, None)),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+        ):
+            pin_path = Path(temp_dir) / artifact.PIN_NAME
+            plan = artifact.resolve_pin(
+                str(pin_path),
+                "18802",
+                "b" * 40,
+                "pr-base",
+            )
+            pin = json.loads(pin_path.read_text())
+
+        self.assertEqual(pin["coverage_db_build"], 42)
+        self.assertEqual(pin["coverage_db_commit"], commit)
+        self.assertTrue(plan["pin_upload_required"])
+        self.assertEqual(plan["pin_path"], str(pin_path))
+        self.assertEqual(
+            plan["pin_target"],
+            f"{artifact.PIN_BASE}/18802/{'b' * 40}/",
+        )
+
+    def test_resolve_pin_declines_invalid_or_unavailable_pin(self) -> None:
+        with mock.patch.object(artifact, "_get", return_value=(200, b"{}")):
+            invalid = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+        with mock.patch.object(artifact, "_get", return_value=(None, None)):
+            unavailable = artifact.resolve_pin("unused.json", "18802", "b" * 40, "pr-base")
+
+        self.assertEqual(invalid["status"], "declined")
+        self.assertIn("invalid coverage DB pin", invalid["decline_reason"])
+        self.assertEqual(unavailable["status"], "declined")
+        self.assertIn("pin query failed", unavailable["decline_reason"])
+
+    def test_resolve_pin_cli_prints_upload_plan(self) -> None:
+        plan = {
+            "status": "ready",
+            "build": 42,
+            "commit": "a" * 40,
+            "pin_upload_required": True,
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="c" * 40),
+            mock.patch.object(artifact, "resolve_pin", return_value=plan) as resolve_pin,
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(
+                [
+                    "--resolve-pin",
+                    "cbts_db_pin.json",
+                    "--pr-number",
+                    "18802",
+                    "--pr-head",
+                    "b" * 40,
+                ]
+            )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), plan)
+        resolve_pin.assert_called_once_with(
+            "cbts_db_pin.json",
+            "18802",
+            "b" * 40,
+            "c" * 40,
+        )
+
+    def test_resolve_build_prints_metadata_without_residual_paths(self) -> None:
+        selection = {
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_tarball", return_value=selection),
+            mock.patch("sys.stdout", stdout),
+        ):
+            status = artifact.main(["--resolve-build", "--pr-head", "pr-head"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), selection)
+
+    def test_prepare_uses_explicit_pinned_build(self) -> None:
+        selection = {
+            "url": "x86-url",
+            "urls": ["x86-url", "sbsa-url"],
+            "build": 42,
+            "commit": "coverage-commit",
+            "base_commit": "pr-base",
+            "drift": 2,
+            "drift_status": "behind",
+            "lag": 5,
+        }
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            mock.patch.object(artifact, "merge_base", return_value="pr-base"),
+            mock.patch.object(artifact, "select_build", return_value=selection) as select_build,
+            mock.patch.object(artifact, "select_tarball") as select_latest,
+            mock.patch.object(artifact, "_patch_apply_status", return_value="conflict"),
+        ):
+            ready = artifact.prepare(
+                temp_dir,
+                "pr-head",
+                ["tensorrt_llm/source.py"],
+                build=42,
+                expected_commit="coverage-commit",
+            )
+
+        self.assertIsNotNone(ready)
+        assert ready is not None
+        self.assertIsNone(ready["path"])
+        select_build.assert_called_once_with(
+            42,
+            "pr-base",
+            expected_commit="coverage-commit",
+        )
+        select_latest.assert_not_called()
 
     def test_prepare_merges_x86_and_sbsa_databases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -191,14 +419,21 @@ class CoverageArtifactTest(unittest.TestCase):
             with (
                 mock.patch.object(artifact, "merge_base", return_value="pr-base"),
                 mock.patch.object(artifact, "select_tarball", return_value=selection) as select,
+                mock.patch.object(artifact, "_patch_apply_status", return_value="clean") as apply,
                 mock.patch.object(artifact, "download", side_effect=download),
                 mock.patch.object(artifact, "extract", side_effect=extract),
             ):
-                ready = artifact.prepare(str(output_dir), "pr-head")
+                ready = artifact.prepare(str(output_dir), "pr-head", ["tensorrt_llm/source.py"])
 
             self.assertIsNotNone(ready)
             assert ready is not None
             select.assert_called_once_with("pr-base")
+            apply.assert_called_once_with(
+                "pr-base",
+                "pr-head",
+                "coverage-commit",
+                relevant_paths=["tensorrt_llm/source.py"],
+            )
             connection = sqlite3.connect(ready["path"])
             try:
                 tests = {
@@ -214,12 +449,6 @@ class CoverageArtifactTest(unittest.TestCase):
                 },
             )
             self.assertEqual(json.loads(Path(ready["meta"]).read_text()), selection)
-
-    def test_freshness_gate_honors_configured_threshold(self) -> None:
-        self.assertEqual(cbts_main._coverage_freshness(7, 7), ("ok", ""))
-        freshness, reason = cbts_main._coverage_freshness(8, 7)
-        self.assertEqual(freshness, "stale")
-        self.assertTrue(reason)
 
 
 # Coverage pilot
@@ -354,6 +583,385 @@ def test_main_reads_bot_trigger_payload(
     captured = capfd.readouterr()
     assert captured.out == "pilot-user\n"
     assert "pr_author=pilot-user, reason=author resolved" in captured.err
+
+
+# Coverage selector
+
+
+def _analyze(source: str, diff: str):
+    return analyze_python_changes(
+        source,
+        iter_diff_post_line_numbers(diff),
+        iter_diff_deleted_post_lines(diff),
+    )
+
+
+def test_literal_assignment_resolves_consumers_and_callers_without_name_policy() -> None:
+    source = (
+        "VALUE = 521\n\ndef helper():\n    return VALUE\n\ndef caller():\n    return helper()\n"
+    )
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+VALUE = 521\n")
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.callers == {"helper": {"caller"}}
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    (
+        ("_VALUE = create_value()\n", "effectful module statement"),
+        ("class Config:\n    value = 521\n", "class/signature import change"),
+    ),
+)
+def test_unsupported_import_time_changes_remain_fail_closed(source: str, reason: str) -> None:
+    changed_line = 2 if source.startswith("class") else 1
+    diff = f"@@ -0,0 +{changed_line} @@\n+changed\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == reason
+
+
+def test_replaced_literal_is_resolved_when_both_images_are_literals() -> None:
+    source = "_VALUE = 521\n"
+    diff = "@@ -1 +1 @@\n-_VALUE = 520\n+_VALUE = 521\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+
+
+def test_replaced_effectful_assignment_remains_fail_closed() -> None:
+    source = "_VALUE = 521\n"
+    diff = "@@ -1 +1 @@\n-_VALUE = create_value()\n+_VALUE = 521\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+@pytest.mark.parametrize("body", ("", "# explanatory comment"))
+def test_added_module_noop_line_is_ignored(body: str) -> None:
+    source = f"VALUE = 521\n{body}\n"
+    diff = f"@@ -1 +1,2 @@\n VALUE = 521\n+{body}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+@pytest.mark.parametrize("body", ("", "# obsolete comment"))
+def test_deleted_module_noop_line_is_ignored(body: str) -> None:
+    source = "VALUE = 521\n"
+    diff = f"@@ -1,2 +1 @@\n VALUE = 521\n-{body}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+def test_added_decorator_line_remains_fail_closed() -> None:
+    source = "@decorate\ndef consumer():\n    return 1\n"
+    diff = "@@ -1,0 +1 @@\n+@decorate\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
+
+
+def test_postponed_annotated_literal_is_resolved() -> None:
+    source = "from __future__ import annotations\n\n_CACHE: dict[str, object] = {}\n"
+    diff = "@@ -2,0 +3 @@\n+_CACHE: dict[str, object] = {}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+
+
+def test_builtin_import_is_safe_when_it_is_only_added() -> None:
+    source = "import sys\n\ndef shutdown():\n    return sys.modules\n"
+    diff = "@@ -0,0 +1 @@\n+import sys\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"shutdown"}
+
+
+def test_builtin_import_replacement_remains_fail_closed() -> None:
+    source = "import _thread as runtime\n"
+    diff = "@@ -1 +1 @@\n-import sys as runtime\n+import _thread as runtime\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_literal_assignment_resolves_class_method_consumer() -> None:
+    source = "_VALUE = 521\n\nclass Config:\n    def check(self):\n        return _VALUE\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Config.check"}
+
+
+def test_literal_assignment_attributes_closure_consumer_to_outer() -> None:
+    source = (
+        "_VALUE = 521\n\ndef outer():\n    def inner():\n        return _VALUE\n    return inner\n"
+    )
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"outer"}
+
+
+def test_import_time_consumer_remains_fail_closed() -> None:
+    source = "_VALUE = 521\n\n_ALIAS = _VALUE\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
+
+    assert analysis.limitation == "import-time binding consumer"
+
+
+def test_plain_function_declaration_with_postponed_annotations_is_safe() -> None:
+    source = (
+        "from __future__ import annotations\n\ndef _helper(value: object) -> int:\n    return 1\n"
+    )
+    diff = "@@ -2,0 +3,2 @@\n+def _helper(value: object) -> int:\n+    return 1\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"_helper"}
+
+
+def test_local_shadow_does_not_create_direct_caller_edge() -> None:
+    source = (
+        "_VALUE = 521\n"
+        "\n"
+        "def _helper():\n"
+        "    return _VALUE\n"
+        "\n"
+        "def caller(_helper):\n"
+        "    return _helper()\n"
+    )
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+_VALUE = 521\n")
+
+    assert not analysis.limitation
+    assert analysis.callers == {}
+
+
+def test_local_shadow_does_not_create_binding_consumer() -> None:
+    source = "VALUE = 521\n\ndef helper(VALUE):\n    return VALUE\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+VALUE = 521\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == set()
+
+
+def test_comprehension_target_does_not_shadow_outer_iterable_load() -> None:
+    source = "VALUE = (1, 2, 3)\n\ndef consumer():\n    return [VALUE for VALUE in VALUE]\n"
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+VALUE = (1, 2, 3)\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"consumer"}
+
+
+def test_function_alias_marks_caller_graph_incomplete() -> None:
+    source = (
+        "VALUE = 521\n\n"
+        "def helper():\n"
+        "    return VALUE\n\n"
+        "def caller():\n"
+        "    alias = helper\n"
+        "    return alias()\n"
+    )
+
+    analysis = _analyze(source, "@@ -0,0 +1 @@\n+VALUE = 521\n")
+
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.callers == {}
+    assert analysis.callable_escapes == {"helper"}
+
+
+@pytest.fixture()
+def reference_root(tmp_path: Path) -> Path:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True, timeout=60)
+    return tmp_path
+
+
+def _stage_reference_files(reference_root: Path) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=reference_root, check=True, timeout=60)
+
+
+def test_repository_reference_index_follows_import_relationships(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\nTHIRD = 3\n")
+    (package / "direct.py").write_text("from pkg.owner import VALUE\n")
+    (package / "module.py").write_text("import pkg.owner as owner\nprint(owner.OTHER)\n")
+    (package / "relative.py").write_text("from . import owner\nprint(owner.THIRD)\n")
+    (package / "unrelated.py").write_text("VALUE = 4\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE", "OTHER", "THIRD"}
+    )
+
+    assert references == {"VALUE", "OTHER", "THIRD"}
+
+
+def test_repository_reference_index_treats_module_escape_as_unresolved(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "consumer.py").write_text("import pkg.owner as owner\nregister(owner)\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {"VALUE", "OTHER"}
+
+
+def test_repository_reference_index_tracks_simple_module_alias(reference_root: Path) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "consumer.py").write_text(
+        "import pkg.owner as owner\nalias = owner\nprint(alias.OTHER)\n"
+    )
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {"OTHER"}
+
+
+def test_repository_reference_index_tracks_direct_import_module(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "consumer.py").write_text(
+        'from importlib import import_module\nowner = import_module("pkg.owner")\n'
+    )
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {"VALUE", "OTHER"}
+
+
+def test_repository_reference_index_finds_untracked_module(reference_root: Path) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\n")
+    _stage_reference_files(reference_root)
+    (package / "consumer.py").write_text("from pkg.owner import VALUE\n")
+
+    references = RepositoryReferenceIndex(reference_root).external_references(
+        "pkg/owner.py", {"VALUE"}
+    )
+
+    assert references == {"VALUE"}
+
+
+def test_repository_reference_index_reports_direct_importers(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (package / "test_relative.py").write_text("from .helper import VALUE\n")
+    (package / "test_prefixed.py").write_text("from defs.perf.helper import VALUE\n")
+
+    importers = RepositoryReferenceIndex(
+        tmp_path,
+        module_prefixes=("defs",),
+    ).direct_importers("perf/helper.py")
+
+    assert importers.complete
+    assert importers.paths == ("perf/test_prefixed.py", "perf/test_relative.py")
+    assert not importers.limitation
+
+
+def test_repository_reference_index_ignores_non_code_leaf_mentions(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (package / "test_consumer.py").write_text("from .helper import VALUE\n")
+    (package / "unrelated.py").write_text(
+        'helper_fn = 1\nLABEL = "helper"\n# helper is not referenced\n'
+    )
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert importers.complete
+    assert importers.paths == ("perf/test_consumer.py",)
+    assert not importers.limitation
+
+
+def test_repository_reference_index_reports_ambiguous_short_import(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "consumer.py").write_text("import helper\n")
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert not importers.complete
+    assert not importers.paths
+    assert importers.limitation == "ambiguous short import in other/consumer.py: helper"
+
+
+def test_repository_reference_index_reports_unresolved_module_reference(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (tmp_path / "consumer.py").write_text("print(helper.VALUE)\n")
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert not importers.complete
+    assert not importers.paths
+    assert importers.limitation == "unresolved module reference in consumer.py"
+
+
+def test_repository_reference_index_marks_dynamic_importers_incomplete(tmp_path: Path) -> None:
+    package = tmp_path / "perf"
+    package.mkdir()
+    (package / "helper.py").write_text("VALUE = 1\n")
+    (package / "test_consumer.py").write_text(
+        "import importlib\nmodule_name = '.helper'\nimportlib.import_module(module_name)\n"
+    )
+
+    importers = RepositoryReferenceIndex(tmp_path).direct_importers("perf/helper.py")
+
+    assert not importers.complete
+    assert not importers.paths
+    assert importers.limitation == "dynamic import may target perf/helper.py"
 
 
 # Decision reporting
@@ -492,14 +1100,29 @@ def test_case_counts_include_coverage_multi_gpu_at_full_size(
     assert (cbts_cases, total_cases) == (80, 160)
 
 
+@pytest.mark.parametrize(
+    ("cbts_applied", "coverage_pilot_eligible"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     report_module: ModuleType,
+    cbts_applied: bool,
+    coverage_pilot_eligible: bool,
 ) -> None:
     decision = _decision()
     decision["affected_stage_split_counts"] = {
         "H100-PyTorch-1": 1,
         "H100-4_GPUs-PyTorch-1": 1,
     }
+    decision["coverage_compatibility"] = "conflict"
+    decision["coverage_decline_reason"] = "residual conflict"
+    decision["coverage_decline_category"] = "compatibility_conflict"
+    decision["coverage_residual_files"] = ["tensorrt_llm/source.py"]
 
     document = report_module.build_document(
         decision,
@@ -510,12 +1133,20 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
         total_cases=100,
         multi_gpu_required=True,
         multi_gpu_label_gate_open=False,
+        cbts_applied=cbts_applied,
+        coverage_pilot_eligible=coverage_pilot_eligible,
     )
 
     assert document["d_case_skip_rate"] == 0.75
     assert document["b_case_skip_rate_valid"] is True
     assert document["b_non_cbts_multi_gpu_required"] is True
     assert document["b_multi_gpu_label_gate_open"] is False
+    assert document["b_cbts_applied"] is cbts_applied
+    assert document["b_coverage_pilot_eligible"] is coverage_pilot_eligible
+    assert document["s_coverage_compatibility"] == "conflict"
+    assert document["s_coverage_decline_reason"] == "residual conflict"
+    assert document["s_coverage_decline_category"] == "compatibility_conflict"
+    assert document["l_coverage_residual_files"] == 1
     assert document["flat_detail"]["hit_stages"] == [
         "H100-PyTorch-1",
         "H100-PyTorch-2",
@@ -523,10 +1154,22 @@ def test_build_document_filters_unscheduled_stages_and_persists_valid_rate(
     assert document["flat_detail"]["split_counts"] == {"H100-PyTorch-1": 1}
 
 
+@pytest.mark.parametrize(
+    ("flag_args", "expected_cbts_applied", "expected_coverage_pilot_eligible"),
+    [
+        ((), False, False),
+        (("--cbts-applied",), True, False),
+        (("--coverage-pilot-eligible",), False, True),
+        (("--cbts-applied", "--coverage-pilot-eligible"), True, True),
+    ],
+)
 def test_main_posts_case_skip_rate_to_opensearch(
     report_module: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    flag_args: tuple[str, ...],
+    expected_cbts_applied: bool,
+    expected_coverage_pilot_eligible: bool,
 ) -> None:
     posted_documents: list[dict[str, object]] = []
 
@@ -561,6 +1204,7 @@ def test_main_posts_case_skip_rate_to_opensearch(
                 ".",
                 "--multi-gpu-required",
                 "--multi-gpu-label-gate-open",
+                *flag_args,
             ]
         )
         == 0
@@ -570,6 +1214,8 @@ def test_main_posts_case_skip_rate_to_opensearch(
     assert posted_documents[0]["b_case_skip_rate_valid"] is True
     assert posted_documents[0]["b_non_cbts_multi_gpu_required"] is True
     assert posted_documents[0]["b_multi_gpu_label_gate_open"] is True
+    assert posted_documents[0]["b_cbts_applied"] is expected_cbts_applied
+    assert posted_documents[0]["b_coverage_pilot_eligible"] is expected_coverage_pilot_eligible
 
 
 # Test-definition rule

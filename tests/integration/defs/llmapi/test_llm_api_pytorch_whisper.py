@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 import soundfile
 
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -238,18 +239,25 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
         assert generated[: len(expected)] == expected
 
 
-# Beam always rides kv-v1: KVCacheManagerV2 requires beam width 1 (a v2
-# preference with beam > 1 silently falls back to v1). The bf16 graphs-on case
-# captures decode graphs over batch_size * beam_width sequences.
+# The bf16 graphs-on cases capture decode graphs over
+# batch_size * beam_width sequences.
 _BEAM_SEARCH_CASES = [
-    pytest.param(None, None, False, id="fp32-kv-v1-graphs-off-beam2"),
-    pytest.param("bfloat16", [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+    pytest.param(None, False, None, False, id="fp32-kv-v1-graphs-off-beam2"),
+    pytest.param("bfloat16", False, [1, 2], True, id="bf16-kv-v1-decoder-graphs-on-beam2"),
+    pytest.param("bfloat16", True, [1, 2], True, id="bf16-kv-v2-decoder-graphs-on-beam2"),
 ]
 
 
-@pytest.mark.parametrize("torch_dtype,cuda_graph_batch_sizes,graphs_captured", _BEAM_SEARCH_CASES)
+@pytest.mark.parametrize(
+    "torch_dtype,use_kv_cache_manager_v2,cuda_graph_batch_sizes,graphs_captured",
+    _BEAM_SEARCH_CASES,
+)
 def test_whisper_pytorch_beam_search(
-    monkeypatch, torch_dtype, cuda_graph_batch_sizes, graphs_captured
+    monkeypatch,
+    torch_dtype,
+    use_kv_cache_manager_v2,
+    cuda_graph_batch_sizes,
+    graphs_captured,
 ):
     """Beam-2 transcription (cross-KV shared across beams)."""
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
@@ -260,6 +268,7 @@ def test_whisper_pytorch_beam_search(
     llm = _make_llm(
         model_path,
         max_beam_width=2,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         torch_dtype=torch_dtype,
         cuda_graph_batch_sizes=cuda_graph_batch_sizes,
     )
@@ -275,15 +284,15 @@ def test_whisper_pytorch_beam_search(
 def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = False) -> None:
     """Introspect the in-process engine (single-process mode only).
 
-    The enc-dec encoder step shares `encoder_cuda_graph_runner` with the
-    `llm.encode()` path; feature mode is a mode of that one runner, selected by
-    `encoder_cuda_graph_config`, not a second runner.
+    The independent encoder phase owns its graphs inside EncoderDecoderRunner;
+    the engine retains the decoder graphs.
     """
     model_engine = llm._executor.engine.model_engine
     assert model_engine.cuda_graph_runner.enabled == captured
     assert bool(model_engine.cuda_graph_runner.graphs) == captured
 
-    encoder_runner = model_engine.encoder_cuda_graph_runner
+    assert isinstance(model_engine._runner, EncoderDecoderRunner)
+    encoder_runner = model_engine._runner._encoder_cuda_graph_runner
     if not encoder_captured:
         assert not encoder_runner.enabled
         assert not encoder_runner.graphs
@@ -293,8 +302,8 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
     assert encoder_runner.feature_mode
     assert encoder_runner.is_encoder_decoder
     # Capture alone is not enough: `pad_batch` and the shape checks in
-    # `_maybe_forward_encoder_graph` can route every request to the eager
-    # encoder while `graphs` stays populated, and that silent fallback would
+    # `EncoderMixin._prepare_encoder_feature_graph_inputs` can route every request
+    # to the eager encoder while `graphs` stays populated. That silent fallback would
     # pass every output assertion above. Only the replay counter rules it out,
     # and only against the warmup baseline: the capture pass replays each key
     # once immediately after capturing it, so anything at or below
@@ -305,7 +314,7 @@ def _assert_cuda_graph_state(llm: LLM, captured: bool, encoder_captured: bool = 
 # Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:
 # (torch_dtype override or None for checkpoint fp32, kv manager v2, decoder
 # cuda-graph batch sizes, graphs must capture, TP size, encoder graphs).
-# KVCacheManagerV2 requires beam width 1, so v2 rides greedy; the
+# Beam coverage lives in _BEAM_SEARCH_CASES. The
 # fp32+graphs-requested case covers fp32 enc-dec capturing decoder graphs. The
 # encoder-graphs case additionally captures the encoder step, which must not
 # change a single token.

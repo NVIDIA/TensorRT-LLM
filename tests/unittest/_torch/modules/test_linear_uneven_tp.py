@@ -911,8 +911,9 @@ class TestW4A8MXFP4FP8MLP:
 
 
 @pytest.mark.skipif(
-    not is_sm_100f(),
-    reason="This test is only supported on SM 100 family GPUs",
+    not is_sm_100f() or get_sm_version() == 107,
+    reason="This test is only supported on SM 100 family GPUs; SM107 has no "
+    "sm107a/sm100f cubins for the dense W4A8 NVFP4xFP8 trtllm-gen GEMM",
 )
 class TestW4A8NVFP4FP8MLP:
     """W4A8 NVFP4/FP8: column → row pipeline.

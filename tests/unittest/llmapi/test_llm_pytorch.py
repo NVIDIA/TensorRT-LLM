@@ -35,9 +35,8 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        sampling_params_for_aborting_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (force_ampere, similar, skip_fp8_pre_ada,
-                        skip_gpu_memory_less_than_40gb,
-                        skip_gpu_memory_less_than_80gb, skip_ray)
+from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
+                        skip_gpu_memory_less_than_138gb, skip_ray)
 from utils.llm_data import llm_models_root
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -60,7 +59,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
 
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from dataclasses import replace
 
 # isort: on
@@ -115,6 +114,56 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         use_overlap=use_overlap,
         enable_chunked_prefill=enable_chunked_prefill,
         enable_iter_req_stats=enable_iter_req_stats)
+
+
+@skip_ray
+@pytest.mark.parametrize("use_overlap", [False, True])
+@pytest.mark.part1
+def test_llm_get_stats_with_interval(use_overlap):
+    """iter_perf_stats_interval samples records but keeps counter sums exact."""
+    interval = 4
+    stat_prompts = [
+        "A B C", "Nvidia is awesome because", "The capital of France is",
+        "Once upon a time"
+    ] * 2
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kvcache_config,
+             enable_iter_perf_stats=True,
+             enable_iter_req_stats=True,
+             iter_perf_stats_interval=interval,
+             disable_overlap_scheduler=not use_overlap) as llm:
+        # Different lengths so requests finish on different iterations.
+        sampling_params = [
+            SamplingParams(max_tokens=5 + 3 * i, end_id=-1)
+            for i in range(len(stat_prompts))
+        ]
+        llm.generate(stat_prompts, sampling_params=sampling_params)
+
+        records = []
+        while True:
+            batch = llm.get_stats(timeout=2)
+            if not batch:
+                break
+            records.extend(
+                json.loads(r) if isinstance(r, str) else r for r in batch)
+
+    iter_records = [r for r in records if "iter" in r]
+    assert iter_records, "expected sampled iteration stats records"
+    # Every record is on a sampled iteration, except the single record
+    # flushed when the last active request finishes between samples.
+    off_interval = [r["iter"] for r in iter_records if r["iter"] % interval]
+    assert len(off_interval) <= 1, off_interval
+    if off_interval:
+        assert off_interval[0] == max(r["iter"] for r in iter_records)
+    # Counters from skipped iterations are folded into emitted records.
+    assert sum(r["numCompletedRequests"]
+               for r in iter_records) == len(stat_prompts)
+    assert sum(r["numNewActiveRequests"]
+               for r in iter_records) == len(stat_prompts)
+    # Far fewer records than executor iterations: the sampled iterations
+    # 0, interval, ..., plus the startup snapshot and the drain record.
+    last_iter = max(r["iter"] for r in iter_records)
+    assert len(iter_records) <= last_iter // interval + 3
 
 
 @pytest.mark.part1
@@ -234,7 +283,7 @@ def test_llm_perf_metrics():
 @pytest.mark.part3
 @pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
 def test_llm_prefix_cache_reuse(attn_backend):
-    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
     prompt = "The future of AI is " * 20
     sampling_params = SamplingParams(temperature=0,
                                      max_tokens=5,
@@ -297,12 +346,13 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
+    vocab_size_padded = AutoConfig.from_pretrained(llama_model_path).vocab_size
     embedding_bias = torch.zeros(vocab_size_padded)
     embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
 
+    max_tokens = 6
     sampling_kwargs = {
-        "max_tokens": 6,
+        "max_tokens": max_tokens,
         "embedding_bias": embedding_bias,
     }
 
@@ -310,10 +360,15 @@ def test_embedding_bias_with_torch_sampler_strategies():
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
         prompts,
-        ["Z Z Z Z Z Z"],
+        [expected_output],
         sampling_params=sampling_params,
         backend="pytorch",
     )
@@ -378,33 +433,45 @@ def test_lora_cuda_graph_params_filling_kernel_special_cases():
     compare_cuda_graph_lora_params_filler(test_params6)
 
 
-@skip_gpu_memory_less_than_80gb
-@pytest.mark.part0
+@skip_gpu_memory_less_than_138gb
+@pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
-def test_llama_3_1_8b_fp8_with_bf16_lora(cuda_graph_config) -> None:
-    skip_fp8_pre_ada(use_fp8=True)
-    model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-    lora_dir = f"{llm_models_root()}/lora/llama-3-chinese-8b-instruct-v2-lora"
-    prompt = "美国的首都是哪里？"
-    reference = "华盛顿特区。华盛顿特区是美国的首都和一个行政区"
-
-    lora_config = LoraConfig(lora_dir=[lora_dir],
+def test_nemotron_nas_lora(cuda_graph_config) -> None:
+    lora_config = LoraConfig(lora_dir=[
+        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
+    ],
                              max_lora_rank=64,
-                             max_loras=2,
-                             max_cpu_loras=2)
-    lora_req = LoRARequest("lora-chinese", 0, lora_dir)
+                             max_loras=1,
+                             max_cpu_loras=1)
 
-    llm = LLM(model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=cuda_graph_config)
+    llm = LLM(
+        model=
+        f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+        lora_config=lora_config,
+        kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     try:
-        output = llm.generate(prompt,
-                              SamplingParams(max_tokens=20),
-                              lora_request=[lora_req])
+        prompts = [
+            "Hello, how are you?",
+            "Hello, how are you?",
+        ]
+
+        sampling_params = SamplingParams(max_tokens=3, add_special_tokens=False)
+        lora_req = LoRARequest(
+            "task-0", 0,
+            f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-lora-adapter_r64"
+        )
+        lora_request = [lora_req, None]
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_request)
+
+        assert similar(outputs[0].outputs[0].text, outputs[1].outputs[0].text)
     finally:
         llm.shutdown()
-    assert similar(output.outputs[0].text, reference)
 
 
 @pytest.mark.part2

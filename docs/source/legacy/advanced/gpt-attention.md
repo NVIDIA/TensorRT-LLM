@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (gpt-attention)=
 
 # Multi-Head, Multi-Query, and Group-Query Attention

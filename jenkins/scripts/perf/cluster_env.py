@@ -89,7 +89,17 @@ UCX_ENV_RULES = [
 
 # Ordered so composite names win over their substrings (GB200 before B200,
 # GB300 before B300).
-KNOWN_GPU_TYPES = ("GB300", "GB200", "GB10X", "B300", "B200", "H200", "H100", "A100")
+KNOWN_GPU_TYPES = (
+    "GB300",
+    "GB200",
+    "GB10X",
+    "VR200",
+    "B300",
+    "B200",
+    "H200",
+    "H100",
+    "A100",
+)
 
 
 def gpu_type_from_stage_name(stage_name):

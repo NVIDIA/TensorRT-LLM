@@ -48,7 +48,9 @@ import json
 import logging
 import os
 import platform
+import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,7 +60,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
-from tensorrt_llm.usage.architecture_allowlist import PUBLIC_HF_ARCHITECTURES
+from tensorrt_llm.usage._startup import REPORT_CONTEXT, bounded_gpu_fields, requested_fields
+from tensorrt_llm.usage.architecture_allowlist import PUBLIC_MODEL_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
 from tensorrt_llm.usage.llmapi_config import (
@@ -75,7 +78,6 @@ _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
 _DISAGG_DEPLOYMENT_ID_ENV = "TRTLLM_DISAGG_DEPLOYMENT_ID"
 _DEFAULT_ENDPOINT = "https://events.gfe.nvidia.com/v1.1/events/json"
 _HTTP_TIMEOUT = 2.0
-_MAX_HEARTBEATS = 1000
 _TERMINAL_FLUSH_TIMEOUT = 0.5
 _ALLOWED_USAGE_CONTEXTS = frozenset(context.value for context in UsageContext)
 _ARCHITECTURE_HASH_DOMAIN = b"trtllm-architecture-class-v1\0"
@@ -404,7 +406,7 @@ def _architecture_telemetry_fields(pretrained_config: Any) -> tuple[str, str]:
     architecture = _extract_architecture_class_name(pretrained_config)
     if architecture is None:
         return "", ""
-    if architecture in PUBLIC_HF_ARCHITECTURES:
+    if architecture in PUBLIC_MODEL_ARCHITECTURES:
         return architecture, ""
     try:
         digest = hashlib.sha256(
@@ -743,10 +745,8 @@ def _background_reporter(
 
         # --- Heartbeat loop ---
         heartbeat_interval = _get_heartbeat_interval()
-        for seq in range(_MAX_HEARTBEATS):
-            if _REPORTER_STOP.wait(timeout=heartbeat_interval):
-                return  # stop requested
-
+        seq = 0
+        while not _HEARTBEAT_STOP.wait(timeout=heartbeat_interval):
             try:
                 event_snapshot = _event_snapshot(usage_context)
                 heartbeat_event = schema.TrtllmHeartbeat(
@@ -761,6 +761,7 @@ def _background_reporter(
                 _send_if_session_active(session, heartbeat_payload)
             except (urllib.error.URLError, OSError, ValueError, TypeError):
                 pass  # fail-silent on individual heartbeat
+            seq = min(seq + 1, schema._UINT32_MAX)
 
     except Exception:
         pass  # fail-silent: entire background reporter
@@ -776,8 +777,7 @@ def _background_reporter(
 _REPORTER_STARTED = False
 _REPORTER_ACTIVE = False
 _REPORTER_LOCK = threading.Lock()
-_REPORTER_STOP = threading.Event()  # signal heartbeat loop to exit
-_PENDING_TERMINAL: Optional["_PendingTerminal"] = None
+_HEARTBEAT_STOP = threading.Event()  # signal heartbeat loop to exit
 _PROCESS_PID = os.getpid()
 _PROCESS_EXIT_HOOK_REGISTERED = False
 
@@ -819,6 +819,12 @@ class _TelemetrySession:
         self.disabled = False
         self.initial_reported = False
         self.terminal_reported = False
+        self.llm_startup = False
+        self.startup_context: dict = {}
+        self.terminal_ready = threading.Event()
+        self.terminal_completion = threading.Event()
+        self.terminal_payload: Optional[_PendingTerminal] = None
+        self.terminal_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.refresh_metadata()
 
@@ -873,6 +879,9 @@ class _TelemetrySession:
             if self.disabled or self.terminal_reported:
                 return False
             self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            self.llm_startup = True
+            # Multiple attempts cannot be attributed from a process-exit snapshot.
+            self.startup_context = {}
             self.lifecycle_phase = "model_initialization"
             if self.component == "unknown":
                 self.component = "llm"
@@ -967,7 +976,7 @@ class _TelemetrySession:
             return self.observed_signal
 
     def claim_terminal(
-        self, outcome: TerminalOutcome
+        self, outcome: TerminalOutcome, lifecycle_phase: Optional[schema.LifecyclePhase] = None
     ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
         """Atomically merge causal context and claim the terminal slot."""
         with self.lock:
@@ -975,7 +984,44 @@ class _TelemetrySession:
                 return None
             outcome = outcome.with_observation(self.observed_outcome)
             self.terminal_reported = True
-            return self._snapshot_unlocked(), outcome
+            snapshot = self._snapshot_unlocked()
+            if lifecycle_phase is not None:
+                snapshot["lifecyclePhase"] = lifecycle_phase
+            if (
+                self.llm_startup
+                and not self.initial_reported
+                and self.llm_instances_created == 0
+                and outcome.reporting_source == "self"
+                and outcome.component in (None, self.component)
+                and snapshot["lifecyclePhase"]
+                in ("cli_parsing", "config_validation", "model_initialization")
+                and not (
+                    outcome.termination_kind == "clean" and self.llm_initialization_attempts == 0
+                )
+            ):
+                self.initial_reported = True
+                snapshot["startup_context"] = (
+                    self.startup_context.copy() if self.llm_initialization_attempts <= 1 else {}
+                )
+            return snapshot, outcome
+
+    def mark_llm_startup(self) -> None:
+        """Enable partial LLM startup reporting without collecting any data."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            self.llm_startup = True
+
+    def capture_startup(self, fields: dict, *, begin: bool) -> None:
+        """Keep sanitized context only for the sole attributable construction attempt."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            if self.llm_initialization_attempts > 1:
+                return
+            if begin:
+                self.startup_context = {}
+            self.startup_context.update(fields)
 
     def claim_initial(self) -> bool:
         """Claim the success-only initial report before network delivery."""
@@ -985,8 +1031,8 @@ class _TelemetrySession:
             self.initial_reported = True
             return True
 
-    def try_start_delivery(self) -> bool:
-        """Reject queued delivery when process opt-out already won the race."""
+    def is_session_telemetry_enabled(self) -> bool:
+        """Return whether telemetry is enabled for this session."""
         with self.lock:
             return not self.disabled
 
@@ -994,15 +1040,18 @@ class _TelemetrySession:
         """Prevent a stale reference from emitting after process opt-out."""
         with self.lock:
             self.disabled = True
+        self.terminal_ready.set()
+        self.terminal_completion.set()
 
 
 @dataclass(frozen=True)
 class _PendingTerminal:
-    """Terminal payload waiting for the active reporter to finish."""
+    """Terminal payload and optional context for the independent exit sender."""
 
     session: _TelemetrySession
     payload: dict
-    completion: threading.Event
+    startup_context: Optional[dict] = None
+    deadline: float = 0.0
 
 
 _SESSION: Optional[_TelemetrySession] = None
@@ -1013,12 +1062,11 @@ _SESSION_DISABLED = False
 def _ensure_process_state() -> None:
     """Reset inherited process-local state after ``fork()``."""
     global _NOTIFICATION_SHOWN
-    global _PENDING_TERMINAL
     global _PROCESS_PID
     global _REPORTER_ACTIVE
     global _REPORTER_LOCK
     global _REPORTER_STARTED
-    global _REPORTER_STOP
+    global _HEARTBEAT_STOP
     global _SESSION
     global _SESSION_LOCK
 
@@ -1032,8 +1080,7 @@ def _ensure_process_state() -> None:
     _REPORTER_STARTED = False
     _REPORTER_ACTIVE = False
     _REPORTER_LOCK = threading.Lock()
-    _REPORTER_STOP = threading.Event()
-    _PENDING_TERMINAL = None
+    _HEARTBEAT_STOP = threading.Event()
     _NOTIFICATION_SHOWN = threading.Event()
 
 
@@ -1049,22 +1096,16 @@ def _get_session() -> Optional[_TelemetrySession]:
 
 def _deactivate_usage_session() -> None:
     """Stop process telemetry after any authoritative opt-out decision."""
-    global _PENDING_TERMINAL
     global _SESSION
     global _SESSION_DISABLED
     with _SESSION_LOCK:
         session = _SESSION
         _SESSION = None
         _SESSION_DISABLED = True
-    pending = None
     with _REPORTER_LOCK:
         if session is not None:
             session.disable()
-        pending = _PENDING_TERMINAL
-        _PENDING_TERMINAL = None
-    if pending is not None:
-        pending.completion.set()
-    _REPORTER_STOP.set()
+    _HEARTBEAT_STOP.set()
 
 
 def _empty_event_snapshot(usage_context: str = "") -> dict[str, Any]:
@@ -1233,7 +1274,7 @@ def apply_usage_session_config(
                 if not _PROCESS_EXIT_HOOK_REGISTERED:
                     atexit.register(_report_process_exit)
                     _PROCESS_EXIT_HOOK_REGISTERED = True
-                _REPORTER_STOP.clear()
+                _HEARTBEAT_STOP.clear()
                 _SESSION = session
                 return True
             session = _SESSION
@@ -1286,6 +1327,48 @@ def record_llm_initialization_failure() -> None:
     _session_call(lambda session: session.record_llm_initialization_failure(), None)
 
 
+def _mark_llm_startup() -> None:
+    """Mark an existing session as an LLM startup path without collecting any data."""
+    _session_call(lambda session: session.mark_llm_startup(), None)
+
+
+def _capture_startup_context(
+    *,
+    requested: Optional[dict] = None,
+    llm_args: Any = None,
+    pretrained_config: Any = None,
+) -> None:
+    """Snapshot LLM-only startup context at normal parsing/loading hooks; retain no raw objects."""
+    try:
+        session = _get_session()
+        if (
+            session is None
+            or not is_usage_stats_enabled()
+            or not session.is_session_telemetry_enabled()
+        ):
+            return
+        fields = {}
+        if requested is not None:
+            fields = requested_fields(requested)
+        if llm_args is not None:
+            if not apply_usage_session_config(getattr(llm_args, "telemetry_config", None)):
+                return
+            fields = requested_fields(_extract_trtllm_config(llm_args))
+            config_json, meta_json = _collect_llm_api_config_payloads(llm_args)
+            meta = json.loads(meta_json)
+            meta["source"] = "validated_pre_initialization"
+            fields.update(llmApiConfigJson=config_json, llmApiConfigMetaJson=json.dumps(meta))
+        if pretrained_config is not None:
+            name, hashed = _architecture_telemetry_fields(pretrained_config)
+            if name:
+                fields["architectureClassName"] = name
+            if hashed:
+                fields["architectureClassHash"] = hashed
+        session.capture_startup(fields, begin=requested is not None)
+    except Exception:
+        pass
+
+
 def record_llm_initialized() -> bool:
     """Record one successfully constructed LLM object."""
     return _session_call(lambda session: session.record_llm_initialized(), False)
@@ -1334,38 +1417,117 @@ def get_observed_signal() -> int:
 def _send_if_session_active(
     session: _TelemetrySession,
     payload: dict,
-    completion: Optional[threading.Event] = None,
 ) -> bool:
     """Start delivery only if process opt-out has not already won."""
-    try:
-        if not session.try_start_delivery():
-            return False
-        _send_to_gxt(payload)
-        return True
-    finally:
-        if completion is not None:
-            completion.set()
+    if not session.is_session_telemetry_enabled():
+        return False
+    _send_to_gxt(payload)
+    return True
 
 
 def _finish_background_reporter() -> None:
-    """Deactivate the reporter and flush a terminal payload queued to it."""
-    global _PENDING_TERMINAL
+    """Mark the initial/heartbeat reporter as finished."""
     global _REPORTER_ACTIVE
-    pending = None
+    with _REPORTER_LOCK:
+        _REPORTER_ACTIVE = False
+
+
+def _terminal_sender(session: _TelemetrySession) -> None:
+    """Wait for one exit payload independently of initial/heartbeat delivery."""
     try:
+        session.terminal_ready.wait()
         with _REPORTER_LOCK:
-            _REPORTER_ACTIVE = False
-            pending = _PENDING_TERMINAL
-            _PENDING_TERMINAL = None
+            pending = session.terminal_payload
+            session.terminal_payload = None
         if pending is not None:
-            _send_if_session_active(
-                pending.session,
-                pending.payload,
-                pending.completion,
-            )
+            _send_terminal(pending)
     except Exception:
-        if pending is not None:
-            pending.completion.set()
+        pass  # Telemetry must not surface transport errors during shutdown.
+    finally:
+        session.terminal_completion.set()
+
+
+def _start_terminal_sender(session: _TelemetrySession) -> None:
+    """Start the exit sender if not already started; caller must hold _REPORTER_LOCK."""
+    if session.terminal_thread is not None or not session.is_session_telemetry_enabled():
+        return
+    try:
+        thread = threading.Thread(
+            target=_terminal_sender,
+            args=(session,),
+            daemon=True,
+            name="trtllm-usage-terminal",
+        )
+        thread.start()
+        session.terminal_thread = thread
+    except Exception:
+        pass  # Exit-sender setup must not prevent normal usage reporting.
+
+
+def _send_terminal(pending: _PendingTerminal) -> None:
+    """Attach optional partial context without delaying exit beyond the shared deadline."""
+    payload = pending.payload
+    try:
+        if pending.startup_context is not None and pending.session.is_session_telemetry_enabled():
+            fields = dict(pending.startup_context)
+            meta = json.loads(fields.pop("llmApiConfigMetaJson", "{}"))
+            source = meta.get("source", "requested_pre_initialization" if fields else "unavailable")
+            fields.update(
+                pythonVersion=platform.python_version(),
+            )
+            for key, value in (
+                ("trtllmVersion", pending.session.trtllm_version),
+                ("cpuArchitecture", platform.machine()),
+            ):
+                if value and value != "unknown":
+                    fields[key] = _clamp_str(value, schema._SHORT_STR)
+            cpu_count = os.cpu_count()
+            if cpu_count is not None:
+                fields["cpuCount"] = cpu_count
+            # Build version is not the driver's supported CUDA version.
+            torch = sys.modules.get("torch")
+            cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+            if isinstance(cuda_version, str):
+                fields["cudaVersion"] = _clamp_str(cuda_version, schema._SHORT_STR)
+            gpu_fields = bounded_gpu_fields(pending.deadline)
+            gpu_source = gpu_fields.pop(
+                "_source", "nvml_visible_hardware" if gpu_fields else "unavailable"
+            )
+            fields.update(gpu_fields)
+            terminal = payload["events"][0]
+            meta.update(
+                report_context=REPORT_CONTEXT,
+                capture_phase=terminal["parameters"]["lifecyclePhase"],
+                source=source,
+                known_fields=sorted(
+                    key
+                    for key in fields
+                    if key != "llmApiConfigJson" or meta.get("capture_succeeded")
+                ),
+                gpu_source=gpu_source,
+                attempt_attribution="sole_attempt"
+                if terminal["parameters"]["llmInitializationAttempts"] == 1
+                else "unavailable",
+            )
+            event_fields = _session_event_fields(terminal["parameters"])
+            defaults = dict(tensorParallelSize=0, pipelineParallelSize=0, contextParallelSize=0)
+            initial = schema.TrtllmInitialReport(
+                **(defaults | fields),
+                llmApiConfigMetaJson=json.dumps(meta, sort_keys=True),
+                **event_fields,
+            )
+            context_event = schema.GxtEvent(
+                ts=terminal["ts"],
+                name="trtllm_initial_report",
+                parameters=initial.model_dump(by_alias=True),
+            ).model_dump(by_alias=True)
+            payload = dict(payload, events=[context_event, terminal])
+    except Exception:
+        # Optional context must never displace the authoritative exit event.
+        pass
+    if not is_usage_stats_enabled():
+        pending.session.disable()
+    _send_if_session_active(pending.session, payload)
 
 
 def report_exit(
@@ -1382,6 +1544,7 @@ def report_exit(
     this call claimed the slot, not whether network delivery succeeded.
     """
     claimed = False
+    deadline = time.monotonic() + _TERMINAL_FLUSH_TIMEOUT
     try:
         disabled, _ = _telemetry_settings(
             telemetry_config,
@@ -1400,7 +1563,7 @@ def report_exit(
         if not _is_reporting_rank():
             return False
 
-        terminal = session.claim_terminal(outcome)
+        terminal = session.claim_terminal(outcome, lifecycle_phase)
         if terminal is None:
             return False
         snapshot, outcome = terminal
@@ -1445,34 +1608,19 @@ def report_exit(
             trtllm_version=session.trtllm_version,
         )
 
-        completion = threading.Event()
-        queued_to_reporter = False
-        global _PENDING_TERMINAL
         with _REPORTER_LOCK:
-            if not session.try_start_delivery():
-                completion.set()
+            if not session.is_session_telemetry_enabled():
                 return True
-            if _REPORTER_ACTIVE:
-                _PENDING_TERMINAL = _PendingTerminal(
-                    session=session,
-                    payload=payload,
-                    completion=completion,
-                )
-                queued_to_reporter = True
+            _start_terminal_sender(session)
+            _HEARTBEAT_STOP.set()
+            if session.terminal_thread is None:
+                return True
+            session.terminal_payload = _PendingTerminal(
+                session, payload, snapshot.get("startup_context"), deadline
+            )
+            session.terminal_ready.set()
 
-        _REPORTER_STOP.set()
-        if queued_to_reporter:
-            completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
-            return True
-
-        thread = threading.Thread(
-            target=_send_if_session_active,
-            args=(session, payload, completion),
-            daemon=True,
-            name="trtllm-usage-terminal",
-        )
-        thread.start()
-        completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+        session.terminal_completion.wait(timeout=max(0, deadline - time.monotonic()))
         return True
     except Exception:
         return claimed
@@ -1485,9 +1633,9 @@ def report_usage(
 ) -> None:
     """Start background usage telemetry reporting.
 
-    Call this once after model initialization. It spawns a daemon thread
-    that sends an initial report and periodic heartbeats. Subsequent calls
-    are no-ops (only one reporter thread per process).
+    Call this once after model initialization. It starts an initial/heartbeat
+    daemon and a one-shot exit report sender so shutdown cannot queue behind a
+    blocked heartbeat. Subsequent calls are no-ops (one pair per reporting process).
 
     This function is fail-silent -- it will never raise an exception or
     block the calling thread.
@@ -1497,7 +1645,6 @@ def report_usage(
         pretrained_config: The pretrained model config (for architecture name).
         telemetry_config: TelemetryConfig object (opt-out + usage context).
     """
-    global _PENDING_TERMINAL
     global _REPORTER_ACTIVE
     global _REPORTER_STARTED
     try:
@@ -1514,6 +1661,10 @@ def report_usage(
                 return
             _REPORTER_STARTED = True
             _REPORTER_ACTIVE = True
+            session = _get_session()
+            if session is not None:
+                # Python 3.12+ cannot create threads from an atexit callback.
+                _start_terminal_sender(session)
 
         _show_usage_notification()
 
@@ -1526,11 +1677,6 @@ def report_usage(
         thread.start()
 
     except Exception:
-        pending = None
         with _REPORTER_LOCK:
             _REPORTER_STARTED = False
             _REPORTER_ACTIVE = False
-            pending = _PENDING_TERMINAL
-            _PENDING_TERMINAL = None
-        if pending is not None:
-            pending.completion.set()

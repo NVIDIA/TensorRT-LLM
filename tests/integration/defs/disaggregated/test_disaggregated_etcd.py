@@ -19,9 +19,8 @@ import signal
 import subprocess
 import time
 
-import pytest
 import requests
-from defs.conftest import get_sm_version
+from defs.conftest import get_sm_version, llm_models_root
 
 from tensorrt_llm.logger import logger
 
@@ -55,7 +54,9 @@ PROMPTS_FILE = f"{CLIENTS_DIR}/prompts.json"
 def kill_automated_disaggregated_processes():
     """Kill any existing automated disaggregated processes."""
     try:
-        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'], check=False)
+        subprocess.run(['pkill', '-9', '-f', 'trtllm-serve'],
+                       check=False,
+                       timeout=30)
     except Exception:
         pass
 
@@ -175,7 +176,8 @@ def run_client_test(config, env=None) -> bool:
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=600)
 
     if result.returncode == 0:
         logger.info("Client test succeeded")
@@ -193,7 +195,10 @@ def kill_server_by_port(port: int) -> bool:
     try:
         # Find PID using port
         cmd = ["lsof", "-t", f"-i:{port}"]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd,
+                                stdout=subprocess.PIPE,
+                                text=True,
+                                timeout=30)
 
         if result.stdout.strip():
             pid = int(result.stdout.strip())
@@ -250,7 +255,8 @@ def cleanup_etcd_data(env=None):
                             env=env,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
-                            text=True)
+                            text=True,
+                            timeout=30)
 
     if result.returncode == 0:
         logger.info("Successfully cleaned etcd data")
@@ -311,7 +317,7 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
     kill_automated_disaggregated_processes()
     cleanup_automated_output_files()
 
-    config = {"model_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0"}
+    config = {"model_path": "Qwen3/Qwen3-0.6B"}
 
     # Create configuration files
     create_config_files(config)
@@ -427,14 +433,14 @@ def run_automated_disaggregated_test(example_dir, env=None, cwd=None):
         kill_automated_disaggregated_processes()
 
 
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_automated_disaggregated_complete(disaggregated_test_root,
-                                          disaggregated_example_root, llm_venv,
-                                          llama_model_root):
+                                          disaggregated_example_root, llm_venv):
+    qwen_model_root = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    assert os.path.exists(
+        qwen_model_root
+    ), f"{qwen_model_root} does not exist under NFS LLM_MODELS_ROOT dir"
     src_dst_dict = {
-        llama_model_root:
-        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        qwen_model_root: f"{llm_venv.get_working_directory()}/Qwen3/Qwen3-0.6B",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):

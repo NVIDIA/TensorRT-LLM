@@ -33,7 +33,7 @@ not one shared concept: they are two registers in the activation functor that
 unrelated kinds borrow for unrelated jobs. ``SwigluBias`` reads ``alpha`` as a
 scale inside the sigmoid and ``beta`` as an additive offset (neutral ``0.0``);
 ``SiTu`` reads both as tanh soft-cap magnitudes that must be positive (neutral
-``1.0``). See ``cpp/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/
+``1.0``). See ``cpp/tensorrt_llm/kernels/moe/cutlass/
 moe_kernels.cuh`` (``SwigluBiasAdaptor`` / ``SiTuAdaptor``) and
 ``GemmGatedActOptions.h``. A single nullable ``beta`` slot therefore has no
 coherent default and no readable meaning until you know the kind.
@@ -102,7 +102,16 @@ def _reject_non_positive_clamp(value: ActivationConstant | None) -> None:
         )
 
 
-def _reject_non_positive(value: ActivationConstant, *, name: str) -> None:
+def _reject_non_positive(value: ActivationConstant | None, *, name: str) -> None:
+    # Unlike ``_reject_non_positive_clamp``, absence is a rejection: a clamp
+    # has a value meaning "no clamp" and a softcap has none, so ``None`` is a
+    # missing constant. Spelled out so the failure is not ``float(None)``
+    # raising TypeError from inside the validator.
+    if value is None:
+        raise ValueError(
+            f"SiTu {name} is required because the kernel divides by it, and "
+            "unlike a clamp there is no value that encodes its absence; got None."
+        )
     smallest = (
         float(value.detach().min().item()) if isinstance(value, torch.Tensor) else float(value)
     )
@@ -137,14 +146,22 @@ class ActivationConstants:
 
 @dataclass(frozen=True, eq=False)
 class SwigluActivation:
-    """``silu(gate) * linear``, optionally clamped."""
+    """``silu(gate) * linear``, optionally clamped.
+
+    The historical mode clamps ``gate`` before SiLU. ``clamp_after_silu``
+    selects ``clamp(silu(gate))`` while leaving the linear-branch clamp in its
+    existing pre-multiply position.
+    """
 
     clamp: ActivationConstant | None = None
+    clamp_after_silu: bool = False
 
     kind: ClassVar[ActivationType] = ActivationType.Swiglu
 
     def __post_init__(self) -> None:
         _reject_non_positive_clamp(self.clamp)
+        if self.clamp_after_silu and self.clamp is None:
+            raise ValueError("clamp_after_silu requires a clamp value.")
 
     def constants(self) -> ActivationConstants:
         return ActivationConstants(limit=self.clamp)
@@ -289,12 +306,17 @@ class MoEActivationSupport:
     alpha_beta: ActivationParamShape = ActivationParamShape.UNSUPPORTED
     limit: ActivationParamShape = ActivationParamShape.UNSUPPORTED
     limit_when_absent: float | None = None
+    clamp_after_silu: bool = False
 
     def __post_init__(self) -> None:
         if self.limit_when_absent is not None and self.limit is ActivationParamShape.UNSUPPORTED:
             raise ValueError(
                 "limit_when_absent names the value a clamp-less layer must still pass, so it "
                 "is meaningless with limit=UNSUPPORTED: declare a shape, or drop the value."
+            )
+        if self.clamp_after_silu and self.limit is ActivationParamShape.UNSUPPORTED:
+            raise ValueError(
+                "clamp_after_silu describes the ordering of a clamp, so it requires limit support."
             )
 
 
@@ -316,12 +338,17 @@ class MaterializedActivation:
     One field per register, not one per ABI form: a clamp reaches its kernel
     either as a ``float*`` indexed by expert or as a value, but which one is
     already pinned by the backend's ``MoEActivationSupport``.
+
+    ``clamp_after_silu`` is a mode rather than a register value. It stays a
+    scalar and defaults to false so existing clamped SwiGLU users keep the
+    pre-SiLU order.
     """
 
     activation_type: ActivationType
     alpha: ActivationConstant | None = None
     beta: ActivationConstant | None = None
     clamp: ActivationConstant | None = None
+    clamp_after_silu: bool = False
 
 
 def materialize_activation_params(
@@ -349,6 +376,12 @@ def materialize_activation_params(
         raise ValueError(
             f"{owner} does not implement activation {kind.name}; it executes: {supported}."
         )
+
+    clamp_after_silu = (
+        activation.clamp_after_silu if isinstance(activation, SwigluActivation) else False
+    )
+    if clamp_after_silu and not support.clamp_after_silu:
+        raise ValueError(f"{owner} does not implement post-SiLU clamping.")
 
     constants = activation.constants()
     alpha = _materialize_to_declared_shape(
@@ -387,17 +420,18 @@ def materialize_activation_params(
         alpha=alpha,
         beta=beta,
         clamp=limit,
+        clamp_after_silu=clamp_after_silu,
     )
 
 
 def resolve_activation_support(module: torch.nn.Module) -> MoEActivationSupport:
     """The declaration that applies to ``module``, class attribute or override.
 
-    Static for ten of the eleven backends. TRTLLM-Gen is the documented
-    exception: its clamp ABI is a per-expert tensor for the FP4 fused-activation
-    cubins but a by-value ``double`` for the FP8 block-scale separate-activation
-    kernel, which is not a property of the class, so it defines
-    ``resolve_activation_support`` and narrows the shape per instance.
+    A class attribute for every backend but one. TRTLLM-Gen's clamp ABI is a
+    per-expert tensor for the FP4 fused-activation cubins and a by-value
+    ``float`` for the FP8 block-scale separate-activation kernel, so that one
+    class overrides this and the rest of the family falls through to the class
+    attribute. Hence the ``getattr`` probe.
     """
     override = getattr(module, "resolve_activation_support", None)
     if callable(override):
@@ -417,7 +451,7 @@ def install_activation_params(
     """Assign the ``act_*`` slots ``module``'s kernels read, from ``module.activation``.
 
     The one place a layer or execution unit turns its declared activation into
-    the three attributes the forward paths and the quantization layer read. Runs
+    the attributes the forward paths and the quantization layer read. Runs
     at construction, and again once ``ConfigurableMoE`` has synced
     ``expert_size_per_partition`` -- the only thing that changes the per-expert
     length -- before any weight is created.
@@ -437,6 +471,7 @@ def install_activation_params(
     _write_activation_slot(module, "act_alpha", params.alpha)
     _write_activation_slot(module, "act_beta", params.beta)
     _write_activation_slot(module, "act_clamp", params.clamp)
+    _write_activation_slot(module, "act_clamp_after_silu", params.clamp_after_silu)
 
 
 def _write_activation_slot(
@@ -451,10 +486,10 @@ def _write_activation_slot(
     state dict, which is where a plain attribute already was -- these are
     backend configuration, not checkpoint values.
 
-    A slot that is already a parameter stays one. ``TRTLLMGenFusedMoE`` promotes
-    the SiTu slots so they do travel in the state dict, and the exclude-modules
-    pass clears ``_weights_created`` without unregistering them, so this runs
-    again over a live parameter.
+    A slot that is already a parameter stays one. TRTLLM-Gen's FP4 block-scale
+    class promotes the SiTu slots so they do travel in the state dict, and the
+    exclude-modules pass clears ``_weights_created`` without unregistering
+    them, so this runs again over a live parameter.
     """
     if isinstance(value, torch.Tensor) and name in getattr(module, "_parameters", {}):
         setattr(module, name, torch.nn.Parameter(value, requires_grad=False))

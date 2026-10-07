@@ -82,7 +82,7 @@ For diffusion-based visual generation (image/video), TensorRT-LLM provides a sep
 
 TensorRT-LLM log messages include a fixed-width module tag that identifies which subsystem produced the message:
 
-```txt
+```text
 [TRT-LLM] [I] [runtime ] Loading model weights...
 [TRT-LLM] [W] [_torch  ] FlashAttention not available, falling back to default
 [TRT-LLM] [I] [serve   ] Server listening on port 8000
@@ -151,6 +151,10 @@ export TLLM_RANK_CRASH_HARD_KILL_GRACE=-1
 Use the escape hatch when you would rather have peer ranks reach their own
 timeouts — for example when attaching a debugger to a surviving rank, or when a
 harness collects per-rank state that a job-wide abort would destroy.
+
+Set `TLLM_HANG_DIAGNOSTICS=1` to enable additional PyExecutor diagnostics. It
+is disabled by default and remains silent unless initialization or execution
+hangs, then dumps worker stacks and the latest available executor state.
 
 ## DeepGEMM Barrier Timeout
 

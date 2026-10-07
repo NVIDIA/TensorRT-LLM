@@ -2170,10 +2170,85 @@ def triton_qsa_paged_sparse_gqa(
     return output
 
 
+@triton.jit
+def _qsa_mtp_reuse_topk_kernel(
+    shared_ptr,
+    shared_visible_ptr,
+    request_ptr,
+    visible_ptr,
+    out_ptr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    """Rebuild a query row's selection from its request's captured row.
+
+    The captured row holds the groups that were complete when it was taken, so
+    groups that completed afterwards are written on top of it. They are always
+    larger than every captured ID, because the capture's Top-K searched only
+    ``[0, captured_visible)``, so the row never gains a duplicate.
+    """
+    row = tl.program_id(0)
+    request = tl.load(request_ptr + row).to(tl.int32)
+    current = tl.load(visible_ptr + row).to(tl.int32)
+    captured = tl.load(shared_visible_ptr + request).to(tl.int32)
+
+    slots = tl.arange(0, BLOCK_TOPK)
+    values = tl.load(shared_ptr + request.to(tl.int64) * BLOCK_TOPK + slots)
+
+    # Valid captured IDs form a prefix; the rest is -1 padding.
+    filled = tl.sum((values >= 0).to(tl.int32))
+    fresh = tl.minimum(tl.maximum(current - captured, 0), BLOCK_TOPK)
+    # Append after the prefix when there is room, otherwise displace its tail.
+    start = tl.minimum(filled, BLOCK_TOPK - fresh)
+    offset = slots - start
+    is_fresh = (offset >= 0) & (offset < fresh)
+    values = tl.where(is_fresh, (captured + offset).to(values.dtype), values)
+    tl.store(out_ptr + row.to(tl.int64) * BLOCK_TOPK + slots, values)
+
+
+def triton_qsa_mtp_reuse_topk(
+    *,
+    shared_indices: torch.Tensor,
+    shared_visible_blocks: torch.Tensor,
+    request_indices: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Expand captured per-request selections back to per-query-row selections."""
+    rows, block_topk = output.shape
+    if shared_indices.shape[1] != block_topk:
+        raise ValueError(
+            "QSA shared Top-K width does not match the selection output: "
+            f"{shared_indices.shape[1]} != {block_topk}"
+        )
+    if request_indices.numel() != rows or visible_blocks.numel() != rows:
+        raise ValueError("QSA shared Top-K reuse needs one request and bound per query row")
+    if rows == 0:
+        return output
+    _require_same_cuda_device(
+        "QSA shared Top-K reuse",
+        shared_indices,
+        shared_visible_blocks,
+        request_indices,
+        visible_blocks,
+        output,
+    )
+    _qsa_mtp_reuse_topk_kernel[(rows,)](
+        shared_indices,
+        shared_visible_blocks,
+        request_indices,
+        visible_blocks,
+        output,
+        BLOCK_TOPK=block_topk,
+        num_warps=4,
+    )
+    return output
+
+
 __all__ = [
     "can_fuse_qsa_splitk_output_gate",
     "qsa_supports_head_dims",
     "triton_qsa_decode_pre_indexer",
+    "triton_qsa_mtp_reuse_topk",
     "triton_qsa_paged_index_scores",
     "triton_qsa_paged_kv_store",
     "triton_qsa_paged_sparse_gqa",

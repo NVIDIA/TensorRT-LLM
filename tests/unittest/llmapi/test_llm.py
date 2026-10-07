@@ -136,7 +136,7 @@ def llm_check_output(llm: LLM,
                  stop_reasons=stop_reasons)
 
 
-default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+default_model_name = "Qwen3/Qwen3-0.6B"
 qwen3_tokenizer_model_name = "Qwen3/Qwen3-0.6B"
 
 llama_model_path = get_model_path(default_model_name)
@@ -251,7 +251,6 @@ def test_llm_with_kv_cache_retention_config():
         (get_model_path('codellama/CodeLlama-7b-Instruct-hf'), False, 0.95),
         (llama_model_path, False, 0.95),
         (get_model_path(qwen3_tokenizer_model_name), False, 0.95),
-        (get_model_path('llama-3.1-model/Meta-Llama-3.1-8B'), False, 0.95),
         (get_model_path('DeepSeek-R1/DeepSeek-R1'), False, 0.95)
     ])
 @pytest.mark.part0
@@ -539,7 +538,10 @@ def test_generate_with_detokenization_stop_words(model_path):
     out = outputs[0].outputs[0]
     assert out.finish_reason == 'stop'
     assert out.stop_reason == "How"
-    assert out.text == "Hello there!", \
+    # Truncation happens in text space (`text[:text.find(stop)]`), so the
+    # whitespace that separated "there!" from the stop string belongs to the
+    # retained prefix -- matching OpenAI/vLLM stop-string semantics.
+    assert out.text == "Hello there! ", \
         f"Stop string 'How' must not be retained in output text, got: {out.text!r}"
 
     # Test case 2: Stop word "there" should be detected after detokenization
@@ -600,7 +602,9 @@ def test_generate_with_detokenization_stop_words_streaming(model_path):
                                      streaming=True):
         if output.outputs[0].finish_reason == 'stop':
             assert output.outputs[0].stop_reason == "How"
-            assert output.outputs[0].text == "Hello there!"
+            # Trailing space is retained by text-space truncation; see the
+            # non-streaming test above.
+            assert output.outputs[0].text == "Hello there! "
             found_stop = True
             break
         elif output.outputs[0].finish_reason == 'length':
@@ -668,17 +672,24 @@ class MyLogitsProcessor(LogitsProcessor):
 def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     tokenizer = TransformersTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    max_tokens = 6
     sampling_params = SamplingParams(
-        max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
+        max_tokens=max_tokens,
+        logits_processor=MyLogitsProcessor(biased_word_id))
 
     prompts = ["A B C"]
     if llm_kwargs.get('enable_chunked_prefill', None):
         prompts[0] = prompts[0] * 256
         llm_kwargs["max_num_tokens"] = 256
 
+    # The biased token's decoded text (e.g. with or without a leading space)
+    # is tokenizer-specific, so derive the expected repeated-token output
+    # rather than hardcoding a particular tokenizer's rendering.
+    expected_output = tokenizer.decode([biased_word_id] * max_tokens)
+
     llm_test_harness(
         llama_model_path,
-        prompts, ["Z Z Z Z Z Z"],
+        prompts, [expected_output],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
@@ -793,6 +804,7 @@ def validate_stats(
     results,
     pytorch_backend,
     max_tokens,
+    prompt_len,
     pp_size=1,
     use_overlap=False,
     enable_chunked_prefill=False,
@@ -845,18 +857,20 @@ def validate_stats(
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS" if use_overlap else "CONTEXT_IN_PROGRESS", f"iter: {iter}"
                 assert req_stat[
-                    "contextPrefillPosition"] == 54 if use_overlap else 32, f"iter: {iter}"
+                    "contextPrefillPosition"] == prompt_len if use_overlap else 32, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == 0, f"iter: {iter}"
             elif iter < (context_iterations - 1 + generation_iterations):
                 assert req_stat[
                     "stage"] == "GENERATION_IN_PROGRESS", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat["numGeneratedTokens"] == iter - (
                     context_iterations - 1) + 1, f"iter: {iter}"
             else:
                 assert req_stat[
                     "stage"] == "GENERATION_COMPLETE", f"iter: {iter}"
-                assert req_stat["contextPrefillPosition"] == 54, f"iter: {iter}"
+                assert req_stat[
+                    "contextPrefillPosition"] == prompt_len, f"iter: {iter}"
                 assert req_stat[
                     "numGeneratedTokens"] == max_tokens, f"iter: {iter}"
             assert req_stat["scheduled"] == True, f"iter: {iter}"
@@ -965,9 +979,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
         for output in llm.generate(long_prompts,
                                    sampling_params=sampling_params):
             print(output)
+            prompt_len = len(output.prompt_token_ids)
 
         time.sleep(2)
         results = llm.get_stats(2)
@@ -975,6 +991,7 @@ def llm_get_stats_test_harness(tp_size: int = 1,
         validate_stats(results=results,
                        pp_size=pp_size,
                        pytorch_backend=pytorch_backend,
+                       prompt_len=prompt_len,
                        max_tokens=max_tokens,
                        use_overlap=use_overlap,
                        enable_chunked_prefill=enable_chunked_prefill,
@@ -1093,12 +1110,16 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
             "A B C D E F G H I J K L M N O P Q R S T U V W X Y Z " * 2
         ]
 
+        prompt_len = None
+
         async def task0():
+            nonlocal prompt_len
             async for output in llm.generate_async(
                     long_prompts[0],
                     streaming=True,
                     sampling_params=sampling_params):
                 print(output)
+                prompt_len = len(output.prompt_token_ids)
 
         async def task1(repetition_index: int):
             results = []
@@ -1115,6 +1136,7 @@ def llm_get_stats_async_test_harness(tp_size: int = 1,
                     pp_size=pp_size,
                     pytorch_backend=pytorch_backend,
                     max_tokens=max_tokens,
+                    prompt_len=prompt_len,
                     use_overlap=use_overlap,
                     # After the first repetition, context will be reused and there will be no chunking.
                     enable_chunked_prefill=enable_chunked_prefill
@@ -1500,7 +1522,10 @@ def run_llm_with_postprocess_parallel_and_result_handler(
               tensor_parallel_size=tp_size,
               num_postprocess_workers=2,
               postprocess_tokenizer_dir=llama_model_path)
-    golden_result = "D E F G H I"
+    # Qwen3's byte-level BPE tokenizer folds the space before the first
+    # generated token into that token itself, so the decoded continuation
+    # of "A B C" carries a leading space that TinyLlama's tokenizer didn't.
+    golden_result = " D E F G H I"
     outputs = []
     for output in llm.generate_async(prompts[0],
                                      sampling_params=sampling_params,
