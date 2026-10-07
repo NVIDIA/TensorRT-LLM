@@ -664,9 +664,11 @@ def test_commit_takes_the_tokens_actually_written(cache):
         cache.commit(cache.chunk_tokens + 1)
 
 
-def test_pool_bytes_formula_matches_the_allocation():
-    """``pool_bytes_for`` is what the constructor allocates, so a window can be
-    sized against a budget before anything is built."""
+def test_pool_bytes_for_is_what_the_gpu_loses():
+    """``pool_bytes_for`` is the device memory a cache really takes, measured with the
+    driver's free-memory counter, so a window sized against a budget before anything
+    is built fits. The rounding beyond the raw K/V bytes is less than one allocator
+    chunk, and the size grows with the window."""
     geometry = dict(
         num_layers=3,
         num_kv_heads=2,
@@ -678,12 +680,18 @@ def test_pool_bytes_formula_matches_the_allocation():
         causal_block_sizes=(120, 60),
     )
     previous = 0
-    for window_tokens in (60, 600, 6000):
+    for window_tokens in (600, 6000, 60000):  # each step crosses an allocator chunk
         expected = CausalKVCacheManager.pool_bytes_for(window_tokens=window_tokens, **geometry)
+        torch.cuda.synchronize()
+        free_before, _ = torch.cuda.mem_get_info()
         cache = CausalKVCacheManager(window_tokens=window_tokens, **geometry)
         try:
+            torch.cuda.synchronize()
+            free_after, _ = torch.cuda.mem_get_info()
+            assert free_before - free_after == expected
             assert cache.pool_bytes == expected
-            assert expected == cache._pool_tokens * 3 * 2 * 2 * 64 * 2
+            raw = cache._pool_tokens * 3 * 2 * 2 * 64 * 2
+            assert 0 <= expected - raw < 32 << 20
             assert expected > previous
             previous = expected
         finally:
