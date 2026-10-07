@@ -16,8 +16,8 @@
 
 Each criterion collects one module from `cases/` for one or more machines:
 
-    selection.run(DeviceCount.MODULE, "--machine=GB200")
-    -> pytest --collect-only -p qa_selection.plugin --machine=GB200 test_device_count.py
+    selection.run(DeviceCases.MODULE, "--machine=GB200")
+    -> pytest --collect-only -p qa_selection.plugin --machine=GB200 test_device_cases.py
 
     B200    8 GPUs/node
     GB200   4 GPUs/node
@@ -27,35 +27,35 @@ machine's GPUs per node. No other option states one. The blocker a dropped
 test carries is pinned once, in AC-5.
 """
 
-from mock_suite import ClosestMarker, DeviceCount, MpiSize
+from mocks import DeviceCases, MarkerCases
 
 
 def test_node_sized_test(selection):
     """`skip_less_device(8)` fits B200's node and not GB200's."""
-    big = selection.run(DeviceCount.MODULE, "--machine=B200")
-    small = selection.run(DeviceCount.MODULE, "--machine=GB200")
+    b200 = selection.run(DeviceCases.MODULE, "--machine=B200")
+    gb200 = selection.run(DeviceCases.MODULE, "--machine=GB200")
 
-    assert big.selected == [DeviceCount.UNMARKED, DeviceCount.NEEDS_EIGHT]
-    assert small.selected == [DeviceCount.UNMARKED]
+    assert DeviceCases.EIGHT_GPUS in b200.selected
+    assert DeviceCases.EIGHT_GPUS not in gb200.selected
 
     # The module was imported on both runs -- the control for test_rung_above_the_node.
-    assert (small.path / DeviceCount.IMPORT_SENTINEL).exists()
+    assert (gb200.path / DeviceCases.IMPORT_SENTINEL).exists()
 
 
 def test_shorter_ladder(selection):
     """A ladder below the node lowers the count: B200's eight GPUs are not what is asked of."""
-    run = selection.run(DeviceCount.MODULE, "--machine=B200", "--ladder=1,4")
+    run = selection.run(DeviceCases.MODULE, "--machine=B200", "--ladder=1,4")
 
-    assert run.selected == [DeviceCount.UNMARKED]
+    assert run.selected == [DeviceCases.UNMARKED, DeviceCases.TWO_GPUS]
 
 
 def test_mpi_ranks_count_as_gpus(selection):
     """`skip_less_mpi_world_size` is measured in GPUs: one rank per GPU."""
-    big = selection.run(MpiSize.MODULE, "--machine=B200")
-    small = selection.run(MpiSize.MODULE, "--machine=GB200")
+    b200 = selection.run(DeviceCases.MODULE, "--machine=B200")
+    gb200 = selection.run(DeviceCases.MODULE, "--machine=GB200")
 
-    assert big.selected == [MpiSize.UNMARKED, MpiSize.NEEDS_EIGHT_RANKS]
-    assert small.selected == [MpiSize.UNMARKED]
+    assert DeviceCases.EIGHT_RANKS in b200.selected
+    assert DeviceCases.EIGHT_RANKS not in gb200.selected
 
 
 def test_closest_marker_wins(selection):
@@ -65,21 +65,31 @@ def test_closest_marker_wins(selection):
     every level (AC-1, `test_arch.py::test_memory_every_level`). Both reproduce
     the fixtures that consume each marker; neither is a defect to tidy away.
     """
-    run = selection.run(ClosestMarker.MODULE, "--machine=GB200")
+    run = selection.run(MarkerCases.MODULE, "--machine=GB200")
 
-    assert run.selected == [ClosestMarker.UNMARKED, ClosestMarker.NEEDS_TWO]
+    assert MarkerCases.CLOSEST_GPUS in run.selected
+
+
+def test_parameter_level_gpu_bound(selection):
+    """A GPU bound on one `pytest.param` is that case's demand alone."""
+    b200 = selection.run(MarkerCases.MODULE, "--machine=B200")
+    gb200 = selection.run(MarkerCases.MODULE, "--machine=GB200")
+
+    assert MarkerCases.PARAM_EIGHT_GPUS in b200.selected
+    assert MarkerCases.PARAM_EIGHT_GPUS not in gb200.selected
+    assert MarkerCases.PARAM_SKIP in gb200.selected
 
 
 def test_rung_above_the_node(selection):
     """A rung above the node is a usage error, raised before collection."""
-    run = selection.refuse(DeviceCount.MODULE, "--machine=GB200", "--ladder=1,8")
+    run = selection.refuse(DeviceCases.MODULE, "--machine=GB200", "--ladder=1,8")
 
     run.result.stderr.fnmatch_lines(["*--ladder: rung 8 exceeds GB200, which has 4 GPUs per node*"])
-    assert not (run.path / DeviceCount.IMPORT_SENTINEL).exists()
+    assert not (run.path / DeviceCases.IMPORT_SENTINEL).exists()
 
 
 def test_no_gpu_option(selection):
     """`--gpus` is not an option: the ladder is the only GPU count a run states."""
-    run = selection.refuse(DeviceCount.MODULE, "--machine=B200", "--gpus=4")
+    run = selection.refuse(DeviceCases.MODULE, "--machine=B200", "--gpus=4")
 
     run.result.stderr.fnmatch_lines(["*unrecognized arguments: --gpus=4*"])

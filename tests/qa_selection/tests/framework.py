@@ -14,8 +14,8 @@
 # limitations under the License.
 """Framework for the automated tests of the QA selection pytest plugin.
 
-    run = selection.run("test_pre_blackwell.py", "--machine=H100")
-    -> pytest --collect-only -p qa_selection.plugin --machine=H100 test_pre_blackwell.py
+    run = selection.run("test_arch_cases.py", "--machine=H100")
+    -> pytest --collect-only -p qa_selection.plugin --machine=H100 test_arch_cases.py
 
     run.selected          the node ids the run kept, in collection order
     run.record            <machine>.json, when the run named --selection-out-dir={out}
