@@ -12,12 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Place a collected test in one allocation of a caller-supplied GPU ladder.
+"""Decide how many GPUs a collected test needs, and which rung of the run's ladder holds it.
 
     GpuDemand.of(test) -> demand.assign_rung(ladder) -> Assignment.of(...)
 
-Reads marks only, never a `MachineProfile`: a test's demand is the same on every
-machine and at every rung. Whether it can run there is `selector.py`'s question.
+The GPU count is decided here and nowhere else: `skip_less_device` and
+`skip_less_mpi_world_size` are read once, closest marker only, and a demand
+above the largest rung is a blocker. Demand reads marks, never a
+`MachineProfile`, so it is the same on every machine. Whether the rules allow
+the test on the machine's card is `selector.py`'s question.
 """
 
 from collections.abc import Sequence
@@ -34,7 +37,7 @@ class GpuDemand:
     # Used when a test states no lower bound; `required_gpus_from` is then empty.
     ASSUMED_GPUS = 1
 
-    # Markers stating a GPU lower bound, in `Selector.resource_blockers` order.
+    # Markers stating a GPU lower bound, each read at its closest level only.
     # `skip_less_mpi_world_size` is measured in GPUs: one rank per GPU.
     MARKERS = ("skip_less_device", "skip_less_mpi_world_size")
 
@@ -62,8 +65,7 @@ class GpuDemand:
     def bounds_of(cls, test: CollectedTest) -> Tuple[Tuple[str, int], ...]:
         """Every GPU lower bound `test` states, as (marker, value) pairs.
 
-        Takes the nearest marker of each kind, through the same accessor
-        `Selector.shortfall` uses.
+        Takes the nearest marker of each kind, as `get_closest_marker` does.
         """
         bounds = []
         for marker in cls.MARKERS:
@@ -86,40 +88,59 @@ class GpuDemand:
         fitting = [rung for rung in ladder if rung >= self.required_gpus]
         return min(fitting) if fitting else None
 
+    def blocker_against(self, ladder: Sequence[int]) -> Optional[str]:
+        """Why no rung of `ladder` holds this test, or None when one does.
+
+        Names the markers that stated the demand and the largest rung, never the
+        machine, so a short ladder and a small node give the same reason.
+        """
+        if self.assign_rung(ladder) is not None:
+            return None
+        return (
+            f"{', '.join(self.required_gpus_from)}: needs {self.required_gpus} GPUs, "
+            f"largest rung is {max(ladder)}"
+        )
+
 
 @dataclass(frozen=True)
 class Assignment:
-    """One test's feasibility decision, paired with its demand and allocation."""
+    """One test's rule decision, its GPU demand, and the rung that holds it.
+
+    `blockers` is the whole answer: the rules' blockers first, then the GPU
+    count's, so `selected` is the one flag selection and the report read.
+    """
 
     decision: Decision
     demand: GpuDemand
     rung: Optional[int]
-    unassignable: bool
+    blockers: Tuple[str, ...]
 
     @classmethod
     def of(
         cls,
         decision: Decision,
         test: CollectedTest,
-        ladder: Optional[Sequence[int]] = None,
+        ladder: Sequence[int],
     ) -> "Assignment":
-        """Pair `decision` with the demand read from `test`, placed on `ladder`.
-
-        With no ladder, `rung` is None and `unassignable` is False.
-
-        `unassignable` means *this machine can run it, and no rung is big
-        enough*, so it is asked only of a test the decision selected. An
-        infeasible test is not waiting for an allocation, and marking one would
-        make the flag disagree with the count the report derives from it.
-        """
+        """Pair `decision` with the demand read from `test`, placed on `ladder`."""
         demand = GpuDemand.of(test)
-        rung = None if ladder is None else demand.assign_rung(ladder)
+        count_blocker = demand.blocker_against(ladder)
         return cls(
             decision=decision,
             demand=demand,
-            rung=rung,
-            unassignable=decision.selected and ladder is not None and rung is None,
+            rung=demand.assign_rung(ladder),
+            blockers=decision.blockers + ((count_blocker,) if count_blocker else ()),
         )
+
+    @property
+    def selected(self) -> bool:
+        """True when neither the rules nor the GPU count drop this test."""
+        return not self.blockers
+
+    @property
+    def unassignable(self) -> bool:
+        """A selected test no rung holds. Never true: such a test has a count blocker."""
+        return self.selected and self.rung is None
 
     @property
     def nodeid(self) -> str:

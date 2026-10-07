@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AC-2: the available GPU count decides what is selected.
+"""AC-2: the ladder's largest rung is the GPU count.
 
 Each criterion collects one module from `cases/` for one or more machines:
 
@@ -22,76 +22,64 @@ Each criterion collects one module from `cases/` for one or more machines:
     B200    8 GPUs/node
     GB200   4 GPUs/node
 
-`--gpus=N` lowers the count below the node; above it, the run is refused.
+The count is the largest rung of the run's ladder, which defaults to the
+machine's GPUs per node. No other option states one. The blocker a dropped
+test carries is pinned once, in AC-5.
 """
 
 from mock_suite import ClosestMarker, DeviceCount, MpiSize
 
 
-def test_device_count(selection):
+def test_node_sized_test(selection):
     """`skip_less_device(8)` fits B200's node and not GB200's."""
     big = selection.run(DeviceCount.MODULE, "--machine=B200")
-    small = selection.run(DeviceCount.MODULE, "--machine=GB200", "--selection-out-dir={out}")
+    small = selection.run(DeviceCount.MODULE, "--machine=GB200")
 
-    assert big.selected == [
-        DeviceCount.UNMARKED,
-        DeviceCount.NEEDS_EIGHT,
-    ]
+    assert big.selected == [DeviceCount.UNMARKED, DeviceCount.NEEDS_EIGHT]
     assert small.selected == [DeviceCount.UNMARKED]
 
-    # The module was imported on both runs -- the control for test_gpus_above_node.
+    # The module was imported on both runs -- the control for test_rung_above_the_node.
     assert (small.path / DeviceCount.IMPORT_SENTINEL).exists()
 
-    (blocker,) = small.outcome(DeviceCount.NEEDS_EIGHT)["blockers"]
-    assert blocker == "skip_less_device: needs 8 GPUs, target has 4"
 
-
-def test_mpi_world_size(selection):
-    """`skip_less_mpi_world_size` is measured in GPUs: one rank per GPU."""
-    big = selection.run(MpiSize.MODULE, "--machine=B200")
-    small = selection.run(MpiSize.MODULE, "--machine=GB200", "--selection-out-dir={out}")
-
-    assert big.selected == [
-        MpiSize.UNMARKED,
-        MpiSize.NEEDS_EIGHT_RANKS,
-    ]
-    assert small.selected == [MpiSize.UNMARKED]
-
-    (blocker,) = small.outcome(MpiSize.NEEDS_EIGHT_RANKS)["blockers"]
-    assert blocker == "skip_less_mpi_world_size: needs 8 ranks, target has 4"
-
-
-def test_gpus_lowers_ceiling(selection):
-    """`--gpus` resizes the profile, so B200's eight GPUs per node are not what is asked of."""
-    run = selection.run(
-        DeviceCount.MODULE, "--machine=B200", "--gpus=4", "--selection-out-dir={out}"
-    )
+def test_shorter_ladder(selection):
+    """A ladder below the node lowers the count: B200's eight GPUs are not what is asked of."""
+    run = selection.run(DeviceCount.MODULE, "--machine=B200", "--ladder=1,4")
 
     assert run.selected == [DeviceCount.UNMARKED]
 
-    (blocker,) = run.outcome(DeviceCount.NEEDS_EIGHT)["blockers"]
-    assert blocker == "skip_less_device: needs 8 GPUs, target has 4"
+
+def test_mpi_ranks_count_as_gpus(selection):
+    """`skip_less_mpi_world_size` is measured in GPUs: one rank per GPU."""
+    big = selection.run(MpiSize.MODULE, "--machine=B200")
+    small = selection.run(MpiSize.MODULE, "--machine=GB200")
+
+    assert big.selected == [MpiSize.UNMARKED, MpiSize.NEEDS_EIGHT_RANKS]
+    assert small.selected == [MpiSize.UNMARKED]
 
 
-def test_closest_marker(selection):
+def test_closest_marker_wins(selection):
     """`skip_less_device` reads the closest marker only: a method's bound replaces its class's.
 
     The deliberate opposite of `skip_less_device_memory`, which is demanded at
     every level (AC-1, `test_arch.py::test_memory_every_level`). Both reproduce
     the fixtures that consume each marker; neither is a defect to tidy away.
     """
-    run = selection.run(ClosestMarker.MODULE, "--machine=GB200", "--selection-out-dir={out}")
+    run = selection.run(ClosestMarker.MODULE, "--machine=GB200")
 
-    assert run.selected == [
-        ClosestMarker.UNMARKED,
-        ClosestMarker.NEEDS_TWO,
-    ]
-    assert run.outcome(ClosestMarker.NEEDS_TWO)["blockers"] == []
+    assert run.selected == [ClosestMarker.UNMARKED, ClosestMarker.NEEDS_TWO]
 
 
-def test_gpus_above_node(selection):
-    """A GPU count above the node is a usage error, raised before collection."""
-    run = selection.refuse(DeviceCount.MODULE, "--machine=GB200", "--gpus=8")
+def test_rung_above_the_node(selection):
+    """A rung above the node is a usage error, raised before collection."""
+    run = selection.refuse(DeviceCount.MODULE, "--machine=GB200", "--ladder=1,8")
 
-    run.result.stderr.fnmatch_lines(["*--gpus: 8 exceeds GB200, which has 4 GPUs per node*"])
+    run.result.stderr.fnmatch_lines(["*--ladder: rung 8 exceeds GB200, which has 4 GPUs per node*"])
     assert not (run.path / DeviceCount.IMPORT_SENTINEL).exists()
+
+
+def test_no_gpu_option(selection):
+    """`--gpus` is not an option: the ladder is the only GPU count a run states."""
+    run = selection.refuse(DeviceCount.MODULE, "--machine=B200", "--gpus=4")
+
+    run.result.stderr.fnmatch_lines(["*unrecognized arguments: --gpus=4*"])
