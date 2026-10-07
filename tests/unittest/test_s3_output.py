@@ -256,6 +256,101 @@ def test_report_keeps_native_capture_when_spool_append_fails(tmp_path, monkeypat
     assert "errno=2" in warnings[0]
 
 
+@pytest.mark.parametrize("upload_mode", ["sync", "deferred"])
+def test_logfinish_uploads_existing_logs_after_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upload_mode: str
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode=upload_mode
+    )
+    call_report = Report([("Captured stdout call", "earlier output")])
+    process_report(plugin, call_report)
+    assert "/stdout.log" in call_report.sections[0][1]
+
+    def fail_append(_test_name: str, _filename: str, _content: str) -> str:
+        raise OSError("spool unavailable")
+
+    monkeypatch.setattr(plugin, "_append_spool_file", fail_append)
+    teardown_section = ("Captured stderr teardown", "keep this error")
+    teardown_report = Report([teardown_section], when="teardown")
+    process_report(plugin, teardown_report)
+    plugin.pytest_runtest_logfinish(call_report.nodeid, None)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert teardown_report.sections == [teardown_section]
+    assert [upload[0] for upload in client.uploads] == [b"earlier output"]
+    assert client.uploads[0][2].endswith("/stdout.log")
+
+
+@pytest.mark.parametrize("upload_mode", ["sync", "deferred"])
+def test_sessionfinish_uploads_existing_logs_after_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upload_mode: str
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode=upload_mode
+    )
+    call_report = Report([("Captured stdout call", "unfinished output")])
+    process_report(plugin, call_report)
+
+    def fail_append(_test_name: str, _filename: str, _content: str) -> str:
+        raise OSError("spool unavailable")
+
+    monkeypatch.setattr(plugin, "_append_spool_file", fail_append)
+    teardown_section = ("Captured stderr teardown", "keep this error")
+    teardown_report = Report([teardown_section], when="teardown")
+    process_report(plugin, teardown_report)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert teardown_report.sections == [teardown_section]
+    assert [upload[0] for upload in client.uploads] == [b"unfinished output"]
+    assert client.uploads[0][2].endswith("/stdout.log")
+
+
+def test_failed_upload_scheduling_keeps_other_streams_and_recovery_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode="deferred"
+    )
+    report = Report(
+        [
+            ("Captured stdout call", "recover this output"),
+            ("Captured stderr call", "upload this error"),
+        ]
+    )
+    process_report(plugin, report)
+    schedule_upload = plugin._schedule_upload
+
+    def fail_stdout_upload(
+        source_path: str, object_key: str, test_name: str, filename: str
+    ) -> None:
+        if filename == "stdout.log":
+            raise OSError("upload scheduling unavailable")
+        schedule_upload(source_path, object_key, test_name, filename)
+
+    monkeypatch.setattr(plugin, "_schedule_upload", fail_stdout_upload)
+    plugin.pytest_runtest_logfinish(report.nodeid, None)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert [upload[0] for upload in client.uploads] == [b"upload this error"]
+    stdout_path = next(s3_output._spool_root(str(tmp_path)).rglob("stdout.log"))
+    assert stdout_path.read_text(encoding="utf-8") == "recover this output"
+    config_path = Path(plugin._spool_config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["pid"] = 99999999
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
+    assert [upload[0] for upload in client.uploads] == [
+        b"upload this error",
+        b"recover this output",
+    ]
+    assert_empty_spool_root(tmp_path)
+
+
 def test_small_stdout_remains_inline(tmp_path):
     plugin = make_plugin(tmp_path, inline_output_max_bytes=4)
     report = Report([("Captured stdout call", "ok\n")])

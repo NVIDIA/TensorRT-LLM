@@ -257,7 +257,7 @@ class UploadLogPlugin:
         suffix = f"{self._hostname}-{os.getpid()}-{time.time_ns()}"
         self._spool_dir = str(_spool_root(output_path) / suffix)
         self._spool_config_path = os.path.join(self._spool_dir, _SPOOL_CONFIG_NAME)
-        self._spool_available = True
+        self._capture_enabled = True
         self._test_names: dict[str, str] = {}
         self._used_test_names: set[str] = set()
         self._captured_sections: dict[str, dict[tuple[str, str, int], CapturedSection]] = {}
@@ -271,17 +271,18 @@ class UploadLogPlugin:
             try:
                 self._write_spool_config()
             except OSError as exc:
-                self._disable_spooling("initializing spool config", exc)
-            if self._spool_available and self.upload_mode == "deferred":
+                self._disable_capture("initializing spool config", exc)
+            if self._capture_enabled and self.upload_mode == "deferred":
                 self._executor = ThreadPoolExecutor(
                     max_workers=self.upload_workers,
                     thread_name_prefix="s3-test-log-upload",
                 )
 
-    def _disable_spooling(self, operation: str, exc: OSError) -> None:
-        if not self._spool_available:
+    def _disable_capture(self, operation: str, exc: OSError) -> None:
+        if not self._capture_enabled:
             return
-        self._spool_available = False
+        self._capture_enabled = False
+        self._upload_failed = True
         path_states = {}
         for label, path in (
             ("output_parent", os.path.dirname(os.path.abspath(self.output_path))),
@@ -571,15 +572,17 @@ class UploadLogPlugin:
         self._remove_source(stream.source_path)
         stream.message = f"{stream.filesize} bytes uploaded to {file_url}"
 
-    def _finalize_attempt(self, nodeid: str, attempt: int) -> None:
-        streams = self._captured_streams.get(nodeid, {})
-        for (stream_attempt, stream_name), stream in streams.items():
-            if stream_attempt == attempt:
+    def _finalize_node(self, nodeid: str, attempt: int | None = None) -> None:
+        for (stream_attempt, stream_name), stream in self._captured_streams.get(nodeid, {}).items():
+            if attempt is not None and stream_attempt != attempt:
+                continue
+            try:
                 self._finalize_stream(stream_name, stream)
-
-    def _finalize_node(self, nodeid: str) -> None:
-        for (_, stream_name), stream in self._captured_streams.get(nodeid, {}).items():
-            self._finalize_stream(stream_name, stream)
+            except OSError as exc:
+                self._upload_failed = True
+                stream.message = f"upload failed: {exc}\nsize: {stream.filesize} bytes"
+                stream.force_output = True
+                logger.warning("Failed to finalize S3 test log %s: %s", stream.source_path, exc)
 
     @staticmethod
     def _attempt(report) -> int:
@@ -639,7 +642,7 @@ class UploadLogPlugin:
                     failure_tails[stream_key] = self._tail(stream.source_path)
 
         if default_phase in ("teardown", "collect"):
-            self._finalize_attempt(nodeid, attempt)
+            self._finalize_node(nodeid, attempt)
 
         transformed_sections = []
         reported_streams = set()
@@ -672,20 +675,20 @@ class UploadLogPlugin:
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_logreport(self, report):
-        if self._spool_available:
+        if self._capture_enabled:
             try:
                 self._process_report(report, getattr(report, "when", "call"))
             except OSError as exc:
-                self._disable_spooling("processing a test report", exc)
+                self._disable_capture("processing a test report", exc)
         return (yield)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collectreport(self, report) -> None:
-        if self._spool_available:
+        if self._capture_enabled:
             try:
                 self._process_report(report, "collect")
             except OSError as exc:
-                self._disable_spooling("processing a collection report", exc)
+                self._disable_capture("processing a collection report", exc)
         nodeid = getattr(report, "nodeid", "unknown")
         self._test_names.pop(nodeid, None)
         self._captured_sections.pop(nodeid, None)
@@ -693,11 +696,7 @@ class UploadLogPlugin:
         self._pending_reruns.discard(nodeid)
 
     def pytest_runtest_logfinish(self, nodeid: str, location) -> None:
-        if self._spool_available:
-            try:
-                self._finalize_node(nodeid)
-            except OSError as exc:
-                self._disable_spooling("finishing a test report", exc)
+        self._finalize_node(nodeid)
         self._test_names.pop(nodeid, None)
         if nodeid in self._pending_reruns:
             self._pending_reruns.remove(nodeid)
@@ -707,18 +706,13 @@ class UploadLogPlugin:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_sessionfinish(self, session, exitstatus) -> None:
-        if self._spool_available:
-            for nodeid in tuple(self._captured_streams):
-                try:
-                    self._finalize_node(nodeid)
-                except OSError as exc:
-                    self._disable_spooling("finishing the test session", exc)
-                    break
+        for nodeid in tuple(self._captured_streams):
+            self._finalize_node(nodeid)
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
             self._finish_uploads(set(self._pending_uploads))
-        if self._spool_available and not self.skip_upload and not self._upload_failed:
+        if not self.skip_upload and not self._upload_failed:
             try:
                 Path(self._spool_config_path).unlink(missing_ok=True)
                 Path(self._spool_dir).rmdir()
