@@ -84,6 +84,8 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         seq_lens=torch.tensor(([2, 3] if num_contexts else []) + [next_n] * num_generations),
         cuda_graph_buffers={},
         is_cuda_graph=False,
+        is_ragged_verify=False,
+        ragged_row_kv_lens=Mock(return_value=None),
         get_empty=lambda buffers, shape, **kwargs: torch.full(shape, -1, dtype=torch.int32),
         skip_indexer_for_ctx_reqs=False,
         skip_indexer_for_gen_reqs=False,
@@ -128,6 +130,7 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
         scores: torch.Tensor,
         sequence_lengths: torch.Tensor,
         scan_lengths: torch.Tensor,
+        row_kv_lens: torch.Tensor | None,
         output: torch.Tensor,
         n: int,
         max_seq_len: int,
@@ -144,6 +147,7 @@ def test_indexer_forward_uses_prior_only_for_temporal_gvr(
             assert torch.all(prior == -99)
         else:
             assert prior is None
+        assert row_kv_lens is None
         assert n == next_n
         output.copy_(selections(num_gen_tokens))
         return output

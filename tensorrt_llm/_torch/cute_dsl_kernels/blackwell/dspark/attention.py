@@ -195,7 +195,7 @@ class DSparkPersistentTileScheduler:
 
 
 class DSparkAttention(DSparkAttentionKernel):
-    """Attention over a 128-token rolling window and one 5/6-token draft block."""
+    """Attention over a 128-token rolling window and one supported draft block."""
 
     window_size = 128
     block_size = 6
@@ -260,8 +260,9 @@ class DSparkAttention(DSparkAttentionKernel):
         ]
         if mismatches:
             raise ValueError("Unsupported DSpark kernel configuration: " + ", ".join(mismatches))
-        if seq_len_q not in (5, 6):
-            raise ValueError(f"DSpark block size must be 5 or 6, got {seq_len_q}")
+        # Each query gets its own head tile; only draft storage bounds K.
+        if seq_len_q not in (1, 2, 3, 4, 5, 6, 7, 8):
+            raise ValueError(f"DSpark block size must be 1 through 8, got {seq_len_q}")
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
 
