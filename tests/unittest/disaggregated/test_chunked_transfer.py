@@ -1291,6 +1291,9 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
     transceiver._retire_cancelled_receive_fence = MethodType(
         KvCacheTransceiverV2._retire_cancelled_receive_fence, transceiver
     )
+    transceiver._record_send_terminal_outcome = MethodType(
+        KvCacheTransceiverV2._record_send_terminal_outcome, transceiver
+    )
     return transceiver
 
 
