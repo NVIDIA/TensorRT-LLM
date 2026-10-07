@@ -26,12 +26,18 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 
+#include <cstdlib>
+#include <string_view>
 #include <torch/extension.h>
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
 #include "tensorrt_llm/common/cudaArchitectures.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
+#if TRTLLM_ENABLE_NCCL_PROFILING
+#include "tensorrt_llm/common/profiler.h"
+#endif
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
@@ -79,6 +85,27 @@ using OptVec = std::optional<std::vector<T>>;
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
+#if TRTLLM_ENABLE_NCCL_PROFILING
+    auto const diagnostic = tc::initializeProfiler();
+    if (diagnostic)
+    {
+        TLLM_LOG_WARNING("%s", diagnostic->c_str());
+    }
+    if (char const* selection = std::getenv("TLLM_PROFILE_CUSTOM_REGIONS"); !diagnostic && selection != nullptr
+        && std::string_view{selection}.find_first_not_of(" \t\r\n") != std::string_view::npos)
+    {
+        auto warnUnavailable = [](tc::ProfilerRegion region, bool available, char const* name, char const* option)
+        {
+            if (!available && tc::customRegionEnabled(region))
+            {
+                std::string const message = std::string{"TLLM_PROFILE_CUSTOM_REGIONS selects "} + name
+                    + ", but this build omits its probes (" + option + "=OFF)";
+                TLLM_LOG_WARNING("%s", message.c_str());
+            }
+        };
+        warnUnavailable(tc::ProfilerRegion::kNccl, TRTLLM_ENABLE_NCCL_PROFILING != 0, "nccl", "ENABLE_NCCL_PROFILING");
+    }
+#endif
     m.doc() = "TensorRT LLM Python bindings for C++ runtime";
     nb::set_leak_warnings(false);
 
@@ -172,6 +199,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
     buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
+    buildInfo.attr("ENABLE_NCCL_PROFILING") = nb::bool_(TRTLLM_ENABLE_NCCL_PROFILING);
 
     auto const toTuple = [](std::vector<int> const& architectures)
     {
