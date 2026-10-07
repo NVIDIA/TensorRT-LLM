@@ -1741,7 +1741,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         from tensorrt_llm.llmapi.llm_args import \
             KvCacheConfig as LlmKvCacheConfig
         if not spec_step_copies.is_supported():
-            self.skipTest("the step-copy kernels run on SM 100")
+            self.skipTest("the step-copy kernels run on SM 100 / 103 / 107")
         max_draft_len = 3
         tokens_per_step = max_draft_len + 1
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(

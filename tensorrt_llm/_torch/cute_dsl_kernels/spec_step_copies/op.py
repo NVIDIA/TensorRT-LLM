@@ -36,8 +36,17 @@ from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 
 def is_supported() -> bool:
-    """Whether the kernels run on the current device: SM 100 with the CuTe DSL installed."""
-    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and get_sm_version() == 100
+    """Whether the kernels run on the current device: the SM 100 family (SM 100, 103, 107) with the CuTe DSL installed.
+
+    The kernels are plain SIMT code (thread and block indices, global loads and stores), with nothing specific to an
+    architecture.
+    """
+    # TODO: validated on SM 100 (B200 / GB200) only; SM 103 (GB300) and SM 107 (Rubin) are untested.
+    return (
+        IS_CUTLASS_DSL_AVAILABLE
+        and torch.cuda.is_available()
+        and get_sm_version() in (100, 103, 107)
+    )
 
 
 def _is_i32(t: torch.Tensor) -> bool:
