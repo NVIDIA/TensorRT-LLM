@@ -41,14 +41,16 @@ import yaml
 
 from defs.model_express.mx_harness import (
     MX_ROLES,
-    TRANSFER_TIER_KINDS,
+    SELF_CHECK_FAILED_EXIT_CODE,
     WORKER_PATH,
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
     assert_transfer_evidence,
+    assert_weight_manifests,
     build_canonical_snapshot,
     build_metadata_only_snapshot,
+    collect_weight_manifests,
     donor_session,
     load_payload,
     log_tail,
@@ -60,10 +62,21 @@ from defs.model_express.mx_harness import (
     worker_command,
     worker_environment,
 )
-from tensorrt_llm._torch.weight_sharing import ArtifactIdentity, compare_weight_manifests
+from tensorrt_llm._torch.weight_sharing import ArtifactIdentity
 
 _REFERENCES_DIR = Path(__file__).resolve().parents[1] / "accuracy" / "references"
 _TASK_REFERENCE_FILES = {"MMLU": "mmlu.yaml", "GSM8K": "gsm8k.yaml"}
+# The receiver loads, receives, self-checks, and then runs the whole task, so it
+# gets its own budget instead of `TRTLLM_MX_E2E_TIMEOUT_S`, which is sized for
+# load plus the short token probe and still bounds the donor-readiness wait.
+_ACCURACY_TIMEOUT_ENV = "TRTLLM_MX_ACCURACY_TIMEOUT_S"
+_DEFAULT_ACCURACY_TIMEOUT_S = 3600
+# Evaluator settings `MxEvalSpec.from_task` and the worker reproduce. Any other
+# setting on a task class would be dropped silently and the score would no
+# longer be comparable with its reference, so `from_task` rejects it instead.
+_REPRODUCED_EVALUATOR_KWARGS = frozenset({"dataset_path", "random_seed"})
+_REPRODUCED_EVALUATE_KWARGS = {"scores_filter": None}
+_REPRODUCED_EXTRA_EVALUATOR_KWARGS = frozenset({"apply_chat_template", "system_prompt"})
 # The spec keys `accuracy_core.AccuracyTask.evaluate` derives from `llm.args`,
 # pinned to the qualified BF16 unquantized, non-speculative MX envelope.
 _BF16_ACCURACY_SPECS = dict(
@@ -101,7 +114,33 @@ class MxEvalSpec:
 
     @classmethod
     def from_task(cls, task_cls, params, extra: Mapping[str, object]) -> "MxEvalSpec":
-        evaluator_kwargs = dict(task_cls.EVALUATOR_KWARGS)
+        """Derive the worker's eval settings from an `accuracy_core` task class.
+
+        Raises:
+            ValueError: The task class or the row's `extra_evaluator_kwargs`
+                carry a setting the worker does not reproduce.
+        """
+        evaluator_kwargs = dict(task_cls.EVALUATOR_KWARGS or {})
+        evaluate_kwargs = dict(getattr(task_cls, "EVALUATE_KWARGS", None) or {})
+        problems = []
+        unsupported = sorted(set(evaluator_kwargs) - _REPRODUCED_EVALUATOR_KWARGS)
+        if unsupported:
+            problems.append(f"EVALUATOR_KWARGS keys {unsupported}")
+        differing = {
+            key: value
+            for key, value in sorted(evaluate_kwargs.items())
+            if key not in _REPRODUCED_EVALUATE_KWARGS or _REPRODUCED_EVALUATE_KWARGS[key] != value
+        }
+        if differing:
+            problems.append(f"EVALUATE_KWARGS {differing}")
+        unsupported_extra = sorted(set(extra) - _REPRODUCED_EXTRA_EVALUATOR_KWARGS)
+        if unsupported_extra:
+            problems.append(f"extra_evaluator_kwargs keys {unsupported_extra}")
+        if problems:
+            raise ValueError(
+                f"{task_cls.__name__} uses evaluator settings the MX worker does not reproduce: "
+                + "; ".join(problems)
+            )
         return cls(
             task=task_cls.__name__,
             num_samples=params.num_samples,
@@ -144,6 +183,10 @@ class MxEvalSpec:
 # that was measured on the PyTorch backend with the task's default evaluator
 # settings, because the receiver's score is gated against it
 # (`test_mx_accuracy_cases_have_references` checks that the entry exists).
+# The bare `Qwen3/Qwen3-8B` GSM8K entry is the one gated by
+# `accuracy/test_disaggregated_serving.py::TestQwen3_8B`; the GSM8K runs in
+# `test_llm_api_pytorch.py` use speculative decoding and match other entries.
+# Re-run the disaggregated test to re-measure it if the value drifts.
 _MX_ACCURACY_CASES = (
     pytest.param(
         MxAccuracyCase(
@@ -223,49 +266,6 @@ def _record_metrics(
         )
 
 
-def _assert_donor_receiver_manifests(case: MxAccuracyCase, manifest_dir: Path) -> None:
-    """Donor and receiver manifests must agree at the transfer boundary and after finalization."""
-    if not manifest_dir.is_dir():
-        pytest.fail(f"No weight manifests were written: {manifest_dir} does not exist")
-    # The accuracy canary has no HF baseline role, so only the MX roles are required.
-    from tensorrt_llm._torch.weight_sharing import (
-        WEIGHT_MANIFEST_FILE_PATTERN,
-        load_weight_manifest,
-    )
-
-    manifests = {}
-    for path in sorted(manifest_dir.iterdir()):
-        match = WEIGHT_MANIFEST_FILE_PATTERN.match(path.name) if path.is_file() else None
-        if match is None:
-            pytest.fail(f"Unexpected entry in the weight manifest directory: {path}")
-        manifests[(match["family"], match["role"], int(match["rank"]))] = load_weight_manifest(path)
-    expected = {
-        (family, role, rank)
-        for family in ("final", "transfer")
-        for role in MX_ROLES
-        for rank in range(case.tp_size)
-    }
-    if set(manifests) != expected:
-        pytest.fail(
-            "Weight manifest set differs from the expected keys: "
-            f"absent={sorted(expected - set(manifests))}, "
-            f"extra={sorted(set(manifests) - expected)}"
-        )
-    for rank in range(case.tp_size):
-        assert manifests[("final", "receiver", rank)].context.get("weights_preloaded") is True
-        for family, kinds in (("transfer", TRANSFER_TIER_KINDS), ("final", ("param", "buffer"))):
-            diff = compare_weight_manifests(
-                manifests[(family, "donor", rank)],
-                manifests[(family, "receiver", rank)],
-                kinds=kinds,
-                exempt_patterns=case.final_manifest_exempt_patterns if family == "final" else (),
-            )
-            if not diff.is_empty:
-                pytest.fail(
-                    diff.describe(f"donor@{family} rank{rank}", f"receiver@{family} rank{rank}")
-                )
-
-
 def test_mx_accuracy_cases_have_references() -> None:
     """CPU-only guard: every canary has a bare BF16 reference entry and a valid worker argv."""
     for case_id, case in _CASES_BY_ID.items():
@@ -292,6 +292,9 @@ def test_mx_accuracy_cases_have_references() -> None:
         max_batch_size=32,
     )
     argv = ["--role", "receiver", "--model", "/snapshot", "--tp-size", "1", "--output", "/o.json"]
+    assert worker.SELF_CHECK_FAILED_EXIT_CODE == SELF_CHECK_FAILED_EXIT_CODE, (
+        "mx_e2e_worker.py and mx_harness.py disagree on the self-check exit status"
+    )
     args = worker._parse_args(argv + ["--mx-url", "http://mx:8001"] + spec.to_argv())
     assert args.eval_task == "GSM8K"
     assert args.eval_num_samples == 1319
@@ -304,6 +307,9 @@ def test_mx_accuracy_cases_have_references() -> None:
         )
 
 
+# Covers the donor-readiness wait, the receiver's whole budget, and teardown;
+# the CI default per-test timeout is sized for the much shorter smoke rows.
+@pytest.mark.timeout(7200)
 @pytest.mark.parametrize("case", _MX_ACCURACY_CASES)
 def test_mx_receiver_accuracy(
     case: MxAccuracyCase, tmp_path: Path, record_property, output_dir, request
@@ -312,13 +318,16 @@ def test_mx_receiver_accuracy(
     accuracy_core = _accuracy_core()
     task_cls = accuracy_core.get_accuracy_task(case.task)
     params = _hypothesis_params(case, task_cls)  # fails fast on a missing reference entry
+    eval_spec = MxEvalSpec.from_task(task_cls, params, case.extra_evaluator_kwargs)
 
     mx_url, gpu_ids = require_mx_environment(case.tp_size * 2)
     _require_evaluator_prerequisites(task_cls)
     model_path = resolve_model_path(case)
     timeout_s = int(os.environ.get("TRTLLM_MX_E2E_TIMEOUT_S", "1200"))
+    accuracy_timeout_s = int(
+        os.environ.get(_ACCURACY_TIMEOUT_ENV, str(_DEFAULT_ACCURACY_TIMEOUT_S))
+    )
     layout = MxRunLayout(tmp_path)
-    eval_spec = MxEvalSpec.from_task(task_cls, params, case.extra_evaluator_kwargs)
 
     donor_snapshot = build_canonical_snapshot(case, model_path, tmp_path)
     receiver_snapshot = build_metadata_only_snapshot(donor_snapshot, tmp_path)
@@ -339,7 +348,8 @@ def test_mx_receiver_accuracy(
                 mx_url=mx_url,
                 ready_file=layout.donor_ready,
                 stop_file=layout.donor_stop,
-                max_serve_seconds=timeout_s + 120,
+                # The donor must outlive the receiver's whole run.
+                max_serve_seconds=accuracy_timeout_s + 120,
             ),
             environment=worker_environment(
                 donor_gpu_ids,
@@ -368,7 +378,7 @@ def test_mx_receiver_accuracy(
                     metadata_port=receiver_port,
                 ),
                 layout.log("receiver"),
-                timeout_s,
+                accuracy_timeout_s,
             )
 
         assert donor.returncode == 0, (
@@ -378,7 +388,12 @@ def test_mx_receiver_accuracy(
         receiver_payload = load_payload(layout.output("receiver"))
 
         assert_transfer_evidence(case, layout.log("receiver"))
-        _assert_donor_receiver_manifests(case, layout.manifest_dir)
+        # Same invariants as the smoke test, minus the HF baseline role this test never runs.
+        assert_weight_manifests(
+            case,
+            collect_weight_manifests(layout.manifest_dir, case, roles=MX_ROLES),
+            roles=MX_ROLES,
+        )
 
         assert receiver_payload["eval_task"] == case.task
         assert receiver_payload["eval_num_samples"] == params.num_samples

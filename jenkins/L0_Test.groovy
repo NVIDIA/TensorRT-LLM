@@ -6400,7 +6400,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
-    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count, modelExpress]
+    // "Stage-Name": ["platform", "yaml_file", splitId, split_count, gpu_count]
     //
     // Where:
     // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
@@ -6409,9 +6409,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // - splitId: Current split number (1-based)
     // - split_count: Total number of splits
     // - gpu_count: Number of GPUs required (optional, defaults to 1)
-    // - modelExpress: Optional boolean; true attaches the Redis + ModelExpress server
-    //   sidecars (and the CI ModelExpress env) to the test pod. The mapping regex in
-    //   scripts/test_to_stage_mapping.py accepts trailing booleans.
     //
     // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
     // mapping between test names and Jenkins stage names. Any changes to this syntax
@@ -6432,9 +6429,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
+        // In this Kubernetes map only, an optional 6th element `true` attaches the Redis +
+        // ModelExpress server sidecars and the CI ModelExpress env to the pod
+        // (`createKubernetesPodConfig(..., values[5])`). The Slurm maps read slot 6 as the
+        // node count and slot 7 as `runWithSbatch` instead.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
-        // Post-merge only: runs the `stage: post_merge` rows of l0_model_express (accuracy canaries).
+        // Post-merge only: the `stage: post_merge` rows of l0_model_express, i.e. the TP=1 smoke
+        // rows of the non-representative families and the accuracy canaries.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],

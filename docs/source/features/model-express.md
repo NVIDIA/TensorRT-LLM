@@ -237,9 +237,11 @@ Current rows (TP=1, BF16; `references/*.yaml` holds the expected values):
 | `qwen3-8b-gsm8k-tp1` | `Qwen3/Qwen3-8B` | GSM8K | `TRTLLM_MX_QWEN3_MODEL` |
 
 A canary needs a bare BF16 reference for its task that was measured on the
-PyTorch backend. No in-envelope Llama, Qwen2, or Mistral checkpoint has one
-today, so those families are covered by their smoke rows until such a
-reference is added.
+PyTorch backend. The Qwen3 GSM8K entry is the one gated by
+`tests/integration/defs/accuracy/test_disaggregated_serving.py::TestQwen3_8B`,
+so re-run that test to re-measure it if the value drifts. No in-envelope Llama,
+Qwen2, or Mistral checkpoint has such a reference today, so those families are
+covered by their smoke rows until one is added.
 
 The rows are registered as `stage: post_merge` entries in
 `tests/integration/test_lists/test-db/l0_model_express.yml`, so they run in
@@ -253,7 +255,12 @@ pull request, which requires the `ci: full pre-merge approved` label, with:
 
 GSM8K needs the `lm_eval` package from `requirements-dev.txt`; the test checks
 for it and, under `TRTLLM_MX_E2E_REQUIRED=1`, fails instead of skipping when it
-is absent. Each run records the donor and receiver load times, the evaluation
+is absent. The receiver gets its own `TRTLLM_MX_ACCURACY_TIMEOUT_S` budget
+(default 3600 seconds) for load, transfer, and the whole evaluation, while
+`TRTLLM_MX_E2E_TIMEOUT_S` still bounds the donor-readiness wait. The reference
+guard `test_mx_accuracy_cases_have_references` needs no GPU and also runs in the
+pre-merge CPU stage, so a pruned reference fails on the pull request that prunes
+it. Each run records the donor and receiver load times, the evaluation
 time, the score, and the threshold as junit properties and as
 `model_express_accuracy/<test-id>.json` under `--output-dir`; load times are
 observed only, not gated. To run one canary locally:
