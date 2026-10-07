@@ -91,10 +91,13 @@ class TokenShardedAdapter:
 class TokenShardedColumn(TokenShardedAdapter):
     """Column-parallel projection reading the token stream: all-gather, then the GEMM.
 
-    Takes this rank's rows (``[n, g, K]`` or ``[m, K]``, bf16 or a static-scale NVFP4
-    ``Fp4QuantizedTensor``) and returns ``[B, S, N_local]`` for all tokens, so code after it
-    must take batch and sequence lengths from its output, not from the block input
-    (``Attention._attn_impl`` re-derives them from ``q`` / ``k``).
+    Takes this rank's rows (``[n, g, K]`` or ``[m, K]``: bf16, a static-scale NVFP4
+    ``Fp4QuantizedTensor`` or an FP8 block-scale ``Fp8BlockScaledActivation``) and returns
+    ``[B, S, N_local]`` for all tokens, so code after it must take batch and sequence lengths
+    from its output, not from the block input (``Attention._attn_impl`` re-derives them from
+    ``q`` / ``k``). A bf16 input is quantized before the all-gather when the Linear takes a
+    pre-quantized input it would produce itself (static NVFP4, or FP8 block scales on the
+    DeepGEMM path).
     """
 
     @classmethod
@@ -108,7 +111,9 @@ class TokenShardedColumn(TokenShardedAdapter):
 
     def forward(self, input, *args, **kwargs):
         tp = self._token_sharded_tp
-        out = super().forward(tp.gather_input(self, input), *args, **kwargs)
+        # An active LoRA (Linear.forward's lora_params) applies its adapters to the dense input.
+        gathered = tp.gather_input(self, input, prequantize=not kwargs.get("lora_params"))
+        out = super().forward(gathered, *args, **kwargs)
         p = tp.plan
         return out.view(p.batch_size, p.seq_len, -1)
 
@@ -139,7 +144,8 @@ class TokenShardedMLP(TokenShardedAdapter):
     Converted whole rather than per projection because its fused GELU paths call the
     up-projection's quant method directly. The MLP runs on the ``B * S`` real rows only (pad
     rows are non-zero after a norm and would perturb a dynamic amax); its output partial is
-    padded per sample before the reduce-scatter.
+    padded per sample before the reduce-scatter. The input is quantized before the all-gather
+    by the up-projection's rule, as for :class:`TokenShardedColumn`.
     """
 
     @classmethod
@@ -154,7 +160,10 @@ class TokenShardedMLP(TokenShardedAdapter):
     def forward(self, x, *args, **kwargs):
         tp = self._token_sharded_tp
         consumer = getattr(self, "up_proj", None) or getattr(self, "gate_up_proj", None)
-        partial = super().forward(tp.gather_input(consumer, x), *args, **kwargs)
+        # MLP.forward(x, lora_params=None) / GatedMLP.forward(..., lora_params=None): an active
+        # LoRA takes the dense input, so the FP8 pre-quantize is skipped for that call.
+        gathered = tp.gather_input(consumer, x, prequantize=not kwargs.get("lora_params"))
+        partial = super().forward(gathered, *args, **kwargs)
         return tp.local_view(tp.reduce_scatter(partial))
 
 

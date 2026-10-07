@@ -49,6 +49,7 @@ from tensorrt_llm._torch.visual_gen.parallel.token_sharded_modules import (
     convert_to_token_sharded_tp,
 )
 from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import TokenShardedTP
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.visual_gen.args import ParallelConfig
@@ -555,11 +556,11 @@ _E2M1_MAX, _FP8_MAX = 6.0, 448.0
 _ATTN1_QKV = ("attn1.to_q", "attn1.to_k", "attn1.to_v")  # fused into attn1.qkv_proj
 
 
-def _block_config(vgm, quant, token_sharded):
+def _block_config(vgm, quant_algo, token_sharded):
     world_size = vgm.tp_size
     cfg = DiffusionModelConfig(
         pretrained_config=SimpleNamespace(**_D5120_BLOCK),
-        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4) if quant else QuantConfig(),
+        quant_config=QuantConfig(quant_algo=quant_algo) if quant_algo else QuantConfig(),
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend="VANILLA"),
         visual_gen_mapping=vgm,
@@ -650,7 +651,7 @@ def _calibrate_amax(vgm, device, bf16_weights, params, block_inputs):
     """One bf16 all-reduce-TP pass recording each Linear's input amax (max over ranks)."""
     from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanBlock
 
-    block = WanBlock(_block_config(vgm, False, False), 0).to(device)
+    block = WanBlock(_block_config(vgm, None, False), 0).to(device)
     _load_block(block, bf16_weights, params)
     amax = {}
 
@@ -706,9 +707,9 @@ def _logic_nvfp4_block(rank, world_size, *, batch, thw):
         for name, entry in bf16_weights.items()
     }
 
-    ar_block = WanBlock(_block_config(vgm, True, False), 0).to(device)
+    ar_block = WanBlock(_block_config(vgm, QuantAlgo.NVFP4, False), 0).to(device)
     _load_block(ar_block, fp4_weights, params)
-    ts_cfg = _block_config(vgm, True, True)
+    ts_cfg = _block_config(vgm, QuantAlgo.NVFP4, True)
     tp = TokenShardedTP.from_model_config(ts_cfg)
     ts_block = WanBlock(ts_cfg, 0).to(device)
     convert_to_token_sharded_tp(_as_model(ts_block), tp)
@@ -783,6 +784,123 @@ class TestWanTokenShardedTPNVFP4Block:
         run_test_in_distributed(
             world_size=world_size,
             test_fn=functools.partial(_logic_nvfp4_block, batch=batch, thw=thw),
+        )
+
+
+# =============================================================================
+# The same D=5120 WanBlock with FP8 block scales (FP8 + scales all-gathers into DeepGEMM)
+# =============================================================================
+
+
+def _to_fp8_block(entry):
+    """128x128 block-scale FP8 checkpoint entry for a bf16 Linear: the ``weight`` /
+    ``weight_scale`` pair ``FP8BlockScalesLinearMethod`` loads."""
+    weight = entry["weight"].cuda()
+    n, k = weight.shape
+    blocks = weight.float().view(n // 128, 128, k // 128, 128).permute(0, 2, 1, 3)
+    scale = blocks.abs().amax(dim=(2, 3), keepdim=True).clamp(min=1e-12) / _FP8_MAX
+    q = (blocks / scale).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+    return {
+        "weight": q.permute(0, 2, 1, 3).reshape(n, k).cpu(),
+        "weight_scale": scale.reshape(n // 128, k // 128).cpu(),
+        "bias": entry["bias"],
+    }
+
+
+def _logic_fp8_block_scales_block(rank, world_size, *, batch, thw):
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import (
+        WanBlock,
+        WanRotaryPosEmbed,
+    )
+    from tensorrt_llm._torch.visual_gen.parallel.token_sharded_tp import (
+        Fp8BlockScaledActivation,
+        fp8_block_scale_prequant_ok,
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    d, ffn, text_len = 5120, _D5120_BLOCK["ffn_dim"], 64
+    t, h, w = thw
+    seq = t * h * w
+    gen = torch.Generator().manual_seed(7)
+    x = torch.randn(batch, seq, d, generator=gen).to(device, torch.bfloat16)
+    enc = (torch.randn(batch, text_len, d, generator=gen) * 0.5).to(device, torch.bfloat16)
+    temb = (torch.randn(batch, 6, d, generator=gen) * 0.1).to(device)  # distinct per sample
+    rope = WanRotaryPosEmbed(128, (1, 2, 2), max_seq_len=1024).to(device)
+    freqs_cos, freqs_sin = rope(torch.empty(batch, 16, t, 2 * h, 2 * w, device=device))
+    timestep = torch.full((batch,), 0.5, device=device)
+    block_inputs = (x, enc, temb, freqs_cos, freqs_sin, timestep)
+
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, tp_size=world_size)
+    bf16_weights, params = _full_block_weights(d, ffn)
+    fp8_weights = {name: _to_fp8_block(entry) for name, entry in bf16_weights.items()}
+
+    ar_block = WanBlock(_block_config(vgm, QuantAlgo.FP8_BLOCK_SCALES, False), 0).to(device)
+    _load_block(ar_block, fp8_weights, params)
+    ts_cfg = _block_config(vgm, QuantAlgo.FP8_BLOCK_SCALES, True)
+    tp = TokenShardedTP.from_model_config(ts_cfg)
+    ts_block = WanBlock(ts_cfg, 0).to(device)
+    convert_to_token_sharded_tp(_as_model(ts_block), tp)
+    _load_block(ts_block, fp8_weights, params)
+    # The norms emit bf16 (no static NVFP4 scale) and all three consumers take the FP8 pair.
+    norm_scales = (ts_block._norm1_fp4_scale, ts_block._norm2_fp4_scale, ts_block._norm3_fp4_scale)
+    consumers = (ts_block.attn1.qkv_proj, ts_block.attn2.to_q, ts_block.ffn.up_proj)
+    _check(
+        all(s is None for s in norm_scales) and all(map(fp8_block_scale_prequant_ok, consumers)),
+        "the FP8 block-scale rule engages for attn1.qkv_proj, attn2.to_q and ffn.up_proj",
+    )
+
+    # A silent BF16 gather must fail: the adapters quantize inside, so the hook sits on the
+    # helper's all-gather, which must move the FP8 pair at all three block boundaries.
+    moved = []
+    gather = tp.all_gather
+
+    def spy(act):
+        moved.append(type(act))
+        return gather(act)
+
+    with torch.no_grad():
+        ref = ar_block(*block_inputs)
+        plan = tp.begin(batch, seq)
+        tp.all_gather = spy
+        out = ts_block(
+            tp.local_view(tp.shard(x)), enc, tp.per_sample_table(temb), *block_inputs[3:]
+        )
+        tp.all_gather = gather
+        out = tp.unshard(out.reshape(plan.local_rows, -1))
+        _replace_all_reduce(_as_model(ar_block), lambda: _EmulatedAllReduce(tp))
+        emu = ar_block(*block_inputs)
+        _replace_all_reduce(_as_model(ar_block), _ExactAllReduce)
+        exact = ar_block(*block_inputs)
+    _check(moved == [Fp8BlockScaledActivation] * 3, f"boundary all-gathers moved {moved}")
+    desc = f"tp={world_size} B={batch} S={seq} padded={tp.plan.is_padded}"
+    _check(torch.equal(out, emu), f"{desc}: token-sharded TP != emulated all-reduce block")
+    cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
+    err = _rel_l2(out, ref)
+    _check(
+        cos.item() >= 0.999 and err <= 2e-2, f"{desc}: vs all-reduce cos={cos:.6f} rel-L2={err:.3e}"
+    )
+    ts_err, ar_err = _rel_l2(out, exact), _rel_l2(ref, exact)
+    _check(
+        ts_err <= 1.5 * ar_err + 1e-6,
+        f"{desc}: vs fp32-exact all-reduce: token-sharded {ts_err:.3e}, plain TP {ar_err:.3e}",
+    )
+
+
+class TestWanTokenShardedTPFP8BlockScalesBlock:
+    @pytest.mark.parametrize(
+        "world_size,batch,thw",
+        [(2, 2, (1, 16, 16)), (3, 2, (3, 5, 7)), (4, 2, (3, 5, 7)), (8, 2, (4, 15, 16))],
+        ids=["tp2_S256", "tp3_S105", "tp4_S105_padded", "tp8_S960"],
+    )
+    def test_fp8_block_scales_block(self, world_size, batch, thw):
+        """D=5120 FP8 block-scale WanBlock (FP8 + scales all-gathers into DeepGEMM): bitwise vs
+        the emulated all-reduce block, close to the plain one, and within 1.5x of its error vs
+        an fp32-exact all-reduce."""
+        if not torch.cuda.is_available() or not is_sm_100f():
+            pytest.skip("The FP8 block-scale DeepGEMM path requires an SM100-family GPU")
+        run_test_in_distributed(
+            world_size=world_size,
+            test_fn=functools.partial(_logic_fp8_block_scales_block, batch=batch, thw=thw),
         )
 
 

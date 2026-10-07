@@ -67,6 +67,7 @@ def simulated_helper(plan: TokenShardPlan) -> TokenShardedTP:
     ts = TokenShardedTP.__new__(TokenShardedTP)
     ts.group, ts.group_name = None, "simulated"
     ts.tp_size, ts.tp_rank = plan.tp_size, plan.tp_rank
+    ts.row_align = plan.row_align
     ts._plans = {(plan.batch_size, plan.seq_len): plan}
     ts._plan = plan
     return ts

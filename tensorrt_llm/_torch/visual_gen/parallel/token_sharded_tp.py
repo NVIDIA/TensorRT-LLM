@@ -17,7 +17,8 @@
 Megatron-style sequence parallelism inside the TP group: between projections each TP rank holds
 only its rows of the residual stream (:class:`TokenShardPlan`). Each row-parallel all-reduce
 becomes a reduce-scatter to those rows, and the next column-parallel projection all-gathers them
-first (as NVFP4 when that projection has a static NVFP4 input scale). Only row-local ops
+first (as NVFP4 when that projection has a static NVFP4 input scale, as FP8 plus its 1x128 block
+scales when it is an FP8 block-scale Linear on the DeepGEMM path). Only row-local ops
 (residual adds, norms, modulation, quantization) run on the shard; attention, QK-norm and RoPE
 see all tokens, with heads sharded as in plain TP. This is not Ulysses / ring / attn2d, which
 shard the sequence through attention, and cannot be combined with them yet.
@@ -38,7 +39,7 @@ while ``shard_rope`` leaves RoPE whole. Code between projections must be row-loc
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import torch.distributed as dist
@@ -46,11 +47,12 @@ import torch.distributed._functional_collectives as funcol
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
-from ...modules.linear import Linear, is_static_nvfp4_input_eligible
+from ...modules.linear import FP8BlockScalesLinearMethod, Linear, is_static_nvfp4_input_eligible
 from ...utils import Fp4QuantizedTensor, compute_swizzled_sf_shape
 from ..utils import SequenceSharder
 
@@ -58,17 +60,44 @@ if TYPE_CHECKING:
     from ..config import DiffusionModelConfig
 
 __all__ = [
+    "FP8_BLOCK_SIZE",
+    "Fp8BlockScaledActivation",
     "TokenShardPlan",
     "TokenShardedSequenceSharder",
     "TokenShardedTP",
+    "fp8_block_scale_prequant_ok",
+    "fp8_scale_cols",
+    "fp8_scales_mn_major",
+    "quantize_fp8_block",
     "quantize_nvfp4",
     "regroup_swizzled_sf",
     "static_nvfp4_input_scale",
     "swizzled_sf_numel",
 ]
 
-# A column projection's input: bf16 rows or a static-scale NVFP4 tensor.
-Activation = torch.Tensor | Fp4QuantizedTensor
+FP8_BLOCK_SIZE = 128
+
+
+class Fp8BlockScaledActivation(NamedTuple):
+    """A 1x128 FP8 block-scale activation, in the ``(activation, scale)`` tuple form
+    ``FP8BlockScalesLinearMethod.apply`` takes as a pre-quantized input.
+
+    Attributes:
+        fp8: ``[rows, K]`` float8_e4m3fn.
+        scale: ``[rows, P]`` int32, ``P = fp8_scale_cols(K)`` (four UE8M0 scales packed per
+            element, one per 128-wide K block; ``K/512`` when 512 divides ``K``), MN-major:
+            strides ``(1, pad4(rows))`` as DeepGEMM reads them in eager. Under torch.compile
+            Inductor materializes a gathered scale with strides ``(1, rows)``, which the GEMM
+            runner re-strides with one small copy.
+    """
+
+    fp8: torch.Tensor
+    scale: torch.Tensor
+
+
+# A column projection's input: bf16 rows, a static-scale NVFP4 tensor or an FP8 block-scale
+# activation.
+Activation = torch.Tensor | Fp4QuantizedTensor | Fp8BlockScaledActivation
 
 
 # =============================================================================
@@ -80,22 +109,25 @@ Activation = torch.Tensor | Fp4QuantizedTensor
 class TokenShardPlan:
     """Which rows of the flattened ``[B * S_pad]`` token stream one TP rank holds.
 
-    Each sample is zero-padded at its end to ``S_pad`` (only when ``B * S % tp != 0``) so that
-    every aligned group of ``g`` local rows lies inside one sample: the shard views as
-    ``[n, g, D]`` and a per-sample table needs only ``n = B / gcd(tp, B)`` entries on every rank.
-    Python ints only (compile / CUDA-graph safe); each new ``(B, S)`` specializes the compiled
-    blocks (eager past Dynamo's ``cache_size_limit``), so warm up every served shape.
+    Each sample is zero-padded at its end to ``S_pad = round_up(S, t' * row_align)`` with
+    ``t' = tp / gcd(tp, B)`` so that every aligned group of ``g`` local rows lies inside one
+    sample: the shard views as ``[n, g, D]`` and a per-sample table needs only
+    ``n = B / gcd(tp, B)`` entries on every rank. With the default ``row_align = 1`` padding
+    happens only when ``B * S % tp != 0``. Python ints only (compile / CUDA-graph safe); each
+    new ``(B, S)`` specializes the compiled blocks (eager past Dynamo's ``cache_size_limit``),
+    so warm up every served shape.
     """
 
     batch_size: int  # B
     seq_len: int  # S (real tokens per sample)
-    padded_seq_len: int  # S_pad = round_up(S, t'), t' = tp // gcd(tp, B)
+    padded_seq_len: int  # S_pad = round_up(S, t' * row_align), t' = tp // gcd(tp, B)
     tp_size: int
     tp_rank: int
     local_rows: int  # m = B * S_pad // tp
     row_start: int  # tp_rank * m, in flat [B * S_pad] order
     rows_per_entry: int  # g = S_pad // t' (the fused AdaLN op's seq_len_per_batch)
     entry_batch: tuple[int, ...]  # sample index of each modulation entry; len B // gcd(tp, B)
+    row_align: int = 1  # m is a multiple of this
 
     @property
     def num_tokens(self) -> int:
@@ -112,7 +144,21 @@ class TokenShardPlan:
         return self.padded_seq_len != self.seq_len
 
     @staticmethod
-    def build(batch_size: int, seq_len: int, tp_size: int, tp_rank: int) -> "TokenShardPlan":
+    def build(
+        batch_size: int, seq_len: int, tp_size: int, tp_rank: int, row_align: int = 1
+    ) -> "TokenShardPlan":
+        """Build the plan for one rank.
+
+        Args:
+            batch_size: ``B``.
+            seq_len: ``S``, real tokens per sample.
+            tp_size: Ranks in the TP group.
+            tp_rank: This rank.
+            row_align: Pad every sample so that each rank's row count ``m`` is a multiple
+                of it. Lets a deployment align the shards to a GEMM tile (e.g. 64 rows); at
+                4 the FP8 block-scale quantizer's per-rank scale buffers carry no pad rows.
+                The default 1 keeps every shape as it is without alignment.
+        """
         if batch_size < 1 or seq_len < 1:
             raise ValueError(
                 f"TokenShardPlan needs batch_size >= 1 and seq_len >= 1 "
@@ -123,10 +169,12 @@ class TokenShardPlan:
                 f"TokenShardPlan needs 0 <= tp_rank < tp_size (got tp_rank={tp_rank}, "
                 f"tp_size={tp_size})."
             )
+        if row_align < 1:
+            raise ValueError(f"TokenShardPlan needs row_align >= 1 (got {row_align}).")
         d = math.gcd(tp_size, batch_size)
         t = tp_size // d
-        s_pad = pad_up(seq_len, t)
-        m = batch_size * s_pad // tp_size  # exact: tp | B * s_pad
+        s_pad = pad_up(seq_len, t * row_align)
+        m = batch_size * s_pad // tp_size  # exact: tp | B * s_pad; row_align | m
         g = s_pad // t
         row_start = tp_rank * m
         entry_batch = tuple((row_start + j * g) // s_pad for j in range(m // g))
@@ -140,6 +188,7 @@ class TokenShardPlan:
             row_start=row_start,
             rows_per_entry=g,
             entry_batch=entry_batch,
+            row_align=row_align,
         )
 
     def local_segments(self) -> tuple[tuple[int, int, int], ...]:
@@ -225,6 +274,70 @@ def quantize_nvfp4(h: torch.Tensor, input_scale: torch.Tensor) -> Fp4QuantizedTe
 
 
 # =============================================================================
+# FP8 block-scale helpers
+# =============================================================================
+
+
+def fp8_block_scale_prequant_ok(linear: nn.Module | None) -> bool:
+    """Whether ``linear`` consumes a bf16 input through the DeepGEMM FP8 block-scale path, so
+    that a row-local 1x128 quantize yields exactly the bytes it would produce on all rows and
+    the activation can be all-gathered as FP8 + scales (an :class:`Fp8BlockScaledActivation`).
+
+    True iff ``linear`` is a ``Linear`` with the ``FP8BlockScalesLinearMethod`` (weights
+    created), on an SM100-family GPU, with neither ``use_cute_dsl_blockscaling_mm`` nor
+    ``disable_deep_gemm`` (those GEMMs quantize differently and reject the packed scales),
+    and with ``in_features`` a multiple of 128 (whole 1x128 blocks; the packed quantize itself
+    needs only 16). The column and MLP adapters quantize a bf16 input before their all-gather
+    by this rule, decided per call (the quant method can change until the weights are loaded).
+    A LoRA is not part of the rule: ``MLP`` attaches a ``LoraLayer`` to its projections whether
+    or not adapters are loaded, and only an active ``lora_params`` at call time needs the dense
+    input, which the adapters handle with ``gather_input(..., prequantize=False)``.
+    """
+    if not isinstance(linear, Linear) or not getattr(linear, "_weights_created", False):
+        return False
+    return (
+        type(linear.quant_method) is FP8BlockScalesLinearMethod
+        and is_sm_100f()
+        and not linear.use_cute_dsl_blockscaling_mm
+        and not linear.disable_deep_gemm
+        and linear.in_features % FP8_BLOCK_SIZE == 0
+    )
+
+
+def fp8_scale_cols(k: int) -> int:
+    """Packed int32 scale columns ``P`` of a 1x128 FP8 block-scale activation with ``K = k``."""
+    return (pad_up(k, FP8_BLOCK_SIZE) // FP8_BLOCK_SIZE + 3) // 4
+
+
+def quantize_fp8_block(h: torch.Tensor) -> Fp8BlockScaledActivation:
+    """1x128 FP8 block-scale quantize of bf16 ``h`` (``[..., K]`` -> fp8 ``[rows, K]`` + packed
+    UE8M0 scales ``[rows, P]`` int32 with ``P = fp8_scale_cols(K)``, MN-major).
+
+    Pinned to ``trtllm::fp8_quantize_1x128_packed_ue8m0``, the CUDA quantizer of the Linear's
+    own ``fp8_swap_ab_gemm`` path (its default, with ``TRTLLM_FUSED_FP8_QUANT_PACK=1``). That
+    path autotunes its quantizer and may pick the Triton kernel for large row counts; the two
+    follow the same scale rule but are not guaranteed bitwise, so the gathered bytes equal the
+    Linear's own exactly for the CUDA tactic.
+    """
+    h2 = h.reshape(-1, h.shape[-1]).contiguous()
+    fp8, scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(h2, False)
+    return Fp8BlockScaledActivation(fp8, scale)
+
+
+def fp8_scales_mn_major(rows: torch.Tensor) -> torch.Tensor:
+    """Row-major ``[M, P]`` packed scales -> the layout DeepGEMM reads: ``(M, P)`` with strides
+    ``(1, pad4(M))`` over a full ``[P, pad4(M)]`` buffer, as the quantize op allocates it. One
+    transposing copy of ``M * P`` ints in eager; under torch.compile Inductor materializes the
+    result with strides ``(1, M)`` instead, which the GEMM runner re-strides with one more tiny
+    copy."""
+    m, cols = rows.shape
+    lead = pad_up(m, 4)
+    out = torch.empty((cols, lead), dtype=rows.dtype, device=rows.device).t()[:m]
+    out.copy_(rows)
+    return out
+
+
+# =============================================================================
 # Collectives
 # =============================================================================
 
@@ -260,9 +373,17 @@ class TokenShardedTP:
     Args:
         group: The TP process group; its rank order is the token-shard order.
         tp_rank: Expected rank of this process in ``group``; a mismatch raises.
+        row_align: Row alignment of every plan (see :meth:`TokenShardPlan.build`); the
+            default 1 pads only what the rank count requires.
     """
 
-    def __init__(self, group: dist.ProcessGroup | None, *, tp_rank: int | None = None) -> None:
+    def __init__(
+        self,
+        group: dist.ProcessGroup | None,
+        *,
+        tp_rank: int | None = None,
+        row_align: int = 1,
+    ) -> None:
         if group is None:
             raise ValueError(
                 "TokenShardedTP needs a torch.distributed TP process group; got None "
@@ -280,9 +401,12 @@ class TokenShardedTP:
                 f"the TP process group ({actual_rank}); a rank's token shard must follow the "
                 "group rank order."
             )
+        if row_align < 1:
+            raise ValueError(f"TokenShardedTP needs row_align >= 1 (got {row_align}).")
         self.group = group
         self.tp_size: int = tp_size
         self.tp_rank: int = actual_rank
+        self.row_align: int = row_align
         # Resolved once here: compiled blocks pass the name string to the functional
         # collectives instead of looking up the group (a compiler-disabled mesh path).
         self.group_name: str = group.group_name
@@ -313,13 +437,16 @@ class TokenShardedTP:
         key = (batch_size, seq_len)
         plan = self._plans.get(key)
         if plan is None:
-            plan = TokenShardPlan.build(batch_size, seq_len, self.tp_size, self.tp_rank)
+            plan = TokenShardPlan.build(
+                batch_size, seq_len, self.tp_size, self.tp_rank, self.row_align
+            )
             self._check_rank_agreement(batch_size, seq_len)
             if plan.is_padded:
                 extra = batch_size * (plan.padded_seq_len - seq_len)
+                aligned = f" into {self.row_align}-row aligned shards" if self.row_align > 1 else ""
                 logger.info_once(
                     f"Token-sharded TP: {batch_size}x{seq_len} tokens do not split evenly "
-                    f"over tp_size={self.tp_size}; padding each sample to "
+                    f"over tp_size={self.tp_size}{aligned}; padding each sample to "
                     f"{plan.padded_seq_len} tokens ({extra} extra rows; adds copies at each "
                     "block boundary).",
                     key=("token_sharded_tp_padding", batch_size, seq_len, self.tp_size),
@@ -416,13 +543,19 @@ class TokenShardedTP:
         p = self.plan
         return t.view(len(p.entry_batch), p.rows_per_entry, *t.shape[1:])
 
-    def gather_input(self, consumer: nn.Module | None, act: Activation) -> Activation:
+    def gather_input(
+        self, consumer: nn.Module | None, act: Activation, *, prequantize: bool = True
+    ) -> Activation:
         """A column projection's input: this rank's rows -> all ``B * S`` real rows.
 
-        ``act`` is ``[n, g, K]`` or ``[m, K]``: bf16, or an :class:`Fp4QuantizedTensor`
-        quantized with ``consumer``'s static scale. A bf16 input is quantized here when
-        ``consumer`` has a static NVFP4 input scale (decided per call: the scale exists only
-        after loading), so the all-gather moves NVFP4.
+        ``act`` is ``[n, g, K]`` or ``[m, K]``: bf16, an :class:`Fp4QuantizedTensor`
+        quantized with ``consumer``'s static scale, or an :class:`Fp8BlockScaledActivation`.
+        A bf16 input is quantized here (decided per call: the quant method is final only
+        after loading) when ``consumer`` has a static NVFP4 input scale, or else when it
+        takes a pre-quantized FP8 block-scale input (:func:`fp8_block_scale_prequant_ok`), so
+        the all-gather moves NVFP4 or FP8 + scales instead of bf16. ``prequantize=False``
+        keeps a bf16 input bf16 on the FP8 path, for a call whose consumer needs the dense
+        input (an active LoRA).
         """
         if isinstance(act, Fp4QuantizedTensor):
             payload = act.fp4_tensor
@@ -433,12 +566,23 @@ class TokenShardedTP:
                 act.unquantized_hidden_states,
                 act.reciprocal_scale,
             )
-        else:
+        elif isinstance(act, Fp8BlockScaledActivation):
+            act = Fp8BlockScaledActivation(act.fp8.reshape(-1, act.fp8.shape[-1]), act.scale)
+        elif isinstance(act, torch.Tensor):
             act = act.reshape(-1, act.shape[-1])
             scale = static_nvfp4_input_scale(consumer)
             if scale is not None:
                 act = quantize_nvfp4(act, scale)
+            elif (
+                prequantize
+                and act.dtype == torch.bfloat16
+                and fp8_block_scale_prequant_ok(consumer)
+            ):
+                act = quantize_fp8_block(act)
+        else:
+            raise self._unsupported_input("gather_input", act)
         self._check_fp4_consumer(consumer, act)
+        self._check_fp8_consumer(consumer, act)
         return self.all_gather(act)
 
     @staticmethod
@@ -454,6 +598,30 @@ class TokenShardedTP:
                 "TokenShardedTP.gather_input: got an NVFP4 activation, but the consuming "
                 "projection has no static NVFP4 input_scale; gather BF16 for it."
             )
+
+    @staticmethod
+    def _check_fp8_consumer(consumer: object, act: Activation) -> None:
+        # Only the DeepGEMM FP8 block-scale Linear takes the (fp8, packed scales) pair; every
+        # other Linear either rejects it or quantizes differently from the gathered bytes.
+        if (
+            isinstance(act, Fp8BlockScaledActivation)
+            and isinstance(consumer, Linear)
+            and not fp8_block_scale_prequant_ok(consumer)
+        ):
+            raise ValueError(
+                "TokenShardedTP.gather_input: got an FP8 block-scale activation, but the "
+                "consuming projection is not an FP8 block-scale Linear on the DeepGEMM path; "
+                "gather BF16 for it."
+            )
+
+    @staticmethod
+    def _unsupported_input(op: str, act: object) -> TypeError:
+        # Linear takes bare (payload, scale) tuples for NVFP4 and FP8 alike; here the FP8 pair
+        # must be typed so that neither is mistaken for the other.
+        return TypeError(
+            f"TokenShardedTP.{op}: expected a tensor, an Fp4QuantizedTensor or an "
+            f"Fp8BlockScaledActivation; got {type(act).__name__}."
+        )
 
     def pad_row_input(self, act: torch.Tensor) -> torch.Tensor:
         """A row projection's input for all tokens -> ``[B * S_pad, K]`` (zero rows per sample).
@@ -526,7 +694,9 @@ class TokenShardedTP:
         """This rank's ``[m, K]`` rows -> all ``[B * S, K]`` rows, padding dropped.
 
         A static-scale :class:`Fp4QuantizedTensor` (payload ``[m, K/2]``, 128x4-swizzled SF for
-        ``m`` rows) is gathered as NVFP4 and returned with its SF regrouped for ``B * S`` rows.
+        ``m`` rows) is gathered as NVFP4 and returned with its SF regrouped for ``B * S`` rows;
+        an :class:`Fp8BlockScaledActivation` (``[m, K]`` fp8 + ``[m, P]`` int32 scales) is
+        gathered as FP8 + scales and returned for ``B * S`` rows with its scales MN-major.
         """
         p = self.plan
         if isinstance(act_loc, Fp4QuantizedTensor):
@@ -536,6 +706,17 @@ class TokenShardedTP:
                 _all_gather_rows(sf, self.group_name), p, k // NVFP4_SF_VEC_SIZE
             )
             return Fp4QuantizedTensor(payload, sf, is_sf_swizzled=True)
+        if isinstance(act_loc, Fp8BlockScaledActivation):
+            fp8, scale = self._check_fp8(act_loc)
+            # Neither gloo nor the functional collectives take float8: move the bytes.
+            payload = _all_gather_rows(fp8.view(torch.uint8), self.group_name)
+            payload = self._drop_padding(payload).view(torch.float8_e4m3fn)
+            # The per-rank scales are MN-major (P columns, tiny): gather them as rows,
+            # drop the per-sample padding like the payload, then re-lay for B * S rows.
+            scale = self._drop_padding(_all_gather_rows(scale, self.group_name))
+            return Fp8BlockScaledActivation(payload, fp8_scales_mn_major(scale))
+        if not isinstance(act_loc, torch.Tensor):
+            raise self._unsupported_input("all_gather", act_loc)
         self._check_local_rows("all_gather", act_loc)
         return self._drop_padding(_all_gather_rows(act_loc, self.group_name))
 
@@ -568,6 +749,24 @@ class TokenShardedTP:
                 f"{a.scaling_factor.numel()} bytes (is_sf_swizzled={a.is_sf_swizzled})."
             )
         return payload, a.scaling_factor.reshape(-1), k
+
+    def _check_fp8(self, a: Fp8BlockScaledActivation) -> tuple[torch.Tensor, torch.Tensor]:
+        m = self.plan.local_rows
+        fp8, scale = a
+        if fp8.dtype != torch.float8_e4m3fn or fp8.dim() != 2 or fp8.shape[0] != m:
+            raise ValueError(
+                f"TokenShardedTP.all_gather: FP8 block-scale payload must be float8_e4m3fn "
+                f"[{m}, K] for the current plan ({self._plan_desc()}); got {fp8.dtype} "
+                f"{tuple(fp8.shape)}."
+            )
+        cols = fp8_scale_cols(fp8.shape[1])
+        if scale.dtype != torch.int32 or tuple(scale.shape) != (m, cols):
+            raise ValueError(
+                f"TokenShardedTP.all_gather: FP8 block scales must be packed UE8M0 int32 "
+                f"[{m}, {cols}] for a [{m}, {fp8.shape[1]}] payload; got {scale.dtype} "
+                f"{tuple(scale.shape)}."
+            )
+        return fp8, scale
 
 
 # =============================================================================
