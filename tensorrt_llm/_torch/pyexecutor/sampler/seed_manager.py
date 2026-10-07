@@ -117,6 +117,22 @@ class _SeedManager:
         consecutive rows). Every row is given a stretch of ``OFFSET_STRIDE``
         offset units that no earlier row of the same stream has used.
         """
+        num_rows = len(slots_per_row)
+        # Calls without a seeded row are the common case; build them on the
+        # device, without a per-row loop or a host-to-device copy.
+        if self._batch_is_draft or not any(map(self._slot_seeded.__getitem__, slots_per_row)):
+            start = self._unseeded_offset
+            self._unseeded_offset += num_rows * self.OFFSET_STRIDE
+            return RequestSeeds(
+                seed=torch.full((num_rows,), self._global_seed, dtype=torch.int64, device=device),
+                offset=torch.arange(
+                    start,
+                    self._unseeded_offset,
+                    self.OFFSET_STRIDE,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            )
         seeds: list[int] = []
         offsets: list[int] = []
         for slot in slots_per_row:

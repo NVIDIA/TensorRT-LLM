@@ -3387,6 +3387,17 @@ class TestRequestSeed:
                 )
                 used.update(stretch)
 
+    def test_unseeded_rows_take_disjoint_stretches(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        device = torch.device("cpu")
+
+        first = manager.take_row_seeds([0, 1, 2], device=device)
+        second = manager.take_row_seeds([2, 3], device=device)
+
+        assert first.seed.tolist() + second.seed.tolist() == [42] * 5
+        stride = _SeedManager.OFFSET_STRIDE
+        assert first.offset.tolist() + second.offset.tolist() == [i * stride for i in range(5)]
+
 
 class TestTopPDecay:
     """Minimal functional guards for Top-P Decay in TorchSampler.
