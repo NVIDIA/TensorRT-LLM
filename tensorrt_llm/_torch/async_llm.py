@@ -93,8 +93,10 @@ class AsyncLLM(LLM):
                 currently parked memory type.
         """
         self._check_runtime_memory_enabled()
-        default_tags = (await self.get_memory_status()).parked_tags
-        normalized = self._normalize_runtime_memory_tags(tags, default_tags=default_tags)
+        status = await self.get_memory_status()
+        if status.state not in ("running", "parked"):
+            raise RuntimeError(f"Cannot resume runtime memory while state is '{status.state}'.")
+        normalized = self._normalize_runtime_memory_tags(tags, default_tags=status.parked_tags)
         if normalized:
             await self.collective_rpc("wakeup", args=([tag.value for tag in normalized],))
 

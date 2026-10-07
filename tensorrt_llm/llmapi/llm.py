@@ -2033,9 +2033,13 @@ class _TorchLLM(BaseLLM):
             None: The call returns after all selected memory has been restored.
         """
         self._check_runtime_memory_enabled()
-        default_tags = self.get_memory_status().parked_tags
+        status = self.get_memory_status()
+        if status.state not in ("running", "parked"):
+            raise RuntimeError(
+                f"Cannot resume runtime memory while state is '{status.state}'."
+            )
         normalized = self._normalize_runtime_memory_tags(
-            tags, default_tags=default_tags)
+            tags, default_tags=status.parked_tags)
         if normalized:
             self._collective_rpc("wakeup",
                                  ([tag.value for tag in normalized], ))
