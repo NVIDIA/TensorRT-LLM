@@ -141,7 +141,7 @@ kv_cache_config:
     periodic_snapshot_interval: 256
 ```
 
-Block reuse stays on only if `mamba_state_config` sets at least one snapshot placement: `periodic_snapshot_interval`, `additional_snapshot_offsets_from_start`, or `additional_snapshot_offsets_from_end`. `enable_branch_snapshot` refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request `num_reused_blocks` metric rather than assuming the submitted setting took effect.
+Block reuse stays on only if `mamba_state_config` sets at least one snapshot placement: `periodic_snapshot_interval`, `additional_snapshot_offsets_from_start`, or `additional_snapshot_offsets_from_end`. `block_reuse_config.enable_branch_snapshot` refines where snapshots land but does not by itself keep reuse enabled. The same settings apply in disaggregated serving; configure them on both workers. A snapshot restores the PLE short-convolution state and n-gram context along with the GDN state, because they share one recurrent page. Check the effective LLM arguments and the per-request `num_reused_blocks` metric rather than assuming the submitted setting took effect.
 
 ### Launch the TensorRT LLM Server
 

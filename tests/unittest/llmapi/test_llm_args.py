@@ -1324,15 +1324,13 @@ def test_KvCacheConfig_requires_v2_for_branch_snapshots():
 def test_KvCacheConfig_keeps_branch_snapshots_under_per_conversation():
     """per_conversation zeroes the periodic interval but not this flag."""
     config = KvCacheConfig(
-        block_reuse_config=BlockReuseConfig(policy="per_conversation"),
-        mamba_state_config=MambaStateConfig(
-            periodic_snapshot_interval=64,
-            enable_branch_snapshot=True,
-        ),
+        block_reuse_config=BlockReuseConfig(policy="per_conversation",
+                                            enable_branch_snapshot=True),
+        mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
 
     assert config.mamba_state_config.periodic_snapshot_interval == 0
-    assert config.mamba_state_config.enable_branch_snapshot is True
+    assert config.block_reuse_config.enable_branch_snapshot is True
 
 
 @pytest.mark.parametrize("interval", [0, 64])
@@ -1361,6 +1359,35 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
     assert any("mamba_state_cache_interval' is deprecated" in message
                for message in warnings_seen)
     assert "mamba_state_cache_interval" not in config.model_dump()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_block_reuse", [True, False])
+def test_KvCacheConfig_migrates_deprecated_mamba_branch_snapshot(
+        monkeypatch, enable_block_reuse: bool) -> None:
+    warnings_seen = []
+    monkeypatch.setattr(llm_args_mod.logger, "warning",
+                        lambda message: warnings_seen.append(message))
+
+    config = KvCacheConfig(
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
+
+    # The old flag had no effect without block reuse, so it is not copied then.
+    assert config.block_reuse_config.enable_branch_snapshot is enable_block_reuse
+    assert any(
+        "mamba_state_config.enable_branch_snapshot' is deprecated" in message
+        for message in warnings_seen)
+    assert "enable_branch_snapshot" not in config.model_dump(
+    )["mamba_state_config"]
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_rejects_conflicting_branch_snapshot_flags() -> None:
+    with pytest.raises(ValidationError, match="Cannot set both"):
+        KvCacheConfig(
+            block_reuse_config=BlockReuseConfig(enable_branch_snapshot=False),
+            mamba_state_config=MambaStateConfig(enable_branch_snapshot=True))
 
 
 @pytest.mark.cpu_only

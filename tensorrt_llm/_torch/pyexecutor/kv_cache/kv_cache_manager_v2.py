@@ -1771,23 +1771,22 @@ class KVCacheManagerV2(BaseResourceManager):
         self._commit_branch_snapshots = (
             block_reuse_config.enable_branch_snapshot and self.enable_block_reuse
         )
+        has_swa_layers = self._commit_branch_snapshots and any(
+            getattr(layer, "sliding_window_size", None) for layer in self.impl.init_config.layers
+        )
         # A paired draft pool caps the target lookup at the common reuse depth,
-        # which hides the fork, so joint reuse records no branch points.
-        if self._commit_branch_snapshots and self.enable_joint_kv_cache_reuse and not self.is_draft:
+        # which hides the fork, so joint reuse records no SWA branch points.
+        if has_swa_layers and self.enable_joint_kv_cache_reuse and not self.is_draft:
             logger.warning(
-                "block_reuse_config.enable_branch_snapshot is not applied with joint "
-                "target/draft KV cache reuse."
+                "block_reuse_config.enable_branch_snapshot is not applied to SWA "
+                "layers with joint target/draft KV cache reuse."
             )
         self._record_branch_snapshots = (
-            self._commit_branch_snapshots
+            has_swa_layers
             and self._can_publish_block_reuse
             and not self.is_draft
             and not self.enable_joint_kv_cache_reuse
             and not self._has_cp_helix
-            and any(
-                getattr(layer, "sliding_window_size", None)
-                for layer in self.impl.init_config.layers
-            )
         )
 
         # With pipeline parallelism, multiple microbatches can be in-flight

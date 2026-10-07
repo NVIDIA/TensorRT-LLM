@@ -868,14 +868,7 @@ def _create_py_executor(
     else:
         ctx_chunk_config = None
 
-    hybrid_linear = is_hybrid_linear(config)
-    if kv_cache_config.block_reuse_config.enable_branch_snapshot and hybrid_linear:
-        logger.warning(
-            "kv_cache_config.block_reuse_config.enable_branch_snapshot is ignored "
-            "for hybrid linear models; use "
-            "kv_cache_config.mamba_state_config.enable_branch_snapshot instead."
-        )
-    if kv_cache_config.enable_block_reuse and hybrid_linear:
+    if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
         ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
