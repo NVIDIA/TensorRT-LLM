@@ -15,6 +15,11 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image_21 import (
     pack_latents,
     unpack_latents,
 )
+from tensorrt_llm._torch.visual_gen.models.qwen_image_21.transformer_qwen_image_21 import (
+    QwenImage21Attention,
+    QwenImage21RMSNorm,
+    QwenImage21ZeroCenterRMSNorm,
+)
 
 
 def test_qwen_image_21_shift_matches_reference_formula():
@@ -77,6 +82,37 @@ def test_qwen_image_21_native_flowmatch_scheduler_matches_reference_equations():
     dt = scheduler.sigmas[1] - scheduler.sigmas[0]
     expected_step = (sample.float() + dt * model_output.float()).half()
     assert torch.equal(out, expected_step)
+
+
+def test_qwen_image_21_attention_qk_norm_uses_regular_rmsnorm():
+    attn = QwenImage21Attention(dim=16, heads=2, dim_head=4)
+
+    assert isinstance(attn.norm_q, QwenImage21RMSNorm)
+    assert isinstance(attn.norm_k, QwenImage21RMSNorm)
+    assert not isinstance(attn.norm_q, QwenImage21ZeroCenterRMSNorm)
+    assert not isinstance(attn.norm_k, QwenImage21ZeroCenterRMSNorm)
+    assert torch.equal(attn.norm_q.weight, torch.ones_like(attn.norm_q.weight))
+    assert torch.equal(attn.norm_k.weight, torch.ones_like(attn.norm_k.weight))
+
+
+def test_qwen_image_21_attention_rmsnorm_is_not_zero_centered():
+    x = torch.tensor(
+        [
+            [[[1.0, -2.0, 3.0, -4.0], [0.25, -0.5, 0.75, -1.0]]],
+            [[[-1.5, 2.5, -3.5, 4.5], [1.25, 0.5, -0.75, -1.5]]],
+        ],
+        dtype=torch.float32,
+    )
+    weight = torch.tensor([0.5, 0.75, 1.25, 1.5], dtype=torch.float32)
+    regular = QwenImage21RMSNorm(4, eps=1e-6)
+    zero_center = QwenImage21ZeroCenterRMSNorm(4, eps=1e-6)
+    with torch.no_grad():
+        regular.weight.copy_(weight)
+        zero_center.weight.copy_(weight)
+
+    expected = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * weight
+    assert torch.allclose(regular(x), expected, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(zero_center(x), expected, atol=1e-6, rtol=1e-6)
 
 
 def test_qwen_image_21_pipeline_runtime_metadata():
