@@ -465,6 +465,7 @@ def _time_dispatch_and_combine(
     flush_l2: bool = True,
     use_cuda_graph: bool = True,
     cupti_ctx: Optional[Any] = None,
+    payload_in_workspace: bool = False,
 ) -> Tuple[List[float], List[float], Dict[str, Any]]:
     """Measure per-iteration dispatch/combine latency with CUDA events, in microseconds.
 
@@ -504,11 +505,18 @@ def _time_dispatch_and_combine(
         token_final_scales,
         all_rank_num_tokens,
     )
-    static_moe_out = torch.zeros(
-        (recv_hidden_states.shape[0], hidden_size),
-        dtype=torch.bfloat16,
-        device=device,
-    )
+    if payload_in_workspace:
+        # A view of the fixed combine input region, as the MoE scheduler passes it, so combine
+        # skips its staging copy. The region's address is fixed, so graph replay stays valid.
+        static_moe_out = backend.get_combine_payload_tensor_in_workspace(
+            max_tokens, hidden_size, torch.bfloat16
+        )
+    else:
+        static_moe_out = torch.zeros(
+            (recv_hidden_states.shape[0], hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        )
     backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
     torch.cuda.synchronize()
 
@@ -787,6 +795,16 @@ def parse_args() -> argparse.Namespace:
         help="Enable low-precision (FP8) MoE combine path.",
     )
     parser.add_argument(
+        "--no_payload_in_workspace",
+        action="store_true",
+        default=False,
+        help=(
+            "Allocate the simulated MoE output outside the workspace, so combine pays its "
+            "staging copy. Backends exposing a combine input region write into it by default, "
+            "as the MoE scheduler does."
+        ),
+    )
+    parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Use eager execution with CUDA event timing instead of CUDA graph replay. Kernel breakdown still uses CUPTI.",
@@ -925,6 +943,7 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "payload_in_workspace": not bool(args.no_payload_in_workspace),
         "cupti_enabled": cupti_ctx is not None,
         "warning": cupti_warning,
     }
@@ -964,7 +983,7 @@ def _run_benchmark_worker_under_current_mpi(
                 num_slots,
                 top_k,
                 experts_per_rank,
-                payload_in_workspace=False,
+                payload_in_workspace=not bool(args.no_payload_in_workspace),
                 alltoall_result_do_sum=True,
                 use_flashinfer=False,
             )
@@ -977,6 +996,15 @@ def _run_benchmark_worker_under_current_mpi(
         except Exception as e:
             _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend_name}: {type(e).__name__}: {e}")
             continue
+
+        # Only NVLinkOneSided exposes a combine input region; time the others with the copy.
+        payload_in_workspace = not bool(args.no_payload_in_workspace)
+        if payload_in_workspace and not hasattr(backend, "get_combine_payload_tensor_in_workspace"):
+            _maybe_warn_rank0(
+                f"[bench_moe_comm] {backend_name} has no combine input region; "
+                "timing it without payload_in_workspace."
+            )
+            payload_in_workspace = False
 
         # Post-quant communication: Quantize → Dispatch (mirrors ConfigurableMoE ordering),
         # using Cutlass' quantize_input() (outside the timed comm region).
@@ -1034,6 +1062,7 @@ def _run_benchmark_worker_under_current_mpi(
                 flush_l2=True,
                 use_cuda_graph=not args.no_cuda_graph,
                 cupti_ctx=cupti_ctx,
+                payload_in_workspace=payload_in_workspace,
             )
 
             iter_stats = bool(args.iter_stats)
@@ -1057,6 +1086,7 @@ def _run_benchmark_worker_under_current_mpi(
             # Prepare output
             output = {
                 "backend": backend_name,
+                "payload_in_workspace": payload_in_workspace,
                 "local_batch_size": int(local_num_tokens),
                 "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
                 "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
