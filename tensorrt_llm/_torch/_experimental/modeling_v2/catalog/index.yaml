@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: 19 entries certified on sm_103, 12 on sm_100 ──────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 18 on sm_100 ──────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -67,10 +67,10 @@
 # device, and rewriting them would manufacture GB300 evidence that does not
 # exist. Read them as provenance; the frontmatter is the certification.
 #
-# The Kimi K3 entries (k3_*, attn_res_*) are certified on sm_100 (B200 /
-# GB200), where their first caller runs, and their tests skip on any other
-# architecture. cublas_mm and flashinfer_rmsnorm, which that caller also
-# uses, keep their sm_103 receipts and add sm_100 ones.
+# The Kimi K3 entries (k3_*, attn_res_* and ssm/kda_decode) are certified on
+# sm_100 (B200 / GB200), where their first caller runs, and their tests skip on
+# any other architecture. cublas_mm and flashinfer_rmsnorm, which that caller
+# also uses, keep their sm_103 receipts and add sm_100 ones.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # 30 of the source catalog's 43 entries are here — the union of what the two
@@ -216,6 +216,35 @@ entries:
   - path: attention/thop_attention.py
     impl: tensorrt_llm.bindings.internal.thop.attention
     summary: "Full attention core with fully explicit state (pybind binding, approved exception): paged KV-cache append + causal/padding-masked GQA FMHA over a caller-owned pool (bf16, or fp8-e4m3 with per-tensor kv scales) and explicit length/offset tensors, written into a caller buffer, on either context execution path (use_paged_context_fmha selects packed-QKV context FMHA, or paged-KV context FMHA so a context call may run over a cached prefix — KV-cache reuse and chunked prefill), with optional per-query-head attention sinks (one extra softmax-denominator logit, dropped from the output) and an optional per-call sliding window (attention_window_size keys ending at the query's absolute position; a pure mask — the append stays at absolute positions, so cyclic pool reuse is the caller's page mapping); MLA mode runs context prefill (in-kernel RoPE + latent append), no-append context over explicit K/V (latent_cache=None: cached-KV prefixes and chunked partial passes with softmax-stats output), and generation latent-MQA decode as separate calls over a paged latent pool (bf16 or fp8-e4m3)"
+
+  # Kimi K3 MLA decode (sm_100). The state type attention/k3_mla_attn_workspace.py is not an entry: it launches nothing
+  # per call.
+  - path: attention/k3_mla_qkv.py
+    impl: torch.ops.trtllm.k3_mla_qkv
+    summary: "Kimi K3's MLA decode query path for at most 64 tokens in one launch (q_a RMSNorm, q_b projection and k_b absorption into fused_q [M, heads x 576]) plus the step's latent KV rows (kv_a RMSNorm, rope columns) stored into the paged latent cache at each token's row; the page table is read before the grid-dependency wait, so under CUDA graphs it must be written before the graph runs; siblings: k3_mla_q (the query path alone) and k3_mla_qkv_out (the cache rows into a dense buffer)"
+
+  - path: attention/k3_mla_attn_vb_out.py
+    impl: torch.ops.trtllm.k3_mla_attn_vb_out
+    summary: "Kimi K3's MLA decode attention of at most 8 requests of at most 8 tokens over the paged latent cache (heads a multiple of 6, causal bottom-right, a request's rows exactly those of its own R = 1 call) with v_b and the optional sigmoid output gate in the same launch, over a caller-owned K3MlaAttnWorkspace: per-CTA partials and the no-cluster mode's arrival counters, one workspace per device and head-group count shared by every layer, its calls one at a time in stream order; siblings: k3_mla_attn_out (the attention output itself) and k3_mla_attn"
+
+  # ─── ssm ───────────────────────────────────────────────────────
+  # KDA (Kimi Delta Attention) decode. The state type ssm/k3_kda_buffers.py is not an entry: it launches nothing per
+  # call. The pools every entry here updates belong to the cache manager (the V2 hybrid manager's per-layer views).
+  - path: ssm/kda_decode.py
+    impl: torch.ops.trtllm.kda_decode
+    summary: "One-token KDA decode of B requests: the causal depthwise conv over each request's conv window, the gated delta rule on its fp32 recurrent state and the gated RMS norm, the state (and the conv window) updated in place at each request's slot of the cache manager's pools; at Kimi K3's rank slice (6 heads, K = V = 128, conv width 4) B <= 5 runs the cluster kernel and 6 <= B <= 24 the legacy compact-heads kernel"
+
+  - path: ssm/k3_kda_attn.py
+    impl: torch.ops.trtllm.k3_kda_attn
+    summary: "Kimi K3's KDA layer for one speculative-decoding request in one launch: the fused input projection of its golden token and 7 drafts and the KDA verify of ssm/k3_kda_verify on it, bit for bit the unfused pair, writing the slot's state, its drafts' records and conv window in place, over a caller-owned K3KdaBuffers (three Lamport buffers and per-CTA indices, one set per device shared with ssm/k3_kda_decode_attn, its launches one at a time in stream order); the head CTAs read the slot's pools before the grid-dependency wait, so a launch must not directly follow another on the same pools; sibling: k3_kda_qkvg (the projection stream alone, a 104-CTA set of its own)"
+
+  - path: ssm/k3_kda_decode_attn.py
+    impl: torch.ops.trtllm.k3_kda_decode_attn
+    summary: "Kimi K3's KDA layer for plain decode of R <= 8 requests in one launch: the fused input projection of one token per request and the one-token KDA decode of ssm/kda_decode on it, the state and conv window updated in place at each request's slot, over the same caller-owned K3KdaBuffers as ssm/k3_kda_attn (either may follow the other on one set); the head CTAs read the slots' pools before the grid-dependency wait"
+
+  - path: ssm/k3_kda_verify.py
+    impl: torch.ops.trtllm.k3_kda_verify
+    summary: "Kimi K3's KDA speculative verify of N requests of 1 + num_spec tokens from the fused projection rows to the gated-norm core output, starting each request from the golden token's state with the drafts the sampler accepted last round replayed from their records (the V2 hybrid manager's kda_state_tok, counted by prev_num_accepted_tokens, read before the grid-dependency wait), and committing the golden token's state and every draft's records for the next round"
 
   # ─── moe ───────────────────────────────────────────────────────
   - path: moe/noaux_tc_op.py
