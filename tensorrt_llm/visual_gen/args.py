@@ -103,6 +103,14 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
+    algorithm: Literal["primsts", "sage", "vc_attention-qk16"] = Field(
+        "sage",
+        status="prototype",
+        description=(
+            "TRTLLM kernel family for the recipe. primsts quantizes per tensor, sage per block, "
+            "vc_attention-qk16 adds the VC-Attention V treatment (both via TLLM_FMHA_LIBS=+prims_ts)."
+        ),
+    )
 
 
 # Discriminated union of sparse attention configs.
@@ -158,6 +166,23 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
             },
         }
+        # PrimTS supports per-tensor FP8 recipes on Blackwell, with or without the VC-Attention V
+        # treatment.
+        PRIMSTS_RECIPES = {
+            100: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+            103: {
+                ("bf16", "fp8", (0, 0, 0)),
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
+        TRTLLM_RECIPES = {
+            "primsts": PRIMSTS_RECIPES,
+            "sage": SAGE_RECIPES,
+            "vc_attention-qk16": PRIMSTS_RECIPES,
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -186,13 +211,23 @@ class AttentionConfig(StrictBaseModel):
             (q_config.q_block_size, q_config.k_block_size, q_config.v_block_size),
         )
         if self.backend == "TRTLLM":
-            recipes = SAGE_RECIPES.get(get_sm_version(), set())
+            recipes = TRTLLM_RECIPES[q_config.algorithm].get(get_sm_version(), set())
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE recipes on this device: "
-                    f"{sorted(recipes)}."
+                    f"for backend='TRTLLM'. Supported {q_config.algorithm} recipes on this "
+                    f"device: {sorted(recipes)}."
                 )
+            if q_config.smooth_k and q_config.algorithm != "sage":
+                raise ValueError(
+                    f"smooth_k is a SageAttention option and does not apply to "
+                    f"algorithm='{q_config.algorithm}'."
+                )
+        elif q_config.algorithm != "sage":
+            raise ValueError(
+                f"algorithm='{q_config.algorithm}' selects a TRTLLM kernel family and requires "
+                f"backend='TRTLLM', got backend='{self.backend}'."
+            )
         elif q_config.smooth_k:
             raise ValueError(
                 f"smooth_k is a SageAttention option and requires backend='TRTLLM', got "
