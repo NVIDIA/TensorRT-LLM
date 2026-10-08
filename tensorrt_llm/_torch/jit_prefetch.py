@@ -16,39 +16,47 @@
 
 Experimental. Enabled by ``TLLM_JIT_PREFETCH=1``.
 
-A kernel variant that warmup never touched compiles synchronously at its first
-launch, on the executor thread, stalling the GPU. This module moves that work
-earlier and off the executor thread:
+A kernel variant that warmup never produced compiles synchronously at its
+first launch, on the executor thread, stalling the GPU. This module compiles
+such variants before the forward pass that launches them, in CPU-only helper
+processes, without launching anything on the GPU and without adding work to
+warmup. Two sources tell it which variants to compile:
 
-1. Once a batch is scheduled, :func:`plan` asks each registered *variant
-   provider* (one per model family; see ``modules/mamba/jit_prefetch.py``)
-   which Triton kernels the batch will launch, and with what arguments. The
-   provider builds those arguments as ``meta`` tensors: same shapes, strides,
-   dtypes and view offsets as the real ones, no storage, no GPU work.
-2. For each call, Triton's own binder turns the arguments into Triton's own
-   cache key, and the key is looked up in the kernel's in-memory cache. This is
-   the "is it compiled?" check, and it is exact by construction: it is the same
-   computation ``JITFunction.run`` does at launch, minus the launch. Nothing is
-   compiled or launched in the calling process.
-3. A miss is serialized with Triton's specialization format (the one
-   ``JITFunction.preload`` consumes) and sent to a CPU-only helper process. The
-   helper calls ``triton.compile``, which writes the cubin to the on-disk
-   Triton cache. The helper has no CUDA context, does not touch the GPU, and
-   does not hold the executor's GIL.
-4. When the real launch arrives, ``triton.compile`` in the executor finds the
-   cubin on disk (milliseconds) instead of compiling it (seconds).
+A. Variant providers (per module; ``modules/mamba/jit_prefetch.py`` for the
+   Mamba2 SSD prefill path). Once a batch is scheduled, a provider replays the
+   module's real Triton launchers on ``meta`` tensors under
+   :func:`shadow_launches`, which records each ``run`` instead of executing
+   it, so the recorded arguments are exactly those of the real launch. On the
+   first plan, a background thread also plans one batch per kernel-signature
+   class the provider can reach within the engine limits. A covers a process
+   that has never run this model before.
 
-Autotuned kernels: the provider resolves the config the autotuner picked (from
-its in-memory cache) and plans that one. If the autotuner has not tuned this
-key yet, choosing a config means benchmarking on the GPU, which this module
-does not do; it compiles every candidate config instead, so the benchmark at
-first launch runs on cached cubins. The benchmark itself still runs at that
-launch, unchanged, and is counted separately in the stats. Which config runs is
-always the autotuner's own choice; this module never selects or reuses one.
+B. Record and replay (any Triton kernel, no per-module code). With
+   ``TLLM_JIT_RECORD_DIR`` set, every variant this process compiles or loads
+   is appended, as Triton's own specialization JSON, to
+   ``jit_record.rank<r>.jsonl`` (via ``jit_post_compile_hook``). The next
+   process hands the whole record to the helpers before its first request.
+   The record header pins the Triton version and GPU target; a mismatching
+   record is discarded.
 
-Measurement hooks (always on when the module is enabled) log every compile and
-every autotune benchmark that happens in the executor after warmup, with its
-wall time, so a run reports how much JIT cost was left on the critical path.
+For every planned or replayed variant, Triton's own binder computes Triton's
+own cache key, which is checked against the kernel's in-memory cache and then
+the on-disk cache (the same lookup ``JITFunction.run`` and ``triton.compile``
+do, minus the launch). Misses go to the helpers, which call ``triton.compile``
+into the on-disk cache, so the real launch loads the cubin in about a
+millisecond. A priority queue orders the work: a variant the executor is
+about to wait on, then the scheduled batch, then the replayed record, then
+provider enumeration. If the executor reaches a variant a helper is still
+compiling, it waits for that compile instead of compiling it a second time.
+
+Autotuned kernels: if the autotuner already picked a config for a key, only
+that config is planned; otherwise every candidate config is compiled, so the
+benchmark at first launch times cached cubins. The benchmark itself runs on
+the GPU, unchanged. Which config runs is always the autotuner's own choice.
+
+Measurement hooks (always on when the module is enabled, or alone with
+``TLLM_JIT_STATS=1``) log every compile and every autotune benchmark that
+still runs on the executor thread after warmup, with its wall time.
 """
 
 from __future__ import annotations
