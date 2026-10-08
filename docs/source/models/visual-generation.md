@@ -38,6 +38,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `Lightricks/LTX-2.3` | Text-to-Video (with Audio), Video-to-Video (with Audio) |
+| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | Text-to-Video (with Audio, 4-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -68,6 +69,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | No | No | Yes |
 | **LTX-2.3** | Yes | Yes | No | No | No | No | Yes | Yes | Yes | Yes | Yes | No | No | No | No | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Layered** | Yes | No | No | Yes | No | No | No | No | Yes | Yes | Yes | No | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | Yes | No | Yes | Yes | Yes | No | No | No | No | No |
@@ -178,6 +180,10 @@ Ulysses requires VANILLA or FA4 attention. CFG, ring, and Attention2D parallelis
 are not supported. See the
 [2-GPU TP config](../../../examples/visual_gen/configs/minimax-h3-bf16-tp2.yaml).
 
+- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+  distilled 4-step checkpoint. TensorRT-LLM currently runs it through the dense
+  MiniMax-H3 attention path; model-specific VSA gate/metadata wiring is not yet
+  implemented for the H3 transformer.
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
   `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.
