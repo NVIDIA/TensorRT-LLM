@@ -81,7 +81,6 @@ def _make_mla_profile_creator() -> KvCacheCreator:
     creator._model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=config),
         attn_runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, chunk_size=8192),
-        use_mrope=False,
     )
     creator._mapping = Mapping()
     creator._max_num_tokens = 8192
@@ -341,7 +340,6 @@ def test_encoder_profiling_uses_full_budget_independent_of_llm_limit(
         input_processor=input_processor,
         encoder_batch_size=4,
         encoder_max_num_tokens=8192,
-        use_mrope=False,
     )
     creator._llm_args = TorchLlmArgs(model="dummy", checkpoint_format="HF")
     creator._profiling_stage_data = {"enable_mm_reqs": True}

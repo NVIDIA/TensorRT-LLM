@@ -801,7 +801,7 @@ def _create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    sparse_attention_config = model_engine.sparse_attention_config
+    sparse_attention_config = model_engine.model.model_config.sparse_attention_config
 
     # Resolve this before cache reuse and cache manager selection consume it.
     resolve_cache_transceiver_config(cache_transceiver_config)

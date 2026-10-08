@@ -124,8 +124,7 @@ def _make_mock_model_engine(model_config):
     """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
-    engine.dtype = torch.bfloat16
-    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.model.config.torch_dtype = torch.bfloat16
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     return engine
 
@@ -443,7 +442,6 @@ class TestCrossKvCacheConstruction:
         )
         creator._skip_est = False
         creator._execution_stream = _FakeCudaStream()
-        creator._model_engine.is_multimodal = False
         creator._model_engine._max_cuda_graph_batch_size = None
 
         distributed = Mock()

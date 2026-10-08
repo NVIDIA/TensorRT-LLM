@@ -1013,7 +1013,6 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.moe_load_balancer = None
         model_engine._metrics = {}
         model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -1033,7 +1032,6 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         runner = model_engine._runner
         runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
@@ -1063,7 +1061,6 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine._metrics = warmup._metrics = {}
         model_engine.moe_load_balancer = None
         model_engine.is_warmup = False
-        model_engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         model_engine._runner = runner
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None

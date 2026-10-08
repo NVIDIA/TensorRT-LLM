@@ -177,14 +177,14 @@ class _DummyModelEngine:
         self.metrics = {}
         self.max_seq_len = max_seq_len
         self.max_num_tokens = 128
-        self.sparse_attention_config = (
+        sparse_attention_config = (
             SimpleNamespace(algorithm=sparse_algorithm) if sparse_algorithm is not None else None
         )
         self.attn_metadata = None
         self.model = SimpleNamespace(
             model_config=SimpleNamespace(
                 attn_backend=attn_backend,
-                sparse_attention_config=self.sparse_attention_config,
+                sparse_attention_config=sparse_attention_config,
                 enable_flash_mla=enable_flash_mla,
                 is_generation=True,
                 is_encoder_decoder=False,

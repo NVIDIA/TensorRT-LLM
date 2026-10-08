@@ -25,8 +25,8 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     _save_spec_decode_capture_state)
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
-from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
-    setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
+    is_multimodal, setup_mm_encoder_attn_metadata)
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (
     DecoderCudaGraphs, _make_single_token_context_graph_batch)
@@ -2011,7 +2011,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=False)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         with self.assertRaisesRegex(ValueError, "multimodal models"):
             engine._validate_breakable_cuda_graph_compatibility()
 
@@ -2024,7 +2024,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=False)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
 
     def test_breakable_allows_multimodal_wrapper_in_text_only_mode(
@@ -2038,7 +2038,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
             disable_mm_encoder=True)
 
-        self.assertTrue(engine.is_multimodal)
+        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
         engine._validate_breakable_cuda_graph_compatibility()
 
     def test_build_request_multimodal_input_skips_when_cache_disabled(
