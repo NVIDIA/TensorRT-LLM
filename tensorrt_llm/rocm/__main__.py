@@ -12,11 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+from .cli import main
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
-
-__all__ = ["LLM"]
+if __name__ == "__main__":
+    main()

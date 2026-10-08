@@ -12,11 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""Standalone ROCm tests: invoke pytest with --confcutdir=tests/rocm."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+import os
 
-__all__ = ["LLM"]
+os.environ["TRTLLM_BACKEND"] = "rocm"
+os.environ["TRTLLM_NO_USAGE_STATS"] = "1"
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+from tensorrt_llm.rocm.llm import LLM  # noqa: E402
+from tensorrt_llm.rocm.validation import tiny_model_and_tokenizer  # noqa: E402
+
+# Keep the tiny CPU fixtures fast and deterministic on shared CI hosts.
+torch.set_num_threads(1)
+
+
+@pytest.fixture
+def engine():
+    model, tokenizer = tiny_model_and_tokenizer()
+    with LLM(model, tokenizer, device="cpu", dtype="float32", max_batch_size=2) as instance:
+        yield instance

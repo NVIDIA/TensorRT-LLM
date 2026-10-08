@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: ROCm portable backend
+on:
+  push:
+    paths:
+      - 'tensorrt_llm/rocm/**'
+      - 'tensorrt_llm/commands/dispatch.py'
+      - 'tensorrt_llm/__init__.py'
+      - 'tensorrt_llm/_bootstrap.py'
+      - 'tensorrt_llm/_backend.py'
+      - 'tensorrt_llm/_config.py'
+      - 'tensorrt_llm/_torch/__init__.py'
+      - 'tensorrt_llm/llmapi/__init__.py'
+      - 'tensorrt_llm/llmapi/utils.py'
+      - 'tensorrt_llm/profiler.py'
+      - 'trtllm_profile/**'
+      - 'scripts/profile.py'
+      - 'examples/rocm/**'
+      - 'tests/rocm/**'
+      - 'tests/integration/test_lists/test-db/l0_rdna4_cpu.yml'
+      - 'requirements-rocm.txt'
+      - 'setup.py'
+      - '.github/workflows/rocm.yml'
+  pull_request:
+    paths:
+      - 'tensorrt_llm/rocm/**'
+      - 'tensorrt_llm/__init__.py'
+      - 'tensorrt_llm/_bootstrap.py'
+      - 'tensorrt_llm/_backend.py'
+      - 'tensorrt_llm/_config.py'
+      - 'tensorrt_llm/_torch/__init__.py'
+      - 'tensorrt_llm/llmapi/__init__.py'
+      - 'tensorrt_llm/llmapi/utils.py'
+      - 'tensorrt_llm/profiler.py'
+      - 'tensorrt_llm/commands/dispatch.py'
+      - 'trtllm_profile/**'
+      - 'scripts/profile.py'
+      - 'examples/rocm/**'
+      - 'tests/rocm/**'
+      - 'tests/integration/test_lists/test-db/l0_rdna4_cpu.yml'
+      - 'requirements-rocm.txt'
+      - 'setup.py'
+      - '.github/workflows/rocm.yml'
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run native HIP parity on a preconfigured self-hosted RDNA4 runner
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TRTLLM_BACKEND: rocm
+      TRTLLM_BUILD_BACKEND: rocm
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install CPU reference environment
+        run: |
+          python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-rocm.txt pytest httpx build ruff
+          python -m pip install --no-deps -e .
+      - name: Test the registered portable suite
+        run: |
+          python - <<'PY'
+          import subprocess, sys, yaml
+          path = 'tests/integration/test_lists/test-db/l0_rdna4_cpu.yml'
+          groups = yaml.safe_load(open(path))['l0_rdna4_cpu']
+          tests = ['tests/' + test for group in groups for test in group['tests']]
+          subprocess.run([sys.executable, '-m', 'pytest', '--confcutdir=tests/rocm', *tests, '-q'], check=True)
+          PY
+      - name: Check modern source style
+        run: |
+          ruff check trtllm_profile tensorrt_llm/rocm tensorrt_llm/_backend.py tensorrt_llm/_config.py tensorrt_llm/commands/dispatch.py scripts/profile.py examples/rocm tests/rocm
+          ruff format --check trtllm_profile tensorrt_llm/rocm tensorrt_llm/_backend.py tensorrt_llm/_config.py tensorrt_llm/commands/dispatch.py scripts/profile.py examples/rocm tests/rocm
+      - name: Check pure-Python wheel packaging
+        run: python -m build --wheel --outdir dist/rocm
+  rdna4:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: [self-hosted, Linux, rdna4]
+    timeout-minutes: 30
+    env:
+      TRTLLM_BACKEND: rocm
+      TRTLLM_BUILD_BACKEND: rocm
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Prepare environment without replacing the runner's ROCm PyTorch
+        run: |
+          python3 -m venv .venv --system-site-packages
+          .venv/bin/python -m pip install -r requirements-rocm.txt pytest
+          .venv/bin/python -m pip install --no-deps -e .
+          .venv/bin/trtllm-rdna4 doctor
+      - name: Execute native HIP parity and current-stream tests
+        run: .venv/bin/python -m pytest tests/rocm/test_hip.py --confcutdir=tests/rocm -q

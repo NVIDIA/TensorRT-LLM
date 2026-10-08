@@ -12,11 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""Opt-in profiling independent of TensorRT, CUDA bindings, and PyTorch installation."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+from .session import Profiler, active_session, component, enable_from_argv, trace_active
 
-__all__ = ["LLM"]
+__all__ = ["Profiler", "active_session", "component", "enable_from_argv", "trace_active"]

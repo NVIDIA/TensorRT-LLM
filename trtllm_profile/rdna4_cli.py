@@ -12,11 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""Select ROCm before importing the product, including for CPU-side doctor diagnostics."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+import os
 
-__all__ = ["LLM"]
+
+def main() -> None:
+    if os.environ.get("TRTLLM_BACKEND", "auto").lower() not in ("auto", "rocm"):
+        raise SystemExit("trtllm-rdna4 requires the ROCm backend; use TRTLLM_BACKEND=rocm or auto")
+    os.environ["TRTLLM_BACKEND"] = "rocm"
+    from tensorrt_llm.rocm.cli import main as run
+
+    run()
+
+
+__all__ = ["main"]

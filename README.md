@@ -1,3 +1,20 @@
+## RDNA4 / ROCm fork
+
+This fork adds a separate Linux **gfx1200/gfx1201 ROCm backend**, ISA-aware wave32 HIP
+kernels, and opt-in `--profile` reports with component/per-file timings and
+**CPU, RAM, GPU and VRAM utilization**.
+
+**[ROCm installation, support matrix, profiling and local validation](docs/source/rocm-rdna4.md)**
+
+Install RDNA4-compatible HIP PyTorch first, then use
+`TRTLLM_BUILD_BACKEND=rocm pip install --no-deps -e .`. Run `trtllm-rdna4 doctor`.
+Native HIP compilation and GPU correctness remain to be qualified on the target
+machine. This is not a port of NVIDIA TensorRT plans/plugins or all upstream advanced
+features; unsupported capabilities are explicit. The documentation/badges below
+refer to the retained upstream NVIDIA backend, not ROCm requirements.
+
+---
+
 <div align="center">
 
 TensorRT LLM

@@ -14,23 +14,16 @@
 # limitations under the License.
 """Package bootstrap mechanics for ``tensorrt_llm``.
 
-Two phases, in this order, both driven from ``tensorrt_llm/__init__.py``:
+Initialization is driven from ``tensorrt_llm/__init__.py``:
 
-1. :func:`_prepare_environment` -- process environment defaults, DLL search
-   path, Python-library preload and vendored ``triton_kernels`` precedence.  It
-   must run *before* ``torch`` and before any TensorRT-LLM shared object is
-   loaded.
-2. :func:`_init` -- custom-op library loading and MPI initialization.  It runs
-   after the package's own imports have completed.
+1. :func:`_prepare_environment` sets process defaults before importing PyTorch.
+2. PyTorch's build metadata selects the CUDA or ROCm execution path without
+   initializing a device.
+3. Only CUDA calls :func:`_prepare_native_environment` for TensorRT library
+   preparation, followed by :func:`_init` for custom ops and MPI.
 
-Module scope here is deliberately limited to the standard library.  ``__init__``
-imports this module ahead of ``import torch``, so anything imported at module
-scope would be pulled in before phase 1 has run -- including ``torch`` itself,
-which is exactly what phase 1 exists to prepare for.  Phase 2's imports are
-therefore inside :func:`_init`; by the time it is called ``torch``,
-``tensorrt_llm.bindings``, ``tensorrt_llm._utils`` and ``tensorrt_llm.logger``
-are already in ``sys.modules``, so this defers the *statement* and not the first
-import of any module.
+Module scope deliberately uses only the standard library. ROCm imports never
+preload native TensorRT libraries, import MPI bindings, or load NVIDIA kernels.
 """
 
 import os
@@ -118,8 +111,16 @@ def _setup_vendored_triton_kernels():
 
 
 def _prepare_environment() -> None:
-    """Phase 1: environment and library preparation, before the Torch import."""
+    """Set backend-independent environment defaults before importing PyTorch."""
     _set_numexpr_thread_default()
+
+
+def _prepare_native_environment() -> None:
+    """Prepare only NVIDIA libraries after PyTorch has identified its backend.
+
+    ROCm does not need TensorRT DLL paths, a shared libpython, or vendored NVIDIA
+    Triton kernels. CUDA calls this before any TensorRT-LLM shared object loads.
+    """
     _add_trt_llm_dll_directory()
     _preload_python_lib()
     _setup_vendored_triton_kernels()

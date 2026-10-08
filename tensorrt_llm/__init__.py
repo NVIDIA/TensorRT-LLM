@@ -19,12 +19,16 @@
 # replace it. The bootstrap mechanics live in `_bootstrap.py`, which keeps its
 # module scope to the standard library so that importing it here cannot pull in
 # torch ahead of the environment preparation it performs.
+# Bootstrap intentionally runs before CUDA/HIP-dependent imports.
+# ruff: noqa: E402
+
 import sys
 
-from ._bootstrap import _init, _prepare_environment
+from ._bootstrap import (_init, _prepare_environment,
+                         _prepare_native_environment)
 
-# Phase 1: DLL search path, Python-library preload and vendored triton_kernels
-# precedence. Must run before torch and before any TensorRT-LLM shared object.
+# Backend-independent defaults must precede PyTorch. NVIDIA library preparation
+# is deferred until its build identifies the backend, before loading native ops.
 _prepare_environment()
 
 # The package's public surface is loaded lazily (PEP 562): importing
@@ -41,8 +45,17 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
+from ._backend import select_backend
 from .logger import logger
 from .version import __version__
+from trtllm_profile import enable_from_argv
+
+_BACKEND = select_backend(torch.version.hip)
+if _BACKEND == "cuda":
+    _prepare_native_environment()
+# Consume the opt-in flag before individual scripts parse their application args.
+# Disabled runs create neither a tracing mode nor a telemetry thread.
+enable_from_argv()
 
 if TYPE_CHECKING:
     import tensorrt_llm._torch.models as torch_models
@@ -109,7 +122,15 @@ _LAZY_ATTRS = {
 }
 
 
+if _BACKEND == "rocm":
+    _LAZY_ATTRS['LLM'] = ('tensorrt_llm.rocm', 'LLM')
+    _LAZY_ATTRS['SamplingParams'] = ('tensorrt_llm.rocm', 'SamplingParams')
+
+
 def __getattr__(name):
+    if _BACKEND == "rocm" and name in _LAZY_ATTRS and name not in ('LLM', 'SamplingParams'):
+        raise NotImplementedError(
+            f"{name} is NVIDIA-only in this checkout. See docs/source/installation/rdna4.md for the ROCm support matrix.")
     entry = _LAZY_ATTRS.get(name)
     if entry is not None:
         module_name, attr = entry
@@ -176,8 +197,12 @@ __all__ = [
     '__version__',
 ]
 
-_init()
+if _BACKEND == "cuda":
+    _init()
+else:
+    # Do not import bindings, TensorRT, MPI, NVML, FlashInfer, or CUDA custom ops.
+    __all__ = ['LLM', 'SamplingParams', 'logger', '__version__']
 
-print(f"[TensorRT-LLM] TensorRT LLM version: {__version__}")
+print(f"[TensorRT-LLM] TensorRT LLM version: {__version__} (backend: {_BACKEND})")
 
 sys.stdout.flush()

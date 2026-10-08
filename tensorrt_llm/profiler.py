@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -37,7 +37,7 @@ if psutil is None:
         "first, e.g, 'pip install psutil'."
     )
 
-if pynvml is None:
+if pynvml is None and not torch.version.hip:
     logger.warning(
         "A required package 'pynvml' is not installed. Will not "
         "monitor the device memory usages. Please install the package "
@@ -144,6 +144,15 @@ def host_memory_info(pid: Optional[int] = None) -> Tuple[int, int, int]:
 
 
 def device_memory_info(device: Optional[Union[torch.device, int]] = None) -> Tuple[int, int, int]:
+    if torch.version.hip:
+        if not torch.cuda.is_available():
+            return 0, 0, 0
+        if isinstance(device, torch.device) and device.type == "cpu":
+            return 0, 0, 0
+        index = device.index if isinstance(device, torch.device) else device
+        index = torch.cuda.current_device() if index is None else index
+        free_mem, total_mem = torch.cuda.mem_get_info(index)
+        return total_mem - free_mem, free_mem, total_mem
     if pynvml is not None:
         if device is None:
             device = torch.cuda.current_device()

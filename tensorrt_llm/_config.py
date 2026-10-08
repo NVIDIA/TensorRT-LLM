@@ -12,11 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""Backend-independent configuration base; no CUDA bindings are imported here."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+from pydantic import BaseModel, ConfigDict
 
-__all__ = ["LLM"]
+
+class StrictBaseModel(BaseModel):
+    """A configuration model that rejects unknown fields."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+__all__ = ["StrictBaseModel"]

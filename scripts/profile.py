@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -12,11 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""Repository-local entry point for the universal --profile launcher."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+import sys
+from pathlib import Path
 
-__all__ = ["LLM"]
+# cProfile imports the standard-library module named 'profile'. Do not let
+# this launcher shadow it through Python's initial script-directory entry.
+_script_directory = Path(__file__).resolve().parent
+sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != _script_directory]
+sys.path.insert(0, str(_script_directory.parent))
+
+from trtllm_profile.__main__ import main  # noqa: E402
+
+if __name__ == "__main__":
+    main()

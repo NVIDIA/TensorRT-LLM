@@ -18,6 +18,7 @@ Welcome to TensorRT LLM's Documentation!
    quick-start-guide.md
    installation/index.rst
    supported-hardware.md
+   rocm-rdna4.md
 
 
 .. toctree::

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Standalone portable suite, consumed by .github/workflows/rocm.yml.
+# --confcutdir is required: upstream pytest plugins depend on CUDA/MPI bindings.
+version: 0.0.1
+l0_rdna4_cpu:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 0
+        lte: 0
+    terms:
+      backend: rocm
+  tests:
+  - rocm/test_runtime.py
+  - rocm/test_llm.py
+  - rocm/test_ops.py
+  - rocm/test_hip.py
+  - rocm/test_attention.py
+  - rocm/test_profile.py
+  - rocm/test_server.py
+  - rocm/test_cli.py

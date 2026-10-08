@@ -130,3 +130,7 @@ examples/kimi_k3/.eval_dflash_runtime.*.yaml
 
 # Media a VisualGen server generates, when it is started from the checkout
 trtllm_generated/
+
+# Local ROCm correctness/performance runs and downloaded development references
+/profiles/
+/.cache/

@@ -12,11 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .. import _BACKEND
+"""ROCm/RDNA4 inference API; heavyweight model imports remain lazy."""
 
-if _BACKEND == "rocm":
-    from ..rocm import LLM
-else:
-    from .llm import LLM
+import importlib
 
-__all__ = ["LLM"]
+from .sampling import CompletionOutput, RequestOutput, SamplingParams
+
+__all__ = ["LLM", "SamplingParams", "CompletionOutput", "RequestOutput"]
+
+
+def __getattr__(name: str):
+    if name == "LLM":
+        value = importlib.import_module(".llm", __name__).LLM
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
