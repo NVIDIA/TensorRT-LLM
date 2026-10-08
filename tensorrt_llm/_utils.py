@@ -1336,6 +1336,59 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+# Set by TLLM_DEBUG_MODE=1, and for every unit test by a fixture: a copy that
+# copy_to_device_if_changed skips first checks that the buffer holds the values.
+_verify_skipped_device_copies = os.environ.get("TLLM_DEBUG_MODE",
+                                               "")[0:1] == "1"
+
+
+def _assert_device_holds(dst: torch.Tensor, flat: torch.Tensor) -> None:
+    """Assert that the leading elements of ``dst`` hold ``flat`` once all queued
+    work has finished."""
+    if dst.is_cuda:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        torch.cuda.synchronize(dst.device)
+    held = dst.view(-1)[:flat.numel()].cpu()
+    assert torch.equal(held, flat.to(held.dtype)), (
+        "copy_to_device_if_changed skipped a copy, but the buffer holds "
+        f"{held.tolist()} instead of {flat.tolist()}: something else wrote it")
+
+
+def copy_to_device_if_changed(dst: torch.Tensor, host: torch.Tensor) -> None:
+    """Copy ``host`` into the leading elements of the device buffer ``dst``
+    unless they already hold it.
+
+    ``dst`` is the whole buffer (not a slice), and the values it last received
+    are kept on it, so a reallocated buffer starts over. Only for per-step
+    metadata buffers that nothing else writes: a decode step whose batch is
+    unchanged then enqueues no copy. "Nothing else" includes other tensor
+    objects over the same memory, such as the views a shared buffer pool hands
+    to each metadata object. The copy itself goes through fresh pinned staging,
+    so ``host`` may be reused right away.
+
+    With ``TLLM_DEBUG_MODE=1`` a skipped copy reads ``dst`` back (a device
+    synchronization) and asserts that it holds ``host``, which catches a write
+    by anything else.
+    """
+    flat = host.reshape(-1)
+    n = flat.numel()
+    last = getattr(dst, "_last_host_values", None)
+    if last is not None and last.numel() >= n and torch.equal(last[:n], flat):
+        if _verify_skipped_device_copies:
+            _assert_device_holds(dst, flat)
+        return
+    staging = torch.empty_like(flat, device="cpu", pin_memory=prefer_pinned())
+    staging.copy_(flat)
+    dst.view(-1)[:n].copy_(staging, non_blocking=True)
+    if last is None or last.numel() <= n:
+        dst._last_host_values = flat.clone()
+    else:
+        last = last.clone()
+        last[:n] = flat
+        dst._last_host_values = last
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a

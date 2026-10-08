@@ -44,8 +44,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
-                                 nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
+                                 copy_to_device_if_changed, nvtx_range,
+                                 prefer_pinned, torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1471,10 +1471,8 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if n > 0:
             self._dummy_request_mask_host[:n].copy_(
                 torch.tensor(is_dummy, dtype=torch.bool))
-        mask_staging = torch.empty_like(self._dummy_request_mask_host,
-                                        pin_memory=prefer_pinned())
-        mask_staging.copy_(self._dummy_request_mask_host)
-        self._dummy_request_mask.copy_(mask_staging, non_blocking=True)
+        copy_to_device_if_changed(self._dummy_request_mask,
+                                  self._dummy_request_mask_host)
 
     def _reset_context_mamba_slots(self, num_contexts: int) -> None:
         if num_contexts == 0:
@@ -2955,6 +2953,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                                                   device):
             return
 
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self._dummy_request_mask = torch.zeros(self.max_batch_size,
                                                dtype=torch.bool,
                                                device=device)
@@ -3245,6 +3245,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         state_index_capacity = (self.max_batch_size +
                                 self._num_reserved_dummy_slots)
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self.cuda_state_indices = torch.zeros([state_index_capacity],
                                               dtype=torch.int32,
                                               device="cuda")
@@ -4174,6 +4176,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         mask_capacity = self._host_state_indices.shape[0]
+        # Only copy_to_device_if_changed writes this buffer: it skips values
+        # it already copied here, so another write would leave stale values.
         self._dummy_request_mask = torch.zeros(mask_capacity,
                                                dtype=torch.bool,
                                                device=device)
@@ -4498,10 +4502,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                         f"request {req.py_request_id}")
                 self._host_state_indices[i] = base_index
 
-        idx_staging = torch.empty_like(self._host_state_indices,
-                                       pin_memory=prefer_pinned())
-        idx_staging.copy_(self._host_state_indices)
-        self.cuda_state_indices.copy_(idx_staging, non_blocking=True)
+        copy_to_device_if_changed(self.cuda_state_indices,
+                                  self._host_state_indices)
         is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(is_dummy)
         state_values = self._host_state_indices[:n].tolist()
