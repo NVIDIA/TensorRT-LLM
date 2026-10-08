@@ -1200,7 +1200,8 @@
         "nano-v3",
         "gemma4",
         "kimi_k2",
-        "kimi_k25"
+        "kimi_k25",
+        "k-exaone"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",

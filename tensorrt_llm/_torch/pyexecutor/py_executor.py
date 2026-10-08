@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import atexit
 import dataclasses
 import datetime
 import math
@@ -103,7 +104,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID, ExecutorRequest,
                           is_multimodal_encoder_ready)
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
-from .pp_utils import PPCommTag
+from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
+                       make_mpi_progress_exit_hook, make_mpi_progress_pump)
 from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
 from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -1085,6 +1087,13 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
         self._broadcast_mpi_comm = None
+        # Idle-time MPI progress pump for the sample-state relay thread, built
+        # by start_worker(); see pp_utils.make_mpi_progress_pump. The stop
+        # Event retires the pump and the quiesced Event acknowledges that the
+        # relay thread will issue no further MPI call.
+        self._pp_mpi_progress: Optional[MpiProgressPump] = None
+        self._pp_mpi_progress_stop = threading.Event()
+        self._pp_mpi_progress_quiesced = threading.Event()
         # Secondary MPI communicator and listener thread for multi-rank
         # sleep/wakeup control messages.  Both are None until start_worker()
         # calls Dup() (a collective) on the main thread.
@@ -1486,6 +1495,28 @@ class PyExecutor:
                         "Create new MPI comm for broadcast sample state thread to avoid deadlock."
                     )
                     self._broadcast_mpi_comm = mpi_comm().Dup()
+                    # Build the idle-time MPI progress pump on the main thread
+                    # and hand it the relay thread's own communicator, never
+                    # the executor thread's.
+                    assert self._broadcast_mpi_comm is not None
+                    assert self._broadcast_mpi_comm is not mpi_comm()
+                    # Fresh Events rather than clear(): an executor may be
+                    # started again after shutdown(), and a flag left set by
+                    # the previous run would disarm the new pump.
+                    self._pp_mpi_progress_stop = threading.Event()
+                    self._pp_mpi_progress_quiesced = threading.Event()
+                    self._pp_mpi_progress = make_mpi_progress_pump(
+                        self._broadcast_mpi_comm, self._pp_mpi_progress_stop,
+                        self._pp_mpi_progress_quiesced)
+                    if self._pp_mpi_progress is not None:
+                        # Retire the pump before MPI_Finalize on exit paths
+                        # that never reach shutdown(). The hook must not hold
+                        # a reference to self.
+                        atexit.register(
+                            make_mpi_progress_exit_hook(
+                                self._pp_mpi_progress_stop,
+                                self._pp_mpi_progress_quiesced,
+                                self._pp_mpi_progress[1]))
                     broadcast_sample_state_loop = self._broadcast_sample_state_loop
                     if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
                         broadcast_sample_state_loop = trace_func(
@@ -1774,13 +1805,22 @@ class PyExecutor:
             # Since the whole process will shutdown after this `shutdown` call,
             # All threads and memory pools will be freed properly.
             logger.error("Hang detected, shutting down immediately.")
+            # Stop the relay thread from probing while the hang detector
+            # aborts MPI. A probe already in flight is not interrupted.
+            self._pp_mpi_progress_stop.set()
             return
         self.worker_thread.join()
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.shutdown()
         if self.dist.pp_size > 1:
+            # The worker thread has exited, so no PP traffic needs progress.
+            self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
+            # The relay thread exits through the sentinel without another
+            # pump tick, so acknowledge the quiesce here; otherwise the exit
+            # hook would wait out its full timeout.
+            self._pp_mpi_progress_quiesced.set()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
         # after the worker thread has joined, which guarantees that the non-rank-0
         # executor loops have already processed the shutdown broadcast and are
@@ -3248,7 +3288,9 @@ class PyExecutor:
         set_thread_local_mpi_comm(broadcast_mpi_comm)
         try:
             while True:
-                executed_batch = self.executed_batch_queue.get()
+                executed_batch = get_with_mpi_progress(
+                    self.executed_batch_queue, self._pp_mpi_progress,
+                    self._pp_mpi_progress_stop)
                 if executed_batch is None:
                     break
                 self._ring_broadcast_sample_state(executed_batch)
@@ -4832,9 +4874,18 @@ class PyExecutor:
     def _can_pause_for_rebalance(self) -> bool:
         """Gate KV pool rebalance to the cases the hook supports.
 
-        Scope: no in-flight disagg transfer, no KV connector, no beam search,
-        no drafter, not during warmup or shutdown.  Honors the
-        ``enable_kv_pool_rebalance`` opt-in flag (default off).
+        Scope: no in-flight disagg transfer, no KV connector, no drafter, not
+        during warmup or shutdown. Honors the ``enable_kv_pool_rebalance``
+        opt-in flag (default off).
+
+        Beam search *is* supported.  It needs no special handling on this side:
+        ``KvCache::suspend`` / ``resume`` walk every beam already
+        (``_activePages`` iterates ``block.pages.size()``), ``adjust()`` moves
+        pages without touching beam width, and the CUDA-graph padding dummies
+        are created at ``max_beam_width``.  What did have to change is the
+        target the tuner converges to -- ``ratioFromLength`` now models the
+        shared prompt prefix and the per-beam tail separately, so the ratio it
+        aims at is no longer skewed by beam width.
 
         Pipeline parallelism *is* supported, but not in the same shape as the
         other two loops.  ``_executor_loop`` and ``_executor_loop_overlap``
@@ -4871,8 +4922,6 @@ class PyExecutor:
         if self.is_warmup:
             return False
         if self.is_shutdown:
-            return False
-        if self.kv_cache_manager.max_beam_width > 1:
             return False
         if self.drafter is not None:
             return False
