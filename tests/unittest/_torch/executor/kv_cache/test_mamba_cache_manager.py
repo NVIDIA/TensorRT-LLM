@@ -3963,6 +3963,7 @@ def test_v2_kda_token_states_reserve_the_slots_the_runtime_keeps():
     )
     assert quota - built.cache_tiers[0].quota == reserved
 
+
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     mgr = object.__new__(MambaCacheManager)
     mgr._impl = SimpleNamespace(use_kda_replay_update=True)
