@@ -96,7 +96,12 @@ def attach_generate_route(app: FastAPI, server: Any) -> None:
         except RenderRequestError as error:
             return error_response(error)
         if body.kind == "chat":
-            return await server.openai_chat(request, raw_request)
+            # The route a worker serves chat on: a Harmony (gpt-oss) worker's chat route
+            # parses channels and tool calls out of the token stream.
+            chat_route = (
+                server.chat_harmony if getattr(server, "use_harmony", False) else server.openai_chat
+            )
+            return await chat_route(request, raw_request)
         return await server.openai_completion(request, raw_request)
 
     app.add_api_route(GENERATE_PATH, generate, methods=["POST"])
