@@ -365,7 +365,9 @@ def test_qwen35_mapper_dequantizes_lm_head_nvfp4_by_scale_shape(group_size: int)
         )
 
 
-def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
+def test_qwen35_dense_vl_normalizes_fp8_mlp_paths() -> None:
+    # The weight mapper moves every dense MLP tensor onto the _DenseMlpAdapter
+    # path, so an FP8 per-layer entry must follow it; only the algorithm is kept.
     name = "model.language_model.layers.0.mlp.gate_proj"
     model_config = SimpleNamespace(
         pretrained_config=SimpleNamespace(num_hidden_layers=64),
@@ -375,7 +377,7 @@ def test_qwen35_dense_vl_leaves_fp8_mlp_paths_unchanged() -> None:
     _normalize_qwen35_quant_config_dict(model_config)
 
     assert model_config.quant_config_dict == {
-        "model.layers.0.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
+        "model.layers.0.mlp.mlp.gate_proj": QuantConfig(quant_algo=QuantAlgo.FP8)
     }
 
 
