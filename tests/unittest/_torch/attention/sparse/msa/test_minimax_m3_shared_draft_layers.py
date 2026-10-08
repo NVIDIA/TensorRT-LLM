@@ -95,8 +95,6 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         # Fill two logical request rows; no context scratch is active.
         for row, slot in enumerate((2, 5)):
             manager.host_kv_cache_block_offsets[:, row].fill_(slot)
-        # Nothing reads the hybrid target's own block offsets, so it has no
-        # attention-op pools to fill and no per-layer copy staging.
         assert manager.num_attention_op_pools == 0
         assert not hasattr(manager, "_device_attention_op_block_offsets_staging")
 
@@ -260,7 +258,6 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     plain.copy_batch_block_offsets(dst, [7], 1, 0, 1)
     assert calls == [("base", [7], 1, None)]
 
-    # Hybrid NVFP4 has no attention-op pools: nothing is copied.
     calls.clear()
     hybrid = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     hybrid.num_attention_op_pools = 0
@@ -299,7 +296,6 @@ def test_per_layer_page_tables_get_no_virtual_pools(monkeypatch, dtype, swa_scra
 
     assert torch.equal(manager.kv_cache_pool_pointers, pointers)
     assert torch.equal(manager.kv_cache_pool_mapping, mapping)
-    # A hybrid NVFP4 cache exposes no attention-op pools.
     assert manager.num_attention_op_pools == (0 if dtype == DataType.NVFP4 else 61)
     assert manager._draft_op_pools == ()
     expected_extra_pages = {128} if dtype == DataType.FP8 else set()

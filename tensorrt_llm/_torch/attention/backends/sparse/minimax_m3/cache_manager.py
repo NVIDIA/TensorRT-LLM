@@ -382,8 +382,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                     dtype=torch_dtype,
                     device=device,
                 )
-        # Resolve the K/V and NVFP4 scale views once as well: the forward fetches
-        # them for every layer on every step.
+        # Resolve the K/V and NVFP4 scale views once too: the forward fetches them every step.
         for layer_idx in self.layer_offsets:
             self._kv_buffers[layer_idx, kv_layout] = self.get_buffers(layer_idx, kv_layout)
             if self.is_nvfp4_layer(layer_idx):
@@ -518,8 +517,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Base pool tables plus one virtual attention-op pool per shared draft layer.
 
         See the class docstring for why. The virtual pool reuses the source
-        pool's slot ids; :meth:`copy_batch_block_offsets` scales them. A
-        hybrid NVFP4 cache keeps no attention-op pools.
+        pool's slot ids; :meth:`copy_batch_block_offsets` scales them.
         """
         super()._prepare_page_table_tensor(index_mapper_capacity)
         if self.dtype == DataType.NVFP4:

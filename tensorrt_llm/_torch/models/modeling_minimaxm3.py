@@ -920,10 +920,7 @@ def minimax_m3_fused_sparse_qkv_producer(
     out_cache_loc: torch.Tensor,
     layer_idx: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Capture projection, norm, RoPE and FP8/NVFP4 cache insertion together.
-
-    ``kv_scale_cache`` is the NVFP4 K/V block-scale view, None for an FP8 cache.
-    """
+    """Capture projection, norm, RoPE and FP8/NVFP4 cache insertion together."""
     attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
     packed = attn_layer.qkv_proj(hidden_states)
     result = attn_layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(

@@ -2015,7 +2015,6 @@ def test_horizontal_producer_explicit_caches_match_manager(
     assert outputs is not None
     for actual, reference in zip(snapshot(outputs), expected):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-    # The explicit caches replace every manager lookup.
     manager.get_buffers.assert_called_once_with(3, kv_layout="HND")
     assert manager.get_block_scale_buffers.call_count == int(nvfp4)
     metadata.msa_idx_k_cache.assert_called_once_with(3)

@@ -152,9 +152,8 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
     # Graph-stable buffers; consumers slice to the live count at the call
     # site. Filled once the current step's cache write is prepared.
     msa_out_cache_loc: Optional[torch.Tensor] = None
-    # Zero-copy pool views prepared outside Dynamo: K/V, index-K and the NVFP4
-    # block scales (None for FP8). PCG passes these explicitly to its mutable
-    # producer instead of hiding writes behind runtime metadata.
+    # Zero-copy pool views prepared outside Dynamo; PCG passes these explicitly
+    # to its mutable producer instead of hiding writes behind runtime metadata.
     msa_layer_cache_tensors: Optional[
         dict[int, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]
     ] = None

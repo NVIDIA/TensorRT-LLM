@@ -226,7 +226,6 @@ def test_cache_manager_honors_executor_sparse_attention_config(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", fake_get_index_k_buffer)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
-    # No real pools behind the K/V views resolved at construction.
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
     sparse_config = SimpleNamespace(
         sparse_index_dim=configured_sparse_index_dim,
@@ -309,7 +308,6 @@ def test_index_k_views_are_fullgraph_safe(
     monkeypatch.setattr(KVCacheManagerV2, "__init__", fake_base_init)
     monkeypatch.setattr(KVCacheManagerV2, "get_index_k_buffer", resolve_index_view)
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "_compute_num_total_slots", lambda self: 0)
-    # No real pools behind the K/V views resolved at construction.
     monkeypatch.setattr(MiniMaxM3KVCacheManagerV2, "get_buffers", lambda self, *args: None)
     config = SimpleNamespace(implementation=implementation, indexer_kv_dtype=indexer_kv_dtype)
     managers = [
@@ -1380,10 +1378,7 @@ def test_plan_rows_narrow_to_the_rows_fmha_sm100_still_runs():
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
 def test_nvfp4_step_plans_skip_the_sparse_attention_plan(monkeypatch, dtype):
-    """NVFP4 sparse layers run the CSR kernel, so only FP8 caches plan sparse GQA.
-
-    The FP8 dense layers keep their plan, and the indexer proxy is unaffected.
-    """
+    """NVFP4 sparse layers run the CSR kernel, so only FP8 caches plan sparse GQA."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend
 
     planned = []
