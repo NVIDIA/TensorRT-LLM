@@ -3649,11 +3649,12 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
         assert layer_cache.kda_conv_q.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_k.shape == (cache_size, 48, 6)
         assert layer_cache.kda_conv_v.shape == (cache_size, 48, 6)
-        assert layer_cache.kda_conv_q.dtype is torch.float32
+        assert layer_cache.kda_conv_q.dtype is torch.bfloat16
         assert layer_cache.kda_conv_q.stride(-2) == 1
-        assert layer_cache.kda_qkg_cache.shape == (cache_size, 2, 3, 48)
+        assert layer_cache.kda_k_cache.shape == (cache_size, 2, 48)
+        assert layer_cache.kda_g_cache.shape == (cache_size, 2, 48)
         assert layer_cache.kda_v_cache.shape == (cache_size, 2, 48)
-        # Six fp32 heads are 24 bytes, so the row is padded to 32 (stride 8)
+        # Six bf16 heads are 12 bytes, so the row is padded to 16 (stride 8)
         # to keep every nested per-draft view 16-byte aligned for CuTe.
         assert layer_cache.kda_beta_cache.shape == (cache_size, 2, 6)
         assert layer_cache.kda_beta_cache.stride(-2) == 8
@@ -3665,7 +3666,10 @@ def test_v2_kda_replay_allocates_logical_slot_caches():
                         % _KDA_BETA_CACHE_ALIGNMENT_BYTES
                         == 0
                     )
-        assert layer_cache.kda_qkg_cache.dtype is torch.float32
+        assert layer_cache.kda_k_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_g_cache.dtype is torch.float32
+        assert layer_cache.kda_v_cache.dtype is torch.bfloat16
+        assert layer_cache.kda_beta_cache.dtype is torch.bfloat16
         assert layer_cache.prev_num_accepted_tokens.data_ptr() == (
             mgr.prev_num_accepted_tokens.data_ptr()
         )
@@ -4212,7 +4216,8 @@ def test_v2_kda_replay_relocates_live_slot_history():
             mgr.kda_conv_q,
             mgr.kda_conv_k,
             mgr.kda_conv_v,
-            mgr.kda_qkg_cache,
+            mgr.kda_k_cache,
+            mgr.kda_g_cache,
             mgr.kda_v_cache,
             mgr.kda_beta_cache,
         )
@@ -4266,7 +4271,8 @@ def test_v2_kda_state_index_setup_relocates_generation_history():
             mgr.kda_conv_q,
             mgr.kda_conv_k,
             mgr.kda_conv_v,
-            mgr.kda_qkg_cache,
+            mgr.kda_k_cache,
+            mgr.kda_g_cache,
             mgr.kda_v_cache,
             mgr.kda_beta_cache,
         )
@@ -4309,7 +4315,8 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
     mgr.kda_conv_q = dim_contiguous_conv_cache()
     mgr.kda_conv_k = dim_contiguous_conv_cache()
     mgr.kda_conv_v = dim_contiguous_conv_cache()
-    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_k_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
 
@@ -4327,7 +4334,8 @@ def test_v2_kda_replay_seeds_disaggregated_generation_slots():
                     conv_state[slot, start : start + 2, :],
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_g_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
             assert mgr.prev_num_accepted_tokens[slot] == 0
@@ -4366,7 +4374,8 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
     mgr.kda_conv_q = dim_contiguous_conv_cache()
     mgr.kda_conv_k = dim_contiguous_conv_cache()
     mgr.kda_conv_v = dim_contiguous_conv_cache()
-    mgr.kda_qkg_cache = torch.full((2, 4, 2, 3, 2), 7.0)
+    mgr.kda_k_cache = torch.full((2, 4, 2, 2), 7.0)
+    mgr.kda_g_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_v_cache = torch.full((2, 4, 2, 2), 7.0)
     mgr.kda_beta_cache = torch.full((2, 4, 2, 1), 7.0)
 
@@ -4393,14 +4402,16 @@ def test_v2_kda_replay_seeds_bf16_conv_state_from_disagg_transfer():
                     atol=0,
                 )
                 assert torch.count_nonzero(replay_buffer[layer_offset, slot, :, 4:]) == 0
-            assert torch.count_nonzero(mgr.kda_qkg_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_k_cache[layer_offset, slot]) == 0
+            assert torch.count_nonzero(mgr.kda_g_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_v_cache[layer_offset, slot]) == 0
             assert torch.count_nonzero(mgr.kda_beta_cache[layer_offset, slot]) == 0
             assert mgr.prev_num_accepted_tokens[slot] == 0
         # Slots no request restored keep their pre-seed contents.
         for slot in (0, 2):
             assert (mgr.kda_conv_q[layer_offset, slot] == 7.0).all()
-            assert (mgr.kda_qkg_cache[layer_offset, slot] == 7.0).all()
+            assert (mgr.kda_k_cache[layer_offset, slot] == 7.0).all()
+            assert (mgr.kda_g_cache[layer_offset, slot] == 7.0).all()
         # The restored bf16 pool is read-only here: plain decode (speculation
         # off) reuses exactly the state the transfer wrote.
         torch.testing.assert_close(conv_state, restored[layer_offset], rtol=0, atol=0)
