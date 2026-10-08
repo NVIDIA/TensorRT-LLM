@@ -296,7 +296,6 @@ unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewis
 unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_epd_disagg_mm_hash_kv_cache_reuse[prompts0] SKIP (https://nvbugs/6812085)
 unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_epd_disagg_mm_hash_kv_cache_reuse[prompts1] SKIP (https://nvbugs/6842946)
 unittest/_torch/multimodal/test_mm_encoder_standalone.py::test_pd_disagg_multimodal_no_reuse_when_disabled SKIP (https://nvbugs/6813129)
-unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_update_weights_nemotron_h SKIP (https://nvbugs/6729495)
 unittest/_torch/sampler/test_beam_search_speculative_d2h.py::test_speculative_d2h_predictor_hit_is_sync_free SKIP (https://nvbugs/6859731)
 unittest/_torch/speculative/test_eagle3.py SKIP (https://nvbugs/6849051)
 unittest/_torch/thop/parallel/test_fp4_linear.py::test_fp4_gemm_bias_per_backend[mnk2-cublaslt] SKIP (https://nvbugs/6581067)

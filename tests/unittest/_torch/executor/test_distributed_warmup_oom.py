@@ -10,9 +10,9 @@ from unittest import mock
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor import model_engine as model_engine_module
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only
@@ -36,7 +36,7 @@ def _engine(
     tp_peer_values: tuple[int, ...] = (),
     peer_values: tuple[int, ...] | None = None,
     with_dist: bool = True,
-) -> PyTorchModelEngine:
+) -> DecoderRunner:
     """Build an engine carrying only what the warmup policy reads.
 
     ``dist`` is ``Optional`` on the real engine -- stub engines such as
@@ -48,7 +48,7 @@ def _engine(
     ``peer_values`` defaults to peers that mirror this rank, i.e. a world that
     agrees with whatever this rank reports.
     """
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(DecoderRunner)
 
     def _allgather(value):
         peers = [value] * (world_size - 1) if peer_values is None else list(peer_values)
@@ -70,9 +70,7 @@ def _engine(
         tp_size=tp_size,
     )
     engine._reset_moe_alltoall_state = mock.Mock()
-    engine.is_spec_decode = False
-    engine.spec_config = None
-    engine.max_draft_len = 0
+    engine._config = SimpleNamespace(is_spec_decode=False, max_draft_len=0, spec_config=None)
     return engine
 
 
@@ -387,7 +385,7 @@ def test_tp_agreement_lets_a_symmetric_world_run() -> None:
     assert engine._should_run_warmup_batch(object(), 128, "general") is True
 
 
-def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> PyTorchModelEngine:
+def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> DecoderRunner:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine._warmup_timer = _WarmupTimer(rank=engine.dist.rank)
     batch = object()
@@ -428,14 +426,17 @@ def test_general_warmup_oom_policy(world_size: int, dwdp_size: int, is_fatal: bo
 _KV_ALLOC_ERROR = "Can't allocate new blocks for window size 8"
 
 
-def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[PyTorchModelEngine, object]:
+def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRunner, object]:
     engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
     engine.kv_cache_manager_key = "kv"
-    engine.max_num_tokens = 8
-    engine.batch_size = 4
-    engine.max_seq_len = 8
-    engine.original_max_draft_len = 0
-    engine.llm_args = SimpleNamespace(enable_autotuner=False)
+    engine._config = SimpleNamespace(
+        **vars(engine._config),
+        max_num_tokens=8,
+        max_batch_size=4,
+        max_seq_len=8,
+        original_max_draft_len=0,
+        enable_autotuner=False,
+    )
     engine.no_cuda_graph = contextlib.nullcontext
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
@@ -451,17 +452,15 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[PyTorchMo
     return engine, resource_manager
 
 
-def _run_mamba_warmup(engine: PyTorchModelEngine, resource_manager: object) -> None:
+def _run_mamba_warmup(engine: DecoderRunner, resource_manager: object) -> None:
     with (
+        mock.patch.object(runner_module, "MambaHybridCacheManager", _StandInMambaCacheManager),
         mock.patch.object(
-            model_engine_module, "MambaHybridCacheManager", _StandInMambaCacheManager
-        ),
-        mock.patch.object(
-            model_engine_module.Mamba2Metadata,
+            runner_module.Mamba2Metadata,
             "force_initial_states_for_warmup",
             side_effect=contextlib.nullcontext,
         ),
-        mock.patch.object(model_engine_module, "clear_memory_buffers"),
+        mock.patch.object(runner_module, "clear_memory_buffers"),
     ):
         engine._run_mamba_hybrid_warmup(resource_manager)
 

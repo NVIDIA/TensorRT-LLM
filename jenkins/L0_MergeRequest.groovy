@@ -215,18 +215,8 @@ def BOLT_CONSUME = "bolt_consume"
 // on for every eligible build is a reviewed code change; a `/bot run` with
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
-//
-// On today means aarch64/SBSA only in practice: the post-merge producer promotes
-// `targetArch: aarch64-linux-gnu` alone (see the BOLT-Profile-Gen stage below), so
-// main has no x86_64 bundle. The x86_64 build still asks and takes apply_latest.sh's
-// documented "nothing promoted" exit (3), which Build.groovy reports as a skip and
-// leaves un-BOLTed.
-//
-// Promoting an x86_64 bundle is necessary but not sufficient to start consuming on
-// that arch. The consume scope and the profile pin are both aarch64-specific, and
-// each has to grow an x86_64 entry alongside the producer.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = true
+def ENABLE_BOLT_PREMERGE_CONSUME = false
 // Version-controlled rollout switch for post-merge BOLT, same idiom as above.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
