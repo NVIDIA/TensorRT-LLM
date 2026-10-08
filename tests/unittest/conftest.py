@@ -106,9 +106,20 @@ def pytest_configure(config):
         print_info(f"  Batch size: {periodic_batch_size}")
 
 
+# pytest-rerunfailures >= 16.7 caches the ExceptionInfo of every failed phase on
+# the item, but clears it only when reruns are configured for that item. The
+# cached traceback pins the failed test's frame locals (e.g. multi-GiB CUDA
+# tensors) for the rest of the session, beyond the reach of gc.collect().
+_RERUNFAILURES_EXCINFOS_ATTR = "_rerun_condition_excinfos"
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
     yield
+
+    rerunfailures_excinfos = getattr(item, _RERUNFAILURES_EXCINFOS_ATTR, None)
+    if rerunfailures_excinfos is not None:
+        rerunfailures_excinfos.clear()
 
     import sys
     for m in sys.modules:
