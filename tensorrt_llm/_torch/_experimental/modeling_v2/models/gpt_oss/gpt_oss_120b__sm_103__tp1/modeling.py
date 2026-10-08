@@ -17,24 +17,15 @@ from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._target import Phase, Target, phase_of
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import advance_step_generation
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    FusedQkNormRope,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     ThopAttention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
-    Mxe4m3Mxe2m1BlockScaleMoeRunner,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     FlashinferFusedAddRmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     FlashinferRmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
-    Mxfp8Quantize,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -46,6 +37,11 @@ from tensorrt_llm._torch.models.modeling_utils import (
 )
 
 from . import weights as _weights
+from .ops.attention.fused_qk_norm_rope import FusedQkNormRope
+from .ops.moe.mxe4m3_mxe2m1_block_scale_moe_runner import (  # noqa: E501
+    Mxe4m3Mxe2m1BlockScaleMoeRunner,
+)
+from .ops.quantization.mxfp8_quantize import Mxfp8Quantize
 
 _CALL_CONSTANTS = dict(
     output_sf=None,

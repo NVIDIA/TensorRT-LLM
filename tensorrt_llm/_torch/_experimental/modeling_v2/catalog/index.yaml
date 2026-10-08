@@ -104,61 +104,17 @@ entries:
     impl: torch.ops.trtllm.cublas_mm
     summary: "General matmul via one cuBLASLt call with optional fused bias: [M,K] @ [K,N] col-major (+ bias), fp32 accumulation"
 
-  - path: gemm/bmm_out.py
-    impl: torch.ops.trtllm.bmm_out
-    summary: "Batched matmul into a caller-provided (possibly strided-view) out buffer: [B,M,K] @ [B,K,N] -> [B,M,N], fp32 accumulation"
-
   - path: gemm/nvfp4_gemm.py
     impl: torch.ops.trtllm.nvfp4_gemm
     summary: "NVFP4 x NVFP4 dense GEMM in nn.Linear layout with in-kernel block-scale dequantization: alpha * ([M,K/2] e2m1 + 128x4-swizzled e4m3 scales) @ ([N,K/2] e2m1 + swizzled scales)^T (+ per-column bias) -> fresh [M,N] bf16/fp16/fp32 buffer, fp32 accumulation, backend auto-selected (cutlass/cublaslt/cuda_core/cutedsl)"
 
   # ─── attention ─────────────────────────────────────────────────
-  - path: attention/fused_qk_norm_rope.py
-    impl: torch.ops.trtllm.fused_qk_norm_rope
-    summary: "In-place fused per-head QK RMS norm + RoPE (neox/interleaved, YaRN, interleaved mRoPE) on a packed bf16 QKV tensor; v heads untouched"
-
-  - path: attention/mla_rope_generation.py
-    impl: torch.ops.trtllm.mla_rope_generation
-    summary: "MLA decode preprocessing: GPT-J RoPE of q_pe + latent [compressed_kv | rope(k_pe)] paged-KV-cache append + decode-FMHA scheduler-buffer fill; bf16 pool writes fused_q's tail, fp8-e4m3 pool writes quant_q_buffer and the two folded bmm scales instead"
-
-  - path: attention/load_paged_kv_cache_for_mla.py
-    impl: torch.ops.trtllm.load_paged_kv_cache_for_mla
-    summary: "Gather each context sequence's full [past + new] MLA latent KV from the paged cache into two new contiguous tensors (compressed_kv [T,C], k_pe [T,R]) for KV-reuse context prefill; an fp8-e4m3 pool is dequantized to bf16/fp16/fp32 by kv_scale_quant_orig"
-
-  - path: attention/mla_rope_append_paged_kv_assign_q.py
-    impl: torch.ops.trtllm.mla_rope_append_paged_kv_assign_q
-    summary: "MLA context-prefill preprocessing: in-place GPT-J RoPE of q_pe (in q) and k_pe (in latent_cache) at each new token's absolute position + [compressed_kv | rope(k_pe)] paged-latent-cache append; an fp8-e4m3 pool quantizes only the appended row, by kv_scale_orig_quant"
-
   - path: attention/thop_attention.py
     impl: tensorrt_llm.bindings.internal.thop.attention
     summary: "Full attention core with fully explicit state (pybind binding, approved exception): paged KV-cache append + causal/padding-masked GQA FMHA over a caller-owned pool (bf16, or fp8-e4m3 with per-tensor kv scales) and explicit length/offset tensors, written into a caller buffer, on either context execution path (use_paged_context_fmha selects packed-QKV context FMHA, or paged-KV context FMHA so a context call may run over a cached prefix — KV-cache reuse and chunked prefill), with optional per-query-head attention sinks (one extra softmax-denominator logit, dropped from the output) and an optional per-call sliding window (attention_window_size keys ending at the query's absolute position; a pure mask — the append stays at absolute positions, so cyclic pool reuse is the caller's page mapping); MLA mode runs context prefill (in-kernel RoPE + latent append), no-append context over explicit K/V (latent_cache=None: cached-KV prefixes and chunked partial passes with softmax-stats output), and generation latent-MQA decode as separate calls over a paged latent pool (bf16 or fp8-e4m3)"
 
   # ─── moe ───────────────────────────────────────────────────────
-  - path: moe/noaux_tc_op.py
-    impl: torch.ops.trtllm.noaux_tc_op
-    summary: "DeepSeek-V3 style MoE routing (noaux_tc): in-kernel sigmoid of the router logits + per-expert bias correction for selection only + optional group-limited top-k (n_group/topk_group; identity at n_group=1) + combine weights gathered from the unbiased sigmoid, renormalized and scaled by routed_scaling_factor, returning weights in the logits' dtype and int32 expert ids"
-
-  - path: moe/fused_moe.py
-    impl: torch.ops.trtllm.fused_moe
-    summary: "Full MoE layer over pre-routed tokens: expert permutation + grouped FC1 GEMM over stacked [up; gate] expert weights + gated activation (SwiGLU with optional per-expert alpha/beta/limit, or GeGLU) + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] buffer (bf16/fp16 unquantized path; expert-parallel slot range selected by ep_size/ep_rank)"
-
-  - path: moe/mxe4m3_mxe2m1_block_scale_moe_runner.py
-    impl: torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner
-    summary: "Full MXFP4-weight / MXFP8-activation MoE layer (trtllm-gen W4A8): optional top-k routing over router logits (softmax-then-topk or topk-then-softmax) or caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + clamped gated activation + MXFP8 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, valid_hidden_size] bf16 buffer (e4m3 hidden states + linear UE8M0 block scales in, expert-parallel window selected by local_expert_offset/local_num_experts)"
-
-  - path: moe/fp4_block_scale_moe_runner.py
-    impl: torch.ops.trtllm.fp4_block_scale_moe_runner
-    summary: "Full NVFP4-weight / NVFP4-activation MoE layer (trtllm-gen W4A4): caller-supplied top-k ids/weights + grouped FC1 GEMM over pre-shuffled block-scaled [up; gate] expert weights + SwiGLU + NVFP4 requantization of that activation + grouped FC2 GEMM + routing-weighted fp32 combine, into a fresh or caller-provided [tokens, hidden] bf16 buffer; the checkpoint's per-tensor global scales enter as three per-expert fp32 scalars, hidden must be a multiple of 256, expert-parallel window selected by local_expert_offset/local_num_experts, do_finalize=False returns the per-slot rows plus their permuted-row map instead of the combine"
-
   # ─── quantization ──────────────────────────────────────────────
-  - path: quantization/mxfp8_quantize.py
-    impl: torch.ops.trtllm.mxfp8_quantize
-    summary: "Dynamic MXFP8 activation quantization: bf16/fp16 -> e4m3 data (last dim zero-padded up to `alignment`) + one UE8M0 power-of-two scale per 32 contiguous elements, emitted either row-major linear or 128x4 swizzled"
-
-  - path: quantization/fp4_quantize.py
-    impl: torch.ops.trtllm.fp4_quantize
-    summary: "Static-scale NVFP4 activation quantization: bf16/fp16 -> packed e2m1 data (two nibbles per byte, no width padding) + one e4m3 scale per 16 contiguous elements, scale = e4m3(global_scale * blockmax / 6) and data = e2m1(x * global_scale / scale), emitted either row-major linear (trtllm-gen block-scale MoE) or 128x4 swizzled (nvfp4 dense GEMM); MXFP4 mode (32-element blocks, UE8M0 scales) accepted but not certified"
-
   # ─── comm ──────────────────────────────────────────────────────
   - path: comm/allgather.py
     impl: torch.ops.trtllm.allgather
