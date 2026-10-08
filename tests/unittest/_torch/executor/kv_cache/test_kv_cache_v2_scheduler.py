@@ -4056,3 +4056,37 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
     output = scheduler.schedule_request([loading, generation], set())
     assert output.generation_requests == []
     assert output.recompute_paused_requests == []
+
+
+@pytest.mark.parametrize("prompt_len", [0, 8])
+def test_rewind_context_after_cache_drop_handles_empty_rank_local_prompt(
+    prompt_len: int,
+) -> None:
+    """A Helix CP rank can hold none of the prompt (promptLen 0); the
+    prepopulated-length setter rejects any value there, so rewinding must not
+    call it, while the context cursor is still reset."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import rewind_context_after_cache_drop
+
+    def set_prepopulated_prompt_len(value: int, tokens_per_block: int) -> None:
+        if not value < prompt_len:
+            raise RuntimeError("prepopulatedPromptLen >= promptLen")
+
+    request = Mock(
+        prompt_len=prompt_len,
+        context_current_position=4,
+        context_chunk_size=2,
+        estimated_reusable_tokens=4,
+        py_ctx_pre_resize_cap=16,
+    )
+    request.set_prepopulated_prompt_len = Mock(side_effect=set_prepopulated_prompt_len)
+
+    rewind_context_after_cache_drop(request, 32)
+
+    if prompt_len > 0:
+        request.set_prepopulated_prompt_len.assert_called_once_with(0, 32)
+    else:
+        request.set_prepopulated_prompt_len.assert_not_called()
+    assert request.context_current_position == 0
+    assert request.context_chunk_size == prompt_len
+    assert request.estimated_reusable_tokens == 0
+    assert request.py_ctx_pre_resize_cap is None
