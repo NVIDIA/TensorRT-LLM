@@ -28,9 +28,8 @@ Simulates two chained speculative-verification rounds through
 Identical hidden states are fed to both worlds; the fused world additionally
 uses fused QKV(G) and full- or low-rank gate projections with multi-stream overlap. With mixed
 per-request acceptance between rounds, matching round-2 outputs proves the
-projection fusion and replay bookkeeping (shifted ``cu_seqlens`` layout,
-conv-window seeding, pending-count plumbing) reproduce the promoted-state
-semantics.
+projection fusion, packed row/slot bookkeeping, conv-window seeding and the
+in-kernel gated RMSNorm epilogue reproduce the promoted-state semantics.
 
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
@@ -163,9 +162,10 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
         kda_conv_q=_conv_cache(0),
         kda_conv_k=_conv_cache(1),
         kda_conv_v=_conv_cache(2),
-        kda_qkg_cache=torch.zeros(B, M, 3, d, device="cuda", dtype=torch.float32),
-        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
-        kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.float32),
+        kda_k_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_g_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.float32),
+        kda_v_cache=torch.zeros(B, M, d, device="cuda", dtype=torch.bfloat16),
+        kda_beta_cache=torch.zeros(B, M, num_heads, device="cuda", dtype=torch.bfloat16),
         prev_num_accepted_tokens=torch.zeros(B, dtype=torch.int32, device="cuda"),
         has_kda_replay_caches=True,
         intermediate_conv_window=None,
@@ -176,7 +176,7 @@ def _make_fused_layer_cache(B, conv_pool, *, num_heads=H):
 def _make_seq_layer_cache(B, *, num_heads=H):
     d = num_heads * K
     return SimpleNamespace(
-        kda_qkg_cache=None,
+        kda_k_cache=None,
         has_kda_replay_caches=False,
         intermediate_conv_window=torch.zeros(
             B, M + 1, 3 * d, W - 1, device="cuda", dtype=torch.bfloat16
@@ -191,6 +191,37 @@ def _promote_sequential(layer_cache, conv_pool, ssm_pool, accept):
     rows = torch.arange(B, device="cuda")
     conv_pool.copy_(layer_cache.intermediate_conv_window[rows, accept])
     ssm_pool.copy_(layer_cache.intermediate_ssm[rows, accept])
+
+
+def _capture_mtp_verify(runtime):
+    """Record the kwargs of every fused verify launch, then run it."""
+    calls = []
+    mtp_verify = runtime._dispatch.mtp_verify
+
+    def _capturing_mtp_verify(**kwargs):
+        calls.append(kwargs)
+        return mtp_verify(**kwargs)
+
+    runtime._dispatch.mtp_verify = _capturing_mtp_verify
+    return calls
+
+
+def _assert_fused_epilogue_call(call, runtime, use_full_rank_gate):
+    """The fused verify ran with the in-kernel output norm on packed rows."""
+    assert call["fuse_output_norm"]
+    assert call["packed_token_layout"]
+    assert call["cu_seqlens"] is None
+    assert not call["mxfp8_output"]
+    onorm_g = call["onorm_g"]
+    assert onorm_g.stride(-1) == 1 and onorm_g.stride(-2) == K
+    if use_full_rank_gate:
+        # The gate and q/k/v stay strided views of the fused QKVG output.
+        row_stride = 4 * runtime.proj_size
+        assert onorm_g.stride(1) == row_stride
+        for name in ("x_q", "x_k", "x_v"):
+            assert call[name].stride(1) == row_stride
+            assert call[name].stride(-1) == 1
+    assert call["beta"].stride(-1) == 1
 
 
 def _rep(name, a, b):
@@ -247,6 +278,8 @@ def test_fused_vs_sequential_two_rounds(
     else:
         assert rt_fused._qkvg_proj_weight is not None
         assert rt_fused._bfa_proj_weight is not None
+    assert rt_fused._onorm_w_f32 is not None
+    mtp_calls = _capture_mtp_verify(rt_fused)
     slot_indices = torch.arange(B, dtype=torch.int32, device="cuda")
 
     conv_pool_seq, ssm_pool_seq = _make_pools(B, seed=2, num_heads=num_heads)
@@ -288,6 +321,7 @@ def test_fused_vs_sequential_two_rounds(
                 x1, T, cache_fused, conv_pool_fused, ssm_pool_fused, slot_indices
             )
         )
+    _assert_fused_epilogue_call(mtp_calls[-1], rt_fused, use_full_rank_gate)
     print("round 1:")
     ok &= _rep("out", out1_fused, out1_seq)
 
@@ -315,6 +349,8 @@ def test_fused_vs_sequential_two_rounds(
             output=core2_fused,
         )
     assert result2_fused is core2_fused
+    assert len(mtp_calls) == 2
+    _assert_fused_epilogue_call(mtp_calls[-1], rt_fused, use_full_rank_gate)
     out2_fused = rt_fused._project_output(core2_fused)
     print("round 2 (mixed replay):")
     ok &= _rep("out", out2_fused, out2_seq)
@@ -328,3 +364,117 @@ def test_fused_vs_sequential_two_rounds(
     ok &= _rep("committed ssm", ssm_pool_fused, ssm_pool_seq)
 
     assert ok
+
+
+def _run_one_verify_round(runtime, x, batch, seed, **verify_kwargs):
+    conv_pool, ssm_pool = _make_pools(batch, seed=seed)
+    layer_cache = _make_fused_layer_cache(batch, conv_pool)
+    slot_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    return runtime.forward_verify(
+        x, M + 1, layer_cache, conv_pool, ssm_pool, slot_indices, **verify_kwargs
+    )
+
+
+@torch.no_grad()
+def test_fused_verify_falls_back_without_output_norm_weights():
+    """Without finalized o_norm weights the verify keeps the Python output gate."""
+    batch = 2
+    runtime = _make_runtime(seed=5)
+    runtime.finalize_decode_weights()
+    x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+    fused_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=6))
+
+    runtime._onorm_w_f32 = None
+    calls = _capture_mtp_verify(runtime)
+    fallback_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=6))
+
+    assert len(calls) == 1
+    assert "fuse_output_norm" not in calls[0]
+    assert calls[0]["cu_seqlens"] is not None
+    assert _rep("fallback vs fused epilogue", fallback_out, fused_out)
+
+
+class _PrequantizedProjectionStub(torch.nn.Module):
+    """o_proj stand-in that records the prequantized pair it receives."""
+
+    supports_prequantized_input = True
+
+    def __init__(self, out_features):
+        super().__init__()
+        self.out_features = out_features
+        self.calls = []
+
+    def forward(self, x):
+        return x.new_zeros(x.shape[0], self.out_features)
+
+    def forward_prequantized(self, activation, activation_scale):
+        self.calls.append((activation, activation_scale))
+        return torch.zeros(
+            activation.shape[0], self.out_features, dtype=torch.bfloat16, device="cuda"
+        )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("allow, with_output", [(True, False), (False, False), (True, True)])
+def test_fused_verify_mxfp8_output_gating(allow, with_output):
+    """MXFP8 output only when allowed, unbuffered and accepted by o_proj."""
+    batch = 2
+    rows = batch * (M + 1)
+    runtime = _make_runtime(seed=9)
+    runtime.finalize_decode_weights()
+    stub = _PrequantizedProjectionStub(HIDDEN)
+    runtime.o_proj = stub
+    calls = []
+
+    def _fake_mtp_verify(**kwargs):
+        calls.append(kwargs)
+        if kwargs["mxfp8_output"]:
+            activation = torch.zeros(rows, H * K, device="cuda").to(torch.float8_e4m3fn)
+            return activation, torch.zeros(128 * H * 4, dtype=torch.uint8, device="cuda")
+        return torch.zeros(1, rows, H, K, dtype=torch.bfloat16, device="cuda")
+
+    runtime._dispatch.mtp_verify = _fake_mtp_verify
+    x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    output = x.new_empty(rows, H, K) if with_output else None
+    core = _run_one_verify_round(
+        runtime, x, batch, seed=10, output=output, allow_prequantized_output=allow
+    )
+    out = runtime._project_output(core)
+
+    expect_mxfp8 = allow and not with_output
+    assert calls[-1]["fuse_output_norm"]
+    assert calls[-1]["mxfp8_output"] is expect_mxfp8
+    assert len(stub.calls) == int(expect_mxfp8)
+    assert out.shape == (rows, HIDDEN)
+    if with_output:
+        assert core is output
+
+
+@torch.no_grad()
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 7),
+    reason="the MXFP8 verify epilogue feeds the Rubin (SM107) CuTe MXFP8 GEMM",
+)
+def test_fused_verify_mxfp8_output_matches_bf16_projection():
+    """SM107: epilogue-quantized o_proj input matches the BF16 core path."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("needs the Rubin CuTe DSL")
+    batch = 4
+    runtime = _make_runtime(seed=11)
+    runtime.finalize_decode_weights()
+    runtime.o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
+    assert runtime.o_proj.supports_prequantized_input
+    calls = _capture_mtp_verify(runtime)
+    x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+
+    bf16_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=12))
+    mxfp8_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
+    mxfp8_out = runtime._project_output(mxfp8_core)
+
+    assert [call["mxfp8_output"] for call in calls] == [False, True]
+    assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
+    assert mxfp8_core.scale.dtype is torch.uint8
+    assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)
