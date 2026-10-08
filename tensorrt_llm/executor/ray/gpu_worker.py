@@ -256,7 +256,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         device_id: int,
-        engine: Path,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -270,7 +269,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         from tensorrt_llm.logger import logger
 
         super().__init__(
-            engine=engine,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,

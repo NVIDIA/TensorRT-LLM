@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
 from queue import Queue
 from threading import Event
@@ -46,7 +48,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Path,
         is_llm_executor: Optional[bool] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -57,7 +58,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
         fetch_timeout: Optional[float] = None,
     ) -> None:
         super().__init__(
-            engine=engine,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -107,7 +107,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
     @staticmethod
     def main_task(
-        engine: Path,
         rpc_addr: str,
         *,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
@@ -125,7 +124,6 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
 
         # Step 1: Create the worker instance
         worker = RpcWorker(
-            engine=engine,
             is_llm_executor=is_llm_executor,
             llm_args=llm_args,
             batched_logits_processor=batched_logits_processor,

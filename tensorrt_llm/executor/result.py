@@ -410,13 +410,10 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         # prompt logprobs handling
-        if logprobs_result and logprobs_result.prompt is not None:  # both backends
+        if logprobs_result and logprobs_result.prompt is not None:
             output.prompt_logprobs = logprobs_result.prompt
-        # generation logprobs handling (provenance varies by backend)
-        if logprobs_result and logprobs_result.generation is not None:  # TRT backend
-            # update logprobs from ResponseWrapper (TRT top logprobs WAR)
-            output.logprobs += logprobs_result.generation
-        elif response_tensors.log_probs is not None:  # PyTorch backend
+        # Generation logprobs are computed by the sampler.
+        if response_tensors.log_probs is not None:
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [
@@ -436,7 +433,6 @@ class GenerationResultBase:
                         self._get_decoder_output_prefix_logprobs())
                 output.logprobs += response_tensors.log_probs[src_idx]
 
-            # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 if self._logprobs_reported_cumulatively and len(
                         output.logprobs) > output.length:
@@ -1318,33 +1314,16 @@ class IterationResult:
             raise StopAsyncIteration
 
 
-def compute_logprobs(
+def compute_prompt_logprobs(
     k_prompt_logprobs: int,
-    k_logprobs: int,
     context_logits: Optional[torch.Tensor],
-    generation_logits: Optional[torch.Tensor],
-    output_token_ids: Optional[list[int]],
     prompt_token_ids: Optional[list[int]] = None,
     simple_prompt_logprobs: bool = False,
-    simple_logprobs: bool = False,
 ) -> LogProbsResult:
-    """Compute top-K logprobs from logits when engine doesn't provide them directly.
+    """Compute prompt token logprobs from context logits.
 
-    Used for post-processing logits into logprobs.
-    - Prompt logprobs (from context_logits): always used.
-    - Generation logprobs (from generation_logits, TRT backend): used when backend doesn't compute them in sampler (e.g., TRT).
-    - Generation logprobs (PyTorch backend): not used; computed in sampler, not here.
-
-    When `simple_prompt_logprobs` / `simple_logprobs` is True and the corresponding
-    `k_*` is 0, the result is a flat ``SimpleTokenLogprobs`` (``list[float]``,
-    one logprob per token) instead of ``TokenLogprobs``. This avoids the
-    per-token dict allocation overhead when only the sampled-token logprob is
-    needed.
-
-    Returns:
-        LogProbsResult, a NamedTuple containing:
-            - prompt: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for prompt tokens.
-            - generation: Optional[TokenLogprobs | SimpleTokenLogprobs] logprobs for generated tokens.
+    When ``simple_prompt_logprobs`` is True and ``k_prompt_logprobs`` is 0,
+    return a flat list of sampled-token logprobs instead of per-token dicts.
     """
 
     def _topk_logprobs(logits: torch.Tensor, top_k: int,
@@ -1355,8 +1334,7 @@ def compute_logprobs(
             logits = logits.squeeze(0)
 
         if tokens is not None and logits.size(0) > len(tokens):
-            # WAR for nvbug 5324291 where TRT backend might return more logits
-            # than output tokens.
+            # Only consume logits corresponding to the supplied tokens.
             logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
@@ -1409,12 +1387,7 @@ def compute_logprobs(
         context_logits, k_prompt_logprobs, prompt_token_ids,
         simple_prompt_logprobs
     ) if k_prompt_logprobs is not None and context_logits is not None else None
-    generation_logprobs = _topk_logprobs(
-        generation_logits, k_logprobs, output_token_ids, simple_logprobs
-    ) if k_logprobs is not None and generation_logits is not None else None
-
-    return LogProbsResult(prompt=prompt_logprobs,
-                          generation=generation_logprobs)
+    return LogProbsResult(prompt=prompt_logprobs)
 
 
 def _build_perf_metrics_dict(

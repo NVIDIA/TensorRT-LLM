@@ -150,3 +150,71 @@ def test_end_id_finish_is_untouched():
     )
     assert output.stop_reason is None
     assert len(output.logprobs) == len(output.token_ids) == 4
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_search", [False, True])
+def test_sampler_logprobs_survive_prompt_response_wrapper(streaming, beam_search):
+    from tensorrt_llm.executor.result import LogProbsResult
+
+    params = SamplingParams(n=2 if beam_search else 1, use_beam_search=beam_search, logprobs=1)
+    result = GenerationResultBase(id=0, sampling_params=params)
+    result._streaming = streaming
+    prompt_logprobs = [{1: Logprob(logprob=-0.25, rank=1)}]
+    wrapped = LogProbsResult(prompt=prompt_logprobs)
+    sequences = [[10, 11], [20, 21]] if beam_search else [[10, 11]]
+    sampler_logprobs = [
+        [{token: Logprob(logprob=-0.5, rank=1)} for token in tokens] for tokens in sequences
+    ]
+
+    # Multi-beam responses carry cumulative tokens and logprobs; sampling
+    # responses carry only the newly generated tokens and logprobs.
+    for step in range(2):
+        response = SimpleNamespace(
+            output_token_ids=[
+                tokens[: step + 1] if beam_search else tokens[step : step + 1]
+                for tokens in sequences
+            ],
+            cum_log_probs=None,
+            log_probs=[
+                values[: step + 1] if beam_search else values[step : step + 1]
+                for values in sampler_logprobs
+            ],
+            generation_logits=None,
+            request_perf_metrics=None,
+        )
+        for beam in range(len(sequences)):
+            result._handle_sequence(
+                [tllm.FinishReason.NOT_FINISHED] * len(sequences),
+                response,
+                beam,
+                logprobs_result=wrapped,
+            )
+
+    for beam, output in enumerate(result._outputs):
+        assert output.token_ids == sequences[beam]
+        assert output.logprobs == sampler_logprobs[beam]
+        assert output.prompt_logprobs == prompt_logprobs
+
+
+@pytest.mark.parametrize("first_token_logprob_transferred", [False, True])
+def test_generation_only_response_preserves_sampler_logprobs(first_token_logprob_transferred):
+    result = GenerationResultBase(id=0, sampling_params=SamplingParams(logprobs=1))
+    result._disaggregated_params = SimpleNamespace(request_type="generation_only")
+    tokens = [10, 11]
+    returned_tokens = tokens if first_token_logprob_transferred else tokens[1:]
+    sampler_logprobs = [{token: Logprob(logprob=-0.5, rank=1)} for token in returned_tokens]
+    response = SimpleNamespace(
+        output_token_ids=[tokens],
+        cum_log_probs=None,
+        log_probs=[sampler_logprobs],
+        generation_logits=None,
+        request_perf_metrics=None,
+    )
+
+    result._handle_sequence([tllm.FinishReason.NOT_FINISHED], response, 0)
+
+    output = result._outputs[0]
+    assert output.token_ids == tokens
+    assert output.logprobs == sampler_logprobs
+    assert output.disaggregated_params is result.disaggregated_params

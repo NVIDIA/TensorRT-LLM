@@ -66,7 +66,6 @@ class MultimodalEncoder(_TorchLLM):
         self.args.mm_encoder_only = True
 
         self._executor = self._executor_cls.create(
-            None,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
