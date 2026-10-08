@@ -164,6 +164,8 @@ def _configure_deep_gemm_pdl() -> None:
 
 class PyTorchModelEngine(ModelEngine):
 
+    kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+
     def __init__(
         self,
         *,
@@ -398,16 +400,14 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
-        self._disable_overlap_scheduler = self.llm_args.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
-        self._is_encode_only = self.llm_args.encode_only
 
         if (isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
-                and self._is_encoder_decoder_model()):
+                and self.model.model_config.is_encoder_decoder):
             logger.warning(
                 "EncodeCudaGraphConfig is not supported for encoder-decoder "
                 "models through cuda_graph_config. Use DecodeCudaGraphConfig "
@@ -432,26 +432,24 @@ class PyTorchModelEngine(ModelEngine):
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
 
-        self.torch_compile_config = self.llm_args.torch_compile_config
-        self.prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
-        torch_compile_enabled = bool(self.torch_compile_config is not None)
-        torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_config = self.llm_args.torch_compile_config
+        prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
+        torch_compile_enabled = bool(torch_compile_config is not None)
+        torch_compile_fullgraph = torch_compile_config.enable_fullgraph if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_fullgraph'].default
         compile_only_piecewise_graphs = (
-            self.torch_compile_config.compile_only_piecewise_graphs
-            if self.torch_compile_config is not None else TorchCompileConfig.
+            torch_compile_config.compile_only_piecewise_graphs
+            if torch_compile_config is not None else TorchCompileConfig.
             model_fields['compile_only_piecewise_graphs'].default)
-        torch_compile_inductor_enabled = self.torch_compile_config.enable_inductor if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_inductor_enabled = torch_compile_config.enable_inductor if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_inductor'].default
-        torch_compile_piecewise_cuda_graph = (self.prefill_cuda_graph_backend ==
-                                              PrefillCudaGraphBackend.PIECEWISE)
-        torch_compile_enable_userbuffers = self.torch_compile_config.enable_userbuffers if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_piecewise_cuda_graph = (
+            prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE)
+        torch_compile_enable_userbuffers = torch_compile_config.enable_userbuffers if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'enable_userbuffers'].default
-        torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
+        torch_compile_max_num_streams = torch_compile_config.max_num_streams if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
 
-        self._torch_compile_enabled = torch_compile_enabled
-        self._compile_only_piecewise_graphs = compile_only_piecewise_graphs
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
 
@@ -475,17 +473,18 @@ class PyTorchModelEngine(ModelEngine):
                 f"Clamping them to the ceiling; raise max_seq_len for larger graphs."
             )
 
+        backend_num_streams = None
         try:
             use_ub_for_nccl = (
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
                 and self._init_userbuffers(self.model.config.hidden_size))
             self._nccl_window_tensor_scope_hooks = []
-            if self._torch_compile_enabled:
+            if torch_compile_enabled:
                 set_torch_compiling(True)
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
-                self.backend_num_streams = Backend.Streams([
+                backend_num_streams = Backend.Streams([
                     torch.cuda.Stream()
                     for _ in range(torch_compile_max_num_streams - 1)
                 ])
@@ -552,8 +551,6 @@ class PyTorchModelEngine(ModelEngine):
         self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
                                                   sparse_params=sparse_params)
 
-        self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
-
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):
             raise ValueError(
@@ -579,28 +576,26 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len = 0
             self.max_total_draft_tokens = 0
 
-        # Memos for engines without a decoder runner; see the properties.
-        self._attn_metadata = None
-        self._spec_metadata = None
         self.iter_states = {}
-
-        # We look up this key in resource_manager during forward to find the
-        # kv cache manager. Can be changed to support multiple model engines
-        # with different KV cache managers.
-        self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._model_caller = ModelCaller(
             self.model,
             compile_backend=self._torch_compile_backend,
-            aux_streams=(self.backend_num_streams
-                         if self._torch_compile_backend is not None else None),
+            aux_streams=backend_num_streams,
             prefill_compile_only=self._torch_compile_prefill_only,
         )
         self._runner = self._initialize_runner(runner_cls)
 
-        self.kv_cache_dtype_byte_size = self.get_kv_cache_dtype_byte_size()
+        layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
+        if layer_quant_mode.has_fp4_kv_cache():
+            self.kv_cache_dtype_byte_size = 1 / 2
+        elif (layer_quant_mode.has_fp8_kv_cache()
+              or layer_quant_mode.has_int8_kv_cache()):
+            self.kv_cache_dtype_byte_size = 1
+        else:
+            self.kv_cache_dtype_byte_size = 2
 
     def _initialize_runner(self, runner_cls: Type[ModelRunner]) -> ModelRunner:
         assert self._model_caller is not None
@@ -675,11 +670,11 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             enable_attention_dp=self.enable_attention_dp,
-            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             attention_backend=self.attn_backend,
             attention_runtime_features=self.attn_runtime_features,
-            mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
         )
         if issubclass(runner_cls, PoolingRunner):
             return runner_cls(
@@ -712,8 +707,8 @@ class PyTorchModelEngine(ModelEngine):
             attention_runtime_features=self.attn_runtime_features,
             dtype=self.dtype,
             enable_attention_dp=self.enable_attention_dp,
-            disable_overlap_scheduler=self._disable_overlap_scheduler,
-            is_encode_only=self._is_encode_only,
+            disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
+            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
@@ -729,17 +724,20 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
             max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
-            prefill_cuda_graph_backend=self.prefill_cuda_graph_backend,
+            prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             enable_in_graph_sampling=self.enable_in_graph_sampling,
-            torch_compile_enabled=self._torch_compile_enabled,
+            torch_compile_enabled=self._torch_compile_backend is not None,
             torch_compile_piecewise_cuda_graph=(
                 self._torch_compile_piecewise_cuda_graph),
             torch_compile_prefill_only=self._torch_compile_prefill_only,
-            compile_only_piecewise_graphs=self._compile_only_piecewise_graphs,
+            compile_only_piecewise_graphs=(
+                self.llm_args.torch_compile_config is not None and
+                self.llm_args.torch_compile_config.compile_only_piecewise_graphs
+            ),
             use_mrope=self.use_mrope,
             is_multimodal=self.is_multimodal,
-            mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
+            mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
             enable_autotuner=self.llm_args.enable_autotuner,
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
@@ -765,8 +763,9 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=self.moe_load_balancer,
             sparse_attention_config=self.sparse_attention_config,
             torch_compile_backend=self._torch_compile_backend,
-            get_runtime_tokens_per_gen_step=self.
-            get_runtime_tokens_per_gen_step,
+            get_runtime_tokens_per_gen_step=(
+                self.spec_config.get_runtime_tokens_per_gen_step if
+                self.spec_config is not None else lambda runtime_draft_len: 1),
             warmup_timer=self._warmup_timer,
             iter_states=self.iter_states,
             metrics=self._metrics,
@@ -779,27 +778,23 @@ class PyTorchModelEngine(ModelEngine):
     def attn_metadata(self) -> Optional[AttentionMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata
-        return self._attn_metadata
+        return None
 
     @attn_metadata.setter
     def attn_metadata(self, value: Optional[AttentionMetadata]) -> None:
         if isinstance(self._runner, DecoderRunner):
             self._runner.attn_metadata = value
-        else:
-            self._attn_metadata = value
 
     @property
     def spec_metadata(self) -> Optional[SpecMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
-        return self._spec_metadata
+        return None
 
     @spec_metadata.setter
     def spec_metadata(self, value: Optional[SpecMetadata]) -> None:
         if isinstance(self._runner, DecoderRunner):
             self._runner.spec_metadata = value
-        else:
-            self._spec_metadata = value
 
     @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
@@ -828,19 +823,6 @@ class PyTorchModelEngine(ModelEngine):
         """Register how a batch maps to its sampling tier, for the graph key."""
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
-
-    def get_kv_cache_dtype_byte_size(self) -> float:
-        """
-        Returns the size (in bytes) occupied by kv cache type.
-        """
-        layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
-        if layer_quant_mode.has_fp4_kv_cache():
-            return 1 / 2
-        elif layer_quant_mode.has_fp8_kv_cache(
-        ) or layer_quant_mode.has_int8_kv_cache():
-            return 1
-        else:
-            return 2
 
     def set_lora_model_config(self,
                               lora_target_modules: list[str],
@@ -878,11 +860,6 @@ class PyTorchModelEngine(ModelEngine):
         logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
 
-    @functools.cached_property
-    def _mm_encoder_cache_enabled(self) -> bool:
-        """Whether the multimodal encoder cache is active for this model."""
-        return mm_encoder_cache_enabled(self.model)
-
     @property
     def is_warmup(self):
         return getattr(self, "_is_warmup", False)
@@ -896,21 +873,9 @@ class PyTorchModelEngine(ModelEngine):
         # timeouts here rather than in set_warmup_flag().
         set_moe_comm_warmup(value)
 
-        self.moe_load_balancer_iter_info = (not value, not value)
-
-    @property
-    def moe_load_balancer_iter_info(self):
-        moe_load_balancer = self.moe_load_balancer
-        if moe_load_balancer is not None:
-            return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
-        return False, False
-
-    @moe_load_balancer_iter_info.setter
-    def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
-        moe_load_balancer = self.moe_load_balancer
-        if moe_load_balancer is not None:
-            moe_load_balancer.set_iter_info(enable_statistic=value[0],
-                                            enable_update_weights=value[1])
+        if self.moe_load_balancer is not None:
+            self.moe_load_balancer.set_iter_info(
+                enable_statistic=not value, enable_update_weights=not value)
 
     @contextmanager
     def set_warmup_flag(self):
@@ -974,12 +939,8 @@ class PyTorchModelEngine(ModelEngine):
         self,
         resource_manager: ResourceManager,
     ) -> None:
-        if not self._is_encoder_decoder_model():
-            return
-        if not isinstance(self._runner, EncoderDecoderRunner):
-            raise RuntimeError(
-                "Encoder-decoder model did not initialize a model runner.")
-        self._runner.warmup_encoder(resource_manager)
+        if isinstance(self._runner, EncoderDecoderRunner):
+            self._runner.warmup_encoder(resource_manager)
 
     def _get_encoder_cuda_graph_batch_sizes(
             self, max_batch_size: int) -> tuple[int, ...]:
@@ -1291,11 +1252,6 @@ class PyTorchModelEngine(ModelEngine):
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
-    def _is_encoder_decoder_model(self) -> bool:
-        return bool(
-            getattr(getattr(self.model, "model_config", None),
-                    "is_encoder_decoder", False))
-
     def forward(self,
                 batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,
@@ -1360,17 +1316,6 @@ class PyTorchModelEngine(ModelEngine):
                                           hidden_size * self.max_num_tokens * 2)
 
         return True
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        """
-        When doing spec decode, sometimes draft models need to share certain weights
-        with their target models. Here, we set up such weights by invoking
-        self.model.load_weights_from_target_model if such a method exists.
-        """
-        loader = getattr(self.model, "load_weights_from_target_model", None)
-        if callable(loader):
-            loader(target_model)
 
     def wait_for_input_copy(self):
         """

@@ -43,11 +43,10 @@ class _WarmupFlagStub:
     """Borrows the engine's ``is_warmup`` property without building a model.
 
     The setter only touches ``_is_warmup``, the MoE communication timeouts, and
-    ``moe_load_balancer_iter_info``, which is a no-op without a load balancer.
+    ``moe_load_balancer``, which it skips when there is no load balancer.
     """
 
     is_warmup = PyTorchModelEngine.is_warmup
-    moe_load_balancer_iter_info = PyTorchModelEngine.moe_load_balancer_iter_info
     moe_load_balancer = None
 
 
