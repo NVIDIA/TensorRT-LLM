@@ -782,6 +782,7 @@ class TestKVCacheV2SchedulerCrossParam:
         model_engine = SimpleNamespace(
             spec_config=None,
             model=SimpleNamespace(model_config=_make_model_config()),
+            mm_encoder_item_scheduling_enabled=False,
         )
         llm_args = TorchLlmArgs(
             model=_DUMMY_MODEL,

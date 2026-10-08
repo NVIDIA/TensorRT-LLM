@@ -1075,9 +1075,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         """Warmup must bypass the slow-start ramp so warmup iters are not
         artificially throttled and `_fill_admit_cap` stays unchanged."""
         ex = self._make_executor(tp_size=4)
-        # Bypass the is_warmup property setter (which also pokes model_engine,
-        # not present on this stub).
-        ex._is_warmup = True
+        ex.is_warmup = True
 
         ex._pop_from_waiting_queue(
             Mock(),

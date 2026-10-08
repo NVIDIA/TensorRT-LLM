@@ -264,8 +264,7 @@ def _model_engine_with_runner(
         runner._model = engine.model
         runner._trtllm_gen_jit_warmup = False
     engine._runner = runner
-    engine.enable_spec_decode = False
-    engine.runtime_draft_len = 0
+    engine._warmup_depth = 0
     engine.moe_load_balancer = None
     resource_manager = Mock()
     resource_manager.get_resource_manager.return_value = kv_cache_manager
@@ -322,6 +321,7 @@ def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> Non
         model_config=SimpleNamespace(is_encoder_decoder=True),
     )
     engine._runner = runner
+    engine._warmup_depth = 0
     requests = [object(), object()]
     resource_manager = object()
 
@@ -343,7 +343,7 @@ def test_model_engine_releases_runner_owned_graphs() -> None:
     engine._runner = Mock(spec=EncoderRunner)
     engine._torch_compile_backend = None
 
-    engine._release_cuda_graphs()
+    engine.release_executor_resources()
 
     engine._runner.release_graphs.assert_called_once_with()
 
@@ -557,20 +557,18 @@ def test_mm_encoder_runner_splits_embeddings_and_returns_mrope_metadata() -> Non
 
 @pytest.mark.parametrize("effective_length", [None, 0, 3])
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_engine_consumes_optional_length_update_and_passes_call_state(effective_length, is_dummy):
+def test_engine_passes_call_state_and_returns_length_update(effective_length, is_dummy):
     runner = Mock(spec=NoKVCacheRunner)
     outputs = {"logits": object()}
     if effective_length is not None:
         outputs["runtime_draft_len"] = effective_length
     runner.forward.return_value = outputs
     engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
-    engine.runtime_draft_len = 2
-    engine.enable_spec_decode = True
-    engine._is_warmup = is_dummy
+    engine._warmup_depth = int(is_dummy)
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [SimpleNamespace(py_return_context_logits=True)]
 
-    assert engine.forward(batch, resources) is outputs
+    assert engine.forward(batch, resources, enable_spec_decode=True, runtime_draft_len=2) is outputs
 
     inputs = runner.forward.call_args.args[0]
     assert inputs.batch is batch
@@ -578,17 +576,14 @@ def test_engine_consumes_optional_length_update_and_passes_call_state(effective_
     assert inputs.enable_spec_decode
     assert inputs.runtime_draft_len == 2
     assert runner.forward.call_args.kwargs["is_dummy"] is is_dummy
-    assert engine.runtime_draft_len == (2 if effective_length is None else effective_length)
-    assert "runtime_draft_len" not in outputs
+    assert outputs.get("runtime_draft_len") == effective_length
 
 
 @pytest.mark.parametrize("is_dummy", [False, True])
 def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy):
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
     # The dummy flag comes from the caller, not from the warmup scope.
-    engine._is_warmup = not is_dummy
-    engine.enable_spec_decode = False
-    engine.runtime_draft_len = 5
+    engine._warmup_depth = int(not is_dummy)
     inputs = ScheduledInputs(
         batch=ScheduledRequests(), enable_spec_decode=True, runtime_draft_len=2
     )
@@ -599,23 +594,7 @@ def test_decoder_runner_passes_call_state_without_engine_writes(is_dummy):
 
     assert outputs is expected
     engine._runner._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=is_dummy)
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (False, 5)
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
-
-
-def test_engine_forward_keeps_call_state_when_decoder_fails():
-    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._is_warmup = False
-    engine.enable_spec_decode = True
-    engine.runtime_draft_len = 2
-    engine._runner._forward_decoder = Mock(side_effect=RuntimeError("decoder failure"))
-
-    with pytest.raises(RuntimeError, match="decoder failure"):
-        engine.forward(ScheduledRequests(), resources)
-
-    inputs = engine._runner._forward_decoder.call_args.args[0]
-    assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 2)
-    assert (engine.enable_spec_decode, engine.runtime_draft_len) == (True, 2)
 
 
 def test_forward_warmup_runs_local_call_state_in_forward_context():
@@ -696,14 +675,12 @@ def test_no_kv_forward_preserves_model_output_dictionary_without_length_update()
 
 @pytest.mark.parametrize("raw_output", [torch.tensor([1.0]), None], ids=["tensor", "none"])
 @pytest.mark.parametrize("is_dummy", [False, True])
-def test_engine_forward_preserves_raw_decoder_outputs_and_length(raw_output, is_dummy):
+def test_engine_forward_preserves_raw_decoder_outputs(raw_output, is_dummy):
     engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
-    engine._is_warmup = is_dummy
-    engine.runtime_draft_len = 2
+    engine._warmup_depth = int(is_dummy)
     engine._runner._forward_decoder = Mock(return_value=raw_output)
 
-    assert engine.forward(ScheduledRequests(), resources) is raw_output
-    assert engine.runtime_draft_len == 2
+    assert engine.forward(ScheduledRequests(), resources, runtime_draft_len=2) is raw_output
     assert engine._runner._forward_decoder.call_args.args[0].runtime_draft_len == 2
     assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": is_dummy}
 

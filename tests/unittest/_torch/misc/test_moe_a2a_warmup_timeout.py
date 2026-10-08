@@ -6,20 +6,24 @@ from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 
-class _WarmupFlagStub:
-    """Minimal object that reuses the engine's is_warmup property.
+class _WarmupScopeStub:
+    """Minimal object that reuses the engine's warmup scope.
 
-    Building a real PyTorchModelEngine needs a model and a device; the property
-    itself only touches _is_warmup, the MoE all-to-all budget selector, and
+    Building a real PyTorchModelEngine needs a model and a device; the scope
+    itself only touches _warmup_depth, the MoE all-to-all budget selector, and
     moe_load_balancer (skipped when it is None), so a stub exercises the real
     code path without either.
 
-    The stub borrows the property object without inheriting, so it has to
-    declare moe_load_balancer itself.
+    The stub borrows the methods without inheriting, so it has to declare
+    moe_load_balancer and _warmup_depth itself.
     """
 
-    is_warmup = PyTorchModelEngine.is_warmup
+    warmup_scope = PyTorchModelEngine.warmup_scope
+    _set_warmup_effects = PyTorchModelEngine._set_warmup_effects
     moe_load_balancer = None
+
+    def __init__(self):
+        self._warmup_depth = 0
 
 
 class TestMoeA2AWarmupBudget(unittest.TestCase):
@@ -60,22 +64,27 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
                 self.assertEqual(seen, [False])
             self.assertEqual(seen, [False, True])
 
-    def test_is_warmup_setter_switches_budget_both_ways(self):
+    def test_warmup_scope_switches_budget_both_ways(self):
         """Regression: the budget must not latch on after warmup.
 
-        PyExecutor sets is_warmup=True before calling warmup() and False after,
-        both through this setter. Selecting the budget anywhere else (e.g. only
-        in set_warmup_flag) leaves the relaxed warmup budget in force for the
-        whole serving lifetime.
+        PyExecutor's warmup enters the engine's scope, and engine.warmup()
+        enters it again inside. Only the outermost scope may switch the
+        budget, and leaving it, even by an exception, must restore the
+        steady-state budget for the whole serving lifetime.
         """
-        stub = _WarmupFlagStub()
+        stub = _WarmupScopeStub()
         seen = []
         with mock.patch.object(model_engine, "set_moe_a2a_warmup", side_effect=seen.append):
-            stub.is_warmup = True
-            stub.is_warmup = False
+            with stub.warmup_scope():
+                with stub.warmup_scope():
+                    self.assertEqual(seen, [True])
+                self.assertEqual(seen, [True])
+            with self.assertRaises(RuntimeError):
+                with stub.warmup_scope():
+                    raise RuntimeError("warmup failure")
 
-        self.assertEqual(seen, [True, False])
-        self.assertFalse(stub.is_warmup)
+        self.assertEqual(seen, [True, False, True, False])
+        self.assertEqual(stub._warmup_depth, 0)
 
 
 if __name__ == "__main__":

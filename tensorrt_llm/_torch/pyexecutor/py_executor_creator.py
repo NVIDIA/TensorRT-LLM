@@ -42,9 +42,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    compute_max_num_sequences, create_py_executor_instance,
-                    instantiate_sampler, is_disagg_enabled, is_mla,
-                    validate_feature_combination)
+                    create_py_executor_instance, instantiate_sampler,
+                    is_disagg_enabled, is_mla, validate_feature_combination)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -811,7 +810,7 @@ def _create_py_executor(
                     layer_wise_benchmarks_config.calibration_layer_indices,
                     mapping=mapping,
                     dist=dist)
-    model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
+    calibrator.maybe_wrap_model(model_engine.model)
 
     draft_model_engine = None
 
@@ -840,13 +839,7 @@ def _create_py_executor(
     resolve_cache_transceiver_config(cache_transceiver_config)
 
     config = model_engine.model.model_config.pretrained_config
-    max_num_seq_slots = getattr(
-        model_engine, "max_num_seq_slots", None) or compute_max_num_sequences(
-            mapping,
-            max_batch_size,
-            llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=getattr(model_engine,
-                                            "_enable_overlap_headroom", False))
+    max_num_seq_slots = model_engine.max_num_seq_slots
     if is_mla(config):
         if uses_fp4_mla_attention(model_engine.model.model_config):
             tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
@@ -1185,7 +1178,8 @@ def _create_py_executor(
 
     for engine in (model_engine, draft_model_engine):
         if engine is not None:
-            engine._warmup_timer.purpose = "memory_profiling" if estimating_kv_cache else "final_executor"
+            engine.set_warmup_purpose(
+                "memory_profiling" if estimating_kv_cache else "final_executor")
 
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
@@ -1247,13 +1241,6 @@ def _create_py_executor(
                 with _startup_timer.phase("profiling_kv_cache_teardown"):
                     kv_cache_creator.teardown_managers(resources)
 
-            # configure_kv_cache_capacity shuts down the Phase-1 executor, which
-            # releases its CUDA graphs before its resource managers. Only the
-            # profiling attention metadata remains to be discarded here.
-            for eng in [model_engine, draft_model_engine]:
-                if eng is not None:
-                    eng.attn_metadata = None
-
             del py_executor  # free before constructing new
             gc.collect()
             torch.cuda.empty_cache()
@@ -1267,7 +1254,7 @@ def _create_py_executor(
 
         for engine in (model_engine, draft_model_engine):
             if engine is not None:
-                engine._warmup_timer.purpose = "final_executor"
+                engine.set_warmup_purpose("final_executor")
 
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 

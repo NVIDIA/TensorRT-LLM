@@ -42,7 +42,6 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
-from ..speculative.utils import get_static_draft_len
 from ..tensor_lru_cache import TensorLRUCache
 from ..utils import get_per_request_prefill_cuda_graph_flag, set_torch_compiling
 from .config_utils import is_hybrid_linear
@@ -265,11 +264,7 @@ class PyTorchModelEngine(ModelEngine):
             init_pp_comm(mapping)
         from ._util import (compute_max_num_sequences,
                             resolved_kv_cache_manager_is_v2,
-                            should_enable_adp_dummy_fixes,
-                            should_enable_non_overlap_adp_forward_intent,
-                            should_enable_overlap_headroom,
-                            should_enable_scheduler_aware_adp_dummy)
-        self._enable_adp_dummy_fixes = should_enable_adp_dummy_fixes(mapping)
+                            should_enable_overlap_headroom)
         self.dist = dist
         self.llm_args = llm_args
         if dist is not None:
@@ -303,7 +298,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        self.enable_spec_decode = self.is_spec_decode
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
         )
@@ -356,14 +350,7 @@ class PyTorchModelEngine(ModelEngine):
                 "parallel ranks and cannot be sampled in-graph.")
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
-        model_type = getattr(pretrained_config, "model_type", None)
-        self._enable_scheduler_aware_adp_dummy = (
-            should_enable_scheduler_aware_adp_dummy(
-                model_type, mapping, llm_args.disable_overlap_scheduler))
-        self._enable_non_overlap_adp_forward_intent = (
-            should_enable_non_overlap_adp_forward_intent(
-                mapping, llm_args.disable_overlap_scheduler))
-        self._enable_overlap_headroom = should_enable_overlap_headroom(
+        self.enable_overlap_headroom = should_enable_overlap_headroom(
             mapping,
             llm_args.disable_overlap_scheduler,
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
@@ -375,7 +362,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping,
             self.batch_size,
             llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self._enable_overlap_headroom,
+            enable_overlap_headroom=self.enable_overlap_headroom,
         )
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -401,16 +388,15 @@ class PyTorchModelEngine(ModelEngine):
             input_processor=self.input_processor,
             encoder_max_num_tokens=self.encoder_max_num_tokens)
         self._mm_item_scheduler = mm_item_scheduler
-        # `getattr`-read by py_executor.py and _util.py.
+        # Read by py_executor.py and _util.py.
         self.mm_encoder_item_scheduling_enabled = mm_item_scheduler is not None
         self.mm_encoder_output_budget_bytes: Optional[int] = None
+        self.bytes_per_mm_encoder_embedding: Optional[int] = None
         if mm_item_scheduler is not None:
             # The raised encoder token budget is read back off the engine by
             # `_util.py`, and sizes the encoder metadata set up below.
             self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
-            # Absent, not None, when item scheduling is off: external readers
-            # rely on the `getattr` default.
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
         if isinstance(self.model,
                       MultimodalModelMixin) and mapping.is_first_pp_rank():
@@ -464,8 +450,8 @@ class PyTorchModelEngine(ModelEngine):
             decode_tokens_per_request,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
 
-        self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
-                                           self._cuda_graph_batch_sizes else 0)
+        self.max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
+                                          self._cuda_graph_batch_sizes else 0)
 
         torch_compile_config = self.llm_args.torch_compile_config
         prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
@@ -559,7 +545,10 @@ class PyTorchModelEngine(ModelEngine):
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
 
-        self.is_warmup = False
+        # Start outside warmup: load-balancer statistics on, runtime
+        # all-to-all budget.
+        self._warmup_depth = 0
+        self._set_warmup_effects(False)
 
         sparse_attention_config = self.model.model_config.sparse_attention_config
         sparse_params = (sparse_attention_config.to_sparse_params(
@@ -581,16 +570,9 @@ class PyTorchModelEngine(ModelEngine):
             )
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
             self.max_draft_len = spec_config.max_draft_len
-            # Mutable per-iteration draft length (updated each iteration when
-            # dynamic draft length is enabled; otherwise stays fixed).  Tree
-            # modes verify all tree nodes per step, which can be wider than the
-            # tree depth used by the drafter loop.
-            self.runtime_draft_len = get_static_draft_len(self.spec_config)
-
         else:
             self.without_logits = False
             self.max_draft_len = 0
-            self.runtime_draft_len = 0
             self.max_total_draft_tokens = 0
 
         self.iter_states = {}
@@ -734,7 +716,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_config=self.cuda_graph_config,
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
-            max_cuda_graph_batch_size=self._max_cuda_graph_batch_size,
+            max_cuda_graph_batch_size=self.max_cuda_graph_batch_size,
             prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             enable_in_graph_sampling=self.enable_in_graph_sampling,
@@ -787,21 +769,11 @@ class PyTorchModelEngine(ModelEngine):
             return self._runner.attn_metadata
         return None
 
-    @attn_metadata.setter
-    def attn_metadata(self, value: Optional[AttentionMetadata]) -> None:
-        if isinstance(self._runner, DecoderRunner):
-            self._runner.attn_metadata = value
-
     @property
     def spec_metadata(self) -> Optional[SpecMetadata]:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
         return None
-
-    @spec_metadata.setter
-    def spec_metadata(self, value: Optional[SpecMetadata]) -> None:
-        if isinstance(self._runner, DecoderRunner):
-            self._runner.spec_metadata = value
 
     @property
     def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
@@ -855,7 +827,7 @@ class PyTorchModelEngine(ModelEngine):
         if isinstance(self._runner, DecoderRunner):
             self._runner.lora_model_config = self.lora_model_config
 
-    def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
+    def init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Build LoRA preparation state for the current executor resources."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.init_cuda_graph_lora_manager(lora_config)
@@ -869,41 +841,34 @@ class PyTorchModelEngine(ModelEngine):
             return success
         return False
 
-    @property
-    def is_warmup(self):
-        return getattr(self, "_is_warmup", False)
-
-    @is_warmup.setter
-    def is_warmup(self, value: bool):
-        self._is_warmup = value
-
-        # This setter is the one choke point every warmup transition passes
-        # through, including PyExecutor's, so select the MoE all-to-all budget
-        # here rather than in set_warmup_flag().
-        set_moe_a2a_warmup(value)
-
+    def _set_warmup_effects(self, in_warmup: bool) -> None:
+        set_moe_a2a_warmup(in_warmup)
         if self.moe_load_balancer is not None:
             self.moe_load_balancer.set_iter_info(
-                enable_statistic=not value, enable_update_weights=not value)
+                enable_statistic=not in_warmup,
+                enable_update_weights=not in_warmup)
 
     @contextmanager
-    def set_warmup_flag(self):
-        prev_is_warmup = self.is_warmup
-        self.is_warmup = True
+    def warmup_scope(self):
+        """Run the enclosed passes as warmup.
+
+        Forwards inside the scope are dummy passes, the MoE all-to-all uses its
+        warmup budget, and the load balancer neither records statistics nor
+        updates weights. Scopes nest; the outermost one switches the effects.
+        """
+        self._warmup_depth += 1
+        if self._warmup_depth == 1:
+            self._set_warmup_effects(True)
         try:
             yield
         finally:
-            self.is_warmup = prev_is_warmup
+            self._warmup_depth -= 1
+            if self._warmup_depth == 0:
+                self._set_warmup_effects(False)
 
-    @staticmethod
-    def with_warmup_flag(method):
-
-        @functools.wraps(method)
-        def wrapper(self, *args, **kwargs):
-            with self.set_warmup_flag():
-                return method(self, *args, **kwargs)
-
-        return wrapper
+    def set_warmup_purpose(self, purpose: str) -> None:
+        """Label the following warmup passes in the warmup timing log."""
+        self._warmup_timer.purpose = purpose
 
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
@@ -943,16 +908,13 @@ class PyTorchModelEngine(ModelEngine):
 
         return wrapper
 
-    @with_warmup_flag
-    def _warmup_encoder_cuda_graphs_enc_dec(
-        self,
-        resource_manager: ResourceManager,
-    ) -> None:
+    def warmup_encoder(self, resource_manager: ResourceManager) -> None:
+        """Capture the encoder CUDA graphs of an encoder-decoder runner."""
         if isinstance(self._runner, EncoderDecoderRunner):
-            self._runner.warmup_encoder(resource_manager)
+            with self.warmup_scope():
+                self._runner.warmup_encoder(resource_manager)
 
-    def _get_encoder_cuda_graph_batch_sizes(
-            self, max_batch_size: int) -> tuple[int, ...]:
+    def encoder_graph_batch_sizes(self, max_batch_size: int) -> tuple[int, ...]:
         """Use startup settings while encoder scheduling remains in PyExecutor."""
         if not isinstance(self._runner, EncoderDecoderRunner):
             return ()
@@ -974,19 +936,19 @@ class PyTorchModelEngine(ModelEngine):
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self.is_warmup,
+            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],
             outputs["encoder_seq_lens"],
         )
 
-    @with_warmup_flag
     @warmup_with_kv_cache_cleanup
     def warmup(self,
                resource_manager: Optional[ResourceManager] = None) -> None:
         """Run model warmup and record its total wall-clock duration."""
-        self._warmup_impl(resource_manager)
+        with self.warmup_scope():
+            self._warmup_impl(resource_manager)
 
     def _warmup_impl(self,
                      resource_manager: Optional[ResourceManager] = None
@@ -1080,7 +1042,7 @@ class PyTorchModelEngine(ModelEngine):
             deliberately does *not* call this: it is also invoked mid-init by
             ``configure_kv_cache_capacity``, which reads ``model`` right
             afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
+            calls :meth:`release_executor_resources` and then drops its reference
             instead.
         """
         if self._cleanup_done:
@@ -1097,7 +1059,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # Release runner-owned graphs before dropping the runner. Keep the
         # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
+        self.release_executor_resources()
 
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
@@ -1117,7 +1079,7 @@ class PyTorchModelEngine(ModelEngine):
         """Best-effort cleanup during garbage collection.
 
         Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (which a
-        release step such as :meth:`_release_cuda_graphs` or
+        release step such as :meth:`release_executor_resources` or
         ``ModelLoader.cleanup`` may raise) and ``AttributeError`` (typical
         on partially-initialized engines torn down during interpreter
         shutdown when module references have already been cleared); both
@@ -1221,11 +1183,15 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_seq_len()
         self._init_max_num_tokens()
 
-    def _release_cuda_graphs(self) -> None:
+    def release_executor_resources(self) -> None:
+        """Release CUDA graphs and attention metadata bound to the executor's
+        resource managers, before those managers shut down."""
         if self._runner is not None:
             self._runner.release_graphs()
         if self._torch_compile_backend is not None:
             self._torch_compile_backend.clear_piecewise_cuda_graphs()
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.attn_metadata = None
 
     def get_max_num_sequences(self) -> int:
         """
@@ -1238,30 +1204,28 @@ class PyTorchModelEngine(ModelEngine):
                 batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,
                 new_tensors_device: Optional[SampleStateTensors] = None,
-                cache_indirection_buffer: Optional[torch.Tensor] = None):
+                cache_indirection_buffer: Optional[torch.Tensor] = None,
+                *,
+                enable_spec_decode: bool = False,
+                runtime_draft_len: int = 0):
         if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
                 "a packed batch requires a packed-batch runner")
             return self._runner.forward(batch)
         assert resource_manager is not None, (
             "scheduled execution requires a resource manager")
-        inputs = make_scheduled_inputs(
-            batch,
-            new_tensors_device,
-            cache_indirection_buffer,
-            enable_spec_decode=self.enable_spec_decode,
-            runtime_draft_len=self.runtime_draft_len)
-        # Executor memory profiling establishes this flag. Padding requests in
-        # a serving batch do not make the pass dummy.
-        outputs = self._forward_scheduled(
+        inputs = make_scheduled_inputs(batch,
+                                       new_tensors_device,
+                                       cache_indirection_buffer,
+                                       enable_spec_decode=enable_spec_decode,
+                                       runtime_draft_len=runtime_draft_len)
+        # Only a warmup scope makes the pass dummy; padding requests in a
+        # serving batch do not.
+        return self._forward_scheduled(
             inputs,
             resource_manager=resource_manager,
-            is_dummy=self.is_warmup,
+            is_dummy=self._warmup_depth > 0,
         )
-        if isinstance(outputs, dict):
-            self.runtime_draft_len = outputs.pop("runtime_draft_len",
-                                                 inputs.runtime_draft_len)
-        return outputs
 
     def _forward_scheduled(
         self,

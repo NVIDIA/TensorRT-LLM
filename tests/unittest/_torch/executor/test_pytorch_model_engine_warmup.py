@@ -120,9 +120,6 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         sparse_attention_config=None,
     )
     for name in (
-        "should_enable_adp_dummy_fixes",
-        "should_enable_scheduler_aware_adp_dummy",
-        "should_enable_non_overlap_adp_forward_intent",
         "should_enable_overlap_headroom",
         "resolved_kv_cache_manager_is_v2",
     ):
@@ -456,7 +453,6 @@ def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
         spec_config=config,
         max_draft_len=3,
         max_total_draft_tokens=config.tokens_per_gen_step - 1,
-        runtime_draft_len=3,
     )
     requests = [
         SimpleNamespace(
@@ -470,9 +466,8 @@ def test_draft_length_resolution_resyncs_dynamic_buffers(config_cls):
     def resolve(**kwargs):
         return resolve_draft_len(config, batch, max_draft_len=3, static_draft_len=3, **kwargs)
 
-    # Normal iteration selects K=2 and stores it on the engine.
-    update_draft_len(engine, batch)
-    assert engine.runtime_draft_len == 2
+    # Normal iteration selects K=2.
+    assert update_draft_len(engine, batch) == 2
     assert all(request.py_draft_tokens[:2] == [7, 8] for request in requests)
     # Each explicit warmup shape resynchronizes the buffers and returns its
     # length, even when the batch size is unchanged.
@@ -845,7 +840,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._metrics = {}
-        model_engine.is_warmup = False
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -864,7 +859,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=NoKVCacheRunner)
         runner = model_engine._runner
         runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
@@ -893,7 +888,7 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine._metrics = warmup._metrics = {}
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
+        model_engine._warmup_depth = 0
         model_engine._runner = runner
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = None
@@ -967,16 +962,22 @@ class TestWarmupCleanup(unittest.TestCase):
         model_engine = object.__new__(PyTorchModelEngine)
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
         model_engine.moe_load_balancer = None
-        model_engine.is_warmup = False
+        model_engine._warmup_depth = 0
         model_engine._runner = Mock(spec=EncoderDecoderRunner)
+        warmup_depths = []
+        model_engine._runner.warmup_encoder.side_effect = lambda _: warmup_depths.append(
+            model_engine._warmup_depth
+        )
         resource_manager = object()
 
-        model_engine._warmup_encoder_cuda_graphs_enc_dec(resource_manager)
+        model_engine.warmup_encoder(resource_manager)
 
         self.assertEqual(
             model_engine._runner.method_calls,
             [call.warmup_encoder(resource_manager)],
         )
+        self.assertEqual(warmup_depths, [1])
+        self.assertEqual(model_engine._warmup_depth, 0)
 
     @pytest.mark.cpu_only
     def test_cuda_graph_metrics_exclude_piecewise_stages(self) -> None:
