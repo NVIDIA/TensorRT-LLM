@@ -729,7 +729,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
-        prims_ts_batch_decode_with_kv_cache,
+        prepare_prims_ts_batch_decode_with_kv_cache,
     )
 
     batch_size = 2
@@ -805,18 +805,6 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
     assert plan_state is not None
     compiled_main = plan_state.compiled_main
 
-    aliased_query = (
-        external_workspace[: query.numel() * query.element_size()].view(dtype).view_as(query)
-    )
-    with pytest.raises(ValueError, match="workspace_buffer must not overlap query storage"):
-        wrapper.run(
-            aliased_query,
-            kv_cache,
-            seq_lens,
-            block_tables,
-            out=output,
-        )
-
     external_workspace.zero_()
     wrapper.run(
         query,
@@ -841,18 +829,19 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
     block_tables.copy_(torch.tensor([[2, 3], [0, 1]], device=device, dtype=torch.int32))
     seq_lens.copy_(torch.tensor([32, 64], device=device, dtype=torch.int32))
     reference_workspace = torch.zeros_like(external_workspace)
-    reference = prims_ts_batch_decode_with_kv_cache(
+    reference = torch.empty_like(query)
+    prepare_prims_ts_batch_decode_with_kv_cache(
         query,
         kv_cache,
         reference_workspace,
         block_tables,
         seq_lens,
         max_seq_len,
+        out=reference,
         out_dtype=dtype,
-        out=torch.empty_like(query),
         mask_type="causal",
         kv_layout="HND",
-    )
+    ).run(query, out=reference)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -869,8 +858,8 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
-        prims_ts_batch_mla_decode_with_kv_cache,
     )
 
     batch_size = 2
@@ -956,19 +945,6 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         assert dict(plan_state.policy)["kernel"] == "throughput_2cta"
     bmm1_scale = (128 + qk_rope_head_dim) ** -0.5
 
-    aliased_query = (
-        external_workspace[: query.numel() * query.element_size()].view(dtype).view_as(query)
-    )
-    with pytest.raises(ValueError, match="workspace_buffer must not overlap query storage"):
-        wrapper.run(
-            aliased_query,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            bmm1_scale=bmm1_scale,
-            out=output,
-        )
-
     wrapper.run(
         query,
         kv_cache,
@@ -993,20 +969,20 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     block_tables.copy_(block_tables.flip(0).clone())
     seq_lens.copy_(seq_lens.flip(0).clone())
     reference_workspace = torch.empty_like(external_workspace)
-    reference = prims_ts_batch_mla_decode_with_kv_cache(
+    reference = batch_mla_decode_with_paged_kv_cache(
         query,
         kv_cache,
-        reference_workspace,
-        kv_lora_rank,
-        qk_rope_head_dim,
         block_tables,
         seq_lens,
-        max_seq_len,
         max_seq_len_q=1,
-        bmm1_scale=bmm1_scale,
-        out_dtype=dtype,
-        out=torch.empty_like(output),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         mask_type="causal",
+        max_kv_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        out=torch.empty_like(output),
+        out_dtype=dtype,
+        workspace_buffer=reference_workspace,
     )
     graph.replay()
     torch.cuda.synchronize()
@@ -1022,7 +998,7 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
-        prims_ts_batch_decode_with_kv_cache,
+        prepare_prims_ts_batch_decode_with_kv_cache,
     )
 
     num_qo_heads = 8
@@ -1142,31 +1118,33 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
     plan(1, max_seq_len_a)
 
     reference_workspace = torch.zeros_like(shared_workspace)
-    reference_a = prims_ts_batch_decode_with_kv_cache(
+    reference_a = torch.empty_like(output_a)
+    prepare_prims_ts_batch_decode_with_kv_cache(
         query_a,
         kv_cache,
         reference_workspace,
         block_tables_a,
         seq_lens_a,
         max_seq_len_a,
+        out=reference_a,
         out_dtype=dtype,
-        out=torch.empty_like(output_a),
         mask_type="causal",
         kv_layout="HND",
-    ).clone()
+    ).run(query_a, out=reference_a)
     reference_workspace.zero_()
-    reference_b = prims_ts_batch_decode_with_kv_cache(
+    reference_b = torch.empty_like(output_b)
+    prepare_prims_ts_batch_decode_with_kv_cache(
         query_b,
         kv_cache,
         reference_workspace,
         block_tables_b,
         seq_lens_b,
         max_seq_len_b,
+        out=reference_b,
         out_dtype=dtype,
-        out=torch.empty_like(output_b),
         mask_type="causal",
         kv_layout="HND",
-    ).clone()
+    ).run(query_b, out=reference_b)
 
     actual_a = []
     shared_workspace[control_span_a].fill_(0xFF)
@@ -1198,7 +1176,7 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchDecodePagedTSWrapper,
         get_prims_ts_batch_decode_workspace_size,
-        prims_ts_batch_decode_with_kv_cache,
+        prepare_prims_ts_batch_decode_with_kv_cache,
     )
 
     batch_size = 2
@@ -1283,18 +1261,19 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             out=output,
         )
         reference_workspace = torch.zeros_like(shared_workspace)
-        reference = prims_ts_batch_decode_with_kv_cache(
+        reference = torch.empty_like(query)
+        prepare_prims_ts_batch_decode_with_kv_cache(
             query,
             kv_cache,
             reference_workspace,
             block_tables,
             seq_lens,
             max_seq_len,
+            out=reference,
             out_dtype=dtype,
-            out=torch.empty_like(query),
             mask_type="causal",
             kv_layout="HND",
-        )
+        ).run(query, out=reference)
 
         assert plan_state.workspace_buffer.data_ptr() == shared_workspace.data_ptr(), layer_index
         torch.testing.assert_close(actual, reference, atol=3e-2, rtol=3e-3)

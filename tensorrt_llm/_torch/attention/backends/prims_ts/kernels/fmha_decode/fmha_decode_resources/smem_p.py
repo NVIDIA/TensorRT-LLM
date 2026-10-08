@@ -42,20 +42,22 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
-from ...._block_sparse.common import _block_sparse_proxy_summary_geometry
+from ..fmha_decode_constants import (
+    FP8_P_QUANT_LOG2_SCALE,
+    INT32_SCORE_BIAS,
+)
 from ...placeholder_helpers import _placeholder_smem_array
 from .helpers_common import (
+    _route_is_proxy,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
     fadd2,
     ffma2,
-    fmul2,
     _TASK_CACHE_LANE_IDX,
     _TASK_CACHE_WARP_GRP_THREAD_IDX,
     _TASK_CACHE_WARP_IDX,
     _decode_gen_task_cache,
-    _fp8_log2_quant_scale,
     _is_last_loop_iteration,
     _keeps_col_base,
     _keeps_row_idx,
@@ -65,7 +67,6 @@ from .helpers_common import (
     _neg_max_f32,
     _pack_float2_to_bf16,
     _pack_float2_to_fp16,
-    _swaps_routed_coordinate,
     _wait_for_mbarrier_phase,
 )
 from .helpers_output import (
@@ -77,13 +78,12 @@ from .helpers_output import (
 )
 from .helpers_softmax import (
     _compute_fp8_p_regs_and_local_sums,
-    _compute_fp8_p_regs_and_local_sums_dense,
-    _compute_p_values_and_local_sums_dense,
+    _compute_p_values_and_local_sums,
     _ex2_emulation_packed_f32x2,
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .smem_block_sparse_metadata import _SOFTMAX_ROUTE_IS_PROXY_FLAG
+from .sage_scales import SageKScalesResource
 from .tmem_s import TmemSResource
 
 # Tunable: number of score pairs per streamed fragment whose exponentials run
@@ -144,6 +144,10 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
+    # The instance's ``sfK`` resources, shared with the S resource; proxy
+    # routes read ``sage_summary_k_scales``, everything else ``sage_k_scales``.
+    sage_k_scales: SageKScalesResource | None = None
+    sage_summary_k_scales: SageKScalesResource | None = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -160,8 +164,8 @@ class SmemPResource(DecodeGenResourceBase):
         """Create placeholder P storage state."""
         self._tmem_base_addr = Int32(0)
         self._smem_base_p = _placeholder_smem_array(
-            self.cfg.q_dtype,
-            self.cfg.smem_p_tile_bytes // self.cfg.q_dtype_bytes,
+            self.cfg.pv_dtype,
+            self.cfg.smem_p_tile_bytes // self.cfg.pv_dtype_bytes,
         )
         self._smem_base_p_i32 = _placeholder_smem_array(
             Int32, self.cfg.smem_p_tile_bytes // 4
@@ -266,8 +270,8 @@ class SmemPResource(DecodeGenResourceBase):
             smem_base_ptr = context.smem_base.data_ptr() + self._alloc.offset
             self._smem_base_p = cutlass.Array(
                 smem_base_ptr,
-                dtype=self.cfg.q_dtype,
-                shape=(self.cfg.smem_p_tile_bytes // self.cfg.q_dtype_bytes,),
+                dtype=self.cfg.pv_dtype,
+                shape=(self.cfg.smem_p_tile_bytes // self.cfg.pv_dtype_bytes,),
                 addrspace=3,
             )
             self._smem_base_p_i32 = cutlass.Array(
@@ -319,26 +323,36 @@ class SmemPResource(DecodeGenResourceBase):
         self._create_initial_task_locals(stage_info.context)
 
     @cute.jit
-    def _apply_proxy_route_denominator_mass(
+    def _exponent_addend(
         self,
-        local_sum: Float32,
-        tail_p: Float32,
-        route_is_proxy: Int32,
+        new_max: Float32,
+        route_is_proxy: cutlass.Boolean,
+        *,
+        guards_masked_rows: Constexpr[bool] = True,
     ) -> Float32:
-        """Weight only a proxy route's softmax denominator by block mass."""
+        """Return ``addend`` of one row's P exponent ``exp2(c * s + addend)``.
 
-        if cutlass.const_expr(not self.cfg.use_block_sparse_proxy_routes):
-            return local_sum
-        if route_is_proxy != Int32(0):
-            _, tail_len = _block_sparse_proxy_summary_geometry(
-                self.cfg.static_seq_len_kv,
-                self.cfg.kv_block_size,
-            )
-            local_sum *= Float32(self.cfg.kv_block_size)
-            tail_delta = tail_len - self.cfg.kv_block_size
-            if cutlass.const_expr(tail_delta != 0):
-                local_sum += Float32(tail_delta) * tail_p
-        return local_sum
+        - ``-c * max`` anchors the row; a fully masked row (``-FLT_MAX``
+          maximum) anchors on zero so its scores exponentiate to zero, not NaN.
+          Callers whose masked rows are skipped or discarded downstream pass
+          ``guards_masked_rows=False``.
+        - Byte-wide P adds ``log2(448)``, its static FP8 quantization scale.
+        - A proxy route adds ``log2`` of its block mass, as the max pass does,
+          so each summary probability carries the tokens it stands for.
+        """
+        cfg = self.cfg
+        safe_new_max = new_max
+        if cutlass.const_expr(guards_masked_rows):
+            if safe_new_max == _neg_max_f32():
+                safe_new_max = Float32(0.0)
+        # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
+        addend = Float32(-self.scale_softmax_log2 * safe_new_max)
+        if cutlass.const_expr(self.cfg.use_fp8_pv):
+            addend += Float32(FP8_P_QUANT_LOG2_SCALE)
+        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+            if route_is_proxy:
+                addend += Float32(cfg.proxy_log2_block_mass)
+        return addend
 
     @producer_work
     @cute.jit
@@ -352,9 +366,29 @@ class SmemPResource(DecodeGenResourceBase):
         self._compute_p_fragments_impl(
             stage_info,
             new_max_arr=new_max_arr,
-            route_is_proxy=Int32(0),
-            route_origin0=Int32(0),
-            route_origin1=Int32(0),
+            route_is_proxy=cutlass.Boolean(False),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_sage_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        sage_q_scale: Float32,
+        sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
+    ) -> None:
+        """Stream every K32 fragment with per-group Sage dequantization scales."""
+        assert self.cfg.use_sage_attention
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=cutlass.Boolean(False),
+            sage_q_scale=sage_q_scale,
+            sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @producer_work
@@ -365,20 +399,36 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         route_flags: Int32,
-        route_origin0: Int32,
-        route_origin1: Int32,
     ) -> None:
-        """Stream every proxy-capable KV256 K32 fragment from one rolled loop."""
+        """Stream every exact or proxy K32 fragment from one rolled loop."""
         assert self.cfg.use_block_sparse_proxy_routes
-        route_is_proxy = Int32(
-            (route_flags & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Int32(0)
-        )
         self._compute_p_fragments_impl(
             stage_info,
             new_max_arr=new_max_arr,
-            route_is_proxy=route_is_proxy,
-            route_origin0=route_origin0,
-            route_origin1=route_origin1,
+            route_is_proxy=_route_is_proxy(route_flags),
+        )
+
+    @producer_work
+    @cute.jit
+    def compute_sage_proxy_route_p_fragments(
+        self,
+        stage_info: StageInfo,
+        *,
+        new_max_arr: cutlass.Array,
+        route_flags: Int32,
+        sage_q_scale: Float32,
+        sage_scale_arr: cutlass.Array,
+        sage_summary_scale_arr: cutlass.Array,
+    ) -> None:
+        """Stream exact or proxy K32 fragments with per-group Sage scales."""
+        assert self.cfg.use_block_sparse_proxy_routes and self.cfg.use_sage_attention
+        self._compute_p_fragments_impl(
+            stage_info,
+            new_max_arr=new_max_arr,
+            route_is_proxy=_route_is_proxy(route_flags),
+            sage_q_scale=sage_q_scale,
+            sage_scale_arr=sage_scale_arr,
+            sage_summary_scale_arr=sage_summary_scale_arr,
         )
 
     @cute.jit
@@ -387,75 +437,192 @@ class SmemPResource(DecodeGenResourceBase):
         stage_info: StageInfo,
         *,
         new_max_arr: cutlass.Array,
-        route_is_proxy: Int32,
-        route_origin0: Int32,
-        route_origin1: Int32,
+        route_is_proxy: cutlass.Boolean,
+        sage_q_scale: Float32 | None = None,
+        sage_scale_arr: cutlass.Array | None = None,
+        sage_summary_scale_arr: cutlass.Array | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
         The fragment index is a runtime loop variable, so the exponentiation
         body exists once in the instruction stream and only the TMEM column
-        offset, the fragment barrier, and the proxy tail bookkeeping depend on
-        it. Unrolling the fragments would replicate that body for every
-        fragment and both softmax instances and leave the softmax warps
-        instruction-fetch bound. The max pass has already written masked
-        scores back to TMEM, so the reload needs no mask logic of its own.
+        offset and the fragment barrier depend on it. Unrolling the fragments
+        would replicate that body for every fragment and both softmax
+        instances and leave the softmax warps instruction-fetch bound. The max
+        pass has already written masked (and mass-shifted) scores back to
+        TMEM, so the reload needs no mask or route logic beyond the proxy
+        addend. Sage attention changes only the per-group multipliers
+        ``c * sfQ * sfK_g``, biased INT32 scores only the per-group addends.
         """
-        _ = stage_info
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
         assert self._tmem_alloc.offset == self.tmem_s_ref._alloc.offset
-        # One FP32 score per column, two packed 16-bit probabilities per column.
+        # One FP32 score per column; two 16-bit or four FP8 probabilities per
+        # packed column.
         fragment_regs = cfg.softmax_score_fragment_regs
-        fragment_cols = fragment_regs // 2
+        fragment_cols = cfg.fragment_p_packed_cols
 
-        new_max = new_max_arr[0]
-        safe_new_max = new_max
-        if safe_new_max == _neg_max_f32():
-            safe_new_max = Float32(0.0)
-        minus_max_scale = Float32(-self.scale_softmax_log2 * safe_new_max)
+        exponent_addend = self._exponent_addend(new_max_arr[0], route_is_proxy)
         tmem_base = self._tmem_base_addr + Int32(self._tmem_alloc.offset)
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
-        total_sum = Float32(0.0)
+        # ``c * sfQ`` is one factor per lane and tile: the only multiplier of a
+        # route kind whose max pass returns dequantized scores (no bias),
+        # otherwise folded into the kind's raw ``sfK`` words.
+        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=False
+        )
+        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=True
+        )
+        exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
+            cfg.sage_k_groups_per_fragment
+        )
+        # A mixed geometry selects the resource per fragment on the CTA-uniform
+        # route kind, unless proxy scores are dequantized and the exact words
+        # sit in registers: the exact resource then serves both kinds, routing
+        # ones on a proxy tile.
+        unified_scales: Constexpr[bool] = (
+            cfg.sage_mixed_k_geometry
+            and summary_dequantized
+            and not exact_scales_in_smem
+        )
+        mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
+        exp_scale = None
+        scales_view = None
+        summary_view = None
+        score_bias = None
+        row_multipliers = None
+        row_addends = None
+        if cutlass.const_expr(cfg.use_sage_attention):
+            exp_scale = self.scale_softmax_log2 * sage_q_scale
+            if cutlass.const_expr(exact_dequantized or summary_dequantized):
+                row_multipliers = cutlass.Array(
+                    Float32, 1, space=cutlass.AddressSpace.rmem
+                )
+                row_addends = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+                row_multipliers[0] = exp_scale
+                row_addends[0] = exponent_addend
+            if cutlass.const_expr(not exact_dequantized):
+                scales_view = self.sage_k_scales.open(
+                    stage_info, sage_scale_arr, exp_scale
+                )
+            if cutlass.const_expr(mixed_scales and not summary_dequantized):
+                summary_view = self.sage_summary_k_scales.open(
+                    stage_info, sage_summary_scale_arr, exp_scale
+                )
+            if cutlass.const_expr(unified_scales and cfg.uses_int32_scores):
+                score_bias = Float32(INT32_SCORE_BIAS)
+                if route_is_proxy:
+                    score_bias = Float32(0.0)
+
+        # A fragment is scaled before its first exponential, and the next
+        # fragment's TMEM load issues once the scale FFMAs have consumed the
+        # scores, so it reuses their registers and hides behind the
+        # exponentials. The running sum stays a packed pair until the loop ends.
+        num_fragments = cfg.num_softmax_score_fragments
+        last_fragment = Int32(num_fragments - 1)
+        total_sum_pair = (Float32(0.0), Float32(0.0))
+        s_arr = cutlass.Array(Float32, fragment_regs, space=cutlass.AddressSpace.rmem)
+        pending_scores = cutlass.Array(
+            Float32, fragment_regs, space=cutlass.AddressSpace.rmem
+        )
+        self._load_score_fragment(tmem_base, Int32(0), pending_scores)
         for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
-            loaded = _keeps_tcgen05_ld(
-                cfg,
-                prims.make_tmem_ptr(
-                    tmem_base + fragment * Int32(fragment_regs), Float32
-                ),
-                num=fragment_regs,
-                offset=cfg.tile_size_kv // 2,
-            )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            s_arr = cutlass.Array(
-                Float32, fragment_regs, space=cutlass.AddressSpace.rmem
-            )
             for score_idx in cutlass.range_constexpr(fragment_regs):
-                s_arr[score_idx] = loaded[score_idx]
+                s_arr[score_idx] = pending_scores[score_idx]
 
-            local_sum = self._exponentiate_fragment_pairs(s_arr, minus_max_scale)
-            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                if route_is_proxy != Int32(0):
-                    local_sum = self._proxy_fragment_sum(
-                        local_sum,
-                        s_arr,
-                        fragment_origin=self._runtime_fragment_origin(
-                            fragment, route_origin0, route_origin1
-                        ),
+            if cutlass.const_expr(mixed_scales):
+                # Each route kind scales the fragment in place with its own
+                # resource, so only the scores cross the branch.
+                if route_is_proxy:
+                    if cutlass.const_expr(summary_dequantized):
+                        self._scale_fragment_pairs(
+                            s_arr, row_addends, row_multipliers, groups=1
+                        )
+                    else:
+                        self._scale_fragment_with(
+                            self.sage_summary_k_scales,
+                            summary_view,
+                            fragment,
+                            s_arr,
+                            exponent_addend,
+                        )
+                else:
+                    if cutlass.const_expr(exact_dequantized):
+                        self._scale_fragment_pairs(
+                            s_arr, row_addends, row_multipliers, groups=1
+                        )
+                    else:
+                        self._scale_fragment_with(
+                            self.sage_k_scales,
+                            scales_view,
+                            fragment,
+                            s_arr,
+                            exponent_addend,
+                        )
+            elif cutlass.const_expr(exact_dequantized):
+                self._scale_fragment_pairs(
+                    s_arr, row_addends, row_multipliers, groups=1
+                )
+            else:
+                fragment_multipliers = None
+                if cutlass.const_expr(cfg.use_sage_attention):
+                    fragment_multipliers = self.sage_k_scales.fragment(
+                        scales_view, fragment
                     )
+                    self.sage_k_scales.advance(scales_view)
+                group_multipliers, group_addends = self._fragment_exponent_terms(
+                    fragment_multipliers,
+                    exponent_addend,
+                    groups=cfg.sage_k_groups_per_fragment,
+                    score_bias=score_bias,
+                )
+                self._scale_fragment_pairs(
+                    s_arr,
+                    group_addends,
+                    group_multipliers,
+                    groups=cfg.sage_k_groups_per_fragment,
+                )
+            # The last iteration reloads its own fragment so the loop body
+            # stays branch-free; the wait after the loop retires it.
+            next_fragment = fragment + Int32(1)
+            if next_fragment > last_fragment:
+                next_fragment = last_fragment
+            self._load_score_fragment(tmem_base, next_fragment, pending_scores)
+            local_sum_pair = self._exponentiate_fragment_pairs(s_arr)
+            total_sum_pair = cute.arch.add_packed_f32x2(total_sum_pair, local_sum_pair)
 
-            packed_p = (
-                s_arr.data_ptr()
-                .load(count=fragment_regs, alignment=4)
-                .to(cfg.q_dtype)
-                .bitcast(Int32)
-            )
+            if cutlass.const_expr(cfg.use_fp8_pv):
+                packed_regs = cutlass.Array(
+                    Int32, fragment_cols, space=cutlass.AddressSpace.rmem
+                )
+                for col_idx in cutlass.range_constexpr(fragment_cols):
+                    value_base = col_idx * 4
+                    packed_regs[col_idx] = _pack_float4_to_fp8_e4m3_inline(
+                        Float32(s_arr[value_base]),
+                        Float32(s_arr[value_base + 1]),
+                        Float32(s_arr[value_base + 2]),
+                        Float32(s_arr[value_base + 3]),
+                    )
+                packed_p = packed_regs.data_ptr().load(count=fragment_cols, alignment=4)
+            else:
+                packed_p = (
+                    s_arr.data_ptr()
+                    .load(count=fragment_regs, alignment=4)
+                    .to(cfg.pv_dtype)
+                    .bitcast(Int32)
+                )
+            # Fence the packed TMEM store before one lane per warp arrives, so
+            # the MMA warp can start this fragment's PV k-slice.
             _keeps_tcgen05_st(
                 cfg,
-                prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_cols), Int32),
+                prims.make_tmem_ptr(
+                    tmem_base + fragment * Int32(cfg.fragment_p_packed_cols), Int32
+                ),
                 packed_p,
                 offset=cfg.tmem_p_cols_per_inst,
             )
@@ -463,51 +630,154 @@ class SmemPResource(DecodeGenResourceBase):
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
             if publishes_fragment:
                 prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
-            total_sum += local_sum
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
 
     @cute.jit
-    def _runtime_fragment_origin(
-        self, fragment: Int32, route_origin0: Int32, route_origin1: Int32
-    ) -> Int32:
-        """Return the token origin of a fragment selected at runtime.
-
-        Each lane's fragments cover two K64 route atoms in order: the first
-        atom's fragments start at ``route_origin0``, the second atom's at
-        ``route_origin1``, and consecutive fragments within an atom advance by
-        one fragment width.
-        """
-        cfg = self.cfg
-        fragment_regs = cfg.softmax_score_fragment_regs
-        fragments_per_origin = cfg.softmax_fragments_per_route_atom
-        fragment_origin = Int32(route_origin0)
-        if fragment >= Int32(fragments_per_origin):
-            fragment_origin = Int32(route_origin1)
-        return fragment_origin + (fragment % Int32(fragments_per_origin)) * Int32(
-            fragment_regs
+    def _scale_fragment_with(
+        self,
+        scales: Constexpr[SageKScalesResource],
+        view,
+        fragment: Int32,
+        s_arr: cutlass.Array,
+        exponent_addend: Float32,
+    ) -> None:
+        """Turn one fragment's scores into log2 exponents with one route kind's resource."""
+        groups = scales.groups
+        fragment_multipliers = scales.fragment(view, fragment)
+        scales.advance(view)
+        group_multipliers, group_addends = self._fragment_exponent_terms(
+            fragment_multipliers, exponent_addend, groups=groups
+        )
+        self._scale_fragment_pairs(
+            s_arr, group_addends, group_multipliers, groups=groups
         )
 
     @cute.jit
-    def _exponentiate_fragment_pairs(
-        self, s_arr: cutlass.Array, minus_max_scale: Float32
-    ) -> Float32:
-        """Turn one fragment of scaled scores into probabilities in place.
+    def _load_score_fragment(
+        self, tmem_base: Int32, fragment: Int32, scores: cutlass.Array
+    ) -> None:
+        """Issue the TMEM load of one K32 score fragment into ``scores``.
 
-        Returns the fragment's probability sum. Eight independent chains keep
-        the denominator update off one long dependency chain, and a configurable
-        subset of pairs runs its exponentials on the FMA pipe.
+        The caller waits for the load before reading ``scores``. The copy runs
+        before that wait, so it must stay a constant-indexed register rename
+        without optimization barriers, or it would read the destination early.
+        """
+        cfg = self.cfg
+        fragment_regs = cfg.softmax_score_fragment_regs
+        loaded = _keeps_tcgen05_ld(
+            cfg,
+            prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_regs), Float32),
+            num=fragment_regs,
+            offset=cfg.tile_size_kv // 2,
+        )
+        for score_idx in cutlass.range_constexpr(fragment_regs):
+            scores[score_idx] = loaded[score_idx]
+
+    @cute.jit
+    def _scale_fragment_pairs(
+        self,
+        s_arr: cutlass.Array,
+        group_addends: cutlass.Array,
+        group_multipliers: cutlass.Array,
+        groups: Constexpr[int],
+    ) -> None:
+        """Turn one fragment of scores into log2 exponents in place.
+
+        Each score takes the multiplier and addend of its compile-time scale
+        group (``groups`` per fragment); the two scores of a pair differ in
+        group only for the one-token K block.
+        """
+        fragment_regs = self.cfg.softmax_score_fragment_regs
+        group_regs = fragment_regs // groups
+        for value_idx in cutlass.range_constexpr(0, fragment_regs, 2):
+            group0: Constexpr[int] = value_idx // group_regs
+            group1: Constexpr[int] = (value_idx + 1) // group_regs
+            s_arr[value_idx], s_arr[value_idx + 1] = cute.arch.fma_packed_f32x2(
+                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                (
+                    Float32(group_multipliers[group0]),
+                    Float32(group_multipliers[group1]),
+                ),
+                (Float32(group_addends[group0]), Float32(group_addends[group1])),
+            )
+
+    @cute.jit
+    def _fragment_exponent_terms(
+        self,
+        fragment_multipliers: cutlass.Array | None,
+        exponent_addend: Float32,
+        groups: Constexpr[int],
+        score_bias: Float32 | None = None,
+    ) -> tuple[cutlass.Array, cutlass.Array]:
+        """Return one fragment's exponent multipliers and addends per scale group.
+
+        The multipliers are the resource's ``c * sfQ * sfK_g`` under Sage, else
+        the softmax scale. Biased INT32 scores subtract ``bias * multiplier``
+        from the row's addend; ``score_bias`` replaces the constant bias when
+        given (zero on a tile whose scores come back dequantized).
+        """
+        cfg = self.cfg
+        neg_bias = Float32(-INT32_SCORE_BIAS)
+        if cutlass.const_expr(score_bias is not None):
+            neg_bias = -score_bias
+        group_multipliers = cutlass.Array(
+            Float32, groups, space=cutlass.AddressSpace.rmem
+        )
+        group_addends = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
+        if cutlass.const_expr(cfg.use_sage_attention):
+            for group_idx in cutlass.range_constexpr(groups):
+                group_multipliers[group_idx] = Float32(fragment_multipliers[group_idx])
+        else:
+            group_multipliers[0] = self.scale_softmax_log2
+        if cutlass.const_expr(cfg.uses_int32_scores):
+            # One rounding per group instead of one conversion per score; the
+            # error stays below one quantized score unit.
+            bias_pair = (neg_bias, neg_bias)
+            for group_base in cutlass.range_constexpr(0, groups - groups % 2, 2):
+                group_addends[group_base], group_addends[group_base + 1] = (
+                    cute.arch.fma_packed_f32x2(
+                        bias_pair,
+                        (
+                            Float32(group_multipliers[group_base]),
+                            Float32(group_multipliers[group_base + 1]),
+                        ),
+                        (exponent_addend, exponent_addend),
+                    )
+                )
+            if cutlass.const_expr(groups % 2 == 1):
+                group_addends[groups - 1] = Float32(
+                    cute.math.fma(
+                        neg_bias,
+                        Float32(group_multipliers[groups - 1]),
+                        exponent_addend,
+                    )
+                )
+        else:
+            for group_idx in cutlass.range_constexpr(groups):
+                group_addends[group_idx] = exponent_addend
+        return group_multipliers, group_addends
+
+    @cute.jit
+    def _exponentiate_fragment_pairs(
+        self, s_arr: cutlass.Array
+    ) -> tuple[Float32, Float32]:
+        """Turn one fragment of log2 exponents into probabilities in place.
+
+        Returns the fragment's probability sum as a packed pair. Eight
+        independent chains keep the denominator update off one long dependency
+        chain; the first four pairs seed them, since an add to zero is a real
+        FADD. A configurable subset of pairs runs its exponentials on the FMA
+        pipe.
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
+        assert pairs_per_fragment >= 4
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-        for chain_idx in cutlass.range_constexpr(8):
-            sum_chains[chain_idx] = Float32(0.0)
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
-            p0, p1 = cute.arch.fma_packed_f32x2(
-                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                (self.scale_softmax_log2, self.scale_softmax_log2),
-                (minus_max_scale, minus_max_scale),
-            )
+            p0 = Float32(s_arr[value_idx])
+            p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
             ):
@@ -518,12 +788,16 @@ class SmemPResource(DecodeGenResourceBase):
             s_arr[value_idx] = p0
             s_arr[value_idx + 1] = p1
             chain_idx = (pair_idx & 3) * 2
-            sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
-                cute.arch.add_packed_f32x2(
-                    (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
-                    (p0, p1),
+            if cutlass.const_expr(pair_idx < 4):
+                sum_chains[chain_idx] = p0
+                sum_chains[chain_idx + 1] = p1
+            else:
+                sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
+                    cute.arch.add_packed_f32x2(
+                        (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
+                        (p0, p1),
+                    )
                 )
-            )
         sum01 = cute.arch.add_packed_f32x2(
             (sum_chains[0], sum_chains[1]),
             (sum_chains[2], sum_chains[3]),
@@ -532,44 +806,7 @@ class SmemPResource(DecodeGenResourceBase):
             (sum_chains[4], sum_chains[5]),
             (sum_chains[6], sum_chains[7]),
         )
-        total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
-        return Float32(total_pair[0] + total_pair[1])
-
-    @cute.jit
-    def _proxy_fragment_sum(
-        self,
-        local_sum: Float32,
-        s_arr: cutlass.Array,
-        *,
-        fragment_origin: Int32,
-    ) -> Float32:
-        """Weight a proxy fragment's sum by the token mass each summary stands for.
-
-        KC stores one mean K vector per semantic KV block while VC stores its V
-        sum. P itself stays unweighted for PV; only the denominator accounts
-        for the represented token count, with the final summary covering the
-        shorter tail block.
-        """
-        cfg = self.cfg
-        fragment_regs = cfg.softmax_score_fragment_regs
-        num_summaries, tail_len = _block_sparse_proxy_summary_geometry(
-            cfg.static_seq_len_kv,
-            cfg.kv_block_size,
-        )
-        local_sum *= Float32(cfg.kv_block_size)
-        tail_delta = tail_len - cfg.kv_block_size
-        if cutlass.const_expr(tail_delta != 0):
-            final_summary_idx = num_summaries - 1
-            final_summary_offset = Int32(final_summary_idx) - fragment_origin
-            if final_summary_offset >= Int32(0) and final_summary_offset < Int32(
-                fragment_regs
-            ):
-                # Proxy fragment origins are fragment-aligned in summary
-                # coordinates, so the tail's in-fragment lane is a compile-time
-                # constant even though route ownership is decided at runtime.
-                tail_lane = final_summary_idx % fragment_regs
-                local_sum += Float32(tail_delta) * Float32(s_arr[tail_lane])
-        return local_sum
+        return cute.arch.add_packed_f32x2(sum01, sum23)
 
     @cute.jit
     def _compute_keeps_p(
@@ -578,6 +815,7 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
+        route_is_proxy: cutlass.Boolean,
     ) -> None:
         """Materialize one complete-row Keeps probability tile.
 
@@ -607,13 +845,7 @@ class SmemPResource(DecodeGenResourceBase):
                 + stage_info.stage_idx * cfg.tmem_s_cols
             )
 
-        new_max = new_max_arr[0]
-        safe_new_max = new_max
-        if safe_new_max == _neg_max_f32():
-            safe_new_max = Float32(0.0)
-        neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-        if cutlass.const_expr(cfg.use_fp8_qkv):
-            neg_scaled_max += _fp8_log2_quant_scale()
+        exponent_addend = self._exponent_addend(new_max_arr[0], route_is_proxy)
 
         # Preserve four independent modulo-4 sum chains as two packed pairs,
         # without keeping a second 16-value P array live beside the S row.
@@ -626,7 +858,7 @@ class SmemPResource(DecodeGenResourceBase):
         for block_idx in cutlass.range_constexpr(num_vector_blocks):
             s_base = block_idx * vector_elements
             packed_base = block_idx * 4 if cfg.uses_two_inst_tmem_p else 0
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_fp8_pv):
                 for packed_idx in cutlass.range_constexpr(4):
                     val_base = packed_idx * 4
                     scaled_pair_01 = ffma2(
@@ -635,7 +867,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base + 1],
                         ),
                         (self.scale_softmax_log2, self.scale_softmax_log2),
-                        (neg_scaled_max, neg_scaled_max),
+                        (exponent_addend, exponent_addend),
                     )
                     p_pair_01 = (
                         cute.math.exp2(scaled_pair_01[0], fastmath=True),
@@ -648,7 +880,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base + 3],
                         ),
                         (self.scale_softmax_log2, self.scale_softmax_log2),
-                        (neg_scaled_max, neg_scaled_max),
+                        (exponent_addend, exponent_addend),
                     )
                     p_pair_23 = (
                         cute.math.exp2(scaled_pair_23[0], fastmath=True),
@@ -672,7 +904,7 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base + 1],
                         ),
                         (self.scale_softmax_log2, self.scale_softmax_log2),
-                        (neg_scaled_max, neg_scaled_max),
+                        (exponent_addend, exponent_addend),
                     )
                     p_pair = (
                         cute.math.exp2(scaled_pair[0], fastmath=True),
@@ -682,7 +914,7 @@ class SmemPResource(DecodeGenResourceBase):
                         local_sum_pair_01 = fadd2(local_sum_pair_01, p_pair)
                     else:
                         local_sum_pair_23 = fadd2(local_sum_pair_23, p_pair)
-                    if cutlass.const_expr(cfg.use_bf16_qkv):
+                    if cutlass.const_expr(cfg.use_bf16_pv):
                         packed_p[packed_base + packed_idx] = _pack_float2_to_bf16(
                             p_pair[0], p_pair[1]
                         )
@@ -717,11 +949,11 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p.data_ptr().load(count=4, alignment=4), alignment=16
                 )
         if cutlass.const_expr(cfg.uses_two_inst_tmem_p):
-            # FP8 publishes the complete row with one x32 STTM. Dense 16-bit
-            # Q128/KV128 uses x16 slices to limit Softmax register pressure.
-            # Block-sparse two-instance profiles stream K32 fragments instead.
-            assert cfg.num_packed_p_regs in (32, 64)
-            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_qkv else 16
+            # FP8 publishes a complete row with one x16/x32 STTM. FP16/BF16
+            # uses x16 slices to limit Softmax register pressure. This is the
+            # complete-row Q128/KV128 path; KV256 publishes K32 fragments.
+            assert cfg.num_packed_p_regs in (16, 32, 64)
+            regs_per_store = cfg.num_packed_p_regs if cfg.use_fp8_pv else 16
             assert cfg.num_packed_p_regs % regs_per_store == 0
             for store_idx in cutlass.range_constexpr(
                 cfg.num_packed_p_regs // regs_per_store
@@ -777,11 +1009,7 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
-        route_is_proxy: Int32,
-        route_origin0: Int32,
-        route_origin1: Int32,
-        route_origin2: Int32,
-        route_origin3: Int32,
+        route_is_proxy: cutlass.Boolean,
     ) -> None:
         """Compute P from S, stage its BMM2 operand, and publish local sums."""
         cfg = self.cfg
@@ -790,6 +1018,7 @@ class SmemPResource(DecodeGenResourceBase):
                 stage_info,
                 new_max_arr=new_max_arr,
                 s_arr=s_arr,
+                route_is_proxy=route_is_proxy,
             )
             return
         # ProdWork: transform the softmax S registers into the P operand layout
@@ -800,7 +1029,16 @@ class SmemPResource(DecodeGenResourceBase):
         task_cache = _decode_gen_task_cache(stage_info)
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = Int32(task_cache[_TASK_CACHE_LANE_IDX])
-        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_qkv):
+        # Static launches whose KV tiles split evenly between the instances
+        # exponentiate unmasked tiles; a row that stays at -FLT_MAX there is
+        # discarded by reduce_sums and the correction gates.
+        static_even_tiles = (
+            not self.use_variable_seqlens_kv
+            and cfg.total_kv_tiles > 0
+            and cfg.total_kv_tiles % cfg.num_insts_kv == 0
+        )
+        guards_fp8_rows = not (static_even_tiles and cfg.q_tiles_are_full)
+        if cutlass.const_expr(cfg.tile_size_q == 32 and cfg.use_fp8_pv):
             # Tile-Q=32 FP8 fast path: compute E4M3 P registers in the
             # same order consumed by the STSM helper, while also capturing
             # one local denominator sum per softmax scale group.
@@ -812,59 +1050,34 @@ class SmemPResource(DecodeGenResourceBase):
                 cfg.num_softmax_scale_groups,
                 space=cutlass.AddressSpace.rmem,
             )
-            if cutlass.const_expr(
-                not self.use_variable_seqlens_kv
-                and cfg.total_kv_tiles > 0
-                and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
-                and cfg.q_tiles_are_full
-            ):
-                # Dense full tiles have no tail/window masking. Use the
-                # straight-line helper to keep this path compact.
-                for scale_pair_idx in cutlass.range_constexpr(4):
-                    scale_base = scale_pair_idx * 2
-                    q32_s_base = scale_pair_idx * 4
-                    p_lo, p_hi, sum_lo, sum_hi = (
-                        _compute_fp8_p_regs_and_local_sums_dense(
-                            self.scale_softmax_log2,
-                            new_max_arr[scale_base],
-                            new_max_arr[scale_base + 1],
-                            s_arr[q32_s_base],
-                            s_arr[q32_s_base + 1],
-                            s_arr[q32_s_base + 2],
-                            s_arr[q32_s_base + 3],
-                            s_arr[q32_s_base + 16],
-                            s_arr[q32_s_base + 17],
-                            s_arr[q32_s_base + 18],
-                            s_arr[q32_s_base + 19],
-                        )
-                    )
-                    packed_p[scale_pair_idx] = p_lo
-                    packed_p[scale_pair_idx + 4] = p_hi
-                    local_sum[scale_base] = sum_lo
-                    local_sum[scale_base + 1] = sum_hi
-            else:
-                # General path handles masked S values from variable
-                # seqlens, odd tail waves, sliding window, or split-KV.
-                for scale_pair_idx in cutlass.range_constexpr(4):
-                    scale_base = scale_pair_idx * 2
-                    q32_s_base = scale_pair_idx * 4
-                    p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
-                        self.scale_softmax_log2,
+            for scale_pair_idx in cutlass.range_constexpr(4):
+                scale_base = scale_pair_idx * 2
+                q32_s_base = scale_pair_idx * 4
+                p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
+                    self.scale_softmax_log2,
+                    self._exponent_addend(
                         new_max_arr[scale_base],
+                        route_is_proxy,
+                        guards_masked_rows=guards_fp8_rows,
+                    ),
+                    self._exponent_addend(
                         new_max_arr[scale_base + 1],
-                        s_arr[q32_s_base],
-                        s_arr[q32_s_base + 1],
-                        s_arr[q32_s_base + 2],
-                        s_arr[q32_s_base + 3],
-                        s_arr[q32_s_base + 16],
-                        s_arr[q32_s_base + 17],
-                        s_arr[q32_s_base + 18],
-                        s_arr[q32_s_base + 19],
-                    )
-                    packed_p[scale_pair_idx] = p_lo
-                    packed_p[scale_pair_idx + 4] = p_hi
-                    local_sum[scale_base] = sum_lo
-                    local_sum[scale_base + 1] = sum_hi
+                        route_is_proxy,
+                        guards_masked_rows=guards_fp8_rows,
+                    ),
+                    s_arr[q32_s_base],
+                    s_arr[q32_s_base + 1],
+                    s_arr[q32_s_base + 2],
+                    s_arr[q32_s_base + 3],
+                    s_arr[q32_s_base + 16],
+                    s_arr[q32_s_base + 17],
+                    s_arr[q32_s_base + 18],
+                    s_arr[q32_s_base + 19],
+                )
+                packed_p[scale_pair_idx] = p_lo
+                packed_p[scale_pair_idx + 4] = p_hi
+                local_sum[scale_base] = sum_lo
+                local_sum[scale_base + 1] = sum_hi
             # Publish the local denominator contribution before committing P so
             # TmemS can update the online-softmax sum after P materialization.
             for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
@@ -899,7 +1112,7 @@ class SmemPResource(DecodeGenResourceBase):
             prims.barrier_cta_sync(4 + self.inst_id, thread_count=128)
             return
 
-        if cutlass.const_expr(cfg.tile_size_q == 16 and cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.tile_size_q == 16 and cfg.use_fp8_pv):
             # Tile-Q=16 FP8 fast path: each helper call handles two softmax
             # scale groups and returns the low/high K halves already packed for
             # STSM. This avoids keeping all 16 FP32 P values live and packing
@@ -915,41 +1128,27 @@ class SmemPResource(DecodeGenResourceBase):
             for scale_pair_idx in cutlass.range_constexpr(2):
                 scale_base = scale_pair_idx * 2
                 s_base = scale_pair_idx * 4
-                if cutlass.const_expr(
-                    not self.use_variable_seqlens_kv
-                    and cfg.total_kv_tiles > 0
-                    and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
-                    and cfg.q_tiles_are_full
-                ):
-                    p_lo, p_hi, sum_lo, sum_hi = (
-                        _compute_fp8_p_regs_and_local_sums_dense(
-                            self.scale_softmax_log2,
-                            new_max_arr[scale_base],
-                            new_max_arr[scale_base + 1],
-                            s_arr[s_base],
-                            s_arr[s_base + 1],
-                            s_arr[s_base + 2],
-                            s_arr[s_base + 3],
-                            s_arr[s_base + 8],
-                            s_arr[s_base + 9],
-                            s_arr[s_base + 10],
-                            s_arr[s_base + 11],
-                        )
-                    )
-                else:
-                    p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
-                        self.scale_softmax_log2,
+                p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
+                    self.scale_softmax_log2,
+                    self._exponent_addend(
                         new_max_arr[scale_base],
+                        route_is_proxy,
+                        guards_masked_rows=guards_fp8_rows,
+                    ),
+                    self._exponent_addend(
                         new_max_arr[scale_base + 1],
-                        s_arr[s_base],
-                        s_arr[s_base + 1],
-                        s_arr[s_base + 2],
-                        s_arr[s_base + 3],
-                        s_arr[s_base + 8],
-                        s_arr[s_base + 9],
-                        s_arr[s_base + 10],
-                        s_arr[s_base + 11],
-                    )
+                        route_is_proxy,
+                        guards_masked_rows=guards_fp8_rows,
+                    ),
+                    s_arr[s_base],
+                    s_arr[s_base + 1],
+                    s_arr[s_base + 2],
+                    s_arr[s_base + 3],
+                    s_arr[s_base + 8],
+                    s_arr[s_base + 9],
+                    s_arr[s_base + 10],
+                    s_arr[s_base + 11],
+                )
                 packed_p[scale_pair_idx] = p_lo
                 packed_p[scale_pair_idx + 2] = p_hi
                 local_sum[scale_base] = sum_lo
@@ -980,25 +1179,16 @@ class SmemPResource(DecodeGenResourceBase):
             local_sums = cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
             )
-            proxy_tail_p = cutlass.Array(
-                Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
-            )
             for idx in cutlass.range_constexpr(num_s_regs):
                 p_vals[idx] = Float32(0.0)
             for idx in cutlass.range_constexpr(num_scale_groups):
                 local_sums[idx] = Float32(0.0)
-                proxy_tail_p[idx] = Float32(0.0)
 
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 # Convert each softmax scale group from S to P. Masked rows have
                 # new_max == -inf and keep their initialized zero P/local_sum.
                 new_max = new_max_arr[scale_idx]
-                safe_new_max = new_max
-                if safe_new_max == _neg_max_f32():
-                    safe_new_max = Float32(0.0)
-                neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-                if cutlass.const_expr(cfg.use_fp8_qkv):
-                    neg_scaled_max += _fp8_log2_quant_scale()
+                exponent_addend = self._exponent_addend(new_max, route_is_proxy)
                 if new_max != _neg_max_f32():
                     repeat_idx = scale_idx // 2
                     pair_idx = scale_idx % 2
@@ -1011,40 +1201,17 @@ class SmemPResource(DecodeGenResourceBase):
                                 generic_s_base + q_repeats * 4 + (k_pair_idx - 2) * 2
                             )
                         p_val = cute.math.exp2(
-                            s_arr[s_idx] * self.scale_softmax_log2 + neg_scaled_max,
+                            s_arr[s_idx] * self.scale_softmax_log2 + exponent_addend,
                             fastmath=True,
                         )
                         p_vals[s_idx] = p_val
                         local_sums[scale_idx] += p_val
-                        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                            num_summaries, _ = _block_sparse_proxy_summary_geometry(
-                                cfg.static_seq_len_kv,
-                                cfg.kv_block_size,
-                            )
-                            atom_origin, logical_summary = _swaps_routed_coordinate(
-                                cfg,
-                                lane_idx >> Int32(2),
-                                route_origin0,
-                                route_origin1,
-                                route_origin2,
-                                route_origin3,
-                                token_group_idx=k_pair_idx,
-                            )
-                            if atom_origin >= Int32(0) and logical_summary == Int32(
-                                num_summaries - 1
-                            ):
-                                proxy_tail_p[scale_idx] = p_val
             # Hand off denominator contributions through TmemS. P remains a pure
             # MMA operand in SMEM; sums are not reloaded from the P tile.
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                local_sums[scale_idx] = self._apply_proxy_route_denominator_mass(
-                    local_sums[scale_idx],
-                    proxy_tail_p[scale_idx],
-                    route_is_proxy,
-                )
                 self.tmem_s_ref.store_p_local_sum(scale_idx, local_sums[scale_idx])
 
-            if cutlass.const_expr(cfg.use_fp8_qkv):
+            if cutlass.const_expr(cfg.use_fp8_pv):
                 # FP8 P is packed four values per register and stored with
                 # transposed 8-bit helpers so BMM2 sees the tcgen05 layout.
                 packed_p = cutlass.Array(
@@ -1081,7 +1248,7 @@ class SmemPResource(DecodeGenResourceBase):
             )
             for pair_idx in cutlass.range_constexpr(cfg.num_packed_p_regs):
                 val_base = pair_idx * 2
-                if cutlass.const_expr(cfg.use_bf16_qkv):
+                if cutlass.const_expr(cfg.use_bf16_pv):
                     regs_p[pair_idx] = _pack_float2_to_bf16(
                         p_vals[val_base], p_vals[val_base + 1]
                     )
@@ -1107,7 +1274,7 @@ class SmemPResource(DecodeGenResourceBase):
             cute.arch.fence_view_async_shared()
             return
 
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_pv):
             # Tile-Q=8 FP8 path: compute packed P and local sums directly
             # from the eight S registers owned by this lane.
             packed_p = cutlass.Array(
@@ -1117,6 +1284,29 @@ class SmemPResource(DecodeGenResourceBase):
                 Float32,
                 cfg.num_softmax_scale_groups,
                 space=cutlass.AddressSpace.rmem,
+            )
+            packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
+                _compute_fp8_p_regs_and_local_sums(
+                    self.scale_softmax_log2,
+                    self._exponent_addend(
+                        new_max_arr[0],
+                        route_is_proxy,
+                        guards_masked_rows=not static_even_tiles,
+                    ),
+                    self._exponent_addend(
+                        new_max_arr[1],
+                        route_is_proxy,
+                        guards_masked_rows=not static_even_tiles,
+                    ),
+                    s_arr[0],
+                    s_arr[1],
+                    s_arr[2],
+                    s_arr[3],
+                    s_arr[4],
+                    s_arr[5],
+                    s_arr[6],
+                    s_arr[7],
+                )
             )
             if cutlass.const_expr(
                 not self.use_variable_seqlens_kv
@@ -1133,62 +1323,6 @@ class SmemPResource(DecodeGenResourceBase):
                     packed_p[1] = Int32(0)
                     local_sum[0] = Float32(0.0)
                     local_sum[1] = Float32(0.0)
-                else:
-                    packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
-                        _compute_fp8_p_regs_and_local_sums(
-                            self.scale_softmax_log2,
-                            new_max_arr[0],
-                            new_max_arr[1],
-                            s_arr[0],
-                            s_arr[1],
-                            s_arr[2],
-                            s_arr[3],
-                            s_arr[4],
-                            s_arr[5],
-                            s_arr[6],
-                            s_arr[7],
-                        )
-                    )
-            elif cutlass.const_expr(
-                not self.use_variable_seqlens_kv
-                and cfg.total_kv_tiles > 0
-                and (cfg.total_kv_tiles % cfg.num_insts_kv) == 0
-            ):
-                # Dense full-tile FP8 can produce packed P and sums in one
-                # straight-line helper because no S entry is masked.
-                packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
-                    _compute_fp8_p_regs_and_local_sums_dense(
-                        self.scale_softmax_log2,
-                        new_max_arr[0],
-                        new_max_arr[1],
-                        s_arr[0],
-                        s_arr[1],
-                        s_arr[2],
-                        s_arr[3],
-                        s_arr[4],
-                        s_arr[5],
-                        s_arr[6],
-                        s_arr[7],
-                    )
-                )
-            else:
-                # General FP8 path preserves masks from softmax by letting the
-                # helper suppress entries whose S value is -inf.
-                packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
-                    _compute_fp8_p_regs_and_local_sums(
-                        self.scale_softmax_log2,
-                        new_max_arr[0],
-                        new_max_arr[1],
-                        s_arr[0],
-                        s_arr[1],
-                        s_arr[2],
-                        s_arr[3],
-                        s_arr[4],
-                        s_arr[5],
-                        s_arr[6],
-                        s_arr[7],
-                    )
-                )
             # Publish sums through TmemS; packed E4M3 P bytes use the
             # transposed SMEM tile consumed by BMM2.
             for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
@@ -1214,6 +1348,16 @@ class SmemPResource(DecodeGenResourceBase):
                 local_sum[scale_idx] = Float32(0.0)
             for p_idx in cutlass.range_constexpr(8):
                 p_vals[p_idx] = Float32(0.0)
+            exponent_addends = cutlass.Array(
+                Float32,
+                cfg.num_softmax_scale_groups,
+                space=cutlass.AddressSpace.rmem,
+            )
+            # Both tile-Q=8 16-bit paths below discard or skip -FLT_MAX rows.
+            for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
+                exponent_addends[scale_idx] = self._exponent_addend(
+                    new_max_arr[scale_idx], route_is_proxy, guards_masked_rows=False
+                )
             if cutlass.const_expr(
                 not self.use_variable_seqlens_kv
                 and not cfg.use_split_kv
@@ -1225,10 +1369,10 @@ class SmemPResource(DecodeGenResourceBase):
                 # intentionally safe: reduce_sums' guarded rescale and the
                 # correction path's uses_instN gate both key on that sentinel
                 # and discard the instance before its P/O contribution is visible.
-                p_result = _compute_p_values_and_local_sums_dense(
+                p_result = _compute_p_values_and_local_sums(
                     self.scale_softmax_log2,
-                    new_max_arr[0],
-                    new_max_arr[1],
+                    exponent_addends[0],
+                    exponent_addends[1],
                     s_arr[0],
                     s_arr[1],
                     s_arr[2],
@@ -1246,19 +1390,17 @@ class SmemPResource(DecodeGenResourceBase):
                 # General tile-Q=8 path preserves masked S entries as zero P
                 # contribution by skipping groups whose new max stayed -inf.
                 for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
-                    new_max = new_max_arr[scale_idx]
-                    if new_max != _neg_max_f32():
+                    exponent_addend = exponent_addends[scale_idx]
+                    if new_max_arr[scale_idx] != _neg_max_f32():
                         for pair_idx in cutlass.range_constexpr(2):
                             p_base = scale_idx + pair_idx * 2
-                            scaled_pair = fmul2(
+                            scaled_pair = ffma2(
+                                (s_arr[p_base], s_arr[p_base + 4]),
                                 (
                                     self.scale_softmax_log2,
                                     self.scale_softmax_log2,
                                 ),
-                                fadd2(
-                                    (s_arr[p_base], s_arr[p_base + 4]),
-                                    (-new_max, -new_max),
-                                ),
+                                (exponent_addend, exponent_addend),
                             )
                             p_pair = (
                                 cute.math.exp2(scaled_pair[0], fastmath=True),
@@ -1268,38 +1410,11 @@ class SmemPResource(DecodeGenResourceBase):
                             p_vals[p_base + 4] = p_pair[1]
                             local_sum[scale_idx] += p_pair[0]
                             local_sum[scale_idx] += p_pair[1]
-            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-                num_summaries, _ = _block_sparse_proxy_summary_geometry(
-                    cfg.static_seq_len_kv,
-                    cfg.kv_block_size,
-                )
-                for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
-                    proxy_tail_p = Float32(0.0)
-                    for token_group_idx in cutlass.range_constexpr(4):
-                        atom_origin, logical_summary = _swaps_routed_coordinate(
-                            cfg,
-                            lane_idx >> Int32(2),
-                            route_origin0,
-                            route_origin1,
-                            route_origin2,
-                            route_origin3,
-                            token_group_idx=token_group_idx,
-                        )
-                        if atom_origin >= Int32(0) and logical_summary == Int32(
-                            num_summaries - 1
-                        ):
-                            p_idx = scale_idx + token_group_idx * 2
-                            proxy_tail_p = Float32(p_vals[p_idx])
-                    local_sum[scale_idx] = self._apply_proxy_route_denominator_mass(
-                        local_sum[scale_idx],
-                        proxy_tail_p,
-                        route_is_proxy,
-                    )
             # Pack the P scalars to match the dtype consumed by BMM2.
             regs_p = cutlass.Array(
                 Int32, cfg.num_packed_p_regs, space=cutlass.AddressSpace.rmem
             )
-            if cutlass.const_expr(cfg.use_bf16_qkv):
+            if cutlass.const_expr(cfg.use_bf16_pv):
                 for reg_idx in cutlass.range_constexpr(cfg.num_packed_p_regs):
                     val_base = reg_idx * 2
                     regs_p[reg_idx] = _pack_float2_to_bf16(
@@ -1339,7 +1454,7 @@ class SmemPResource(DecodeGenResourceBase):
                 shape=prims.StoreShape.M8N8,
             )
         cute.arch.fence_view_async_shared()
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_pv):
             # FP8 P uses inline STSM stores. Synchronize the producer
             # warpgroup before the UMMA-consumer pipeline is committed so
             # BMM2 cannot observe a partially written P tile.
@@ -1360,11 +1475,7 @@ class SmemPResource(DecodeGenResourceBase):
             stage_info,
             new_max_arr=new_max_arr,
             s_arr=s_arr,
-            route_is_proxy=Int32(0),
-            route_origin0=Int32(0),
-            route_origin1=Int32(0),
-            route_origin2=Int32(0),
-            route_origin3=Int32(0),
+            route_is_proxy=cutlass.Boolean(False),
         )
 
     @producer_work
@@ -1375,45 +1486,26 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         s_arr: cutlass.Array,
-        route_origin0: Int32,
-        route_origin1: Int32,
-        keeps_route_flags_or_swaps_origin2: Int32,
-        swaps_route_origin3_bits: Uint32,
+        keeps_route_flags: Int32,
         swaps_route_flags: Uint32,
     ) -> None:
-        """Normalize the active Keeps/SWAP metadata view and compute P.
+        """Read the route kind from the active Keeps/SWAP metadata view and compute P.
 
-        The shared Int32 input is Keeps route flags or SWAP origin2.  SWAP's
-        origin3 and flags stay bit-preserving Uint32 values until this work
-        boundary because schedule-level dataflow tokens cannot be cast.
+        Keeps carries the kind in its Int32 route flags, SWAP in its
+        bit-preserving Uint32 flags word. The kind selects only the exponent
+        addend; the max pass has already applied the proxy mass to the scores.
         """
 
         assert self.cfg.use_block_sparse_proxy_routes
-        route_origin2 = Int32(0)
-        route_origin3 = Int32(0)
         if cutlass.const_expr(self.cfg.use_keeps_mma_ab):
-            route_is_proxy = Int32(
-                (
-                    keeps_route_flags_or_swaps_origin2
-                    & Int32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)
-                )
-                != Int32(0)
-            )
+            route_is_proxy = _route_is_proxy(keeps_route_flags)
         else:
-            route_is_proxy = Int32(
-                (swaps_route_flags & Uint32(_SOFTMAX_ROUTE_IS_PROXY_FLAG)) != Uint32(0)
-            )
-            route_origin2 = keeps_route_flags_or_swaps_origin2
-            route_origin3 = swaps_route_origin3_bits.bitcast(Int32)
+            route_is_proxy = _route_is_proxy(swaps_route_flags.bitcast(Int32))
         self._compute_p_impl(
             stage_info,
             new_max_arr=new_max_arr,
             s_arr=s_arr,
             route_is_proxy=route_is_proxy,
-            route_origin0=route_origin0,
-            route_origin1=route_origin1,
-            route_origin2=route_origin2,
-            route_origin3=route_origin3,
         )
 
     @consumer_work(
@@ -1447,7 +1539,7 @@ class SmemPResource(DecodeGenResourceBase):
             if cutlass.const_expr(cfg.streams_tmem_p_fragments):
                 # A streamed profile's four pipeline stages are K32 fragments of one P
                 # operand, not four independent full S/P stages.
-                p_stage_cols = cfg.softmax_score_fragment_regs // 2
+                p_stage_cols = cfg.fragment_p_packed_cols
             p_tmem_addr = self._tmem_base_addr + Int32(
                 self._tmem_alloc.offset + stage_info.stage_idx * p_stage_cols
             )
@@ -1489,8 +1581,7 @@ class SmemPResource(DecodeGenResourceBase):
         )
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
 
-        fragment_cols = cfg.softmax_score_fragment_regs // 2
         p_tmem_addr = self._tmem_base_addr + Int32(
-            self._tmem_alloc.offset + fragment_idx * fragment_cols
+            self._tmem_alloc.offset + fragment_idx * cfg.fragment_p_packed_cols
         )
         return p_tmem_addr

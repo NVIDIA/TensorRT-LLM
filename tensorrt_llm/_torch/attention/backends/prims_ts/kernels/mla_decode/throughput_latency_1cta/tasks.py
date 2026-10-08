@@ -14,6 +14,7 @@
 
 """Captured task schedules for the throughput-latency 1CTA MLA TS path."""
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.experimental import primitives as prims
@@ -67,6 +68,7 @@ class MlaDecodeTask(Task):
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
 
+    @cute.jit
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
         super().init_variables(context)
@@ -103,21 +105,22 @@ class MlaDecodeTask(Task):
             Int32(0),
         )
 
+    @cute.jit
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
-        if self.cfg is None:
+        if cutlass.const_expr(self.cfg is None):
             return self.domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
-        if isinstance(tile_coord[2], int):
-            if self.cfg.use_persistent_scheduler == 1:
+        if cutlass.const_expr(isinstance(tile_coord[2], int)):
+            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
                 batch_idx = tile_coord[2] // self.cfg.num_ctas_for_all_heads
             else:
                 batch_idx = tile_coord[2]
         else:
             batch_idx = Int32(tile_coord[2])
-            if self.cfg.use_persistent_scheduler == 1:
+            if cutlass.const_expr(self.cfg.use_persistent_scheduler == 1):
                 batch_idx = batch_idx // Int32(self.cfg.num_ctas_for_all_heads)
 
         # Task-domain ownership must match K/V, softmax, and reduction: dense
@@ -126,7 +129,7 @@ class MlaDecodeTask(Task):
         # raw batch length for causal can move an all-masked tile into tail and
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]
-        if self.cfg.use_persistent_scheduler != 1:
+        if cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
             # Nonpersistent grid X combines (head tile, Q tile, KV split), with
             # KV split innermost. Persistent work queues already expose Q as
             # tile coordinate 0 and must not be decoded a second time.
