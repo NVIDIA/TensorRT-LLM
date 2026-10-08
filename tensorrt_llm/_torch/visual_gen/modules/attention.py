@@ -551,12 +551,18 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
+        # Under tensor parallelism the packed projection holds this rank's heads. A
+        # per-head norm weight ([head_dim]) is the same on every rank; a full-dim
+        # weight ([num_heads * head_dim]) would need this rank's slice of it.
+        if self.tp_size > 1 and self.norm_q.weight.numel() != self.head_dim:
+            raise NotImplementedError(
+                "fused_dit_qk_norm_rope under tensor parallelism needs per-head norm weights"
+            )
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
+            self.local_num_attention_heads,
+            self.local_num_key_value_heads,
+            self.local_num_key_value_heads,
             self.head_dim,
             self.eps,
             self.norm_q.weight,
