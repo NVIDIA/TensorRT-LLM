@@ -1489,7 +1489,26 @@ class KimiK3MoERuntime(nn.Module):
             )
         mapping = model_config.mapping
         if getattr(mapping, "_dwdp_size", 0) > 1:
-            raise NotImplementedError("Kimi K3 packed-checkpoint streaming does not support DWDP.")
+            # DWDP does not hook the load path at all: setup_dwdp() scans the
+            # model *after* every weight is loaded, reads w3_w1_weight /
+            # w2_weight and their block scales straight off the backend
+            # (dwdp/setup.py::collect_moe_params), copies them into fabric
+            # memory, frees the originals, and rebinds param.data to a
+            # composite VA view.  K3's packed-checkpoint streaming produces
+            # exactly those tensors, so the two are compatible -- but only on
+            # the backends that declare supports_dwdp, which is the CuteDSL
+            # family (fused_moe_cute_dsl.py) and NVFP4 only.
+            #
+            # MEGAMOE_CUTEDSL is excluded deliberately rather than by
+            # oversight: its process_weights_after_loading packs into the mega
+            # buffers and shrinks the raw source params back to placeholders
+            # (see maybe_finalize_layer), which has never been checked against
+            # DWDP's copy-then-free of those same originals.
+            if model_config.moe_backend not in ("CUTEDSL", "CUTEDSL_FC12"):
+                raise NotImplementedError(
+                    "Kimi K3 with DWDP requires moe_config.backend CUTEDSL or "
+                    f"CUTEDSL_FC12; got {model_config.moe_backend!r}."
+                )
 
         moe_tp, moe_ep = KimiK3MoERuntime._select_moe_tp_ep(mapping)
         if moe_tp < 1 or moe_ep < 1 or moe_tp * moe_ep != mapping.tp_size:
