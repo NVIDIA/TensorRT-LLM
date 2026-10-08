@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,16 +57,43 @@ class RenderedPrompt:
     # Multimodal payload, filled only when the caller asked to load media.
     mm_data: Optional[Dict[str, Any]] = None
     mm_embeddings: Optional[Dict[str, Any]] = None
+    # Decisions derived from the rendered prompt (see :class:`PreparedContext`).
+    context: Dict[str, Any] = field(default_factory=dict)
+
+
+class PreparedContext(BaseModel):
+    """Decisions the chat route derives from the rendered prompt.
+
+    A worker handed token ids never sees the rendered text, so it cannot make these
+    decisions again; they are computed once where the prompt is rendered and carried
+    with the ids.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Rendered prompt tokens that are not reported as prompt usage (kimi_k3: the
+    # generation channel opener). Zero when a server-level chat template applies.
+    prompt_tokens_excluded_from_usage: int = Field(default=0, ge=0)
+    # Reasoning mode read off the rendered prompt by parsers that take it from there
+    # (a template that prefills ``<think>`` or ``</think>``); ``None`` when not applicable.
+    resolved_thinking: Optional[bool] = None
 
 
 class GenerateRequest(BaseModel):
-    """Prepared request: the prompt tokens plus everything needed to execute it.
+    """Prepared request: the prompt tokens plus the original request to execute.
 
-    Returned by the render routes and consumed by ``POST /generate``. The
-    ``request`` field is the original request body (chat-completions, or
-    completions with the prompt replaced by ``token_ids``), so tool, response
-    format, streaming and sampling semantics are exactly those of the normal
-    route; ``token_ids`` replaces rendering and tokenization.
+    Returned by the render routes and consumed by ``POST /generate``.
+
+    **Contract: prompt replay.** What is guaranteed is prompt preparation: when the
+    ``fingerprint`` matches the worker's, ``token_ids`` are the tokens the worker's own
+    chat route would have rendered, and ``context`` carries the decisions derived from
+    the rendered prompt. Everything else stays worker-owned: the ``request`` field is
+    the original request body (chat-completions, or completions with the prompt replaced
+    by ``token_ids``) and is validated and executed by the worker's normal route, so
+    sampling defaults, guided decoding, tool and reasoning parsing, streaming, usage and
+    errors are the worker's. A caller that needs identical generation behavior must also
+    ensure the worker's execution configuration (generation defaults, parsers) is the one
+    it expects; the rendering fingerprint does not cover it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -80,5 +107,7 @@ class GenerateRequest(BaseModel):
     # False when the ids must not be executed as is; the consumer re-renders.
     tokens_trusted: bool = True
     untrusted_reason: Optional[str] = None
+    # Decisions derived from the rendered prompt, preserved for the executing worker.
+    context: PreparedContext = Field(default_factory=PreparedContext)
     # The original request body.
     request: Dict[str, Any] = Field(default_factory=dict)

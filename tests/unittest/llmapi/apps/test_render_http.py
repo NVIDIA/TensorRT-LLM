@@ -502,6 +502,196 @@ class TestGenerateSkipsRendering:
         assert rendered_calls == []
 
 
+def _real_chat_worker(tokenizer, *, model_type="render-test-model", reasoning_parser=None):
+    """A worker whose real chat route runs, with the engine and response building stubbed.
+
+    Returns ``(app_with_generate, captured)``; ``captured["kwargs"]`` holds what the route
+    handed the engine, including the postprocessing arguments it derived.
+    """
+    from unittest.mock import AsyncMock
+
+    from tensorrt_llm.serve.openai_protocol import (
+        ChatCompletionResponse,
+        ChatCompletionResponseChoice,
+        ChatMessage,
+        UsageInfo,
+    )
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    captured = {}
+
+    def generate_async(*, inputs, **kwargs):
+        captured["inputs"] = inputs
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
+
+    server = object.__new__(OpenAIServer)
+    server.model = "m"
+    server.allow_request_chat_template = False
+    server.model_config = SimpleNamespace(model_type=model_type, vocab_size=1000)
+    server.processor = None
+    server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=1000))
+    server.chat_template = None
+    server.tool_parser = None
+    server.tool_call_id_type = "random"
+    server.multimodal_server_config = None
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(
+            gather_generation_logits=False,
+            reasoning_parser=reasoning_parser,
+            backend="pytorch",
+            guided_decoding_backend=None,
+            num_postprocess_workers=0,
+        ),
+        generate_async=generate_async,
+    )
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(
+        return_value=ChatCompletionResponse(
+            id="x",
+            model="m",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content="ok"),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        )
+    )
+    app = FastAPI()
+    attach_generate_route(app, server)
+    return app, server, captured
+
+
+class TestGenerateThroughTheRealChatRoute:
+    """What the worker's chat route derives must survive the render -> /generate hop."""
+
+    def test_messages_the_request_model_rejects_still_reach_the_route(self, tokenizer) -> None:
+        # Object-valued tool-call arguments are rejected by the request model; the chat
+        # route then reads the messages from the raw JSON body. For /generate that body
+        # is the prepared-request envelope, which has no top-level "messages".
+        app, server, captured = _real_chat_worker(tokenizer)
+        server._render_fingerprint = resources(tokenizer).fingerprint()
+        body = {
+            "model": "m",
+            "max_tokens": 4,
+            "messages": [
+                {"role": "user", "content": "hello world"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": {"city": "paris"}},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "assistant", "content": "it is sunny"},
+            ],
+        }
+        prepared = (
+            TestClient(build_render_app(resources(tokenizer)))
+            .post("/v1/chat/completions/render", json=body)
+            .json()
+        )
+
+        response = TestClient(app).post("/generate", json=prepared)
+
+        assert response.status_code == 200, response.text
+        postproc_args = server._create_chat_response.call_args.args[1].postproc_args
+        # Taken from the parsed conversation: empty if the route fell back to nothing.
+        assert postproc_args.last_message_content == "it is sunny"
+
+    @pytest.fixture
+    def usage_extension(self):
+        from tensorrt_llm.serve import serving_extensions
+        from tensorrt_llm.serve.serving_extensions import register_serving_extension
+
+        key = "render-test-usage-model"
+
+        @register_serving_extension(model_types=(key,))
+        class UsageExtension(ServingExtension):
+            def prompt_tokens_excluded_from_usage(self, request):
+                # Like kimi_k3: the trailing generation opener is not reported as usage,
+                # and only a request that is rendered here has one.
+                return (
+                    3 if request.add_generation_prompt and request.prompt_token_ids is None else 0
+                )
+
+        try:
+            yield key
+        finally:
+            serving_extensions._BY_MODEL_TYPE.pop(key, None)
+
+    def test_the_usage_adjustment_decided_at_render_time_reaches_the_worker(
+        self, tokenizer, usage_extension
+    ) -> None:
+        from tensorrt_llm.serve.serving_extensions import get_serving_extension
+
+        render_resources = resources(
+            tokenizer, model_type=usage_extension, extension=get_serving_extension(usage_extension)
+        )
+        app, server, captured = _real_chat_worker(tokenizer, model_type=usage_extension)
+        server._render_fingerprint = render_resources.fingerprint()
+        prepared = (
+            TestClient(build_render_app(render_resources))
+            .post("/v1/chat/completions/render", json={**CHAT_BODY, "max_tokens": 4})
+            .json()
+        )
+
+        response = TestClient(app).post("/generate", json=prepared)
+
+        assert prepared["context"]["prompt_tokens_excluded_from_usage"] == 3
+        assert response.status_code == 200, response.text
+        # Without the context the route sees ``prompt_token_ids`` and adjusts nothing.
+        postproc_args = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc_args.num_prompt_tokens_offset == 3
+
+    def test_the_thinking_mode_read_off_the_rendered_prompt_reaches_the_worker(self) -> None:
+        # The template prefills "<think>"; a parser that takes its mode from the prompt must
+        # see it as open even though the worker never renders the prompt.
+        thinking_tokenizer = make_tokenizer(
+            chat_template=(
+                "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+                "{% if add_generation_prompt %}<assistant><think>{% endif %}"
+            )
+        )
+        render_resources = resources(thinking_tokenizer, reasoning_parser="poolside_v1")
+        app, server, captured = _real_chat_worker(
+            thinking_tokenizer, reasoning_parser="poolside_v1"
+        )
+        server._render_fingerprint = render_resources.fingerprint()
+        prepared = (
+            TestClient(build_render_app(render_resources))
+            .post("/v1/chat/completions/render", json={**CHAT_BODY, "max_tokens": 4})
+            .json()
+        )
+
+        response = TestClient(app).post("/generate", json=prepared)
+
+        assert prepared["context"]["resolved_thinking"] is True
+        assert response.status_code == 200, response.text
+        postproc_args = server._create_chat_response.call_args.args[1].postproc_args
+        assert postproc_args.chat_template_kwargs["thinking"] is True
+
+    def test_a_client_cannot_set_the_prepared_context_on_the_normal_route(self, tokenizer) -> None:
+        # The context is a private attribute set only by /generate; a field of the same
+        # name in an ordinary chat request is just an unknown field.
+        from pydantic import ValidationError
+
+        from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+        with pytest.raises(ValidationError, match="_render_context"):
+            ChatCompletionRequest.model_validate(
+                {**CHAT_BODY, "_render_context": {"prompt_tokens_excluded_from_usage": 99}}
+            )
+
+
 class TestHarmonyConversionErrors:
     """Harmony reports messages it cannot convert as a RuntimeError; the chat route answers 400."""
 

@@ -52,13 +52,18 @@ _LEGACY_ENV = "TRTLLM_RENDER_LEGACY"
 
 
 def legacy_render_enabled() -> bool:
-    """Whether callers keep their pre-merge renderer choice.
+    """Whether callers run in the pre-merge compatibility mode.
 
-    Set ``TRTLLM_RENDER_LEGACY=1`` to restore the previous behavior for one
-    release: the router and ``count_tokens`` render with the simplified renderer
-    and the router writes tokens back without checking the fingerprint, and the
-    governor, Responses and multimodal-encoder routes render without the server
-    template and extension rules.
+    ``TRTLLM_RENDER_LEGACY=1`` is a compatibility mode, not a bit-for-bit rollback.
+    What it restores exactly: the router and ``count_tokens`` run their previous
+    implementations, and the router writes ids back without checking the fingerprint.
+    What it only approximates: the governor, Responses and multimodal-encoder routes
+    render without the server-level chat template and the model extension's rules (as
+    before) but still go through the shared render-then-tokenize pipeline, not the
+    previous helper. For a tokenizer whose two pipelines disagreed (one that renders text
+    itself, where the previous governor returned the text's characters as ids) the previous
+    output is not restored. The recorded pre-merge outputs and every intended difference
+    are in ``tests/unittest/llmapi/apps/test_render_golden.py``.
     """
     return os.getenv(_LEGACY_ENV, "0") == "1"
 
@@ -397,7 +402,36 @@ def render_chat(
         # can do that, so ids rendered here are not the executed prompt.
         result.tokens_trusted = False
         result.untrusted_reason = "named_tool_choice"
+    result.context = preparation_context(request, res, result)
     return result
+
+
+def preparation_context(
+    request: "ChatCompletionRequest", res: RenderResources, rendered: RenderedPrompt
+) -> Dict[str, Any]:
+    """Decisions the chat route derives from the rendered prompt.
+
+    A worker given token ids never sees the rendered text, so it cannot make these
+    decisions itself; they are computed here, where the prompt is rendered, and carried
+    with the ids (see ``PreparedContext``). ``request`` is the request as rendered, so it
+    does not yet carry ``prompt_token_ids``.
+    """
+    excluded = 0
+    if res.default_chat_template is None:
+        # A server-level chat template may end differently, so the route reports
+        # unadjusted usage when one is configured.
+        excluded = int(res.extension.prompt_tokens_excluded_from_usage(request) or 0)
+    thinking: Optional[bool] = None
+    parser = res.reasoning_parser
+    if parser and rendered.template_text and request.add_generation_prompt:
+        # Deferred: the reasoning parsers module is only needed here.
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        if ReasoningParserFactory.resolves_thinking_from_prompt(parser):
+            thinking = ReasoningParserFactory.resolve_prefilled_thinking(
+                parser, rendered.template_text
+            )
+    return {"prompt_tokens_excluded_from_usage": excluded, "resolved_thinking": thinking}
 
 
 async def arender_chat(
