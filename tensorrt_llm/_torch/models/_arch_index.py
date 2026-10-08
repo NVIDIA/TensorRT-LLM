@@ -50,7 +50,7 @@ MODEL_ARCH_TO_MODULE = {
     "Eagle3DeepSeekV3ForCausalLM": "modeling_speculative",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
-    "ExaoneMoEForCausalLM": "modeling_exaone_moe",
+    "ExaoneMoeForCausalLM": "modeling_exaone_moe",
     "Gemma3ForCausalLM": "modeling_gemma3",
     "Gemma3ForConditionalGeneration": "modeling_gemma3vl",
     "Gemma4AssistantForCausalLM": "modeling_gemma4",
