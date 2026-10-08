@@ -2408,6 +2408,9 @@ class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
 class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro-DSpark"
+    # NVFP4 export (nvidia/deepseek-v4-pro-nvfp4-dspark) with the embedded
+    # DSpark drafter.
+    NVFP4_MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro-nvfp4-DSpark"
     EXTRA_EVALUATOR_KWARGS = dict(
         apply_chat_template=True,
         system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
@@ -2453,6 +2456,59 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                   f"acceptance_length = {acceptance_length:.3f}")
             assert_acceptance_length(
                 "TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm",
+                acceptance_length)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_gsm8k_dep4_megamoe_cutedsl(self):
+        # MegaMoE CuTe DSL is the backend that serves the NVFP4 export. DEP4
+        # doubles the per-rank model footprint relative to DEP8, so bound both
+        # the serving and the CUDA-graph batch to what fits without a warmup
+        # OOM.
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=5, speculative_model=self.NVFP4_MODEL_PATH)
+        # Build the evaluator (dataset and harness) before the LLM claims the
+        # GPUs.
+        task = GSM8K(self.MODEL_NAME)
+        evaluator = task.create_evaluator(GSM8K.NUM_SAMPLES,
+                                          self.EXTRA_EVALUATOR_KWARGS)
+        with LLM(self.NVFP4_MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="MEGAMOE_CUTEDSL"),
+                 max_batch_size=64,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=64),
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 disable_overlap_scheduler=True,
+                 custom_tokenizer="deepseek_v4",
+                 max_stats_len=-1,
+                 enable_iter_perf_stats=True,
+                 speculative_config=spec_config) as llm:
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(llm, prepared_evaluator=evaluator)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
+            # Gate on acceptance as well as on the score: a drafter regression
+            # on this backend costs speed only, which the accuracy assert
+            # cannot see.
+            acceptance_length = compute_acceptance_length(llm)
+            print(f"[AL] test_gsm8k_dep4_megamoe_cutedsl "
+                  f"acceptance_length = {acceptance_length:.3f}")
+            assert_acceptance_length(
+                "TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl",
                 acceptance_length)
 
 

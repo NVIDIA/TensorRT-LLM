@@ -352,9 +352,10 @@ public:
 
     virtual ~RunnerBase() = default;
     virtual void prepare(AttentionOp& op) const = 0;
-    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const
+    virtual int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const
         = 0;
     // typically, we use single qkv input, but for context MLA, we use separate qkv inputs
     virtual void run(AttentionOp& op, bool const is_context, int32_t const seq_offset, int32_t const num_seqs,
@@ -419,14 +420,15 @@ public:
         op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_sequences, op.getMultiProcessorCount()));
     }
 
-    int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
-        int const num_gen_tokens, int const max_blocks_per_sequence, int const ctx_total_kv_len = 0,
-        int const maxCrossKvLength = 0) const override
+    int64_t getWorkspaceSize(AttentionOp const& op, int const num_contexts, int const num_context_tokens,
+        int const max_context_q_len, int const cross_kv_length, int const num_generations,
+        int const max_attention_window_size, int const num_gen_tokens, int const max_blocks_per_sequence,
+        int const ctx_total_kv_len = 0) const override
     {
         size_t const context_workspace_size = op.getWorkspaceSizeForContext(
-            op.mType, max_num_requests, op.mMaxContextLength, maxCrossKvLength, num_tokens, ctx_total_kv_len);
+            op.mType, num_contexts, max_context_q_len, cross_kv_length, num_context_tokens, ctx_total_kv_len);
         size_t const generation_workspace_size = op.getWorkspaceSizeForGeneration(
-            op.mType, max_num_sequences, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
+            op.mType, num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence);
 
         return std::max(context_workspace_size, generation_workspace_size);
     }
@@ -507,19 +509,11 @@ public:
                     // kv cache reuse / chunked context cases, latent_cache is not used
                     mla_params.latent_cache = nullptr;
                 }
-                TORCH_CHECK(q_pe.has_value());
-                TORCH_CHECK(q_pe->dim() == 3);
-                TORCH_CHECK(q_pe->strides()[2] == 1);
-
-                mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
-                mla_params.q_pe_ld = q_pe->strides()[1];
-                mla_params.q_pe_stride = q_pe->strides()[0];
-
                 // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
                 // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
                 // appends rope FP8 in place and the standalone quantize is
-                // skipped. Without this wiring the sparse-MLA context branch
-                // runs the legacy quantize over the bf16 placeholder q.
+                // skipped. A missing q_pe on this path means the upstream q_b
+                // fusion has already written the complete rotated FP8 Q.
                 mla_params.bmm1_scale = mla_bmm1_scale.has_value()
                     ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
                     : nullptr;
@@ -532,6 +526,23 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+                mla_params.q_rope_applied = mla_params.fuse_q_fp8_in_rope && !q_pe.has_value();
+                if (q_pe.has_value())
+                {
+                    TORCH_CHECK(q_pe->dim() == 3);
+                    TORCH_CHECK(q_pe->strides()[2] == 1);
+                    mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
+                    mla_params.q_pe_ld = q_pe->strides()[1];
+                    mla_params.q_pe_stride = q_pe->strides()[0];
+                }
+                else
+                {
+                    TORCH_CHECK(mla_params.q_rope_applied,
+                        "Sparse MLA context requires q_pe unless quant_q_buffer already contains rotated Q.");
+                    mla_params.q_pe = nullptr;
+                    mla_params.q_pe_ld = 0;
+                    mla_params.q_pe_stride = 0;
+                }
 
                 // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
                 // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.
@@ -699,12 +710,10 @@ public:
         if (max_context_q_len_override.has_value())
         {
             int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
-            TORCH_CHECK(override_value >= max_context_q_len_computed,
-                "max_context_q_len_override (%d) must be >= computed max context q length (%d).", override_value,
-                max_context_q_len_computed);
-            TORCH_CHECK(override_value >= max_past_kv_length_computed,
-                "max_context_q_len_override (%d) must be >= computed max past kv length (%d).", override_value,
-                max_past_kv_length_computed);
+            TORCH_CHECK(override_value >= max_context_q_len_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", max_context_q_len_computed, ").");
+            TORCH_CHECK(override_value >= max_past_kv_length_computed, "max_context_q_len_override (", override_value,
+                ") must be >= computed max past kv length (", max_past_kv_length_computed, ").");
         }
 
         int32_t const max_context_q_len = max_context_q_len_override.has_value()
@@ -1483,6 +1492,27 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     auto const ctx_total_kv_len = host_total_kv_lens.index({0}).item<int32_t>();
     auto const gen_total_kv_len = host_total_kv_lens.index({1}).item<int32_t>();
 
+    // The thop workspace is resized for each call, so size the quadratic
+    // unfused-context buffers for this batch rather than the model's configured
+    // maximum context length. Keep the explicit override for CUDA graph capture,
+    // where launch dimensions are padded to a stable length.
+    int32_t max_context_q_len = 0;
+    if (num_contexts > 0)
+    {
+        int32_t const computed_max_context_q_len = host_context_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
+        if (max_context_q_len_override.has_value())
+        {
+            int32_t const override_value = static_cast<int32_t>(max_context_q_len_override.value());
+            TORCH_CHECK(override_value >= computed_max_context_q_len, "max_context_q_len_override (", override_value,
+                ") must be >= computed max context q length (", computed_max_context_q_len, ").");
+            max_context_q_len = override_value;
+        }
+        else
+        {
+            max_context_q_len = computed_max_context_q_len;
+        }
+    }
+
     for (int32_t idx = num_contexts; idx < num_seqs; idx++)
     {
         TLLM_CHECK(request_types[idx] == RequestType::kGENERATION);
@@ -1502,8 +1532,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     {
         maxCrossKvLength = host_past_key_value_lengths.slice(0, 0, num_contexts).max().item<int32_t>();
     }
-    int64_t const workspace_size = runner->getWorkspaceSize(*op, num_tokens, max_attention_window_size, num_gen_tokens,
-        max_blocks_per_sequence, ctx_total_kv_len, maxCrossKvLength);
+    int64_t const workspace_size
+        = runner->getWorkspaceSize(*op, num_contexts, num_ctx_tokens, max_context_q_len, maxCrossKvLength,
+            num_generations, max_attention_window_size, num_gen_tokens, max_blocks_per_sequence, ctx_total_kv_len);
     TLLM_LOG_TRACE("Expected workspace size is %ld bytes", workspace_size);
 
     torch::Tensor workspace;

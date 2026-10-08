@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
@@ -232,6 +233,95 @@ def _create_dsv4_epilogue_buffers(
     return fp8_o, output_sf
 
 
+def _uses_rubin_dsv4_o_b_proj_out(self) -> bool:
+    """Whether o_b_proj runs as the SM107 MXFP8 GEMM writing the output in place."""
+    return (
+        get_sm_version() == 107
+        and self.o_b_proj.has_fp8_block_scales
+        and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        and (self.o_b_proj.use_cute_dsl_blockscaling_mm or self.o_b_proj.disable_deep_gemm)
+    )
+
+
+def _rubin_dsv4_o_b_proj_out(
+    self,
+    o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    """Run o_b_proj on SM107 directly into `output`.
+
+    A tuple input is an already-quantized `(fp8, packed UE8M0 scale)` pair; a
+    tensor input is BF16 O-LoRA and is quantized here.
+    """
+    if isinstance(o_b_proj_input, tuple):
+        activation, activation_scale = o_b_proj_input
+    else:
+        activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            o_b_proj_input
+        )
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+        activation,
+        self.o_b_proj.weight,
+        activation_scale,
+        self.o_b_proj.weight_scale,
+        output,
+    )
+
+
+def _rubin_dsv4_o_lora_quantized_input(
+    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Run o_a_proj on SM107 and emit FP8 O-LoRA plus packed scales for o_b_proj.
+
+    Returns None when the Rubin direct-output o_b_proj path is not in use.
+    """
+    if not _uses_rubin_dsv4_o_b_proj_out(self):
+        return None
+    num_tokens = attn_fp8.shape[1]
+    flat_n = self.n_local_groups * self.o_lora_rank
+    fp8_output = torch.empty(
+        (num_tokens, flat_n), dtype=torch.float8_e4m3fn, device=attn_fp8.device
+    )
+    fp8_batched = fp8_output.view(num_tokens, self.n_local_groups, self.o_lora_rank).transpose(0, 1)
+    # Packed UE8M0 scales in the R128c4 layout: M padded to 128, K/32 padded to 4.
+    scale_numel = (num_tokens + 127) // 128 * 128 * (((flat_n + 31) // 32 + 3) // 4 * 4)
+    packed_scale = torch.empty((scale_numel,), dtype=torch.uint8, device=attn_fp8.device)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        fp8_batched,
+        packed_scale,
+    )
+    return fp8_output, packed_scale
+
+
+def _deepseek_v4_fp8_o_a_proj(
+    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
+) -> torch.Tensor:
+    """Run o_a_proj and o_b_proj on the FP8 inverse-RoPE output."""
+    quantized_input = _rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale)
+    if quantized_input is not None:
+        return self.o_b_proj(quantized_input)
+    from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
+
+    num_tokens = attn_fp8.shape[1]
+    o_lora = torch.empty(
+        [num_tokens, self.n_local_groups, self.o_lora_rank],
+        device=attn_fp8.device,
+        dtype=self.dtype,
+    )
+    _cute_dsl_fp8_bmm_out(
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        o_lora.transpose(0, 1),
+    )
+    return self.o_b_proj(o_lora.flatten(1))
+
+
 def _run_dsv4_o_lora_bmms(
     self,
     o_lora_output: torch.Tensor,
@@ -240,6 +330,57 @@ def _run_dsv4_o_lora_bmms(
     context_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
     generation_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
+    """Run both O-LoRA projections and write hidden states into `o_lora_output`.
+
+    `o_lora_output` is the single mutable output of the MLA custom op. The final
+    projection stays inside the op and its result lands in the leading
+    `hidden_size` columns of the flattened buffer, so the op contract holds under
+    CUDA-graph replay and torch.compile.
+    """
+    active_inputs = [
+        item for item in (context_o_lora_bmm_input, generation_o_lora_bmm_input) if item is not None
+    ]
+    if not active_inputs:
+        return
+
+    uses_direct_output = _uses_rubin_dsv4_o_b_proj_out(self)
+    projected_output = None
+    if uses_direct_output:
+        projected_output = o_lora_output.flatten(1)[:num_tokens]
+        if projected_output.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"DSv4 projected output width must be {self.hidden_size}, got "
+                f"{projected_output.shape[1]}"
+            )
+
+    def write_projected_output_copy(
+        o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        projected = self.o_b_proj(o_b_proj_input)
+        output_view = o_lora_output.flatten(1)
+        output_view[: projected.shape[0], : self.hidden_size].copy_(projected)
+
+    if len(active_inputs) == 1:
+        quantized_input = _rubin_dsv4_o_lora_quantized_input(self, *active_inputs[0])
+        if quantized_input is not None:
+            if uses_direct_output:
+                assert projected_output is not None
+                _rubin_dsv4_o_b_proj_out(self, quantized_input, projected_output)
+            else:
+                write_projected_output_copy(quantized_input)
+            return
+
+    # The direct-output GEMM overwrites the buffer it reads from, so it needs a
+    # separate O-LoRA scratch; the copy path can reuse the output buffer.
+    if uses_direct_output:
+        o_lora_bmm_output = torch.empty(
+            [num_tokens, self.n_local_groups, self.o_lora_rank],
+            device=o_lora_output.device,
+            dtype=self.dtype,
+        )
+    else:
+        o_lora_bmm_output = o_lora_output
+
     def run_o_lora_bmm(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
         phase_o_lora_output: torch.Tensor,
@@ -258,13 +399,18 @@ def _run_dsv4_o_lora_bmms(
     if context_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             context_o_lora_bmm_input,
-            o_lora_output[:num_context_tokens],
+            o_lora_bmm_output[:num_context_tokens],
         )
     if generation_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             generation_o_lora_bmm_input,
-            o_lora_output[num_context_tokens:num_tokens],
+            o_lora_bmm_output[num_context_tokens:num_tokens],
         )
+    if uses_direct_output:
+        assert projected_output is not None
+        _rubin_dsv4_o_b_proj_out(self, o_lora_bmm_output.flatten(1), projected_output)
+    else:
+        write_projected_output_copy(o_lora_bmm_output[:num_tokens].flatten(1))
 
 
 def prepare_sparse_attn_outputs(
@@ -278,6 +424,9 @@ def prepare_sparse_attn_outputs(
         if num_contexts == 0 and num_generations == 0:
             return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
+            return False
+        # SM107 takes the fused epilogue only with its direct-output o_b_proj.
+        if get_sm_version() == 107 and not _uses_rubin_dsv4_o_b_proj_out(self):
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
             return False
@@ -299,9 +448,17 @@ def prepare_sparse_attn_outputs(
 
     if _should_use_dsv4_epilogue_fusion():
         num_tokens = hidden_states.shape[0]
+        # 3D marks the fused epilogue (see forward_sparse_attn). The direct-output
+        # path needs exactly hidden_size columns; the copy path keeps the
+        # O-LoRA-sized buffer and uses its leading hidden_size columns.
+        output_shape = (
+            [num_tokens, 1, self.hidden_size]
+            if _uses_rubin_dsv4_o_b_proj_out(self)
+            else [num_tokens, self.n_local_groups, self.o_lora_rank]
+        )
         return [
             torch.empty(
-                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                output_shape,
                 device=hidden_states.device,
                 dtype=self.dtype,
             )
@@ -318,10 +475,13 @@ def project_sparse_attn_output(
 ) -> torch.Tensor:
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
-    # BCG/mixed-batch epilogue fusion runs o_a_proj at the end of attention,
-    # so this 3D tensor is O-LoRA output and only o_b_proj remains.
+    # The fused epilogue already ran both O-LoRA projections inside the custom op
+    # and wrote the hidden states into the leading hidden_size columns.
     if attn_output_tensor.ndim == 3:
-        return self.o_b_proj(attn_output_tensor.flatten(1))
+        output_view = attn_output_tensor.flatten(1)
+        if output_view.shape[1] == self.hidden_size:
+            return output_view
+        return output_view[:, : self.hidden_size]
 
     assert position_ids is not None
     num_tokens = attn_output_tensor.shape[0]
@@ -329,10 +489,7 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    from tensorrt_llm._torch.attention.mla import (
-        _cute_dsl_fp8_bmm_out,
-        _is_cute_dsl_fp8_bmm_available,
-    )
+    from tensorrt_llm._torch.attention.mla import _is_cute_dsl_fp8_bmm_available
 
     fused_inv_rope_fp8 = (
         self.o_a_proj.dtype == torch.float8_e4m3fn and _is_cute_dsl_fp8_bmm_available()
@@ -350,20 +507,7 @@ def project_sparse_attn_output(
             128,
             self.inverse_rotary_emb.is_neox,
         )
-        o_lora = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=attn_output_tensor.device,
-            dtype=self.dtype,
-        )
-        _cute_dsl_fp8_bmm_out(
-            attn_fp8,
-            self.o_a_proj,
-            attn_scale,
-            self.o_a_proj_scale,
-            o_lora.transpose(0, 1),
-        )
-        o_lora = o_lora.flatten(1)
-        return self.o_b_proj(o_lora)
+        return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale)
 
     # Restore the RoPE portion before output projection.
     torch.ops.trtllm.mla_rope_inplace(
@@ -478,6 +622,132 @@ def _is_fused_q_fp8_quant_enabled(
     if self.kv_cache_dtype == "fp8_ds_mla":
         return False
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
+
+
+def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+) -> bool:
+    """Whether q_b can use the SM107 GEMM, norm, and RoPE fusion."""
+    if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
+        return False
+    num_contexts = attn_metadata.num_contexts
+    num_generations = attn_metadata.num_generations
+    if num_contexts > 0 and num_generations > 0:
+        return False
+    if not _is_fused_q_fp8_quant_enabled(
+        self, num_generations=num_generations, num_contexts=num_contexts
+    ):
+        return False
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return False
+    if self.apply_rotary_emb or position_ids is None:
+        return False
+    # q is the q_a_layernorm output; the wrapper asserts contiguity before launch.
+    if q.dtype != torch.bfloat16 or q.dim() != 2:
+        return False
+    if q.shape != (attn_metadata.num_tokens, self.q_lora_rank):
+        return False
+    if position_ids.numel() != q.shape[0] or position_ids.device != q.device:
+        return False
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    if not isinstance(attention_backend, TrtllmAttention):
+        return False
+    if self.q_b_proj.bias is not None or self.q_b_proj.lora is not None:
+        return False
+    if not self.q_b_proj.has_fp8_block_scales:
+        return False
+    if not (self.q_b_proj.use_cute_dsl_blockscaling_mm or self.q_b_proj.disable_deep_gemm):
+        return False
+    if self.q_b_proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    if self.q_b_proj.weight_scale.dtype != torch.uint8:
+        return False
+    if self.q_b_proj.weight.shape != (
+        self.num_heads_tp * self.qk_head_dim,
+        self.q_lora_rank,
+    ):
+        return False
+    if self.q_lora_rank % 128 != 0:
+        return False
+    cu_q_seqlens = attn_metadata.cu_q_seqlens
+    if cu_q_seqlens is None and num_contexts == 0:
+        generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+        if generation_cu_seqlens is not None:
+            cu_q_seqlens = generation_cu_seqlens[: num_generations + 1]
+    kv_cache_lengths = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+    if cu_q_seqlens is None or kv_cache_lengths is None:
+        return False
+    if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+        return False
+    if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+        return False
+    if cu_q_seqlens.device != q.device or kv_cache_lengths.device != q.device:
+        return False
+    return kv_cache_lengths.numel() <= 128
+
+
+def _dsv4_q_b_gemm_cu_q_seqlens(
+    self: MLA, attn_metadata: AttentionMetadata
+) -> Optional[torch.Tensor]:
+    """Per-phase cumulative Q lengths for the fused q_b GEMM.
+
+    Context batches take the ragged prefix sums from the DSA metadata; pure
+    generation batches slice the uniform generation prefix sums.
+    """
+    if attn_metadata.cu_q_seqlens is not None:
+        return attn_metadata.cu_q_seqlens
+    if attn_metadata.num_contexts > 0:
+        prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
+        return prep_ctx() if prep_ctx is not None else None
+    generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+    if generation_cu_seqlens is None:
+        return None
+    return generation_cu_seqlens[: attn_metadata.num_generations + 1]
+
+
+def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quantization.
+
+    Returns `(q_shape_carrier, quant_q_buffer, quant_scale_qkv)`. The FP8 buffer
+    holds the complete rotated Q, so downstream consumers only read the carrier's
+    leading dimension: context keeps the compact q_lora tensor, generation gets a
+    full-width placeholder for the shared q_pe view.
+    """
+    assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
+    assert q.is_contiguous(), "fused q_b GEMM needs a contiguous q_lora"
+    if getattr(self, "_quant_scale_qkv", None) is None:
+        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
+    q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
+    position_ids_i32 = position_ids.reshape(-1)
+    if position_ids_i32.dtype != torch.int32:
+        position_ids_i32 = position_ids_i32.to(torch.int32)
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    attention_backend._ensure_rope_table_size(attn_metadata.max_seq_len)
+    quant_q_buffer = torch.ops.trtllm.cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+        q_fp8,
+        self.q_b_proj.weight,
+        q_scale,
+        self.q_b_proj.weight_scale,
+        attention_backend.rotary_cos_sin,
+        _dsv4_q_b_gemm_cu_q_seqlens(self, attn_metadata),
+        attn_metadata.kv_lens_cuda_runtime,
+        position_ids_i32,
+        self._quant_scale_qkv,
+        float(self.q_b_layernorm.variance_epsilon),
+    )
+    if attn_metadata.num_contexts > 0:
+        q_shape_carrier = q
+    else:
+        q_shape_carrier = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
+    return q_shape_carrier, quant_q_buffer, self._quant_scale_qkv
 
 
 def _is_fused_prologue_active(
@@ -710,13 +980,18 @@ def forward_generation_sparse_attn(
     fused_q_fp8_pe = getattr(self, "_fused_q_pe", None)
     fused_q_fp8_buf = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_fp8_scale = getattr(self, "_quant_scale_qkv", None)
+    # The q_b GEMM fusion writes the complete rotated Q into the FP8 buffer.
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        fused_q_fp8_pe is not None and fused_q_fp8_buf is not None and fused_q_fp8_scale is not None
+        fused_q_fp8_buf is not None
+        and fused_q_fp8_scale is not None
+        and (fused_q_fp8_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
         # Suffix slice: the Q branch ran over the whole batch.
-        gen_offset = fused_q_fp8_pe.shape[0] - num_tokens
-        q_pe = fused_q_fp8_pe[gen_offset:]
+        gen_offset = fused_q_fp8_buf.shape[0] - num_tokens
+        if not fused_q_rope_applied:
+            q_pe = fused_q_fp8_pe[gen_offset:]
 
     num_seqs = attn_metadata.num_seqs
 
@@ -767,7 +1042,7 @@ def forward_generation_sparse_attn(
     _kv_hoisted = getattr(self, "_fused_kv_norm_hoisted", False)
     # q_b_layernorm already rotated the rope segment into the FP8 Q buffer, so no Q
     # work is left -- but the KV half still runs, hence kv_only.
-    _q_rope_done = use_fused_q_fp8 and _fused_kv_norm
+    _q_rope_done = use_fused_q_fp8 and (fused_q_rope_applied or _fused_kv_norm)
     assert not (_q_rope_done and not precomputed_cu_seqlens), (
         "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
         "attention metadata must precompute them"
@@ -794,6 +1069,7 @@ def forward_generation_sparse_attn(
             # Non-None tells the launcher q_nope is already FP8, so it drops the q_nope
             # quantize rows (1024 of 1161 at head_num 128) from the grid.
             quant_scale_qkv=quant_scale_qkv,
+            q_rope_applied=fused_q_rope_applied,
             kv_only=_q_rope_done and not _kv_hoisted,
             precomputed_cu_seqlens=precomputed_cu_seqlens,
             # `_deepseek_v4_local_to_global_kernel` emits the tile counter and bmm
@@ -882,22 +1158,27 @@ def forward_context_sparse_attn(
         )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
-    q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
 
     quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_pe = getattr(self, "_fused_q_pe", None)
     quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
+    # With the q_b GEMM fusion, `q` is the compact q_lora tensor and the FP8 buffer
+    # already holds the rotated Q; the op takes no q_pe in that case.
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        quant_q_buffer is not None and fused_q_pe is not None and quant_scale_qkv is not None
+        quant_q_buffer is not None
+        and quant_scale_qkv is not None
+        and (fused_q_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
-        q_pe = fused_q_pe[:num_tokens]
+        q_pe = None if fused_q_rope_applied else fused_q_pe[:num_tokens]
         quant_q_buffer = quant_q_buffer[:num_tokens].view(
             num_tokens,
             self.num_heads_tp,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
     else:
+        q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
         quant_q_buffer = None
         quant_scale_qkv = None
 
@@ -1002,8 +1283,17 @@ def forward_sparse_attn(
     _prelaunch_compressor = _use_indexer_overlap or (
         _v4_extra_overlap and do_multi_stream() and self.compressor_stream is not None
     )
+    # Record the start event before kv_a_proj and launch kv_a_proj before the
+    # aux-stream work, so the caller stream issues the GEMM first and the
+    # compressor and indexer prework overlap with it instead of delaying it.
     if _prelaunch_compressor:
         self.dsv4_compressor_start_event.record()
+
+    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
+        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
+    )
+
+    if _prelaunch_compressor:
         with torch.cuda.stream(self.compressor_stream):
             self.dsv4_compressor_start_event.wait()
             self.compressor(hidden_states, attn_metadata)
@@ -1012,13 +1302,15 @@ def forward_sparse_attn(
 
     # Precompute QR-independent indexer work while the caller stream prepares KV.
     # Passing pre_aux later prevents the indexer from launching this work again.
+    # It shares the compressor's start event, so it is ordered against the same
+    # point of the caller stream.
     _indexer_pre_aux = None
     if _use_indexer_overlap:
-        _indexer_pre_aux = self.indexer.precompute_aux(hidden_states, attn_metadata)
-
-    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
-        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
-    )
+        _indexer_pre_aux = self.indexer.precompute_aux(
+            hidden_states,
+            attn_metadata,
+            start_event=self.dsv4_compressor_start_event,
+        )
 
     # Fused kv-norm: the KV kernels apply kv_a_layernorm themselves, so skip the
     # standalone RMSNorm and the concat and hand them the RAW latent. Resolved here,
@@ -1111,6 +1403,17 @@ def forward_sparse_attn(
         )
 
     def _q_branch():
+        self._fused_q_rope_applied = False
+        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(self, q, position_ids, attn_metadata):
+            assert position_ids is not None
+            q_shape_carrier, quant_q_buffer, quant_scale_qkv = (
+                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(self, q, position_ids, attn_metadata)
+            )
+            self._fused_quant_q_buffer = quant_q_buffer
+            self._fused_q_pe = None
+            self._fused_q_rope_applied = True
+            self._quant_scale_qkv = quant_scale_qkv
+            return q_shape_carrier
         if _use_q_b_cute:
             q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
             # The context path detects fusion from these buffers, so clear stale state.
@@ -1259,8 +1562,8 @@ def forward_sparse_attn(
     if enable_dsv4_epilogue_fusion:
         assert context_o_lora_bmm_input is None or isinstance(context_o_lora_bmm_input, tuple)
         assert generation_o_lora_bmm_input is None or isinstance(generation_o_lora_bmm_input, tuple)
-        # The fused kernel output is group-first, which BCG cannot slice on
-        # dim 0. Write O-LoRA as token-first so replay can slice the bucket.
+        # Keep the final projection inside the custom op and write it into the
+        # only mutable output buffer declared by the BCG contract.
         _run_dsv4_o_lora_bmms(
             self,
             output,
@@ -1275,6 +1578,7 @@ def forward_sparse_attn(
     # generation half.
     self._fused_quant_q_buffer = None
     self._fused_q_pe = None
+    self._fused_q_rope_applied = False
     self._fused_q_rope_cos_sin = None
     self._fused_q_rope_specs_cached = []
     self._fused_kv_norm_active = False

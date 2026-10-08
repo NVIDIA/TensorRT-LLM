@@ -28,6 +28,7 @@ def _manager(
     manager.kv_compression_manages_history = kv_compression_manages_history
     manager._kv_reserve_draft_tokens = kv_reserve_draft_tokens
     manager._allocated_draft_lens = {}
+    manager._pending_overlap_slack = {}
     manager.kv_cache_map = {}
     return manager
 
@@ -197,7 +198,8 @@ def test_disagg_gen_transition_reserves_target_drafts_without_context_drafts():
     )
 
     assert manager._effective_draft_len(request) == 4
-    assert manager._required_gen_capacity(request, 128) == 133
+    # 1 base token + 4 draft slots + 4 overlap-slack tokens.
+    assert manager._required_gen_capacity(request, 128) == 137
 
 
 def test_disagg_gen_transition_does_not_reserve_disabled_speculation():
@@ -224,3 +226,88 @@ def test_disagg_gen_transition_prefers_context_drafts():
     )
 
     assert manager._effective_draft_len(request) == 2
+
+
+def _generation_manager(draft_len: int, capacity: int = 100) -> tuple[KVCacheManagerV2, MagicMock]:
+    manager = _manager(is_draft=False)
+    manager.kv_cache_type = CacheType.SELF
+    manager.max_beam_width = 1
+    manager._effective_draft_len = MagicMock(return_value=draft_len)
+    manager._fresh_page_fill = None
+    cache = _cache(capacity=capacity)
+    cache.beam_width = 1
+
+    def resize(new_capacity, history_length=None):
+        if new_capacity is not None:
+            cache.capacity = new_capacity
+        return True
+
+    cache.resize.side_effect = resize
+    return manager, cache
+
+
+def _generation_request(request_id: int, *, accepted: int, committed: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=request_id,
+        py_beam_width=1,
+        is_dummy_request=False,
+        py_rewind_len=0,
+        py_num_accepted_draft_tokens=accepted,
+        max_beam_num_tokens=committed,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+    )
+
+
+def test_generation_allocation_grants_and_trims_overlap_slack() -> None:
+    manager, cache = _generation_manager(draft_len=3)
+    request = _generation_request(5, accepted=1, committed=90)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    assert manager.try_allocate_generation(request)
+    # 1 base token + 3 draft slots + 3 overlap-slack tokens.
+    assert cache.capacity == 107
+    assert manager._pending_overlap_slack == {5: 3}
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    # Keeps 1 base token + 1 accepted draft token; slack and rejected drafts go.
+    assert cache.capacity == 102
+    assert manager._pending_overlap_slack == {}
+
+
+def test_overlap_slack_does_not_compound_across_iterations() -> None:
+    manager, cache = _generation_manager(draft_len=3)
+    request = _generation_request(6, accepted=2, committed=10)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    for iteration in range(1, 5):
+        assert manager.try_allocate_generation(request)
+        manager.update_resources(SimpleNamespace(generation_requests=[request]))
+        # Net growth per iteration is 1 base token + 2 accepted draft tokens.
+        assert cache.capacity == 100 + 3 * iteration
+    assert manager._pending_overlap_slack == {}
+
+
+def test_revert_generation_allocation_returns_overlap_slack() -> None:
+    manager, cache = _generation_manager(draft_len=2)
+    request = _generation_request(7, accepted=0, committed=90)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    assert manager.try_allocate_generation(request)
+    assert cache.capacity == 105
+
+    manager.revert_allocate_generation(request)
+
+    assert cache.capacity == 100
+    assert manager._pending_overlap_slack == {}
+
+
+def test_overlap_slack_trim_never_drops_below_committed_history() -> None:
+    manager, cache = _generation_manager(draft_len=0)
+    request = _generation_request(8, accepted=0, committed=100)
+    manager.kv_cache_map[request.py_request_id] = cache
+    manager._pending_overlap_slack[request.py_request_id] = 5
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    assert cache.capacity == 99

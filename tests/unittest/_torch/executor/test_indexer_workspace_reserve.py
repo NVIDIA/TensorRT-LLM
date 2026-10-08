@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     get_indexer_mqa_logits_elem_budget,
     get_indexer_mqa_logits_workspace_bytes,
 )
+from tensorrt_llm._torch.pyexecutor._util import get_indexer_mqa_logits_workspace_reserve
 
 
 def test_workspace_bytes_match_runtime_element_budget(monkeypatch):
@@ -28,3 +31,16 @@ def test_workspace_bytes_match_runtime_element_budget(monkeypatch):
 def test_workspace_bytes_are_bounded_by_reachable_request_shape(monkeypatch):
     monkeypatch.setenv("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", str(1 << 31))
     assert get_indexer_mqa_logits_workspace_bytes(4096, 4096) == 64 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "kv_cache_memory,workspace_memory,expected",
+    [
+        (6, 4, 4),
+        (2, 4, 2),
+        (0, 4, 0),
+        (8, 0, 0),
+    ],
+)
+def test_workspace_reserve_covers_full_cap(kv_cache_memory, workspace_memory, expected):
+    assert get_indexer_mqa_logits_workspace_reserve(kv_cache_memory, workspace_memory) == expected

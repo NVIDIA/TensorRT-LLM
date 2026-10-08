@@ -472,6 +472,14 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
         output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
             a_fp8, b_fp8, a_sf, b_sf)
 
+    # The in-place variant writes into a caller-owned buffer (DSv4 o_b_proj).
+    inplace_output = torch.empty_like(output)
+    with autotune():
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+            a_fp8, b_fp8, a_sf, b_sf, inplace_output)
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(a_fp8, b_fp8, a_sf, b_sf,
+                                                       inplace_output)
+
     expected = a @ b.t()
     alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha(a.device)
     seen_alphas = []
@@ -503,6 +511,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
     diff = calc_diff(output, expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(inplace_output, expected, atol=1e-3, rtol=1e-3)
 
 
 def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
@@ -527,10 +536,10 @@ def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
     getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and SM107 CuTe DSL support.",
 )
-@pytest.mark.parametrize("m", [1, 128])
+@pytest.mark.parametrize("m", [1, 32, 128, 192, 256])
 def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     """Validate production decode shapes, including CUDA Graph replay."""
-    num_heads, head_dim, nope_dim, k = 16, 512, 448, 1536
+    num_heads, head_dim, nope_dim, k = 128, 512, 448, 1536
     n = num_heads * head_dim
     eps = 1e-6
     torch.random.manual_seed(17)
@@ -547,8 +556,17 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
                                                                    k=k)
 
     position_ids = torch.arange(m, dtype=torch.int32, device="cuda")
-    cu_q_seqlens = torch.tensor([0, m], dtype=torch.int32, device="cuda")
-    kv_cache_lengths = torch.tensor([m], dtype=torch.int32, device="cuda")
+    batch_size = min(m, 32)
+    tokens_per_sequence = torch.full((batch_size, ),
+                                     m // batch_size,
+                                     dtype=torch.int32,
+                                     device="cuda")
+    tokens_per_sequence[:m % batch_size] += 1
+    cu_q_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        tokens_per_sequence.cumsum(0, dtype=torch.int32),
+    ])
+    kv_cache_lengths = tokens_per_sequence.clone()
     quant_scale_qkv = torch.ones(1, dtype=torch.float32, device="cuda")
 
     rope_dim = head_dim - nope_dim
@@ -574,8 +592,48 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
             eps,
         )
 
+    # Exercise the eager fallback first, then profile every registered tactic.
     run_fusion()
     torch.cuda.synchronize()
+    custom_op = "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant"
+    with autotune():
+        run_fusion()
+    torch.cuda.synchronize()
+    tuner = AutoTuner.get()
+    assert tuner.stats.tuned_op_profiled_configs.get(custom_op, 0) >= 4
+    assert not tuner.stats.failed_profiling_count.get(custom_op, set())
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner
+
+    runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+    profile_inputs = [
+        a_fp8.new_empty((8192, k)),
+        b_fp8,
+        a_sf,
+        b_sf,
+        cos_sin_cache,
+        cu_q_seqlens,
+        kv_cache_lengths,
+        position_ids.new_empty(8192),
+        quant_scale_qkv,
+    ]
+    small_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(runner.tuning_config,
+                                                    profile_inputs)
+    }
+    assert small_profile_ms == {32, 128, 192, 256}
+
+    profile_inputs[0] = a_fp8.new_empty((16384, k))
+    profile_inputs[7] = position_ids.new_empty(16384)
+    large_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(
+            runner.large_m_tuning_config, profile_inputs)
+    }
+    assert large_profile_ms == {32, 128, 192, 256, 16384}
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run_fusion()
@@ -779,6 +837,67 @@ def test_cute_dsl_mxfp8_gemm_rubin_mixed_clusters_clc_dynamic_prefetch_multi_wav
     assert calc_diff(static_output, expected) < 1e-3
     assert calc_diff(dynamic_output, expected) < 1e-3
     torch.testing.assert_close(dynamic_output, static_output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "batch_size", "use_2cta_instrs", "cluster_shape_mn", "expected"),
+    [
+        # 64 x 1024 = 65536 single-CTA clusters: one past the grid-Z limit.
+        (8192, 65536, 1, False, (1, 1), False),
+        (8192, 65472, 1, False, (1, 1), True),
+        # Split-K multiplies the L extent of the launch.
+        (8192, 32768, 2, False, (1, 1), False),
+        # Larger clusters reduce the cluster count.
+        (8192, 65536, 1, False, (2, 1), True),
+        # 2-CTA instructions halve the per-CTA M tile, doubling the CTAs.
+        (8192, 32768, 1, True, (2, 1), True),
+    ],
+)
+def test_clc_raster_n_launchable_grid(m, n, batch_size, use_2cta_instrs,
+                                      cluster_shape_mn, expected):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        _clc_raster_n_has_launchable_grid
+
+    assert _clc_raster_n_has_launchable_grid(m, n, batch_size, (128, 64),
+                                             use_2cta_instrs,
+                                             cluster_shape_mn) is expected
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and SM107 CuTe DSL support.",
+)
+def test_cute_dsl_mxfp8_gemm_rubin_rejects_clc_grid_z_overflow():
+    """CLC raster-N tactics must not exceed CUDA's grid-Z limit."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLMXFP8RubinLinear
+
+    m, n, k = 8192, 65536, 1536
+    a_fp8 = torch.empty((m, k), device="cuda", dtype=torch.float8_e4m3fn)
+    b_fp8 = torch.empty((n, k), device="cuda", dtype=torch.float8_e4m3fn)
+    a_sf = torch.empty((393216, ), device="cuda", dtype=torch.uint8)
+    b_sf = torch.empty((3145728, ), device="cuda", dtype=torch.uint8)
+    alpha = torch.ones((), dtype=torch.float32, device="cuda")
+    inputs = [a_fp8, b_fp8, a_sf, b_sf, alpha]
+
+    invalid_tactic = (
+        "base",
+        (128, 64, 128),
+        (128, 64, 64),
+        (1, 1),
+        False,
+        True,
+        "clc_dynamic",
+        "n",
+        1,
+    )
+    valid_tactic = (*invalid_tactic[:-2], "m", 1)
+    tactics = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16,
+                                      use_tvm_ffi=True).get_valid_tactics(
+                                          inputs, None)
+
+    assert invalid_tactic not in tactics
+    assert valid_tactic in tactics
 
 
 @pytest.mark.skipif(

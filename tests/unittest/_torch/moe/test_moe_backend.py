@@ -19,6 +19,7 @@ import importlib
 import itertools
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,7 +108,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     impl_class_for,
     resolve_moe_impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
+    ExternalCommMoEScheduler,
+    FusedCommMoEScheduler,
+)
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -133,6 +137,50 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fused_comm_scheduler_accepts_singleton_non_dp_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6])
+    )
+
+    assert x_real.shape == x.shape
+    assert router_logits_real.shape == router_logits.shape
+    assert all_rank_num_tokens == [6]
+    assert ep_rank == 0
+    assert not had_meta
+
+
+def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5, 4, 3])
+    )
+
+    assert x_real.shape[0] == 3
+    assert router_logits_real.shape[0] == 3
+    assert all_rank_num_tokens == [6, 5, 4, 3]
+    assert ep_rank == 3
+    assert had_meta
+
+
+def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
 
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
@@ -1210,6 +1258,46 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 
     moe._alloc_symm_buffer.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(moe)
+
+
+def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
+    """A launcher env describing another world must not seed this MPI world.
+
+    A disaggregated launcher can export its outer RANK/WORLD_SIZE into each
+    server, whose model runs in its own MPI world. The bootstrap must then
+    rendezvous over MPI and overwrite the stale variables.
+    """
+    mpi_comm = MagicMock()
+    mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Get_size.return_value = 4
+    mpi_comm.bcast.return_value = ("model-host", 29501)
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Split_type.return_value = local_mpi_comm
+    mpi = SimpleNamespace(COMM_WORLD=mpi_comm, COMM_TYPE_SHARED=1)
+    init_process_group = MagicMock()
+
+    monkeypatch.setitem(sys.modules, "mpi4py", SimpleNamespace(MPI=mpi))
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("MASTER_ADDR", "outer-host")
+    monkeypatch.setenv("MASTER_PORT", "29400")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    MegaMoEDeepGemm._maybe_init_dist_from_mpi()
+
+    mpi_comm.bcast.assert_called_once_with(None, root=0)
+    assert os.environ["MASTER_ADDR"] == "model-host"
+    assert os.environ["MASTER_PORT"] == "29501"
+    assert os.environ["RANK"] == "2"
+    assert os.environ["WORLD_SIZE"] == "4"
+    init_process_group.assert_called_once_with(
+        backend="nccl",
+        rank=2,
+        world_size=4,
+        device_id=None,
+    )
 
 
 def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
