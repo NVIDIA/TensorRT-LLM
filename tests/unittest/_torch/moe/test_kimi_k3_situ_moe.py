@@ -1400,14 +1400,16 @@ def _skip_if_backend_unavailable(moe_backend):
 
     if not IS_CUTLASS_DSL_AVAILABLE:
         pytest.skip("CuteDSL MoE requires the CuTe DSL wheel")
-    # nvfp4_moe_supported admits every SM >= 100, but this integration enables
-    # SiTU only on Blackwell. Match can_implement() rather than exercising an
-    # end-to-end path that has not been enabled on SM107.
-    if get_sm_version() not in (100, 103):
-        pytest.skip(
-            f"CuteDSL SiTU MoE needs the Blackwell act-fusion kernel "
-            f"(SM100/SM103), got SM{get_sm_version()}"
-        )
+    # nvfp4_moe_supported admits every SM >= 100; the CuteDSL act-fusion
+    # kernels with a SiTU epilogue exist for SM100/SM103 and SM107 (Rubin).
+    sm_version = get_sm_version()
+    if sm_version not in (100, 103, 107):
+        pytest.skip(f"CuteDSL SiTU MoE needs SM100/SM103/SM107, got SM{sm_version}")
+    if sm_version == 107:
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+        if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("CuteDSL SiTU MoE on SM107 needs CuTe DSL Rubin support")
 
 
 def _make_nvfp4_expert_bank(num_experts, intermediate, hidden, seed=907):

@@ -3403,6 +3403,22 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
 
 
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_cutedsl_nvfp4_situ_admitted_on_blackwell_and_rubin(sm):
+    """CuteDSL NVFP4 SiTU is eligible on SM100/SM103 and on Rubin (SM107)."""
+    deps = (MoEDep.CUTEDSL_RUBIN,) if sm == 107 else ()
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=256,
+        env=MoEEnvironment(sm=sm, available_deps=deps),
+    )
+    verdict = CuteDslFusedMoE.can_implement(_nvfp4_problem(2048, "SiTu"), deployment)
+    assert verdict.reject_reason is not MoERejectReason.ACTIVATION_UNSUPPORTED, verdict.detail
+
+
 def test_cutedsl_fc12_refuses_relu2_at_resolution():
     """Relu2 is not gated; the fused FC12 epilogue would compile it as SwiGLU."""
     rejection = _reject_unsupported_activation(CuteDslFc12FusedMoE, _nvfp4_problem(2048, "Relu2"))
