@@ -220,3 +220,49 @@ def test_remove_copy_for_mla_restores_final_output_mutation() -> None:
     assert inplace_nodes[0].kwargs["output"] is output
     assert clone.args[0] is output
     graph.lint()
+
+
+def test_inplace_info_declares_every_mutated_arg():
+    """Every inplace_info entry must name ALL of its op's mutates_args.
+
+    remove_copy_for_mutates_args rebuilds the direct call from
+    ``{k: v for k, v in node.kwargs.items() if not k.startswith("_")}`` plus the
+    names in inplace_info. auto_functionalize hoists every mutable argument into
+    underscore-prefixed metadata, so a mutable arg missing from the map is
+    dropped from the rewritten call entirely, and the failure surfaces far away
+    as a "missing value for argument" error (nvbugs/6474888) or, for an
+    optional mutable argument, as a silently skipped write.
+
+    Asserting the invariant rather than one op is deliberate: the same
+    omission is available to every in-place custom op.
+    """
+    from tensorrt_llm._torch.compilation.utils import inplace_info
+
+    table = inplace_info()
+    assert table, "inplace_info() is empty; no op was registered, so this test would be vacuous"
+    registered = {op._schema.name for op in table}
+    assert "trtllm::mla_custom_op_inplace" in registered, (
+        "trtllm::mla_custom_op_inplace is absent from inplace_info(); the "
+        "regression this test exists for could not be detected. Registered: "
+        f"{sorted(registered)}"
+    )
+
+    mismatches = []
+    for op_overload, declared in table.items():
+        schema = op_overload._schema
+        actual = [
+            argument.name
+            for argument in schema.arguments
+            if argument.alias_info is not None and argument.alias_info.is_write
+        ]
+        # Ordered comparison: inplace_info values follow the op's schema
+        # declaration order. The keys are not asserted:
+        # verify_dynamic_tree_rejection_out_op keys by position in the full
+        # argument list rather than among the mutable arguments.
+        if list(declared.values()) != actual:
+            mismatches.append(
+                f"{schema.name}: inplace_info declares {list(declared.values())}, "
+                f"op mutates {actual}"
+            )
+
+    assert not mismatches, "inplace_info is out of sync with op schemas:\n" + "\n".join(mismatches)
