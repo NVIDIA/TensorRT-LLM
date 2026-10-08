@@ -1375,7 +1375,7 @@ def test_tp16_nvfp4_padded_loaders_preserve_rank_ownership():
 #: importing ``cute_dsl_utils`` pulls in the DSL package, which appends its own
 #: directory to ``sys.path``, and this repository fails the whole pytest
 #: session when a test file does that at collection time.
-_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL"]
+_NVFP4_SITU_BACKENDS = ["CUTLASS", "TRTLLM", "CUTEDSL", "CUTEDSL_FC12"]
 
 
 def _skip_if_backend_unavailable(moe_backend):
@@ -1386,6 +1386,14 @@ def _skip_if_backend_unavailable(moe_backend):
     early puts the wheel's package directory on ``sys.path`` for every other
     test file in the session.
     """
+    if moe_backend == "CUTEDSL_FC12":
+        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+        # The fused FC1+FC2 kernel is Rubin-only; can_implement() turns every
+        # other SM down, so there is no end-to-end path to exercise.
+        if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+            pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+        return
     if moe_backend != "CUTEDSL":
         return
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -2187,6 +2195,72 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
     for betas, output in outputs.items():
         if betas != (4.0, 25.0):
             assert not torch.allclose(first, output), f"soft-caps {betas} reused the first output"
+
+
+@nvfp4_moe_supported
+def test_cutedsl_fc12_survives_autotune_warmup():
+    """Drive FC12 through a cold AutoTuner warmup.
+
+    ``do_preparation`` only runs from inside ``AutoTuner.choose_one``'s
+    profiling path. Other FC12 tests call ``moe.forward`` outside any
+    ``autotune()`` context, so that branch never runs there. ``clear_cache()``
+    is load-bearing: in tuning mode a cache hit also returns early.
+    """
+    from tensorrt_llm._torch.autotuner import AutoTuner, AutoTunerStatistics, autotune
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+
+    custom_op = "CuteDslFc12FusedMoE::run_moe_nvfp4"
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+
+    torch.manual_seed(91)
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w3 = [
+        torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    w2 = [
+        torch.randn(hidden, inter, dtype=torch.bfloat16, device="cuda") * 0.05
+        for _ in range(num_experts)
+    ]
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+
+    router_logits = gate.compute_logits(x)
+
+    autotuner = AutoTuner.get()
+    saved = (autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs)
+    autotuner.clear_cache()
+    # The singleton outlives the test; fresh statistics keep the positive
+    # control below from being satisfied by an earlier test.
+    autotuner.stats = AutoTunerStatistics()
+    autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = 0, 1, 10
+    try:
+        # No cache_path: a shared on-disk cache would turn a cold miss into a
+        # hit and skip the branch under test.
+        with torch.inference_mode(), autotune():
+            tuned = moe.forward(x, router_logits, all_rank_num_tokens=None)
+    finally:
+        autotuner.warmup, autotuner.repeat, autotuner.stream_delay_micro_secs = saved
+
+    assert tuned.shape == x.shape
+    assert torch.isfinite(tuned.float()).all()
+    # Positive control: without it the test passes when nothing is profiled.
+    profiled = autotuner.stats.tuned_op_profiled_configs.get(custom_op, 0)
+    assert profiled > 0, f"{custom_op} was never profiled; the warmup branch did not run"
+    assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
 
 
 def test_fp8_block_scaled_dequantization():

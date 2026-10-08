@@ -1258,7 +1258,7 @@ class KimiK3MoERuntime(nn.Module):
             # CUTLASS is absent on purpose: it is the fallback target, so
             # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
+            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL", "CUTEDSL_FC12"),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1466,18 +1466,20 @@ class KimiK3MoERuntime(nn.Module):
         config. Default split is EP-only; see ``_select_moe_tp_ep``."""
         # Every backend here declares ``ActivationType.SiTu`` in its
         # ``activation_support``; the list is not a preference order. CUTEDSL
-        # joined once its act-fusion kernel grew the SiTU epilogue.
+        # joined once its act-fusion kernel grew the SiTU epilogue, and
+        # CUTEDSL_FC12 (Rubin/SM107) once its fused FC1+FC2 kernel did.
         supported_backends = {
             "CUTLASS",
             "TRTLLM",
             "CUTEDSL",
+            "CUTEDSL_FC12",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, CUTEDSL_FC12, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:
