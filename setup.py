@@ -56,9 +56,10 @@ def sanity_check():
         schema = tensorrt_llm_path / "schemas" / f"trtllm-serve-{config_kind}.schema.json"
         if not schema.is_file():
             raise ImportError(
-                f"Missing configuration schema: {schema}. Run "
+                f"Missing configuration schema: {schema}. Restore the checked-in "
+                "schema files, or regenerate them with "
                 "python3 scripts/generate_trtllm_serve_schemas.py "
-                "with a matching TensorRT-LLM build before packaging.")
+                "using a matching TensorRT-LLM build before packaging.")
     if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
