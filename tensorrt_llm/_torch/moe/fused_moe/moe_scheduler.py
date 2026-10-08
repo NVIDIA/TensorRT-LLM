@@ -1132,15 +1132,24 @@ class FusedCommMoEScheduler(MoEScheduler):
         provided, e.g. dummy / single-rank forwards).
         """
         moe = self.moe
-        had_meta = all_rank_num_tokens is not None
+        # A single count is local (non-DP) metadata, not one entry per EP rank:
+        # indexing it with moe_ep_rank > 0 would raise.
+        had_meta = all_rank_num_tokens is not None and len(all_rank_num_tokens) > 1
         if had_meta:
             # Force plain Python int: downstream torch.Tensor.split and range()
             # reject torch 0-d tensor / numpy scalar elements, and the public
             # ``Optional[List[int]]`` type hint is not runtime-enforced.
             real_all_rank_num_tokens = [int(v) for v in all_rank_num_tokens]
+            if len(real_all_rank_num_tokens) != moe.mapping.moe_ep_size:
+                raise ValueError(
+                    "Fused-comm MoE token metadata must contain one count per EP rank; "
+                    f"got {len(real_all_rank_num_tokens)} counts for EP size "
+                    f"{moe.mapping.moe_ep_size}."
+                )
             ep_rank = moe.mapping.moe_ep_rank
         else:
-            real_all_rank_num_tokens = [int(x.shape[0])]
+            real_local = int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
+            real_all_rank_num_tokens = [real_local]
             ep_rank = 0
         real_local = real_all_rank_num_tokens[ep_rank]
         assert real_local <= x.shape[0], (
