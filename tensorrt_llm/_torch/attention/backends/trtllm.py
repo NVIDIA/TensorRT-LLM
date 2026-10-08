@@ -40,7 +40,6 @@ from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
-from .fmha.registry import get_enabled_fmha_lib_classes
 from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -354,12 +353,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             or self.runtime_features.cache_reuse
             or self.runtime_features.has_speculative_draft_tokens
         ) if self.runtime_features is not None else False
-        # Give every enabled FMHA library a chance to refuse a configuration
-        # its forward would serve incorrectly (e.g. a fused-kernel absence the
-        # C++ op would silently paper over). Raises at construction with an
-        # actionable error instead of failing in flight.
-        for fmha_cls in get_enabled_fmha_lib_classes():
-            fmha_cls.validate_metadata(self)
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}

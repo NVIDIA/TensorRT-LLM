@@ -419,17 +419,17 @@ remain invariant for its lifetime. Request-varying capability requirements
 must be represented in `FmhaManager._make_cache_key`, because a cache hit
 reuses the selected library without rechecking support.
 
-A third check point, `validate_metadata(cls, metadata)`, runs once per
-`TrtllmAttentionMetadata` construction for every enabled library. It is for
-configurations a library would serve *incorrectly* rather than not at all:
-failures inside the library's own kernels that selection cannot see or route
-around. The hook raises with an actionable error instead of returning a
-bool, so a doomed configuration fails at construction with the cause and the
-remedy named, not at first forward with a generic no-library error. The
-default accepts everything. `FallbackFmha` uses it to refuse paged-context
-FMHA on (SM, head_dim) combinations whose fused context kernel is proven
-absent, where the C++ op would silently fall back to unfused MHA and corrupt
-the cached prefix.
+For a configuration a library would serve *incorrectly* rather than not at
+all -- a failure inside the library's own kernels that selection cannot see
+or route around -- `_is_supported` raises an actionable error instead of
+returning False. A False would let selection fall through to the generic
+no-library error (or, for a library that is not last in the registry, hand
+the request to a library that masks the broken configuration), while the
+raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
+way for FP4 MLA configurations only it can serve, and `FallbackFmha` raises
+to refuse paged-context FMHA on (SM, head_dim) combinations whose fused
+context kernel is proven absent, where the C++ op would silently fall back
+to unfused MHA and corrupt the cached prefix.
 
 The FMHA package is split by role:
 

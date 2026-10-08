@@ -78,14 +78,14 @@ class FallbackFmha(Fmha):
     # configurations the op serves correctly. The authoritative
     # exact-parameter check is the op-level refusal in
     # thop/attentionOp.cpp's get_attention_op; this gate exists to move the
-    # proven-problematic cells to metadata construction with a remedial
-    # error. Extend as further combinations are proven.
+    # proven-problematic cells to FMHA dispatch with a remedial error.
+    # Extend as further combinations are proven.
     CONTEXT_FMHA_ABSENT_HEAD_DIMS: ClassVar[dict[int, tuple[int, ...]]] = {
         103: (64,),
     }
 
     @classmethod
-    def validate_metadata(cls, metadata: "TrtllmAttentionMetadata") -> None:
+    def _validate_paged_context_fmha(cls, metadata: "TrtllmAttentionMetadata") -> None:
         """Refuse paged-context FMHA when no kernel exists for this config.
 
         When ``use_paged_context_fmha`` is enabled but the fused context FMHA
@@ -95,9 +95,12 @@ class FallbackFmha(Fmha):
         then OVERWRITTEN by the chunk's write-back. Any request with a
         non-zero cached length -- block reuse, partial reuse, chunked
         prefill, speculative draft tokens -- returns a plausible wrong answer
-        with no error. That fallback happens inside the C++ op, invisible to
-        FMHA library selection, so the refusal must happen here at metadata
-        construction, where the features are enabled.
+        with no error. That fallback happens inside the C++ op, after
+        selection has already committed to this library, so ``_is_supported``
+        calls this check for every batch with a context phase and raises
+        instead of returning False: this library is last in the registry, so
+        the raise skips no other library, and it replaces the silent wrong
+        answer with an error naming the cause and the remedy.
 
         Inside a blocklisted (SM, head_dim) cell the decision is per KV
         dtype and page size, made by asking the build what it contains via
@@ -140,8 +143,8 @@ class FallbackFmha(Fmha):
             # KV precision. For an FP8 KV cache the op quantizes Q to FP8
             # but keeps dataTypeOut at the activation dtype (BF16/FP16)
             # unless FP8 attention output is enabled, and neither the
-            # activation dtype nor that per-module flag is knowable at
-            # metadata construction, so one present variant admits the
+            # activation dtype nor that per-module flag is visible to this
+            # metadata-only check, so one present variant admits the
             # cell; if the variant the model actually needs is the absent
             # one, the exact-parameter refusal in get_attention_op still
             # raises. An NVFP4 KV cache is read by the FP8-output kernels,
@@ -167,11 +170,12 @@ class FallbackFmha(Fmha):
                 )
                 for dim in absent
             ):
-                logger.info(
+                logger.info_once(
                     f"Paged-context FMHA enabled for head_dim {absent} on SM "
                     f"{sm}: this build's fused context FMHA kernel is present "
                     f"for KV cache dtype {kv_dtype} at {tokens_per_block} "
-                    f"tokens per block."
+                    f"tokens per block.",
+                    key=f"paged_context_fmha_present_{sm}_{absent}_{kv_dtype}_{tokens_per_block}",
                 )
                 return
             cause = (
@@ -229,6 +233,17 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del k, v, phase
+        # A context phase served by the thop op with use_paged_context_fmha
+        # enabled would silently corrupt the cached prefix wherever the fused
+        # context kernel is absent. Raise rather than return False: no
+        # library follows this one, and the error names the cause and the
+        # remedy instead of the generic no-library message. Generation-only
+        # batches never run the context path, so they pass; whether a batch
+        # has a context phase is part of the FMHA cache key
+        # (``context_batch_size``), so the admitted result cannot be reused
+        # for a context batch.
+        if metadata.num_contexts > 0:
+            self._validate_paged_context_fmha(metadata)
         # A verify group may straddle a page boundary onto two CP ranks, so
         # its KV ownership is per-token. The fused thop path cannot express
         # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
