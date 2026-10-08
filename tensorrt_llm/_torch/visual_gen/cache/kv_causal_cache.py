@@ -115,8 +115,8 @@ class _CausalBlockLayout:
     # A fixed 2*(tpb-1) entries per block, padded with a
     # harmless repeat of the block's own first token, so the first ``n`` blocks'
     # entries are a prefix and a captured forward replays them.
-    extra_src: torch.Tensor  # [num_blocks*(tpb-1)] int64 staged token index
-    extra_dst: torch.Tensor  # [num_blocks*(tpb-1)] int64 slot id
+    extra_src: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 staged token index
+    extra_dst: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 slot id
 
 
 @dataclass
@@ -127,7 +127,6 @@ class _GeometryState:
     Every per-layout tensor is a view into one of two packed buffers with a host
     twin, rewritten in place by ``commit``."""
 
-    num_private_pages: int
     layouts: Dict[int, _CausalBlockLayout]  # by causal block size
     packed_i32: torch.Tensor
     packed_i64: torch.Tensor
@@ -168,6 +167,42 @@ class CausalKVCacheManager(KVCacheManagerV2):
     """
 
     @staticmethod
+    def _region_pages(tokens_per_page: int, block_size: int) -> int:
+        """Private pages one causal block needs: up to three partial pages' worth of
+        visible slots plus its own tokens."""
+        return ceil_div(3 * (tokens_per_page - 1) + block_size, tokens_per_page)
+
+    @staticmethod
+    def _geometry_pages(
+        tokens_per_page: int,
+        pin_tokens: int,
+        window_tokens: int,
+        max_staged_tokens: int,
+        causal_block_sizes: Sequence[int],
+    ) -> Tuple[int, int, Tuple[int, ...]]:
+        """Validate a geometry and return its page counts: ``(resident, private,
+        sizes)``. Resident tokens peak at pin + window + (tpb - 1) stale + staged; the
+        extra page covers the stale tokens and an unaligned fixed-region end."""
+        tpb = tokens_per_page
+        if tpb <= 0 or tpb & (tpb - 1):
+            raise ValueError(f"tokens_per_page must be a power of two, got {tpb}")
+        if min(window_tokens, max_staged_tokens) <= 0 or pin_tokens < 0:
+            raise ValueError(
+                "window_tokens and max_staged_tokens must be positive and pin_tokens non-negative"
+            )
+        sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
+        if not sizes or any(not 0 < b <= max_staged_tokens for b in sizes):
+            raise ValueError(
+                f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and at most "
+                f"max_staged_tokens {max_staged_tokens}"
+            )
+        resident = ceil_div(pin_tokens + window_tokens + max_staged_tokens, tpb) + 1
+        private = sum(
+            (max_staged_tokens // b) * CausalKVCacheManager._region_pages(tpb, b) for b in sizes
+        )
+        return resident, private, sizes
+
+    @staticmethod
     def pool_tokens_for(
         *,
         tokens_per_page: int,
@@ -179,11 +214,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """Pool tokens a geometry needs: resident pages (pinned prefix, window, staged
         tokens, one spare) plus the private pages of every block size. A pool of at
         least this many tokens can ``open`` the geometry."""
-        tpb = tokens_per_page
-        sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
-        num_pages = ceil_div(pin_tokens + window_tokens + max_staged_tokens, tpb) + 1
-        private = sum((max_staged_tokens // b) * ceil_div(3 * (tpb - 1) + b, tpb) for b in sizes)
-        return (num_pages + private) * tpb
+        resident, private, _ = CausalKVCacheManager._geometry_pages(
+            tokens_per_page, pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes
+        )
+        return (resident + private) * tokens_per_page
 
     @staticmethod
     def bytes_for_pool_tokens(
@@ -271,9 +305,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_dtype = dtype
         self._pool_tokens = pool_tokens
         self._pool_pages = pool_tokens // tpb
-        # Private pages: for every block size, each block needs room for up to three
-        # partial pages' worth of slots plus its own tokens.
-        self._region_pages_for = lambda block_size: ceil_div(3 * (tpb - 1) + block_size, tpb)
         # Staged tokens a block's private region holds besides its own: at most two
         # partial pages of earlier blocks, where its window starts and where it starts.
         self._start_entries = 2 * (tpb - 1)
@@ -349,7 +380,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._piece_offsets: Optional[torch.Tensor] = None  # [layers * 2H] pool rows
         # Per-geometry state, and the open geometry's fields bound as attributes.
         self._states: Dict[Tuple[int, int, Tuple[int, ...]], _GeometryState] = {}
-        self._state: Optional[_GeometryState] = None
         self._layouts: Dict[int, _CausalBlockLayout] = {}
         self._packed_i32: Optional[torch.Tensor] = None
         self._packed_i64: Optional[torch.Tensor] = None
@@ -364,12 +394,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._logical: Optional[torch.Tensor] = None
         self._logical_page: Optional[torch.Tensor] = None
         self._view_page: Optional[torch.Tensor] = None
-        self._num_private_pages = 0
         self._block_offsets_size: Optional[int] = None
         self._kv_heads_local = 0
         self._rows_per_page = 0  # pool rows of head_dim per view page: 2 * H * tpb
         self._kv_offset = 0  # the V plane's offset in the op's block-offset encoding
-        self._table_version = 0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -406,24 +434,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """
         if self._kv_cache is not None:
             raise RuntimeError("cache already open; call close() first")
-        if min(window_tokens, max_staged_tokens) <= 0 or pin_tokens < 0:
-            raise ValueError(
-                "window_tokens and max_staged_tokens must be positive and pin_tokens non-negative"
-            )
-        sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
-        if not sizes or any(not 0 < b <= max_staged_tokens for b in sizes):
-            raise ValueError(
-                f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and at most "
-                f"max_staged_tokens {max_staged_tokens}"
-            )
         tpb = self.tokens_per_page
-        needed = self.pool_tokens_for(
-            tokens_per_page=tpb,
-            pin_tokens=pin_tokens,
-            window_tokens=window_tokens,
-            max_staged_tokens=max_staged_tokens,
-            causal_block_sizes=sizes,
+        num_pages, num_private, sizes = self._geometry_pages(
+            tpb, pin_tokens, window_tokens, max_staged_tokens, causal_block_sizes
         )
+        needed = (num_pages + num_private) * tpb
         if needed > self._pool_tokens:
             raise ValueError(
                 f"geometry needs {needed} pool tokens (pin {pin_tokens}, window {window_tokens}, "
@@ -446,10 +461,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._release(kv_cache)
             raise
 
-        # Resident tokens peak at pin + window + (tpb - 1) stale + staged; the extra
-        # page covers the stale tokens and an unaligned fixed-region end.
-        num_pages = ceil_div(pin_tokens + window_tokens + max_staged_tokens, tpb) + 1
-        num_private = sum((max_staged_tokens // b) * self._region_pages_for(b) for b in sizes)
         total_pages = num_pages + num_private
         # V2 owns and may rewrite that buffer: copy it.
         pages = np.array(kv_cache.get_base_page_indices(0), dtype=np.int64)[:total_pages]
@@ -479,7 +490,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self.causal_block_sizes = sizes
         self.num_pages = num_pages
         self.capacity = num_pages * tpb
-        self._num_private_pages = num_private
         self._pin_tokens = pin_tokens
         self._fixed_tokens = 0
         self._history_tokens = 0
@@ -509,7 +519,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._states[key] = state
         self._bind_state(state)
         self._block_offsets_size = None
-        self._table_version += 1
         self._refresh_device_state()
 
     def close(self) -> None:
@@ -576,11 +585,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return self._fixed_tokens + self._history_tokens
 
     @property
-    def table_version(self) -> int:
-        """Increments whenever the block table changes; lets callers cache derived metadata."""
-        return self._table_version
-
-    @property
     def table(self) -> torch.Tensor:
         """``[num_pages]`` int32 device table of layer-0 view indices in logical order
         (a view of the pool-sized table a captured graph holds)."""
@@ -632,7 +636,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 host_ring[:] = np.roll(host_ring, -drop_pages)
                 refill = (old_head, int(host_ring[0]))
                 self._history_tokens -= drop_pages * self.tokens_per_page
-                self._table_version += 1
         self._refresh_device_state(refill)
 
     # ------------------------------------------------------------------ causal blocks
@@ -650,7 +653,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         tpb = self.tokens_per_page
         specs = []  # (size, n, region_pages, i32 fields, i64 fields)
         for size in sizes:
-            n, region_pages = max_staged_tokens // size, self._region_pages_for(size)
+            n, region_pages = max_staged_tokens // size, self._region_pages(tpb, size)
             i32 = {
                 # A row holds a block's whole pages then its region, never more than
                 # the pool has; sized for the pool so every geometry's rows agree.
@@ -712,7 +715,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         )
         view_page = torch.empty(max_staged_tokens, dtype=torch.int32, device=device)
         return _GeometryState(
-            num_private_pages=num_private,
             layouts=layouts,
             packed_i32=packed_i32,
             packed_i64=packed_i64,
@@ -731,7 +733,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _bind_state(self, state: _GeometryState) -> None:
         """Make ``state`` the open geometry's: its tensors become the attributes the
         rest of the cache reads."""
-        self._state = state
         self._layouts = state.layouts
         self._packed_i32, self._packed_i64 = state.packed_i32, state.packed_i64
         self._host_i32, self._host_i64 = state.host_i32, state.host_i64
@@ -1143,7 +1144,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         if k.dtype != buf.dtype or v.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-        size = causal_block_size or num_tokens
+        size = num_tokens if causal_block_size is None else causal_block_size
         layout = self._layout(size)
         if num_tokens % size or num_tokens > layout.num_blocks * size:
             raise ValueError(
@@ -1202,13 +1203,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"first with a size that cuts the staged tokens into at least that many blocks; "
                 f"declared: {size}"
             )
-        rows = self._layouts[size].rows[:num_seqs]
-        n = rows.shape[1]
-        # The op wants base_page * index_scale; the rows hold view indices, which
-        # are base_page * index_scale / kv_factor.
-        k_offsets = rows * self.kv_factor
-        dst_tensor[0, :num_seqs, 0, :n] = k_offsets
-        dst_tensor[0, :num_seqs, 1, :n] = k_offsets + int(self.kv_offset[0])
+        offsets = self._layouts[size].block_offsets[0, :num_seqs]
+        n = offsets.shape[-1]
+        dst_tensor[0, :num_seqs, :, :n] = offsets
         if n < dst_tensor.shape[-1]:
             dst_tensor[0, :num_seqs, :, n:].zero_()
 
