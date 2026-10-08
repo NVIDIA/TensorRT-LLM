@@ -436,6 +436,7 @@ def test_nvfp4_swiglu_blackwell_capability(monkeypatch, sm_version, partitioned,
 
     mlp = GatedMLP.__new__(GatedMLP)
     torch.nn.Module.__init__(mlp)
+    mlp.split_gate_up = False
     mlp.gate_up_proj = layer
     mlp.activation = F.silu
     mlp.swiglu_alpha = None
