@@ -1451,11 +1451,15 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         self.model_config.pretrained_config = self.llm.config
         self.config = self.model_config.pretrained_config
 
-    def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
+    def apply_llm_torch_compile(
+        self, *, backend: Any, fullgraph: bool, recompile_limit: int
+    ) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models
         # consistently expose an LLM compile contract.
         """Compile only the LLM decoder; the vision encoder stays eager."""
-        self.llm.model = torch.compile(self.llm.model, backend=backend, fullgraph=fullgraph)
+        self.llm.model = torch.compile(
+            self.llm.model, backend=backend, fullgraph=fullgraph, recompile_limit=recompile_limit
+        )
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config.text_config
