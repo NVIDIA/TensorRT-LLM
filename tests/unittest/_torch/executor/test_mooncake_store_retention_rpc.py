@@ -181,3 +181,15 @@ def test_protocol_errors_are_not_endpoint_unavailable(status, body):
     with pytest.raises(rpc.RetentionError) as caught:
         client.acquire("marker")
     assert not isinstance(caught.value, rpc.EndpointUnavailable)
+
+
+def test_expired_replay_over_rpc_cannot_displace_newer_turn(service):
+    factory, store, _ = service
+    writer, late = factory(), factory()
+    for number in range(6):
+        save(writer, store, number)
+    drain(writer, store)
+    save(late, store, 0)
+    drain(late, store)
+    assert not store.exists(keys(writer, 0)[0])
+    assert all(store.exists(keys(writer, i)[0]) for i in range(1, 6))

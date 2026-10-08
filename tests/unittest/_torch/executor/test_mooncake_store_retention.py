@@ -330,3 +330,131 @@ def test_shared_or_foreign_page_cannot_enter_reclaim_manifest(setup, payload):
     drain(catalog, store)
     assert store.exists(payload)
     assert payload not in store.removed
+
+
+@pytest.mark.parametrize("replay_endpoint", [0, 99])
+def test_expired_turn_replay_cannot_displace_newer_turn(tmp_path, replay_endpoint):
+    catalog = retention.CheckpointRetention(str(tmp_path / "catalog"), NS, 1)
+    store = FileStore(tmp_path / "store")
+    save(catalog, store, 0, turn="A")
+    save(catalog, store, 1, turn="B")
+    drain(catalog, store)
+    # Restart the catalog to prove the forgotten identity is durable.
+    other = retention.CheckpointRetention(str(tmp_path / "catalog"), NS, 1)
+    save(other, store, replay_endpoint, turn="A")
+    drain(other, store)
+    assert all(store.exists(key) for key in keys(1))
+    assert all(not store.exists(key) for key in keys(replay_endpoint))
+    ledger = json.loads(next((catalog.root / "conversations").glob("*.json")).read_text())
+    assert [row["turn"] for row in ledger] == ["B"]
+
+
+def test_replayed_expired_turn_keeps_active_transfer_pin(setup):
+    catalog, store = setup
+    for number in range(6):
+        save(catalog, store, number)
+    lease = catalog.acquire(keys(0)[0])
+    save(catalog, store, 0)
+    assert drain(catalog, store)["gc_deferred_active"] > 0
+    assert store.exists(keys(0)[0])
+    lease.close(retired=True)
+    drain(catalog, store)
+    assert not store.exists(keys(0)[0])
+    assert all(store.exists(keys(i)[0]) for i in range(1, 6))
+
+
+def test_expired_duplicate_does_not_drop_other_conversation_reference(setup):
+    catalog, store = setup
+    save(catalog, store, 0, "other", "0")
+    for number in range(6):
+        save(catalog, store, number)
+    save(catalog, store, 0)
+    drain(catalog, store)
+    assert all(store.exists(keys(i)[0]) for i in range(6))
+
+
+def test_expired_replay_from_separate_owner_process(setup, tmp_path):
+    catalog, store = setup
+    for number in range(6):
+        save(catalog, store, number)
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=_owner_save, args=(str(tmp_path), 0)) for _ in range(4)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(15)
+        assert process.exitcode == 0
+    drain(catalog, store)
+    assert not store.exists(keys(0)[0])
+    assert all(store.exists(keys(i)[0]) for i in range(1, 6))
+
+
+def test_crash_after_tombstone_before_ledger_preserves_live_turn(setup, monkeypatch):
+    catalog, store = setup
+    for number in range(5):
+        save(catalog, store, number)
+    original = retention._atomic
+
+    def fail_ledger(path, value):
+        if path.parent.name == "conversations":
+            raise OSError("crash after durable tombstone")
+        original(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_atomic", fail_ledger)
+        with pytest.raises(OSError):
+            save(catalog, store, 5)
+    # A tombstone alone must not reject an endpoint of a still-live turn.
+    save(catalog, store, 99, turn="0")
+    drain(catalog, store)
+    assert store.exists(keys(99)[0])
+    save(catalog, store, 5)
+    drain(catalog, store)
+    assert not store.exists(keys(99)[0])
+    save(catalog, store, 100, turn="0")
+    drain(catalog, store)
+    assert not store.exists(keys(100)[0])
+    assert all(store.exists(keys(i)[0]) for i in range(1, 6))
+
+
+def test_tombstone_write_failure_cannot_forget_turn(setup, monkeypatch):
+    catalog, store = setup
+    for number in range(5):
+        save(catalog, store, number)
+    original = retention._atomic
+
+    def fail_expiry(path, value):
+        if path.parent.name == "expired_turns":
+            raise OSError("expiry write failed")
+        original(path, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(retention, "_atomic", fail_expiry)
+        with pytest.raises(OSError):
+            save(catalog, store, 5)
+    ledger = json.loads(next((catalog.root / "conversations").glob("*.json")).read_text())
+    assert [row["turn"] for row in ledger] == list(map(str, range(5)))
+    drain(catalog, store)
+    assert all(store.exists(keys(i)[0]) for i in range(6))
+
+
+def test_old_catalog_without_complete_expiry_history_is_rejected(setup):
+    catalog, _ = setup
+    path = catalog.root / "policy.json"
+    policy = json.loads(path.read_text())
+    policy["schema"] = 1
+    path.write_text(json.dumps(policy))
+    with pytest.raises(retention.RetentionError, match="same retention policy"):
+        retention.CheckpointRetention(str(catalog.root.parent), NS)
+
+
+def test_expired_replay_preserves_same_endpoint_owned_by_newer_turn(setup):
+    catalog, store = setup
+    for number in range(6):
+        save(catalog, store, number)
+    save(catalog, store, 0, turn="new-turn")
+    save(catalog, store, 0, turn="0")
+    drain(catalog, store)
+    assert store.exists(keys(0)[0])
+    assert not store.exists(keys(1)[0])
+    assert all(store.exists(keys(i)[0]) for i in range(2, 6))

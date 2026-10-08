@@ -116,12 +116,12 @@ class CheckpointRetention:
         self.namespace = namespace
         self.max_turns = max_turns
         self.root = Path(directory) / _digest(namespace)
-        for child in ("endpoints", "conversations", "pending"):
+        for child in ("endpoints", "conversations", "pending", "expired_turns"):
             (self.root / child).mkdir(parents=True, exist_ok=True)
         self._pending_cursor = None
         self._uncertain_claims = []
         with _lock(self.root / "catalog.lock"):
-            policy = {"schema": 1, "namespace": namespace, "max_turns": max_turns}
+            policy = {"schema": 2, "namespace": namespace, "max_turns": max_turns}
             path = self.root / "policy.json"
             previous = _read(path, None)
             if previous is not None and previous != policy:
@@ -201,6 +201,14 @@ class CheckpointRetention:
                     row["endpoints"] = sorted(set(row["endpoints"]) | {endpoint_id})
                     break
             else:
+                # Expired identities outlive the bounded ledger. A late duplicate
+                # must not become a new turn and displace a newer checkpoint.
+                # Check the live ledger first: a crash can leave a tombstone for
+                # a turn whose eviction has not committed yet.
+                tombstone = self.root / "expired_turns" / _digest(conversation_id + "/" + turn)
+                if tombstone.exists():
+                    _atomic(self.root / "pending" / endpoint_id, {})
+                    return 0
                 turns.append({"turn": turn, "endpoints": [endpoint_id]})
             retained = turns[-self.max_turns :]
             expired = turns[: -self.max_turns]
@@ -209,6 +217,14 @@ class CheckpointRetention:
             # Insert new reference first, then commit ledger, then release old
             # references. A crash between steps can only retain extra objects.
             _atomic(lease.endpoint / "refs" / conversation_id, {})
+            # Persist expiry before forgetting a turn. On failure the old ledger
+            # still wins; on success all later publications see the tombstone.
+            # These small records live for the job namespace, not the payload TTL.
+            for row in expired:
+                tombstone = (
+                    self.root / "expired_turns" / _digest(conversation_id + "/" + row["turn"])
+                )
+                _atomic(tombstone, {})
             _atomic(path, retained)
             for old_id in dropped_ids:
                 _atomic(self.root / "pending" / old_id, {})
