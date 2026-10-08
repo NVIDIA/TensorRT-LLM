@@ -16,10 +16,12 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MambaLayerGroup,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import FLASHINFER_REPLAY_RING_SIZE
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
     _create_kv_cache_manager,
+    _use_gdn_flashinfer_ring_replay,
     get_kv_cache_manager_cls,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import (
@@ -2354,6 +2356,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    use_flashinfer_ring_replay=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2408,6 +2411,7 @@ def _build_v2_hybrid_with_mamba_layer(
         dtype=dtype,
         conv_state_layout=conv_state_layout,
         kda_replay_num_spec=kda_replay_num_spec,
+        use_flashinfer_ring_replay=use_flashinfer_ring_replay,
     )
 
 
@@ -3675,6 +3679,242 @@ def test_v2_kda_replay_validates_configuration(
             conv_state_layout=conv_state_layout,
             kda_replay_num_spec=num_spec,
         )
+
+
+def _ring_gate_mamba_params(**overrides):
+    params = dict(
+        state_size=128,
+        conv_kernel=4,
+        num_heads=4,
+        n_groups=2,
+        head_dim=128,
+        mamba_layer_mask=[True, False],
+        target_full_attention_layer_mask=[False, True],
+        num_mamba_layers=1,
+        num_draft_layers=1,
+        dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.bfloat16,
+    )
+    params.update(overrides)
+    return MambaKVCacheParams(**params)
+
+
+@pytest.mark.parametrize(
+    (
+        "env",
+        "use_replay",
+        "manager_cls",
+        "available",
+        "param_overrides",
+        "draft_len",
+        "expected",
+        "warns",
+    ),
+    [
+        ("1", True, MambaHybridCacheManagerV2, True, {}, 3, True, False),
+        ("1", True, MambaHybridCacheManagerV2, True, {}, 7, True, False),
+        (None, True, MambaHybridCacheManagerV2, True, {}, 3, False, False),
+        ("1", False, MambaHybridCacheManagerV2, True, {}, 3, False, False),
+        ("1", True, CppMambaHybridCacheManager, True, {}, 3, False, True),
+        ("1", True, MambaHybridCacheManagerV2, False, {}, 3, False, True),
+        (
+            "1",
+            True,
+            MambaHybridCacheManagerV2,
+            True,
+            {"mamba_ssm_cache_dtype": torch.float32},
+            3,
+            False,
+            True,
+        ),
+        ("1", True, MambaHybridCacheManagerV2, True, {"dtype": torch.float16}, 3, False, True),
+        ("1", True, MambaHybridCacheManagerV2, True, {"head_dim": 64}, 3, False, True),
+        ("1", True, MambaHybridCacheManagerV2, True, {}, 2, False, True),
+    ],
+    ids=[
+        "eligible_T4",
+        "eligible_T8",
+        "not_opted_in",
+        "replay_off",
+        "cpp_manager",
+        "kernel_unavailable",
+        "fp32_state",
+        "fp16_model",
+        "head_dim_64",
+        "T3",
+    ],
+)
+def test_gdn_flashinfer_ring_replay_gate(
+    monkeypatch,
+    env,
+    use_replay,
+    manager_cls,
+    available,
+    param_overrides,
+    draft_len,
+    expected,
+    warns,
+):
+    if env is None:
+        monkeypatch.delenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", env)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    warning_log = MagicMock()
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.logger.warning", warning_log)
+
+    assert (
+        _use_gdn_flashinfer_ring_replay(
+            use_replay,
+            manager_cls,
+            _ring_gate_mamba_params(**param_overrides),
+            MTPDecodingConfig(max_draft_len=draft_len),
+        )
+        is expected
+    )
+    assert warning_log.called is warns
+
+
+@pytest.mark.parametrize("available", [True, False], ids=["eligible", "kernel_unavailable"])
+def test_gdn_flashinfer_ring_replay_gate_force(monkeypatch, available):
+    monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.fla.flashinfer_cached_replay."
+        "is_flashinfer_cached_replay_available",
+        lambda: available,
+    )
+    args = (
+        True,
+        MambaHybridCacheManagerV2,
+        _ring_gate_mamba_params(),
+        MTPDecodingConfig(max_draft_len=3),
+    )
+    if available:
+        assert _use_gdn_flashinfer_ring_replay(*args) is True
+    else:
+        with pytest.raises(RuntimeError, match="force"):
+            _use_gdn_flashinfer_ring_replay(*args)
+
+
+@pytest.mark.parametrize(
+    ("use_replay_state_update", "conv_state_layout"),
+    [(False, "q_k_v"), (True, "x_b_c")],
+    ids=["replay_off", "mamba2_layout"],
+)
+def test_v2_flashinfer_ring_replay_requires_gdn_replay(use_replay_state_update, conv_state_layout):
+    with pytest.raises(ValueError, match="requires GDN replay"):
+        _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=3),
+            use_replay_state_update=use_replay_state_update,
+            conv_state_layout=conv_state_layout,
+            use_flashinfer_ring_replay=True,
+        )
+
+
+def test_v2_gdn_ring_replay_allocates_rings_instead_of_double_buffer():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        use_replay_state_update=True,
+        conv_state_layout="q_k_v",
+        use_flashinfer_ring_replay=True,
+    )
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    try:
+        assert mgr.use_replay_state_update
+        assert not mgr.use_gdn_cached_replay_all_layer_commit
+        assert mgr.old_x is None and mgr.old_B is None
+        assert mgr.old_dt is None and mgr.old_dA_cumsum is None
+        nheads, head_dim, d_state = mgr.ssm_state_shape
+        layers, slots = mgr.local_num_mamba_layers, mgr.cache_base.shape[0]
+        assert mgr.k_ring.shape == (layers, slots, mgr._n_groups_per_rank, ring_size, d_state)
+        assert mgr.u_ring.shape == (layers, slots, nheads, ring_size, head_dim)
+        assert mgr.g_ring.shape == (layers, slots, nheads, ring_size)
+        assert mgr.g_ring.dtype == torch.float32
+        for t in (mgr.cache_base, mgr.k_ring, mgr.u_ring, mgr.g_ring):
+            assert not t.any()
+
+        layer_cache = mgr.mamba_layer_cache(1)
+        offset = mgr.mamba_layer_offsets[1]
+        assert layer_cache.old_x is None
+        assert layer_cache.cache_base is mgr.cache_base
+        assert layer_cache.k_ring.data_ptr() == mgr.k_ring[offset].data_ptr()
+        assert layer_cache.u_ring.data_ptr() == mgr.u_ring[offset].data_ptr()
+        assert layer_cache.g_ring.data_ptr() == mgr.g_ring[offset].data_ptr()
+    finally:
+        mgr.shutdown()
+    assert mgr.cache_base is None and mgr.k_ring is None
+    assert mgr.u_ring is None and mgr.g_ring is None
+
+
+def test_v2_gdn_ring_replay_update_advances_ring_start(monkeypatch):
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 1
+    mgr._request_id_to_state_index = {100: 0, 101: 1, 102: 2, 103: 3, 104: 4}
+    mgr._request_id_to_is_dummy = {100: False, 101: False, 102: False, 103: True, 104: False}
+    mgr._dummy_request_mask = torch.zeros(5, dtype=torch.bool)
+    mgr._dummy_request_mask_host = torch.zeros(5, dtype=torch.bool)
+    mgr._use_replay_state_update = True
+    mgr._use_gdn_flashinfer_ring_replay = True
+    mgr.replay_step_width = 4
+    mgr.replay_history_size = 16
+    mgr.prev_num_accepted_tokens = torch.tensor([13, 13, 2, 13, 13], dtype=torch.int32)
+    mgr.cache_buf_idx = torch.zeros(5, dtype=torch.int32)
+    mgr.cache_base = torch.tensor([5, 20, 30, 7, 9], dtype=torch.int32)
+    mgr.intermediate_state_indices = torch.arange(5, dtype=torch.int32)
+    mgr.all_ssm_states = []
+    mgr.all_conv_states = [torch.empty(0)]
+    mgr._stacked_conv_states = None
+    mgr.intermediate_conv_states = torch.empty(0)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *args, **kwargs: None,
+    )
+
+    # Row 0 is a context request, 103 a dummy, 104 CUDA-graph padding.
+    state_indices = torch.tensor(
+        mgr.get_state_indices([100, 101, 102, 103, 104], [False, False, False, False, True]),
+        dtype=torch.int32,
+    )
+    assert mgr._dummy_request_mask.tolist() == [False, False, False, True, True]
+
+    mgr.update_mamba_states(
+        SimpleNamespace(num_seqs=5, num_contexts=1),
+        torch.tensor([1, 3, 2, 3, 3], dtype=torch.int32),
+        state_indices=state_indices,
+    )
+
+    # Slot 1 flushed (13 + 4 > 16): its start moves past the 13 folded rows and
+    # wraps, (20 + 13) % 32 = 1. Slot 2 only appended. Others are untouched.
+    assert mgr.cache_base.tolist() == [5, 1, 30, 7, 9]
+    assert mgr.prev_num_accepted_tokens.tolist() == [13, 3, 4, 13, 13]
+
+
+def test_v2_gdn_ring_replay_resets_context_slots():
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_replay_state_update = True
+    mgr.cuda_state_indices = torch.tensor([2, 1], dtype=torch.int32)
+    mgr.mamba_ssm_rand_seed = None
+    mgr.prev_num_accepted_tokens = torch.tensor([5, 6, 7], dtype=torch.int32)
+    mgr.cache_buf_idx = torch.ones(3, dtype=torch.int32)
+    mgr.old_x = mgr.old_B = mgr.old_dt = mgr.old_dA_cumsum = None
+    mgr.cache_base = torch.tensor([5, 6, 7], dtype=torch.int32)
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    mgr.k_ring = torch.ones(2, 3, 1, ring_size, 4)
+    mgr.u_ring = torch.ones(2, 3, 2, ring_size, 4)
+    mgr.g_ring = torch.ones(2, 3, 2, ring_size)
+
+    mgr._reset_context_mamba_slots(num_contexts=1)
+
+    assert mgr.prev_num_accepted_tokens.tolist() == [5, 6, 0]
+    assert mgr.cache_base.tolist() == [5, 6, 0]
+    for ring in (mgr.k_ring, mgr.u_ring, mgr.g_ring):
+        assert not ring[:, 2].any()  # the new request's slot, in every layer
+        assert ring[:, :2].all()  # other slots untouched
 
 
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
