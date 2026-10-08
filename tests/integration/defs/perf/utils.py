@@ -402,6 +402,7 @@ class PerfServeScriptTestCmds:
             dir=os.getcwd(),
             delete=False)
         self._server_log_path = self._server_log_file.name
+        print_info(f"trtllm-serve log: {self._server_log_path}")
         self._server_proc = subprocess.Popen(cmd,
                                              env=self.server_env,
                                              stdout=self._server_log_file,
