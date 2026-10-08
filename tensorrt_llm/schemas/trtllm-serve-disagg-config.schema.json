@@ -2010,9 +2010,19 @@
           "type": "boolean"
         },
         "free_gpu_memory_fraction": {
-          "maximum": 1,
-          "minimum": 0,
-          "type": "number"
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0.9,
+          "description": "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used.",
+          "title": "Free Gpu Memory Fraction"
         },
         "garbage_collection_gen0_threshold": {
           "default": 20000,
@@ -2155,6 +2165,20 @@
           "description": "KV cache config."
         },
         "kv_cache_dtype": {
+          "default": "auto",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "telemetry": {
+            "allowed_values": [
+              "auto",
+              "float16",
+              "bfloat16",
+              "float32",
+              "fp8",
+              "fp8_ds_mla",
+              "nvfp4"
+            ]
+          },
+          "title": "Dtype",
           "type": "string"
         },
         "kv_connector_config": {
@@ -2991,7 +3015,20 @@
           "type": "boolean"
         },
         "video_pruning_rate": {
-          "type": "number"
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
+          "status": "prototype",
+          "title": "Video Pruning Rate"
         }
       },
       "type": "object"
@@ -7918,9 +7955,19 @@
       "type": "boolean"
     },
     "free_gpu_memory_fraction": {
-      "maximum": 1,
-      "minimum": 0,
-      "type": "number"
+      "anyOf": [
+        {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": 0.9,
+      "description": "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used.",
+      "title": "Free Gpu Memory Fraction"
     },
     "garbage_collection_gen0_threshold": {
       "default": 20000,
@@ -8088,6 +8135,20 @@
       "description": "KV cache config."
     },
     "kv_cache_dtype": {
+      "default": "auto",
+      "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+      "telemetry": {
+        "allowed_values": [
+          "auto",
+          "float16",
+          "bfloat16",
+          "float32",
+          "fp8",
+          "fp8_ds_mla",
+          "nvfp4"
+        ]
+      },
+      "title": "Dtype",
       "type": "string"
     },
     "kv_connector_config": {
@@ -8956,7 +9017,20 @@
       "type": "boolean"
     },
     "video_pruning_rate": {
-      "type": "number"
+      "anyOf": [
+        {
+          "exclusiveMaximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
+      "status": "prototype",
+      "title": "Video Pruning Rate"
     }
   },
   "required": [],
