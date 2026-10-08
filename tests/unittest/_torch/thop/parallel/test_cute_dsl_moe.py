@@ -57,6 +57,29 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version
 
 
+def _nvfp4_quantize_fp32_ref(
+    x: torch.Tensor, inverse_global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize without the BF16 rounding absent from the fused FP32 epilogue."""
+    m, n = x.shape
+    blocks = x.reshape(m, n // 16, 16)
+    scales = (blocks.abs().amax(dim=-1) / 6 * inverse_global_scale).to(torch.float8_e4m3fn)
+    inverse_scales = (inverse_global_scale / scales.float()).clamp(
+        max=torch.finfo(torch.float32).max
+    )
+    normalized = (blocks * inverse_scales.unsqueeze(-1)).reshape(m, n)
+    magnitudes = normalized.abs().contiguous()
+    # E2M1 magnitudes are 0, 0.5, 1, 1.5, 2, 3, 4, 6. At midpoint ties,
+    # choose the even code, matching round-to-nearest-even conversion.
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    codes = torch.bucketize(magnitudes, midpoints)
+    for index in (1, 3, 5):
+        codes += (magnitudes == midpoints[index]).to(codes.dtype)
+    codes = codes.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
+    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
+    return packed, swizzle_sf(scales.view(torch.uint8), m, n)
+
+
 def swiglu_ref(x: torch.Tensor, swiglu_limit: float = float("inf")) -> torch.Tensor:
     x, gate = x.chunk(2, dim=-1)
     if swiglu_limit != float("inf"):
@@ -1276,8 +1299,12 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1306,12 +1333,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type, swiglu_limit)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call gather kernel (single-B)
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
@@ -1482,8 +1512,12 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1511,12 +1545,15 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_rubin(
         tile_idx_to_group_idx,
         num_non_exiting_tiles,
         tile_size=tile_size,
-        output_dtype=torch.bfloat16,
+        output_dtype=torch.float32 if activation_type == ActivationType.Relu2 else torch.bfloat16,
         scaling_vector_size=sf_vec_size,
     )
     c_ref = apply_activation_ref(c_ref, activation_type)
     global_sf = c_ref[:num_valid_permuted_tokens].abs().max().float() / (448 * 6)
-    c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
+    if activation_type == ActivationType.Relu2:
+        c_ref, c_sf_ref = _nvfp4_quantize_fp32_ref(c_ref, 1 / global_sf)
+    else:
+        c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call Rubin gather kernel
     c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_rubin(
@@ -1653,8 +1690,12 @@ def test_nvfp4_gather_grouped_gemm_situ_rubin(tile_size: int):
     permuted_idx_to_expanded_idx_list = permuted_idx_to_expanded_idx.cpu().tolist()
     tile_idx_to_mn_limit_list = tile_idx_to_mn_limit.cpu().tolist()
 
-    a_gathered = torch.empty(max_num_permuted_tokens, hidden_size // 2, dtype=a.dtype)
-    a_sf_gathered = torch.empty(
+    # Padding participates in the reference GEMM and output-scale reduction.
+    # Initialize both FP4 values and scales so padding cannot introduce NaNs.
+    a_gathered = torch.zeros(max_num_permuted_tokens, hidden_size // 2, dtype=torch.uint8).view(
+        a.dtype
+    )
+    a_sf_gathered = torch.zeros(
         max_num_permuted_tokens, hidden_size // sf_vec_size, dtype=a_sf.dtype
     )
     for i in range(num_valid_permuted_tokens):
@@ -1876,12 +1917,13 @@ def test_nvfp4_gather_grouped_gemm_swiglu_rubin_small_tokens(
     )
     num_valid_permuted_tokens = n_tiles * tile_size
     for i in range(min(num_valid_permuted_tokens, max_num_permuted_tokens)):
+        # Routing metadata defines valid rows; expanded index zero is valid.
+        if i >= tile_idx_to_mn_limit[i // tile_size].item():
+            continue
         expanded_idx = permuted_idx_to_expanded_idx[i].item()
-        if expanded_idx > 0 or i == 0:
-            token_id = expanded_idx // top_k
-            if token_id < num_tokens:
-                a_gathered[i] = a[token_id]
-                a_sf_gathered[i] = a_sf_unswizzled[token_id]
+        token_id = expanded_idx // top_k
+        a_gathered[i] = a[token_id]
+        a_sf_gathered[i] = a_sf_unswizzled[token_id]
 
     a_sf_gathered_swizzled = swizzle_sf(
         a_sf_gathered.view(max_num_permuted_tokens, hidden_size // sf_vec_size),
@@ -2282,9 +2324,6 @@ def test_bf16_gather_grouped_gemm_swiglu_rubin(
             valid_mask[i] = True
     c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_mask]
 
-    # Even-tile padding for Rubin cluster sync
-    kernel_nnet = ((num_non_exiting_tiles + 1) // 2) * 2
-
     # Test all valid autotuner candidate tactics via direct runner call
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         Sm107ContiguousGatherGroupedGemmSwigluFusionRunner,
@@ -2300,7 +2339,7 @@ def test_bf16_gather_grouped_gemm_swiglu_rubin(
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,
-        kernel_nnet,
+        num_non_exiting_tiles,
     ]
     tactics = runner.get_valid_tactics(inputs, None)
     assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
@@ -2741,6 +2780,9 @@ def test_cute_dsl_nvfp4_quantize_empty_input_rubin():
 
     assert x.shape == (0, hidden_size // 2)
     assert x_sf.shape == (0, hidden_size // scaling_vector_size)
+    # The empty input must not leave a pending CUDA error for the next launch.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
 
 
 def test_sm107_nvfp4_tile512_fallback_uses_two_cta_cluster():
@@ -4146,8 +4188,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -4188,7 +4229,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_backend(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -4196,8 +4237,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                 moe_backend="CUTEDSL",
                 locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
             )
-            backend = create_moe_backend(
-                moe_cls=CuteDslFusedMoE,
+            moe = create_moe(
                 routing_method=routing_method,
                 num_experts=num_experts,
                 hidden_size=hidden_size,
@@ -4205,9 +4245,11 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                 dtype=dtype,
                 reduce_results=True,
                 model_config=model_config,
-                init_load_balancer=False,
+                allow_backend_degradation=False,
             )
-            backend.load_weights([weights])
+            backend = moe.backend
+            moe.create_weights()
+            moe.load_weights([weights])
             source_storage_ptrs = {}
             if enable_locality_domains and top_k == 2:
                 source_storage_ptrs = {
@@ -4216,12 +4258,13 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                     "fc1_weight_block": backend.quant_scales.fc1_weight_block.untyped_storage().data_ptr(),
                     "fc2_weight_block": backend.quant_scales.fc2_weight_block.untyped_storage().data_ptr(),
                 }
-            backend.post_load_weights()
-            backend.cuda()
-            return backend, source_storage_ptrs
+            moe.post_load_weights()
+            moe.cuda()
+            return moe, source_storage_ptrs
 
-        base_backend, _ = create_backend(False)
-        locality_domain_backend, source_storage_ptrs = create_backend(True)
+        base_moe, _ = create_module(False)
+        locality_domain_moe, source_storage_ptrs = create_module(True)
+        locality_domain_backend = locality_domain_moe.backend
 
         if top_k == 2:
             assert locality_domain_backend._locality_domain_runtime is not None
@@ -4241,10 +4284,8 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
             assert locality_domain_backend.quant_scales.fc2_weight_block.numel() == 0
 
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
-            )
+            base_output = base_moe.forward(input_tensor, router_logits)
+            locality_domain_output = locality_domain_moe.forward(input_tensor, router_logits)
 
         torch.cuda.synchronize()
         torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
@@ -4254,7 +4295,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
+def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -4263,8 +4304,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.mapping import Mapping
 
@@ -4306,7 +4346,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_backend(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool, post_load: bool = True):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -4314,8 +4354,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 moe_backend="CUTEDSL",
                 locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
             )
-            backend = create_moe_backend(
-                moe_cls=CuteDslFusedMoE,
+            moe = create_moe(
                 routing_method=routing_method,
                 num_experts=num_experts,
                 hidden_size=hidden_size,
@@ -4323,9 +4362,11 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 dtype=dtype,
                 reduce_results=True,
                 model_config=model_config,
-                init_load_balancer=False,
+                allow_backend_degradation=False,
             )
-            backend.load_weights([weights])
+            backend = moe.backend
+            moe.create_weights()
+            moe.load_weights([weights])
             full_w3_w1 = None
             full_w2 = None
             source_storage_ptrs = ()
@@ -4336,12 +4377,14 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                     backend.w3_w1_weight.untyped_storage().data_ptr(),
                     backend.w2_weight.untyped_storage().data_ptr(),
                 )
-            backend.post_load_weights()
-            backend.cuda()
-            return backend, full_w3_w1, full_w2, source_storage_ptrs
+            if post_load:
+                moe.post_load_weights()
+            moe.cuda()
+            return moe, full_w3_w1, full_w2, source_storage_ptrs
 
-        base_backend, _, _, _ = create_backend(False)
-        locality_domain_backend, full_w3_w1, full_w2, source_storage_ptrs = create_backend(True)
+        base_moe, _, _, _ = create_module(False)
+        locality_domain_moe, full_w3_w1, full_w2, source_storage_ptrs = create_module(True)
+        locality_domain_backend = locality_domain_moe.backend
 
         assert locality_domain_backend._locality_domain_runtime is not None
         assert locality_domain_backend._locality_domain_weight_shards is not None
@@ -4356,17 +4399,24 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
-        # Keep the production-shape lifecycle and public forward_chunk
-        # integration here. Broad accuracy, autotune, capture, and outer-tile
-        # replay are covered by the unified backend matrix.
+        # The split is a one-time transform: a repeated post-load keeps the shards.
+        locality_domain_moe.post_load_weights()
+        assert locality_domain_backend._locality_domain_weight_shards is shards
+
+        # Keep the production-shape lifecycle and public ConfigurableMoE
+        # forward integration here. Broad accuracy, autotune, capture, and
+        # outer-tile replay are covered by the unified backend matrix.
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
-            )
+            base_output = base_moe.forward(input_tensor, router_logits)
+            locality_domain_output = locality_domain_moe.forward(input_tensor, router_logits)
 
         torch.cuda.synchronize()
         torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
+
+        # A staged load skips transform_weights and only refreshes derived state.
+        staged_moe, _, _, _ = create_module(True, post_load=False)
+        with pytest.raises(NotImplementedError, match="staged loads"):
+            staged_moe.cache_derived_state()
 
 
 @pytest.mark.skipif(
@@ -4452,9 +4502,6 @@ def test_bf16_grouped_gemm_finalize_rubin(
             scale = token_final_scales[token_idx, topk_idx].item()
             c_ref[token_idx] += (c_permuted[i] * scale).to(torch.bfloat16)
 
-    # Even-tile padding for Rubin cluster sync
-    kernel_nnet = ((num_non_exiting_tiles + 1) // 2) * 2
-
     # Test all valid autotuner candidate tactics via direct runner call
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         Sm107ContiguousGroupedGemmFinalizeFusionRunner,
@@ -4491,7 +4538,7 @@ def test_bf16_grouped_gemm_finalize_rubin(
             tile_idx_to_group_idx,
             tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx,
-            kernel_nnet,
+            num_non_exiting_tiles,
             token_final_scales,
         ]
         with torch.inference_mode():

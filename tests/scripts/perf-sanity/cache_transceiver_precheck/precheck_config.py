@@ -88,7 +88,7 @@ MAX_STEP_TIMEOUT_S = 1800
 
 # Fallback KV shape for dry-runs and explicitly selected manager versions when
 # the model directory cannot be resolved. Manager-version "auto" resolution
-# fails fast instead of silently pairing this shape with V1.
+# requires a registered checkpoint or declared architecture instead of assuming V1.
 FALLBACK_KV_SHAPE = {
     "num_layers": 32,
     "num_kv_heads": 8,
@@ -339,6 +339,39 @@ def gate_library_content(draft_launch_sh, llm_src):
     )
 
 
+def declared_architecture(cfg: Mapping[str, Any]) -> str | None:
+    """Read one architecture hint for prechecks without a local checkpoint.
+
+    Args:
+        cfg: Parsed disaggregated benchmark YAML.
+
+    Returns:
+        The stripped architecture name, or None when the hint is omitted.
+
+    Raises:
+        ValueError: If a supplied declaration is not a nonempty string.
+    """
+    metadata = cfg.get("metadata") or {}
+    if "architecture" not in metadata:
+        return None
+    value = metadata["architecture"]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("metadata.architecture must be a nonempty string")
+    return value.strip()
+
+
+def normalized_kv_dtype(dtype: str) -> str:
+    """Return the storage dtype used by the synthetic KV pool.
+
+    Args:
+        dtype: Per-role KV dtype from the benchmark configuration.
+
+    Returns:
+        Canonical fp8, fp16, or bf16 spelling; unsupported/auto uses bf16.
+    """
+    return {"fp8": "fp8", "fp16": "fp16", "half": "fp16"}.get(dtype.lower(), "bf16")
+
+
 def resolve_plan(cfg, benchmark_mode="e2e"):
     """Build the shared precheck plan both roles must agree on.
 
@@ -439,6 +472,7 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
         ),
         "rendezvous_timeout_s": rendezvous_timeout_s,
         "verify_data": bool(knobs["verify_data"]),
+        "architecture": declared_architecture(cfg),
     }
     for role, side, xcvr in (("ctx", ctx_side, ctx_xcvr), ("gen", gen_side, gen_xcvr)):
         kv_cfg = side.get("kv_cache_config") or {}
@@ -457,6 +491,11 @@ def resolve_plan(cfg, benchmark_mode="e2e"):
 def plan_fingerprint(plan):
     """Stable string both sides must agree on before transferring."""
     keys = (
+        "architecture",
+        "ctx_use_kv_cache_manager_v2",
+        "gen_use_kv_cache_manager_v2",
+        "ctx_kv_dtype",
+        "gen_kv_dtype",
         "num_ctx_servers",
         "num_gen_servers",
         "ctx",
@@ -479,6 +518,7 @@ def side_plan(plan, role):
     """Per-role view: this role's parallelism + transceiver/kv config."""
     return {
         "role": role,
+        "architecture": plan["architecture"],
         "parallel": plan[role],
         "cache_transceiver_config": plan[f"{role}_cache_transceiver_config"],
         "kv_dtype": plan[f"{role}_kv_dtype"],

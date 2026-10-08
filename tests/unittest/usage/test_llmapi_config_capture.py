@@ -500,7 +500,7 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
     meta = rc._failure_meta(args_class="X")
     assert meta["capture_version"] == "2"
     assert meta["api_contract_version"] == "0.2.0"
-    assert meta["field_policy_version"] == "3"
+    assert meta["field_policy_version"] == "4"
     assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
     assert meta["payload_truncated"] is False
     assert meta["sequence_truncated"] is False
