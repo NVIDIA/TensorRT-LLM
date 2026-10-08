@@ -503,7 +503,7 @@ For offline use, set ``$schema`` to a local JSON file (an absolute path or a pat
 relative to your YAML file):
 
 * Source checkouts include the schemas in ``tensorrt_llm/schemas/``; no build is needed to use them.
-* Release containers expose them at ``/opt/tensorrt_llm/schemas/``. The editor must be
+* Release containers expose them at ``/app/tensorrt_llm/schemas/``. The editor must be
   attached to the container, or otherwise able to access those files.
 * Wheels include the same schemas. To locate them without importing TensorRT-LLM:
 
