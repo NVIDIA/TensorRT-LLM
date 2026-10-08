@@ -102,7 +102,10 @@ def _assert_close_fp8(fused: torch.Tensor, ref: torch.Tensor, name: str):
 # 256 is an exact multiple of every BLOCK_N tile; 333/6455 exercise the
 # masked tail rows; 6455 is the profiled serving prefill size.
 @pytest.mark.parametrize("n_tokens", [1, 7, 256, 333, 6455])
-def test_fused_qkv_prep_parity_fp8(nq, nk, hd, rotary_frac, theta, n_tokens):
+@pytest.mark.parametrize("out_q_fp8", [True, False])
+def test_fused_qkv_prep_parity_fp8(
+    nq: int, nk: int, hd: int, rotary_frac: float, theta: float, n_tokens: int, out_q_fp8: bool
+) -> None:
     torch.manual_seed(1234)
     max_pos = 4096
     qkv = torch.randn((n_tokens, (nq + 2 * nk) * hd), dtype=torch.bfloat16, device="cuda")
@@ -113,13 +116,71 @@ def test_fused_qkv_prep_parity_fp8(nq, nk, hd, rotary_frac, theta, n_tokens):
     eps = 1e-6
 
     fq, fk, fv = gemma4_fused_qkv_norm_rope_quant(
-        qkv, position_ids, cos_sin, q_w, k_w, eps, nq, nk, hd, out_fp8=True
+        qkv,
+        position_ids,
+        cos_sin,
+        q_w,
+        k_w,
+        eps,
+        nq,
+        nk,
+        hd,
+        out_fp8=out_q_fp8,
+        out_kv_fp8=True,
     )
-    rq, rk, rv = _ref_chain(qkv, position_ids, cos_sin, q_w, k_w, eps, nq, nk, hd, out_fp8=True)
+    rq, rk, rv = _ref_chain(
+        qkv, position_ids, cos_sin, q_w, k_w, eps, nq, nk, hd, out_fp8=out_q_fp8
+    )
 
-    _assert_close_fp8(fq, rq, "q")
-    _assert_close_fp8(fk, rk, "k")
-    _assert_close_fp8(fv, rv, "v")
+    assert fq.dtype == rq.dtype
+    assert fk.dtype == fv.dtype == torch.float8_e4m3fn
+    if out_q_fp8:
+        _assert_close_fp8(fq, rq, "q")
+    else:
+        torch.testing.assert_close(fq, rq, atol=0.02, rtol=0.02)
+    _assert_close_fp8(fk, rk.to(torch.float8_e4m3fn), "k")
+    _assert_close_fp8(fv, rv.to(torch.float8_e4m3fn), "v")
+
+
+@pytest.mark.parametrize("hd,nk", [(256, 16), (512, 4)])
+@pytest.mark.parametrize("wide_dynamic_range", [False, True])
+def test_fa2_norm_reduction_matches_flashinfer(hd: int, nk: int, wide_dynamic_range: bool) -> None:
+    """Preserve the serving norm's rounding before low-precision MLPs."""
+    from flashinfer.norm import _use_cuda_norm, rmsnorm
+
+    if _use_cuda_norm(torch.device("cuda")):
+        pytest.skip("This reduction-order regression covers FlashInfer CuTe RMSNorm")
+    torch.manual_seed(42)
+    nq, n_tokens = 32, 65
+    qkv = torch.randn(n_tokens, (nq + 2 * nk) * hd, dtype=torch.bfloat16, device="cuda")
+    if wide_dynamic_range:
+        # Large activation outliers expose differences in per-thread summation
+        # that ordinary unit-variance inputs can hide, particularly at HD=512.
+        exponents = torch.randint(-6, 7, qkv.shape, device="cuda")
+        qkv = (qkv.float() * torch.exp2(exponents.float())).to(torch.bfloat16)
+    weights = [torch.rand(hd, dtype=torch.bfloat16, device="cuda") + 0.5 for _ in range(2)]
+    # Identity RoPE isolates norm rounding from the rotary arithmetic.
+    cos_sin = torch.zeros(1, 2, hd // 2, dtype=torch.float32, device="cuda")
+    cos_sin[:, 0] = 1
+    positions = torch.zeros(n_tokens, dtype=torch.int32, device="cuda")
+    actual = gemma4_fused_qkv_norm_rope_quant(
+        qkv,
+        positions,
+        cos_sin,
+        *weights,
+        1e-6,
+        nq,
+        nk,
+        hd,
+        out_fp8=False,
+        out_kv_fp8=True,
+    )
+    weights.append(torch.ones(hd, dtype=torch.bfloat16, device="cuda"))
+    for value, source, weight in zip(
+        actual, qkv.split([nq * hd, nk * hd, nk * hd], dim=-1), weights, strict=True
+    ):
+        expected = rmsnorm(source.reshape(-1, hd), weight, eps=1e-6).reshape_as(value)
+        torch.testing.assert_close(value.float(), expected.to(value.dtype).float(), atol=0, rtol=0)
 
 
 def test_fused_qkv_prep_parity_bf16_and_strided():
@@ -209,7 +270,8 @@ def test_fused_qkv_prep_packed_bf16(nq, nk, hd, rotary_frac, theta, n_tokens):
     )
 
 
-def test_fused_qkv_prep_rejects_packed_fp8():
+@pytest.mark.parametrize("out_q_fp8", [False, True])
+def test_fused_qkv_prep_rejects_packed_fp8(out_q_fp8: bool) -> None:
     qkv = torch.empty((0, 384), dtype=torch.bfloat16, device="cuda")
     position_ids = torch.empty(0, dtype=torch.int32, device="cuda")
     cos_sin = torch.empty((1, 2, 64), dtype=torch.float32, device="cuda")
@@ -225,14 +287,15 @@ def test_fused_qkv_prep_rejects_packed_fp8():
             1,
             1,
             128,
-            out_fp8=True,
+            out_fp8=out_q_fp8,
+            out_kv_fp8=True,
             packed_output=True,
         )
 
 
 if __name__ == "__main__":
-    test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 333)
-    test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 6455)
-    test_fused_qkv_prep_parity_fp8(32, 4, 512, 0.25, 1000000.0, 6455)
+    test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 333, True)
+    test_fused_qkv_prep_parity_fp8(32, 16, 256, 1.0, 10000.0, 6455, True)
+    test_fused_qkv_prep_parity_fp8(32, 4, 512, 0.25, 1000000.0, 6455, True)
     test_fused_qkv_prep_parity_bf16_and_strided()
     print("ALL PARITY CHECKS PASSED")
