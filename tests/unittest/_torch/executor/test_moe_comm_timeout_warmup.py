@@ -39,15 +39,19 @@ class _RecordingProxy:
         self.calls.append(seconds)
 
 
-class _WarmupFlagStub:
-    """Borrows the engine's ``is_warmup`` property without building a model.
+class _WarmupScopeStub:
+    """Borrows the engine's warmup scope without building a model.
 
-    The setter only touches ``_is_warmup``, the MoE communication timeouts, and
+    The scope only touches ``_warmup_depth``, the MoE communication timeouts, and
     ``moe_load_balancer``, which it skips when there is no load balancer.
     """
 
-    is_warmup = PyTorchModelEngine.is_warmup
+    warmup_scope = PyTorchModelEngine.warmup_scope
+    _set_warmup_effects = PyTorchModelEngine._set_warmup_effects
     moe_load_balancer = None
+
+    def __init__(self) -> None:
+        self._warmup_depth = 0
 
 
 class _GraphRunnerStub:
@@ -72,18 +76,30 @@ class _CaptureGraphsStub(DecoderCudaGraphs):
         self.passes.append((self.cuda_graph_runner.is_warmup_only, self._guard.in_warmup))
 
 
-def test_is_warmup_setter_switches_the_timeouts_both_ways(guard: MoECommTimeoutGuard) -> None:
+def test_warmup_scope_switches_the_timeouts_both_ways(guard: MoECommTimeoutGuard) -> None:
     proxy = _RecordingProxy()
     guard.register(proxy)
-    stub = _WarmupFlagStub()
+    stub = _WarmupScopeStub()
 
-    stub.is_warmup = True
-    assert guard.in_warmup
-
-    stub.is_warmup = False
+    with stub.warmup_scope():
+        with stub.warmup_scope():
+            assert guard.in_warmup
+        assert guard.in_warmup
     assert not guard.in_warmup
-    assert not stub.is_warmup
-    assert proxy.calls == [None, DEFAULT_WARMUP_TIMEOUT_SEC, None]
+
+    with pytest.raises(RuntimeError):
+        with stub.warmup_scope():
+            raise RuntimeError("warmup failure")
+
+    assert not guard.in_warmup
+    assert stub._warmup_depth == 0
+    assert proxy.calls == [
+        None,
+        DEFAULT_WARMUP_TIMEOUT_SEC,
+        None,
+        DEFAULT_WARMUP_TIMEOUT_SEC,
+        None,
+    ]
 
 
 def test_only_the_capturing_pass_uses_the_serving_timeouts(guard: MoECommTimeoutGuard) -> None:

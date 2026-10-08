@@ -6,7 +6,7 @@ import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -356,7 +356,7 @@ def _make_forward_only_engine(
         extra_attrs={},
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
-    engine.enable_spec_decode = False
+    engine._warmup_depth = 0
     decoder._config = SimpleNamespace(
         compile_only_piecewise_graphs=False,
         disable_overlap_scheduler=True,
@@ -376,7 +376,6 @@ def _make_forward_only_engine(
         enable_lm_head_tp_in_adp=False,
     )
     decoder._dist = None
-    engine.runtime_draft_len = 0
     get_runtime_tokens_per_gen_step = Mock(return_value=1)
     decoder._get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
     engine.iter_states = decoder._iter_states = {}
@@ -680,6 +679,21 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
 
         clear_blocks_graph.assert_called_once_with(
             release_nccl_window_owners=False)
+
+    def test_executor_release_clears_model_owned_graphs_first(self) -> None:
+        for release_model_owned_graphs in (True, False):
+            with self.subTest(
+                    release_model_owned_graphs=release_model_owned_graphs):
+                engine = Mock()
+
+                PyTorchModelEngine.release_executor_resources(
+                    engine,
+                    release_model_owned_graphs=release_model_owned_graphs)
+
+                expected = [call._release_cuda_graphs()]
+                if release_model_owned_graphs:
+                    expected.insert(0, call._release_model_owned_cuda_graphs())
+                self.assertEqual(engine.method_calls, expected)
 
 
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
@@ -1224,7 +1238,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs._make_single_token_context_graph_batch"
         ) as promote:
             actual_outputs = engine.forward(batch, resource_manager)
-            self.assertEqual(actual_outputs, outputs)
+            self.assertEqual(actual_outputs, {
+                **outputs, "runtime_draft_len": 0
+            })
             self.assertIs(actual_outputs["logits"], outputs["logits"])
         promote.assert_not_called()
         runner.replay.assert_not_called()
@@ -1237,7 +1253,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         key = KeyType(batch_size=2, draft_len=0)
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(key)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
@@ -1257,9 +1272,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context, generation])
@@ -1284,7 +1301,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=True,
@@ -1296,9 +1312,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context])
@@ -1314,7 +1332,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, semantic_attn_metadata, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
@@ -1329,9 +1346,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
         self.assertIsNot(actual_outputs, outputs)
         lookup = runner.maybe_get_cuda_graph.call_args
         self.assertIs(lookup.args[0], batch)
@@ -1408,7 +1427,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                         resource_manager,
                     )
 
-                self.assertEqual(actual_outputs, outputs)
+                self.assertEqual(actual_outputs, {
+                    **outputs, "runtime_draft_len": 0
+                })
                 self.assertIsNot(actual_outputs, outputs)
                 if return_context_logits:
                     breakable_runner.execute.assert_not_called()
@@ -1479,11 +1500,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             with self.subTest(case=case):
                 engine, runner, resource_manager, _, _ = \
                     _make_forward_only_engine(None)
+                spec_state = {}
                 if case == "graphs_disabled":
                     runner.enabled = False
                 elif case == "speculative_nonzero_runtime_draft":
-                    engine.enable_spec_decode = True
-                    engine.runtime_draft_len = 1
+                    spec_state = dict(enable_spec_decode=True,
+                                      runtime_draft_len=1)
                     engine._runner._config.spec_config = SimpleNamespace(
                         spec_dec_mode=_TWO_MODEL_SPEC_MODE,
                         is_linear_tree=True,
@@ -1508,10 +1530,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 with patch(
                         "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                         return_value=Mock()):
-                    engine.forward(
-                        batch,
-                        resource_manager,
-                    )
+                    engine.forward(batch, resource_manager, **spec_state)
 
                 lookup = runner.maybe_get_cuda_graph.call_args
                 self.assertIs(lookup.args[0], batch)
@@ -1525,8 +1544,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             self) -> None:
         engine, runner, resource_manager, _, outputs = \
             _make_forward_only_engine(None)
-        engine.enable_spec_decode = True
-        engine.runtime_draft_len = 2
         engine._runner._config.spec_config = SimpleNamespace(
             spec_dec_mode=_TWO_MODEL_SPEC_MODE,
             is_linear_tree=False,
@@ -1543,9 +1560,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch, resource_manager)
+            actual_outputs = engine.forward(batch,
+                                            resource_manager,
+                                            enable_spec_decode=True,
+                                            runtime_draft_len=2)
 
-        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 7})
         self.assertEqual(runner.pad_batch.call_args.args[2], 2)
         self.assertTrue(
             runner.maybe_get_cuda_graph.call_args.kwargs["enable_spec_decode"])
@@ -1559,7 +1579,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             (step_kwargs["enable_spec_decode"],
              step_kwargs["runtime_draft_len"], step_kwargs["is_dummy"]),
             (True, 7, False))
-        self.assertEqual(engine.runtime_draft_len, 7)
 
 
 class DecoderForwardTestCase(unittest.TestCase):
@@ -1651,7 +1670,7 @@ class DecoderForwardTestCase(unittest.TestCase):
         self.assertEqual(replayed["input_ids"].tolist(), [44, 60])
         self.assertEqual(replayed["position_ids"].flatten().tolist(), [3, 5])
         self.assertEqual(len(engine.model.recorded_kwargs), num_model_calls)
-        self.assertEqual(set(outputs), {"logits"})
+        self.assertEqual(set(outputs), {"logits", "runtime_draft_len"})
         self.assertEqual(engine.attn_metadata.num_contexts, 0)
         self.assertEqual(engine.iter_states['num_ctx_requests'], 1)
         self.assertEqual(engine.iter_states['num_ctx_tokens'], 1)
@@ -2131,8 +2150,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._torch_compile_backend = None
 
         engine.wait_for_input_copy()
-        engine._release_cuda_graphs()
-        engine._init_cuda_graph_lora_manager(Mock())
+        engine.release_executor_resources(release_model_owned_graphs=False)
+        engine.init_cuda_graph_lora_manager(Mock())
 
         runner.wait_for_input_copy.assert_called_once_with()
         runner.release_graphs.assert_called_once_with(
@@ -2164,9 +2183,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             torch_compile_bypass=nullcontext,
             context_promotion_supported=True,
         )
+        decoder._metadata = SimpleNamespace(attn_metadata=Mock())
 
         engine.wait_for_input_copy()
-        engine._release_cuda_graphs()
+        engine.release_executor_resources(release_model_owned_graphs=False)
 
         decoder._inputs._prepare_inputs_event.synchronize.assert_called_once_with(
         )
@@ -2174,6 +2194,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             release_nccl_window_owners=True)
         decoder._graphs.breakable_cuda_graph_runner.clear.assert_called_once_with(
             release_nccl_window_owners=True)
+        self.assertIsNone(decoder.attn_metadata)
 
     def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
         inputs = _input_preparer()
@@ -3377,6 +3398,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case):
                 engine, _, _, _, _ = _make_forward_only_engine(key)
+                enable_spec_decode = False
                 metadata = self._metadata()
                 batch = ScheduledRequests()
                 batch.generation_requests = [_make_request_stub(1)]
@@ -3392,7 +3414,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 elif case == "promoted_context":
                     promoted = frozenset({1})
                 elif case == "speculative":
-                    engine.enable_spec_decode = True
+                    enable_spec_decode = True
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
@@ -3406,7 +3428,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                         selected,
                         batch,
                         promoted,
-                        enable_spec_decode=engine.enable_spec_decode):
+                        enable_spec_decode=enable_spec_decode):
                     self.assertEqual(metadata._csa2_defer_decode_outputs, case
                                      in ("ordinary", "ordinary_overlap"))
                 self.assertFalse(metadata._csa2_defer_decode_outputs)
@@ -3451,7 +3473,9 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                             engine.forward(batch, resource_manager)
                     else:
                         actual_outputs = engine.forward(batch, resource_manager)
-                        self.assertEqual(actual_outputs, outputs)
+                        self.assertEqual(actual_outputs, {
+                            **outputs, "runtime_draft_len": 0
+                        })
                         self.assertIs(actual_outputs["logits"],
                                       outputs["logits"])
                 self.assertFalse(metadata._csa2_defer_decode_outputs)

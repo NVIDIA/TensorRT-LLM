@@ -442,7 +442,7 @@ class TestCrossKvCacheConstruction:
         )
         creator._skip_est = False
         creator._execution_stream = _FakeCudaStream()
-        creator._model_engine._max_cuda_graph_batch_size = None
+        creator._model_engine.max_cuda_graph_batch_size = None
 
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value
@@ -831,6 +831,7 @@ class TestKVCacheV2SchedulerCrossParam:
         model_engine = SimpleNamespace(
             spec_config=None,
             model=SimpleNamespace(model_config=_make_model_config()),
+            mm_encoder_item_scheduling_enabled=False,
         )
         llm_args = TorchLlmArgs(
             model=_DUMMY_MODEL,

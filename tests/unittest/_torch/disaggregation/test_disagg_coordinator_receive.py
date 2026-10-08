@@ -518,8 +518,9 @@ def _executor_over(coordinator: DisaggTransferCoordinator, events: list) -> PyEx
         }
     )
     executor.sampler = SimpleNamespace(setup_sampler_step=record_batch("sampler"))
-    executor.model_engine = SimpleNamespace(enable_spec_decode=False)
+    executor.model_engine = SimpleNamespace()
     executor.draft_model_engine = None
+    executor.enable_spec_decode = False
     executor._handle_errors = Mock()
 
     finish = coordinator.try_finish_gen_receive
