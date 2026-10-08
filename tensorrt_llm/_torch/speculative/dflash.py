@@ -2063,6 +2063,9 @@ class DFlashWorker(SpecWorkerBase):
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
+                # Padding and ADP dummy rows share a slot that is never freed; keep its
+                # context empty. zero_() is graph-capturable, a scalar store is not.
+                self._ctx_len[self._dummy_slot].zero_()
 
             num_ctx_per_req_t = self._ctx_len[slots]
             if self._ctx_block_tables is not None:
