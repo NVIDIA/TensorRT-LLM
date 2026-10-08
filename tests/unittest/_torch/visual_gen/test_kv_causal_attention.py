@@ -440,6 +440,55 @@ def test_graph_replay_survives_commit(cache, backend):
         torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")
 
 
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_graph_survives_reopen_with_a_longer_prefix(backend):
+    """A graph captured on a rollout with a short pinned prefix replays correctly on a
+    later rollout of the same geometry whose prefix spans more pages, so nothing the
+    kernels read may be sized to the first rollout's resident capacity."""
+    torch.manual_seed(6)
+    long_prefix = 512  # outgrows the first rollout's capacity by several kernel tiles
+    cache = make_cache(32, pin_tokens=long_prefix)
+    attn = make_backend(backend)
+    try:
+        open_with_prompt(cache, 9)
+        first_capacity = cache.capacity
+        q, k, v = rand_qkv(CHUNK)  # static buffers the graph reads
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                run(attn, cache, q, k, v)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run(attn, cache, q, k, v)
+        cache.close()
+
+        pk, pv = open_with_prompt(cache, long_prefix)  # sixteen more resident pages
+        history_k, history_v = [], []
+        for _ in range(2):
+            _, hk, hv = rand_qkv(CHUNK)
+            cache.write_range(0, cache.staging_offset, hk, hv)
+            cache.commit(cache.max_staged_tokens)
+            history_k.append(hk)
+            history_v.append(hv)
+        assert cache.staging_offset + CHUNK > first_capacity, "keys must outgrow the first rollout"
+        q2, k2, v2 = rand_qkv(CHUNK)
+        q.copy_(q2), k.copy_(k2), v.copy_(v2)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = exact_reference(
+            q, pk, pv, torch.cat(history_k), torch.cat(history_v), k, v, 0, CHUNK
+        )
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+        positions = torch.arange(cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE)
+        k_back, v_back = read_kv(cache, 0, positions)
+        torch.testing.assert_close(k_back, k)
+        torch.testing.assert_close(v_back, v)
+    finally:
+        cache.shutdown()
+
+
 @pytest.mark.parametrize("num_causal_blocks", [1, 4])
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
