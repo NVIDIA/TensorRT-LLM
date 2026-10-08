@@ -109,7 +109,7 @@ from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention.backends import AttentionMetadata
-from ..distributed import AllReduce, AllReduceParams
+from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -1612,8 +1612,18 @@ class KimiK3MoERuntime(nn.Module):
             disable_on_compile=True,
         )
         if self._reduce_routed_output:
-            routed_latent = moe_all_reduce(routed_out)
-            routed_latent = self.routed_expert_norm(routed_latent)
+            # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
+            # MNNVL kernel normalizes straight out of the lamport buffer, so
+            # the reduced row never round-trips through HBM for a norm kernel.
+            # Strategies without the fusion fall back inside AllReduce.
+            routed_latent = moe_all_reduce(
+                routed_out,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=AllReduceFusionOp.RMS_NORM,
+                    norm_weight=self.routed_expert_norm.weight,
+                    eps=float(self.routed_expert_norm.variance_epsilon),
+                ),
+            )
             routed_out = self._routed_projection(routed_latent, self.routed_expert_up_proj)
         return routed_out + shared_out
 
