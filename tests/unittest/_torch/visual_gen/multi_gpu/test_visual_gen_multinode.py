@@ -133,6 +133,7 @@ class TestRunDiffusionWorkerDeviceAssignment:
             patch("torch.cuda.set_device", mock_set_device),
             patch("torch.distributed.init_process_group"),
             patch("torch.distributed.destroy_process_group"),
+            patch("tensorrt_llm._torch.visual_gen.executor.check_cuda_architecture_supported"),
             patch.object(DiffusionExecutor, "__new__", return_value=mock_exec),
             patch.object(DiffusionExecutor, "__init__", return_value=None),
         ):
