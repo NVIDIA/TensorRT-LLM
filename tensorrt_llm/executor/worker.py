@@ -22,7 +22,8 @@ from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import VizTracer, set_global_tracer
 from ..llmapi.utils import ManagedThread, logger_debug, print_traceback_on_error
 from ..sampling_params import BatchedLogitsProcessor
-from .base_worker import BaseWorker, _init_hf_modules
+from .base_worker import (BaseWorker, _init_hf_modules,
+                          _release_rebalance_resources_collectively)
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
@@ -123,13 +124,26 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
-        if self.engine is not None:
-            if self.engine.can_enqueue_requests():
-                if self.await_response_thread.is_alive():
-                    self.await_response_thread.stop()
-                    self.await_response_thread.join()
-
-            self.engine.shutdown()
+        engine = self.engine
+        shutdown_succeeded = False
+        try:
+            if engine is not None:
+                if engine.can_enqueue_requests():
+                    if self.await_response_thread.is_alive():
+                        self.await_response_thread.stop()
+                        self.await_response_thread.join()
+                engine.shutdown()
+                shutdown_succeeded = True
+        finally:
+            try:
+                _release_rebalance_resources_collectively(
+                    local_safe=shutdown_succeeded
+                    and not getattr(engine, "worker_started", False))
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    f"Failed to release MoE rebalance resources on shutdown: {e}"
+                )
+        if engine is not None:
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
@@ -208,7 +222,12 @@ def worker_main(
     hmac_key: bytes = b"",
 ) -> None:
 
-    # Set ON's queue before MPI setup or replaying worker environment overrides.
+    if llm_args is not None and llm_args.env_overrides:
+        # MPI may have cached the parent's environment before this worker was
+        # spawned, so replay overrides before any rebalance state is inspected.
+        os.environ.update(llm_args.env_overrides)
+
+    # Set ON's queue before MPI setup.
     if llm_args is not None and llm_args.backend == "pytorch":
         queue_overrides = configure_moe_launch_queues(
             getattr(llm_args, "moe_config", None), llm_args.env_overrides)
@@ -231,14 +250,6 @@ def worker_main(
         print_stacks_thread.start()
 
     mpi_comm().barrier()
-
-    if llm_args is not None and llm_args.env_overrides:
-        # this is needed because MPI_Init seems to cache the env at import time.
-        # The cached env snapshot is used to spawn workers.
-        # Any env overrides to the main process after tensorrt_llm import
-        # may not get reflected in the spawned worker process, no matter how early,
-        # unless we update it explicitly here.
-        os.environ.update(llm_args.env_overrides)
 
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()

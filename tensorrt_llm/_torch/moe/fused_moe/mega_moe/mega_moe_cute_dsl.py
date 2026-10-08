@@ -1931,9 +1931,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._wait_rebalance_routes()
         try:
             torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
-                # Cached dtype views alias the live staging and in-place weight storage.
-                activation=self._memo_dtype_view(activation, _as_nvfp4),
-                activation_sf=self._memo_dtype_view(activation_sf, _as_fp8_sf),
+                # Activations are per-forward allocations; only persistent weights
+                # belong in the strong-reference dtype-view memo.
+                activation=_as_nvfp4(activation),
+                activation_sf=_as_fp8_sf(activation_sf),
                 topk_idx=topk_idx,
                 topk_weights=topk_weights,
                 fc1_weight=self._memo_dtype_view(weight_view.fc1_weight, _as_nvfp4),

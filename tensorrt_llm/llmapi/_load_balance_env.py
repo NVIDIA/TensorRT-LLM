@@ -28,6 +28,8 @@ def configure_moe_launch_queues(
     The late-init guard detects PyTorch initialization; external CUDA users
     must still arrange for this setting before initializing their contexts.
     """
+    if moe_config is not None:
+        moe_config.resolve_rebalance_compatibility()
     rebalance = getattr(moe_config, "rebalance", None)
     if rebalance is None or not rebalance.is_active:
         return env_overrides

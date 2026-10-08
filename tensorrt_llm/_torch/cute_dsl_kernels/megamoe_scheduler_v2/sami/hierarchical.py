@@ -458,36 +458,42 @@ class HierarchicalSamiWeightBroadcast:
         if partition is None:
             raise ValueError(f"unknown hierarchy partition {self.partition!r}")
         if self._thop_tma:
-            self.ctx = torch.ops.trtllm.moe_rebalance_tma_create(
+            ctx = torch.ops.trtllm.moe_rebalance_tma_create(
                 helper_count * planes, tma_sm_count or 0, tma_warps or 0
             )
-            target_count = sum(world // size for size in self.arena.group_sizes[1:])
-            torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
-                self.ctx, world, rank, helper_count, planes,
-                global_expert_count, self.home_count, plan_stride,
-                len(self.arena.group_sizes), target_count, 6, plan_words, 0,
-                {"plan": 0, "source": 1, "scatter": 2}[tma_route],
-                round(100 * self.tma_source_load_factor),
-                list(self.arena.group_sizes),
-                list(self.arena.base.scatter_source_ptrs),
-                list(self.arena.group_destination_ptrs), [],
-                [plane.nbytes for plane in bundle.planes],
-            )
-            config_names = (
-                "abi_version", "device", "device_sm_count", "sms", "warps",
-                "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
-                "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
-                "device_optin_shared_bytes", "device_shared_bytes_per_sm",
-                "max_active_ctas_per_sm", "compute_major", "compute_minor",
-                "total_slots", "max_slots_per_warp", "extra_slot_warps",
-                "max_warps", "max_segments",
-            )
-            self.tma_config = dict(zip(
-                config_names, torch.ops.trtllm.moe_rebalance_tma_config(self.ctx)
-            ))
-            current_generation = torch.ops.trtllm.moe_rebalance_tma_current_gen(
-                self.ctx
-            )
+            try:
+                target_count = sum(world // size for size in self.arena.group_sizes[1:])
+                torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
+                    ctx, world, rank, helper_count, planes,
+                    global_expert_count, self.home_count, plan_stride,
+                    len(self.arena.group_sizes), target_count, 6, plan_words, 0,
+                    {"plan": 0, "source": 1, "scatter": 2}[tma_route],
+                    round(100 * self.tma_source_load_factor),
+                    list(self.arena.group_sizes),
+                    list(self.arena.base.scatter_source_ptrs),
+                    list(self.arena.group_destination_ptrs), [],
+                    [plane.nbytes for plane in bundle.planes],
+                )
+                config_names = (
+                    "abi_version", "device", "device_sm_count", "sms", "warps",
+                    "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
+                    "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
+                    "device_optin_shared_bytes", "device_shared_bytes_per_sm",
+                    "max_active_ctas_per_sm", "compute_major", "compute_minor",
+                    "total_slots", "max_slots_per_warp", "extra_slot_warps",
+                    "max_warps", "max_segments",
+                )
+                tma_config = dict(zip(
+                    config_names, torch.ops.trtllm.moe_rebalance_tma_config(ctx)
+                ))
+                current_generation = torch.ops.trtllm.moe_rebalance_tma_current_gen(ctx)
+                if int(current_generation) != 1:
+                    raise RuntimeError("hierarchical SAMI context is not fresh")
+            except BaseException:
+                torch.ops.trtllm.moe_rebalance_tma_destroy(ctx)
+                raise
+            self.ctx = ctx
+            self.tma_config = tma_config
         else:
             self.ctx = self.mod.create(
                 world=world,
@@ -513,7 +519,7 @@ class HierarchicalSamiWeightBroadcast:
             )
             self.mod.set_loc_hint(self.ctx, device, device)
             current_generation = self.mod.current_gen(self.ctx)
-        if int(current_generation) != 1:
+        if not self._thop_tma and int(current_generation) != 1:
             raise RuntimeError("hierarchical SAMI context is not fresh")
 
         self._lock = threading.Lock()
@@ -928,6 +934,19 @@ class HierarchicalSamiWeightBroadcast:
             )
             self._generation += 1
             return ticket
+
+    def close(self) -> None:
+        """Release the native copy context after all device work is drained."""
+        with self._lock, torch.cuda.device(self.device):
+            if self.ctx is None:
+                return
+            if self._thop_tma:
+                torch.ops.trtllm.moe_rebalance_tma_destroy(self.ctx)
+            # Non-THOP contexts are PyCapsules whose destructor owns cleanup.
+            self.ctx = None
+            self._scheduler = None
+            self._outputs = None
+            self._stream_owner = None
 
     def last_mode_counts(self) -> tuple[int, int, int]:
         """Return diagnostic ``(direct_slots, scatter_slots, commands)``.

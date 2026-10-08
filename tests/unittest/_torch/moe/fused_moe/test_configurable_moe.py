@@ -118,6 +118,36 @@ def _create_backend(
     return backend
 
 
+def test_layerwise_quant_config_preserves_model_mapping_identity() -> None:
+    global_config = QuantConfig()
+    layer_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+    model_config = ModelConfig(quant_config=global_config)
+    wrapper = _wrapper()
+    wrapper.quant_config = global_config
+    backend = _backend_mock()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.resolve_moe_cls",
+            return_value=Mock(),
+        ),
+        patch(
+            "tensorrt_llm._torch.moe.fused_moe.create_moe.create_moe_backend",
+            return_value=backend,
+        ) as create_backend,
+    ):
+        wrapper._create_and_sync_backend(
+            model_config=model_config,
+            routing_method=Mock(),
+            override_quant_config=layer_config,
+        )
+
+    backend_config = create_backend.call_args.kwargs["model_config"]
+    assert backend_config is not model_config
+    assert backend_config.quant_config is layer_config
+    assert backend_config.mapping is model_config.mapping
+
+
 def test_layerwise_quant_config_is_applied_before_weight_creation() -> None:
     global_config = QuantConfig()
     layer_config = QuantConfig()

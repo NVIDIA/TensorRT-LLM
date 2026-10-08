@@ -75,14 +75,24 @@ def test_shared_slot_arena_is_default_and_model_local():
 
     scope_cls = _extract_class(source, "_PoolScope", None, {})
     registry = WeakKeyDictionary()
+
+    class FakePool:
+        def __init__(self, **kwargs):
+            self._closed = False
+            self.group_sizes = (kwargs["world"],)
+
+        def build_layer(self, comm):
+            return object(), {}, object(), 1
+
     provider_cls = _extract_class(
         source,
         "SharedSlotArenaProvider",
-        {"__init__"},
+        {"__init__", "build_hierarchical_live_arena"},
         {
             "_POOL_SCOPE_ATTRIBUTE": "_trtllm_rebalance_shared_slot_scope",
             "_PoolScope": scope_cls,
             "_SHARED_SLOT_POOLS": registry,
+            "_SharedSlotPool": FakePool,
         },
     )
 
@@ -108,6 +118,242 @@ def test_shared_slot_arena_is_default_and_model_local():
     del second_provider, second
     gc.collect()
     assert len(registry) == 2
+
+    bundle = SimpleNamespace(
+        hidden=16,
+        intermediate=32,
+        planes=(SimpleNamespace(name="weight", nbytes=64),),
+    )
+    first_provider.build_hierarchical_live_arena(
+        world=8,
+        rank=0,
+        home_count=32,
+        helper_count=4,
+        bundle=bundle,
+        device=0,
+        comm=object(),
+    )
+    closed_pool = first_provider.pool
+    closed_pool._closed = True
+    for provider in (first_provider, same_model_provider):
+        provider.build_hierarchical_live_arena(
+            world=8,
+            rank=0,
+            home_count=32,
+            helper_count=4,
+            bundle=bundle,
+            device=0,
+            comm=object(),
+        )
+        assert provider.pool is not closed_pool
+        assert not provider.pool._closed
+
+
+def test_rebalance_arena_has_explicit_collective_lifecycle():
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena_v2.py"
+    tree = ast.parse(source.read_text())
+
+    registry = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "_ACTIVE_SHARED_SLOT_POOLS"
+    )
+    assert isinstance(registry.value, (ast.Dict, ast.Call))
+    if isinstance(registry.value, ast.Call):
+        assert isinstance(registry.value.func, ast.Name)
+        assert registry.value.func.id == "dict"
+
+    classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+    provider_methods = {
+        node.name: node
+        for node in classes["SharedSlotArenaProvider"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    pool_methods = {
+        node.name: node
+        for node in classes["_SharedSlotPool"].body
+        if isinstance(node, ast.FunctionDef)
+    }
+    assert "register_producer" in provider_methods
+    assert "close_collectively" in pool_methods
+    manifest_fields = {
+        node.attr
+        for node in ast.walk(pool_methods["_cleanup_manifest"])
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    }
+    assert manifest_fields.isdisjoint({"device", "rank"})
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "register_producer"
+        for node in ast.walk(provider_methods["register_producer"])
+    )
+
+    release = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "release_rebalance_resources_collectively"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_active_pools_for_comm"
+        for node in ast.walk(release)
+    )
+    active_for_comm = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_active_pools_for_comm"
+    )
+    assert any(
+        isinstance(node, ast.Name) and node.id == "_ACTIVE_SHARED_SLOT_POOLS"
+        for node in ast.walk(active_for_comm)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "allgather"
+        for node in ast.walk(release)
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "close_collectively"
+        for node in ast.walk(release)
+    )
+    assert not any(
+        isinstance(node, ast.FunctionDef) and node.name == "__del__" for node in ast.walk(tree)
+    )
+
+
+def test_terminal_workers_release_rebalance_resources_after_engine_shutdown():
+    shutdown_paths = (
+        ("tensorrt_llm/executor/base_worker.py", "BaseWorker", False),
+        ("tensorrt_llm/executor/worker.py", "GenerationExecutorWorker", True),
+        ("tensorrt_llm/executor/ray/gpu_worker.py", "RayGPUWorker", False),
+    )
+    for relative, class_name, owns_process_group in shutdown_paths:
+        tree = ast.parse((_ROOT / relative).read_text())
+        owner = next(
+            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        shutdown = next(
+            node
+            for node in owner.body
+            if isinstance(node, ast.FunctionDef) and node.name == "shutdown"
+        )
+        engine_shutdowns = [
+            node
+            for node in ast.walk(shutdown)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "shutdown"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "engine"
+        ]
+        releases = [
+            node
+            for node in ast.walk(shutdown)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_release_rebalance_resources_collectively"
+        ]
+        assert len(engine_shutdowns) == len(releases) == 1, relative
+        assert engine_shutdowns[0].lineno < releases[0].lineno, relative
+        local_safe = next(
+            (keyword.value for keyword in releases[0].keywords if keyword.arg == "local_safe"),
+            None,
+        )
+        assert local_safe is not None, relative
+
+        parents = {
+            child: parent for parent in ast.walk(shutdown) for child in ast.iter_child_nodes(parent)
+        }
+        ancestor = parents[releases[0]]
+        while ancestor is not shutdown:
+            if isinstance(ancestor, ast.If):
+                assert not any(
+                    (isinstance(node, ast.Constant) and node.value == "worker_started")
+                    or (isinstance(node, ast.Name) and node.id == "can_shutdown")
+                    for node in ast.walk(ancestor.test)
+                ), relative
+            ancestor = parents[ancestor]
+
+        destroys = [
+            node
+            for node in ast.walk(shutdown)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "destroy_process_group"
+        ]
+        if owns_process_group:
+            assert len(destroys) == 1, relative
+            assert releases[0].lineno < destroys[0].lineno, relative
+
+
+def test_base_worker_joins_rebalance_release_when_engine_cannot_shutdown():
+    events = []
+    worker_cls = _extract_class(
+        _ROOT / "tensorrt_llm/executor/base_worker.py",
+        "BaseWorker",
+        {"shutdown"},
+        {
+            "_release_rebalance_resources_collectively": lambda *, local_safe: events.append(
+                ("release", local_safe)
+            ),
+            "logger": SimpleNamespace(error=lambda *args, **kwargs: events.append(("error",))),
+        },
+    )
+    engine = SimpleNamespace(
+        can_shutdown=lambda: False,
+        can_enqueue_requests=lambda: False,
+        shutdown=lambda: events.append(("engine_shutdown",)),
+        worker_started=False,
+    )
+    worker = worker_cls()
+    worker.doing_shutdown = False
+    worker.engine = engine
+
+    worker.shutdown()
+
+    assert events == [("release", False)]
+
+    events.clear()
+    worker = worker_cls()
+    worker.doing_shutdown = False
+    worker.engine = None
+
+    worker.shutdown()
+
+    assert events == [("release", False)]
+
+    events.clear()
+
+    def fail_shutdown():
+        events.append(("engine_shutdown",))
+        raise RuntimeError("engine shutdown failed")
+
+    worker = worker_cls()
+    worker.doing_shutdown = False
+    worker.engine = SimpleNamespace(
+        can_shutdown=lambda: True,
+        can_enqueue_requests=lambda: True,
+        shutdown=fail_shutdown,
+        worker_started=False,
+    )
+    try:
+        worker.shutdown()
+    except RuntimeError as error:
+        assert str(error) == "engine shutdown failed"
+    else:
+        raise AssertionError("engine shutdown failure did not propagate")
+
+    assert events == [("engine_shutdown",), ("release", False)]
 
 
 class _Routes:
@@ -182,7 +428,8 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
                 enabled=enabled,
                 helper_slots_per_rank=slots,
                 is_active=active,
-            )
+            ),
+            resolve_rebalance_compatibility=lambda: None,
         )
 
     original = {"KEEP": "value"}
@@ -209,18 +456,42 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
     assert original == {"KEEP": "value"}
     assert _QUEUE not in os.environ
 
+    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+    disabled = {"TRTLLM_MOE_REBALANCE_DISABLE": "1"}
+    assert module.configure_moe_launch_queues(config(active=False), disabled) is disabled
+    assert _QUEUE not in os.environ
+
     entrypoints = (
-        ("tensorrt_llm/llmapi/llm.py", "BaseLLM", "__init__", ("get_device_count",)),
-        ("tensorrt_llm/executor/worker.py", None, "worker_main", ("barrier", "update")),
-        ("tensorrt_llm/executor/base_worker.py", "BaseWorker", "__init__", ("__init__",)),
+        (
+            "tensorrt_llm/llmapi/llm.py",
+            "BaseLLM",
+            "__init__",
+            "_process_env_overrides",
+            ("get_device_count",),
+        ),
+        (
+            "tensorrt_llm/executor/worker.py",
+            None,
+            "worker_main",
+            "update",
+            ("barrier",),
+        ),
+        (
+            "tensorrt_llm/executor/base_worker.py",
+            "BaseWorker",
+            "__init__",
+            "update",
+            ("__init__",),
+        ),
         (
             "tensorrt_llm/executor/ray/gpu_worker.py",
             "RayWorkerWrapper",
             "__init__",
+            "update",
             ("device_count", "set_device"),
         ),
     )
-    for relative, class_name, method_name, boundaries in entrypoints:
+    for relative, class_name, method_name, env_applier, boundaries in entrypoints:
         tree = ast.parse((_ROOT / relative).read_text())
         scope = tree
         if class_name is not None:
@@ -247,6 +518,24 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
         ]
         assert len(calls) == 1, relative
         setup_line = calls[0].lineno
+        env_calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == env_applier
+            and (
+                env_applier != "update"
+                or (
+                    isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "os"
+                    and node.func.value.attr == "environ"
+                )
+            )
+        ]
+        assert len(env_calls) == 1, relative
+        assert env_calls[0].lineno < setup_line, relative
         for boundary in boundaries:
             boundary_calls = [
                 node
@@ -261,6 +550,30 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
             ]
             assert boundary_calls, (relative, boundary)
             assert setup_line < min(node.lineno for node in boundary_calls), (relative, boundary)
+
+
+def test_direct_inputs_are_not_retained_by_dtype_view_memo():
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    tree = ast.parse(source.read_text())
+    launch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cute_dsl_megamoe_nvfp4_blackwell"
+    )
+    arguments = {keyword.arg: keyword.value for keyword in launch.keywords}
+
+    for name, caster in (("activation", "_as_nvfp4"), ("activation_sf", "_as_fp8_sf")):
+        value = arguments[name]
+        assert isinstance(value, ast.Call)
+        assert isinstance(value.func, ast.Name) and value.func.id == caster
+
+    for name in ("fc1_weight", "fc1_weight_sf", "fc2_weight", "fc2_weight_sf"):
+        value = arguments[name]
+        assert isinstance(value, ast.Call)
+        assert isinstance(value.func, ast.Attribute)
+        assert value.func.attr == "_memo_dtype_view"
 
 
 def test_halo_q_is_the_only_scheduler_planner():

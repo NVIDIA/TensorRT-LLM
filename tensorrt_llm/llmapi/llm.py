@@ -378,6 +378,9 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            # Rebalance validation and launch-queue setup read process state.
+            # Apply caller overrides before either one observes that state.
+            self._process_env_overrides(env_overrides)
             if kwargs.get("backend") == "pytorch":
                 # This must precede TorchLlmArgs validators and GPU probes.
                 moe_config = kwargs.get("moe_config")
@@ -389,7 +392,6 @@ class BaseLLM:
                 if queue_overrides is not env_overrides:
                     kwargs["env_overrides"] = queue_overrides
                     env_overrides = queue_overrides
-            self._process_env_overrides(env_overrides)
 
             backend = kwargs.get('backend', None)
             if backend == "pytorch":

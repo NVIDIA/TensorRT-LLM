@@ -281,14 +281,41 @@ class TestMoeConfigRebalanceCompatibility:
             MoeConfig(backend=backend, rebalance=self._active_rebalance())
 
     @pytest.mark.parametrize("backend", [None, "MEGAMOE_CUTEDSL"])
-    def test_accepts_compatible_backend(self, monkeypatch,
-                                        backend: str | None) -> None:
+    def test_resolves_default_and_accepts_compatible_backend(
+            self, monkeypatch, backend: str | None) -> None:
         monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE", raising=False)
         kwargs = {} if backend is None else {"backend": backend}
 
         config = MoeConfig(rebalance=self._active_rebalance(), **kwargs)
 
         assert config.rebalance is not None and config.rebalance.is_active
+        assert config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_revalidates_when_disable_override_changes(self,
+                                                       monkeypatch) -> None:
+        monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+        config = MoeConfig(rebalance=self._active_rebalance())
+        assert config.backend == "AUTO"
+
+        monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE")
+        config.resolve_rebalance_compatibility()
+
+        assert config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_revalidates_explicit_auto_when_disable_override_changes(
+            self, monkeypatch) -> None:
+        monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+        config = MoeConfig(
+            backend="AUTO",
+            rebalance=self._active_rebalance(),
+        )
+        assert config.backend == "AUTO"
+
+        monkeypatch.delenv("TRTLLM_MOE_REBALANCE_DISABLE")
+        with pytest.raises(
+                ValueError,
+                match=r"rebalance requires backend='MEGAMOE_CUTEDSL'"):
+            config.resolve_rebalance_compatibility()
 
     def test_disable_override_makes_conflicts_inert(self, monkeypatch) -> None:
         monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")

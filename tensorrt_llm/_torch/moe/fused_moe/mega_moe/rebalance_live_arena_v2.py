@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["allocate_rebalance_arena_v2"]
+__all__ = ["allocate_rebalance_arena_v2", "release_rebalance_resources_collectively"]
 
 BUFFER_ALIGNMENT = 2 * 1024 * 1024
 
@@ -264,10 +264,7 @@ class _ViewSpec:
 
 
 class _Vmm:
-    """CUDA VMM calls on FABRIC-exportable memory; retains every handle.
-
-    Mappings live for the process and are retained with their owning pool.
-    """
+    """CUDA VMM calls on FABRIC-exportable memory with explicit ownership."""
 
     def __init__(self, device: int, group_sizes: Tuple[int, ...]) -> None:
         from cuda.bindings import driver as cuda
@@ -312,7 +309,13 @@ class _Vmm:
                 )
             )
         self.granularity = math.lcm(*values)
-        self.handles: List[Any] = []
+        self.local_allocation_handles: List[Any] = []
+        self.imported_allocation_handles: List[Any] = []
+        self.created_multicast_handles: List[Any] = []
+        self.imported_multicast_handles: List[Any] = []
+        self.mappings: List[Tuple[int, int]] = []
+        self.reservations: List[Tuple[int, int]] = []
+        self.multicast_binds: List[Tuple[Any, int, int]] = []
         self.allocated_bytes = 0
 
     def multicast_properties(self, members: int, nbytes: int) -> Any:
@@ -327,7 +330,7 @@ class _Vmm:
         handle = self.check(
             self.cuda.cuMemCreate(nbytes, self.properties, 0), "cuMemCreate(shared slots)"
         )
-        self.handles.append(handle)
+        self.local_allocation_handles.append(handle)
         self.allocated_bytes += nbytes
         exported = self.check(
             self.cuda.cuMemExportToShareableHandle(handle, self.fabric, 0),
@@ -345,22 +348,90 @@ class _Vmm:
             self.cuda.cuMemImportFromShareableHandle(bytearray(shareable), self.fabric),
             "cuMemImportFromShareableHandle(shared slots)",
         )
-        self.handles.append(handle)
+        self.imported_allocation_handles.append(handle)
+        return handle
+
+    def register_created_multicast(self, handle: Any) -> None:
+        self.created_multicast_handles.append(handle)
+
+    def import_multicast(self, shareable: bytes) -> Any:
+        if not isinstance(shareable, bytes) or len(shareable) != 64:
+            raise RuntimeError("multicast fabric handle must contain exactly 64 bytes")
+        handle = self.check(
+            self.cuda.cuMemImportFromShareableHandle(bytearray(shareable), self.fabric),
+            "cuMemImportFromShareableHandle(shared multicast)",
+        )
+        self.imported_multicast_handles.append(handle)
         return handle
 
     def reserve(self, nbytes: int) -> int:
-        return int(
+        address = int(
             self.check(
                 self.cuda.cuMemAddressReserve(nbytes, self.granularity, 0, 0),
                 "cuMemAddressReserve(shared slots)",
             )
         )
+        self.reservations.append((address, int(nbytes)))
+        return address
 
     def map(self, address: int, nbytes: int, handle: Any) -> None:
         self.check(self.cuda.cuMemMap(address, nbytes, 0, handle, 0), "cuMemMap(shared slots)")
+        self.mappings.append((int(address), int(nbytes)))
         self.check(
             self.cuda.cuMemSetAccess(address, nbytes, self._access, 1),
             "cuMemSetAccess(shared slots)",
+        )
+
+    def record_multicast_bind(self, handle: Any, offset: int, nbytes: int) -> None:
+        self.multicast_binds.append((handle, int(offset), int(nbytes)))
+
+    def unmap_all(self) -> None:
+        while self.mappings:
+            address, nbytes = self.mappings[-1]
+            self.check(self.cuda.cuMemUnmap(address, nbytes), "cuMemUnmap(shared slots)")
+            self.mappings.pop()
+
+    def unbind_all(self) -> None:
+        while self.multicast_binds:
+            handle, offset, nbytes = self.multicast_binds[-1]
+            self.check(
+                self.cuda.cuMulticastUnbind(handle, self.device, offset, nbytes),
+                "cuMulticastUnbind(shared slots)",
+            )
+            self.multicast_binds.pop()
+
+    def free_reservations(self) -> None:
+        while self.reservations:
+            address, nbytes = self.reservations[-1]
+            self.check(
+                self.cuda.cuMemAddressFree(address, nbytes),
+                "cuMemAddressFree(shared slots)",
+            )
+            self.reservations.pop()
+
+    def _release_handles(self, handles: List[Any], label: str) -> None:
+        while handles:
+            self.check(self.cuda.cuMemRelease(handles[-1]), label)
+            handles.pop()
+
+    def release_imported_handles(self) -> None:
+        self._release_handles(
+            self.imported_multicast_handles,
+            "cuMemRelease(imported shared multicast)",
+        )
+        self._release_handles(
+            self.imported_allocation_handles,
+            "cuMemRelease(imported shared allocation)",
+        )
+
+    def release_created_handles(self) -> None:
+        self._release_handles(
+            self.created_multicast_handles,
+            "cuMemRelease(created shared multicast)",
+        )
+        self._release_handles(
+            self.local_allocation_handles,
+            "cuMemRelease(local shared allocation)",
         )
 
     def zero(self, address: int, nbytes: int) -> None:
@@ -409,6 +480,7 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
                     ),
                     "cuMulticastCreate(shared slots)",
                 )
+                vmm.register_created_multicast(handle)
                 created[(index, alias)] = handle
                 exported[(index, alias)] = bytes(
                     check(
@@ -422,9 +494,7 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
         for alias, creator in enumerate(spec.members[:2]):
             handle = created.get((index, alias))
             if handle is None:
-                handle = vmm.import_(gathered[creator][(index, alias)])
-            else:
-                vmm.handles.append(handle)
+                handle = vmm.import_multicast(gathered[creator][(index, alias)])
             spec.handles.append(handle)
             check(
                 cuda.cuMulticastAddDevice(handle, vmm.device), "cuMulticastAddDevice(shared slots)"
@@ -437,6 +507,7 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
                     cuda.cuMulticastBindMem_v2(handle, vmm.device, offset, memory, 0, nbytes, 0),
                     "cuMulticastBindMem_v2(shared slots)",
                 )
+                vmm.record_multicast_bind(handle, offset, nbytes)
     comm.barrier()
     for _, spec in joined:
         selected = spec.handles[1 if len(spec.handles) > 1 and rank == spec.members[0] else 0]
@@ -476,6 +547,10 @@ class _SharedLayer:
         self.holders: List[_RawPointer] = []
 
 
+_ACTIVE_SHARED_SLOT_POOLS: Dict[int, "_SharedSlotPool"] = {}
+_NEXT_SHARED_SLOT_POOL_ID = 0
+
+
 class _SharedSlotPool:
     """Helper-slot sets shared by every MoE layer of one geometry.
 
@@ -504,10 +579,16 @@ class _SharedSlotPool:
             hierarchy_group_sizes,
         )
 
+        global _NEXT_SHARED_SLOT_POOL_ID
+
         torch.cuda.set_device(device)
         self.world = world
         self.rank = rank
         self.device = device
+        self.comm = comm
+        self._closed = False
+        self._closing = False
+        self._producers: Dict[int, Any] = {}
         self.home_count = home_count
         self.helper_count = helper_count
         self.slots = home_count + helper_count
@@ -548,7 +629,121 @@ class _SharedSlotPool:
         self.records_per_page = self.page_bytes // self.record_stride
         self.pages: List[_RecordPage] = []
         self.layer_count = 0
+        self.sets: Tuple[_HelperSet, ...] = ()
+        self._construction_complete = False
+        self._registry_id = _NEXT_SHARED_SLOT_POOL_ID
+        _NEXT_SHARED_SLOT_POOL_ID += 1
+        _ACTIVE_SHARED_SLOT_POOLS[self._registry_id] = self
         self.sets = self._create_sets(comm)
+        self._construction_complete = True
+
+    def register_producer(self, producer: Any) -> None:
+        if self._closed:
+            raise RuntimeError("cannot register a producer on a closed shared-slot pool")
+        self._producers.setdefault(id(producer), producer)
+
+    def _cleanup_manifest(self) -> tuple:
+        return (
+            1,
+            self._construction_complete,
+            self.world,
+            self.home_count,
+            self.helper_count,
+            self.bundle.hidden,
+            self.bundle.intermediate,
+            self.group_sizes,
+            self.layer_count,
+            len(self.pages),
+            len(self.sets),
+            tuple((plane.name, int(plane.nbytes)) for plane in self.bundle.planes),
+            tuple(
+                (
+                    type(producer).__qualname__,
+                    getattr(producer, "layer_idx", getattr(producer, "_layer_idx", None)),
+                )
+                for producer in self._producers.values()
+            ),
+        )
+
+    def _collective_phase(self, label: str, operation: Any) -> None:
+        error = None
+        try:
+            operation()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = self.comm.allgather(error)
+        if len(errors) != self.world:
+            raise RuntimeError(
+                f"shared-slot cleanup {label} returned {len(errors)} ranks; expected {self.world}"
+            )
+        failures = [f"rank {rank}: {item}" for rank, item in enumerate(errors) if item]
+        if failures:
+            raise RuntimeError(f"shared-slot cleanup {label} failed: {'; '.join(failures)}")
+
+    def _close_producers(self) -> None:
+        for producer in self._producers.values():
+            close = getattr(producer, "close", None)
+            if close is None:
+                raise TypeError(f"registered producer {type(producer).__qualname__} has no close")
+            if close() is False:
+                raise RuntimeError(
+                    f"registered producer {type(producer).__qualname__} did not close"
+                )
+
+    def _on_device(self, operation: Any) -> None:
+        with torch.cuda.device(self.device):
+            operation()
+
+    def close_collectively(self, local_safe: bool = True) -> bool:
+        if self._closed:
+            return True
+        if self._closing:
+            raise RuntimeError("shared-slot pool cleanup is already in progress")
+        preflight = self.comm.allgather(
+            {
+                "local_safe": bool(local_safe),
+                "manifest": self._cleanup_manifest(),
+            },
+        )
+        if len(preflight) != self.world:
+            raise RuntimeError(
+                f"shared-slot cleanup preflight returned {len(preflight)} ranks; "
+                f"expected {self.world}"
+            )
+        if not all(item["local_safe"] for item in preflight):
+            return False
+        manifests = [item["manifest"] for item in preflight]
+        expected = manifests[0]
+        if any(manifest != expected for manifest in manifests[1:]):
+            raise RuntimeError("shared-slot cleanup manifests differ across the EP communicator")
+        self._closing = True
+        try:
+            self._collective_phase(
+                "device synchronize",
+                lambda: self._on_device(lambda: torch.cuda.synchronize(self.device)),
+            )
+            self._collective_phase("producers", lambda: self._on_device(self._close_producers))
+            self._producers.clear()
+            self._collective_phase("unmap", lambda: self._on_device(self.vmm.unmap_all))
+            self._collective_phase("multicast unbind", lambda: self._on_device(self.vmm.unbind_all))
+            self._collective_phase(
+                "address free", lambda: self._on_device(self.vmm.free_reservations)
+            )
+            self._collective_phase(
+                "release imported handles",
+                lambda: self._on_device(self.vmm.release_imported_handles),
+            )
+            self._collective_phase(
+                "release created handles",
+                lambda: self._on_device(self.vmm.release_created_handles),
+            )
+            self._closed = True
+            _ACTIVE_SHARED_SLOT_POOLS.pop(self._registry_id, None)
+            self.sets = ()
+            self.pages.clear()
+            return True
+        finally:
+            self._closing = False
 
     def _create_sets(self, comm: Any) -> Tuple[_HelperSet, ...]:
         if not self.large:
@@ -785,10 +980,20 @@ class SharedSlotArenaProvider:
                     "shared-slot arena provider is per-layer and single-geometry; "
                     f"rebuilt with {signature} after {self._signature}"
                 )
-            return self._built
+            if self.pool is not None and not self.pool._closed:
+                return self._built
+            self._built = None
+            self._tekit_views = {}
+            self.layer = None
+            self.pool = None
+            self.buffer_bytes = 0
+            self.group_sizes = ()
         self._signature = signature
         key = signature
         pool = self._pools.get(key)
+        if pool is not None and pool._closed:
+            self._pools.pop(key)
+            pool = None
         if pool is None:
             pool = _SharedSlotPool(
                 world=int(world),
@@ -805,9 +1010,55 @@ class SharedSlotArenaProvider:
         self.group_sizes = pool.group_sizes
         return self._built
 
+    def register_producer(self, producer: Any) -> None:
+        if self.pool is None:
+            raise RuntimeError("build the shared-slot arena before registering its producer")
+        self.pool.register_producer(producer)
+
     def tekit_alias(self, name: str) -> torch.Tensor:
         """Return this rank's framework storage view for a weight plane."""
         return self._tekit_views[name]
+
+
+def _active_pools_for_comm(raw_comm: Any) -> List[_SharedSlotPool]:
+    return [
+        pool
+        for _, pool in sorted(_ACTIVE_SHARED_SLOT_POOLS.items())
+        if getattr(pool.comm, "_comm", None) is raw_comm
+    ]
+
+
+def release_rebalance_resources_collectively(local_safe: bool = True) -> bool:
+    """Collectively release every live shared-slot pool in creation order."""
+    released = True
+    for comm_key, raw_comm in sorted(_EP_MPI_COMMS.items()):
+        local_pools = _active_pools_for_comm(raw_comm)
+        preflight = list(
+            raw_comm.allgather(
+                {
+                    "local_safe": bool(local_safe),
+                    "pools": [pool._cleanup_manifest() for pool in local_pools],
+                }
+            )
+        )
+        expected = int(raw_comm.Get_size())
+        if len(preflight) != expected:
+            raise RuntimeError(
+                f"shared-slot module preflight {comm_key} returned {len(preflight)} ranks; "
+                f"expected {expected}"
+            )
+        if not all(item["local_safe"] for item in preflight):
+            released = False
+            continue
+        descriptors = [item["pools"] for item in preflight]
+        if any(descriptor != descriptors[0] for descriptor in descriptors[1:]):
+            raise RuntimeError(
+                f"shared-slot pool count or order differs across EP communicator {comm_key}"
+            )
+        for pool in local_pools:
+            if not pool.close_collectively(local_safe=True):
+                released = False
+    return released
 
 
 def allocate_rebalance_arena_v2(

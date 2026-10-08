@@ -170,6 +170,18 @@ class RebalanceSlotSchedulerGroupV2:
         self._route_wait_generation = 0
         self._owner_thread_id: Optional[int] = None
         self._execution_stream_handle: Optional[int] = None
+        self._closed = False
+        self.scheduler = None
+        self.symmetric = None
+        self.broadcaster = None
+        self.lease = None
+
+        # Keep a partially initialized producer reachable by the arena's
+        # collective shutdown path. Constructor failures must not attempt a
+        # rank-local teardown while peers may still be initializing.
+        ep_comm = _ep_mpi_comm(mapping)
+        self._ep_comm = ep_comm
+        arena.provider.register_producer(self)
 
         logical_expert_count = self.home_experts * ep_size
 
@@ -204,9 +216,6 @@ class RebalanceSlotSchedulerGroupV2:
         self._input_ready_handle = int(self._input_ready.cuda_event)
         self._plan_ready_handle = int(self._plan_ready.cuda_event)
         self._consumer_done_handle = int(self._consumer_done.cuda_event)
-
-        ep_comm = _ep_mpi_comm(mapping)
-        self._ep_comm = ep_comm
 
         # Every peer address must be connected before either warmup or submit;
         # HALO-Q performs an all-rank exchange on the COPY stream.
@@ -257,12 +266,34 @@ class RebalanceSlotSchedulerGroupV2:
 
         logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
 
+    def close(self) -> None:
+        """Release this layer after the owning pool has drained device work."""
+        if self._closed:
+            return
+        with torch.cuda.device(self.device):
+            if self.broadcaster is not None:
+                self.broadcaster.close()
+            if self.symmetric is not None:
+                self.symmetric.close()
+        self._closed = True
+        self._owner_thread_id = None
+        self._execution_stream_handle = None
+        self._plan_part = None
+        self._pending_release = None
+        self.lease = None
+        self.broadcaster = None
+        self.scheduler = None
+        self.symmetric = None
+        self.arena = None
+
     @property
     def has_submission_owner(self) -> bool:
         """Whether a CPU thread currently owns MAIN submissions."""
         return self._owner_thread_id is not None
 
     def _check_owner(self) -> None:
+        if self._closed:
+            raise RuntimeError("Rebalance scheduler group is closed")
         thread_id = threading.get_ident()
         if torch.cuda.current_device() != self.device:
             raise RuntimeError("Rebalance submission requires its bound CUDA device")
@@ -287,6 +318,8 @@ class RebalanceSlotSchedulerGroupV2:
         Keep the fixed MAIN stream, generation counters, and pending lease
         release. The first serving submission binds its CPU owner normally.
         """
+        if self._closed:
+            raise RuntimeError("Rebalance scheduler group is closed")
         if self._owner_thread_id != threading.get_ident():
             raise RuntimeError("Only the warmup submitter may release its owner")
         if self._execution_stream_handle != int(execution_stream_handle):

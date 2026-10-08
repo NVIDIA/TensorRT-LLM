@@ -339,7 +339,11 @@ class ConfigurableMoE(MoE):
 
         backend_model_config = model_config
         if override_quant_config is not None:
-            backend_model_config = copy.deepcopy(model_config)
+            # Mapping is model topology, not a layer quantization setting. Preserve
+            # its identity so model-local resources can be shared across backends.
+            backend_model_config = copy.deepcopy(
+                model_config, {id(model_config.mapping): model_config.mapping}
+            )
             backend_model_config.quant_config = override_quant_config
 
         with self._temporarily_skip_weight_creation(backend_model_config):

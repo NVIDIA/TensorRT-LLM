@@ -16,6 +16,8 @@ import datetime
 import enum
 import gc
 import json
+import os
+import sys
 import time
 import traceback
 import uuid
@@ -85,6 +87,18 @@ def _init_hf_modules():
 
 _init_hf_modules()
 
+_REBALANCE_LIVE_ARENA_MODULE = (
+    "tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_live_arena_v2")
+
+
+def _release_rebalance_resources_collectively(local_safe: bool = True) -> None:
+    """Release active shared-slot pools without importing the optional path."""
+    module = sys.modules.get(_REBALANCE_LIVE_ARENA_MODULE)
+    release = (None if module is None else getattr(
+        module, "release_rebalance_resources_collectively", None))
+    if callable(release):
+        release(local_safe=local_safe)
+
 
 class BaseWorker(GenerationExecutor):
 
@@ -102,6 +116,8 @@ class BaseWorker(GenerationExecutor):
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
         # Direct worker construction also bypasses BaseLLM/worker_main.
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
         if llm_args is not None and llm_args.backend == "pytorch":
             queue_overrides = configure_moe_launch_queues(
                 getattr(llm_args, "moe_config", None), llm_args.env_overrides)
@@ -1028,13 +1044,30 @@ class BaseWorker(GenerationExecutor):
         else:
             self.doing_shutdown = True
 
-        if self.engine is not None:
-            can_shutdown = getattr(self.engine, "can_shutdown", None)
-            if can_shutdown is None:
-                can_shutdown = self.engine.can_enqueue_requests
-            if can_shutdown():
-                self.engine.shutdown()
-                self.engine = None
+        engine = self.engine
+        can_shutdown_now = False
+        shutdown_succeeded = False
+        try:
+            if engine is not None:
+                can_shutdown = getattr(engine, "can_shutdown", None)
+                if can_shutdown is None:
+                    can_shutdown = engine.can_enqueue_requests
+                can_shutdown_now = can_shutdown()
+                if can_shutdown_now:
+                    engine.shutdown()
+                    shutdown_succeeded = True
+        finally:
+            try:
+                _release_rebalance_resources_collectively(
+                    local_safe=shutdown_succeeded
+                    and not getattr(engine, "worker_started", False))
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to release MoE rebalance resources on shutdown: %s",
+                    exc,
+                )
+        if can_shutdown_now:
+            self.engine = None
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

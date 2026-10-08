@@ -35,7 +35,7 @@ from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
 from ...llmapi.utils import configure_cpu_affinity
 from ...sampling_params import BatchedLogitsProcessor
-from ..base_worker import BaseWorker
+from ..base_worker import BaseWorker, _release_rebalance_resources_collectively
 from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
@@ -59,6 +59,8 @@ class RayWorkerWrapper:
 
     def __init__(self, worker_cls, worker_kwargs, world_size, rank):
         llm_args = worker_kwargs.get("llm_args")
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
         if llm_args is not None and llm_args.backend == "pytorch":
             queue_overrides = configure_moe_launch_queues(
                 getattr(llm_args, "moe_config", None), llm_args.env_overrides)
@@ -384,8 +386,22 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                 )
             self.rpc_server = None
 
-        if self.engine is not None:
-            self.engine.shutdown()
+        engine = self.engine
+        shutdown_succeeded = False
+        try:
+            if engine is not None:
+                engine.shutdown()
+                shutdown_succeeded = True
+        finally:
+            try:
+                _release_rebalance_resources_collectively(
+                    local_safe=shutdown_succeeded
+                    and not getattr(engine, "worker_started", False))
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    f"Failed to release MoE rebalance resources on shutdown: {e}"
+                )
+        if engine is not None:
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
