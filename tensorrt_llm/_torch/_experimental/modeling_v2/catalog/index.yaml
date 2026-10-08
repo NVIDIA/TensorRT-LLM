@@ -28,7 +28,7 @@
 # limits, e.g. no float8 arithmetic, are noted in the entry docstring).
 # Entries wrapping trtllm ops carry all three.
 #
-# ── RECEIPT STATUS: 19 entries certified on sm_103, 18 on sm_100 ──────────
+# ── RECEIPT STATUS: 19 entries certified on sm_103, 30 on sm_100 ──────────
 #
 # A receipt says this entry's test passed on a stated GPU architecture. The
 # architecture is the whole key: it is a real axis -- see the
@@ -69,8 +69,12 @@
 #
 # The Kimi K3 entries (k3_*, attn_res_* and ssm/kda_decode) are certified on
 # sm_100 (B200 / GB200), where their first caller runs, and their tests skip on
-# any other architecture. cublas_mm and flashinfer_rmsnorm, which that caller
-# also uses, keep their sm_103 receipts and add sm_100 ones.
+# any other architecture. The entries of Kimi K3's generic path (the KDA
+# prefill ops, rms_norm_gated_token_major, situ_and_mul and
+# kimi_k3_noaux_tc_mxfp8_quant) carry sm_100 receipts too. cublas_mm,
+# flashinfer_rmsnorm, thop_attention, the three MLA cache / RoPE ops and the
+# MXFP4 MoE runner, which that caller also uses, keep their sm_103 receipts and
+# add sm_100 ones.
 # ──────────────────────────────────────────────────────────────────────────
 #
 # 30 of the source catalog's 43 entries are here — the union of what the two
