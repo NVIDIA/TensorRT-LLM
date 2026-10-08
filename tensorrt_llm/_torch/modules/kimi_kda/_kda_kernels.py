@@ -403,10 +403,15 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
+    def mtp_verify(
+        self, *, mxfp8_output: bool = False, **kwargs
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the fused KDA multi-token verify kernel.
 
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
+        Thin passthrough to ``trtllm::kda_mtp_decode``, or with
+        ``mxfp8_output`` to ``trtllm::kda_mtp_decode_fp8``, which always
+        fuses the output norm and returns the E4M3 core and its R128c4
+        scales (see
         ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
         argument and state-management contract). Only defined on the
         optimized path; the FLA fallback is the module's sequential
@@ -417,7 +422,11 @@ class KDAKernelDispatch:
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
+        _load_mtp_module()  # registers both the BF16 and the MXFP8-output ops
+        if mxfp8_output:
+            if not kwargs.pop("fuse_output_norm", True):
+                raise ValueError("the MXFP8-output KDA MTP op always fuses the output norm")
+            return torch.ops.trtllm.kda_mtp_decode_fp8(**kwargs)
         return torch.ops.trtllm.kda_mtp_decode(**kwargs)
 
     def can_use_indexed_prefill(
