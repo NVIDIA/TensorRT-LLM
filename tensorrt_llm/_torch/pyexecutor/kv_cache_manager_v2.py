@@ -2363,6 +2363,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # multimodal alignment or cross attention. Phase 3 runs on the final batch.
 
     def _connector_may_serve(self, req: LlmRequest) -> bool:
+        if self.kv_connector_manager.capacity_only:
+            # It can serve nothing, so all three phases would run over an empty
+            # offer.
+            return False
         if req.is_dummy:
             # Mirrors V1, which skips the query for dummy requests entirely.
             return False
@@ -2678,7 +2682,9 @@ class KVCacheManagerV2(BaseResourceManager):
         under a valid hash. Callers must not count on the pages until
         :meth:`try_complete_preemption` has run for this request.
         """
-        if self.kv_connector_manager is None:
+        # A capacity-only connector has no save to wait for, so the victim's
+        # pages can go back now, without the page index gather below.
+        if self.kv_connector_manager is None or self.kv_connector_manager.capacity_only:
             self._release_preempted(req)
             return True
 
@@ -2768,7 +2774,14 @@ class KVCacheManagerV2(BaseResourceManager):
         # its pages. This is the same point in the iteration at which the V1
         # manager drives the connector's scheduler-side hooks, and page indices
         # are available, so the connector is driven from here.
-        if publish_connector_output and self.kv_connector_manager is not None:
+        #
+        # A capacity-only connector cannot reach those pages, so reporting them
+        # would cost a page index gather per request for nothing.
+        if (
+            publish_connector_output
+            and self.kv_connector_manager is not None
+            and not self.kv_connector_manager.capacity_only
+        ):
             self._run_kv_connector_hooks(scheduled_batch)
 
     def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:

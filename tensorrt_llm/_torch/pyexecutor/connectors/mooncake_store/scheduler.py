@@ -143,6 +143,11 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         Returns:
             Tokens the store can supply, and `False` for a synchronous load.
         """
+        if self._config.capacity_only:
+            # Nothing will read the hash chain `_state_for` builds, which costs
+            # a SHA-256 over the whole prompt. No state also suppresses saves.
+            return 0, False
+
         scope = _reuse_scope(request)
         if scope is None:
             # Leaving it without a `_RequestState` suppresses its saves too,

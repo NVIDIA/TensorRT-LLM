@@ -110,6 +110,9 @@ class FakeRequest:
 class FakeConnectorManager:
     """Records the calls the phases make, in order."""
 
+    #: Read by the manager to decide whether the phases run at all.
+    capacity_only = False
+
     def __init__(self, num_matched=0, load_async=False, trace=None):
         self.num_matched = num_matched
         self.load_async = load_async

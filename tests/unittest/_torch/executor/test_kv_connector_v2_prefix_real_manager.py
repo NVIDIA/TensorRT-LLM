@@ -59,6 +59,9 @@ class FakeConnectorManager:
     ``build_scheduler_output`` that ``prepare_resources`` calls after delivery.
     """
 
+    #: Read by the manager to decide whether the phases run at all.
+    capacity_only = False
+
     def __init__(self, num_matched=OFFER_TOKENS, load_async=False):
         self.num_matched = num_matched
         self.load_async = load_async

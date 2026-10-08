@@ -325,6 +325,109 @@ def test_a_capacity_only_manager_builds_no_scheduler_output():
     transferring.scheduler.build_connector_meta.assert_called_once()
 
 
+def test_only_a_worker_that_says_so_is_capacity_only():
+    """What the capacity role opts out of is too much to infer.
+
+    A double that leaves the property unset is truthy, and believing it would
+    silently lift a whole engine off the connector's per-request path.
+    """
+    manager = KvCacheConnectorManager(MagicMock(), scheduler=MagicMock())
+
+    assert manager.capacity_only is False
+
+
+def test_a_capacity_only_connector_is_asked_nothing_per_request():
+    """A worker that registers no page has nothing to be asked about.
+
+    Both queries reach the leader through a broadcast every rank joins, so the
+    pair would cost two collectives per request.
+    """
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    scheduler = MagicMock()
+    scheduler.get_num_new_matched_tokens.return_value = (16, False)
+    scheduler.request_finished.return_value = True
+    manager = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                      scheduler=scheduler)
+
+    req = MagicMock(is_dummy_request=False, is_generation_only_request=False)
+    req.request_id = 7
+
+    assert manager.get_num_new_matched_tokens(req, 0) == 0
+    assert manager.request_finished(req, []) is False
+    scheduler.get_num_new_matched_tokens.assert_not_called()
+    scheduler.request_finished.assert_not_called()
+    # Nothing is recorded either, since the scheduler output that would clear
+    # it is never built.
+    assert manager.scheduler_output_manager.external_loads == {}
+    assert not manager.new_async_requests.saving
+
+
+def test_a_capacity_only_connector_serves_generation_only_requests():
+    """A disaggregated generation server is what the capacity role is for.
+
+    Every request there is generation-only, which the API otherwise rejects
+    outright, so the capacity check has to come first.
+    """
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    manager = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                      scheduler=MagicMock())
+
+    req = MagicMock(is_dummy_request=False, is_generation_only_request=True)
+    req.request_id = 7
+
+    assert manager.get_num_new_matched_tokens(req, 0) == 0
+
+
+def test_a_capacity_only_connector_polls_no_completion():
+    """Nothing was offered asynchronously, so nothing can be in flight.
+
+    Agreeing on completion is an allgather, and it runs once per iteration.
+    """
+
+    class RecordingWorker(MinimalWorker):
+        capacity_only = True
+
+        def __init__(self, llm_args):
+            super().__init__(llm_args)
+            self.polls = 0
+
+        def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+            self.polls += 1
+            return [], []
+
+    worker = RecordingWorker(MagicMock())
+    manager = KvCacheConnectorManager(worker, scheduler=MagicMock())
+
+    assert manager.get_finished() == []
+    assert worker.polls == 0
+
+
+def test_a_capacity_only_connector_is_told_of_no_allocation():
+    """It holds no address, so a page list is nothing it can use.
+
+    Both runtime callers gather the indices only when the role can reach them,
+    and the check belongs here too so a third one cannot reintroduce the report.
+    """
+
+    class CapacityWorker(MinimalWorker):
+        capacity_only = True
+
+    scheduler = MagicMock()
+    manager = KvCacheConnectorManager(CapacityWorker(MagicMock()),
+                                      scheduler=scheduler)
+
+    manager.update_state_after_alloc(MagicMock(is_dummy_request=False),
+                                     [1, 2, 3])
+
+    scheduler.update_state_after_alloc.assert_not_called()
+
+
 def test_releasing_an_allocation_for_replay_tells_the_connector():
     """The connector's per-request state is keyed to the pages being freed."""
     scheduler = MagicMock()
