@@ -17,6 +17,18 @@
 One :class:`ServingRender` backs both ways of exposing rendering over HTTP: the
 routes mounted on a normal ``trtllm-serve`` worker and the standalone CPU-only
 renderer process.
+
+Supported integration. The render routes are *routing-only rendering* for a consumer
+such as the Dynamo EPP: it reads ``token_ids`` to compute KV-cache block hashes, forwards
+the original request unchanged, and leaves the worker to render it. Such a consumer does
+not use ``schema_version``, ``fingerprint`` or ``tokens_trusted``, so a router built on
+the ids alone must itself decide what to do when ``tokens_trusted`` is false (a named
+``tool_choice``: the ids are a good estimate but not the executed prompt) or when its
+renderer's fingerprint differs from the workers' (``GET /server_info``): the ids are then
+an estimate and routing quality, not correctness, is what is at stake. Executing the
+prepared request without re-rendering (``POST /generate``) is a separate, optional flow
+that needs a consumer which sends the whole ``GenerateRequest`` back; its contract is
+described on :class:`~.prompt_types.GenerateRequest`.
 """
 
 from __future__ import annotations
@@ -118,6 +130,7 @@ class ServingRender:
             token_ids=rendered.token_ids,
             tokens_trusted=rendered.tokens_trusted,
             untrusted_reason=rendered.untrusted_reason,
+            context=rendered.context,
             request=original,
         )
 

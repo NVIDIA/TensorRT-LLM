@@ -24,6 +24,7 @@ and errors are those of the route the request belongs to.
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
@@ -95,7 +96,15 @@ def attach_generate_route(app: FastAPI, server: Any) -> None:
                 raise RenderRequestError(400, str(error)) from error
         except RenderRequestError as error:
             return error_response(error)
+        # The routes fall back to the raw JSON body's messages when the request model
+        # rejects them (object-valued tool-call arguments); here the HTTP body is the
+        # prepared-request envelope, so hand the route the original request body instead.
+        # (Starlette caches the parsed body in ``_json``; ``Request.json()`` returns it.)
+        raw_request._json = copy.deepcopy(body.request)
         if body.kind == "chat":
+            # Decisions derived from the rendered prompt, which the route cannot make
+            # again from token ids. A private attribute, so a client cannot set it.
+            request._render_context = body.context.model_dump()
             # The route a worker serves chat on: a Harmony (gpt-oss) worker's chat route
             # parses channels and tool calls out of the token stream.
             chat_route = (

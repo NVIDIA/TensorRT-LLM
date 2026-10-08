@@ -65,10 +65,12 @@ class RenderResources:
     custom_tokenizer: Optional[str] = None
 
     def legacy_view(self) -> "RenderResources":
-        """Resources as the pre-merge callers saw them (``TRTLLM_RENDER_LEGACY=1``).
+        """Resources approximating the pre-merge inputs (``TRTLLM_RENDER_LEGACY=1``).
 
         The governor, Responses and multimodal-encoder routes rendered without
         the server-side chat template and without the model extension's rules.
+        This restores those inputs only; the render and tokenize steps are still the
+        shared ones (see :func:`~tensorrt_llm.serve.render.chat.legacy_render_enabled`).
         """
         return dataclasses.replace(self, default_chat_template=None, extension=ServingExtension())
 

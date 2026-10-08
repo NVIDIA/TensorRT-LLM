@@ -2091,9 +2091,16 @@ class OpenAIServer(_VideoRoutesMixin):
             # tokens (kimi_k3: the generation channel opener); the model still
             # sees the full prompt. The extension decides from the request; a
             # server-level chat template may end differently, so report
-            # unadjusted usage when one is configured.
-            excluded_tokens = extension.prompt_tokens_excluded_from_usage(
-                request)
+            # unadjusted usage when one is configured. A prepared request
+            # (POST /generate) carries what the renderer decided, since this
+            # route never sees the rendered prompt.
+            render_context = getattr(request, "_render_context", None)
+            if render_context is not None:
+                excluded_tokens = render_context[
+                    "prompt_tokens_excluded_from_usage"]
+            else:
+                excluded_tokens = extension.prompt_tokens_excluded_from_usage(
+                    request)
             if excluded_tokens and self.chat_template is None:
                 postproc_args.num_prompt_tokens_offset = excluded_tokens
             if dynamic_tool_params:
@@ -2209,6 +2216,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 if rendered_prompt and request.add_generation_prompt:
                     thinking = ReasoningParserFactory.resolve_prefilled_thinking(
                         postproc_args.reasoning_parser, rendered_prompt)
+                if thinking is None and render_context is not None:
+                    # Prepared request: the renderer read the mode off the
+                    # prompt it rendered.
+                    thinking = render_context["resolved_thinking"]
                 if thinking is None and request.disaggregated_params is not None:
                     # Generation worker: it never rendered, so use the mode the
                     # context worker resolved and relayed.
