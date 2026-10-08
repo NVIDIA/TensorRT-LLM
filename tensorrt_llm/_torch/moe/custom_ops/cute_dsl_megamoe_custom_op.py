@@ -4,7 +4,7 @@
 """CuteDSL MegaMoE NVFP4 custom op + TunableRunner.
 
 Wraps the architecture-specific MegaMoE kernel (see
-``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/``) into the
+``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/``) into the
 standard TRT-LLM CuteDSL op pattern used by
 ``cute_dsl_custom_ops.py``:
 
@@ -713,16 +713,13 @@ def _construct_megamoe_kernel(
     """Construct the active architecture kernel and report a narrow gen rejection."""
     from cutlass.cute.nvgpu import OperandMajorMode
 
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe import (
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe import (
         BlackwellInferenceMegaMoE,
         RubinInferenceGenphaseMegaMoE,
         RubinInferenceMegaMoE,
     )
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
-    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.quant_def import (
-        CombineFormat,
-        QuantKind,
-    )
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import CombineFormat, QuantKind
 
     local_experts, intermediate_gateup_size, hidden_size = common["static_expert_shape"]
     problem_desc = ProblemDesc(
@@ -1203,13 +1200,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         except ImportError:
             from cuda import cuda
 
-        from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe import (  # noqa: F401
             BlackwellInferenceMegaMoE,
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceLocalMegaMoE,
             RubinInferenceMegaMoE,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
+        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,  # noqa: F401
         )
 
@@ -1256,7 +1253,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         import cutlass.torch as cutlass_torch
         from cutlass.cute.typing import AddressSpace
 
-        from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
+        from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost as SymBufferHost,
         )
 
