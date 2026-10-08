@@ -52,7 +52,7 @@ from .engine.lora import make_lora_model_config
 from .engine.model_call import ModelCaller
 from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
                                 mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata)
+                                setup_mm_encoder_attn_metadata, use_mrope)
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import (make_scheduled_inputs,
                                     resolve_mrope_position_deltas_cache,
@@ -206,8 +206,6 @@ def _configure_deep_gemm_pdl() -> None:
 
 class PyTorchModelEngine(ModelEngine):
 
-    kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-
     def __init__(
         self,
         *,
@@ -305,7 +303,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
-        self.sparse_attention_config = llm_args.sparse_attention_config
         self.enable_spec_decode = self.is_spec_decode
 
         self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
@@ -331,7 +328,7 @@ class PyTorchModelEngine(ModelEngine):
                 llm_args=llm_args,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
-                sparse_attention_config=self.sparse_attention_config,
+                sparse_attention_config=llm_args.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
@@ -380,7 +377,6 @@ class PyTorchModelEngine(ModelEngine):
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_overlap_headroom,
         )
-        self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
@@ -441,7 +437,6 @@ class PyTorchModelEngine(ModelEngine):
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
         self._torch_compile_backend = None
-        self.dtype = self.model.config.torch_dtype
         self._init_model_capacity()
 
         self.cuda_graph_config = self.llm_args.cuda_graph_config
@@ -486,7 +481,6 @@ class PyTorchModelEngine(ModelEngine):
         torch_compile_max_num_streams = torch_compile_config.max_num_streams if torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
 
-        self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
         self._torch_compile_prefill_only = False
 
         prefill_cuda_graph_num_tokens = self.llm_args.prefill_capture_num_tokens
@@ -526,8 +520,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._torch_compile_backend = Backend(
                     torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=self.
-                    _torch_compile_piecewise_cuda_graph,
+                    enable_piecewise_cuda_graph=(
+                        torch_compile_piecewise_cuda_graph),
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
@@ -541,7 +535,7 @@ class PyTorchModelEngine(ModelEngine):
                         backend=self._torch_compile_backend,
                         fullgraph=torch_compile_fullgraph)
                     self._torch_compile_prefill_only = (
-                        self._torch_compile_piecewise_cuda_graph
+                        torch_compile_piecewise_cuda_graph
                         and not self.model.use_fx_for_pcg_fallback)
                     self.model.model = (
                         _PrefillCompiledModel(eager_model, compiled_model)
@@ -567,9 +561,10 @@ class PyTorchModelEngine(ModelEngine):
 
         self.is_warmup = False
 
-        sparse_params = (self.sparse_attention_config.to_sparse_params(
+        sparse_attention_config = self.model.model_config.sparse_attention_config
+        sparse_params = (sparse_attention_config.to_sparse_params(
             pretrained_config=self.model.model_config.pretrained_config)
-                         if self.sparse_attention_config is not None else None)
+                         if sparse_attention_config is not None else None)
         self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
                                                   sparse_params=sparse_params)
 
@@ -721,7 +716,7 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            dtype=self.dtype,
+            dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
             is_encode_only=self.llm_args.encode_only,
@@ -745,10 +740,11 @@ class PyTorchModelEngine(ModelEngine):
             enable_in_graph_sampling=self.enable_in_graph_sampling,
             torch_compile_enabled=self._torch_compile_backend is not None,
             torch_compile_piecewise_cuda_graph=(
-                self._torch_compile_piecewise_cuda_graph),
+                self.llm_args.prefill_cuda_graph_backend ==
+                PrefillCudaGraphBackend.PIECEWISE),
             torch_compile_prefill_only=self._torch_compile_prefill_only,
-            use_mrope=self.use_mrope,
-            is_multimodal=self.is_multimodal,
+            use_mrope=use_mrope(self.model),
+            is_multimodal=is_multimodal(self.model, self.input_processor),
             mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
             enable_autotuner=self.llm_args.enable_autotuner,
             cuda_graph_specialize_lora=(
@@ -772,7 +768,8 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            sparse_attention_config=self.sparse_attention_config,
+            sparse_attention_config=(
+                self.model.model_config.sparse_attention_config),
             attention_runtime_features=self.attn_runtime_features,
             get_runtime_tokens_per_gen_step=(
                 self.spec_config.get_runtime_tokens_per_gen_step if
@@ -873,17 +870,6 @@ class PyTorchModelEngine(ModelEngine):
         return False
 
     @property
-    def use_mrope(self):
-        use_mrope = False
-        try:
-            use_mrope = self.model.model_config.pretrained_config.rope_scaling[
-                'type'] == 'mrope'
-        except Exception:
-            pass
-        logger.debug(f"Detected use_mrope: {use_mrope}")
-        return use_mrope
-
-    @property
     def is_warmup(self):
         return getattr(self, "_is_warmup", False)
 
@@ -944,8 +930,8 @@ class PyTorchModelEngine(ModelEngine):
                 result = method(self, resource_manager, *args, **kwargs)
                 with timing_metric("kv_cache_cleanup_seconds", self._metrics):
                     kv_cache_manager = (resource_manager.get_resource_manager(
-                        self.kv_cache_manager_key) if resource_manager
-                                        is not None else None)
+                        ResourceManagerType.KV_CACHE_MANAGER) if
+                                        resource_manager is not None else None)
                     if kv_cache_manager is not None:
                         has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
                             fill_with_zero=True)
@@ -1018,11 +1004,6 @@ class PyTorchModelEngine(ModelEngine):
         self._runner.warmup(resource_manager)
 
     ### Helper methods promoted from the original warmup method ###
-
-    @property
-    def is_multimodal(self) -> bool:
-        """True iff this engine drives a multimodal model."""
-        return is_multimodal(self.model, self.input_processor)
 
     def _validate_breakable_cuda_graph_compatibility(self) -> None:
         if self.llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.BREAKABLE:

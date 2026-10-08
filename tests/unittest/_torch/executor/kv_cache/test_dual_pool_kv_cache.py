@@ -138,8 +138,7 @@ def _make_mock_model_engine(model_config):
     """Mock PyTorchModelEngine shell; a real engine needs GPU + loaded weights."""
     engine = Mock()
     engine.model.model_config = model_config
-    engine.dtype = torch.bfloat16
-    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+    engine.model.config.torch_dtype = torch.bfloat16
     return engine
 
 

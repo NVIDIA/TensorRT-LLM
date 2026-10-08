@@ -145,6 +145,17 @@ def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool
     return enabled
 
 
+def use_mrope(model: nn.Module) -> bool:
+    """Whether the model's rope scaling is multimodal RoPE."""
+    use_mrope = False
+    try:
+        use_mrope = model.model_config.pretrained_config.rope_scaling["type"] == "mrope"
+    except Exception:
+        pass
+    logger.debug(f"Detected use_mrope: {use_mrope}")
+    return use_mrope
+
+
 def mm_encoder_cache_enabled(model: nn.Module) -> bool:
     """Whether the multimodal encoder cache is active for this model."""
     return isinstance(model, MultimodalModelMixin) and model.encoder_cache_active

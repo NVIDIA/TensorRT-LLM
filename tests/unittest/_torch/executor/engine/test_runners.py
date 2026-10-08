@@ -32,7 +32,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import (
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -260,7 +259,6 @@ def _model_engine_with_runner(
     engine = object.__new__(PyTorchModelEngine)
     engine._model_caller = Mock()
     engine.model = SimpleNamespace(extra_attrs={})
-    engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     if runner is None:
         runner = object.__new__(DecoderRunner)
         runner._model = engine.model

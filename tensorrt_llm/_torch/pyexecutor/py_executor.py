@@ -46,6 +46,7 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ExecutorMemoryType, PeftCacheConfig,
+                                          PrefillCudaGraphBackend,
                                           WaitingQueuePolicy)
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
@@ -823,8 +824,8 @@ class PyExecutor:
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
                     "scope. Set pp_size=1 to run T5/BART/mBART.")
-            if getattr(self.model_engine, "_torch_compile_piecewise_cuda_graph",
-                       False):
+            if (self.llm_args.prefill_cuda_graph_backend ==
+                    PrefillCudaGraphBackend.PIECEWISE):
                 raise NotImplementedError(
                     "Piecewise CUDA graph is not supported for "
                     "encoder-decoder models. Disable "
