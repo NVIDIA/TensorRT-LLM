@@ -103,12 +103,12 @@ class QuantAttentionConfig(StrictBaseModel):
             "quantized type has to cover. SageAttention only."
         ),
     )
-    algorithm: Literal["primsts", "sage", "vc_attention-qk16"] = Field(
+    algorithm: Literal["primsts", "sage"] = Field(
         "sage",
         status="prototype",
         description=(
-            "TRTLLM kernel family for the recipe. primsts quantizes per tensor, sage per block, "
-            "vc_attention-qk16 adds the VC-Attention V treatment (both via TLLM_FMHA_LIBS=+prims_ts)."
+            "TRTLLM kernel family for the recipe. primsts quantizes per tensor "
+            "(TLLM_FMHA_LIBS=+prims_ts), sage per block."
         ),
     )
 
@@ -166,8 +166,7 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (1, 4, 1)),
             },
         }
-        # PrimTS supports per-tensor FP8 recipes on Blackwell, with or without the VC-Attention V
-        # treatment.
+        # PrimTS supports per-tensor FP8 recipes on Blackwell.
         PRIMSTS_RECIPES = {
             100: {
                 ("bf16", "fp8", (0, 0, 0)),
@@ -178,11 +177,7 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
-        TRTLLM_RECIPES = {
-            "primsts": PRIMSTS_RECIPES,
-            "sage": SAGE_RECIPES,
-            "vc_attention-qk16": PRIMSTS_RECIPES,
-        }
+        TRTLLM_RECIPES = {"primsts": PRIMSTS_RECIPES, "sage": SAGE_RECIPES}
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),

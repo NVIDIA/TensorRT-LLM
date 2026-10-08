@@ -495,8 +495,6 @@ class PrimsTSFmha(PhasedFmha):
         if q.dtype not in self.SUPPORTED_DTYPES:
             return False, f"query dtype {q.dtype} is unsupported."
         recipe = attn.quant_attention_config
-        if recipe is not None and recipe.algorithm == "vc_attention-qk16":
-            return False, "VC-Attention kernels are not available in this build."
         if recipe is not None and recipe.qk_dtype == "bf16" and q.dtype != torch.bfloat16:
             return False, f"the attention recipe keeps Q/K in BF16, got {q.dtype}."
         output = fwd.output
@@ -806,6 +804,7 @@ class PrimsTSFmha(PhasedFmha):
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
     ) -> None:
+        """Run the request on the cache-free context path or the phased paged path."""
         if metadata.kv_cache_manager is None and not int(metadata.num_generations):
             self._forward_without_kv_cache(q, metadata, forward_args)
             return

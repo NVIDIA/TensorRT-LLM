@@ -2335,6 +2335,7 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
 
 
 def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cache-free context path plans one contiguous wrapper per shape and reuses it."""
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
     fmha = PrimsTSFmha(attn)
