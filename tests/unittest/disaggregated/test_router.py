@@ -2335,6 +2335,10 @@ class _PrefixCacheFakeTokenizer:
 
     _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
 
+    # A stable serialization of the encoding, so the rendering fingerprint can
+    # identify this tokenizer (one without it is never trusted for write-back).
+    backend_tokenizer = SimpleNamespace(to_str=lambda: "prefix-cache-fake")
+
     def apply_chat_template(self,
                             messages,
                             add_generation_prompt=False,

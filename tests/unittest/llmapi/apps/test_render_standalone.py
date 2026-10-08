@@ -108,6 +108,14 @@ class TestLoad:
         with pytest.raises(Exception):  # noqa: B017 - the exact type depends on the loader
             RenderResources.load(str(tmp_path / "does-not-exist"))
 
+    def test_an_unreadable_model_config_is_refused_not_rendered_generically(self, tmp_path) -> None:
+        # A tokenizer and no config: rendering would silently lose the model type (the
+        # serving extension, Harmony) and produce a prompt a worker would not.
+        make_tokenizer().save_pretrained(tmp_path)
+
+        with pytest.raises(Exception, match="onfig"):
+            RenderResources.load(str(tmp_path))
+
 
 class TestCommandLine:
     def test_the_options_that_change_the_prompt_use_the_serve_names(self) -> None:

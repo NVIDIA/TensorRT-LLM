@@ -303,9 +303,18 @@ class BlockHashMixin:
         if resources is None:
             try:
                 model_type = self._get_model_type()
-            except Exception as error:  # an unreadable config only loses the extension
-                logger.debug(f"Router could not resolve the model type: {error}")
+            except Exception as error:
+                logger.warning(f"Router could not resolve the model type: {error}")
                 model_type = None
+            if model_type is None:
+                # Not an intentional generic-text configuration: a model that renders through
+                # an extension or Harmony would be rendered here without it, so its routing
+                # ids are an estimate and its fingerprint will not match the workers'.
+                logger.warning(
+                    "Router has no resolvable model type (no checkpoint path or an unreadable "
+                    "config); it renders as a generic text model. Models that need a serving "
+                    "extension or Harmony route on estimated ids and never forward them."
+                )
             resources = RenderResources.from_tokenizer(
                 self._get_tokenizer(model),
                 model_type=model_type,
