@@ -5789,13 +5789,15 @@ MANGLED_NAMES = [
     ("my_exec_command", "my_exec_command"),
 ]
 
-# Prose and code that mention a declared tool; never repaired into a call to it.
+# Prose and code in the name position, mostly mentioning a declared tool; none
+# is a call.
 PROSE_NAMES = [
     "ops_check - re-querying for current status. Since my last report",
     "exec_command depended on the tools. Let me use the correct approach",
     "exec_sudo_command onCompleteCommand=\"export SKILLS_DIR=/x\"",
     "collaboration.immediately_agent(\"target\" => \"/root/builder\")",
     "exec_command(cmd=\"cat /workspace/kernel.cu\"",
+    "exec command",
 ]
 
 
@@ -6059,13 +6061,14 @@ class TestGlmStreamingMatchesWholeParse:
         assert calls == [(delivered, dict(cmd="ls -la /workspace"))]
 
     @pytest.mark.parametrize("prose", PROSE_NAMES)
-    def test_prose_is_never_repaired_into_a_call(self, parser_cls, prose):
-        text = _glm_call(parser_cls, prose, ("cmd", "ls"))
+    @pytest.mark.parametrize("pairs", [[("cmd", "ls")], []],
+                             ids=["with arguments", "without arguments"])
+    def test_a_prose_name_is_released_as_text(self, parser_cls, prose, pairs):
+        text = _glm_call(parser_cls, prose, *pairs)
 
-        _, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+        normal, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
 
-        declared = {tool.function.name for tool in AGENT_TOOLS}
-        assert not {name for name, _ in calls} & declared
+        assert (normal, calls) == (text, [])
 
     def test_a_bare_name_is_typed_by_its_qualified_declaration(
             self, parser_cls):

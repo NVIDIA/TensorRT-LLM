@@ -890,6 +890,24 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
     assert result == "qwen3"
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("glm_moe_dsa", "glm_moe_dsa"),  # GLM-5, GLM-5.2
+        # GLM-4.5/4.6 and GLM-4.7 share glm4_moe but differ on whether the
+        # template prefills <think>; GLM-5.3-Flash prefills it whatever
+        # enable_thinking says. Neither is resolved automatically.
+        ("glm4_moe", None),
+        ("glm5_next", None),
+    ])
+def test_auto_detect_glm(tmp_path, model_type, expected):
+    model_dir = str(tmp_path / "GLM")
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
 def test_auto_detect_deepseek_r1(tmp_path):
     """DeepSeek R1 model → 'deepseek-r1' parser."""
     model_dir = str(tmp_path / "DeepSeek-R1")

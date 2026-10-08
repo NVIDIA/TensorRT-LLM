@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
-from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
+from tensorrt_llm.serve.tool_parser.base_tool_parser import _QUALIFIED_NAME, BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -200,22 +200,27 @@ class Glm4ToolParser(BaseToolParser):
 
         A declared tool the name maps onto wins over the name as written; markup
         after the name is only accepted when it resolves onto a declared tool.
+        An undeclared name is delivered as written only when it is a dotted
+        identifier, so prose or code in the name position is not a call.
         """
         tool_indices = self._get_tool_indices(tools)
         name = name.strip()
         if junk:
             return self.resolve_tool_name((name + junk).strip(), tool_indices)
-        return name and (self.resolve_tool_name(name, tool_indices) or name)
+        resolved = self.resolve_tool_name(name, tool_indices)
+        return resolved or (name if _QUALIFIED_NAME.match(name) else None)
 
     def _parse_call_segment(
         self, segment: str, tools: List[Tool]
     ) -> Tuple[List[ToolCallItem], str]:
         """Parse one ``<tool_call>...</tool_call>`` into (calls, text to release).
 
-        A ``<tool_call>`` after the name restarts the call: the abandoned prefix
-        is released and the rest parsed. A call is released whole as text when it
-        is not one (see ``_call_name``) or its argument text is not all pairs (see
-        ``parse_argument_text``).
+        A ``<tool_call>`` in the markup between the name and the argument text
+        restarts the call: the abandoned prefix is released and the rest parsed.
+        One inside the argument text is not a restart; inside a value it is part
+        of the value, so a string argument may quote it. A call is released whole
+        as text when it is not one (see ``_call_name``) or its argument text is
+        not all pairs (see ``parse_argument_text``).
         """
         parts = self._split_call(segment[len(self.bot_token) : -len(self.eot_token)])
         restart = -1 if parts is None else parts[1].rfind(self.bot_token)
