@@ -1399,9 +1399,23 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
     owner._terminate_request.assert_called_once_with(request)
 
 
-@pytest.mark.parametrize("outcome", ["complete", "cancel", "timeout", "shutdown"])
+@pytest.mark.parametrize(
+    "outcome,is_async,mixed_batch",
+    [
+        ("complete", True, False),
+        ("cancel", True, False),
+        ("timeout", True, False),
+        ("shutdown", True, False),
+        ("complete", False, False),
+        ("cancel", False, False),
+        ("cancel", True, True),
+        ("cancel", False, True),
+    ],
+)
 @pytest.mark.parametrize("overlap", [False, True])
-def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
+def test_prefix_load_recovery_lifetime(
+    outcome: str, is_async: bool, mixed_batch: bool, overlap: bool
+) -> None:
     from tensorrt_llm._torch.pyexecutor.connectors.prefix_load_completion import (
         PrefixLoadCompletionTracker,
     )
@@ -1412,7 +1426,7 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
     manager = executor.kv_connector_manager = _manager()
     manager.prefix_reservations_enabled = True
     manager._prefix_completion_tracker = PrefixLoadCompletionTracker()
-    manager.scheduler.reserve_prefix.return_value = (4, True)
+    manager.scheduler.reserve_prefix.return_value = (4, is_async)
     request = _request(7)
     executor.active_requests = [request]
     executor.kv_cache_manager = MagicMock(spec=KVCacheManagerV2)
@@ -1427,15 +1441,21 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
     manager.accept_prefix_load(request, 0, 4, [[2, 3]])
     batch = ScheduledRequests()
     batch.context_requests_last_chunk = [request]
+    if mixed_batch:
+        context, generation = _request(8), _request(9)
+        generation.state = LlmRequestState.GENERATION_IN_PROGRESS
+        batch.context_requests_last_chunk.append(context)
+        batch.generation_requests.append(generation)
+        executor.active_requests.extend([context, generation])
     manager.build_scheduler_output(batch, executor.kv_cache_manager)
     manager.worker.get_finished_prefix_loads.side_effect = (
         lambda: [1] if outcome in ("complete", "cancel") else []
     )
 
-    # Keep the production padding helper: the canceled request initially owns
-    # the sole slot, which becomes reusable only after its response is flushed.
-    executor.expected_num_active_requests = 1
-    executor.max_num_active_requests = 1
+    # In a single-request batch, the canceled load owns the sole slot until its
+    # response is flushed. Mixed batches keep their surviving compute requests.
+    executor.expected_num_active_requests = len(executor.active_requests)
+    executor.max_num_active_requests = len(executor.active_requests)
     executor.max_total_draft_tokens = 0
     executor._should_skip_dummy_for_benchmark_disagg = MagicMock(return_value=False)
     executor._count_schedulable_active_requests = MagicMock(return_value=0)
@@ -1455,7 +1475,8 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
 
     def finalize(can_queue: bool) -> None:
         assert can_queue
-        assert batch.batch_size == 1
+        assert batch.batch_size == (2 if mixed_batch else 1)
+        assert all(not req.is_finished for req in batch.all_requests())
         assert queue_checks == 1
         raise RecoveryComplete
 
@@ -1516,8 +1537,22 @@ def test_prefix_load_recovery_lifetime(outcome: str, overlap: bool) -> None:
             assert not manager.has_pending_transfers(7)
             if outcome == "cancel":
                 executor._terminate_request.assert_called_once_with(request)
-                assert not batch.context_requests
-                assert batch.generation_requests[0].is_dummy_request
+                output = manager.scheduler.build_connector_meta.call_args.args[0]
+                if not is_async or not mixed_batch:
+                    assert not output.prefix_loads
+                if mixed_batch:
+                    assert batch.context_requests == [context]
+                    assert batch.generation_requests == [generation]
+                    assert {
+                        req.request_id for req in output.new_requests + output.cached_requests
+                    } == {8, 9}
+                    # Surviving pages were allocated before the completion poll.
+                    executor.resource_manager.prepare_resources.assert_called_once_with(batch)
+                else:
+                    assert not batch.context_requests
+                    assert not output.new_requests
+                    assert not output.cached_requests
+                    assert batch.generation_requests[0].is_dummy_request
                 executor._enqueue_responses.assert_called_once()
                 assert executor._enqueue_responses.call_args.args[0][0][0] == 7
                 assert not executor._pending_response_terminations

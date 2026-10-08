@@ -4147,27 +4147,40 @@ class PyExecutor:
             if error is None:
                 try:
                     self._kv_connector_terminate_requests(synchronize=False)
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-            if waiting and error is None:
-                try:
-                    scheduled_batch.reset_context_requests([
-                        req for req in loading_context
-                        if req.state == LlmRequestState.CONTEXT_INIT
-                    ])
-                    if (scheduled_batch.batch_size == 0
-                            and all(req.is_finished
-                                    for req in loading_context)):
-                        # Canceled loads drain without becoming runnable. Their
-                        # released slots can now host the collective dummy.
-                        self._pad_empty_attention_dp_batch(scheduled_batch)
-                        if scheduled_batch.batch_size:
-                            self.resource_manager.prepare_resources(
-                                scheduled_batch, publish_connector_output=False)
-                    waiting = scheduled_batch.batch_size == 0
-                    if not waiting:
-                        # Publish the first compute plan for restored contexts
-                        # without allocating their V2 pages a second time.
+                    # Synchronous prefix loads remain in the prepared batch.
+                    # Completion can cancel them, so remove them before the
+                    # status vote flushes responses and frees their KV pages.
+                    batch_changed = any(
+                        req.is_finished
+                        for req in scheduled_batch.context_requests)
+                    if batch_changed:
+                        scheduled_batch.reset_context_requests([
+                            req for req in scheduled_batch.context_requests
+                            if not req.is_finished
+                        ])
+                    waiting = bool(loading_context
+                                   and scheduled_batch.batch_size == 0)
+                    if waiting:
+                        scheduled_batch.reset_context_requests([
+                            req for req in loading_context
+                            if req.state == LlmRequestState.CONTEXT_INIT
+                        ])
+                        if (scheduled_batch.batch_size == 0
+                                and all(req.is_finished
+                                        for req in loading_context)):
+                            # Response flushing in the status vote may need to
+                            # release a canceled load's slot before padding can
+                            # succeed on the next iteration.
+                            self._pad_empty_attention_dp_batch(scheduled_batch)
+                            if scheduled_batch.batch_size:
+                                self.resource_manager.prepare_resources(
+                                    scheduled_batch,
+                                    publish_connector_output=False)
+                        waiting = scheduled_batch.batch_size == 0
+                        batch_changed = not waiting
+                    if batch_changed and not waiting:
+                        # Replace the compute plan after cancellation or restore
+                        # without allocating surviving contexts' pages again.
                         self.kv_connector_manager.build_scheduler_output(
                             scheduled_batch, self.kv_cache_manager)
                         self.kv_connector_manager.handle_metadata()
