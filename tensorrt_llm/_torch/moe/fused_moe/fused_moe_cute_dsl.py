@@ -1072,7 +1072,9 @@ class CuteDslFusedMoE(MoEImplBase):
         return x, x_sf
 
     def quantize_input_async(
-        self, x: torch.Tensor
+        self,
+        x: torch.Tensor,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[torch.cuda.Event]]:
         """Quantize ``x`` on the MoE aux stream so it overlaps top-k and ``moe_sort``.
@@ -1085,11 +1087,14 @@ class CuteDslFusedMoE(MoEImplBase):
         the first kernel that reads ``x``/``x_sf`` (``run_moe_nvfp4_impl``,
         after ``moe_sort``). Falls back to the synchronous ``quantize_input``
         (event ``None``) when disabled, not NVFP4, already quantized, or no aux
-        stream is available.
+        stream is available. The stream running the quantization joins
+        ``input_ready_event`` (``x`` written on another stream).
         """
         if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
                 or isinstance(x, Fp4QuantizedTensor)
                 or not self._has_moe_output_memset_aux_stream()):
+            if input_ready_event is not None:
+                input_ready_event.wait()
             x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
             return x_q, x_sf, None
         main_stream = torch.cuda.current_stream()
@@ -1098,6 +1103,8 @@ class CuteDslFusedMoE(MoEImplBase):
         x.record_stream(aux_stream)
         with torch.cuda.stream(aux_stream):
             self.event_dict[EventType.Main].wait()
+            if input_ready_event is not None:
+                input_ready_event.wait()
             x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
             self._x_quant_event.record()
         x_q.record_stream(main_stream)
