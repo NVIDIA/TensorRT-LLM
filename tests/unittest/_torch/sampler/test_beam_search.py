@@ -2701,3 +2701,125 @@ class TestParameterValidation:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_update_requests_reparents_intermediate_tokens():
+    """Test TorchSampler.update_requests correctly reparents tokens for mid-flight steps."""
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler import (
+        SampleStateTensors,
+        SampleStateTensorsHostTorch,
+        SampleStateTorch,
+    )
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
+
+    test_params = GeneralTestParams()
+    # Ensure beam search is used
+    test_params.beam_width = 2
+    test_params.max_beam_width = 3
+    test_params.seq_slot = 0
+    request = create_default_request(test_params)
+    sampler = create_default_sampler(test_params)
+
+    # We are in step 2: there are 2 existing generated tokens.
+    request.py_decoding_iter = 2
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+
+    # Pre-populate tokens.
+    # Beam 0 path so far: [100, 101]
+    # Beam 1 path so far: [200, 201]
+    prompt_len = request.py_prompt_len
+    # clear initial tokens setup by create_default_request
+    request.set_generated_tokens([[100, 101], [200, 201]])
+
+    # Predecessor beams simulate a beam swap. Beam 0 reparents to previous beam 1, and Beam 1 to previous beam 0.
+    # Note that py_seq_slot is 0 for our request.
+    predecessor_beams_host = torch.zeros(
+        (test_params.max_batch_size, test_params.max_beam_width), dtype=torch.int32
+    )
+    predecessor_beams_host[0, :2] = torch.tensor([1, 0], dtype=torch.int32)
+
+    # New tokens for the current step.
+    # shape [step, seq_slot, beam] -> [1, max_batch_size, max_beam_width]
+    new_tokens_host = torch.zeros(
+        (1, test_params.max_batch_size, test_params.max_beam_width), dtype=torch.int32
+    )
+    new_tokens_host[0, 0, :2] = torch.tensor([102, 202], dtype=torch.int32)
+
+    # Provide values that keep the request active
+    first_finish_reasons = torch.zeros(
+        (test_params.max_batch_size, test_params.max_beam_width), dtype=torch.int32
+    )
+    beam_history_builders = [None] * test_params.max_batch_size
+
+    # Setup the sample state
+    host_state = SampleStateTensorsHostTorch(
+        new_tokens=new_tokens_host,
+        finish_reasons=None,
+        first_finish_reasons=first_finish_reasons,
+        predecessor_beams=predecessor_beams_host,
+        logprobs_state=None,
+        single_step_greedy=False,
+    )
+    state = SampleStateTorch(
+        requests=[request],
+        device=SampleStateTensors(
+            new_tokens=new_tokens_host
+        ),  # Not really used in update_requests Python loop
+        host=host_state,
+        sampler_event=None,
+        sample_type=SampleType.FULL,
+        beam_history_builders=beam_history_builders,
+    )
+
+    sampler.update_requests(state)
+
+    # Check that tokens were reparented
+    # Beam 0 should have parent 1 ([200, 201]) + 102 -> [200, 201, 102]
+    # Beam 1 should have parent 0 ([100, 101]) + 202 -> [100, 101, 202]
+    gen_tokens = request.get_tokens()
+
+    assert gen_tokens[0][prompt_len:] == [200, 201, 102]
+    assert gen_tokens[1][prompt_len:] == [100, 101, 202]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_sample_async_predecessor_beams_host_copy():
+    """Verify that sample_async correctly propagates predecessor_beams to the host."""
+    test_params = GeneralTestParams()
+    test_params.beam_width = 2
+    test_params.max_beam_width = 3
+    test_params.seq_slot = 0
+    request = create_default_request(test_params)
+    sampler = create_default_sampler(test_params)
+
+    # Setup the sampler step so that internal buffers are prepared
+    from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import ScheduledRequests
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_last_chunk = [request]
+    sampler.setup_sampler_step(scheduled_requests)
+
+    beam_search_store = sampler.store.beam_search_store
+    assert beam_search_store is not None
+
+    # Provide fake logits using deterministic values to force a nontrivial predecessor selection
+    torch.manual_seed(42)
+    logits = torch.randn(
+        (1, test_params.vocab_size),
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    # sample_async should update beam_search_store and D2H copy the predecessor_beams
+    state = sampler.sample_async(
+        scheduled_requests=scheduled_requests,
+        model_outputs={"logits": logits},
+        num_context_logits_prefix_sum=[0]
+    )
+
+    if state.sampler_event:
+        state.sampler_event.synchronize()
+
+    assert state.host.predecessor_beams is not None
+    # Compare the host copy with the tensor's post-sampling device value
+    torch.testing.assert_close(state.host.predecessor_beams, beam_search_store.predecessor_beams.cpu())
