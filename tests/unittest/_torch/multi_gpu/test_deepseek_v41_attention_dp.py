@@ -21,6 +21,7 @@ from _torch.moe.test_deepseek_v41_parallel_moe import (
 )
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
@@ -286,6 +287,7 @@ def _run_rank(world_size: int, num_heads: int) -> bool:
     return True
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize(
     "world_size,num_heads",
     [
