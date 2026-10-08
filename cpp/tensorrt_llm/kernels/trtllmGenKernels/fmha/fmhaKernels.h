@@ -19,18 +19,27 @@
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <functional>
+#include <initializer_list>
 #include <limits>
 #include <linux/limits.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <sstream>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
@@ -38,6 +47,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
+#include "tensorrt_llm/kernels/trtllmGenKernels/fmha/fmhaJitWarmup.h"
 
 #include "cubin/kernelMetaInfo.h"
 #include "fmhaReduction.h"
@@ -102,6 +112,100 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM)
 
     return gpuSM == kernelSM;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Serializes every call into the prebuilt trtllm-gen FMHA export library
+// (libTrtLlmGenFmhaLib.a). The library caches NVRTC-compiled kernels in an
+// unsynchronized, file-scope global LRU cache (fmha::kernelCache); even cache
+// hits mutate the LRU list, so FmhaInterface::generateAndCompileKernel() and
+// FmhaInterface::run() must never execute concurrently. Every call site in
+// this file must hold this mutex. Intentionally leaked: a background warmup
+// sweep may still take it during process teardown (see fmhaJitWarmup.h).
+inline std::mutex& getFmhaInterfaceMutex()
+{
+    static auto* const sMutex = new std::mutex();
+    return *sMutex;
+}
+
+// Serializes kernel selection (FmhaAutoTuner::selectKernel and
+// fmha::computeNumCtas). The selection path queries CUDA occupancy through a
+// shared dummy kernel (fmha::emulatedFmhaKernel in FmhaAutoTuner.cu.o) whose
+// function attribute it mutates first (cudaFuncSetAttribute followed by
+// cudaOccupancyMaxPotentialClusterSize / cudaOccupancyMaxActiveClusters in
+// FmhaAutoTuner::getMaxNumActiveClusters). Two threads interleaving
+// set-attribute + occupancy-query on that shared handle can read each other's
+// smem sizes and select different kernel variants (headDimPerCtaV /
+// CGA-reduction / tile decisions) for identical inputs — observed as the
+// background warmup sweep compiling a different KernelKey set than foreground
+// traffic derives. Selection is microseconds-fast; this lock is never held
+// while getFmhaInterfaceMutex() is taken. Intentionally leaked, like the
+// interface mutex.
+inline std::mutex& getFmhaSelectionMutex()
+{
+    static auto* const sMutex = new std::mutex();
+    return *sMutex;
+}
+
+// Whether the TRTLLM-Gen FMHA JIT warmup grid is compiled on a background
+// thread (TRTLLM_GEN_FMHA_ASYNC_WARMUP=1) instead of synchronously inside the
+// first warmup forward pass.
+inline bool asyncJITWarmupEnabled()
+{
+    static bool const sEnabled = []()
+    {
+        char const* env = std::getenv("TRTLLM_GEN_FMHA_ASYNC_WARMUP");
+        return env != nullptr && env[0] == '1' && env[1] == '\0';
+    }();
+    return sEnabled;
+}
+
+// Whether getAsyncJITWarmupWorker() has created the process-wide worker. Lets
+// drain paths (the pre-capture barrier, kernel destruction) skip the worker
+// entirely when no sweep was ever queued, instead of creating one just to
+// find it idle.
+inline std::atomic<bool>& asyncJITWarmupWorkerCreated()
+{
+    static std::atomic<bool> sCreated{false};
+    return sCreated;
+}
+
+// Process-wide worker for the background JIT warmup sweeps. See
+// fmhaJitWarmup.h for the lifetime and shutdown-ordering contract. Every
+// dependency a queued sweep reads is either leaked (the registry, the
+// interface and selection mutexes, the install path) or constructed at library
+// load (the export library's globals), and kernel objects drain the worker in
+// their destructor, so it does not matter which path creates the worker first.
+inline TllmGenFmhaAsyncWarmupWorker& getAsyncJITWarmupWorker()
+{
+    static TllmGenFmhaAsyncWarmupWorker* const sWorker = []()
+    {
+        auto* worker = new TllmGenFmhaAsyncWarmupWorker(
+            []()
+            {
+                // Relaxed capture mode: CUDA calls made by the worker thread (NVRTC module
+                // loads) must neither fail nor invalidate a CUDA graph capture that the
+                // forward-pass thread may have in progress. Module loads never touch a
+                // capturing stream. This is the same pattern NCCL/cuDNN use for lazy
+                // module loading from helper threads.
+                cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+                if (cudaThreadExchangeStreamCaptureMode(&mode) != cudaSuccess)
+                {
+                    TLLM_LOG_WARNING(
+                        "TRTLLM-Gen FMHA async JIT warmup: failed to set relaxed stream-capture mode; "
+                        "run() will drain this worker before any CUDA graph capture.");
+                }
+            });
+        // Drains and joins the worker at process exit so no sweep is still running
+        // during static destruction. The object itself is intentionally leaked.
+        std::atexit([]() { getAsyncJITWarmupWorker().shutdown(); });
+        asyncJITWarmupWorkerCreated().store(true, std::memory_order_release);
+        return worker;
+    }();
+    return *sWorker;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline void checkTrtllmSkipCorrThreshold(fmha::FmhaOptions const& options, float skipCorrThreshold)
 {
@@ -174,6 +278,21 @@ public:
         , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
     {
     }
+
+    ~TllmGenFmhaKernel()
+    {
+        // A queued background warmup task captures `this`, so no such task may
+        // outlive this object: wait for it here, whether this object dies while
+        // the process keeps running or during static destruction (the worker and
+        // everything a sweep reads are leaked, so waiting is safe either way).
+        if (asyncJITWarmupEnabled() && asyncJITWarmupWorkerCreated().load(std::memory_order_acquire))
+        {
+            getAsyncJITWarmupWorker().drain();
+        }
+    }
+
+    TllmGenFmhaKernel(TllmGenFmhaKernel const&) = delete;
+    TllmGenFmhaKernel& operator=(TllmGenFmhaKernel const&) = delete;
 
     void loadKernels()
     {
@@ -322,7 +441,7 @@ public:
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
-        computeNumCtas(options, params.mMultiProcessorCount);
+        computeNumCtasSerialized(options, params.mMultiProcessorCount);
 
         if (shouldUseNvrtc(options))
         {
@@ -416,7 +535,7 @@ private:
         updateFmhaOptions(options, optionsFromArgs);
         checkTrtllmSkipCorrThreshold(options, params.mSkipCorrThreshold);
 
-        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtasSerialized(options, params.mMultiProcessorCount);
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
 
         if (shouldUseNvrtc(options))
@@ -427,11 +546,14 @@ private:
             populateJsonConfig(options, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
+            // Serialize with the foreground run() path: the export library caches
+            // compiled kernels in an unsynchronized global LRU cache.
+            std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
             fmhaConfig.mExecPath = getExecPath().c_str();
             fmhaConfig.mCtaDim = ctaDim;
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
-            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
@@ -439,6 +561,164 @@ private:
                 auto const& kernelName = fmhaConfig.mFunctionName;
                 TLLM_LOG_INFO("JIT Warmup: Warmup for %s took %.3f ms", kernelName.c_str(), compileElapsedMs);
             }
+        }
+    }
+
+    // The set of kernels a warmup sweep compiles only depends on this kernel
+    // instance (dtypes/SM/sage), the current device (modules load into the
+    // calling device's CUDA context), and the scalar runner params hashed
+    // below, not on the calling layer. Every attention layer with the same configuration
+    // requests an identical sweep during the warmup forward, and (with eagle3
+    // one-model speculative decoding) the target layers and the draft layers
+    // request sweeps that differ only in the spec-decoding fields.
+    uint64_t jitWarmupFingerprint(RunnerParams const& params) const
+    {
+        auto combine = [](uint64_t seed, uint64_t value)
+        { return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2)); };
+        uint32_t skipSoftmaxBits = 0;
+        static_assert(
+            sizeof(skipSoftmaxBits) == sizeof(params.mSkipSoftmaxThresholdScaleFactor), "expect 32-bit float");
+        std::memcpy(&skipSoftmaxBits, &params.mSkipSoftmaxThresholdScaleFactor, sizeof(skipSoftmaxBits));
+        uint32_t scaleQBits = 0;
+        std::memcpy(&scaleQBits, &params.mScaleQ, sizeof(scaleQBits));
+        uint64_t fingerprint = 0;
+        // Include the current device: compiled modules are loaded into the calling
+        // device's CUDA context, so an identical configuration on another device
+        // still needs its own sweep. Warmup requests always run with the target
+        // device current.
+        for (uint64_t value :
+            std::initializer_list<uint64_t>{static_cast<uint64_t>(tensorrt_llm::common::getDevice()),
+                static_cast<uint64_t>(mSM), static_cast<uint64_t>(mDtypeQ), static_cast<uint64_t>(mDtypeK),
+                static_cast<uint64_t>(mDtypeV), static_cast<uint64_t>(mDtypeOut),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkQ), static_cast<uint64_t>(mNumEltsPerSageAttnBlkK),
+                static_cast<uint64_t>(mNumEltsPerSageAttnBlkP), static_cast<uint64_t>(mNumEltsPerSageAttnBlkV),
+                static_cast<uint64_t>(params.mQkvLayout), static_cast<uint64_t>(params.mMaskType),
+                static_cast<uint64_t>(params.mKernelType), static_cast<uint64_t>(params.mTileScheduler),
+                static_cast<uint64_t>(params.mMultiCtasKvMode), static_cast<uint64_t>(params.mUseBlockSparseAttention),
+                static_cast<uint64_t>(params.mHeadDimQk), static_cast<uint64_t>(params.mHeadDimV),
+                static_cast<uint64_t>(params.mNumHeadsQ), static_cast<uint64_t>(params.mNumHeadsKv),
+                static_cast<uint64_t>(params.mNumHeadsQPerKv), static_cast<uint64_t>(params.mMaxSeqLenQ),
+                static_cast<uint64_t>(params.mUseGenKernelForPrefill),
+                static_cast<uint64_t>(params.mJITWarmupMaxNumRequests),
+                static_cast<uint64_t>(params.mJITWarmupMaxSeqLenQ), static_cast<uint64_t>(params.mJITWarmupMaxSeqLenKv),
+                static_cast<uint64_t>(params.mAttentionWindowSize), static_cast<uint64_t>(params.mChunkedAttentionSize),
+                static_cast<uint64_t>(params.mMaxNumPagesPerSeqKv), static_cast<uint64_t>(params.mNumTokensPerPage),
+                static_cast<uint64_t>(params.mNumPagesInMemPool), static_cast<uint64_t>(params.mMultiProcessorCount),
+                static_cast<uint64_t>(skipSoftmaxBits), static_cast<uint64_t>(scaleQBits),
+                static_cast<uint64_t>(params.mSparseAttention), static_cast<uint64_t>(params.mSparseTopK),
+                static_cast<uint64_t>(params.mIsSpecDecTree),
+                static_cast<uint64_t>(params.mSpecDecodingTargetMaxGenLen)})
+        {
+            fingerprint = combine(fingerprint, value);
+        }
+        return fingerprint;
+    }
+
+    using JITWarmupRegistry = TllmGenFmhaJitWarmupRegistry<RunnerParams, TllmGenFmhaKernel>;
+
+    // Process-wide; intentionally leaked (heap-allocated, never destroyed) so a
+    // background sweep can touch it at any point during process teardown.
+    static JITWarmupRegistry& getJITWarmupRegistry()
+    {
+        static auto* const sRegistry = new JITWarmupRegistry();
+        return *sRegistry;
+    }
+
+    // Tally of the export library's kernel-cache results (one per
+    // generateAndCompileKernel() call). Intentionally leaked.
+    static TllmGenFmhaJitCompileStats& getJITCompileStats()
+    {
+        static auto* const sStats = new TllmGenFmhaJitCompileStats();
+        return *sStats;
+    }
+
+    static void recordJITCacheResult(FmhaInterface::KernelCacheStatus status)
+    {
+        using CacheResult = TllmGenFmhaJitCompileStats::CacheResult;
+        CacheResult result = CacheResult::kUnknown;
+        if (status == FmhaInterface::KernelCacheStatus::CacheHit)
+        {
+            result = CacheResult::kHit;
+        }
+        else if (status == FmhaInterface::KernelCacheStatus::CacheMiss)
+        {
+            result = CacheResult::kMiss;
+        }
+        getJITCompileStats().record(result);
+    }
+
+    // Registers a warmup sweep for this kernel object on the current device;
+    // returns true if an identical sweep was already registered.
+    bool tryRegisterJITWarmupConfig(RunnerParams const& params, JITWarmupState initialState)
+    {
+        return getJITWarmupRegistry().tryRegister(
+            jitWarmupFingerprint(params), params, initialState, tensorrt_llm::common::getDevice(), this);
+    }
+
+    static void markJITWarmupBackgroundDone(uint64_t fingerprint)
+    {
+        getJITWarmupRegistry().markBackgroundDone(fingerprint);
+    }
+
+    // Re-runs a finished background sweep on the calling thread. A cache-hit loop
+    // (milliseconds) when the background pass compiled exactly the keys the
+    // foreground derivation produces; anything it missed, or a sweep whose
+    // background task failed, is compiled here and shows up as "JIT Warmup:
+    // Warmup for ... took ..." log lines inside the verify window.
+    void verifyJITWarmupSweep(JITWarmupRegistry::PendingSweep const& sweep)
+    {
+        TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass started (fingerprint=%llx).",
+            static_cast<unsigned long long>(sweep.mFingerprint));
+        runJITWarmupGrid(sweep.mParams);
+        TLLM_LOG_INFO("TRTLLM-Gen FMHA JIT warmup: foreground verify pass finished (fingerprint=%llx).",
+            static_cast<unsigned long long>(sweep.mFingerprint));
+    }
+
+    // Foreground verify pass (async mode only): the first eager (non-capturing,
+    // non-warmup) NVRTC-path run() re-runs the sweeps this kernel object
+    // scheduled on the current device. drainAndVerifyAllJITWarmups() normally
+    // gets there first; this is the fallback for callers that never invoke it.
+    void maybeRunJITWarmupVerifyPass(RunnerParams const& liveParams)
+    {
+        if (getJITWarmupRegistry().numUnverified() == 0 || liveParams.mJITWarmup)
+        {
+            return;
+        }
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(liveParams.stream, &captureStatus));
+        if (captureStatus != cudaStreamCaptureStatusNone)
+        {
+            return;
+        }
+        // Only sweeps this kernel object scheduled on the current device: the
+        // sweep re-runs through this object's kernel table and loads modules into
+        // the current device's context.
+        int const currentDevice = tensorrt_llm::common::getDevice();
+        while (auto sweep = getJITWarmupRegistry().claimUnverified(currentDevice, this))
+        {
+            verifyJITWarmupSweep(*sweep);
+        }
+    }
+
+    // If CUDA graphs are being captured on this stream while the background JIT
+    // warmup thread still has work queued, wait for it to finish. The worker
+    // thread runs in the relaxed capture mode so its module loads cannot
+    // invalidate an ongoing capture, but draining here additionally guarantees
+    // that every launch captured into a graph resolves against a fully
+    // populated kernel cache.
+    void maybeWaitForAsyncJITWarmup(cudaStream_t stream) const
+    {
+        if (!asyncJITWarmupEnabled() || !asyncJITWarmupWorkerCreated().load(std::memory_order_acquire)
+            || getAsyncJITWarmupWorker().numPendingTasks() == 0)
+        {
+            return;
+        }
+        cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &captureStatus));
+        if (captureStatus != cudaStreamCaptureStatusNone)
+        {
+            TLLM_LOG_INFO("TRTLLM-Gen FMHA: draining background JIT warmup before capturing CUDA graphs.");
+            getAsyncJITWarmupWorker().drain();
         }
     }
 
@@ -464,6 +744,68 @@ private:
             maxBatchSize, maxSeqLenKv, useGenKernelForPrefill, maxSeqLenQ);
         TLLM_CHECK_WITH_INFO(maxBatchSize > 0 && maxSeqLenKv > 0 && (!useGenKernelForPrefill || maxSeqLenQ > 0),
             "TRTLLM-Gen Fmha Warmup Param is invalid.");
+
+        // Deduplicate identical sweeps: every layer of the warmup forward requests
+        // the same grid, and only the first request per distinct configuration
+        // compiles anything (the rest would be pure cache-hit loops).
+        // Snapshot the runner params: the warmup sweep only reads scalar fields
+        // and never dereferences device pointers or the stream.
+        auto warmupParams = runnerParams;
+        warmupParams.stream = nullptr;
+        if (tryRegisterJITWarmupConfig(
+                warmupParams, asyncJITWarmupEnabled() ? JITWarmupState::kScheduled : JITWarmupState::kVerified))
+        {
+            return;
+        }
+
+        if (asyncJITWarmupEnabled())
+        {
+            uint64_t const fingerprint = jitWarmupFingerprint(warmupParams);
+            int const deviceId = tensorrt_llm::common::getDevice();
+            TLLM_LOG_INFO(
+                "TRTLLM-Gen FMHA JIT warmup: scheduling background compilation of the generation-kernel grid "
+                "(device=%d, maxBatchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d, fingerprint=%llx).",
+                deviceId, maxBatchSize, maxSeqLenQ, maxSeqLenKv, static_cast<unsigned long long>(fingerprint));
+            bool const queued = getAsyncJITWarmupWorker().enqueue(
+                [this, warmupParams, deviceId, fingerprint]()
+                {
+                    try
+                    {
+                        TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+                        runJITWarmupGrid(warmupParams);
+                    }
+                    catch (...)
+                    {
+                        // Mark done even on failure so the fingerprint is not stranded in
+                        // kScheduled: the foreground verify pass then re-runs this sweep
+                        // and compiles whatever the background pass did not finish,
+                        // instead of dedupe silently suppressing it forever.
+                        markJITWarmupBackgroundDone(fingerprint);
+                        throw;
+                    }
+                    markJITWarmupBackgroundDone(fingerprint);
+                    TLLM_LOG_INFO(
+                        "TRTLLM-Gen FMHA JIT warmup: background compilation of the generation-kernel grid "
+                        "finished (fingerprint=%llx).",
+                        static_cast<unsigned long long>(fingerprint));
+                });
+            if (!queued)
+            {
+                runJITWarmupGrid(runnerParams);
+                markJITWarmupBackgroundDone(fingerprint);
+            }
+            return;
+        }
+
+        runJITWarmupGrid(runnerParams);
+    }
+
+    void runJITWarmupGrid(RunnerParams const& runnerParams)
+    {
+        bool const useGenKernelForPrefill = runnerParams.mUseGenKernelForPrefill;
+        int const maxBatchSize = runnerParams.mJITWarmupMaxNumRequests;
+        int const maxSeqLenQ = runnerParams.mJITWarmupMaxSeqLenQ;
+        int const maxSeqLenKv = runnerParams.mJITWarmupMaxSeqLenKv;
 
         std::vector<int> batchSizeCandidates
             = makeWarmupCandidateSizes(kDefaultWarmupBatchSizeCandidates, maxBatchSize);
@@ -503,6 +845,60 @@ private:
     }
 
 public:
+    // Pre-capture / pre-readiness barrier (called from ModelEngine.warmup between
+    // the graph-shape warmup pass and graph capture): waits for every queued
+    // background sweep, then re-runs each finished-but-unverified sweep on the
+    // calling thread through the kernel object and device that scheduled it.
+    // Must be called with no CUDA graph capture in progress. Returns the number of
+    // sweeps verified here. A no-op unless async warmup is enabled.
+    static int64_t drainAndVerifyAllJITWarmups()
+    {
+        if (!asyncJITWarmupEnabled())
+        {
+            return 0;
+        }
+        if (asyncJITWarmupWorkerCreated().load(std::memory_order_acquire))
+        {
+            getAsyncJITWarmupWorker().drain();
+        }
+
+        struct RestoreDevice
+        {
+            int mDevice{tensorrt_llm::common::getDevice()};
+
+            ~RestoreDevice()
+            {
+                cudaSetDevice(mDevice);
+            }
+        } restoreDevice;
+
+        int64_t numVerified = 0;
+        while (auto sweep = getJITWarmupRegistry().claimAnyUnverified())
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(sweep->mDeviceId));
+            sweep->mInstance->verifyJITWarmupSweep(*sweep);
+            ++numVerified;
+        }
+        return numVerified;
+    }
+
+    // Number of kernel-cache misses, i.e. NVRTC compiles, reported by the export
+    // library in this process. A value that is stable across the first request
+    // after readiness proves no request-time JIT; the same key compiled again
+    // after an LRU eviction counts again.
+    static int64_t numJITCacheMisses()
+    {
+        return getJITCompileStats().numMisses();
+    }
+
+    // Number of generateAndCompileKernel() calls whose cache result the export
+    // library did not report. Non-zero means the miss count is not a complete
+    // measure of compilation.
+    static int64_t numJITUnknownCacheResults()
+    {
+        return getJITCompileStats().numUnknown();
+    }
+
     void run(RunnerParams const& params)
     {
         if (params.mMaxSeqLenQ == 0 || params.mBatchSize == 0
@@ -556,7 +952,7 @@ public:
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
-        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtasSerialized(options, params.mMultiProcessorCount);
 
         // Set the launch grid size.
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
@@ -580,6 +976,14 @@ public:
 
         if (shouldUseNvrtc(options))
         {
+            // If a CUDA graph capture is starting on this stream, make sure the
+            // background JIT warmup finished before capturing any FMHA launch.
+            maybeWaitForAsyncJITWarmup(params.stream);
+            // Re-run finished background sweeps once on the foreground thread
+            // (cache-hit loop when the background keys match; compiles any gap
+            // here, pre-readiness, instead of on the first real requests).
+            maybeRunJITWarmupVerifyPass(params);
+
             // nvrtc path - uses mFmhaInterface member for kernel caching
             FmhaOptions nvrtcOptions = options;
 #ifdef TLLM_RUBIN_FEATURES
@@ -596,11 +1000,14 @@ public:
             populateJsonConfig(nvrtcOptions, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
+            // Serialize with the async JIT warmup thread: the export library caches
+            // compiled kernels in an unsynchronized global LRU cache.
+            std::lock_guard<std::mutex> interfaceLock(getFmhaInterfaceMutex());
             fmhaConfig.mExecPath = getExecPath().c_str();
             fmhaConfig.mCtaDim = ctaDim;
             fmhaConfig.mGrid = grid;
             auto const compileStart = std::chrono::steady_clock::now();
-            mFmhaInterface.generateAndCompileKernel(fmhaConfig);
+            recordJITCacheResult(mFmhaInterface.generateAndCompileKernel(fmhaConfig));
             auto const compileElapsed = std::chrono::steady_clock::now() - compileStart;
             auto const compileElapsedMs = std::chrono::duration<double, std::milli>(compileElapsed).count();
             if (compileElapsedMs > 1000.0) // FIXME: Change to return cache status from FmhaInterface
@@ -610,6 +1017,24 @@ public:
                     "Possible JIT Cache Missing: TRTLLM-Gen FMHA generateAndCompileKernel took %.3f ms, kernelName=%s, "
                     "batchSize=%d, maxSeqLenQ=%d, maxSeqLenKv=%d. This could affect performance measurement.",
                     compileElapsedMs, kernelName.c_str(), params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv);
+                // Dump the kernel-selection options so a cache miss can be diffed
+                // against what the warmup sweep compiled for the same kernel name.
+                TLLM_LOG_WARNING(
+                    "JIT cache miss options: maskType=%d, kernelType=%d, tileScheduler=%d, multiCtasKvMode=%d, "
+                    "headDimPerCtaV=%d, tileSizeQ=%d, tileSizeKv=%d, numTokensPerPage=%d, numHeadsQ=%d, "
+                    "numHeadsKv=%d, numHeadsQPerKv=%d, numSpecDecodingTokens=%d, specDecodingTargetMaxGenLen=%d, "
+                    "isCausalSpecDecodingGen=%d, isCustomSpecDecodingGen=%d, attentionWindowSize=%d, "
+                    "chunkedAttentionSize=%d, sparseType=%d, skipsSoftmax=%d, clusterDimX=%d, reuseSmemKForV=%d, "
+                    "numInstsQ=%d, numInstsKv=%d",
+                    static_cast<int>(options.mMaskType), static_cast<int>(options.mFmhaKernelType),
+                    static_cast<int>(options.mTileScheduler), static_cast<int>(options.mMultiCtasKvMode),
+                    options.mHeadDimPerCtaV, options.mTileSizeQ, options.mTileSizeKv, options.mNumTokensPerPage,
+                    options.mNumHeadsQ, options.mNumHeadsKv, options.mNumHeadsQPerKv, options.mNumSpecDecodingTokens,
+                    options.mSpecDecodingTargetMaxGenLen, static_cast<int>(options.mIsCausalSpecDecodingGen),
+                    static_cast<int>(options.mIsCustomSpecDecodingGen), options.mAttentionWindowSize,
+                    options.mChunkedAttentionSize, static_cast<int>(options.mSparseType),
+                    static_cast<int>(options.mSkipsSoftmaxWhenPossible), options.mClusterDimX,
+                    static_cast<int>(options.mReuseSmemKForV), options.mNumInstsQ, options.mNumInstsKv);
             }
             mFmhaInterface.run(fmhaConfig, fmhaData, params.stream, params.mMultiProcessorCount, 0);
         }
@@ -663,12 +1088,25 @@ public:
     }
 
 private:
+    // computeNumCtas queries cluster occupancy through the same shared dummy kernel that
+    // kernel selection mutates, so it is serialized on the same lock. Never call it while
+    // selectKernelAutotuned() holds the lock (std::mutex is not recursive).
+    std::tuple<int32_t, int32_t, int32_t> computeNumCtasSerialized(
+        FmhaOptions& options, int32_t multiProcessorCount) const
+    {
+        std::lock_guard<std::mutex> selectionLock(getFmhaSelectionMutex());
+        return computeNumCtas(options, multiProcessorCount);
+    }
+
     // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
     // CgaSmemReduction configs where clusterDimX * mMaxNumCtasPerSeqKv must stay <= 16;
     // the pre/post clamps below enforce that. Other architectures keep the legacy path.
     std::tuple<FmhaOptions, FmhaOptionsFromArgs, int32_t> selectKernelAutotuned(
         FmhaOptions options, FmhaOptionsFromArgs optionsFromArgs, int32_t multiProcessorCount) const
     {
+        // Kernel selection mutates and then queries the autotuner's shared dummy kernel; the
+        // background JIT warmup thread runs this same path. See getFmhaSelectionMutex().
+        std::lock_guard<std::mutex> selectionLock(getFmhaSelectionMutex());
         // CGA SMEM reduction cluster limits are Rubin SM107-specific; clamping on SM100/SM103
         // changed autotuner choices without fixing a known failure mode on those GPUs.
         if (mSM != kSM_107)
@@ -840,9 +1278,15 @@ private:
             info);
     }
 
-    std::string const& getExecPath() const
+public:
+    // Install path handed to the export library for NVRTC compilation. Depends on
+    // no instance state. The string is intentionally leaked: a background warmup
+    // sweep may read it at any point up to process exit, whichever path created
+    // the worker (see fmhaJitWarmup.h).
+    static std::string const& getExecPath()
     {
-        static std::string execPathStr;
+        static auto* const execPathPtr = new std::string();
+        std::string& execPathStr = *execPathPtr;
         if (execPathStr.empty())
         {
             // Get build directory relative path from CMake macro
@@ -973,6 +1417,7 @@ private:
         return execPathStr;
     }
 
+private:
     // Prepare pointers for TMA descriptors.
     static std::tuple<void const*, void const*, void const*> getDevicePtrs(
         TllmGenFmhaRunnerParams const& runnerParams, int32_t bitsPerElt)
@@ -1076,7 +1521,7 @@ private:
         fmhaData.mOutputBuffers.partialOPtrD = fmhaData.mOutputBuffers.partialStatsPtrD + partialStatsBufferSize;
         fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD = nullptr; // Not available in params (would need to be added)
         fmhaData.mOutputBuffers.softmaxStatsD = params.softmaxStatsPtr;
-        fmhaData.mOutputBuffers.oDebugPtrD = nullptr;           // Debug output not supported in TensorRT-LLM
+        fmhaData.mOutputBuffers.oDebugPtrD = nullptr; // Debug output not supported in TensorRT-LLM
 
         // Print all primitive type variables in FmhaData for debugging
     }
