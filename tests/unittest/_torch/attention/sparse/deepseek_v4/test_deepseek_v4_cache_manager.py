@@ -466,7 +466,6 @@ def test_descriptor_uses_common_pool_origin_and_layer_relative_bound() -> None:
 def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
     manager = _manager()
     manager._enable_kv_cache_offload = enabled
-    manager._wait_for_sparse_model_work = Mock()
     batch = SimpleNamespace(
         context_requests=[SimpleNamespace(is_first_context_chunk=first, is_last_context_chunk=last)]
     )
@@ -478,6 +477,56 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
         else:
             manager.prepare_resources(batch)
             prepare.assert_called_once_with(batch)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("same_stream", [False, True])
+@pytest.mark.parametrize("has_metadata", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_sparse_publication_orders_model_work_once(
+    direct: bool, same_stream: bool, has_metadata: bool, capture: bool
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = True
+    manager._stream = Mock(cuda_stream=19, device=None)
+    manager._disagg_receive_ready = {}
+    manager.is_draft = False
+    manager.kv_connector_manager = None
+    manager.sparse_metadata_batch = Mock() if has_metadata else None
+    batch = SimpleNamespace(context_requests=[])
+    caller_stream = manager._stream if same_stream else object()
+    operations = []
+    manager._stream.wait_stream.side_effect = lambda stream: operations.append("wait")
+    if has_metadata:
+        manager.sparse_metadata_batch.record_read.side_effect = lambda stream: operations.append(
+            "record_read"
+        )
+        manager.sparse_metadata_batch.publish.side_effect = lambda stream: operations.append(
+            "publish"
+        )
+    publish = (
+        manager._publish_sparse_metadata if direct else lambda: manager.prepare_resources(batch)
+    )
+
+    with (
+        patch("torch.cuda.current_stream", return_value=caller_stream),
+        patch("torch.cuda.is_current_stream_capturing", return_value=capture),
+    ):
+        if capture and has_metadata:
+            with pytest.raises(RuntimeError, match="outside CUDA graph capture"):
+                publish()
+        else:
+            publish()
+
+    expected = []
+    if has_metadata and not capture:
+        expected = ([] if same_stream else ["wait"]) + ["record_read", "publish"]
+        manager.sparse_metadata_batch.record_read.assert_called_once_with(
+            manager._stream.cuda_stream
+        )
+        manager.sparse_metadata_batch.publish.assert_called_once_with(manager._stream.cuda_stream)
+    assert operations == expected
 
 
 @pytest.mark.cpu_only

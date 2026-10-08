@@ -1697,7 +1697,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # length, so only the scheduled request can identify a first chunk
             # that does not complete its prompt. Reject before model writes.
             raise NotImplementedError("Sparse offload does not support chunked prefill")
-        self._wait_for_sparse_model_work()
         super().prepare_resources(scheduled_batch)
 
     @property
@@ -1708,7 +1707,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         if self._enable_kv_cache_offload:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Sparse history updates must run outside CUDA graph capture")
-            self._stream.wait_stream(torch.cuda.current_stream(self._stream.device))
+            caller_stream = torch.cuda.current_stream(self._stream.device)
+            if self._stream != caller_stream:
+                self._stream.wait_stream(caller_stream)
 
     def _validate_sparse_history_policy(self) -> None:
         """Reject history policies unsupported by sparse offload."""
@@ -1785,8 +1786,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         super().release_index_slot(request_id)
 
     def _publish_sparse_metadata(self) -> None:
-        self._wait_for_sparse_model_work()
-        super()._publish_sparse_metadata()
+        if self.sparse_metadata_batch is not None:
+            self._wait_for_sparse_model_work()
+            super()._publish_sparse_metadata()
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests) -> None:
         self._order_sparse_history_update(scheduled_batch.context_requests)
