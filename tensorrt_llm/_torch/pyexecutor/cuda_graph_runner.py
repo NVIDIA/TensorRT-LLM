@@ -44,9 +44,9 @@ _STRICT_BUFFER_CHECK = _strict_buffer_check_enabled()
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # Gen dummies get prompt_len = token_num - 1. Before capturing enc-dec decode
-# graphs, prepare_cross_batch temporarily runs each dummy generation request
-# as a one-token context chunk to write its cross-KV cache, so enc-dec
-# dummies need one prompt token plus one generated token.
+# graphs, EncoderDecoderRunner._prepare_capture_batch temporarily runs each
+# dummy generation request as a one-token context chunk to write its cross-KV
+# cache, so enc-dec dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 
 
@@ -948,14 +948,14 @@ class CUDAGraphRunner:
         would mis-associate every real request with another request's output,
         because three separate consumers hard-code "the generation rows start
         at index 0":
-          * ``ModelEngine._prepare_tp_inputs`` skips the input_ids of
+          * ``DecoderRunner._prepare_tp_inputs`` skips the input_ids of
             CUDA-graph dummies and blits the overlap scheduler's tokens at
             ``input_ids_cuda[num_tokens:...]``, which only lines up with the
             per-row position_ids while every dummy sits after every real row;
           * ``TorchSampler`` reads generation logits as ``raw_logits_cuda[:
             len(generation_requests)]`` (and via request offsets that start at
             zero), against the batch with the padding already stripped;
-          * ``ModelEngine._execute_logit_post_processors`` walks the padded
+          * ``DecoderRunner._execute_logit_post_processors`` walks the padded
             batch with a row offset starting at zero.
         Offsetting all three is a change to the output association, not to
         padding, so it does not belong here.
