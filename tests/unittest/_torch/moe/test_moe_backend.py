@@ -109,7 +109,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     impl_class_for,
     resolve_moe_impl,
 )
-from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
+    ExternalCommMoEScheduler,
+    FusedCommMoEScheduler,
+)
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
@@ -136,6 +139,50 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_fused_comm_scheduler_accepts_singleton_non_dp_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6])
+    )
+
+    assert x_real.shape == x.shape
+    assert router_logits_real.shape == router_logits.shape
+    assert all_rank_num_tokens == [6]
+    assert ep_rank == 0
+    assert not had_meta
+
+
+def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=3, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    x_real, router_logits_real, _, all_rank_num_tokens, ep_rank, had_meta = (
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5, 4, 3])
+    )
+
+    assert x_real.shape[0] == 3
+    assert router_logits_real.shape[0] == 3
+    assert all_rank_num_tokens == [6, 5, 4, 3]
+    assert ep_rank == 3
+    assert had_meta
+
+
+def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
+    mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
+    scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+
+    with pytest.raises(ValueError, match="got 2 counts for EP size 4"):
+        scheduler._strip_adp_padding(x, router_logits, None, [6, 5])
 
 
 def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
