@@ -35,6 +35,7 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..bindings.BuildInfo import check_cuda_architecture_supported
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -172,6 +173,9 @@ class BaseWorker(GenerationExecutor):
                 self.llm_args, "backend"
             ), "llm_args should be with backend in _create_py_executor"
             _ = self._get_comm_ranks_device_id()
+            # Fail before loading the model: missing optimized kernels for this GPU otherwise
+            # surface much later as unrelated errors such as running out of memory.
+            check_cuda_architecture_supported(torch.cuda.current_device())
             if self._backend == "pytorch":
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
