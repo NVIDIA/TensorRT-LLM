@@ -1758,7 +1758,6 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
                 max_beam_width=1,
                 use_mrope=False,
             ),
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             model=SimpleNamespace(
                 model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
             ),

@@ -638,7 +638,6 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             enable_autotuner=self.llm_args.enable_autotuner,
         )
         return runner_cls(
@@ -648,6 +647,7 @@ class PyTorchModelEngine(ModelEngine):
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
             model_caller=self._model_caller,
+            attention_runtime_features=self.attn_runtime_features,
         )
 
     def _initialize_encoder_decoder_runner(
@@ -663,7 +663,6 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             enable_autotuner=self.llm_args.enable_autotuner,
             is_encoder_decoder=True,
         )
@@ -672,9 +671,11 @@ class PyTorchModelEngine(ModelEngine):
             enable_encoder_decoder_mixed_cuda_graph=(
                 self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
         )
-        return self._initialize_decoder_runner(runner_cls,
-                                               runner_config,
-                                               encoder_config=encoder_config)
+        return self._initialize_decoder_runner(
+            runner_cls,
+            runner_config,
+            encoder_config=encoder_config,
+            input_processor=self.input_processor)
 
     def _initialize_no_kv_cache_runner(
             self, runner_cls: Type[NoKVCacheRunner]) -> NoKVCacheRunner:
@@ -688,7 +689,6 @@ class PyTorchModelEngine(ModelEngine):
             prefill_cuda_graph_backend=self.llm_args.prefill_cuda_graph_backend,
             prefill_cuda_graph_num_tokens=self._prefill_cuda_graph_num_tokens,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             mm_encoder_cache_enabled=mm_encoder_cache_enabled(self.model),
         )
         if issubclass(runner_cls, PoolingRunner):
@@ -699,6 +699,7 @@ class PyTorchModelEngine(ModelEngine):
                 dist=self.dist,
                 moe_load_balancer=self.moe_load_balancer,
                 model_caller=self._model_caller,
+                attention_runtime_features=self.attn_runtime_features,
             )
         return runner_cls(
             self.model,
@@ -706,6 +707,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
+            attention_runtime_features=self.attn_runtime_features,
         )
 
     def _decoder_runner_config(
@@ -719,7 +721,6 @@ class PyTorchModelEngine(ModelEngine):
             max_beam_width=self.max_beam_width,
             without_logits=self.without_logits,
             attention_backend=self.attn_backend,
-            attention_runtime_features=self.attn_runtime_features,
             dtype=self.dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
@@ -767,20 +768,18 @@ class PyTorchModelEngine(ModelEngine):
         return runner_cls(
             self.model,
             runner_config,
-            input_processor=self.input_processor,
             model_caller=self._model_caller,
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
             sparse_attention_config=self.sparse_attention_config,
-            torch_compile_backend=self._torch_compile_backend,
+            attention_runtime_features=self.attn_runtime_features,
             get_runtime_tokens_per_gen_step=(
                 self.spec_config.get_runtime_tokens_per_gen_step if
                 self.spec_config is not None else lambda runtime_draft_len: 1),
             warmup_timer=self._warmup_timer,
             iter_states=self.iter_states,
             metrics=self._metrics,
-            kv_cache_manager_key=self.kv_cache_manager_key,
             mm_item_scheduler=self._mm_item_scheduler,
             **runner_kwargs,
         )

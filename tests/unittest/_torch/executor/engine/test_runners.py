@@ -70,7 +70,12 @@ def _make_runner(
         input_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
         position_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
     )
-    kwargs = dict(mapping=SimpleNamespace(), dist=SimpleNamespace(), moe_load_balancer=None)
+    kwargs = dict(
+        mapping=SimpleNamespace(),
+        dist=SimpleNamespace(),
+        moe_load_balancer=None,
+        attention_runtime_features=AttentionRuntimeFeatures(),
+    )
     if issubclass(runner_type, PoolingRunner):
         kwargs["model_caller"] = model_caller or Mock(return_value={"logits": torch.empty(0)})
     with patch.object(InputBuffers, "allocate", return_value=buffers):
@@ -85,7 +90,6 @@ def _config() -> NoKVCacheRunnerConfig:
         max_beam_width=1,
         without_logits=False,
         attention_backend=_AttentionBackend,
-        attention_runtime_features=AttentionRuntimeFeatures(),
         enable_attention_dp=False,
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
         prefill_cuda_graph_num_tokens=[],
@@ -233,6 +237,7 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
         dist=engine.dist,
         moe_load_balancer=engine.moe_load_balancer,
         model_caller=engine._model_caller,
+        attention_runtime_features=engine.attn_runtime_features,
     )
 
 

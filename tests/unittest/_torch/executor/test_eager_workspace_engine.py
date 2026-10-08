@@ -171,10 +171,9 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.warmup = object.__new__(DecoderWarmup)
         self.warmup._eager_workspace_reclaimable = True
-        self.warmup._config = SimpleNamespace(is_spec_decode=False)
+        self.warmup._config = SimpleNamespace(is_spec_decode=False, torch_compile_enabled=False)
         self.warmup.mapping = SimpleNamespace(cp_size=1)
         self.warmup.sparse_attention_config = None
-        self.warmup._torch_compile_backend = None
         self.warmup._graphs = SimpleNamespace(breakable_cuda_graph_runner=None)
         self.metadata = object.__new__(TrtllmAttentionMetadata)
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
@@ -237,7 +236,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.reclaimer_class.assert_not_called()
         for target, name, value in [
             (self.warmup._config, "is_spec_decode", True),
-            (self.warmup, "_torch_compile_backend", object()),
+            (self.warmup._config, "torch_compile_enabled", True),
             (self.warmup._graphs, "breakable_cuda_graph_runner", object()),
             (self.warmup, "sparse_attention_config", object()),
         ]:

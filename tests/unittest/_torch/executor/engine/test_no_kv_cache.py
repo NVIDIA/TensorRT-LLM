@@ -97,7 +97,6 @@ def _prepare(
                 max_beam_width=1,
                 without_logits=False,
                 attention_backend=_AttentionBackend,
-                attention_runtime_features=AttentionRuntimeFeatures(),
                 enable_attention_dp=enable_attention_dp,
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
                 prefill_cuda_graph_num_tokens=[],
@@ -107,6 +106,7 @@ def _prepare(
             dist=dist,
             moe_load_balancer=None,
             model_caller=Mock(),
+            attention_runtime_features=AttentionRuntimeFeatures(),
         )
     monkeypatch.setattr(
         runner,

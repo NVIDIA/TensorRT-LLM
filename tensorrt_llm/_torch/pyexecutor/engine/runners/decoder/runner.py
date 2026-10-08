@@ -10,9 +10,11 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionMetadata,
+    AttentionRuntimeFeatures,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
@@ -37,7 +39,6 @@ from tensorrt_llm._torch.speculative import SpecMetadata, get_draft_kv_cache_man
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.utils import with_model_extra_attrs
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, InputProcessor
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.mapping import Mapping
 
@@ -74,34 +75,30 @@ class DecoderRunner(ScheduledModelRunner):
         model: torch.nn.Module,
         config: DecoderRunnerConfig,
         *,
-        input_processor: InputProcessor | BaseMultimodalInputProcessor,
         model_caller: ModelCaller,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         sparse_attention_config: BaseSparseAttentionConfig | None,
-        torch_compile_backend: Backend | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         warmup_timer: _WarmupTimer,
         iter_states: dict[str, Any],
         metrics: dict[str, float],
-        kv_cache_manager_key: ResourceManagerType,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self.model = model
-        self.input_processor = input_processor
         self._model_caller = model_caller
         self.mapping = mapping
         self.dist = dist
         self._agreement = WarmupAgreement(dist, mapping)
         self.moe_load_balancer = moe_load_balancer
         self.sparse_attention_config = sparse_attention_config
-        self._torch_compile_backend = torch_compile_backend
+        self._attention_runtime_features = attention_runtime_features
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self._warmup_timer = warmup_timer
         self.iter_states = iter_states
         self._metrics = metrics
-        self.kv_cache_manager_key = kv_cache_manager_key
 
         self._config = config
 
@@ -121,7 +118,11 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._buffers = DecoderInputBuffers.for_config(self._config, self.use_beam_search)
         self._metadata = DecoderMetadata(
-            config=self._config, mapping=mapping, model=model, buffers=self._buffers
+            config=self._config,
+            mapping=mapping,
+            model=model,
+            buffers=self._buffers,
+            attention_runtime_features=attention_runtime_features,
         )
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
@@ -133,8 +134,6 @@ class DecoderRunner(ScheduledModelRunner):
             dist=dist,
             model=model,
             sparse_attention_config=sparse_attention_config,
-            torch_compile_backend=torch_compile_backend,
-            kv_cache_manager_key=kv_cache_manager_key,
             warmup_timer=warmup_timer,
             metrics=metrics,
             agreement=self._agreement,
@@ -164,7 +163,6 @@ class DecoderRunner(ScheduledModelRunner):
     def _dummy_requests_kwargs(self) -> dict[str, Any]:
         return dict(
             config=self._config,
-            kv_cache_manager_key=self.kv_cache_manager_key,
             model=self.model,
             get_runtime_tokens_per_gen_step=self.get_runtime_tokens_per_gen_step,
             release_request_state=getattr(self.model, "release_request_state", None),
@@ -199,7 +197,6 @@ class DecoderRunner(ScheduledModelRunner):
             model=self.model,
             sparse_attention_config=self.sparse_attention_config,
             metrics=self._metrics,
-            kv_cache_manager_key=self.kv_cache_manager_key,
             dummy_requests=self._dummy_requests,
             agreement=self._agreement,
             metadata=self._metadata,
@@ -344,7 +341,7 @@ class DecoderRunner(ScheduledModelRunner):
             batch_size=self._config.max_batch_size,
             mapping=self.mapping,
             dist=self.dist,
-            kv_cache_manager_key=self.kv_cache_manager_key,
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             sparse_attention_config=self.sparse_attention_config,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
         )
@@ -408,7 +405,9 @@ class DecoderRunner(ScheduledModelRunner):
         gather_context_logits = forward_inputs.gather_context_logits
         enable_spec_decode = forward_inputs.enable_spec_decode
         runtime_draft_len = forward_inputs.runtime_draft_len
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
         scheduled_requests = self._graphs.attention_dp_execution_batch(scheduled_requests)

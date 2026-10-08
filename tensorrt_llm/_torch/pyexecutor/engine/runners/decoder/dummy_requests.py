@@ -46,13 +46,11 @@ class DummyRequestFactory:
         self,
         *,
         config: DecoderRunnerConfig,
-        kv_cache_manager_key: ResourceManagerType,
         model: torch.nn.Module,
         get_runtime_tokens_per_gen_step: Callable[[int], int],
         release_request_state: Callable[[int], None] | None,
     ) -> None:
         self._config = config
-        self.kv_cache_manager_key = kv_cache_manager_key
         self.model = model
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self._release_request_state = release_request_state
@@ -117,7 +115,9 @@ class DummyRequestFactory:
         Only shrinks or drops sequences, so the block estimate below stays a
         safe over-estimate.
         """
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -297,7 +297,9 @@ class DummyRequestFactory:
         generation requests.
         """
         capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
@@ -400,7 +402,9 @@ class DummyRequestFactory:
         capture_sampling_params: SamplingParams | None,
     ) -> LlmRequest | None:
         """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
         )
@@ -502,7 +506,9 @@ class DummyRequestFactory:
                 self._free_requests(requests, resource_manager)
 
     def _free_requests(self, requests: list[LlmRequest], resource_manager: ResourceManager) -> None:
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return
         draft_kv_cache_manager = get_draft_kv_cache_manager(

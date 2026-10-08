@@ -93,7 +93,6 @@ class EncoderConfigMixin:
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
         is_encoder_decoder: bool,
     ) -> Self:
@@ -194,7 +193,6 @@ class EncoderConfigMixin:
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             cuda_graph_enabled=cuda_graph_enabled,
             cuda_graph_padding_enabled=enable_padding,
@@ -237,7 +235,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
     ) -> Self:
         return super().create(
@@ -250,7 +247,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             is_encoder_decoder=False,
         )
@@ -280,11 +276,13 @@ class EncoderMixin:
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model = model
         self._mapping = mapping
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
+        self._attention_runtime_features = attention_runtime_features
         self._config = cast(RunnerConfig, config)
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
@@ -348,7 +346,7 @@ class EncoderMixin:
             max_num_tokens=self._config.max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
+            attention_runtime_features=self._attention_runtime_features,
             mapping=self._mapping,
             cache_indirection=cache_indirection,
             kv_cache_manager=None,
@@ -573,6 +571,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         model_caller: ModelCaller,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model_caller = model_caller
         if config.is_encoder_decoder:
@@ -585,7 +584,12 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
         )
         self._initialize_encoder(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
 

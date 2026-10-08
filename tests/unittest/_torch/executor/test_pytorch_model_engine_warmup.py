@@ -367,7 +367,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
             max_draft_len=0,
             spec_config=None,
         ),
-        _torch_compile_backend=None,
         _eager_workspace_reclaimer=None,
         is_warmup=True,
         model=SimpleNamespace(
@@ -380,7 +379,6 @@ def test_compiled_mxfp8_warmup_backend_selection(
         ),
         mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
         dist=object(),
-        kv_cache_manager_key="kv_cache",
         is_draft_model=False,
         guided_decoder=None,
         _graphs=SimpleNamespace(no_cuda_graph=lambda: contextlib.nullcontext(), enabled=True),
@@ -397,7 +395,9 @@ def test_compiled_mxfp8_warmup_backend_selection(
     engine._model_caller = ModelCaller(engine.model, prefill_compile_only=prefill_only)
     cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
     resources = SimpleNamespace(
-        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+        get_resource_manager=lambda key: cache
+        if key == ResourceManagerType.KV_CACHE_MANAGER
+        else None
     )
     tuner = Mock(profiling_cache={})
     monkeypatch.setattr(decoder_warmup_module.AutoTuner, "get", lambda: tuner)
@@ -888,7 +888,6 @@ class TestWarmupCleanup(unittest.TestCase):
         runner = object.__new__(DecoderRunner)
         warmup = runner._warmup = object.__new__(DecoderWarmup)
         warmup._warmup_timer = _WarmupTimer(rank=0)
-        warmup.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         warmup.model = SimpleNamespace(config=SimpleNamespace(vocab_size=128))
         warmup._config = SimpleNamespace(
             dtype=torch.float16, cuda_graph_batch_sizes=[1, 4], enable_in_graph_sampling=False
@@ -995,7 +994,6 @@ class TestWarmupCleanup(unittest.TestCase):
             model=SimpleNamespace(modules=lambda: []),
             sparse_attention_config=None,
             metrics={},
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             dummy_requests=None,
             agreement=None,
             metadata=None,
@@ -1281,7 +1279,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
@@ -1305,7 +1302,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (
@@ -1406,7 +1405,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
                 dist=object(),
                 guided_decoder=None,
@@ -1430,7 +1428,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (
@@ -1516,7 +1516,6 @@ class TestWarmupCleanup(unittest.TestCase):
                         SimpleNamespace(quant_method=method),
                     ]
                 ),
-                kv_cache_manager_key="kv_cache",
                 mapping=SimpleNamespace(tp_size=2, has_pp=lambda: True),
                 dist=dist,
                 guided_decoder=None,
@@ -1533,7 +1532,9 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             kv_cache_manager = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
             resource_manager = SimpleNamespace(
-                get_resource_manager=lambda key: kv_cache_manager if key == "kv_cache" else None
+                get_resource_manager=lambda key: kv_cache_manager
+                if key == ResourceManagerType.KV_CACHE_MANAGER
+                else None
             )
 
             with (
