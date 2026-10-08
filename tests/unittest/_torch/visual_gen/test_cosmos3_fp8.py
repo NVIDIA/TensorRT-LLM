@@ -558,3 +558,251 @@ def test_static_fp8_scales_match_checkpoint_calibration(_cleanup_gpu):
         del pipeline
         gc.collect()
         torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Distilled 4-step sampling with a static-FP8 transformer (synthetic weights)
+# =============================================================================
+#
+# The FP8 4-Step distilled checkpoints combine two features that are otherwise
+# only tested apart: the fixed-step SDE sampler (test_cosmos3_distilled.py,
+# never with a real transformer) and the static-FP8 W8A8 transformer (above,
+# never inside a sampling loop). This section runs the real 4-step
+# FlowMatchEuler SDE schedule through a small random-weight static-FP8
+# transformer and compares the final latents against the same loop over a BF16
+# twin carrying the dequantized weights, so the only difference is activation
+# quantization.
+
+# Same small GQA architecture as the multi-GPU parity tests.
+_SYNTH_PRETRAINED_CONFIG = {
+    "hidden_size": 512,
+    "intermediate_size": 512,
+    "num_hidden_layers": 4,
+    "latent_patch_size": 2,
+    "latent_channel": 4,
+    "position_embedding_type": "unified_3d_mrope",
+    "num_attention_heads": 8,
+    "num_key_value_heads": 4,
+    "head_dim": 64,
+    "rope_scaling": {"rope_type": "default", "mrope_section": [12, 10, 10]},
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 1024,
+    "rope_theta": 1_000_000.0,
+    "max_position_embeddings": 4096,
+    "timestep_scale": 1.0,
+    "base_fps": 24.0,
+    "unified_3d_mrope_temporal_modality_margin": 100,
+    "enable_fps_modulation": True,
+}
+
+# The 4-Step checkpoints' scheduler recipe (subset consumed by the sampler).
+_DISTILLED_SIGMAS = (1.0, 0.9375, 0.8333333333333334, 0.625)
+_DISTILLED_SCHEDULER_CONFIG = {
+    "_class_name": "FlowMatchEulerDiscreteScheduler",
+    "num_train_timesteps": 1000,
+    "shift": 1.0,
+    "stochastic_sampling": True,
+    "use_karras_sigmas": False,
+    "fixed_step_requires_explicit_sigmas": True,
+    "fixed_step_sampler_config": {"sample_type": "sde", "t_list": list(_DISTILLED_SIGMAS)},
+}
+
+_SEED_FP8_WEIGHTS = 123
+_SEED_LATENTS = 456
+_SEED_TEXT = 42
+_SEED_SDE = 987
+_SYNTH_INPUT_SCALE = 1e-2
+_SCALE_SUFFIXES = ("weight_scale", "input_scale", "inv_input_scale", "kv_scales")
+_LATENT_SHAPE = (1, 4, 2, 4, 4)  # [B, C, T, H, W]; patch 2 -> 8 gen tokens
+_TEXT_LEN = 8
+_MAX_TEXT_LEN = 16
+
+
+def _make_synth_model_config(quant_algo):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    return DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(**_SYNTH_PRETRAINED_CONFIG),
+        quant_config=QuantConfig(quant_algo=quant_algo) if quant_algo else QuantConfig(),
+        torch_compile=TorchCompileConfig(enable=False),
+        attention=AttentionConfig(backend="VANILLA"),
+        skip_create_weights_in_init=False,
+    )
+
+
+def _init_synth_static_fp8(model) -> None:
+    """Synthesize a calibrated static-FP8 state (same recipe as the parallel tests)."""
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dtype == torch.float8_e4m3fn or name.endswith(_SCALE_SUFFIXES):
+                continue
+            if "norm" in name and name.endswith(".weight"):
+                p.fill_(1.0)
+            elif p.ndim >= 2:
+                std = 0.02 / max(1.0, p.shape[1] ** 0.5)
+                p.data.uniform_(-std, std)
+            else:
+                p.data.uniform_(-0.01, 0.01)
+        for _, module in model.named_modules():
+            if not (isinstance(module, Linear) and module.weight.dtype == torch.float8_e4m3fn):
+                continue
+            std = 0.02 / max(1.0, module.weight.shape[1] ** 0.5)
+            w = torch.empty(
+                module.weight.shape, device=module.weight.device, dtype=torch.float32
+            ).uniform_(-std, std)
+            weight_scale = w.abs().amax() / 448.0
+            module.weight.data.copy_((w / weight_scale).to(torch.float8_e4m3fn))
+            module.weight_scale.data.copy_(weight_scale)
+            module.input_scale.data.fill_(_SYNTH_INPUT_SCALE)
+            module.inv_input_scale.data.fill_(1.0 / _SYNTH_INPUT_SCALE)
+
+
+def _copy_dequantized_weights(fp8_model, bf16_model) -> None:
+    """Load the BF16 twin with the FP8 model's dequantized weights.
+
+    The static-FP8 topology splits GEN q/k/v and both towers' gate/up, while
+    BF16 fuses them, so fused destinations concatenate the dequantized splits.
+    After this, the two models compute the same function up to activation
+    quantization (and BF16 rounding of the dequantized weights).
+    """
+    fp8_modules = dict(fp8_model.named_modules())
+    fp8_params = dict(fp8_model.named_parameters())
+
+    def dequantize(module_name: str) -> torch.Tensor:
+        module = fp8_modules[module_name]
+        return (module.weight.float() * module.weight_scale.float()).to(torch.bfloat16)
+
+    with torch.no_grad():
+        for name, p in bf16_model.named_parameters():
+            if name in fp8_params:
+                src = fp8_params[name]
+                if src.dtype == torch.float8_e4m3fn:
+                    p.copy_(dequantize(name.rsplit(".", 1)[0]).to(p.dtype))
+                else:
+                    p.copy_(src.to(p.dtype))
+            elif name.endswith("qkv_proj.weight"):
+                prefix = name[: -len("qkv_proj.weight")]
+                p.copy_(
+                    torch.cat(
+                        [dequantize(prefix + part) for part in ("to_q", "to_k", "to_v")], dim=0
+                    ).to(p.dtype)
+                )
+            elif name.endswith("gate_up_proj.weight"):
+                prefix = name[: -len("gate_up_proj.weight")]
+                p.copy_(
+                    torch.cat(
+                        [dequantize(prefix + part) for part in ("gate_proj", "up_proj")], dim=0
+                    ).to(p.dtype)
+                )
+            else:
+                raise AssertionError(f"No FP8 source for BF16 parameter {name}")
+
+
+def _build_distilled_test_models(device):
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
+        Cosmos3VFMTransformer,
+    )
+
+    torch.manual_seed(_SEED_FP8_WEIGHTS)
+    fp8_model = Cosmos3VFMTransformer(_make_synth_model_config(QuantAlgo.FP8)).to(device).eval()
+    _init_synth_static_fp8(fp8_model)
+    fp8_model.post_load_weights()
+
+    cross_attn = fp8_model.gen_layers[0].cross_attention
+    assert cross_attn.to_q.weight.dtype == torch.float8_e4m3fn
+    assert cross_attn._maybe_share_qkv_quantize is True
+    assert fp8_model.gen_layers[0].mlp._maybe_share_gate_up_quantize is True
+
+    bf16_model = Cosmos3VFMTransformer(_make_synth_model_config(None)).to(device).eval()
+    _copy_dequantized_weights(fp8_model, bf16_model)
+    bf16_model.post_load_weights()
+    return fp8_model, bf16_model
+
+
+def _run_distilled_loop(model, device) -> torch.Tensor:
+    """The 4-step fixed-sigma SDE denoise loop the distilled checkpoints run."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
+    from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+
+    scheduler = FlowMatchEulerDiscreteScheduler.from_config(_DISTILLED_SCHEDULER_CONFIG)
+    policy = Cosmos3SamplingPolicy.from_scheduler(scheduler)
+    policy.set_timesteps(scheduler, num_inference_steps=len(_DISTILLED_SIGMAS), device=device)
+    step_kwargs = policy.scheduler_step_kwargs(torch.Generator().manual_seed(_SEED_SDE))
+
+    assert torch.allclose(
+        scheduler.timesteps.float().cpu(),
+        torch.tensor([s * 1000.0 for s in _DISTILLED_SIGMAS]),
+        atol=1e-3,
+    )
+
+    torch.manual_seed(_SEED_LATENTS)
+    latents = torch.randn(_LATENT_SHAPE, device=device, dtype=torch.bfloat16)
+    torch.manual_seed(_SEED_TEXT)
+    text_ids = torch.randint(1, 1000, (1, _MAX_TEXT_LEN), device=device, dtype=torch.long)
+    text_mask = torch.zeros(1, _MAX_TEXT_LEN, device=device, dtype=torch.long)
+    text_mask[:, :_TEXT_LEN] = 1
+    video_shape = _LATENT_SHAPE[2:]
+
+    for t in scheduler.timesteps:
+        raw_timestep = torch.full((1,), float(t), device=device, dtype=torch.float32)
+        model.reset_cache()
+        with torch.inference_mode():
+            velocity = model(
+                hidden_states=latents,
+                timestep=raw_timestep / scheduler.config.num_train_timesteps,
+                raw_timestep=raw_timestep,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+            ).video
+        assert velocity.shape == latents.shape
+        latents = scheduler.step(velocity, t, latents, return_dict=False, **step_kwargs)[0]
+
+    return latents
+
+
+class TestDistilledSamplingWithStaticFp8:
+    """4-step SDE sampling drives a static-FP8 transformer (no checkpoint)."""
+
+    def test_fp8_matches_dequantized_bf16_through_distilled_loop(self, _cleanup_gpu):
+        _requires_cuda()
+        device = torch.device("cuda")
+        fp8_model, bf16_model = _build_distilled_test_models(device)
+
+        fp8_latents = _run_distilled_loop(fp8_model, device).float()
+        ref_latents = _run_distilled_loop(bf16_model, device).float()
+
+        assert not torch.isnan(fp8_latents).any()
+        assert not torch.isinf(fp8_latents).any()
+
+        error = fp8_latents - ref_latents
+        ref_norm = torch.linalg.vector_norm(ref_latents)
+        assert ref_norm > 0
+        relative_l2 = (torch.linalg.vector_norm(error) / ref_norm).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            fp8_latents.flatten(), ref_latents.flatten(), dim=0
+        ).item()
+        print(
+            f"[distilled fp8 vs dequantized bf16] relative_l2={relative_l2:.4e}, cosine={cosine:.6f}"
+        )
+
+        # The only difference is per-layer activation quantization accumulated
+        # over 4 layers x 4 steps, and the residual stream damps it: measured
+        # 1.7e-5 on B300. A scale or wiring bug perturbs the attention/MLP
+        # contributions by O(1) and lands orders of magnitude above this.
+        assert relative_l2 <= 1e-3
+        assert cosine >= 0.9999
+
+    def test_fp8_distilled_loop_is_deterministic(self, _cleanup_gpu):
+        _requires_cuda()
+        device = torch.device("cuda")
+        fp8_model, _ = _build_distilled_test_models(device)
+
+        first = _run_distilled_loop(fp8_model, device)
+        second = _run_distilled_loop(fp8_model, device)
+        assert torch.equal(first, second)

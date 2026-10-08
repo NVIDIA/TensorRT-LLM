@@ -37,6 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     _resolve_cosmos3_cross_attention_backend,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 # Attention2D (attn2d) wraps the compute backend in Attention2DAttention, which
 # requires (a) an LSE-capable inner backend — only FA4, VANILLA does not support
@@ -290,6 +291,7 @@ def _make_model_config(
     attn2d_row_size=1,
     attn2d_col_size=1,
     backend="VANILLA",
+    quant_config=None,
 ):
     pretrained_config = SimpleNamespace(**pretrained_dict)
     ws = cfg_size * tp_size * ulysses_size * attn2d_row_size * attn2d_col_size
@@ -309,7 +311,7 @@ def _make_model_config(
     )
     config = DiffusionModelConfig(
         pretrained_config=pretrained_config,
-        quant_config=QuantConfig(),
+        quant_config=quant_config if quant_config is not None else QuantConfig(),
         torch_compile=TorchCompileConfig(enable=False),
         attention=AttentionConfig(backend=backend),
         visual_gen_mapping=vgm,
@@ -331,6 +333,61 @@ def _stabilize_model_weights(model: Cosmos3VFMTransformer) -> None:
                 p.data.uniform_(-std, std)
             else:
                 p.data.uniform_(-0.01, 0.01)
+
+
+# Shared static activation scale for synthetic FP8 "calibration". One value for
+# every projection keeps q/k/v (and gate/up) scales equal, which is the invariant
+# ModelOpt calibration produces and the shared-quantize fast path relies on.
+_FP8_INPUT_SCALE = 1e-2
+_FP8_SCALE_SUFFIXES = ("weight_scale", "input_scale", "inv_input_scale", "kv_scales")
+
+
+def _init_static_fp8_weights(model: Cosmos3VFMTransformer) -> None:
+    """Synthesize a calibrated static-FP8 state on the unsharded model.
+
+    Non-quantized parameters get the `_stabilize_model_weights` init; each FP8
+    Linear gets weights quantized from the same distribution with a per-tensor
+    amax/448 weight_scale and the shared static input_scale.
+    """
+    from tensorrt_llm._torch.modules.linear import Linear as TrtllmLinear
+
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dtype == torch.float8_e4m3fn or name.endswith(_FP8_SCALE_SUFFIXES):
+                continue
+            if "norm" in name and name.endswith(".weight"):
+                p.fill_(1.0)
+            elif p.ndim >= 2:
+                fan_in = p.shape[1]
+                std = 0.02 / max(1.0, fan_in**0.5)
+                p.data.uniform_(-std, std)
+            else:
+                p.data.uniform_(-0.01, 0.01)
+        for _, module in model.named_modules():
+            if not (
+                isinstance(module, TrtllmLinear) and module.weight.dtype == torch.float8_e4m3fn
+            ):
+                continue
+            fan_in = module.weight.shape[1]
+            std = 0.02 / max(1.0, fan_in**0.5)
+            w = torch.empty(
+                module.weight.shape, device=module.weight.device, dtype=torch.float32
+            ).uniform_(-std, std)
+            weight_scale = w.abs().amax() / 448.0
+            module.weight.data.copy_((w / weight_scale).to(torch.float8_e4m3fn))
+            module.weight_scale.data.copy_(weight_scale)
+            module.input_scale.data.fill_(_FP8_INPUT_SCALE)
+            module.inv_input_scale.data.fill_(1.0 / _FP8_INPUT_SCALE)
+
+
+def _assert_static_fp8_engaged(model: Cosmos3VFMTransformer) -> None:
+    """The test must exercise W8A8 with split projections, not silently run BF16."""
+    cross_attn = model.gen_layers[0].cross_attention
+    assert cross_attn.to_q.weight.dtype == torch.float8_e4m3fn
+    assert cross_attn._maybe_share_qkv_quantize is True
+    mlp = model.gen_layers[0].mlp
+    assert mlp.gate_proj.weight.dtype == torch.float8_e4m3fn
+    assert mlp._maybe_share_gate_up_quantize is True
 
 
 def _shard_dim0(tensor, tp_rank, tp_size):
@@ -602,6 +659,49 @@ def _build_ref_and_parallel(
     else:
         parallel_model.load_state_dict(ref_model.state_dict())
     parallel_model.post_load_weights()
+
+    return ref_model, parallel_model, vgm, device
+
+
+def _build_fp8_ref_and_parallel(
+    *,
+    tp_size: int = 1,
+    ulysses_size: int = 1,
+    cfg_size: int = 1,
+) -> Tuple[Cosmos3VFMTransformer, Cosmos3VFMTransformer, VisualGenMapping, torch.device]:
+    """Static-FP8 variant of `_build_ref_and_parallel`.
+
+    Both models carry the same synthetic calibrated FP8 state (same weights,
+    same per-tensor scales), so parity isolates the parallelism over the
+    W8A8 path with split q/k/v and gate/up projections.
+    """
+    device = torch.device(f"cuda:{dist.get_rank() % torch.cuda.device_count()}")
+
+    torch.manual_seed(SEED_WEIGHTS)
+    ref_config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    ref_model = Cosmos3VFMTransformer(ref_config).to(device).eval()
+    _init_static_fp8_weights(ref_model)
+    ref_model.post_load_weights()
+    _assert_static_fp8_engaged(ref_model)
+
+    parallel_config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        cfg_size=cfg_size,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    vgm = parallel_config.visual_gen_mapping
+    parallel_model = Cosmos3VFMTransformer(parallel_config).to(device).eval()
+    if tp_size > 1:
+        _copy_ref_weights_to_tp(ref_model, parallel_model, vgm.tp_rank, tp_size)
+    else:
+        parallel_model.load_state_dict(ref_model.state_dict())
+    parallel_model.post_load_weights()
+    _assert_static_fp8_engaged(parallel_model)
 
     return ref_model, parallel_model, vgm, device
 
@@ -893,6 +993,128 @@ def _logic_cosmos3_cfg_ulysses_vs_single_gpu(rank, world_size):
     )
 
 
+def _logic_cosmos3_fp8_tp_vs_single_gpu(rank, world_size):
+    ref_model, tp_model, _, device = _build_fp8_ref_and_parallel(tp_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=world_size, ulysses_size=1, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    tp_out = _forward(tp_model, device, text_seed)
+
+    if rank == 0:
+        diff = (tp_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,tp={world_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        tp_out, ref_out, msg=f"Rank {rank}: FP8 TP output differs from single-GPU FP8 reference"
+    )
+
+
+def _logic_cosmos3_fp8_ulysses_vs_single_gpu(rank, world_size):
+    ref_model, ulysses_model, _, device = _build_fp8_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    ulysses_out = _forward(ulysses_model, device, text_seed)
+
+    if rank == 0:
+        diff = (ulysses_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,ulysses={world_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 Ulysses output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_ulysses_unequal_text_vs_single_gpu(rank, world_size):
+    """The replicated-K/V sequence-parallel cross-attention path under SEPARATE_QKV."""
+    ref_model, ulysses_model, _, device = _build_fp8_ref_and_parallel(ulysses_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=world_size, cfg_size=1)
+
+    ref_out = _forward_with_unequal_text_lengths(ref_model, device, text_seed)
+    ulysses_out = _forward_with_unequal_text_lengths(ulysses_model, device, text_seed)
+
+    assert ulysses_model.cached_kv[0][0].shape[1] == _TEXT_LEN
+    torch.testing.assert_close(
+        ulysses_model.cached_real_text_lens,
+        torch.tensor([2, _TEXT_LEN], dtype=torch.int32),
+    )
+
+    if rank == 0:
+        diff = (ulysses_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,ulysses={world_size},text_lens=2/{_TEXT_LEN}] "
+            f"max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        ulysses_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 unequal-length Ulysses output differs from FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_cfg_vs_single_gpu(rank, world_size):
+    ref_model, parallel_model, _, device = _build_fp8_ref_and_parallel(cfg_size=world_size)
+    text_seed = _cfg_text_seed(rank, tp_size=1, ulysses_size=1, cfg_size=world_size)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    parallel_out = _forward(parallel_model, device, text_seed)
+
+    _assert_parity(
+        parallel_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 CFG output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_tp_ulysses_vs_single_gpu(rank, world_size):
+    tp_size = 2
+    ulysses_size = 2
+    ref_model, combined_model, _, device = _build_fp8_ref_and_parallel(
+        tp_size=tp_size, ulysses_size=ulysses_size
+    )
+    text_seed = _cfg_text_seed(rank, tp_size=tp_size, ulysses_size=ulysses_size, cfg_size=1)
+
+    ref_out = _forward(ref_model, device, text_seed)
+    combined_out = _forward(combined_model, device, text_seed)
+
+    if rank == 0:
+        diff = (combined_out.float() - ref_out.float()).abs()
+        print(
+            f"[fp8,tp={tp_size},ulysses={ulysses_size}] max_abs_diff={diff.max().item():.6e}, "
+            f"mean_abs_diff={diff.mean().item():.6e}",
+            flush=True,
+        )
+
+    _assert_parity(
+        combined_out,
+        ref_out,
+        msg=f"Rank {rank}: FP8 TP+Ulysses output differs from single-GPU FP8 reference",
+    )
+
+
+def _logic_cosmos3_fp8_attn2d_rejected(rank, world_size):
+    config = _make_model_config(
+        _COSMOS3_TEST_CONFIG,
+        attn2d_row_size=world_size,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
+    )
+    with pytest.raises(NotImplementedError, match="context parallelism"):
+        Cosmos3VFMTransformer(config)
+
+
 def _logic_cosmos3_attn2d_vs_single_gpu(rank, world_size):
     # 2x1 attn2d mesh (Q gathered across rows, K/V kept local). FA4 backend since
     # Attention2DAttention requires an LSE-capable inner backend.
@@ -1054,6 +1276,30 @@ class TestCosmos3TransformerParallel:
             "FA4 / flash_attn_combine JIT kernels not available; expected on the Blackwell CI runner"
         )
         run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_attn2d_ulysses_vs_single_gpu)
+
+    def test_fp8_tp2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_tp_vs_single_gpu)
+
+    def test_fp8_ulysses2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_ulysses_vs_single_gpu)
+
+    def test_fp8_ulysses2_unequal_text_lengths_vs_single_gpu(self):
+        """SEPARATE_QKV cross-attention through the replicated-K/V Ulysses path."""
+        run_test_in_distributed(
+            world_size=2,
+            test_fn=_logic_cosmos3_fp8_ulysses_unequal_text_vs_single_gpu,
+        )
+
+    def test_fp8_cfg2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_cfg_vs_single_gpu)
+
+    @pytest.mark.gpu4
+    def test_fp8_tp2_ulysses2_vs_single_gpu(self):
+        run_test_in_distributed(world_size=4, test_fn=_logic_cosmos3_fp8_tp_ulysses_vs_single_gpu)
+
+    def test_fp8_attn2d_rejected(self):
+        """Attention2D/ring sequence sharding is unvalidated with split q/k/v: refuse loudly."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_cosmos3_fp8_attn2d_rejected)
 
 
 if __name__ == "__main__":
