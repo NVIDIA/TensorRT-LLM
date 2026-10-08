@@ -13605,9 +13605,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     0]
 
                 partition_id = kwargs.get("partition_id", -1)
-                locality_domain_half_gemm = output_tensor is not None
+                # A caller-owned output without a partition id is a plain
+                # in-place GEMM; with one it is a locality-domain half GEMM.
+                locality_domain_half_gemm = (output_tensor is not None
+                                             and partition_id >= 0)
                 if locality_domain_half_gemm:
-                    if partition_id < 0 or partition_id >= 2:
+                    if partition_id >= 2:
                         raise ValueError(
                             "partition_id must be 0 or 1 when output_tensor is provided."
                         )
@@ -13620,6 +13623,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     # Kernel writes with strided layout (row stride = full width).
                     c_tensor = output_tensor[:, partition_id *
                                              n:(partition_id + 1) * n]
+                elif output_tensor is not None:
+                    if output_tensor.dim() != 2:
+                        raise ValueError("output_tensor must be 2-D")
+                    if output_tensor.dtype != self.output_dtype:
+                        raise ValueError(
+                            f"output_tensor must have dtype {self.output_dtype}, "
+                            f"got {output_tensor.dtype}")
+                    if output_tensor.shape != (m, n):
+                        raise ValueError(
+                            f"output_tensor must have shape {(m, n)}, got "
+                            f"{tuple(output_tensor.shape)}")
+                    if not output_tensor.is_contiguous():
+                        raise ValueError("output_tensor must be contiguous")
+                    c_tensor = output_tensor
                 else:
                     # Allocate output tensor from UserBuffers or regular CUDA memory
                     if self.to_userbuffers:
@@ -13959,6 +13976,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_cuda_graph=True,
             )
 
+        class CuteDSLMXFP8InplaceRubinLinear(CuteDSLMXFP8RubinLinear):
+            """SM107 MXFP8 runner that writes into a caller-owned output."""
+
+            kernel_cache = dict()
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2), ),
+                constraint_specs=(ConstraintSpec(2, 0, mxfp8_scale_infer_shape),
+                                  ConstraintSpec(5, 0, infer_output_m_shape)),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
             kernel_cache = dict()
             tuning_config = TuningConfig(
@@ -14022,6 +14054,72 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
+
+        @torch.library.custom_op(
+            "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
+            mutates_args=("output_tensor", ),
+            device_types="cuda",
+        )
+        def cute_dsl_mxfp8_gemm_inplace_rubin(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_tensor: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            """Run the SM107 dense MXFP8 GEMM directly into output_tensor."""
+            if output_dtype != torch.bfloat16:
+                raise ValueError(
+                    f"CuteDSL MXFP8 only supports bfloat16 output, got "
+                    f"{output_dtype}")
+            if (sm_version := get_sm_version()) != 107:
+                raise ValueError(
+                    f"CuteDSL MXFP8 SM107 GEMM requires SM107, got SM{sm_version}."
+                )
+            if input.dtype != torch.float8_e4m3fn or weight.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "CuteDSL MXFP8 input and weight must be FP8 E4M3")
+            if input_scale.dtype != torch.uint8 or weight_scale.dtype != torch.uint8:
+                raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
+            if output_tensor.shape != (input.shape[0], weight.shape[0]):
+                raise ValueError(
+                    "CuteDSL MXFP8 output shape must be [M, N], got "
+                    f"{tuple(output_tensor.shape)}")
+            if output_tensor.dtype != output_dtype:
+                raise ValueError(
+                    f"CuteDSL MXFP8 output must have dtype {output_dtype}, got "
+                    f"{output_tensor.dtype}")
+            if not output_tensor.is_contiguous():
+                raise ValueError("CuteDSL MXFP8 output must be contiguous")
+
+            alpha = _get_mxfp8_gemm_alpha(input.device)
+            runner = CuteDSLMXFP8InplaceRubinLinear(output_dtype=output_dtype,
+                                                    use_tvm_ffi=use_tvm_ffi)
+            inputs = [
+                input, weight, input_scale, weight_scale, alpha, output_tensor
+            ]
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin",
+                [runner],
+                runner.__class__.tuning_config,
+                inputs,
+            )
+            runner(inputs, tactic=best_tactic)
+
+        @torch.library.register_fake(
+            "trtllm::cute_dsl_mxfp8_gemm_inplace_rubin")
+        def _(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            input_scale: torch.Tensor,
+            weight_scale: torch.Tensor,
+            output_tensor: torch.Tensor,
+            output_dtype: torch.dtype = torch.bfloat16,
+            use_tvm_ffi: bool = True,
+        ) -> None:
+            return None
 
         _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS = (32, 128, 192, 256)
         _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET = 16384

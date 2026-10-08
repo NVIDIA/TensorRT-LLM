@@ -233,6 +233,95 @@ def _create_dsv4_epilogue_buffers(
     return fp8_o, output_sf
 
 
+def _uses_rubin_dsv4_o_b_proj_out(self) -> bool:
+    """Whether o_b_proj runs as the SM107 MXFP8 GEMM writing the output in place."""
+    return (
+        get_sm_version() == 107
+        and self.o_b_proj.has_fp8_block_scales
+        and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+        and (self.o_b_proj.use_cute_dsl_blockscaling_mm or self.o_b_proj.disable_deep_gemm)
+    )
+
+
+def _rubin_dsv4_o_b_proj_out(
+    self,
+    o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> None:
+    """Run o_b_proj on SM107 directly into `output`.
+
+    A tuple input is an already-quantized `(fp8, packed UE8M0 scale)` pair; a
+    tensor input is BF16 O-LoRA and is quantized here.
+    """
+    if isinstance(o_b_proj_input, tuple):
+        activation, activation_scale = o_b_proj_input
+    else:
+        activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            o_b_proj_input
+        )
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+        activation,
+        self.o_b_proj.weight,
+        activation_scale,
+        self.o_b_proj.weight_scale,
+        output,
+    )
+
+
+def _rubin_dsv4_o_lora_quantized_input(
+    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """Run o_a_proj on SM107 and emit FP8 O-LoRA plus packed scales for o_b_proj.
+
+    Returns None when the Rubin direct-output o_b_proj path is not in use.
+    """
+    if not _uses_rubin_dsv4_o_b_proj_out(self):
+        return None
+    num_tokens = attn_fp8.shape[1]
+    flat_n = self.n_local_groups * self.o_lora_rank
+    fp8_output = torch.empty(
+        (num_tokens, flat_n), dtype=torch.float8_e4m3fn, device=attn_fp8.device
+    )
+    fp8_batched = fp8_output.view(num_tokens, self.n_local_groups, self.o_lora_rank).transpose(0, 1)
+    # Packed UE8M0 scales in the R128c4 layout: M padded to 128, K/32 padded to 4.
+    scale_numel = (num_tokens + 127) // 128 * 128 * (((flat_n + 31) // 32 + 3) // 4 * 4)
+    packed_scale = torch.empty((scale_numel,), dtype=torch.uint8, device=attn_fp8.device)
+    torch.ops.trtllm.cute_dsl_fp8_bmm_quantize_rubin_out(
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        fp8_batched,
+        packed_scale,
+    )
+    return fp8_output, packed_scale
+
+
+def _deepseek_v4_fp8_o_a_proj(
+    self, attn_fp8: torch.Tensor, attn_scale: torch.Tensor
+) -> torch.Tensor:
+    """Run o_a_proj and o_b_proj on the FP8 inverse-RoPE output."""
+    quantized_input = _rubin_dsv4_o_lora_quantized_input(self, attn_fp8, attn_scale)
+    if quantized_input is not None:
+        return self.o_b_proj(quantized_input)
+    from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
+
+    num_tokens = attn_fp8.shape[1]
+    o_lora = torch.empty(
+        [num_tokens, self.n_local_groups, self.o_lora_rank],
+        device=attn_fp8.device,
+        dtype=self.dtype,
+    )
+    _cute_dsl_fp8_bmm_out(
+        attn_fp8,
+        self.o_a_proj,
+        attn_scale,
+        self.o_a_proj_scale,
+        o_lora.transpose(0, 1),
+    )
+    return self.o_b_proj(o_lora.flatten(1))
+
+
 def _run_dsv4_o_lora_bmms(
     self,
     o_lora_output: torch.Tensor,
@@ -241,6 +330,57 @@ def _run_dsv4_o_lora_bmms(
     context_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
     generation_o_lora_bmm_input: Optional[tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
+    """Run both O-LoRA projections and write hidden states into `o_lora_output`.
+
+    `o_lora_output` is the single mutable output of the MLA custom op. The final
+    projection stays inside the op and its result lands in the leading
+    `hidden_size` columns of the flattened buffer, so the op contract holds under
+    CUDA-graph replay and torch.compile.
+    """
+    active_inputs = [
+        item for item in (context_o_lora_bmm_input, generation_o_lora_bmm_input) if item is not None
+    ]
+    if not active_inputs:
+        return
+
+    uses_direct_output = _uses_rubin_dsv4_o_b_proj_out(self)
+    projected_output = None
+    if uses_direct_output:
+        projected_output = o_lora_output.flatten(1)[:num_tokens]
+        if projected_output.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"DSv4 projected output width must be {self.hidden_size}, got "
+                f"{projected_output.shape[1]}"
+            )
+
+    def write_projected_output_copy(
+        o_b_proj_input: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        projected = self.o_b_proj(o_b_proj_input)
+        output_view = o_lora_output.flatten(1)
+        output_view[: projected.shape[0], : self.hidden_size].copy_(projected)
+
+    if len(active_inputs) == 1:
+        quantized_input = _rubin_dsv4_o_lora_quantized_input(self, *active_inputs[0])
+        if quantized_input is not None:
+            if uses_direct_output:
+                assert projected_output is not None
+                _rubin_dsv4_o_b_proj_out(self, quantized_input, projected_output)
+            else:
+                write_projected_output_copy(quantized_input)
+            return
+
+    # The direct-output GEMM overwrites the buffer it reads from, so it needs a
+    # separate O-LoRA scratch; the copy path can reuse the output buffer.
+    if uses_direct_output:
+        o_lora_bmm_output = torch.empty(
+            [num_tokens, self.n_local_groups, self.o_lora_rank],
+            device=o_lora_output.device,
+            dtype=self.dtype,
+        )
+    else:
+        o_lora_bmm_output = o_lora_output
+
     def run_o_lora_bmm(
         o_lora_bmm_input: tuple[torch.Tensor, torch.Tensor],
         phase_o_lora_output: torch.Tensor,
@@ -259,13 +399,18 @@ def _run_dsv4_o_lora_bmms(
     if context_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             context_o_lora_bmm_input,
-            o_lora_output[:num_context_tokens],
+            o_lora_bmm_output[:num_context_tokens],
         )
     if generation_o_lora_bmm_input is not None:
         run_o_lora_bmm(
             generation_o_lora_bmm_input,
-            o_lora_output[num_context_tokens:num_tokens],
+            o_lora_bmm_output[num_context_tokens:num_tokens],
         )
+    if uses_direct_output:
+        assert projected_output is not None
+        _rubin_dsv4_o_b_proj_out(self, o_lora_bmm_output.flatten(1), projected_output)
+    else:
+        write_projected_output_copy(o_lora_bmm_output[:num_tokens].flatten(1))
 
 
 def prepare_sparse_attn_outputs(
@@ -278,12 +423,10 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
-        if get_sm_version() == 107:
-            # is_sm_100f() is true on Rubin, but its quantized-attention output
-            # is not numerically compatible with this FMHA epilogue; keep the
-            # standard O-LoRA projection path there.
-            return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
+            return False
+        # SM107 takes the fused epilogue only with its direct-output o_b_proj.
+        if get_sm_version() == 107 and not _uses_rubin_dsv4_o_b_proj_out(self):
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):
             return False
@@ -305,9 +448,17 @@ def prepare_sparse_attn_outputs(
 
     if _should_use_dsv4_epilogue_fusion():
         num_tokens = hidden_states.shape[0]
+        # 3D marks the fused epilogue (see forward_sparse_attn). The direct-output
+        # path needs exactly hidden_size columns; the copy path keeps the
+        # O-LoRA-sized buffer and uses its leading hidden_size columns.
+        output_shape = (
+            [num_tokens, 1, self.hidden_size]
+            if _uses_rubin_dsv4_o_b_proj_out(self)
+            else [num_tokens, self.n_local_groups, self.o_lora_rank]
+        )
         return [
             torch.empty(
-                [num_tokens, self.n_local_groups, self.o_lora_rank],
+                output_shape,
                 device=hidden_states.device,
                 dtype=self.dtype,
             )
@@ -324,10 +475,13 @@ def project_sparse_attn_output(
 ) -> torch.Tensor:
     del attn_metadata, all_reduce_params
     attn_output_tensor = attn_output[0]
-    # BCG/mixed-batch epilogue fusion runs o_a_proj at the end of attention,
-    # so this 3D tensor is O-LoRA output and only o_b_proj remains.
+    # The fused epilogue already ran both O-LoRA projections inside the custom op
+    # and wrote the hidden states into the leading hidden_size columns.
     if attn_output_tensor.ndim == 3:
-        return self.o_b_proj(attn_output_tensor.flatten(1))
+        output_view = attn_output_tensor.flatten(1)
+        if output_view.shape[1] == self.hidden_size:
+            return output_view
+        return output_view[:, : self.hidden_size]
 
     assert position_ids is not None
     num_tokens = attn_output_tensor.shape[0]
@@ -335,10 +489,7 @@ def project_sparse_attn_output(
 
     # Fuse inverse RoPE with FP8 quantization to avoid a BF16 latent read/write.
     # This is independent of the K/V absorption BMM implementation.
-    from tensorrt_llm._torch.attention.mla import (
-        _cute_dsl_fp8_bmm_out,
-        _is_cute_dsl_fp8_bmm_available,
-    )
+    from tensorrt_llm._torch.attention.mla import _is_cute_dsl_fp8_bmm_available
 
     fused_inv_rope_fp8 = (
         self.o_a_proj.dtype == torch.float8_e4m3fn and _is_cute_dsl_fp8_bmm_available()
@@ -356,20 +507,7 @@ def project_sparse_attn_output(
             128,
             self.inverse_rotary_emb.is_neox,
         )
-        o_lora = torch.empty(
-            [num_tokens, self.n_local_groups, self.o_lora_rank],
-            device=attn_output_tensor.device,
-            dtype=self.dtype,
-        )
-        _cute_dsl_fp8_bmm_out(
-            attn_fp8,
-            self.o_a_proj,
-            attn_scale,
-            self.o_a_proj_scale,
-            o_lora.transpose(0, 1),
-        )
-        o_lora = o_lora.flatten(1)
-        return self.o_b_proj(o_lora)
+        return _deepseek_v4_fp8_o_a_proj(self, attn_fp8, attn_scale)
 
     # Restore the RoPE portion before output projection.
     torch.ops.trtllm.mla_rope_inplace(
@@ -1424,8 +1562,8 @@ def forward_sparse_attn(
     if enable_dsv4_epilogue_fusion:
         assert context_o_lora_bmm_input is None or isinstance(context_o_lora_bmm_input, tuple)
         assert generation_o_lora_bmm_input is None or isinstance(generation_o_lora_bmm_input, tuple)
-        # The fused kernel output is group-first, which BCG cannot slice on
-        # dim 0. Write O-LoRA as token-first so replay can slice the bucket.
+        # Keep the final projection inside the custom op and write it into the
+        # only mutable output buffer declared by the BCG contract.
         _run_dsv4_o_lora_bmms(
             self,
             output,

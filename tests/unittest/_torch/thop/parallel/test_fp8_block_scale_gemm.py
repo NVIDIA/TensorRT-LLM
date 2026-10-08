@@ -472,6 +472,14 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
         output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
             a_fp8, b_fp8, a_sf, b_sf)
 
+    # The in-place variant writes into a caller-owned buffer (DSv4 o_b_proj).
+    inplace_output = torch.empty_like(output)
+    with autotune():
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(
+            a_fp8, b_fp8, a_sf, b_sf, inplace_output)
+    torch.ops.trtllm.cute_dsl_mxfp8_gemm_inplace_rubin(a_fp8, b_fp8, a_sf, b_sf,
+                                                       inplace_output)
+
     expected = a @ b.t()
     alpha = cute_dsl_custom_ops._get_mxfp8_gemm_alpha(a.device)
     seen_alphas = []
@@ -503,6 +511,7 @@ def test_cute_dsl_mxfp8_gemm_rubin_k128_replicated_scales():
     diff = calc_diff(output, expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(inplace_output, expected, atol=1e-3, rtol=1e-3)
 
 
 def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
