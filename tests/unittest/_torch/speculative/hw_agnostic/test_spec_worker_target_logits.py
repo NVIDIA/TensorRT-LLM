@@ -9,7 +9,7 @@ import torch
 
 import tensorrt_llm._torch.distributed as distributed
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 pytestmark = pytest.mark.cpu_only
@@ -52,7 +52,7 @@ def _generation_request(post_processors, tokens=(1, 2, 3)):
 
 
 def _engine(vocab_size=None, attention_dp=False):
-    engine = object.__new__(PyTorchModelEngine)
+    engine = object.__new__(DecoderRunner)
     engine.mapping = SimpleNamespace(is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp)
     engine.model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
     return engine
