@@ -761,6 +761,11 @@ def test_build_multimodal_encoder_input_unhandled_layout_raises(mm_data, expecte
             "Mistral3VLM",
             {"_vision_tower": None, "_multi_modal_projector": None},
         ),
+        (
+            "tensorrt_llm._torch.models.modeling_glm5_next_vision",
+            "Glm5NextVLM",
+            {"mm_encoder": None},
+        ),
     ],
 )
 def test_encode_without_a_local_encoder_raises_the_contract_error(module_path, class_name, attrs):

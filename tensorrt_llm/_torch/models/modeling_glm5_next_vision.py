@@ -71,6 +71,7 @@ from .modeling_glm5_next import Glm5NextForCausalLM, glm5_next_attention_mapping
 from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_mixin import (
     EncoderGroup,
+    MultimodalEncoderContractError,
     MultimodalModelMixin,
     encode_multimodal_by_groups,
 )
@@ -1173,7 +1174,11 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
         self, multimodal_params: List[MultimodalParams], **encoder_kwargs: Any
     ) -> torch.Tensor:
         if self.mm_encoder is None:
-            raise ValueError("Raw multimodal inputs require a local multimodal encoder.")
+            # Contract error, not a server fault: see the matching raise in
+            # Qwen3-VL's encode_multimodal_inputs.
+            raise MultimodalEncoderContractError(
+                "Raw multimodal inputs require a local multimodal encoder."
+            )
         mm_embeds = self.mm_encoder.forward(list(multimodal_params), **encoder_kwargs)
         if len(mm_embeds) != 1:
             raise ValueError(
