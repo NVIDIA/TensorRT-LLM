@@ -170,6 +170,9 @@ public:
     int getPageStride(LayerId layerId, DataRole role) const;
     size_t getPageIndexUpperBound(LayerId layerId, DataRole role) const;
 
+    // Whether this buffer belongs to a sparse-attention lifecycle. Unknown buffers throw.
+    bool isSparse(LayerId layerId, DataRole role) const;
+
     // Scale factor: base_page_index * scale → kernel page index.
     int getPageIndexScale(LayerId layerId, DataRole role) const;
 
