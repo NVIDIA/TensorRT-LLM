@@ -429,6 +429,9 @@ def test_kimi_k3_shared_allreduce_ordering(
     runtime.moe_shared_event = _Event("shared_done", parallel)
     midpoint_event = _Event("midpoint", overlap) if defer else None
     runtime.moe_routed_event = midpoint_event
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
@@ -458,6 +461,103 @@ def test_kimi_k3_shared_allreduce_ordering(
         elif defer:
             assert calls.index(("routed_moe", "main")) < allreduce
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("multi_stream", [True, False], ids=["forked", "serial"])
+def test_kimi_k3_latent_down_projection_overlaps_routing(
+    monkeypatch: pytest.MonkeyPatch, multi_stream: bool
+) -> None:
+    """The latent down-projection forks onto the CuteDSL quantization stream
+    before the router GEMM, and the MoE receives the event to join."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    calls = []
+    current_stream = "main"
+    latent_stream = object()
+
+    class _Event:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self) -> None:
+            calls.append((f"{self.name}_record", current_stream))
+
+        def wait(self) -> None:
+            calls.append((f"{self.name}_wait", current_stream))
+
+    @contextmanager
+    def use_stream(stream: object) -> Iterator[None]:
+        nonlocal current_stream
+        assert stream is latent_stream
+        previous_stream = current_stream
+        current_stream = "latent"
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class _Projection(nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value + 1
+
+    received = {}
+
+    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+        calls.append(("routed_moe", current_stream))
+        received.update(kwargs)
+        return value
+
+    def compute_logits(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("router_gemm", current_stream))
+        return value
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(compute_logits=compute_logits)
+    runtime.routed_experts = routed_experts
+    runtime.routed_expert_down_proj = _Projection("routed_down")
+    runtime.routed_expert_norm = _Projection("routed_norm")
+    runtime.routed_expert_up_proj = _Projection("routed_up")
+    runtime.shared_experts = lambda value, final_all_reduce_params=None: value * 0
+    runtime._reduce_routed_output = False
+    runtime._defer_shared_allreduce = False
+    runtime.shared_expert_stream = None
+    runtime.moe_main_event = _Event("fork")
+    runtime.moe_shared_event = _Event("shared_done")
+    runtime.moe_routed_event = None
+    runtime.latent_down_stream = latent_stream
+    runtime.moe_latent_fork_event = _Event("latent_fork")
+    runtime.moe_latent_ready_event = _Event("latent_ready")
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+
+    with with_multi_stream(multi_stream):
+        output = runtime(torch.zeros(2, 4))
+
+    # down (+1), norm (+1), up (+1); the shared branch contributes zero.
+    torch.testing.assert_close(output, torch.full((2, 4), 3.0))
+    if multi_stream:
+        assert calls.index(("latent_fork_record", "main")) < calls.index(
+            ("latent_fork_wait", "latent")
+        )
+        assert calls.index(("latent_fork_wait", "latent")) < calls.index(("routed_down", "latent"))
+        assert calls.index(("routed_down", "latent")) < calls.index(
+            ("latent_ready_record", "latent")
+        )
+        # The router GEMM is issued on main after the fork, not after the join.
+        assert calls.index(("latent_fork_record", "main")) < calls.index(("router_gemm", "main"))
+        assert received["input_ready_event"] is runtime.moe_latent_ready_event
+    else:
+        assert ("routed_down", "main") in calls
+        assert "input_ready_event" not in received
 
 
 def _make_kimi_k3_moe_weights(config):
