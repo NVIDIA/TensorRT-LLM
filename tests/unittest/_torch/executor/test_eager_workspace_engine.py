@@ -173,6 +173,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine._config = SimpleNamespace(
             is_spec_decode=False, torch_compile_prefill_only=False
         )
+        self.engine._moe_workspace_reclaimer = None
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
@@ -226,6 +227,41 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.assertEqual(self.call(), 42)
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
+
+    def test_moe_scope_tracks_warmup_and_serving_but_not_profiling(self) -> None:
+        reclaimer = Mock()
+        reclaimer.forward.return_value = ExitStack()
+        self.engine._moe_workspace_reclaimer = reclaimer
+        self.assertEqual(self.call(is_dummy=True), 42)
+        reclaimer.forward.assert_not_called()
+        self.engine._is_warmup = True
+        self.assertEqual(self.call(is_dummy=True), 42)
+        reclaimer.forward.assert_called_once_with(warmup=True)
+        self.engine._is_warmup = False
+        reclaimer.reset_mock()
+        self.assertEqual(self.call(), 42)
+        reclaimer.forward.assert_called_once_with(warmup=False)
+
+    def test_moe_reclamation_eligibility_and_escape_hatch(self) -> None:
+        with (
+            patch.object(self.engine, "_eager_workspace_reclaim_supported", True),
+            patch(f"{_RUNNER_MODULE}.CutlassWorkspaceReclaimer") as factory,
+        ):
+            for flag, expected in [("0", False), ("1", True)]:
+                with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": flag}):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertEqual(self.engine._moe_workspace_reclaimer is not None, expected)
+            factory.assert_called_once()
+            for target, name, value in [
+                (self.engine._config, "is_spec_decode", True),
+                (self.engine, "_eager_workspace_reclaim_supported", False),
+                (self.engine, "_torch_compile_backend", object()),
+                (self.engine, "breakable_cuda_graph_runner", object()),
+            ]:
+                with patch.object(target, name, value):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertIsNone(self.engine._moe_workspace_reclaimer)
+            factory.assert_called_once()
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):

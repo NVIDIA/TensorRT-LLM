@@ -32,6 +32,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
+from tensorrt_llm._torch.moe.workspace import CutlassWorkspaceReclaimer
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
@@ -415,8 +416,13 @@ class DecoderRunner(ScheduledModelRunner):
     def warmup(self, resource_manager: ResourceManager) -> None:
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         # Retain a partial summary when a phase raises.
-        with self._warmup_timer:
-            self._warmup_scheduled(resource_manager, kv_cache_manager)
+        was_warmup = self._is_warmup
+        self._is_warmup = True
+        try:
+            with self._warmup_timer:
+                self._warmup_scheduled(resource_manager, kv_cache_manager)
+        finally:
+            self._is_warmup = was_warmup
 
     def release_graphs(self) -> None:
         self._release_decoder_graphs()
@@ -512,6 +518,8 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
+        self._is_warmup = False
+        self._moe_workspace_reclaimer: CutlassWorkspaceReclaimer | None = None
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
@@ -760,6 +768,7 @@ class DecoderRunner(ScheduledModelRunner):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
+        self._initialize_moe_workspace_reclaimer()
         with self._warmup_timer.phase(
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
@@ -920,6 +929,18 @@ class DecoderRunner(ScheduledModelRunner):
         maybe_bolt_clear_counters()
 
         self._freeze_eager_workspace_floor()
+
+    def _initialize_moe_workspace_reclaimer(self) -> None:
+        self._moe_workspace_reclaimer = None
+        if (
+            os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+            and not self._config.is_spec_decode
+            and self.mapping.cp_size == 1
+            and self._eager_workspace_reclaim_supported
+            and self._torch_compile_backend is None
+            and self.breakable_cuda_graph_runner is None
+        ):
+            self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
     def _freeze_eager_workspace_floor(self) -> None:
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
@@ -5017,7 +5038,11 @@ class DecoderRunner(ScheduledModelRunner):
             and isinstance(metadata, TrtllmAttentionMetadata)
             else contextlib.nullcontext()
         )
-        with reclaim_scope:
+        moe_reclaimer = self._moe_workspace_reclaimer
+        moe_scope = contextlib.nullcontext()
+        if moe_reclaimer is not None and (not is_dummy or self._is_warmup):
+            moe_scope = moe_reclaimer.forward(warmup=self._is_warmup)
+        with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
     @nvtx_range("_forward_step")
