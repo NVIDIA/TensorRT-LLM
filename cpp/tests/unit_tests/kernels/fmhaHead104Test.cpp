@@ -118,7 +118,7 @@ protected:
                             dot += qkv[(offset + q) * 3 * hidden + head * kHeadDim + d]
                                 * qkv[(offset + k) * 3 * hidden + hidden + head * kHeadDim + d];
                         }
-                        scores[k] = dot / (std::sqrt(float(kHeadDim)) * kQScaling);
+                        scores[k] = dot / (std::sqrt(static_cast<float>(kHeadDim)) * kQScaling);
                     }
                     float const maximum = *std::max_element(scores.begin(), scores.begin() + keys);
                     float sum = 0.0F;
@@ -211,8 +211,8 @@ protected:
             float const value = static_cast<float>(actual[i]);
             ASSERT_TRUE(std::isfinite(value)) << "Unwritten or nonfinite output at " << i;
             float const error = value - expected[i];
-            squaredError += double(error) * error;
-            squaredReference += double(expected[i]) * expected[i];
+            squaredError += static_cast<double>(error) * error;
+            squaredReference += static_cast<double>(expected[i]) * expected[i];
             maxError = std::max(maxError, std::abs(error));
             referencePeak = std::max(referencePeak, std::abs(expected[i]));
         }
