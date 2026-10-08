@@ -14,8 +14,8 @@ from tensorrt_llm._utils import get_sm_version
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_CUTLASS_DSL_AVAILABLE
-    or get_sm_version() not in (100, 103),
-    reason="CuTe DSL MLA decode runs on SM100/SM103 only (see CuteDslMlaFmha)",
+    or get_sm_version() not in (100, 103, 107),
+    reason="CuTe DSL MLA decode runs on SM100/SM103/SM107 only (see CuteDslMlaFmha)",
 )
 
 
