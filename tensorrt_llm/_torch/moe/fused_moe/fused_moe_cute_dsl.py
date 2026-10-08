@@ -849,13 +849,9 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
-            # Keep SiTU enablement scoped to the Blackwell path. Rubin
-            # integration needs separate end-to-end validation.
-            if p.activation == "SiTu" and sm_version == 107:
-                return _reject(
-                    MoERejectReason.ACTIVATION_UNSUPPORTED,
-                    "CuteDSL SiTU is enabled only on SM100/SM103; "
-                    "SM107 integration is not enabled")
+            # SiTU is served on SM107 too: the Rubin act-fusion kernel carries
+            # the same trace-time SiTU epilogue as the Blackwell one, and Kimi
+            # K3 NVFP4 on CUTEDSL is what the Rubin K3 deployments run.
             # process_weights_after_loading() unswizzles the FC1 block scales,
             # which asserts 128-row tiles; without this gate an unaligned shard
             # dies mid weight load with a bare swizzle error.
