@@ -101,6 +101,9 @@ class _CausalBlockLayout:
     regions: np.ndarray  # [num_blocks, region_pages] int64 layer-0 view indices, host
     host: Dict[str, np.ndarray]  # host twins of rows, seq_len_*, own_slots, extra_*
     rows: torch.Tensor  # [num_blocks, row_len] int32 layer-0 view indices, 0-padded
+    # The rows in the TRTLLM attention op's block-offset encoding, K plane then V
+    # plane: ``row * kv_factor`` and ``+ kv_offset``. The op reads this tensor directly.
+    block_offsets: torch.Tensor  # [1, num_blocks, 2, row_len] int32
     seq_len_q: torch.Tensor  # [num_blocks] int32, all block_size
     seq_len_kv: torch.Tensor  # [num_blocks] int32, cached + block_size
     cached: List[int]  # host copy
@@ -365,6 +368,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._block_offsets_size: Optional[int] = None
         self._kv_heads_local = 0
         self._rows_per_page = 0  # pool rows of head_dim per view page: 2 * H * tpb
+        self._kv_offset = 0  # the V plane's offset in the op's block-offset encoding
         self._table_version = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -483,6 +487,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         device = buf.device
         self._kv_heads_local = buf.shape[2]
         self._rows_per_page = 2 * self._kv_heads_local * tpb
+        self._kv_offset = int(self.kv_offset[0])
         scaled = pages * self.page_view_scale
         if self._table is None:
             self._table = torch.zeros(self._pool_pages, dtype=torch.int32, device=device)
@@ -645,6 +650,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 # A row holds a block's whole pages then its region, never more than
                 # the pool has; sized for the pool so every geometry's rows agree.
                 "rows": (n, self._pool_pages),
+                "block_offsets": (1, n, 2, self._pool_pages),
                 "seq_len_q": (n,),
                 "seq_len_kv": (n,),
             }
@@ -773,6 +779,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """
         return self._layout(causal_block_size).rows
 
+    def block_offsets(self, causal_block_size: int) -> torch.Tensor:
+        """``[1, num_blocks, 2, row_len]`` int32 device tensor: ``page_table`` in the
+        TRTLLM attention op's block-offset encoding (K plane, then V plane), the
+        layout its ``kv_cache_block_offsets`` argument has. Persistent, refreshed in
+        place by ``commit``, so a kernel bound to it reads the current rows without
+        any metadata refresh."""
+        return self._layout(causal_block_size).block_offsets
+
     def set_causal_block_size(self, causal_block_size: int) -> None:
         """Declare the block size the next ``copy_batch_block_offsets`` describes."""
         self._layout(causal_block_size)
@@ -893,6 +907,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         row = blk.host["rows"][i]
         row[: whole.size] = whole
         row[whole.size : whole.size + region.size] = region
+        offsets = blk.host["block_offsets"][0, i]
+        offsets[0] = row * self.kv_factor
+        offsets[1] = offsets[0] + self._kv_offset
 
     def _fill_own_slots(
         self, blk: _CausalBlockLayout, i: int, region: np.ndarray, first: int

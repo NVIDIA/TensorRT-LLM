@@ -198,12 +198,13 @@ class TrtllmAttentionMetadata:
         ``causal_block_size`` tokens, request ``i`` with ``past + i*causal_block_size``
         tokens already cached. All requests are the one sequence and share its table.
 
-        One object per (cache, blocking) for the life of the cache, shared by every
-        layer through the model-scoped state. Its device buffers are allocated once
-        and ``prepare()`` re-fills them in place whenever the cache's table or
-        ``past`` moved, which is what keeps a CUDA graph captured around the
-        forward valid after ``commit()``. Neither creation nor re-preparation may
-        happen during capture: warm up eagerly first, and call this before replay.
+        One object per (cache, geometry, blocking) for the life of the cache, shared
+        by every layer through the model-scoped state. It is built once, eagerly, and
+        then bound to the cache's own device tensors: the block offsets and the
+        per-block key counts the kernel reads are the cache's, rewritten in place by
+        ``commit``. So nothing here changes after a commit, and a CUDA graph captured
+        around the forward replays correctly with no refresh. The host-side lengths
+        the op also takes are upper bounds, fixed at the geometry's capacity.
         """
         cache_key = (
             "kv_cache",
@@ -212,56 +213,46 @@ class TrtllmAttentionMetadata:
             num_causal_blocks,
             causal_block_size,
         )
-        state = (kv_cache.table_version, kv_cache.past_tokens)
         cached = self._metadata_cache.get(cache_key)
-        if cached is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "K/V cache attention metadata first needed during CUDA graph capture; "
-                    "run the forward eagerly once before capturing"
-                )
-            self._drop_metadata_of_shut_down_caches()
-            metadata = BaseTrtllmAttentionMetadata(
-                max_num_requests=kv_cache.max_causal_blocks,
-                max_num_tokens=kv_cache.max_staged_tokens,
-                max_num_sequences=kv_cache.max_causal_blocks,
-                kv_cache_manager=kv_cache,
-                mapping=kv_cache.mapping,
-                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+        if cached is not None:
+            return cached["metadata"]
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "K/V cache attention metadata first needed during CUDA graph capture; "
+                "run the forward eagerly once before capturing"
             )
-            metadata.seq_lens = torch.full(
-                (num_causal_blocks,), causal_block_size, dtype=torch.int32
-            )
-            metadata.num_contexts = num_causal_blocks
-            metadata.request_ids = kv_cache.request_ids(num_causal_blocks)
-            metadata.prompt_lens = [causal_block_size] * num_causal_blocks
-            cached = {
-                "metadata": metadata,
-                "prepared": False,
-                "seq_lens": metadata.seq_lens,
-                "kv_state": None,
-            }
-            self._metadata_cache[cache_key] = cached
-        metadata = cached["metadata"]
-        if cached["kv_state"] != state:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "K/V cache moved since the metadata was prepared; prepare before capture "
-                    "or replay, not inside it"
-                )
-            # Each block's row holds the fixed region, its window, the earlier blocks
-            # and then its own tokens; the kernel writes the block right after the
-            # cached count, inside the block's private pages.
-            metadata.kv_cache_params = KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=kv_cache.cached_tokens(causal_block_size)[
-                    :num_causal_blocks
-                ],
-            )
-            kv_cache.set_causal_block_size(causal_block_size)
-            metadata.prepare()
-            cached["prepared"] = True
-            cached["kv_state"] = state
+        self._drop_metadata_of_shut_down_caches()
+        n, size = num_causal_blocks, causal_block_size
+        metadata = BaseTrtllmAttentionMetadata(
+            max_num_requests=kv_cache.max_causal_blocks,
+            max_num_tokens=kv_cache.max_staged_tokens,
+            max_num_sequences=kv_cache.max_causal_blocks,
+            kv_cache_manager=kv_cache,
+            mapping=kv_cache.mapping,
+            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+        )
+        metadata.seq_lens = torch.full((n,), size, dtype=torch.int32)
+        metadata.num_contexts = n
+        metadata.request_ids = kv_cache.request_ids(n)
+        metadata.prompt_lens = [size] * n
+        # One ordinary prepare() allocates the metadata's buffers; what it fills in is
+        # then replaced by the cache's own tensors below.
+        metadata.kv_cache_params = KVCacheParams(
+            use_cache=True, num_cached_tokens_per_seq=kv_cache.cached_tokens(size)[:n]
+        )
+        kv_cache.set_causal_block_size(size)
+        metadata.prepare()
+        # Each block's row holds the fixed region, its window, the earlier blocks and
+        # then its own tokens; the kernel writes the block right after the cached count,
+        # inside the block's private pages. Both tensors are the cache's.
+        metadata.kv_cache_block_offsets = kv_cache.block_offsets(size)[:, :n]
+        metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
+        # host_past_key_value_lengths and the context total only bound the kernel's
+        # work; the per-block lengths come from the device tensor above.
+        metadata.kv_lens_runtime = torch.full((n,), kv_cache.capacity, dtype=torch.int32)
+        metadata.host_total_kv_lens[0] = n * kv_cache.capacity
+        metadata.host_total_kv_lens[1] = 0
+        self._metadata_cache[cache_key] = {"metadata": metadata}
         return metadata
 
     def _drop_metadata_of_shut_down_caches(self) -> None:

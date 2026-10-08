@@ -421,9 +421,9 @@ def test_graph_replay_survives_commit(cache, backend):
     for step in range(3):  # the third commit rotates the table
         history_k.append(k.clone())
         history_v.append(v.clone())
-        cache.commit(cache.max_staged_tokens)
-        if backend == "trtllm":
-            attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)  # the step loop's job
+        cache.commit(
+            cache.max_staged_tokens
+        )  # no metadata refresh: the kernel reads the cache's tensors
         q2, k2, v2 = rand_qkv(CHUNK)
         q.copy_(q2), k.copy_(k2), v.copy_(v2)
         graph.replay()
@@ -468,9 +468,7 @@ def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
         for step in range(12):
             q2, k2, v2 = rand_qkv(CHUNK)
             q.copy_(q2), k.copy_(k2), v.copy_(v2)
-            if backend == "trtllm":  # the step loop's job, after every commit
-                attn.metadata.prepare_with_kv_cache(cache, num_causal_blocks, size)
-            graph.replay()
+            graph.replay()  # nothing refreshed since the commit, on either backend
             torch.cuda.synchronize()
             hk = torch.cat(history_k) if history_k else empty
             hv = torch.cat(history_v) if history_v else empty
