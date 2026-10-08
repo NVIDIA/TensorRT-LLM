@@ -81,6 +81,14 @@ private:
     // Get the kernel sequence that support the max sequence length (only used by non-flash-attention kernels).
     int getSFromMaxSeqLen(int const max_seq_len) const;
 
+    // Is the input selected as fp8? SageAttention is selected as DATA_TYPE_KV_INT8_E4M3, which
+    // records that it runs int8 Q/K with an e4m3 PV. Everywhere in this runner it behaves like the
+    // plain fp8 kernels: one byte per element, fp32 accumulation, and device-side scales.
+    bool isFp8Selected() const
+    {
+        return mFixedParams.dataType == DATA_TYPE_E4M3 || mFixedParams.dataType == DATA_TYPE_KV_INT8_E4M3;
+    }
+
 private:
     // The attention fixed params (mostly related to the attention structure).
     MHARunnerFixedParams mFixedParams;

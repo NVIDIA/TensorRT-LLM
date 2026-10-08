@@ -70,6 +70,23 @@ ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INF
 // must be declared there as a boolean parameter defaulting to false. Until it is,
 // the parameter is simply absent and this stays false.
 BOLT_CONSUME_ENABLED = (params.boltConsume ?: env.boltConsume ?: env.BOLT_CONSUME ?: "false").toString() == "true"
+// Publish the BOLTed build BESIDE an untouched canonical tarball instead of
+// replacing canonical with it. Set by the post-merge launch, where canonical is
+// BoltProfileGen's input and must stay un-BOLTed. Same resolution order as above.
+BOLT_PUBLISH_VARIANT = (params.boltPublishVariant ?: env.boltPublishVariant ?: "false").toString() == "true"
+// The profile bundle this pipeline pinned, or "" for whatever `latest` is now.
+// A BINDING variable, not a local: `globalVars` is a parameter of launchStages and
+// is not in scope inside applyLatestBolt, so the value is hoisted here the same way
+// BOLT_CONSUME_ENABLED is.
+BOLT_PINNED_REF = (params.boltProfileRef ?: env.boltProfileRef ?: "").toString()
+// The branch the pin was resolved against. Only ever set together with the ref,
+// and authoritative when set -- see the hoist in launchStages.
+BOLT_PINNED_BRANCH = ""
+// The triples BOLT consume applies to, comma separated, hoisted from globalVars
+// in launchStages. This job runs for both architectures, so the scope has to be
+// stated rather than inferred; see applyLatestBolt. Empty means unrestricted,
+// which is the behaviour for a job run directly instead of from the pipeline.
+BOLT_CONSUME_TRIPLES = ""
 
 // Literals for easier access.
 @Field
@@ -146,7 +163,11 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
+def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
+@Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def BOLT_CONSUME_TRIPLES_KEY = "bolt_consume_triples"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -161,7 +182,9 @@ def globalVars = [
     // silently dropped -- which for this one would mean running unpinned
     // without saying so.
     (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT_KEY): false,
     (BOLT_PROFILE_BRANCH): "",
+    (BOLT_CONSUME_TRIPLES_KEY): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -360,16 +383,22 @@ def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
     return reused
 }
 
+// artifacts maps an upload name to either a local path, or a Map of
+// [path: <local path>, props: <"k=v;k=v" or null>] when the object needs
+// Artifactory properties attached. Properties are set in the same request as the
+// upload, so metadata and bytes cannot disagree.
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
 {
     for (it in artifacts) {
         def uploadpath = it.key
-        def filepath = it.value
+        def filepath = it.value instanceof Map ? it.value.path : it.value
+        def props = it.value instanceof Map ? it.value.props : null
+        def propsField = props ? ",\n                        \"props\": \"${props}\"" : ""
         def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
-                        "target": "${prefix}/${uploadpath}"
+                        "target": "${prefix}/${uploadpath}"${propsField}
                         }
                     ]
                 }"""
@@ -556,8 +585,35 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     // forwards neither of these, so a build launched by L0_MergeRequest.groovy lands
     // on "main" -- the only branch with a promoted bundle. Revisit together with the
     // parent's main-only gate if either name starts being forwarded.
-    def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
+    // The pinned branch wins when there is one: the pin names an object under
+    // exactly that branch's promote directory, and the expression below is not
+    // the one the pin was resolved with, so re-deriving could look in the wrong
+    // place and find nothing.
+    def branch = BOLT_PINNED_BRANCH ?: (env.gitlabTargetBranch ?: env.branch_name ?: "main")
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    // An architecture outside the parent's consume scope has nothing to apply, so
+    // stop before staging llvm-bolt and discovering that over a retried 404. Only
+    // aarch64 has a profile producer today, and this job runs for both.
+    //
+    // The scope is its own fact, not something read off the pin: an unresolvable
+    // pin is deliberately non-fatal, so deciding the architecture from the pin
+    // meant x86_64 skipped cheaply when the pin resolved and did minutes of
+    // pointless work when it did not. Same outcome either way -- there is no
+    // x86_64 bundle to apply -- but the cost and the log differed for a reason
+    // that has nothing to do with architecture.
+    //
+    // Empty means unrestricted, so a job run directly keeps today's behaviour of
+    // attempting and skipping gracefully.
+    def scopedTriples = BOLT_CONSUME_TRIPLES.split(",").collect { it.trim() }.findAll { it }
+    if (scopedTriples && !(triple in scopedTriples)) {
+        echo "[bolt-consume] consume is scoped to ${scopedTriples.join(', ')}; " +
+             "skipping ${triple} (build stays un-BOLTed)"
+        return
+    }
+    // The bundle this pipeline pinned, or "" to take whatever `latest` is now.
+    // Exported to apply_latest.sh, which passes it to artifactory.sh; also stamped
+    // onto the published artifact so a consumer can verify what it received.
+    def boltRef = BOLT_PINNED_REF
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
     stage("BOLT consume") {
         // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
@@ -577,9 +633,22 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
+            export BOLT_PROFILE_REF='${boltRef}'
             bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
                  ${branch} ${triple} ${tarName} bolted-${tarName}
         """)
+        if (rc == 3 && boltRef) {
+            // rc=3 means apply_latest.sh could not pull a bundle. Unpinned that
+            // legitimately means "this branch has nothing promoted" -- true for
+            // x86_64 today -- and skipping is right. Pinned it cannot mean that:
+            // the pipeline read this exact ref minutes ago, so absence is a real
+            // failure. Skipping would leave bolted-${tarName} unpublished, and
+            // the test stages fetch it by name, so an Artifactory blip here would
+            // surface as a pile of unexplained 404s in a different job.
+            error("[bolt-consume] pinned BOLT bundle ${boltRef} not found under ${branch}/${triple}. " +
+                  "The pipeline pinned a bundle this build cannot fetch; refusing to silently produce " +
+                  "an un-BOLTed build that downstream stages expect to be optimized.")
+        }
         if (rc == 3) {
             echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"
             return
@@ -587,23 +656,47 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
         if (rc != 0) {
             error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
         }
-        // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
-        // the BOLTed build to the canonical name. Matches the postmerge
-        // publishBoltedCanonical convention (canonical = BOLTed).
-        sh """
-            set -e
-            cp -f ${tarName} unbolted-${tarName}
-            mv -f bolted-${tarName} ${tarName}
-            echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
-        """
-        // Register the unbolted- variant for upload via the caller's artifacts map,
-        // so it is pushed by buildOrCache OUTSIDE the build container (where the
-        // JFrog 'Artifactory' server resolves). Uploading here with rtUpload fails
-        // with "Couldn't find JFrog Instance ID: Artifactory" -- the server is not
-        // available inside the container context. Added only on a successful apply,
-        // so a skipped arch never references a nonexistent file.
-        if (artifacts != null) {
-            artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+        // Applied. Which name the BOLTed build takes depends on who consumes this
+        // build, and the two cases are opposites:
+        //
+        //   pre-merge  -- BOLTed becomes canonical, original kept as unbolted-.
+        //                 Every downstream consumer should exercise the optimized
+        //                 build, and canonical is what they all fetch.
+        //   post-merge -- canonical stays UN-BOLTed and the optimized build is
+        //                 published beside it as bolted-<tarName>. Canonical is
+        //                 BoltProfileGen's input; replacing it would generate the
+        //                 next bundle from already-optimized binaries.
+        //
+        // Both register the second variant through the caller's artifacts map, so
+        // it is pushed by buildOrCache OUTSIDE the build container -- rtUpload here
+        // fails with "Couldn't find JFrog Instance ID: Artifactory", the server not
+        // being resolvable in the container context. Added only on a successful
+        // apply, so a skipped arch never references a nonexistent file.
+        if (BOLT_PUBLISH_VARIANT) {
+            sh """
+                set -e
+                echo '[bolt-consume] ${tarName} left un-BOLTed (BoltProfileGen input); optimized build published as bolted-${tarName}'
+            """
+            if (artifacts != null) {
+                // bolt.ref records WHICH bundle produced it, so a consumer can
+                // assert it matches the pin rather than trusting the filename, and
+                // an A/B job can tell the two sides apart by property rather than
+                // by a name that means the opposite thing pre-merge.
+                artifacts["bolted-${tarName}"] = [
+                    path: "bolted-${tarName}",
+                    props: boltRef ? "bolt.ref=${boltRef}" : null,
+                ]
+            }
+        } else {
+            sh """
+                set -e
+                cp -f ${tarName} unbolted-${tarName}
+                mv -f bolted-${tarName} ${tarName}
+                echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
+            """
+            if (artifacts != null) {
+                artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+            }
         }
     }
 }
@@ -672,6 +765,28 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             BOLT_CONSUME_ENABLED = true
             echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
         }
+        if (globalVars[BOLT_PROFILE_REF]) {
+            BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
+            BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+        }
+        // Which architectures consume BOLT, independent of whether a pin resolved.
+        if (globalVars[BOLT_CONSUME_TRIPLES_KEY]) {
+            BOLT_CONSUME_TRIPLES = globalVars[BOLT_CONSUME_TRIPLES_KEY].toString()
+            echo "[bolt-consume] scoped to ${BOLT_CONSUME_TRIPLES}"
+        }
+        // Same reason as boltConsume directly above: boltPublishVariant is not
+        // registered on the remote build jobs, so the Parameterized Remote
+        // Trigger drops it and the param resolution at the top of this file
+        // leaves it false. Post-merge that is the worst possible default --
+        // consume is on (it comes through globalVars and survives), so
+        // applyLatestBolt would take the else branch and REPLACE canonical,
+        // feeding already-BOLTed binaries to BoltProfileGen, while the test
+        // stages fetch a bolted- variant that was never uploaded.
+        if (globalVars[BOLT_PUBLISH_VARIANT_KEY]?.toString() == "true") {
+            BOLT_PUBLISH_VARIANT = true
+            echo "[bolt-consume] publishing bolted- variant via globalVars.bolt_publish_variant"
+        }
     }
 
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
@@ -706,6 +821,22 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         timeout: 300
     )
     def reuseArtifactPath = env.reuseArtifactPath
+    // copyCachedArtifacts walks the artifact map as it stands BEFORE the build
+    // runs, and bolted-<tarName> is added to that map by applyLatestBolt during
+    // the build. So a cache hit would copy canonical only, report success, and
+    // leave the test stages fetching a variant that was never published.
+    //
+    // Pre-declaring the variant in the map instead would break the builds where
+    // it is legitimately absent (x86_64 is outside the consume scope), so the
+    // reuse is dropped rather than taught about an artifact it cannot predict.
+    // reuse_build is a manual `/bot run` opt-in, never a default, and asking to
+    // skip the build on a run whose purpose is to produce these binaries is
+    // already contradictory.
+    if (reuseArtifactPath && BOLT_PUBLISH_VARIANT) {
+        echo "[bolt-consume] ignoring reuseArtifactPath: this run publishes " +
+             "bolted- variants, which a cached build has no way to supply"
+        reuseArtifactPath = null
+    }
 
     def k8s_cpu = "amd64"
     if (cpu_arch == AARCH64_TRIPLE) {

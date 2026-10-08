@@ -46,6 +46,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Spec-dec source-path prefixes the rule may claim. Tests under tests/**
 # are left to TestsDefRule; the two rules' scopes combine via
@@ -110,16 +111,16 @@ _MTP_DISABLED_MARKER = "mtp_nextn=0"
 def _is_spec_claim(path: str) -> bool:
     """Decide whether SpecDecRule claims `path`.
 
-    `*.md` files are excluded so docs-only PRs (e.g.
-    `examples/eagle/README.md`) don't force spec-dec stages —
-    `OutOfScopeRule` claims them as noop instead. Other suffixes
+    Documentation files are excluded so docs-only PRs (e.g.
+    `examples/eagle/README.md`) don't force spec-dec stages; `DocsRule`
+    routes them to the docs build instead. Other suffixes
     (`.png` / `.jpg` / etc.) are NOT excluded here: a binary asset
     under a spec-dec path could be a test fixture, so the rule keeps
     claiming them and forces spec-dec stages to re-run (safe over-run).
     """
     if not path.startswith(_SPEC_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

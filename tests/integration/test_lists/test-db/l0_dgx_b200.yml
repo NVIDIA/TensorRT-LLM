@@ -18,6 +18,8 @@ l0_dgx_b200:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
+  - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
+  - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
@@ -41,6 +43,7 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/disaggregated/test_transfer_lifecycle_gpu.py
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[linear] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eagle3[dynamic] TIMEOUT (60)
@@ -139,10 +142,10 @@ l0_dgx_b200:
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part3"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part4"
     - unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py -m "part5"
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
-    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2
+    - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2]
     - examples/test_ray.py::test_ray_disaggregated_serving[tp2]
     - examples/test_ray.py::test_ray_disaggregated_serving_python[tp2]

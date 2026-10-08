@@ -1329,7 +1329,6 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         vlm_to_llm_arch = {
             "Qwen3VLForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3VLMoeForConditionalGeneration": "Qwen3MoeForCausalLM",
-            "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
             "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",

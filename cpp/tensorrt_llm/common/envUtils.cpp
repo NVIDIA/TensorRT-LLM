@@ -232,6 +232,12 @@ bool getEnvUseTileSizeKv64ForTrtllmGen()
     return useTileSizeKv64;
 }
 
+bool getEnvUseStaticTileSchedulerForTrtllmGenContextFmha()
+{
+    static bool const useStatic = getBoolEnv("TRTLLM_GEN_FMHA_CONTEXT_STATIC_TILE_SCHEDULER");
+    return useStatic;
+}
+
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
