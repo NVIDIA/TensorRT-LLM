@@ -1,8 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import socket
 import time
 import unittest
 
 import pytest
+import zmq
 from parameterized import parameterized
 
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
@@ -143,6 +159,18 @@ def test_zmq_messenger_double_start_listener(dynamic_endpoint):
     with pytest.raises(RuntimeError, match="Listener already running"):
         messenger.start_listener(lambda msgs: None)
     messenger.stop()
+
+
+def test_zmq_messenger_send_timeout(dynamic_endpoint):
+    """send_timeout_ms bounds sends with SNDTIMEO; by default sends block (-1)."""
+    bounded = ZMQMessenger("DEALER", endpoint=dynamic_endpoint, send_timeout_ms=50)
+    blocking = ZMQMessenger("DEALER", endpoint=dynamic_endpoint)
+    try:
+        assert bounded._socket.getsockopt(zmq.SNDTIMEO) == 50
+        assert blocking._socket.getsockopt(zmq.SNDTIMEO) == -1
+    finally:
+        bounded.stop()
+        blocking.stop()
 
 
 if __name__ == "__main__":

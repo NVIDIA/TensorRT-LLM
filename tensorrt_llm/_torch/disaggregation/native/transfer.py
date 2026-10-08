@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Opti
 import msgpack
 import numpy as np
 import torch
+import zmq
 
 try:
     from cuda.bindings import runtime as cudart
@@ -969,15 +970,23 @@ class _SessionQuiescence:
     endpoint: Optional[str]
 
 
+# A shared DEALER's outgoing queue fills (SNDHWM) only when its peer stopped draining
+# it; then drop the send after this wait rather than stall the listener, caller or
+# shutdown.
+_SHARED_DEALER_SEND_TIMEOUT_MS = 100
+
+
 @dataclass
 class _SharedDealer:
     """A DEALER shared by the Sender's listener and caller threads.
 
-    ZMQ sockets are not thread-safe; ``lock`` serializes every use of ``messenger``.
+    ZMQ sockets are not thread-safe; ``lock`` serializes every use of ``messenger``
+    and guards ``closed``, which shutdown sets before it stops the messenger.
     """
 
     messenger: ZMQMessenger
     lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
 
 
 class Sender(SenderBase):
@@ -1010,9 +1019,11 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        # Shared DEALERs for the listener and caller threads; see
-        # _send_on_shared_dealer for their locking.
+        # Shared DEALERs for the listener and caller threads. _shared_dealers_lock
+        # guards the dict and _shared_dealers_closed; each dealer's own lock guards
+        # its sends and its closed flag (see _send_on_shared_dealer).
         self._shared_dealers: dict[str, _SharedDealer] = {}
+        self._shared_dealers_closed = False
         self._shared_dealers_lock = threading.Lock()
         # Worker threads send only on their own DEALERs (_get_or_connect_thread_dealer).
         self._thread_local = threading.local()
@@ -2324,19 +2335,43 @@ class Sender(SenderBase):
         The listener and caller threads share these sockets. The lookup and
         first-use connect run under ``_shared_dealers_lock``, so each endpoint gets
         exactly one socket. The sends run under that dealer's own lock, so one
-        call's messages are never interleaved with another thread's, and a send
-        blocked toward one peer does not stall sends to other peers.
+        call's messages are never interleaved with another thread's. Each send
+        waits at most ``_SHARED_DEALER_SEND_TIMEOUT_MS``, so a peer that stopped
+        draining cannot stall this thread, sends to other peers, or shutdown.
+
+        Raises:
+            ValueError: ``endpoint`` is None; the peer has not registered yet.
+            RuntimeError: The Sender is shut down, or a send timed out. Either way
+                the remaining messages are not sent.
         """
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
         with self._shared_dealers_lock:
+            if self._shared_dealers_closed:
+                raise RuntimeError(f"Sender is shut down; not sending to {endpoint}")
             dealer = self._shared_dealers.get(endpoint)
             if dealer is None:
-                dealer = _SharedDealer(ZMQMessenger(mode="DEALER", endpoint=endpoint))
+                dealer = _SharedDealer(
+                    ZMQMessenger(
+                        mode="DEALER",
+                        endpoint=endpoint,
+                        send_timeout_ms=_SHARED_DEALER_SEND_TIMEOUT_MS,
+                    )
+                )
                 self._shared_dealers[endpoint] = dealer
         with dealer.lock:
+            # Shutdown may have closed the dealer after the lookup above.
+            if dealer.closed:
+                raise RuntimeError(f"Sender is shut down; not sending to {endpoint}")
             for message in messages:
-                dealer.messenger.send(message)
+                try:
+                    dealer.messenger.send(message)
+                except zmq.Again as error:
+                    raise RuntimeError(
+                        f"Sender: send to {endpoint} timed out after "
+                        f"{_SHARED_DEALER_SEND_TIMEOUT_MS} ms; its outgoing queue is full "
+                        "(peer not draining)"
+                    ) from error
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -2417,15 +2452,19 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
+        # Reject new shared sends, then stop each dealer without holding the map lock.
         with self._shared_dealers_lock:
-            for dealer in self._shared_dealers.values():
-                # Let an in-progress send finish before its socket is closed.
-                with dealer.lock:
-                    try:
-                        dealer.messenger.stop()
-                    except Exception as e:
-                        logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
+            self._shared_dealers_closed = True
+            dealers = list(self._shared_dealers.values())
             self._shared_dealers.clear()
+        for dealer in dealers:
+            # An active send returns within the send timeout; never close its socket under it.
+            with dealer.lock:
+                dealer.closed = True
+                try:
+                    dealer.messenger.stop()
+                except Exception as e:
+                    logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
         self._shutdown = True
 
     def __del__(self):

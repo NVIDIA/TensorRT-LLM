@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
@@ -78,7 +93,18 @@ class ZMQMessenger(MessengerInterface):
         "REP": zmq.REP,  # Receives requests and sends replies (synchronous).
     }
 
-    def __init__(self, mode: str, endpoint: Optional[str] = None) -> None:
+    def __init__(
+        self, mode: str, endpoint: Optional[str] = None, *, send_timeout_ms: Optional[int] = None
+    ) -> None:
+        """Create the socket and bind (ROUTER/REP) or connect (DEALER/REQ) it.
+
+        Args:
+            mode: One of ``SOCKET_MODES``.
+            endpoint: Address to bind or connect; required for DEALER/REQ.
+            send_timeout_ms: If set, a ``send()`` that cannot queue its message
+                within this many milliseconds raises ``zmq.Again`` instead of
+                blocking. By default a send blocks until it can queue.
+        """
         if mode not in self.SOCKET_MODES:
             raise ValueError(
                 f"Invalid mode '{mode}'. Allowed modes are {list(self.SOCKET_MODES.keys())}"
@@ -86,6 +112,8 @@ class ZMQMessenger(MessengerInterface):
         self._context = zmq.Context()
         self._mode = mode
         self._socket = self._context.socket(self.SOCKET_MODES[mode])
+        if send_timeout_ms is not None:
+            self._socket.setsockopt(zmq.SNDTIMEO, send_timeout_ms)
         self._endpoint: Optional[str] = None
         self._lock = Lock()
         self._closed = False
