@@ -153,8 +153,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("prompt_embedding_table", &GenLlmReq::getPromptEmbeddingTable)
         .def_prop_rw("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
         .def_prop_rw("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
-        .def_prop_ro("context_logits", &GenLlmReq::getContextLogitsHost)
-        .def_prop_ro("generation_logits", &GenLlmReq::getGenerationLogitsHost)
         .def_prop_ro("prompt_vocab_size", &GenLlmReq::getPromptVocabSize)
         .def_prop_ro("lora_task_id", &GenLlmReq::getLoraTaskId)
         .def_prop_rw("context_chunk_size", &GenLlmReq::getContextChunkSize, &GenLlmReq::setContextChunkSize)
@@ -167,10 +165,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_prop_rw("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_rw("seq_slot", &GenLlmReq::mSeqSlot)
-        .def_prop_ro("return_context_logits", &GenLlmReq::getReturnContextLogits)
-        .def_prop_ro("return_generation_logits", &GenLlmReq::getReturnGenerationLogits)
-        .def("set_return_encoder_output", &GenLlmReq::setReturnEncoderOutput, nb::arg("return_encoder_output"))
-        .def("get_return_encoder_output", &GenLlmReq::getReturnEncoderOutput)
         .def("priority", nb::overload_cast<>(&GenLlmReq::priority, nb::const_))
         .def("set_priority", nb::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
@@ -180,7 +174,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_last_context_chunk", &GenLlmReq::isLastContextChunk)
         .def_prop_ro("is_first_context_chunk", &GenLlmReq::isFirstContextChunk)
         .def_prop_ro("context_remaining_length", &GenLlmReq::getContextRemainingLength)
-        .def_prop_ro("context_logits", &GenLlmReq::getContextLogitsHost)
         .def_prop_ro("num_draft_tokens", &GenLlmReq::getNumDraftTokens)
         .def("set_finished_reason", &GenLlmReq::setFinishedReason, nb::arg("finish_reason"), nb::arg("beam"))
         .def_prop_ro("is_finished", &GenLlmReq::isFinished)
@@ -225,7 +218,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("avg_decoded_tokens_per_iter", &GenLlmReq::getAvgDecodedTokensPerIter)
         .def_prop_ro("alloc_total_blocks", &GenLlmReq::getAllocTotalBlocksPerRequest)
         .def_prop_ro("alloc_new_blocks", &GenLlmReq::getAllocNewBlocksPerRequest)
-        .def("alloc_context_logits", &GenLlmReq::allocContextLogitsHost, nb::arg("vocab_size"), nb::arg("logit_dtype"))
         .def("update_kv_cache_perf_metrics", &GenLlmReq::updateKvCachePerfMetrics, nb::arg("alloc_total_blocks"),
             nb::arg("alloc_new_blocks"), nb::arg("reused_blocks"), nb::arg("missed_blocks"))
         .def_prop_ro("reused_blocks", &GenLlmReq::getReusedBlocksPerRequest)
@@ -365,10 +357,9 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<std::optional<std::string>>> multimodal_uuids,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                 std::optional<at::Tensor> lora_config,
-                std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_context_logits,
-                bool return_generation_logits, std::optional<tb::LlmRequest::VecTokens> draft_tokens,
-                bool exclude_input_from_output, std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens,
-                bool return_encoder_output, executor::PriorityType priority,
+                std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config,
+                std::optional<tb::LlmRequest::VecTokens> draft_tokens, bool exclude_input_from_output,
+                std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens, executor::PriorityType priority,
                 std::optional<tb::LlmRequest::SizeType32> encoder_input_length,
                 std::optional<tb::LlmRequest::SizeType32> encoder_output_length, tb::LlmRequestType llm_request_type,
                 std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids, bool return_perf_metrics,
@@ -397,8 +388,7 @@ void initBindings(nb::module_& m)
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
                     multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, return_context_logits, return_generation_logits, draft_tokens,
-                    exclude_input_from_output, encoder_input_tokens, return_encoder_output, priority,
+                    kv_cache_retention_config, draft_tokens, exclude_input_from_output, encoder_input_tokens, priority,
                     encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
                     return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
                     multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
@@ -410,11 +400,10 @@ void initBindings(nb::module_& m)
             nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
             nb::arg("multimodal_uuids") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
             nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_context_logits") = false,
-            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("draft_tokens") = std::nullopt,
             nb::arg("exclude_input_from_output") = false, nb::arg("encoder_input_tokens") = std::nullopt,
-            nb::arg("return_encoder_output") = false, nb::arg("priority") = executor::Request::kDefaultPriority,
-            nb::arg("encoder_input_length") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
+            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_length") = std::nullopt,
+            nb::arg("encoder_output_len") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("return_perf_metrics") = false,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,
@@ -426,14 +415,13 @@ void initBindings(nb::module_& m)
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("enable_kv_cache_reuse") = false)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
-        .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
-            nb::arg("mpi_world_rank") = 0)
+        .def("create_result", &tb::LlmRequest::createResult)
         .def("create_serialized_result",
-            [](tb::LlmRequest& self, bool use_fast_logits = false, int mpi_world_rank = 0)
+            [](tb::LlmRequest& self)
             {
                 std::vector<char> serialized_result;
                 bool is_final = false;
-                self.createSerializedResult(serialized_result, is_final, use_fast_logits, mpi_world_rank);
+                self.createSerializedResult(serialized_result, is_final);
                 return std::make_tuple(nb::bytes(serialized_result.data(), serialized_result.size()), is_final);
             })
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))

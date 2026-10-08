@@ -291,6 +291,60 @@ def test_python_logprob_response_snapshots(streaming, beam_width, simple_format)
         assert first_response.result.cum_log_probs == [-0.5]
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_optional_tensor_results_are_python_owned(streaming) -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=4,
+        streaming=streaming,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        output_config=trtllm.OutputConfig(
+            return_context_logits=True,
+            return_generation_logits=True,
+            return_encoder_output=True,
+            additional_model_outputs=[trtllm.AdditionalModelOutput("hidden", True)],
+        ),
+    )
+    request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    assert request.py_return_context_logits
+    assert request.py_return_generation_logits
+    assert request.py_return_encoder_output
+    assert request.child_requests[0].py_return_encoder_output
+    for name in ("return_context_logits", "return_generation_logits", "alloc_context_logits"):
+        assert not hasattr(request, name)
+    context = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    generation = torch.arange(4, dtype=torch.float32).reshape(1, 1, 4)
+    encoder = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    # Preallocate CPU storage so these response tests do not require CUDA or
+    # pinned-memory allocation, while exercising the real append/get methods.
+    request.py_result._context_logits._storage = torch.empty(3, 1, 4)
+    request.py_result._context_logits.beam_width = 1
+    request.py_result._generation_logits.use_chunked_generation_logits = False
+    request.py_result._generation_logits._storage = torch.empty(4, 1, 4)
+    request.py_result._generation_logits.beam_width = 1
+    request.py_result.append_context_logits(context)
+    request.py_result.append_generation_logits(generation)
+    request.py_result.set_encoder_output(encoder)
+    request.py_result.append_additional_context_outputs("hidden", context)
+    request.py_result.append_additional_generation_outputs("hidden", generation)
+    request.add_new_token(4, 0)
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    response = request.create_response()
+    assert response is not None
+    native = response.result.get_result()
+    assert native.context_logits is None
+    assert native.generation_logits is None
+    assert native.encoder_output is None
+    assert native.additional_outputs == []
+    torch.testing.assert_close(response.result.context_logits, context)
+    torch.testing.assert_close(response.result.generation_logits, generation.transpose(0, 1))
+    torch.testing.assert_close(response.result.encoder_output, encoder)
+    torch.testing.assert_close(response.result.additional_context_outputs["hidden"], context)
+    torch.testing.assert_close(response.result.additional_generation_outputs["hidden"], generation)
+
+
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
     position_ids = [4, 7, 9]
     executor_request = trtllm.Request(
