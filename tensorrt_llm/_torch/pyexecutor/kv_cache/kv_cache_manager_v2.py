@@ -3939,20 +3939,12 @@ class KVCacheManagerV2(BaseResourceManager):
     def admit_mirror(self, req: LlmRequest) -> bool:
         """Create *req*'s draft mirror if it has none, then resume it.
 
-        Creating is half the job, not a precondition of it: a fresh ``_KVCache``
-        starts SUSPENDED (``_KVCache.__init__`` sets the status and
-        ``_never_resumed``), so its FIRST resume goes through the same
-        ``max_util_for_resume`` gate as any later one and can be refused under
-        pool pressure. Treating "no mirror yet" as nothing-to-do therefore
-        leaves the whole first-sight case unadmitted, and the refusal lands
-        instead inside ``_prepare_draft_resources``, where the request is
-        already in the batch and the only remaining answer is to raise.
-        Measured: a c=256 run died on the first request whose mirror was born
-        while the draft pool was above the gate.
-
-        Returns False when the mirror cannot be created (IndexMapper saturated)
-        or cannot be resumed, so the caller defers the request instead of
-        forwarding it.
+        A fresh ``_KVCache`` is born SUSPENDED, so its FIRST resume goes
+        through the same ``max_util_for_resume`` gate as any later one and can
+        be refused under pool pressure; "no mirror yet" is therefore not a
+        nothing-to-do case. Returns False when the mirror cannot be created
+        (IndexMapper saturated) or resumed, so the caller defers the request
+        instead of forwarding it.
         """
         kv_cache = self._mirror_draft_kv_cache(req)
         if kv_cache is None:
@@ -4432,25 +4424,14 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                     continue
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
-                    # RAISE, deliberately, even though this is a transient
-                    # pressure refusal and not corruption.
-                    #
-                    # Skipping it here looks like the mirror-shortage branch
-                    # above and is NOT the same: that one has no cache at all,
-                    # so the request id stays unmapped and copy_batch_block_offsets
-                    # asserts in C++ before anything reads it. A cache that
-                    # merely failed to RESUME is still in kv_cache_map, so the
-                    # offsets copy succeeds, the forward proceeds, and the
-                    # drafter writes context K/V through the inactive cache's
-                    # stale page table -- a crash traded for silent corruption.
-                    # An earlier iteration deferred the resume here and hit
-                    # exactly that corruption; the deferral was reverted.
-                    #
-                    # Deferring it safely means not forwarding the request this
-                    # iteration, which is an admission decision and belongs to
-                    # the scheduler, not to this method: by the time draft
-                    # preparation runs, the target manager has already prepared
-                    # the same request.
+                    # Raise, deliberately, although this is only a transient
+                    # pressure refusal: unlike the mirror-shortage skip above
+                    # (no cache mapped, C++ asserts before anything reads it),
+                    # this cache is still in kv_cache_map, so skipping would
+                    # let the forward write through the inactive cache's stale
+                    # page table -- silent corruption, seen when an earlier
+                    # iteration deferred here. Safe deferral is an admission
+                    # decision and belongs to the scheduler.
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
