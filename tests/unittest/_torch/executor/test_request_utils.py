@@ -9,6 +9,7 @@ This module tests:
 
 """
 
+import pickle
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -16,7 +17,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
@@ -27,10 +28,13 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
     merge_helix_requests,
     merge_requests,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_strategy import _CachingRequestGrouper
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import CpType
+from tensorrt_llm.sampling_params import LogprobMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -204,6 +208,94 @@ def test_executor_request_to_llm_request_owns_encoder_features_in_python() -> No
         request.pause(20)
         assert request.state.name == "ENCODER_INIT"
         assert request.encoder_output_len == 6
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("mode", [LogprobMode.RAW, LogprobMode.PROCESSED])
+def test_logprob_flag_is_python_owned(enabled, mode) -> None:
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+        output_config=trtllm.OutputConfig(return_log_probs=enabled),
+    )
+    request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    assert request.py_return_log_probs is enabled
+    assert request.child_requests[0].py_return_log_probs is enabled
+    assert not hasattr(request, "return_log_probs")
+    assert (request.py_result._log_probs is not None) is enabled
+    if enabled:
+        assert request.child_requests[0].py_result._log_probs is not request.py_result._log_probs
+    request.py_logprobs_mode = mode
+    grouper = _CachingRequestGrouper(max_num_sequences=1)
+    grouper.prepare_for_new_request(request, 0)
+    groups, raw_mask = grouper.group_requests_by_strategy_key(
+        [request],
+        strategy_to_key=lambda strategy: strategy,
+        seq_slots=torch.tensor([0]),
+        vocab_size=16,
+    )
+    assert raw_mask.tolist() == [enabled and mode == LogprobMode.RAW]
+    assert next(iter(groups.values())).need_processed_logprobs.tolist() == [
+        enabled and mode == LogprobMode.PROCESSED
+    ]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("beam_width", [1, 2])
+@pytest.mark.parametrize("simple_format", [False, True])
+def test_python_logprob_response_snapshots(streaming, beam_width, simple_format) -> None:
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=10,
+        input_tokens=[1, 2, 3],
+        sampling_config=trtllm.SamplingConfig(beam_width=beam_width),
+        is_streaming=streaming,
+        return_log_probs=True,
+        logprobs_simple_format=simple_format,
+    )
+    request.state = (
+        LlmRequestState.GENERATION_IN_PROGRESS if streaming else LlmRequestState.GENERATION_COMPLETE
+    )
+    first_probs = [[-0.5] if simple_format else [{4: Logprob(-0.5)}] for _ in range(beam_width)]
+    next_probs = [[-0.25] if simple_format else [{5: Logprob(-0.25)}] for _ in range(beam_width)]
+    request.add_new_tokens([4] * beam_width)
+    request.py_result.set_log_probs(first_probs, [-0.5] * beam_width)
+    first_response = request.create_response()
+    assert first_response is not None
+    # Exercise the IPC snapshot boundary for beam-search results, which replace
+    # all logprobs each iteration rather than emitting greedy streaming deltas.
+    snapshot = pickle.loads(pickle.dumps(first_response))
+    native_result = first_response.result.get_result()
+    assert native_result.log_probs is None
+    assert native_result.cum_log_probs is None
+    assert snapshot.result.log_probs == first_probs
+    assert snapshot.result.cum_log_probs == [-0.5] * beam_width
+    request.add_new_tokens([5] * beam_width)
+    if beam_width > 1:
+        request.py_result.set_log_probs(
+            [first + next_ for first, next_ in zip(first_probs, next_probs)],
+            [-0.75] * beam_width,
+        )
+    else:
+        request.py_result.append_log_probs(next_probs)
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    final_response = request.create_response()
+    assert final_response is not None
+    expected = (
+        next_probs
+        if streaming and beam_width == 1
+        else [first + next_ for first, next_ in zip(first_probs, next_probs)]
+    )
+    assert final_response.result.log_probs == expected
+    assert final_response.result.cum_log_probs == [-0.75] * beam_width
+    assert snapshot.result.log_probs == first_probs
+    assert snapshot.result.cum_log_probs == [-0.5] * beam_width
+    if streaming and beam_width == 1:
+        assert first_response.result.log_probs == first_probs
+        assert first_response.result.cum_log_probs == [-0.5]
 
 
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:
