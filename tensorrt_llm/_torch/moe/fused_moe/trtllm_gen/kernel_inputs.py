@@ -176,9 +176,11 @@ def prepare_kernel_inputs(impl, ctx: MoERunContext) -> KernelInputs:
 
     x_sf = ctx.x_sf
     if x_sf is not None:
-        # Ensure x_sf is 2D before flattening
-        assert len(x_sf.shape) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
-        x_sf = x_sf.flatten()
+        # ``quantize_input`` produces token-major 2-D scales and the dispatch
+        # keeps them that way. The flat 1-D linear layout is a native-ABI
+        # detail, so ``TRTLLMOpBackend`` flattens inside its own kernel-facing
+        # methods rather than in this provider-neutral assembly.
+        assert x_sf.dim() == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
 
     return KernelInputs(
         x=ctx.x,

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 
@@ -281,6 +281,7 @@ def create_moe(
     layer_idx: Optional[int] = None,
     activation: MoEActivation = DEFAULT_MOE_ACTIVATION,
     communication_method: Optional[str] = None,
+    unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
     allow_backend_degradation: bool = True,
 ) -> MoE | VanillaMoE:
     """
@@ -304,6 +305,11 @@ def create_moe(
             ``SwigluActivation(clamp=7.0)`` or
             ``SiTuActivation(gate_softcap=..., linear_softcap=...)``
         communication_method: Optional ConfigurableMoE communication method
+        unfinalized_combine_fn: Optional model-owned finalize that
+            ``ConfigurableMoE`` runs on every ``do_finalize=False`` forward,
+            before any communication combine. See the signature and contract on
+            ``ConfigurableMoE.__init__``; validated against the resolved
+            backend and comm strategy in ``validate_backend``.
         allow_backend_degradation: When False, a requested backend that cannot
             serve this layer raises with the rejection trail instead of falling
             back. For callers that must know they got the backend they asked
@@ -377,12 +383,15 @@ def create_moe(
             bias=bias,
             activation=activation,
             communication_method=communication_method,
+            unfinalized_combine_fn=unfinalized_combine_fn,
         )
 
     # TritonFusedMoE and VanillaMoE are not wrapped by ConfigurableMoE
     # and own their communication and forward paths.
     if communication_method is not None:
         raise ValueError("communication_method requires ConfigurableMoE.")
+    if unfinalized_combine_fn is not None:
+        raise ValueError("unfinalized_combine_fn requires ConfigurableMoE.")
     return create_moe_backend(
         moe_cls=moe_cls,
         routing_method=routing_method,
