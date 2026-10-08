@@ -84,7 +84,7 @@ class GuidedRequest:
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
         return cls(
-            guided_decoding_params=request.guided_decoding_params,
+            guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
             seq_slot=(request.py_target_seq_slot
                       if request.py_is_draft else request.py_seq_slot),
@@ -563,7 +563,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
         # self.token_event.record() should be called inside CUDA graph capturing;
-        # currently, it is in PyTorchModelEngine._preprocess_inputs.
+        # currently, it is in DecoderRunner._preprocess_inputs.
 
     @hostfunc
     def fetch_batch(self) -> None:
