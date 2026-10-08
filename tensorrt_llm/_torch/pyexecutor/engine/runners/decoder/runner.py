@@ -131,6 +131,25 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
     return request.get_token(0, chunk_end)
 
 
+def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
+    """Zero ``buffer`` over half-open row spans, merging adjacent spans.
+
+    Used for the input-id rows of CUDA-graph and attention-DP padding requests,
+    which neither the host nor the device input-id copies write.
+    """
+    if not spans:
+        return
+    rows = sorted(spans)
+    merged_begin, merged_end = rows[0]
+    for row_begin, row_end in rows[1:]:
+        if row_begin <= merged_end:
+            merged_end = max(merged_end, row_end)
+            continue
+        buffer[merged_begin:merged_end].fill_(0)
+        merged_begin, merged_end = row_begin, row_end
+    buffer[merged_begin:merged_end].fill_(0)
+
+
 def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
     """Resolve the model-specific Mamba metadata class with a default."""
     return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
@@ -3532,6 +3551,10 @@ class DecoderRunner(ScheduledModelRunner):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        # Half-open token-row spans of padding requests (CUDA-graph and
+        # attention-DP dummies) whose input ids are not appended to the host
+        # ``input_ids`` list; zero-filled after the input-id copies below.
+        unwritten_input_id_rows = []
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
@@ -3587,6 +3610,12 @@ class DecoderRunner(ScheduledModelRunner):
                 position_ids.extend(
                     list(range(past_seen_token_num, past_seen_token_num + 1 + num_draft_tokens))
                 )
+                if request.is_attention_dp_dummy or request.is_cuda_graph_dummy:
+                    # One position per token row, in batch order, so the rows
+                    # this request owns are the position_ids it just added.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - (1 + num_draft_tokens), len(position_ids))
+                    )
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens
                 )
@@ -3890,6 +3919,11 @@ class DecoderRunner(ScheduledModelRunner):
 
                 request.py_batch_idx = request.py_seq_slot
                 extra_inputs.add_generation_request(request, repeat=beam_width)
+                if request.is_cuda_graph_dummy:
+                    # beam_width token rows were added without input ids.
+                    unwritten_input_id_rows.append(
+                        (len(position_ids) - beam_width, len(position_ids))
+                    )
                 # Do not add a gen_request_seq_slot for CUDA graph dummy requests
                 # to prevent access errors due to None values
                 if not request.is_cuda_graph_dummy:
@@ -4027,6 +4061,12 @@ class DecoderRunner(ScheduledModelRunner):
             # when writing key/values to the KV cache.
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
+
+        # The host copy covers input_ids_cuda[:num_tokens] and the device copies
+        # cover the previous-batch rows; padding-request rows are covered by
+        # neither, so without this the embedding would gather stale contents
+        # of the uninitialized buffer, which may exceed the vocabulary size.
+        _zero_fill_row_spans(self.input_ids_cuda, unwritten_input_id_rows)
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
