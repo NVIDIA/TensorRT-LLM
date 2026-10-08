@@ -21,7 +21,7 @@ from unittest import mock
 
 import pytest
 
-from tensorrt_llm.serve.render import render_chat
+from tensorrt_llm.serve.render import RenderResources, render_chat
 
 from .render_helpers import SERVER_TEMPLATE, WEATHER_TOOL, chat_request, make_tokenizer, resources
 
@@ -111,8 +111,27 @@ class _Router:
         return router
 
     @staticmethod
-    def fingerprint(router, model="m"):
-        return router._render_resources(model).fingerprint()
+    def worker_fingerprint(tokenizer):
+        """A worker's fingerprint, built from a worker-shaped server and not from the router.
+
+        Copying the router's own fingerprint would make the write-back tests agree by
+        construction and hide any difference between how the two sides describe the
+        same rendering configuration.
+        """
+        from tensorrt_llm.inputs.registry import DefaultInputProcessor
+
+        server = SimpleNamespace(
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(model_type=None),
+            processor=None,
+            chat_template=None,
+            allow_request_chat_template=False,
+            generator=SimpleNamespace(
+                args=SimpleNamespace(reasoning_parser=None),
+                input_processor=DefaultInputProcessor(None, None, tokenizer),
+            ),
+        )
+        return RenderResources.from_server(server).fingerprint()
 
 
 @pytest.fixture
@@ -128,14 +147,14 @@ class TestRouterWriteBack:
             request, resources(tokenizer, allow_request_chat_template=True)
         ).token_ids
 
-    def _trust(self, router, servers=("server1", "server2")):
-        fingerprint = _Router.fingerprint(router)
+    def _trust(self, router, tokenizer, servers=("server1", "server2")):
+        fingerprint = _Router.worker_fingerprint(tokenizer)
         router._server_info = {name: {"render_fingerprint": fingerprint} for name in servers}
 
-    def test_ids_are_forwarded_when_every_worker_reports_the_routers_fingerprint(
+    def test_ids_are_forwarded_when_every_worker_reports_a_matching_fingerprint(
         self, router, tokenizer
     ) -> None:
-        self._trust(router)
+        self._trust(router, tokenizer)
         request = chat_request()
 
         ids = router._tokenize(request)[0]
@@ -146,7 +165,7 @@ class TestRouterWriteBack:
     def test_ids_are_not_forwarded_when_a_worker_reports_no_fingerprint(
         self, router, tokenizer
     ) -> None:
-        fingerprint = _Router.fingerprint(router)
+        fingerprint = _Router.worker_fingerprint(tokenizer)
         router._server_info = {
             "server1": {"render_fingerprint": fingerprint},
             "server2": {},  # an older worker
@@ -160,8 +179,10 @@ class TestRouterWriteBack:
         assert ids == self._expected_ids(tokenizer, request)
         assert router._render_fallbacks == 1
 
-    def test_ids_are_not_forwarded_when_a_worker_renders_differently(self, router) -> None:
-        fingerprint = _Router.fingerprint(router)
+    def test_ids_are_not_forwarded_when_a_worker_renders_differently(
+        self, router, tokenizer
+    ) -> None:
+        fingerprint = _Router.worker_fingerprint(tokenizer)
         other = {**fingerprint, "digest": "a-different-digest"}
         router._server_info = {
             "server1": {"render_fingerprint": fingerprint},
@@ -182,7 +203,7 @@ class TestRouterWriteBack:
         assert request.prompt_token_ids is None
 
     def test_a_named_tool_choice_is_never_forwarded(self, router, tokenizer) -> None:
-        self._trust(router)
+        self._trust(router, tokenizer)
         request = chat_request(
             tools=[WEATHER_TOOL],
             tool_choice={"type": "function", "function": {"name": "get_weather"}},
@@ -193,8 +214,8 @@ class TestRouterWriteBack:
         assert ids  # still used for routing
         assert request.prompt_token_ids is None
 
-    def test_media_is_routed_on_an_estimate_and_never_forwarded(self, router) -> None:
-        self._trust(router)
+    def test_media_is_routed_on_an_estimate_and_never_forwarded(self, router, tokenizer) -> None:
+        self._trust(router, tokenizer)
         request = chat_request(
             messages=[
                 {
@@ -212,8 +233,8 @@ class TestRouterWriteBack:
         assert ids
         assert request.prompt_token_ids is None
 
-    def test_a_request_that_is_already_pre_tokenized_is_left_alone(self, router) -> None:
-        self._trust(router)
+    def test_a_request_that_is_already_pre_tokenized_is_left_alone(self, router, tokenizer) -> None:
+        self._trust(router, tokenizer)
         request = chat_request(prompt_token_ids=[4, 5, 6])
 
         assert router._tokenize(request) == [[4, 5, 6]]

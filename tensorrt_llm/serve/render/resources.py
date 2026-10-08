@@ -193,14 +193,18 @@ class RenderResources:
                 )
             except Exception:
                 logger.debug(f"No AutoProcessor for {model}.")
-        hf_config = None
+        # The model type selects the serving extension and Harmony. A worker cannot start
+        # without its config, so a renderer that could not read it must not quietly fall
+        # back to generic text rendering (a different fingerprint, a different prompt).
         try:
             hf_config = load_pretrained_config(
                 model, trust_remote_code=trust_remote_code, checkpoint_format=checkpoint_format
             )
-        except Exception:
-            logger.debug(f"Failed to load the model config for {model}.")
-        model_type = resolve_top_level_model_type(hf_config) if hf_config is not None else None
+        except Exception as error:
+            raise ValueError(
+                f"Could not load the model configuration from {model!r}: {error}"
+            ) from error
+        model_type = resolve_top_level_model_type(hf_config)
         return cls(
             tokenizer=loaded,
             model_type=model_type,
