@@ -213,6 +213,65 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 extra_evaluator_kwargs=dict(apply_chat_template=True),
             )
 
+    # The NVFP4 requant: the Blackwell/Rubin deployment precision, served
+    # here by the aggregate DEP8 recipe rather than the DEP16 one above.
+    NVFP4_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-NVFP4"
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    # Attention DP replicates every non-expert weight on each rank, so DEP8
+    # holds far more weight per GPU than TEP8 does; only GB300-class memory
+    # leaves room for the KV cache.
+    @pytest.mark.skip_less_device_memory(250000)
+    def test_gsm8k_nvfp4_dep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Full GSM8K on the NVFP4 checkpoint with the aggregate DEP8 recipe.
+
+        TP=8 / EP=8 with attention DP, TRTLLM-Gen MoE (fused NVFP4 SiTu
+        cubins), CUDA graphs and chunked prefill.
+        """
+        # Attention DP also replicates the shared-expert and latent MoE MLPs.
+        # Kept in BF16 (the default) they cost about 15.7 GiB more per rank
+        # and leave DEP8 no KV-cache room, so read them as FP8 block-scale
+        # weights; the GSM8K reference was measured with this cast. The
+        # variable is read in the worker ranks while the model is built, so it
+        # travels as an LLM env override. LLM also sets it in this process and
+        # does not restore it, hence the monkeypatch teardown.
+        fp8_moe_mlp_env = {"KIMI_K3_FP8_WEIGHT_READ_MOE_MLP": "1"}
+        for key, value in fp8_moe_mlp_env.items():
+            monkeypatch.setenv(key, value)
+        with LLM(
+            self.NVFP4_MODEL_PATH,
+            env_overrides=fp8_moe_mlp_env,
+            tensor_parallel_size=8,
+            moe_expert_parallel_size=8,
+            enable_attention_dp=True,
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            disable_overlap_scheduler=False,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
+            moe_config=MoeConfig(
+                backend="TRTLLM",
+                max_num_tokens=131072,
+                use_low_precision_moe_combine=True,
+            ),
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                # Attention DP replicates KV per rank. A smaller fraction lets
+                # clamp_max_seq_len_for_mem drop max_seq_len below a GSM8K
+                # prompt, which then overruns max_blocks_per_seq mid-run.
+                free_gpu_memory_fraction=0.4,
+                tokens_per_block=64,
+            ),
+        ) as llm:
+            # The requant ships hf_quant_config.json, so the matcher sees
+            # MIXED_PRECISION -- only the experts are 4-bit.
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def _assert_checkpoint_routing(self) -> None:
         config = load_pretrained_config(self.MODEL_PATH, trust_remote_code=True)
         assert isinstance(config, KimiK3Config)
