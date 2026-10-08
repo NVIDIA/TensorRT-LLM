@@ -280,6 +280,9 @@ class TestIndexMapperSlotReuse:
         )[1]
         manager._early_freed_index_requests = set()
         kv_cache = MagicMock()
+        # release_index_slot walks the sequence's own beam width (#17306), not
+        # the manager's max_beam_width; an unset MagicMock attribute is int 1.
+        kv_cache.beam_width = 2
         kv_cache.set_base_page_index_buf.side_effect = (
             lambda beam_idx, pool_idx, value: events.append(("detach", beam_idx, pool_idx, value))
         )
@@ -289,13 +292,13 @@ class TestIndexMapperSlotReuse:
 
         expected_calls = [
             call(beam_idx, pool_idx, None)
-            for beam_idx in range(manager.max_beam_width)
+            for beam_idx in range(kv_cache.beam_width)
             for pool_idx in range(manager.num_pools)
         ]
         assert kv_cache.set_base_page_index_buf.call_args_list == expected_calls
         assert events == [
             ("detach", beam_idx, pool_idx, None)
-            for beam_idx in range(manager.max_beam_width)
+            for beam_idx in range(kv_cache.beam_width)
             for pool_idx in range(manager.num_pools)
         ] + [("remove", 1)]
         assert not _has_sequence(index_mapper, 1)
