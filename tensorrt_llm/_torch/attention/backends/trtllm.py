@@ -42,6 +42,7 @@ from ...pyexecutor.config_utils import is_mla
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from .fmha.manager import FmhaManager
+from .fmha.prims_ts import PrimsTSFmha
 from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -2368,6 +2369,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if fmha is None:
             raise RuntimeError(
                 "No TRT-LLM attention FMHA library supports this request.")
+        recipe = self.quant_attention_config
+        if recipe is not None and recipe.algorithm != "sage" and not isinstance(
+                fmha, PrimsTSFmha):
+            raise RuntimeError(
+                f"The {recipe.algorithm} attention recipe needs the PrimTS FMHA "
+                f"library (TLLM_FMHA_LIBS=+prims_ts), got "
+                f"{type(fmha).__name__}.")
         if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
             # Conservatively disable reclamation for metadata used by graphs
             # or backends that can retain staged workspace state.

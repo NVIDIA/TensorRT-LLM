@@ -180,6 +180,20 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize("qk_dtype", ["bf16", "fp8"])
+    def test_supported_quant_config_primsts(self, sm_ver, qk_dtype):
+        """PrimTS per-tensor recipes validate on Blackwell for both Q/K dtypes."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype, v_dtype="fp8", algorithm="primsts"
+                ),
+            )
+
+        assert attention.quant_attention_config.algorithm == "primsts"
+
     @pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
     def test_smooth_k_rejected_on_non_trtllm_backend(self, backend):
         with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):

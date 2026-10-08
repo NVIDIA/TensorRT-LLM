@@ -64,7 +64,7 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `q_block_size` | int ≥ 0 | `0` | Q tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `k_block_size` | int ≥ 0 | `0` | K tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
-| `algorithm` | `"primsts" \| "sage" \| "vc_attention-qk16"` | `"sage"` | Kernel family serving the recipe on the `TRTLLM` backend. `sage` quantizes per block; `primsts` quantizes per tensor and `vc_attention-qk16` adds the VC-Attention V treatment, both served by the `prims_ts` FMHA library. |
+| `algorithm` | `"primsts" \| "sage"` | `"sage"` | Kernel family serving the recipe on the `TRTLLM` backend. `sage` quantizes per block; `primsts` quantizes per tensor and is served by the `prims_ts` FMHA library. |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 
