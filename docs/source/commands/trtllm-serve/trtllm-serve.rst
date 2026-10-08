@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 trtllm-serve
 ============
 
@@ -325,7 +328,7 @@ Runtime Profiling Endpoints
 
 .. note::
 
-   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.
+   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). APIs, parameters, and behaviour may change in future releases.
 
 The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting ``trtllm-serve`` and without setting ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``. Under TP/PP > 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a ``rank-<N>`` suffix in the filename) and all ranks profile the same iterations in lockstep.
 

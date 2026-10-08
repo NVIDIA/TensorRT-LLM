@@ -62,10 +62,8 @@ MODELING_V2_ROUTERS = {
 }
 
 #: Backends whose model construction reaches ``modeling_v2_resolve``. The
-#: resolver is called from ``AutoModelForCausalLM._resolve_class``, so a
-#: backend that builds its model some other way never consults it -- AutoDeploy
-#: goes through ``ADEngine.build_from_config`` and nothing under
-#: ``_torch/auto_deploy/`` mentions modeling_v2 at all.
+#: resolver is called from ``AutoModelForCausalLM._resolve_class`` during
+#: PyTorch model construction.
 ROUTING_BACKENDS = frozenset({"pytorch"})
 
 

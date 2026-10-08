@@ -44,8 +44,8 @@ in the subtree are Markdown. Claiming them would make a
 documentation-only PR pull in multi-GPU GB300 stages.
 
 PerfSanity policy: `perfsanity_relevant` is dynamic, True only when a
-matched block lives in a `*_perf_sanity*` yaml -- same as AutoDeployRule
-/ VisualGenRule / SpecDecRule. modeling_v2 has no perf-sanity entries
+matched block lives in a `*_perf_sanity*` yaml -- same as VisualGenRule
+/ SpecDecRule. modeling_v2 has no perf-sanity entries
 today, so this aggregates to False and Groovy Layer 2 drops the
 force-keep of `*-PerfSanity-*` stages.
 

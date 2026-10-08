@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # TensorRT-LLM Examples
 
 ## Quick Start
@@ -50,19 +55,12 @@ For model-specific walkthroughs and an interactive recipe selector, see the
 [Model Recipes](https://nvidia.github.io/TensorRT-LLM/deployment-guide/index.html)
 deployment guide.
 
-## Legacy Engine-Build Workflow
+## Migrating from the Engine-Build Workflow
 
-> **⚠️ Legacy:** The `convert_checkpoint.py` → `trtllm-build` → `run.py`
-> workflow is legacy and may not receive new features.
-> For new projects, use `trtllm-serve` or the LLM API as shown above.
-
-The [`models/`](models/) directory contains per-model scripts for the legacy
-TensorRT engine-build workflow. These scripts convert Hugging Face checkpoints
-to TensorRT engines for deployment. While still functional for supported models,
-this workflow is no longer the recommended path and may not support newly added
-models.
-
-If you are following a tutorial or guide that references `convert_checkpoint.py`
-or `trtllm-build`, please refer to the
+The legacy TensorRT execution backend and its `convert_checkpoint.py` →
+`trtllm-build` → `run.py` workflow have been removed. Use `trtllm-serve` or the
+LLM API as shown above. See the
 [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-for the current recommended workflow.
+for the current workflow and the
+[legacy documentation](../docs/source/legacy/)
+for historical engine-build instructions.

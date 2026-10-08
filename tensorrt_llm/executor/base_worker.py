@@ -1088,8 +1088,8 @@ class BaseWorker(GenerationExecutor):
                       activities: Optional[List[str]] = None) -> None:
         """Forward profiling request to the underlying PyExecutor engine.
 
-        No-op (with a warning) for legacy TensorRT-backend engines which
-        do not expose this API.
+        Logs a warning if the engine is uninitialized or does not expose
+        the profiling API.
         """
         if self.engine is None:
             logger.warning(
