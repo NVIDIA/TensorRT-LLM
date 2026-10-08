@@ -1796,9 +1796,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             if cutlass.const_expr(self.is_var_split_kv):
                 local_split_kv = block_split_kvs[bidz]
             k_tile_total = cute.ceil_div(cache_seqs[bidz], self.mma_qk_tiler[1])
-            k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
-            if cutlass.const_expr(kv_bounds is not None):
-                k_tile_per_cta = cutlass.max(k_tile_per_cta, 1)
+            # A request without KV has no K tiles; keep the divisor nonzero.
+            k_tile_per_cta = cutlass.max(
+                cute.ceil_div(k_tile_total, local_split_kv), 1)
             local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
             gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]

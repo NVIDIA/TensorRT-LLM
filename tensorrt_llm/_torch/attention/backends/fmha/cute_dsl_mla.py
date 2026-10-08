@@ -204,7 +204,7 @@ class CuteDslMlaFmha(PhasedFmha):
             mma_qk_tiler_mn,
             mma_pv_tiler_mn,
             1,  # split_kv
-            True,  # is_persistent
+            False,  # is_persistent
             True,  # is_var_seq
             False,  # is_var_split_kv
             page_size,

@@ -11962,6 +11962,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _WORKSPACE_ALIGN = 128
         _LSE_DTYPE_BYTES = 4  # float32
 
+        _MMA_TILE_M = 128
+        _MAX_SPLIT_KV = 32
+        # CTA waves the split targets: with one wave, the longest request of a
+        # skewed decode batch sets the kernel time.
+        _SPLIT_KV_WAVES = 8
+
         def __init__(
             self,
             in_dtype,
@@ -12021,25 +12027,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cls._cute_dsl_max_active_blocks = cached
             return cached
 
-        @staticmethod
-        def get_default_split_kv(B: int, S: int, max_active_blocks: int) -> int:
-            # S is the number of packed 128-row query tiles per request.
-            max_split_kv = 32
-            blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
-            split_kv = min(blocks_per_batch, max_split_kv)
-            return split_kv
+        @classmethod
+        def get_num_q_tiles(cls, num_heads: int, seq_len_q: int) -> int:
+            """Packed 128-row query tiles per request: the kernel packs the
+            ``seq_len_q * num_heads`` query rows into the M tile."""
+            return ceil_div(num_heads * seq_len_q, cls._MMA_TILE_M)
 
-        @staticmethod
-        def get_default_is_persistent(B: int) -> bool:
-            if B >= 64:
-                return True
-            else:
-                return False
+        @classmethod
+        def get_default_split_kv(cls, B: int, S: int,
+                                 max_active_blocks: int) -> int:
+            """~_SPLIT_KV_WAVES waves of (2, B * S, split_kv) CTAs, as a power of
+            two; ``S`` is the number of packed query tiles per request."""
+            target = cls._SPLIT_KV_WAVES * max_active_blocks / (2 * B * S)
+            return min(cls._MAX_SPLIT_KV, 1 << max(0, round(math.log2(target))))
 
         @staticmethod
         def get_split_kv_candidates(B: int, S: int,
                                     max_active_blocks: int) -> List[int]:
-            # TODO: default split_kv is not always the best choice. We need to optimize it.
+            # One candidate: tuning profiles short KV, where split 1 wins, but the
+            # tactic is reused for long decode KV.
             return [
                 CuteDSLNVMlaDecodeBlackwellRunner.get_default_split_kv(
                     B, S, max_active_blocks)
@@ -12047,36 +12053,61 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @staticmethod
         def get_is_persistent_candidates() -> List[bool]:
-            return [True, False]
+            # The hardware scheduler balances skewed KV better than persistent
+            # round-robin; short-KV tuning would not see it.
+            return [False]
+
+        @classmethod
+        def get_max_split_kv_rows(cls, H: int, S: int,
+                                  max_batch_size: int) -> int:
+            """Largest B * num_q_tiles(s) * split_kv over the batch buckets up
+            to ``max_batch_size`` and every s <= S, so the bound never shrinks
+            as S grows (the shared CUDA-graph workspace is sized once)."""
+            return cls._max_split_kv_rows(H, S, max_batch_size,
+                                          cls._get_max_active_blocks())
+
+        @classmethod
+        @functools.cache
+        def _max_split_kv_rows(cls, H: int, S: int, max_batch_size: int,
+                               max_active_blocks: int) -> int:
+            rows = 0
+            for s in range(1, S + 1):
+                num_q_tiles = cls.get_num_q_tiles(H, s)
+                bucket = 1
+                while bucket <= max(1, max_batch_size):
+                    split_kv = cls.get_default_split_kv(bucket, num_q_tiles,
+                                                        max_active_blocks)
+                    if split_kv > 1:
+                        rows = max(rows, bucket * num_q_tiles * split_kv)
+                    bucket *= 2
+            return rows
 
         @classmethod
         def get_max_split_kv_workspace_size(
             cls,
             H: int,
+            S: int,
             D: int,
+            max_batch_size: int,
             acc_dtype: Type[cutlass.Numeric],
         ) -> int:
             """Raw bytes reserved for split-KV intermediates.
 
-            Batch-INDEPENDENT: CUDA graphs are captured per batch size in
-            descending order, and a later capture that needed a larger workspace
-            would resize the buffer, dangling the address baked into every
-            previously captured graph.
+            Fixed per (H, S, max_batch_size), never per batch: CUDA graphs are
+            captured per batch size in descending order, and a later capture
+            that needed a larger workspace would resize the buffer, dangling
+            the address baked into every previously captured graph.
 
             # cuda graph capture(B=8):   eager warmup N times  →  capture graph_8
             # cuda graph capture(B=4):   eager warmup N times  →  capture graph_4
             # ...
             # cuda graph replay
             # A later capture with a bigger workspace would resize it, so the
-            # bound covers every batch size up-front."""
-            max_active_blocks = cls._get_max_active_blocks()
-            # Each query tile reserves 128 rows, including its masked tail.
-            # For split_kv > 1, the occupancy heuristic bounds
-            # B * num_q_tiles * split_kv by max_active_blocks / 2 at a tuning
-            # bucket. Runtime batches below the next bucket can use up to
-            # twice that space. split_kv == 1 does not use this workspace.
-            return (2 * max(H, 128) * (max_active_blocks // 2) * (D + 1) *
-                    acc_dtype.width // 8)
+            # bound covers every batch size up-front; ``forward`` lowers
+            # split_kv for a batch between two buckets instead. Each query tile
+            # reserves _MMA_TILE_M rows, including its masked tail."""
+            return (cls.get_max_split_kv_rows(H, S, max_batch_size) *
+                    cls._MMA_TILE_M * (D + 1) * acc_dtype.width // 8)
 
         @classmethod
         def get_workspace_layout(
@@ -12092,7 +12123,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             lse_size = cls.get_lse_workspace_size(H, seq_len_q, max_batch_size)
             split_kv_offset = pad_up(lse_offset + lse_size,
                                      cls._WORKSPACE_ALIGN)
-            split_kv_size = cls.get_max_split_kv_workspace_size(H, D, acc_dtype)
+            split_kv_size = cls.get_max_split_kv_workspace_size(
+                H, seq_len_q, D, max_batch_size, acc_dtype)
             workspace_size = split_kv_offset + pad_up(split_kv_size,
                                                       cls._WORKSPACE_ALIGN)
             return (lse_offset, lse_size, split_kv_offset, split_kv_size,
@@ -12150,9 +12182,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ((128, 128), (128, 256)),
             ]
             max_active_blocks = self._get_max_active_blocks()
-            num_q_tiles = ceil_div(h * seq_len_q, 128)
             split_candidates = self.get_split_kv_candidates(
-                batch_size, num_q_tiles, max_active_blocks)
+                batch_size, self.get_num_q_tiles(h, seq_len_q),
+                max_active_blocks)
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
@@ -12329,24 +12361,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             ``batch_size`` is rounded down to its tuning bucket
             (``last_positive_power_of_2`` -- the same mapping the tuning
-            config uses) before deriving ``split_kv``: tuning profiles (and
-            therefore ``cute.compile``s) exactly the bucket-derived
-            ``split_kv`` variants, so a bucket-aligned fallback reuses an
-            already-compiled kernel where one exists instead of JIT-compiling
-            a fresh raw-batch ``split_kv`` variant in the serving loop. The
-            ``is_persistent`` choice is unaffected by the rounding (its
-            threshold is a power of two, so rounding down to a power of two
-            never crosses it), and both candidates are compiled during tuning
-            anyway."""
+            config uses) before deriving ``split_kv``, so the fallback is the
+            tactic tuning would have stored for that bucket, and the one the
+            split-KV workspace is sized for."""
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
-            num_q_tiles = ceil_div(self.num_heads * self.seq_len_q, 128)
-            split_kv = self.get_default_split_kv(bucketed_batch_size,
-                                                 num_q_tiles, max_active_blocks)
-            is_persistent = self.get_default_is_persistent(bucketed_batch_size)
-            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
+            split_kv = self.get_default_split_kv(
+                bucketed_batch_size,
+                self.get_num_q_tiles(self.num_heads, self.seq_len_q),
+                max_active_blocks)
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
 
         def forward(
             self,
@@ -12486,6 +12512,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Kernel split-KV intermediates start AFTER the reserved LSE region.
             split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
                                               split_kv_size]
+            # The workspace fits each batch bucket's split; a batch between two
+            # buckets shrinks its split to fit instead of JIT-compiling a variant.
+            split_kv_rows = split_kv_size // (self._MMA_TILE_M *
+                                              (d_latent + 1) *
+                                              cutlass.Float32.width // 8)
+            fitting_split_kv = split_kv_rows // (
+                batch_size * self.get_num_q_tiles(self.num_heads, seq_len_q))
+            use_workspace = split_kv > 1 and fitting_split_kv >= 1
+            split_kv = max(1, min(split_kv, fitting_split_kv))
 
             if kv_bounds is not None and AutoTuner.get().is_tuning_mode:
                 # Profiling rebuilds cache_seqs at bucketed sizes but input 9
@@ -12507,11 +12542,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{expected_bounds_shape}, got shape="
                         f"{tuple(kv_bounds.shape)}, dtype={kv_bounds.dtype}.")
 
+            # split_kv is a runtime Int32; only the workspace use is compiled in.
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
                 mma_pv_tiler_mn,
-                split_kv,
+                use_workspace,
                 is_persistent,
                 kv_bounds is not None,
             )
@@ -12569,7 +12605,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     softmax_stats_kernel, assumed_align=16).mark_layout_dynamic(
                         leading_dim=3) if softmax_stats_kernel is not None else
                                     None)
-                use_workspace = split_kv > 1 and split_workspace.numel() > 0
                 workspace_ct = (cute.runtime.from_dlpack(
                     split_workspace, assumed_align=32).mark_layout_dynamic()
                                 if use_workspace else None)
@@ -12642,8 +12677,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if self.emit_softmax_stats:
                 runtime_args.append(softmax_stats_kernel)
             runtime_args.extend([
-                split_workspace if
-                (split_kv > 1 and split_workspace.numel() > 0) else None,
+                split_workspace if use_workspace else None,
                 split_kv,
                 cache_seqs,
                 kv_bounds,
