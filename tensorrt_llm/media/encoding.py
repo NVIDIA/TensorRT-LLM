@@ -50,6 +50,31 @@ def _check_ffmpeg_available() -> bool:
     return bool(_FFMPEG_PATH)
 
 
+_X264_PRESETS = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+
+
+def _x264_preset() -> str:
+    """libx264 preset; ``TRTLLM_VIDEO_X264_PRESET`` overrides the medium default."""
+    preset = os.environ.get("TRTLLM_VIDEO_X264_PRESET", "medium").strip().lower()
+    if preset not in _X264_PRESETS:
+        raise ValueError(
+            f"TRTLLM_VIDEO_X264_PRESET={preset!r} is not a libx264 preset; "
+            f"expected one of {_X264_PRESETS}"
+        )
+    return preset
+
+
 def _get_ffmpeg_path() -> str:
     """Return cached ffmpeg path (after :func:`_check_ffmpeg_available`)."""
     if _FFMPEG_PATH is None:
@@ -167,7 +192,7 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 "-pix_fmt",
                 "yuv420p",
                 "-preset",
-                "medium",
+                _x264_preset(),
                 "-crf",
                 "23",
                 *audio_output_args,
