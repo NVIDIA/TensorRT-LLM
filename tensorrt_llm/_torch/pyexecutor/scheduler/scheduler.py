@@ -737,7 +737,8 @@ class MultimodalScheduler(RequestScheduler):
                 for holder in active_requests[position + 1 :]
                 if holder.py_mm_encoder_state is not None
                 and any(
-                    cache_key is not None for cache_key in holder.py_mm_encoder_state.item_cache_keys
+                    cache_key is not None
+                    for cache_key in holder.py_mm_encoder_state.item_cache_keys
                 )
             ]
             if not holders:

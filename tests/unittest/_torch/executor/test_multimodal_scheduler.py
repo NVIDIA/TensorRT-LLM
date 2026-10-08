@@ -751,7 +751,11 @@ _BYTES_PER_ROW = 4
 
 
 def _make_v2_multimodal_scheduler(
-    *, kv_capacity, max_num_tokens, encoder_max_num_tokens, encoder_batch_size,
+    *,
+    kv_capacity,
+    max_num_tokens,
+    encoder_max_num_tokens,
+    encoder_batch_size,
     stable_cache_keys=True,
 ):
     kv_allocated = {}
@@ -854,7 +858,10 @@ def _run_prefill(scheduler, requests, *, arrivals=None, before_pass=None, max_pa
 def test_v2_chunked_prefill_spends_encoder_budget_in_admission_order(stable_cache_keys):
     # Two encoder slots; the 12 B output budget holds 3 embedding rows.
     scheduler, _ = _make_v2_multimodal_scheduler(
-        kv_capacity=80, max_num_tokens=60, encoder_max_num_tokens=12, encoder_batch_size=2,
+        kv_capacity=80,
+        max_num_tokens=60,
+        encoder_max_num_tokens=12,
+        encoder_batch_size=2,
         stable_cache_keys=stable_cache_keys,
     )
     first = _make_v2_request(1, 10, [1])
