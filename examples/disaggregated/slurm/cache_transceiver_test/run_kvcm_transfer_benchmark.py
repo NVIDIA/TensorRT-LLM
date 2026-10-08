@@ -412,6 +412,8 @@ def main() -> None:
     rank = int(os.environ["SLURM_LOCALID"])
     sweep = int(os.environ["CTT_SWEEP"])
     torch.cuda.set_device(rank % torch.cuda.device_count())
+    benchmark_stream = torch.cuda.Stream()
+    torch.cuda.set_stream(benchmark_stream)
     if args.role == "gen":
         out = Path(config["work_dir"]) / "kvcm_transfer"
         out.mkdir(parents=True, exist_ok=True)

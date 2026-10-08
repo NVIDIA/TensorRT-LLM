@@ -1,12 +1,13 @@
 # Configuration for the 2-node KV cache transceiver bandwidth / UCX-tuning harness.
 #
 # Fill in the placeholders (<...>) and run:
-#     ./submit.py
+#     python3 submit.py -c config.yaml
 #
 # The job allocates 2 nodes; one runs the context (ctx) group, the other the
 # generation (gen) group, each using `hardware.gpus_per_node` GPUs. For every
-# UCX env-var set, transceiver combination, and request length, the harness
-# transfers KV cache ctx -> gen, verifies correctness, and reports bandwidth.
+# UCX env-var set in `ucx_env_sweep`, every transceiver combination in
+# `test_matrix.combinations`, and every request length, the harness transfers KV cache
+# ctx -> gen, verifies correctness, and reports the achieved bandwidth.
 
 slurm:
   partition: "<partition>"
@@ -58,8 +59,8 @@ test_matrix:
   warmup_requests: 2
 
 host_transfer_benchmark:
-  # Transport-only NIXL payload benchmark on the same two nodes and UCX sweep.
-  # "gpu" is the direct GPU-only baseline. Each mode verifies every byte.
+  # NIXL payload benchmark on the same two nodes and UCX sweep. Reports both
+  # transport-only and GPU-ready (including staging) rates, with "gpu" as baseline.
   enabled: true
   modes: ["gpu", "host", "host_to_gpu", "gpu_to_host"]
   bytes_per_transfer: 16777216

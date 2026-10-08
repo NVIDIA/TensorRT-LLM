@@ -85,6 +85,41 @@ def test_host_bandwidth_compares_only_verified_samples_with_gpu(
     assert modes[1]["ratio_to_gpu"] == 0.5
 
 
+def test_host_gpu_ready_bandwidth_includes_staging(tmp_path: Path) -> None:
+    config = {
+        "environment": {"work_dir": str(tmp_path)},
+        "hardware": {"gpus_per_node": 1},
+        "ucx_env_sweep": [{"name": "default"}],
+        "host_transfer_benchmark": {"enabled": True, "modes": ["gpu", "host"]},
+    }
+    gpu_samples = _samples(1)
+    host_samples = _samples(0.5)
+    gpu_samples[0]["gpu_ready_seconds"] = 1
+    host_samples[0]["gpu_ready_seconds"] = 3
+    _write(tmp_path, "host_transfer", "gpu", gpu_samples)
+    _write(tmp_path, "host_transfer", "host", host_samples)
+    modes = _report_module()._aggregate_host_transfer(config)[0]["modes"]
+    assert modes[0]["gpu_ready_GBps"] == 1
+    assert modes[1]["ratio_to_gpu"] == 2
+    assert modes[1]["gpu_ready_GBps"] == pytest.approx(1 / 3)
+    assert modes[1]["gpu_ready_ratio_to_gpu"] == pytest.approx(1 / 3)
+
+
+def test_host_legacy_samples_have_no_gpu_ready_comparison(tmp_path: Path) -> None:
+    config = {
+        "environment": {"work_dir": str(tmp_path)},
+        "hardware": {"gpus_per_node": 1},
+        "ucx_env_sweep": [{"name": "default"}],
+        "host_transfer_benchmark": {"enabled": True, "modes": ["gpu", "host"]},
+    }
+    _write(tmp_path, "host_transfer", "gpu", _samples(1))
+    _write(tmp_path, "host_transfer", "host", _samples(2))
+    modes = _report_module()._aggregate_host_transfer(config)[0]["modes"]
+    assert all(mode["status"] == "PASS" for mode in modes)
+    assert all(mode["gpu_ready_GBps"] is None for mode in modes)
+    assert all(mode["gpu_ready_ratio_to_gpu"] is None for mode in modes)
+
+
 @pytest.mark.parametrize("missing", ["byte_correct", "logical_cancel", "delayed_completion"])
 @pytest.mark.parametrize(
     "section,directory",

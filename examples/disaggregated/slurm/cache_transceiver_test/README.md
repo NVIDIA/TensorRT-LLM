@@ -13,16 +13,21 @@ transceivers, and for every UCX environment set you list.
 The `host_transfer_benchmark` runs after each sweep on the same nodes and GPU
 ranks. It sends the same byte payload through NIXL as GPU→GPU, host→host,
 host→GPU, and GPU→host transfers. GPU→GPU is the comparison baseline. Every
-sample verifies all received bytes against a deterministic pattern. Two untimed
+mode begins with the payload on the context GPU and ends with it on the
+generation GPU. Host modes time the necessary GPU→pinned-host and/or
+pinned-host→GPU copies separately from NIXL, and report both transport-only
+bandwidth and GPU-ready bandwidth from the sum of those stages. Every sample
+verifies the GPU-resident destination against a deterministic pattern. Two untimed
 cases retain registered buffers after submission: `delayed_completion` defers
 completion reporting, and `logical_cancel` sends cancellation notice before a
 separate physical-drain handshake. If physical
 completion cannot be proven, the process terminates without deregistering the
 possibly live buffer.
 
-This measures the physical NIXL DRAM/VRAM payload path. It does not allocate
-offloaded KVCM pages or exercise request claims. The production transceiver
-still needs per-page claim integration for an end-to-end host-aware measurement.
+This measures the physical NIXL DRAM/VRAM payload path and local staging cost.
+It does not allocate offloaded KVCM pages or exercise request claims. GPU-ready
+bandwidth excludes allocation, registration, KVCM admission, scheduling, and
+model execution; it is not end-to-end serving throughput.
 
 The `kvcm_transfer_benchmark` adds the native-page measurement. It creates a
 single sparse attention layer in KVCM V2, writes deterministic bytes to its GPU
@@ -36,8 +41,10 @@ and peer handshake prove physical settlement. `mixed` reserves alternating
 host and GPU destination pages, exercising two NIXL memory-type batches.
 
 The KVCM benchmark compares host modes against its own GPU→GPU baseline with
-the same page geometry. It measures transfer bandwidth through real KVCM
-addresses. Production PD transfer planning, layer remapping, and decode are
+the same page geometry. It measures transport-only bandwidth through real KVCM
+addresses. Source offload occurs once during setup, and destination promotion
+to GPU is not timed, so its host→host ratio must not be read as a GPU-ready
+speedup. Production PD transfer planning, layer remapping, and decode are
 outside this benchmark.
 
 ## Topology
@@ -142,6 +149,15 @@ deliverable for tuning your cluster.
 `Bandwidth(Gbps) ÷ 8`, Python `throughput_mbs × 1024² ÷ 1e9`, then takes the
 median across ranks. The two runtimes time slightly different spans, so compare
 within a `(combination)` across UCX sweeps.
+
+For `host_transfer_benchmark`, `per_gpu_GBps` and `ratio_to_gpu` remain the
+transport-only measurements. `gpu_ready_GBps` and `gpu_ready_ratio_to_gpu` use
+`gpu_ready_seconds = source_stage_seconds + seconds + destination_stage_seconds`
+for each timed request, then take the median per-GPU rate. The staging copies
+are repeated for every request; warmup, delayed completion, and logical cancel
+are excluded from bandwidth statistics. Existing result files without staging
+timings retain transport-only values and report `null` for GPU-ready values.
+`kvcm_transfer_benchmark` reports only transport-only rates.
 
 ## Notes & limitations
 

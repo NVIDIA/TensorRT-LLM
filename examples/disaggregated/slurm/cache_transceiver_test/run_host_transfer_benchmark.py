@@ -73,13 +73,15 @@ def _run_mode(
     warmup = int(config.get("warmup", 2))
     delay_ms = int(config.get("delayed_completion_ms", 100))
     tensor = _buffer(size, kind)
+    gpu_endpoint = _buffer(size, "VRAM") if kind == "DRAM" else tensor
     expected = _pattern(size, rank, mode_index)
     if role == "ctx":
-        tensor.copy_(expected, non_blocking=False)
+        gpu_endpoint.copy_(expected, non_blocking=False)
     else:
         tensor.zero_()
-    if kind == "VRAM":
-        torch.cuda.synchronize()
+        if kind == "DRAM":
+            gpu_endpoint.zero_()
+    torch.cuda.synchronize()
     device = torch.cuda.current_device() if kind == "VRAM" else 0
     name = f"ctt_{role}_{rank}_{mode}_{sweep}"
     peer = f"ctt_{'gen' if role == 'ctx' else 'ctx'}_{rank}_{mode}_{sweep}"
@@ -115,8 +117,9 @@ def _run_mode(
         for scenario, index in scenarios:
             if role == "gen":
                 tensor.zero_()
-                if kind == "VRAM":
-                    torch.cuda.synchronize()
+                if kind == "DRAM":
+                    gpu_endpoint.zero_()
+                torch.cuda.synchronize()
                 socket.send_pyobj((scenario, index))
                 remote_active = True
                 result = socket.recv_pyobj()
@@ -128,19 +131,35 @@ def _run_mode(
                     result = socket.recv_pyobj()
                 if result.get("error"):
                     raise RuntimeError(result["error"])
-                remote_active = False
-                actual = tensor.cpu()
+                destination_stage_seconds = 0.0
+                if kind == "DRAM":
+                    stage_start = time.perf_counter()
+                    gpu_endpoint.copy_(tensor, non_blocking=True)
+                    torch.cuda.synchronize()
+                    destination_stage_seconds = time.perf_counter() - stage_start
+                actual = gpu_endpoint.cpu()
                 if not torch.equal(actual, expected):
                     mismatch = torch.nonzero(actual != expected).flatten()
                     raise AssertionError(
                         f"{mode} {scenario}: {len(mismatch)} wrong bytes; first={mismatch[0].item()}"
                     )
+                socket.send_pyobj("ready")
+                if socket.recv_pyobj() != "ready":
+                    raise RuntimeError("missing sender GPU-ready acknowledgement")
+                remote_active = False
                 results.append(
                     {
                         "scenario": scenario,
                         "sample": index,
                         "warmup": scenario == "throughput" and index < warmup,
                         "seconds": result["seconds"],
+                        "source_stage_seconds": result["source_stage_seconds"],
+                        "destination_stage_seconds": destination_stage_seconds,
+                        "gpu_ready_seconds": (
+                            result["source_stage_seconds"]
+                            + result["seconds"]
+                            + destination_stage_seconds
+                        ),
                         "bytes": size,
                         "byte_correct": True,
                         "logical_cancel": result["logical_cancel"],
@@ -150,6 +169,12 @@ def _run_mode(
                 received = socket.recv_pyobj()
                 if received != (scenario, index):
                     raise RuntimeError(f"unexpected benchmark control message: {received!r}")
+                source_stage_seconds = 0.0
+                if kind == "DRAM":
+                    stage_start = time.perf_counter()
+                    tensor.copy_(gpu_endpoint, non_blocking=True)
+                    torch.cuda.synchronize()
+                    source_stage_seconds = time.perf_counter() - stage_start
                 request = TransferRequest(
                     TransferOp.WRITE,
                     _memory_desc(src_kind, tensor.data_ptr(), size, device),
@@ -171,8 +196,17 @@ def _run_mode(
                 elapsed = time.perf_counter() - start
                 if not complete or not status.is_completed():
                     raise RuntimeError(f"{mode} {scenario}: physical completion unproven")
+                socket.send_pyobj(
+                    {
+                        "seconds": elapsed,
+                        "source_stage_seconds": source_stage_seconds,
+                        "logical_cancel": cancelled,
+                    }
+                )
+                if socket.recv_pyobj() != "ready":
+                    raise RuntimeError("missing receiver GPU-ready acknowledgement")
+                socket.send_pyobj("ready")
                 submitted = False
-                socket.send_pyobj({"seconds": elapsed, "logical_cancel": cancelled})
         if role == "gen":
             socket.send_pyobj("done")
             socket.recv_pyobj()

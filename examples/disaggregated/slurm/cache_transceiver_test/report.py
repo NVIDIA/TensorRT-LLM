@@ -554,8 +554,11 @@ def _aggregate_transfer_evidence(cfg: dict, section: str, directory: str) -> lis
     for sweep_idx, sweep in enumerate(cfg["ucx_env_sweep"]):
         modes = []
         baseline = None
+        gpu_ready_baseline = None
         for mode in host_cfg.get("modes", ["gpu", "host"]):
             rates = []
+            gpu_ready_rates = []
+            gpu_ready_complete = True
             error = None
             for rank in range(ranks):
                 path = os.path.join(work_dir, directory, f"sweep{sweep_idx}_rank{rank}_{mode}.json")
@@ -583,27 +586,48 @@ def _aggregate_transfer_evidence(cfg: dict, section: str, directory: str) -> lis
                     if not timed:
                         raise ValueError("no timed samples")
                     rates.extend(sample["bytes"] / sample["seconds"] / 1e9 for sample in timed)
+                    if section == "host_transfer_benchmark":
+                        if all("gpu_ready_seconds" in sample for sample in timed):
+                            gpu_ready_rates.extend(
+                                sample["bytes"] / sample["gpu_ready_seconds"] / 1e9
+                                for sample in timed
+                            )
+                        else:
+                            gpu_ready_complete = False
                 except (OSError, KeyError, ValueError, ZeroDivisionError) as exc:
                     error = f"rank {rank}: {exc}"
                     break
             rate = statistics.median(rates) if error is None else None
+            gpu_ready_rate = (
+                statistics.median(gpu_ready_rates)
+                if error is None and gpu_ready_complete and gpu_ready_rates
+                else None
+            )
             if mode == "gpu":
                 baseline = rate
-            modes.append(
-                {
-                    "mode": mode,
-                    "status": "PASS" if error is None else "ERROR",
-                    "per_gpu_GBps": rate,
-                    "samples": len(rates),
-                    "error": error,
-                }
-            )
+                gpu_ready_baseline = gpu_ready_rate
+            entry = {
+                "mode": mode,
+                "status": "PASS" if error is None else "ERROR",
+                "per_gpu_GBps": rate,
+                "samples": len(rates),
+                "error": error,
+            }
+            if section == "host_transfer_benchmark":
+                entry["gpu_ready_GBps"] = gpu_ready_rate
+            modes.append(entry)
         for entry in modes:
             entry["ratio_to_gpu"] = (
                 entry["per_gpu_GBps"] / baseline
                 if baseline and entry["per_gpu_GBps"] is not None
                 else None
             )
+            if section == "host_transfer_benchmark":
+                entry["gpu_ready_ratio_to_gpu"] = (
+                    entry["gpu_ready_GBps"] / gpu_ready_baseline
+                    if gpu_ready_baseline and entry["gpu_ready_GBps"] is not None
+                    else None
+                )
         summary.append({"sweep": sweep.get("name", str(sweep_idx)), "modes": modes})
     return summary
 
@@ -722,14 +746,16 @@ def aggregate(cfg, out_path, require_kv_transport=False):
         for mode in sweep["modes"]:
             print(
                 f"host transfer {sweep['sweep']} {mode['mode']}: "
-                f"{mode['status']} {mode['per_gpu_GBps']} GB/s/GPU, "
-                f"GPU ratio={mode['ratio_to_gpu']}"
+                f"{mode['status']} transport={mode['per_gpu_GBps']} GB/s/GPU "
+                f"(GPU ratio={mode['ratio_to_gpu']}), "
+                f"GPU-ready={mode['gpu_ready_GBps']} GB/s/GPU "
+                f"(GPU ratio={mode['gpu_ready_ratio_to_gpu']})"
             )
     for sweep in results["kvcm_transfer_benchmark"]:
         for mode in sweep["modes"]:
             print(
                 f"KVCM transfer {sweep['sweep']} {mode['mode']}: "
-                f"{mode['status']} {mode['per_gpu_GBps']} GB/s/GPU, "
+                f"{mode['status']} transport-only={mode['per_gpu_GBps']} GB/s/GPU, "
                 f"GPU ratio={mode['ratio_to_gpu']}"
             )
     print(f"\nBest-per-combination summary: {best_path}", file=sys.stderr)
