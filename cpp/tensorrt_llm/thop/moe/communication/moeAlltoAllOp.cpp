@@ -29,6 +29,7 @@
 #include <memory>
 #include <torch/extension.h>
 #include <torch/types.h>
+#include <unordered_map>
 #include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -299,8 +300,19 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
 // CFT Handle-Based Counted Writes Initialization
 // ============================================================================
 
-// Static CftLeManager — lives for the process lifetime (like workspace).
-static std::unique_ptr<tensorrt_llm::kernels::moe_comm::CftLeManager> g_cft_manager;
+using CftLeManager = tensorrt_llm::kernels::moe_comm::CftLeManager;
+
+// One CftLeManager per workspace, keyed by this rank's workspace region. Each
+// workspace has its own MNNVL allocation handle, so it needs its own logical
+// endpoint. Managers live for the process lifetime because the driver endpoint
+// stays bound to the workspace allocation.
+static std::unordered_map<CUdeviceptr, std::unique_ptr<CftLeManager>> g_cft_managers;
+
+static CftLeManager* getCftManager(CUdeviceptr workspaceRankPtr)
+{
+    auto const it = g_cft_managers.find(workspaceRankPtr);
+    return it == g_cft_managers.end() ? nullptr : it->second.get();
+}
 
 // Initialize CFT Logical Endpoints by binding the LE to the MNNVL workspace.
 // The workspace memory IS the LE backing store — fabric.try_put.counted writes land
@@ -349,23 +361,20 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     CUdeviceptr workspaceRankPtr
         = reinterpret_cast<CUdeviceptr>(workspace.data_ptr<uint8_t>() + epRank * workspace.stride(0));
 
-    if (g_cft_manager && g_cft_manager->isInitialized())
+    if (auto const* existing = getCftManager(workspaceRankPtr); existing != nullptr && existing->isInitialized())
     {
-        TORCH_CHECK(g_cft_manager->getLocalBackingPtr() == workspaceRankPtr,
-            "CFT logical endpoints are already bound to a different workspace. Only one workspace "
-            "per process may use CFT counted writes.");
         return;
     }
 
-    g_cft_manager = std::make_unique<tensorrt_llm::kernels::moe_comm::CftLeManager>();
+    auto manager = std::make_unique<CftLeManager>();
 
-    TORCH_CHECK(g_cft_manager->loadApis(),
+    TORCH_CHECK(manager->loadApis(),
         "CftLeManager: Failed to load LE driver APIs. The installed driver does not export the "
         "CUDA logical endpoint API that CFT requires.");
 
     int localDevIdx = -1;
     TORCH_CHECK(cudaGetDevice(&localDevIdx) == cudaSuccess, "cudaGetDevice failed during CFT initialization");
-    TORCH_CHECK(g_cft_manager->createEndpointExternal(localDevIdx,
+    TORCH_CHECK(manager->createEndpointExternal(localDevIdx,
                     static_cast<CUmemGenericAllocationHandle>(workspaceMemHandle), workspaceRankPtr,
                     static_cast<size_t>(workspaceSizePerRank), static_cast<int>(epRank), static_cast<int>(epSize)),
         "CftLeManager: Failed to create LE endpoint bound to workspace on device ", localDevIdx);
@@ -373,7 +382,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     auto allgatherFn = [](void const* sendBuf, void* recvBuf, size_t bytesPerRank)
     { moeA2AAllgatherBytes(sendBuf, recvBuf, bytesPerRank); };
 
-    TORCH_CHECK(g_cft_manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
+    TORCH_CHECK(manager->exchangeEndpoints(allgatherFn), "CftLeManager: Failed to exchange LE endpoints");
 
     cudaError_t initErr = cudaDeviceSynchronize();
     if (initErr != cudaSuccess)
@@ -394,6 +403,7 @@ void moeA2ACftInitializeOp(torch::Tensor const& workspace, int64_t workspaceMemH
     {
         moeA2ABarrier();
     }
+    g_cft_managers[workspaceRankPtr] = std::move(manager);
 }
 
 // MoE All-to-All Dispatch Operation
@@ -650,11 +660,12 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     // CFT handle-based counted writes
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
+        auto const* cftManager = getCftManager(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr));
+        TORCH_CHECK(cftManager != nullptr && cftManager->isInitialized(),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
 
         // Fill peer LE IDs
-        auto const* leIds = g_cft_manager->getAllLeIds();
+        auto const* leIds = cftManager->getAllLeIds();
         for (int i = 0; i < static_cast<int>(epSize); i++)
         {
             params.cft_peer_le_ids[i] = leIds[i];
@@ -876,9 +887,10 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.use_cft_for_combine = useCftCountedWrites;
     if (useCftCountedWrites)
     {
-        TORCH_CHECK(g_cft_manager && g_cft_manager->isInitialized(),
-            "CFT counted writes requested but moe_a2a_cft_initialize has not been called");
-        auto const* leIds = g_cft_manager->getAllLeIds();
+        auto const* cftManager = getCftManager(reinterpret_cast<CUdeviceptr>(rankWorkSpacePtr));
+        TORCH_CHECK(cftManager != nullptr && cftManager->isInitialized(),
+            "CFT counted writes requested but moe_a2a_cft_initialize has not been called for this workspace");
+        auto const* leIds = cftManager->getAllLeIds();
         for (int i = 0; i < static_cast<int>(epSize); i++)
         {
             params.cft_peer_le_ids[i] = leIds[i];
