@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
     attach_py_objects_to_requests,
@@ -153,6 +154,56 @@ def test_executor_request_to_llm_request_owns_end_id_in_python() -> None:
 
     assert llm_request.py_end_id == 7
     assert llm_request.child_requests[0].py_end_id == 7
+
+
+@pytest.mark.parametrize("shape", [(12, 8), (12, 3, 2, 2)])
+@pytest.mark.parametrize("output_length", [None, 6])
+def test_encoder_feature_metadata_drives_native_request(shape, output_length) -> None:
+    features = torch.ones(shape)
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=10,
+        input_tokens=[1, 2, 3],
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=False,
+        encoder_input_tokens=[4, 5],
+        encoder_input_features=features,
+        encoder_output_len=output_length,
+    )
+    # Feature length takes precedence over token length, while explicit output
+    # length accounts for encoder downsampling.
+    assert request.encoder_output_len == (12 if output_length is None else output_length)
+    assert request.py_encoder_input_features is features
+    request.validate(10, 30, 0)
+    request.pause(20)
+    assert request.state.name == "ENCODER_INIT"
+    assert request.py_encoder_input_features is features
+
+
+def test_executor_request_to_llm_request_owns_encoder_features_in_python() -> None:
+    features = torch.arange(96, dtype=torch.float32).reshape(12, 8)
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    executor_request.py_multimodal_data = {
+        "audio": {"encoder_input_features": features, "encoder_output_len": 6}
+    }
+    llm_request = executor_request_to_llm_request(
+        42, executor_request, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    child = llm_request.child_requests[0]
+    assert llm_request.py_encoder_input_features is features
+    torch.testing.assert_close(child.py_encoder_input_features, features)
+    assert child.py_encoder_input_features.data_ptr() != features.data_ptr()
+    for request in (llm_request, child):
+        assert request.encoder_output_len == 6
+        assert request.state.name == "ENCODER_INIT"
+        request.validate(10, 30, 0)
+        request.pause(20)
+        assert request.state.name == "ENCODER_INIT"
+        assert request.encoder_output_len == 6
 
 
 def test_executor_request_to_llm_request_owns_position_ids_in_python() -> None:

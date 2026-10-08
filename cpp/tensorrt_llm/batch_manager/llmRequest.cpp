@@ -242,17 +242,9 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
         tokens.begin(), tokens.end(), [&vocabSize](auto const& token) { return token >= 0 && token < vocabSize; });
 }
 
-void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-    std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
+void LlmRequest::validate(
+    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse)
 {
-    if (getEncoderInputFeatures()
-        && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
-    {
-        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
-            maxEncoderInputLen.value());
-    }
-
     if (mPromptLen > maxInputLen)
     {
         TLLM_THROW(

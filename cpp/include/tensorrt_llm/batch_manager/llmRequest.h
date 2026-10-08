@@ -129,7 +129,7 @@ public:
         bool excludeInputFromOutput = false,
         std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
-        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderInputLength = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<std::shared_ptr<VecTokenExtraIds>> inputTokenExtraIds = std::nullopt,
@@ -174,7 +174,6 @@ public:
         , mReturnEncoderOutput(returnEncoderOutput)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
-        , mEncoderInputFeatures(std::move(encoderInputFeatures))
         , mEncoderOutputLength(encoderOutputLength)
         , mLlmRequestType(llmRequestType)
         , mContextPhaseParams(contextPhaseParams)
@@ -183,7 +182,11 @@ public:
         , mCacheSalt(std::move(cacheSalt))
         , mAgentHierarchy(std::move(agent_hierarchy))
     {
-        if (mEncoderTokens.has_value() || encoderInputFeatures.has_value())
+        TLLM_CHECK_WITH_INFO(!encoderInputLength.has_value() || encoderInputLength.value() >= 0,
+            "Encoder input length must be nonnegative.");
+        mEncoderInputLength = encoderInputLength;
+
+        if (mEncoderTokens.has_value() || mEncoderInputLength.has_value())
         {
             mState = LlmRequestState::kENCODER_INIT;
         }
@@ -379,11 +382,11 @@ public:
         auto const& encoderInputFeatures = req.getEncoderInputFeatures();
         if (encoderInputFeatures.has_value())
         {
-            mEncoderInputFeatures = executor::detail::toITensor(encoderInputFeatures.value());
+            mEncoderInputLength = encoderInputFeatures->getShape()[0];
         }
         else
         {
-            mEncoderInputFeatures = std::nullopt;
+            mEncoderInputLength = std::nullopt;
         }
 
         switch (req.getRequestType())
@@ -569,9 +572,9 @@ public:
     /// @return Encoder input length, or nullopt when this request has no encoder side.
     [[nodiscard]] std::optional<SizeType32> tryGetEncoderInputLen() const
     {
-        if (mEncoderInputFeatures.has_value())
+        if (mEncoderInputLength.has_value())
         {
-            return getEncoderInputFeatures()->getShape().d[0];
+            return mEncoderInputLength;
         }
         if (getEncoderTokens().has_value())
         {
@@ -789,8 +792,8 @@ public:
         }
 
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
-        mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
-                                                                     : LlmRequestState::kCONTEXT_INIT;
+        mState = mEncoderTokens.has_value() || mEncoderInputLength.has_value() ? LlmRequestState::kENCODER_INIT
+                                                                               : LlmRequestState::kCONTEXT_INIT;
 
         if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
         {
@@ -1091,11 +1094,6 @@ public:
     [[nodiscard]] TensorPtr const& getEncoderOutputHost() const
     {
         return mEncoderOutputHost;
-    }
-
-    [[nodiscard]] TensorPtr getEncoderInputFeatures() const
-    {
-        return mEncoderInputFeatures.value_or(nullptr);
     }
 
     void setEncoderOutputHost(TensorPtr encoderOutputHost)
@@ -1829,8 +1827,8 @@ protected:
 
     std::vector<executor::FinishReason> mFinishReasons;
 
-    // Input features of encoder for multimodal models.
-    std::optional<TensorPtr> mEncoderInputFeatures{std::nullopt};
+    // Encoder feature length drives admission without retaining the feature payload.
+    std::optional<SizeType32> mEncoderInputLength{std::nullopt};
 
     // Setting buffer sizes correctly for models like Whisper,
     // which encoder output shape cannot be inferred from encoder input shape due to downsampling.
@@ -2020,7 +2018,7 @@ public:
         std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
         std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
-        std::optional<TensorPtr> encoderInputFeatures = std::nullopt,
+        std::optional<SizeType32> encoderInputLength = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
         LlmRequestType llmRequestType = LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         std::optional<VecTokenExtraIds> inputTokenExtraIds = std::nullopt, bool returnPerfMetrics = false,
@@ -2052,7 +2050,7 @@ public:
             excludeInputFromOutput,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, priority, std::move(encoderInputFeatures), encoderOutputLength, llmRequestType,
+            returnEncoderOutput, priority, encoderInputLength, encoderOutputLength, llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             returnPerfMetrics, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
@@ -2088,8 +2086,8 @@ public:
     /// @return True if tokens are within range.
     bool checkTokenIdRange(SizeType32 vocabSize);
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
+    void validate(
+        SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 
