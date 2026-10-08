@@ -11,6 +11,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -34,6 +35,43 @@ cublasLtHandle_t ltHandle()
         return t;
     }();
     return h;
+}
+
+// FFN-up: heuristic nvjet config with a 2x4 cluster, bit-identical and faster.
+// TRTLLM_WAN_GEMM_FFNUP_PIN=0 keeps the heuristic top.
+bool pinnedFfnUpAlgo(cublasLtMatmulDesc_t op, cublasLtMatrixLayout_t lA, cublasLtMatrixLayout_t lB,
+    cublasLtMatrixLayout_t lC, cublasLtMatrixLayout_t lD, size_t wsBytes, cublasLtMatmulAlgo_t* algo)
+{
+    char const* env = std::getenv("TRTLLM_WAN_GEMM_FFNUP_PIN");
+    if (env != nullptr && std::atoi(env) == 0)
+        return false;
+    cublasLtMatmulAlgo_t a;
+    if (cublasLtMatmulAlgoInit(ltHandle(), CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_8F_E4M3, CUDA_R_8F_E4M3, CUDA_R_16BF,
+            CUDA_R_8F_E4M3, 66, &a)
+        != CUBLAS_STATUS_SUCCESS)
+        return false;
+    uint32_t const tile = CUBLASLT_MATMUL_TILE_128x256, stages = CUBLASLT_MATMUL_STAGES_128xAUTO, custom = 1;
+    uint32_t const swizzle = 0;
+    int32_t const splitK = 1;
+    uint16_t const cluster = CUBLASLT_CLUSTER_SHAPE_2x4x1;
+    bool ok = cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitK, sizeof(splitK))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &custom, sizeof(custom))
+            == CUBLAS_STATUS_SUCCESS
+        && cublasLtMatmulAlgoConfigSetAttribute(&a, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cluster, sizeof(cluster))
+            == CUBLAS_STATUS_SUCCESS;
+    cublasLtMatmulHeuristicResult_t r{};
+    ok = ok && cublasLtMatmulAlgoCheck(ltHandle(), op, lA, lB, lC, lD, &a, &r) == CUBLAS_STATUS_SUCCESS
+        && r.workspaceSize <= wsBytes;
+    if (ok)
+        *algo = a;
+    return ok;
 }
 
 struct AlgoKey
@@ -121,7 +159,10 @@ void gemm_fp8(torch::Tensor a, torch::Tensor w, torch::Tensor scale_a, torch::Te
             CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(ltHandle(), op, lA, lB, lC, lD, pref, 1, res, &got));
             cublasLtMatmulPreferenceDestroy(pref);
             TORCH_CHECK(got > 0, "no cuBLASLt algo for FP8 GEMM m=", m, " n=", n, " k=", k, " epi=", epilogue);
-            it = algos.emplace(key, res[0].algo).first;
+            cublasLtMatmulAlgo_t chosen = res[0].algo;
+            if (epilogue == 2 && outFp8 && n == 13824 && k == 5120)
+                pinnedFfnUpAlgo(op, lA, lB, lC, lD, wsBytes, &chosen);
+            it = algos.emplace(key, chosen).first;
         }
         algo = it->second;
     }
@@ -144,32 +185,164 @@ constexpr int kBlock = 128;
 constexpr int kElts = kD / kBlock; // 40
 constexpr int kChunks = kElts / 8; // 5
 
-__device__ __forceinline__ void load8(__nv_bfloat16 const* p, float* v)
+// float to bf16 (RN) and back in one cvt: zero low half.
+__device__ __forceinline__ float roundBf16(float v)
 {
-    uint4 const u = *reinterpret_cast<uint4 const*>(p);
-    __nv_bfloat162 const* h = reinterpret_cast<__nv_bfloat162 const*>(&u);
-#pragma unroll
-    for (int i = 0; i < 4; i++)
-    {
-        float2 f = __bfloat1622float2(h[i]);
-        v[2 * i] = f.x;
-        v[2 * i + 1] = f.y;
-    }
+    __nv_bfloat162 const p = __floats2bfloat162_rn(0.f, v);
+    return __uint_as_float(*reinterpret_cast<uint32_t const*>(&p));
 }
 
+// One row: residual (x_out) then LayerNorm/AdaLN + FP8 quant (q_out).
 template <int MODE, bool HAS_Y, bool HAS_GATE, bool HAS_YBIAS, bool HAS_Q>
-__global__ void __launch_bounds__(kBlock, 4) residLnQuantKernel(__nv_bfloat16 const* x, __nv_bfloat16 const* y,
+__device__ __forceinline__ void residLnRow(uint4 const (&xr)[kChunks], uint4 const (&yr)[kChunks], int tid, int row,
     __nv_bfloat16 const* ybias, float const* gate, float const* w, float const* b, int seqPerBatch, float eps,
-    float const* invScale, __nv_bfloat16* xOut, __nv_fp8_e4m3* qOut)
+    float qmul, __nv_bfloat16* xOut, __nv_fp8_e4m3* qOut, float* wsum, float* wsq, float* stats)
 {
-    int const tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    int const row = blockIdx.x;
+    int const warp = tid >> 5, lane = tid & 31;
     int64_t const base = static_cast<int64_t>(row) * kD;
     int const batch = row / seqPerBatch;
     int64_t const modBase = MODE == 2 ? static_cast<int64_t>(batch) * kD : 0;
-    // Issue all 128-bit loads up front.
-    uint4 xr[kChunks], yr[kChunks], br[kChunks];
-    float4 gr[2 * kChunks], wr[2 * kChunks], bbr[2 * kChunks];
+    // Residual kept as packed bf16; sums keep the original element order.
+    uint4 xb[kChunks];
+    float s = 0.f, s2 = 0.f;
+#pragma unroll
+    for (int c = 0; c < kChunks; c++)
+    {
+        int const off = (c * kBlock + tid) * 8;
+        if constexpr (HAS_Y)
+        {
+            uint4 br = make_uint4(0, 0, 0, 0);
+            float4 gr[2] = {};
+            if constexpr (HAS_YBIAS)
+                br = *reinterpret_cast<uint4 const*>(ybias + off);
+            if constexpr (HAS_GATE)
+            {
+                gr[0] = *reinterpret_cast<float4 const*>(gate + static_cast<int64_t>(batch) * kD + off);
+                gr[1] = *reinterpret_cast<float4 const*>(gate + static_cast<int64_t>(batch) * kD + off + 4);
+            }
+            __nv_bfloat162 const* xh = reinterpret_cast<__nv_bfloat162 const*>(&xr[c]);
+            __nv_bfloat162 const* yh = reinterpret_cast<__nv_bfloat162 const*>(&yr[c]);
+            __nv_bfloat162 const* bh = reinterpret_cast<__nv_bfloat162 const*>(&br);
+            float const* gv = reinterpret_cast<float const*>(gr);
+            __nv_bfloat162 o[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float2 const xx = __bfloat1622float2(xh[i]);
+                float2 yy = __bfloat1622float2(yh[i]);
+                if constexpr (HAS_YBIAS)
+                {
+                    // y + bias in bf16, as torch does.
+                    float2 bb = __bfloat1622float2(bh[i]);
+                    yy = make_float2(roundBf16(yy.x + bb.x), roundBf16(yy.y + bb.y));
+                }
+                float2 r;
+                // Round the product before the add; no FMA.
+                r.x = HAS_GATE ? __fadd_rn(xx.x, __fmul_rn(yy.x, gv[2 * i])) : __fadd_rn(xx.x, yy.x);
+                r.y = HAS_GATE ? __fadd_rn(xx.y, __fmul_rn(yy.y, gv[2 * i + 1])) : __fadd_rn(xx.y, yy.y);
+                o[i] = __floats2bfloat162_rn(r.x, r.y);
+            }
+            xb[c] = *reinterpret_cast<uint4 const*>(o);
+            *reinterpret_cast<uint4*>(xOut + base + off) = xb[c];
+        }
+        else
+        {
+            xb[c] = xr[c];
+        }
+        if constexpr (MODE != 0)
+        {
+            __nv_bfloat162 const* h = reinterpret_cast<__nv_bfloat162 const*>(&xb[c]);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float2 const f = __bfloat1622float2(h[i]);
+                s += f.x;
+                s2 += f.x * f.x;
+                s += f.y;
+                s2 += f.y * f.y;
+            }
+        }
+    }
+    if constexpr (MODE != 0)
+    {
+#pragma unroll
+        for (int o = 16; o > 0; o /= 2)
+        {
+            s += __shfl_xor_sync(0xffffffffu, s, o);
+            s2 += __shfl_xor_sync(0xffffffffu, s2, o);
+        }
+        if (lane == 0)
+        {
+            wsum[warp] = s;
+            wsq[warp] = s2;
+        }
+        __syncthreads();
+        if (warp == 0)
+        {
+            float a = lane < kBlock / 32 ? wsum[lane] : 0.f;
+            float a2 = lane < kBlock / 32 ? wsq[lane] : 0.f;
+#pragma unroll
+            for (int o = 16; o > 0; o /= 2)
+            {
+                a += __shfl_xor_sync(0xffffffffu, a, o);
+                a2 += __shfl_xor_sync(0xffffffffu, a2, o);
+            }
+            if (lane == 0)
+            {
+                float const invD = 1.0f / static_cast<float>(kD);
+                float const mean = a * invD;
+                float const var = a2 * invD - mean * mean;
+                stats[0] = mean;
+                stats[1] = rsqrtf(var + eps);
+            }
+        }
+        __syncthreads();
+        float const mean = stats[0], rstd = stats[1];
+#pragma unroll
+        for (int c = 0; c < kChunks; c++)
+        {
+            int const off = (c * kBlock + tid) * 8;
+            float4 wr[2], bbr[2];
+            wr[0] = *reinterpret_cast<float4 const*>(w + modBase + off);
+            wr[1] = *reinterpret_cast<float4 const*>(w + modBase + off + 4);
+            bbr[0] = *reinterpret_cast<float4 const*>(b + modBase + off);
+            bbr[1] = *reinterpret_cast<float4 const*>(b + modBase + off + 4);
+            float const* wv = reinterpret_cast<float const*>(wr);
+            float const* bv = reinterpret_cast<float const*>(bbr);
+            __nv_bfloat162 const* h = reinterpret_cast<__nv_bfloat162 const*>(&xb[c]);
+            __nv_fp8x2_storage_t packed[4];
+#pragma unroll
+            for (int i = 0; i < 8; i += 2)
+            {
+                float2 const xf = __bfloat1622float2(h[i / 2]);
+                float const xv[2] = {xf.x, xf.y};
+                float yv[2];
+#pragma unroll
+                for (int j = 0; j < 2; j++)
+                {
+                    float const xn = (xv[j] - mean) * rstd;
+                    float const ww = MODE == 2 ? 1.0f + wv[i + j] : wv[i + j];
+                    // Round to bf16, then saturating static FP8 quant.
+                    yv[j] = roundBf16(xn * ww + bv[i + j]) * qmul;
+                }
+                packed[i / 2] = __nv_cvt_float2_to_fp8x2(make_float2(yv[0], yv[1]), __NV_SATFINITE, __NV_E4M3);
+            }
+            *reinterpret_cast<uint2*>(qOut + base + off) = *reinterpret_cast<uint2 const*>(packed);
+        }
+    }
+}
+
+// One row per block; <= 64 registers for 8 blocks per SM.
+template <int MODE, bool HAS_Y, bool HAS_GATE, bool HAS_YBIAS, bool HAS_Q>
+__global__ void __launch_bounds__(kBlock, 8) residLnQuantKernel(__nv_bfloat16 const* x, __nv_bfloat16 const* y,
+    __nv_bfloat16 const* ybias, float const* gate, float const* w, float const* b, int seqPerBatch, float eps,
+    float const* invScale, __nv_bfloat16* xOut, __nv_fp8_e4m3* qOut)
+{
+    int const tid = threadIdx.x;
+    int const row = blockIdx.x;
+    int64_t const base = static_cast<int64_t>(row) * kD;
+    // Issue the streaming row loads up front.
+    uint4 xr[kChunks], yr[kChunks];
 #pragma unroll
     for (int c = 0; c < kChunks; c++)
     {
@@ -177,131 +350,11 @@ __global__ void __launch_bounds__(kBlock, 4) residLnQuantKernel(__nv_bfloat16 co
         xr[c] = *reinterpret_cast<uint4 const*>(x + base + off);
         if constexpr (HAS_Y)
             yr[c] = *reinterpret_cast<uint4 const*>(y + base + off);
-        if constexpr (HAS_YBIAS)
-            br[c] = *reinterpret_cast<uint4 const*>(ybias + off);
-        if constexpr (HAS_GATE)
-        {
-            gr[2 * c] = *reinterpret_cast<float4 const*>(gate + static_cast<int64_t>(batch) * kD + off);
-            gr[2 * c + 1] = *reinterpret_cast<float4 const*>(gate + static_cast<int64_t>(batch) * kD + off + 4);
-        }
-        if constexpr (MODE != 0)
-        {
-            wr[2 * c] = *reinterpret_cast<float4 const*>(w + modBase + off);
-            wr[2 * c + 1] = *reinterpret_cast<float4 const*>(w + modBase + off + 4);
-            bbr[2 * c] = *reinterpret_cast<float4 const*>(b + modBase + off);
-            bbr[2 * c + 1] = *reinterpret_cast<float4 const*>(b + modBase + off + 4);
-        }
     }
-    float xv[kElts];
-#pragma unroll
-    for (int c = 0; c < kChunks; c++)
-    {
-        int const off = (c * kBlock + tid) * 8;
-        __nv_bfloat162 const* xh = reinterpret_cast<__nv_bfloat162 const*>(&xr[c]);
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-        {
-            float2 f = __bfloat1622float2(xh[i]);
-            xv[c * 8 + 2 * i] = f.x;
-            xv[c * 8 + 2 * i + 1] = f.y;
-        }
-        if constexpr (HAS_Y)
-        {
-            __nv_bfloat162 const* yh = reinterpret_cast<__nv_bfloat162 const*>(&yr[c]);
-            __nv_bfloat162 const* bh = reinterpret_cast<__nv_bfloat162 const*>(&br[c]);
-            float const* gv = reinterpret_cast<float const*>(&gr[2 * c]);
-            __nv_bfloat162 o[4];
-#pragma unroll
-            for (int i = 0; i < 4; i++)
-            {
-                float2 yy = __bfloat1622float2(yh[i]);
-                if constexpr (HAS_YBIAS)
-                {
-                    // y + bias in bf16, as torch does.
-                    float2 bb = __bfloat1622float2(bh[i]);
-                    yy = __bfloat1622float2(__floats2bfloat162_rn(yy.x + bb.x, yy.y + bb.y));
-                }
-                float2 r;
-                // Round the product before the add; no FMA.
-                r.x = HAS_GATE ? __fadd_rn(xv[c * 8 + 2 * i], __fmul_rn(yy.x, gv[2 * i]))
-                               : __fadd_rn(xv[c * 8 + 2 * i], yy.x);
-                r.y = HAS_GATE ? __fadd_rn(xv[c * 8 + 2 * i + 1], __fmul_rn(yy.y, gv[2 * i + 1]))
-                               : __fadd_rn(xv[c * 8 + 2 * i + 1], yy.y);
-                o[i] = __floats2bfloat162_rn(r.x, r.y);
-                float2 rf = __bfloat1622float2(o[i]);
-                xv[c * 8 + 2 * i] = rf.x;
-                xv[c * 8 + 2 * i + 1] = rf.y;
-            }
-            *reinterpret_cast<uint4*>(xOut + base + off) = *reinterpret_cast<uint4 const*>(o);
-        }
-    }
-    if constexpr (MODE == 0)
-        return;
     __shared__ float wsum[kBlock / 32], wsq[kBlock / 32], stats[2];
-    float s = 0.f, s2 = 0.f;
-#pragma unroll
-    for (int i = 0; i < kElts; i++)
-    {
-        s += xv[i];
-        s2 += xv[i] * xv[i];
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o /= 2)
-    {
-        s += __shfl_xor_sync(0xffffffffu, s, o);
-        s2 += __shfl_xor_sync(0xffffffffu, s2, o);
-    }
-    if (lane == 0)
-    {
-        wsum[warp] = s;
-        wsq[warp] = s2;
-    }
-    __syncthreads();
-    if (warp == 0)
-    {
-        float a = lane < kBlock / 32 ? wsum[lane] : 0.f;
-        float a2 = lane < kBlock / 32 ? wsq[lane] : 0.f;
-#pragma unroll
-        for (int o = 16; o > 0; o /= 2)
-        {
-            a += __shfl_xor_sync(0xffffffffu, a, o);
-            a2 += __shfl_xor_sync(0xffffffffu, a2, o);
-        }
-        if (lane == 0)
-        {
-            float const invD = 1.0f / static_cast<float>(kD);
-            float const mean = a * invD;
-            float const var = a2 * invD - mean * mean;
-            stats[0] = mean;
-            stats[1] = rsqrtf(var + eps);
-        }
-    }
-    __syncthreads();
-    float const mean = stats[0], rstd = stats[1];
     float const qmul = HAS_Q ? invScale[0] : 1.f;
-#pragma unroll
-    for (int c = 0; c < kChunks; c++)
-    {
-        int const off = (c * kBlock + tid) * 8;
-        float const* wv = reinterpret_cast<float const*>(&wr[2 * c]);
-        float const* bv = reinterpret_cast<float const*>(&bbr[2 * c]);
-        __nv_fp8x2_storage_t packed[4];
-#pragma unroll
-        for (int i = 0; i < 8; i += 2)
-        {
-            float yv[2];
-#pragma unroll
-            for (int j = 0; j < 2; j++)
-            {
-                float const xn = (xv[c * 8 + i + j] - mean) * rstd;
-                float const ww = MODE == 2 ? 1.0f + wv[i + j] : wv[i + j];
-                // Round to bf16, then saturating static FP8 quant.
-                yv[j] = __bfloat162float(__float2bfloat16_rn(xn * ww + bv[i + j])) * qmul;
-            }
-            packed[i / 2] = __nv_cvt_float2_to_fp8x2(make_float2(yv[0], yv[1]), __NV_SATFINITE, __NV_E4M3);
-        }
-        *reinterpret_cast<uint2*>(qOut + base + off) = *reinterpret_cast<uint2 const*>(packed);
-    }
+    residLnRow<MODE, HAS_Y, HAS_GATE, HAS_YBIAS, HAS_Q>(
+        xr, yr, tid, row, ybias, gate, w, b, seqPerBatch, eps, qmul, xOut, qOut, wsum, wsq, stats);
 }
 
 // x [T, D] bf16; outputs x_out (if y given) and q_out (if mode != 0).
