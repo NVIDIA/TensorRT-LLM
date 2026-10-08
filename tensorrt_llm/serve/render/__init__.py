@@ -35,6 +35,7 @@ from .generate import attach_generate_route, mount_render_endpoints
 from .prompt_types import (
     GENERATE_REQUEST_SCHEMA_VERSION,
     GenerateRequest,
+    PreparedContext,
     RenderedPrompt,
     UnsupportedRenderError,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "GENERATE_REQUEST_SCHEMA_VERSION",
     "GenerateRequest",
     "PreparedChat",
+    "PreparedContext",
     "RenderRequestError",
     "RenderResources",
     "RenderedPrompt",

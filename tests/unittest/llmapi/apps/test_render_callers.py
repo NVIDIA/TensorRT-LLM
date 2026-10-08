@@ -202,6 +202,42 @@ class TestRouterWriteBack:
 
         assert request.prompt_token_ids is None
 
+    def test_ids_are_not_forwarded_when_the_worker_would_lose_decisions_from_the_prompt(
+        self,
+    ) -> None:
+        # A forwarded request is an ordinary chat request carrying prompt_token_ids: the
+        # worker never sees the rendered text, so a reasoning mode read off the prompt (here a
+        # template that prefills "<think>") would be lost. The worker must render it itself.
+        thinking_tokenizer = make_tokenizer(
+            chat_template=(
+                "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+                "{% if add_generation_prompt %}<assistant><think>{% endif %}"
+            )
+        )
+        built = _Router.build(thinking_tokenizer, ["server1"])
+        try:
+            built._server_info = {
+                "server1": {"render_fingerprint": _Router.worker_fingerprint(thinking_tokenizer)}
+            }
+            request = chat_request()
+
+            ids = built._tokenize(request)[0]
+
+            assert ids  # still used for routing
+            assert request.prompt_token_ids is None
+        finally:
+            built._test_patcher.stop()
+
+    def test_ids_are_forwarded_when_the_prompt_carries_no_decisions(
+        self, router, tokenizer
+    ) -> None:
+        self._trust(router, tokenizer)
+        request = chat_request()
+
+        router._tokenize(request)
+
+        assert request.prompt_token_ids is not None
+
     def test_a_named_tool_choice_is_never_forwarded(self, router, tokenizer) -> None:
         self._trust(router, tokenizer)
         request = chat_request(

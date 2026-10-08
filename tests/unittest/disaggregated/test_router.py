@@ -2337,7 +2337,7 @@ class _PrefixCacheFakeTokenizer:
 
     # A stable serialization of the encoding, so the rendering fingerprint can
     # identify this tokenizer (one without it is never trusted for write-back).
-    backend_tokenizer = SimpleNamespace(to_str=lambda: "prefix-cache-fake")
+    backend_tokenizer = SimpleNamespace(to_str=lambda: '{"fake": "prefix-cache"}')
 
     def apply_chat_template(self,
                             messages,
