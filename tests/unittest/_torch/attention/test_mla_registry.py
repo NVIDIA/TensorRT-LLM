@@ -29,7 +29,6 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
 )
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
 
@@ -215,10 +214,14 @@ def _make_dsv4_epilogue_layer() -> SimpleNamespace:
         v_head_dim=512,
         n_local_groups=8,
         o_lora_rank=3,
+        hidden_size=16,
         dtype=torch.bfloat16,
         inverse_rotary_emb=SimpleNamespace(is_neox=False),
         create_output=Mock(),
     )
+
+
+_DSV4_MODULE = "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module"
 
 
 def test_mla_custom_op_marks_only_final_output_mutable() -> None:
@@ -242,14 +245,9 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
     hidden_states = torch.empty(8, 16)
 
     with (
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
-            return_value=True,
-        ),
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
-            return_value=100,
-        ),
+        patch(f"{_DSV4_MODULE}.is_sm_100f", return_value=True),
+        patch(f"{_DSV4_MODULE}.get_sm_version", return_value=100),
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=False),
     ):
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
 
@@ -260,27 +258,43 @@ def test_dsv4_epilogue_fusion_supports_mixed_batch() -> None:
 
 
 @pytest.mark.parametrize(("num_contexts", "num_generations"), [(1, 0), (0, 1), (1, 1)])
-def test_dsv4_epilogue_fusion_rejects_sm107(num_contexts: int, num_generations: int) -> None:
+def test_dsv4_epilogue_fusion_supports_sm107_direct_output(
+    num_contexts: int, num_generations: int
+) -> None:
     mla_layer = _make_dsv4_epilogue_layer()
-    fallback = torch.empty(8, 16)
-    mla_layer.create_output.return_value = fallback
     metadata = SimpleNamespace(num_contexts=num_contexts, num_generations=num_generations)
     hidden_states = torch.empty(8, 16)
 
     with (
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
-            return_value=True,
-        ),
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
-            return_value=107,
-        ),
+        patch(f"{_DSV4_MODULE}.is_sm_100f", return_value=True),
+        patch(f"{_DSV4_MODULE}.get_sm_version", return_value=107),
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=True),
+    ):
+        outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
+
+    assert len(outputs) == 1
+    assert outputs[0].shape == (8, 1, 16)
+    assert outputs[0].dtype == torch.bfloat16
+    assert outputs[0].is_contiguous()
+    mla_layer.create_output.assert_not_called()
+
+
+def test_dsv4_epilogue_fusion_rejects_sm107_without_direct_output() -> None:
+    mla_layer = _make_dsv4_epilogue_layer()
+    fallback = torch.empty(8, 16)
+    mla_layer.create_output.return_value = fallback
+    metadata = SimpleNamespace(num_contexts=1, num_generations=0)
+    hidden_states = torch.empty(8, 16)
+
+    with (
+        patch(f"{_DSV4_MODULE}.is_sm_100f", return_value=True),
+        patch(f"{_DSV4_MODULE}.get_sm_version", return_value=107),
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=False),
     ):
         outputs = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)
 
     assert outputs == [fallback]
-    mla_layer.create_output.assert_called_once_with(hidden_states, num_contexts)
+    mla_layer.create_output.assert_called_once_with(hidden_states, 1)
 
 
 def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:
@@ -289,35 +303,26 @@ def test_dsv4_fusion_create_output_uses_bucket_token_count() -> None:
     hidden_states = torch.empty(8, 16)
 
     with (
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.is_sm_100f",
-            return_value=True,
-        ),
-        patch(
-            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module.get_sm_version",
-            return_value=100,
-        ),
+        patch(f"{_DSV4_MODULE}.is_sm_100f", return_value=True),
+        patch(f"{_DSV4_MODULE}.get_sm_version", return_value=107),
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=True),
     ):
         output = prepare_sparse_attn_outputs(mla_layer, hidden_states, metadata)[0]
 
-    assert output.shape == (8, 8, 3)
+    assert output.shape == (8, 1, 16)
     assert output.dtype == torch.bfloat16
 
 
-def test_dsv4_fusion_o_proj_only_flattens_lora_output() -> None:
+def test_dsv4_fusion_o_proj_returns_preprojected_output_view() -> None:
     projected = torch.randn(7, 5)
-    mla_layer = SimpleNamespace(
-        n_local_groups=4,
-        o_lora_rank=3,
-        o_b_proj=Mock(return_value=projected),
-    )
-    lora_o = torch.randn(7, 4, 3)
+    mla_layer = SimpleNamespace(hidden_size=5)
+    custom_op_output = projected.view(7, 1, 5)
 
-    output = project_sparse_attn_output(mla_layer, [lora_o])
+    output = project_sparse_attn_output(mla_layer, [custom_op_output])
 
-    assert output is projected
-    mla_layer.o_b_proj.assert_called_once()
-    torch.testing.assert_close(mla_layer.o_b_proj.call_args.args[0], lora_o.flatten(1))
+    torch.testing.assert_close(output, projected)
+    assert output.is_contiguous()
+    assert output.untyped_storage().data_ptr() == custom_op_output.untyped_storage().data_ptr()
 
 
 def test_dsv4_epilogue_buffers_use_real_token_count() -> None:
@@ -349,17 +354,20 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
     mla_layer = SimpleNamespace(
         o_a_proj=torch.empty(0),
         o_a_proj_scale=torch.empty(0),
+        hidden_size=4,
+        o_b_proj=Mock(side_effect=lambda o_lora: o_lora[:, :4] + 100.0),
     )
 
     def fake_bmm(_attn_fp8, _weight, attn_scale, _weight_scale, phase_output):
         phase_output.fill_(attn_scale.item())
 
-    bmm_op = "cute_dsl_fp8_bmm_rubin" if get_sm_version() == 107 else "cute_dsl_fp8_bmm_blackwell"
-    with patch.object(
-        torch.ops.trtllm,
-        bmm_op,
-        side_effect=fake_bmm,
-    ) as bmm:
+    with (
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=False),
+        patch(
+            "tensorrt_llm._torch.attention.mla._cute_dsl_fp8_bmm_out",
+            side_effect=fake_bmm,
+        ) as bmm,
+    ):
         context_epilogue = None
         if num_context_tokens:
             context_epilogue = (
@@ -381,16 +389,124 @@ def test_dsv4_epilogue_bmm_writes_only_phase_ranges(
             generation_epilogue,
         )
 
+    projected_output = project_sparse_attn_output(mla_layer, [output])
+
     assert bmm.call_count == bool(num_context_tokens) + bool(num_generation_tokens)
+    assert mla_layer.o_b_proj.call_count == 1
     if num_context_tokens:
         torch.testing.assert_close(
-            output[:num_context_tokens], torch.full_like(output[:num_context_tokens], 11.0)
+            projected_output[:num_context_tokens],
+            torch.full_like(projected_output[:num_context_tokens], 111.0),
         )
     if num_generation_tokens:
         generation_end = num_context_tokens + num_generation_tokens
         torch.testing.assert_close(
-            output[num_context_tokens:generation_end],
-            torch.full_like(output[num_context_tokens:generation_end], 22.0),
+            projected_output[num_context_tokens:generation_end],
+            torch.full_like(projected_output[num_context_tokens:generation_end], 122.0),
         )
     real_tokens = num_context_tokens + num_generation_tokens
-    torch.testing.assert_close(output[real_tokens:], torch.full_like(output[real_tokens:], -1.0))
+    torch.testing.assert_close(
+        projected_output[real_tokens:], torch.full_like(projected_output[real_tokens:], -1.0)
+    )
+
+
+def test_dsv4_quantized_o_lora_writes_projected_custom_op_output() -> None:
+    bucket_tokens = 4
+    num_tokens = 3
+    hidden_size = 5
+    projected = torch.arange(num_tokens * hidden_size, dtype=torch.float32).reshape(
+        num_tokens, hidden_size
+    )
+    custom_op_output = torch.full((bucket_tokens, 1, hidden_size), -1.0)
+    quantized_input = (torch.empty(0), torch.empty(0, dtype=torch.uint8))
+    mla_layer = SimpleNamespace(
+        hidden_size=hidden_size,
+        o_b_proj=Mock(),
+    )
+
+    def fake_o_b_proj_out(_layer, o_b_proj_input, output):
+        assert o_b_proj_input is quantized_input
+        assert output.is_contiguous()
+        output.copy_(projected)
+
+    with (
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=True),
+        patch(
+            f"{_DSV4_MODULE}._rubin_dsv4_o_lora_quantized_input",
+            return_value=quantized_input,
+        ),
+        patch(
+            f"{_DSV4_MODULE}._rubin_dsv4_o_b_proj_out",
+            side_effect=fake_o_b_proj_out,
+        ) as o_b_proj_out,
+    ):
+        result = _run_dsv4_o_lora_bmms(
+            mla_layer,
+            custom_op_output,
+            num_tokens,
+            num_tokens,
+            (torch.empty(0), torch.empty(0)),
+            None,
+        )
+
+    output = project_sparse_attn_output(mla_layer, [custom_op_output])
+
+    assert result is None
+    o_b_proj_out.assert_called_once()
+    mla_layer.o_b_proj.assert_not_called()
+    torch.testing.assert_close(output[:num_tokens], projected)
+    torch.testing.assert_close(output[num_tokens:], torch.full_like(output[num_tokens:], -1.0))
+
+
+def test_dsv4_mixed_batch_uses_non_aliasing_o_lora_scratch() -> None:
+    num_context_tokens = 2
+    num_tokens = 3
+    groups = 2
+    rank = 3
+    hidden_size = 4
+    custom_op_output = torch.full((4, 1, hidden_size), -1.0)
+    mla_layer = SimpleNamespace(
+        o_a_proj=torch.empty(0),
+        o_a_proj_scale=torch.empty(0),
+        n_local_groups=groups,
+        o_lora_rank=rank,
+        hidden_size=hidden_size,
+        dtype=torch.float32,
+        o_b_proj=Mock(),
+    )
+
+    def fake_bmm(_attn_fp8, _weight, attn_scale, _weight_scale, phase_output):
+        phase_output.fill_(attn_scale.item())
+
+    def fake_o_b_proj_out(_layer, o_b_proj_input, output):
+        assert o_b_proj_input.untyped_storage().data_ptr() != output.untyped_storage().data_ptr()
+        assert output.is_contiguous()
+        output.copy_(o_b_proj_input[:, :hidden_size] + 100.0)
+
+    with (
+        patch(f"{_DSV4_MODULE}._uses_rubin_dsv4_o_b_proj_out", return_value=True),
+        patch(
+            "tensorrt_llm._torch.attention.mla._cute_dsl_fp8_bmm_out",
+            side_effect=fake_bmm,
+        ),
+        patch(
+            f"{_DSV4_MODULE}._rubin_dsv4_o_b_proj_out",
+            side_effect=fake_o_b_proj_out,
+        ) as o_b_proj_out,
+    ):
+        _run_dsv4_o_lora_bmms(
+            mla_layer,
+            custom_op_output,
+            num_context_tokens,
+            num_tokens,
+            (torch.empty(groups, num_context_tokens, 4), torch.tensor(11.0)),
+            (torch.empty(groups, 1, 4), torch.tensor(22.0)),
+        )
+
+    output = project_sparse_attn_output(mla_layer, [custom_op_output])
+
+    o_b_proj_out.assert_called_once()
+    mla_layer.o_b_proj.assert_not_called()
+    torch.testing.assert_close(output[:num_context_tokens], torch.full((2, 4), 111.0))
+    torch.testing.assert_close(output[num_context_tokens:num_tokens], torch.full((1, 4), 122.0))
+    torch.testing.assert_close(output[num_tokens:], torch.full((1, 4), -1.0))
