@@ -9,10 +9,13 @@ import pytest
 import torch
 
 import tensorrt_llm
+import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
+import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
+import tensorrt_llm._torch.attention.backends.trtllm as trtllm_backend
 from tensorrt_llm._torch.attention.backends.fmha.fp4_mla import Fp4MlaFmha
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_BLOCK_SIZE,
@@ -41,6 +44,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, MTPDecodingConfig
@@ -99,6 +103,338 @@ def test_fp4_mla_request_validation_uses_sparse_runtime_params() -> None:
             None,
             metadata,
             forward_args,
+        )
+
+
+def _fp4_mla_validation_metadata(**overrides) -> SimpleNamespace:
+    fields = dict(
+        num_sparse_topk=0,
+        kv_cache_manager=SimpleNamespace(dtype=_DataType.NVFP4, kv_factor=1),
+        beam_width=1,
+        fp4_mla_state=Fp4MlaState(hp_pool=object(), v_scale_pool=object()),
+        helix_position_offsets=None,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_fp4_mla_request_validation_still_requires_nvfp4_kv() -> None:
+    metadata = _fp4_mla_validation_metadata(
+        kv_cache_manager=SimpleNamespace(dtype=object(), kv_factor=1)
+    )
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+
+    with pytest.raises(RuntimeError, match="requires NVFP4 KV cache storage"):
+        Fp4MlaFmha._is_supported(
+            SimpleNamespace(attn=SimpleNamespace(sparse_params=None)),
+            torch.empty(1, 4),
+            None,
+            None,
+            metadata,
+            forward_args,
+        )
+
+
+@pytest.mark.parametrize(
+    "softmax_stats, expected_exception",
+    [
+        (None, RuntimeError),
+        (torch.empty(2, 3, 2, dtype=torch.bfloat16), ValueError),
+        (torch.empty(2, 3, 3, dtype=torch.float32), ValueError),
+        (torch.empty(2, 2, 3, dtype=torch.float32).transpose(1, 2), ValueError),
+    ],
+    ids=["missing", "bf16", "wrong-shape", "non-contiguous"],
+)
+def test_fp4_mla_helix_validates_softmax_stats(
+    softmax_stats: torch.Tensor | None,
+    expected_exception: type[Exception],
+) -> None:
+    num_tokens, num_heads = 2, 3
+    metadata = _fp4_mla_validation_metadata(
+        helix_position_offsets=torch.arange(num_tokens, dtype=torch.int32),
+        num_generations=num_tokens,
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        softmax_stats_tensor=softmax_stats,
+    )
+    fmha = SimpleNamespace(attn=SimpleNamespace(sparse_params=None, num_heads=num_heads))
+
+    with pytest.raises(
+        expected_exception,
+        match="FP4 MLA Helix requires.*softmax stats|requires softmax_stats_tensor",
+    ):
+        Fp4MlaFmha._is_supported(
+            fmha, torch.empty(num_tokens, 4), None, None, metadata, forward_args
+        )
+
+
+def test_fp4_mla_helix_accepts_valid_softmax_stats() -> None:
+    num_generations, tokens_per_generation, num_heads = 2, 6, 3
+    num_tokens = num_generations * tokens_per_generation
+    metadata = _fp4_mla_validation_metadata(
+        helix_position_offsets=torch.arange(num_tokens, dtype=torch.int32),
+        num_generations=num_generations,
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        softmax_stats_tensor=torch.empty(num_tokens, num_heads, 2, dtype=torch.float32),
+    )
+    fmha = SimpleNamespace(attn=SimpleNamespace(sparse_params=None, num_heads=num_heads))
+
+    assert Fp4MlaFmha._is_supported(
+        fmha, torch.empty(num_tokens, 4), None, None, metadata, forward_args
+    )
+
+
+def test_fp4_mla_helix_stats_require_cutedsl_backend(monkeypatch) -> None:
+    kv_lora_rank = 512
+    qk_rope_head_dim = FP4_MLA_K_RESIDUAL_DIM
+    head_dim = kv_lora_rank + qk_rope_head_dim
+    metadata = SimpleNamespace(
+        page_size=FP4_MLA_TOKENS_PER_BLOCK,
+        num_seqs=1,
+        num_contexts=0,
+    )
+    q = torch.empty(1, 1, head_dim, dtype=torch.bfloat16)
+    output = torch.empty(1, 1, kv_lora_rank, dtype=torch.bfloat16)
+    softmax_stats = torch.empty(1, 1, 2, dtype=torch.float32)
+
+    # decode.py binds the backend selector at import time; patch that binding.
+    monkeypatch.setattr(fp4_mla_decode, "_fp4_mla_attention_backend", lambda: "triton")
+
+    with pytest.raises(
+        NotImplementedError,
+        match="softmax stats require the cutedsl attention backend",
+    ):
+        fp4_mla_backend.run_fp4_mla_attention_decode(
+            metadata,
+            layer_idx=0,
+            local_layer=0,
+            q=q,
+            output=output,
+            sm_scale=1.0,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            prequantized_q=None,
+            prequantized_q_sf=None,
+            q_batch_capacity=None,
+            softmax_stats_tensor=softmax_stats,
+        )
+
+
+def test_fp4_mla_generation_forwards_helix_softmax_stats(monkeypatch) -> None:
+    num_tokens, num_heads, kv_lora_rank, qk_rope_head_dim = 2, 3, 4, 2
+    fused_head_dim = kv_lora_rank + qk_rope_head_dim
+    q = torch.empty(num_tokens, num_heads * fused_head_dim, dtype=torch.bfloat16)
+    output = torch.empty(num_tokens, num_heads * kv_lora_rank, dtype=torch.bfloat16)
+    softmax_stats = torch.empty(num_tokens, num_heads, 2, dtype=torch.float32)
+    expected_stats = torch.tensor([1.25, 2.5], dtype=torch.float32).expand_as(softmax_stats)
+    metadata = SimpleNamespace(
+        num_generations=num_tokens,
+        helix_position_offsets=torch.tensor([384, 769], dtype=torch.int32),
+        _helix_spec_tokens_valid=False,
+        fp4_mla_state=Fp4MlaState(
+            generation_cache_scattered=True,
+            prequantized_q=torch.empty(0),
+            prequantized_q_sf=torch.empty(0),
+            q_batch_capacity=num_tokens,
+        ),
+    )
+    attn = SimpleNamespace(
+        get_fp4_mla_local_layer_idx=lambda observed: 5,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        num_heads=num_heads,
+        q_scaling=1.0,
+        qk_nope_head_dim=2,
+        layer_idx=7,
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        latent_cache=torch.empty(num_tokens, fused_head_dim, dtype=torch.bfloat16),
+        softmax_stats_tensor=softmax_stats,
+    )
+    params = SimpleNamespace(
+        attn=attn,
+        meta=metadata,
+        fwd=forward_args,
+        query_input=q,
+        output=output,
+    )
+    calls = []
+
+    def record_decode(*args, **kwargs) -> None:
+        calls.append((args, kwargs))
+        kwargs["softmax_stats_tensor"].copy_(expected_stats)
+
+    monkeypatch.setattr(fp4_mla_fmha_backend, "run_fp4_mla_attention_decode", record_decode)
+
+    Fp4MlaFmha.run_mla_generation(None, params)
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:3] == (metadata, 7, 5)
+    assert args[3].shape == (num_tokens, num_heads, fused_head_dim)
+    assert args[4].shape == (num_tokens, num_heads, kv_lora_rank)
+    assert kwargs["softmax_stats_tensor"] is softmax_stats
+    assert softmax_stats.is_contiguous()
+    torch.testing.assert_close(softmax_stats, expected_stats)
+    state = metadata.fp4_mla_state
+    assert not state.generation_cache_scattered
+    assert state.prequantized_q is None
+    assert state.prequantized_q_sf is None
+    assert state.q_batch_capacity is None
+
+
+def test_fp4_mla_rope_generation_forwards_helix_cache_ownership(
+    monkeypatch,
+) -> None:
+    num_tokens, num_heads = 2, 3
+    kv_lora_rank, qk_rope_head_dim = 4, 2
+    fused_q = torch.empty(
+        num_tokens,
+        num_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.bfloat16,
+    )
+    q_pe = torch.empty(num_tokens, num_heads, qk_rope_head_dim, dtype=torch.bfloat16)
+    latent_cache = torch.empty(
+        num_tokens,
+        kv_lora_rank + qk_rope_head_dim,
+        dtype=torch.bfloat16,
+    )
+    helix_position_offsets = torch.tensor([384, 769], dtype=torch.int32)
+    helix_is_inactive_rank = torch.tensor([True, False])
+    metadata = SimpleNamespace(
+        num_generations=num_tokens,
+        num_ctx_tokens=0,
+        helix_position_offsets=helix_position_offsets,
+        helix_is_inactive_rank=helix_is_inactive_rank,
+        _helix_spec_tokens_valid=False,
+    )
+    attn = SimpleNamespace(
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        rope_params=SimpleNamespace(duplicate_data=True),
+        rotary_cos_sin=torch.empty(1024, qk_rope_head_dim, 2, dtype=torch.float32),
+        layer_idx=7,
+        can_fuse_fp4_mla_q_quant=lambda *args: True,
+        get_fp4_mla_local_layer_idx=lambda observed: 5,
+    )
+    calls = []
+
+    def record_scatter(*args, **kwargs) -> bool:
+        calls.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(trtllm_backend, "scatter_fp4_mla_kv_cache", record_scatter)
+
+    def run_rope_generation() -> dict:
+        trtllm_backend.TrtllmAttention._fp4_mla_rope_generation(
+            attn,
+            fused_q,
+            q_pe,
+            latent_cache,
+            metadata,
+            fuse_q_quant=True,
+        )
+        args, kwargs = calls[-1]
+        assert args[:3] == (metadata, latent_cache, 7)
+        assert kwargs["phase"] == "generation"
+        assert kwargs["local_layer"] == 5
+        assert kwargs["q_quant_input"] is fused_q
+        return kwargs
+
+    helix_kwargs = run_rope_generation()
+    assert helix_kwargs["helix_position_offsets"] is helix_position_offsets
+    assert helix_kwargs["helix_is_inactive_rank"] is helix_is_inactive_rank
+
+    metadata.helix_position_offsets = None
+    metadata.helix_is_inactive_rank = None
+    non_helix_kwargs = run_rope_generation()
+    assert non_helix_kwargs["helix_position_offsets"] is None
+    assert non_helix_kwargs["helix_is_inactive_rank"] is None
+
+    metadata.num_generations = 1
+    metadata.helix_position_offsets = helix_position_offsets
+    metadata.helix_is_inactive_rank = torch.tensor([False])
+    metadata.helix_local_slots = torch.tensor([384, 385], dtype=torch.int32)
+    metadata._helix_spec_tokens_valid = True
+    spec_helix_kwargs = run_rope_generation()
+    assert spec_helix_kwargs["helix_position_offsets"] is helix_position_offsets
+    assert spec_helix_kwargs["helix_is_inactive_rank"] is metadata.helix_is_inactive_rank
+    assert len(calls) == 3
+
+
+def test_mla_fp4_helix_generation_reaches_fused_cache_update() -> None:
+    """Helix generation must reach the fused FP4 RoPE/Q-quant/cache update."""
+    num_tokens, num_heads = 2, 2
+    qk_nope_head_dim, qk_rope_head_dim = 2, 2
+    kv_lora_rank = 4
+
+    class ReachedFusedCacheUpdate(Exception):
+        pass
+
+    class FakeFp4Attention:
+        has_fp4_kv_cache = True
+        has_fp8_kv_cache = False
+
+        def support_fp4_kv_cache(self) -> bool:
+            return True
+
+        def mla_rope_generation(self, *args, **kwargs) -> None:
+            assert kwargs == {"fuse_fp4_q_quant": True}
+            raise ReachedFusedCacheUpdate
+
+    mla = SimpleNamespace(
+        num_heads_tp=num_heads,
+        qk_head_dim=qk_nope_head_dim + qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        mqa=FakeFp4Attention(),
+        mapping=SimpleNamespace(has_cp_helix=lambda: True),
+        sparse_params=None,
+        quant_config=SimpleNamespace(
+            layer_quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)
+        ),
+        kv_cache_dtype="nvfp4",
+        k_b_proj_trans=torch.empty(
+            num_heads,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            dtype=torch.bfloat16,
+        ),
+        apply_rotary_emb=False,
+        aux_stream=None,
+        ln_events=[None, None],
+        _bmm_bf16_out=lambda *args: None,
+    )
+    metadata = SimpleNamespace(
+        num_seqs=num_tokens,
+        num_ctx_tokens=0,
+        _helix_spec_tokens_valid=False,
+    )
+
+    with pytest.raises(ReachedFusedCacheUpdate):
+        MLA.forward_absorption_generation(
+            mla,
+            torch.empty(
+                num_tokens,
+                num_heads * (qk_nope_head_dim + qk_rope_head_dim),
+                dtype=torch.bfloat16,
+            ),
+            compressed_kv=torch.empty(0),
+            k_pe=torch.empty(num_tokens, qk_rope_head_dim, dtype=torch.bfloat16),
+            attn_metadata=metadata,
+            output=torch.empty(0),
+            position_ids=torch.arange(num_tokens),
+            latent_cache=torch.empty(
+                num_tokens,
+                kv_lora_rank + qk_rope_head_dim,
+                dtype=torch.bfloat16,
+            ),
         )
 
 
@@ -532,6 +868,24 @@ def test_fp4_mla_disagg_import_skips_hybrid_linear_attention_layers(monkeypatch)
     assert rebuilt_compact_layers == [0, 1]
 
 
+def test_fp4_mla_helix_disagg_import_skips_empty_rank() -> None:
+    manager = SimpleNamespace(
+        dtype=_DataType.NVFP4,
+        kv_factor=1,
+        mla_v_scale_head_dim=512,
+        get_fp4_mla_page_table_spec=lambda *_: SimpleNamespace(),
+        get_batch_cache_indices=lambda *_args, **_kwargs: pytest.fail(
+            "an empty Helix rank must not query cache pages"
+        ),
+    )
+
+    assert fp4_mla_backend.rebuild_fp4_mla_disagg_imported_cache(
+        manager,
+        request_id=41,
+        prompt_len=0,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
@@ -862,6 +1216,155 @@ def _materialize_reference_cache_tokens(
 
 
 @pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize("inactive_rank", [False, True], ids=["active", "inactive"])
+def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
+    monkeypatch,
+    inactive_rank: bool,
+) -> None:
+    _reset_triton_allocator()
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    local_kv_len = 6
+    local_cache_position = local_kv_len - 1
+    global_position = 70
+    num_heads = 4
+    (
+        kv_cache_manager,
+        metadata,
+        _,
+        kv_lora_rank,
+        qk_rope_head_dim,
+    ) = _build_fp4_mla_attention_decode_case(
+        seq_lens=[local_kv_len],
+        num_heads=num_heads,
+        seed=31,
+    )
+    try:
+        state = metadata.fp4_mla_state
+        head_dim = kv_lora_rank + qk_rope_head_dim
+        state.positions = torch.tensor([global_position], dtype=torch.int32, device="cuda")
+        metadata._helix_spec_tokens_valid = False
+        metadata.helix_position_offsets = state.positions
+        metadata.helix_is_inactive_rank = torch.tensor(
+            [inactive_rank], dtype=torch.bool, device="cuda"
+        )
+
+        kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+        kv_cache.zero_()
+        sf_cache.zero_()
+        state.hp_pool.zero_()
+        state.v_scale_pool.zero_()
+        v_packed_pool = kv_cache_manager.get_mla_v_packed_pool_base()
+        assert v_packed_pool is not None
+        v_packed_pool.zero_()
+
+        generation_latent = (
+            torch.randn(1, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        generation_latent[:, :FP4_BLOCK_SIZE] = 0.75
+        generation_latent[:, 1:FP4_BLOCK_SIZE:2] = -0.75
+        q_pe = (
+            torch.randn(1, num_heads, qk_rope_head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        original_q_pe = q_pe.clone()
+        q_quant_input = torch.zeros(1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        q_rope_out = q_quant_input[..., kv_lora_rank:]
+        # Identity rotation everywhere except the global position, which rotates
+        # every RoPE pair by 90 degrees; any other rope position leaves q_pe as is.
+        rotary_cos_sin = torch.zeros(
+            (FP4_MLA_TOKENS_PER_BLOCK, qk_rope_head_dim, 2),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        rotary_cos_sin[..., 0] = 1.0
+        rotary_cos_sin[global_position, :, 0] = 0.0
+        rotary_cos_sin[global_position, :, 1] = 1.0
+
+        assert scatter_fp4_mla_kv_cache(
+            metadata,
+            generation_latent,
+            layer_idx=0,
+            token_offset=0,
+            phase="generation",
+            local_layer=0,
+            v_head_dim=kv_lora_rank,
+            rotary_cos_sin=rotary_cos_sin,
+            q_pe=q_pe,
+            q_rope_out=q_rope_out,
+            q_quant_input=q_quant_input,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+        )
+        torch.cuda.synchronize()
+
+        def rotate_pairs(values: torch.Tensor) -> torch.Tensor:
+            pairs = values.reshape(*values.shape[:-1], qk_rope_head_dim // 2, 2)
+            return torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+
+        torch.testing.assert_close(q_rope_out, rotate_pairs(original_q_pe), rtol=0, atol=0)
+        expected_q_fp4, expected_q_sf = torch.ops.trtllm.fp4_quantize_with_residual(
+            q_quant_input.reshape(-1, head_dim),
+            state.q_global_scale,
+            FP4_MLA_Q_RESIDUAL_DIM,
+            is_act=True,
+        )
+        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
+        valid_q_sf_offsets = torch.tensor(
+            [
+                _swizzled_sf_offset(row_idx, col_idx, q_sf_per_token)
+                for row_idx in range(num_heads)
+                for col_idx in range(q_sf_per_token)
+            ],
+            device="cuda",
+        )
+        torch.testing.assert_close(
+            state.prequantized_q_sf.view(torch.uint8)[valid_q_sf_offsets],
+            expected_q_sf.view(torch.uint8).flatten()[valid_q_sf_offsets],
+        )
+        assert state.q_batch_capacity == 1
+        if inactive_rank:
+            for cache_tensor in (
+                kv_cache,
+                sf_cache,
+                state.hp_pool,
+                state.v_scale_pool,
+                v_packed_pool,
+            ):
+                assert not torch.count_nonzero(cache_tensor)
+            return
+
+        expected_latent = generation_latent.clone()
+        expected_latent[:, kv_lora_rank:] = rotate_pairs(generation_latent[:, kv_lora_rank:])
+        batch_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+        local_token = _materialize_reference_cache_tokens(
+            metadata,
+            layer_idx=0,
+            batch_indices=batch_indices,
+            positions=torch.tensor([local_cache_position], dtype=torch.int32, device="cuda"),
+            head_dim=head_dim,
+        )
+        torch.testing.assert_close(local_token, expected_latent.float(), rtol=0.25, atol=0.2)
+        global_slot = _materialize_reference_cache_tokens(
+            metadata,
+            layer_idx=0,
+            batch_indices=batch_indices,
+            positions=metadata.helix_position_offsets,
+            head_dim=head_dim,
+        )
+        assert not torch.count_nonzero(global_slot)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
     reason="requires Rubin SM107",
 )
@@ -962,6 +1465,7 @@ def _build_fp4_mla_attention_decode_case(
     num_heads: int,
     seed: int,
     query_len_per_seq: int = 1,
+    enable_helix: bool = False,
     enable_block_reuse: bool = False,
 ) -> tuple[Fp4MlaKVCacheManagerV2, SimpleNamespace, torch.Tensor, int, int]:
     torch.manual_seed(seed)
@@ -1098,6 +1602,18 @@ def _build_fp4_mla_attention_decode_case(
     )
     rotary_cos_sin[..., 0] = 1.0
 
+    if enable_helix:
+        # CP1 exercises the Helix per-token metadata contract while the
+        # verify group below still crosses a physical page boundary.
+        positions = metadata.fp4_mla_state.positions
+        metadata.helix_position_offsets = positions.clone()
+        metadata.helix_local_slots = positions.clone()
+        metadata.helix_kv_bounds = positions + 1
+        metadata.helix_is_inactive_rank = torch.zeros(
+            len(seq_lens), dtype=torch.bool, device=device
+        )
+        metadata._helix_spec_tokens_valid = query_len_per_seq > 1
+
     assert scatter_fp4_mla_kv_cache(
         metadata,
         generation_latent,
@@ -1110,6 +1626,8 @@ def _build_fp4_mla_attention_decode_case(
         q_pe=q_pe,
         q_rope_out=q_rope_out,
         q_quant_input=q_quant_input,
+        helix_position_offsets=getattr(metadata, "helix_position_offsets", None),
+        helix_is_inactive_rank=getattr(metadata, "helix_is_inactive_rank", None),
     )
     torch.cuda.synchronize()
     assert metadata.fp4_mla_state.prequantized_q is not None
@@ -1147,7 +1665,7 @@ def _fp4_mla_attention_decode_reference(
     sm_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = kv_lora_rank + qk_rope_head_dim
     storage = _materialize_reference_cache_storage(metadata, 0, head_dim)
     dequant_cache = storage[..., :head_dim]
@@ -1195,6 +1713,7 @@ def _fp4_mla_attention_decode_reference(
     query_len_per_seq = q_nope.shape[0] // num_seqs
     max_pages = max(indptr[seq_idx + 1] - indptr[seq_idx] for seq_idx in range(num_seqs))
     outputs = []
+    softmax_stats = []
     for seq_idx in range(num_seqs):
         kv_len = kv_lens[seq_idx]
         page_count = indptr[seq_idx + 1] - indptr[seq_idx]
@@ -1223,10 +1742,11 @@ def _fp4_mla_attention_decode_reference(
                     full_k_residual[:effective_kv_len],
                     FP4_MLA_Q_RESIDUAL_DIM,
                 )
-            probs = torch.softmax(
-                torch.matmul(logical_q, logical_k.transpose(0, 1)) * sm_scale,
-                dim=-1,
-            )
+            scores = torch.matmul(logical_q, logical_k.transpose(0, 1)) * sm_scale
+            row_max = scores.max(dim=-1).values
+            row_sum = torch.exp(scores - row_max[:, None]).sum(dim=-1)
+            softmax_stats.append(torch.stack((row_max, row_sum), dim=-1))
+            probs = torch.softmax(scores, dim=-1)
 
             if p_dequant is None:
                 p = probs
@@ -1243,7 +1763,7 @@ def _fp4_mla_attention_decode_reference(
                 p = torch.cat(p_pages, dim=-1)
 
             outputs.append(torch.matmul(p, v_cache.float()))
-    return torch.stack(outputs, dim=0)
+    return torch.stack(outputs, dim=0), torch.stack(softmax_stats, dim=0)
 
 
 def _assert_fp4_mla_attention_decode_accuracy(
@@ -1255,6 +1775,7 @@ def _assert_fp4_mla_attention_decode_accuracy(
     seq_lens: list[int],
     seed: int,
     query_len_per_seq: int = 1,
+    enable_helix: bool = False,
     enable_block_reuse: bool = False,
 ) -> None:
     _reset_triton_allocator()
@@ -1274,6 +1795,7 @@ def _assert_fp4_mla_attention_decode_accuracy(
         num_heads=num_heads,
         seed=seed,
         query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
         enable_block_reuse=enable_block_reuse,
     )
     try:
@@ -1281,6 +1803,9 @@ def _assert_fp4_mla_attention_decode_accuracy(
         assert (v_packed_pool is None) is fused_v_transpose
 
         output = torch.empty_like(q[..., :kv_lora_rank])
+        softmax_stats = None
+        if backend == "cutedsl" and (query_len_per_seq == 1 or enable_helix):
+            softmax_stats = torch.empty((*q.shape[:2], 2), dtype=torch.float32, device=q.device)
         sm_scale = 0.1
         run_fp4_mla_attention_decode(
             metadata,
@@ -1294,10 +1819,11 @@ def _assert_fp4_mla_attention_decode_accuracy(
             prequantized_q=metadata.fp4_mla_state.prequantized_q,
             prequantized_q_sf=metadata.fp4_mla_state.prequantized_q_sf,
             q_batch_capacity=metadata.fp4_mla_state.q_batch_capacity,
+            softmax_stats_tensor=softmax_stats,
         )
         torch.cuda.synchronize()
 
-        ref_output = _fp4_mla_attention_decode_reference(
+        ref_output, ref_softmax_stats = _fp4_mla_attention_decode_reference(
             metadata,
             q[..., :kv_lora_rank],
             q[..., kv_lora_rank:],
@@ -1336,6 +1862,21 @@ def _assert_fp4_mla_attention_decode_accuracy(
                 f"min_cosine={min_cosine}"
             ),
         )
+        if softmax_stats is not None:
+            torch.testing.assert_close(
+                softmax_stats[..., 0],
+                ref_softmax_stats[..., 0],
+                atol=1.5e-1,
+                rtol=1.5e-1,
+                msg=f"{backend} FP4 MLA softmax row maxima diverged from reference",
+            )
+            torch.testing.assert_close(
+                softmax_stats[..., 1],
+                ref_softmax_stats[..., 1],
+                atol=2.5e-1,
+                rtol=1.5e-1,
+                msg=f"{backend} FP4 MLA softmax row sums diverged from reference",
+            )
     finally:
         torch.cuda.synchronize()
         _reset_triton_allocator()
@@ -1367,6 +1908,31 @@ def test_fp4_mla_attention_decode_cutedsl_matches_reference(
         seq_lens=[131, 512],
         seed=29,
         query_len_per_seq=query_len_per_seq,
+    )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "fused_v_transpose",
+    [False, True],
+    ids=["mufu16", "mufu16-fused-v-transpose"],
+)
+def test_fp4_mla_attention_decode_cutedsl_helix_mtp5_matches_reference(
+    monkeypatch,
+    fused_v_transpose: bool,
+) -> None:
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=fused_v_transpose,
+        num_heads=128,
+        seq_lens=[131, 512],
+        seed=37,
+        query_len_per_seq=6,
+        enable_helix=True,
     )
 
 
