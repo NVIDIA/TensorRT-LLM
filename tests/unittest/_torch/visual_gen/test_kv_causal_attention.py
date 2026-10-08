@@ -45,6 +45,23 @@ DEVICE = torch.device("cuda")
 PROMPT_CAPACITY = 64
 WINDOW = 64
 CHUNK = 40  # not a page multiple: exercises partial pages and stale tokens
+GEOMETRY = dict(
+    window_tokens=WINDOW, max_staged_tokens=CHUNK, causal_block_sizes=(CHUNK, CHUNK // 4)
+)
+
+
+def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
+    """A cache whose pool is sized for ``geometry`` with up to ``pin_tokens`` pinned."""
+    return CausalKVCacheManager(
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_page=tokens_per_page,
+        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+            tokens_per_page=tokens_per_page, pin_tokens=pin_tokens, **geometry
+        ),
+    )
 
 
 def reference_attention(q, keys, values):
@@ -73,17 +90,7 @@ def exact_reference(q, pk, pv, hk, hv, k, v, start, end):
 
 @pytest.fixture(params=[32, 64], ids=["tpb32", "tpb64"])
 def cache(request):
-    mgr = CausalKVCacheManager(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        dtype=DTYPE,
-        tokens_per_page=request.param,
-        fixed_capacity=PROMPT_CAPACITY,
-        window_tokens=WINDOW,
-        chunk_tokens=CHUNK,
-        causal_block_sizes=(CHUNK, CHUNK // 4),
-    )
+    mgr = make_cache(request.param)
     try:
         yield mgr
     finally:
@@ -139,10 +146,10 @@ def rand_qkv(n):
     return q, k, torch.randn_like(k)
 
 
-def open_with_prompt(cache, prompt_len):
+def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
     """Open pinning ``prompt_len`` tokens, write a random prompt at position 0 and
     commit it; returns its K and V."""
-    cache.open(pin_tokens=prompt_len)
+    cache.open(pin_tokens=prompt_len, **geometry)
     pk, pv = rand_qkv(prompt_len)[1:]
     cache.write_range(0, 0, pk, pv)
     if prompt_len:
@@ -194,7 +201,7 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
         torch.testing.assert_close(k_back, k)
         torch.testing.assert_close(v_back, v)
 
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
     assert saw_stale, "test geometry should hold stale tokens at some step"
@@ -240,7 +247,7 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
     assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
@@ -296,13 +303,13 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     def keys(n):
         return torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
-    cache.open(pin_tokens=prompt + sink)
+    cache.open(pin_tokens=prompt + sink, **GEOMETRY)
     cache.write_range(0, 0, keys(prompt), indicator_values(watch, 0, prompt))
     cache.commit(prompt)
     for c in range(commits):
         first = prompt + c * CHUNK
         cache.write_range(0, cache.past_tokens, keys(CHUNK), indicator_values(watch, first, CHUNK))
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
     assert cache.fixed_tokens == fixed
 
     size = CHUNK // num_causal_blocks
@@ -396,7 +403,7 @@ def test_graph_replay_survives_commit(cache, backend):
     for _ in range(2):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
 
@@ -414,7 +421,7 @@ def test_graph_replay_survives_commit(cache, backend):
     for step in range(3):  # the third commit rotates the table
         history_k.append(k.clone())
         history_v.append(v.clone())
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
         if backend == "trtllm":
             attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)  # the step loop's job
         q2, k2, v2 = rand_qkv(CHUNK)
@@ -440,20 +447,10 @@ def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
     read must come from the cache at replay, not from the moment of capture."""
     torch.manual_seed(8)
     prompt, size = 8, CHUNK // num_causal_blocks
-    cache = CausalKVCacheManager(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        dtype=DTYPE,
-        tokens_per_page=32,
-        fixed_capacity=prompt,
-        window_tokens=WINDOW,
-        chunk_tokens=CHUNK,
-        causal_block_sizes=(CHUNK, CHUNK // 4),
-    )
+    cache = make_cache(32, pin_tokens=prompt)
     try:
-        assert cache.num_pages == 5
         pk, pv = open_with_prompt(cache, prompt)
+        assert cache.num_pages == 5
         attn = make_backend(backend)
         q, k, v = rand_qkv(CHUNK)  # static buffers the graph reads
         side = torch.cuda.Stream()
@@ -486,7 +483,7 @@ def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
             torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"step {step}")
             history_k.append(k.clone())
             history_v.append(v.clone())
-            cache.commit()
+            cache.commit(cache.max_staged_tokens)
         assert len(history_k) * CHUNK >= 3 * cache.capacity, "the pool should cycle three times"
     finally:
         cache.shutdown()
@@ -532,7 +529,7 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     for _ in range(3):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
-        cache.commit()
+        cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
     assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
@@ -571,19 +568,10 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
     block starts and ends fall on page boundaries, through several rotations."""
     torch.manual_seed(10)
     prompt, window, chunk = 8, 96, 128
-    cache = CausalKVCacheManager(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        dtype=DTYPE,
-        tokens_per_page=32,
-        fixed_capacity=prompt,
-        window_tokens=window,
-        chunk_tokens=chunk,
-        causal_block_sizes=(128, 64, 32),
-    )
+    geometry = dict(window_tokens=window, max_staged_tokens=chunk, causal_block_sizes=(128, 64, 32))
+    cache = make_cache(32, pin_tokens=prompt, geometry=geometry)
     try:
-        pk, pv = open_with_prompt(cache, prompt)
+        pk, pv = open_with_prompt(cache, prompt, geometry)
         attn = make_backend(backend)
         history_k, history_v = [], []
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
@@ -608,7 +596,7 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
             )
             history_k.append(k)
             history_v.append(v)
-            cache.commit()
+            cache.commit(cache.max_staged_tokens)
         assert cache.history_tokens >= window, "the window should be full by now"
     finally:
         cache.shutdown()
@@ -658,17 +646,7 @@ def test_trtllm_forgets_metadata_of_shut_down_caches():
         }
 
     def new_cache():
-        return CausalKVCacheManager(
-            num_layers=1,
-            num_kv_heads=NUM_KV_HEADS,
-            head_dim=HEAD_DIM,
-            dtype=DTYPE,
-            tokens_per_page=32,
-            fixed_capacity=PROMPT_CAPACITY,
-            window_tokens=WINDOW,
-            chunk_tokens=CHUNK,
-            causal_block_sizes=(CHUNK, CHUNK // 4),
-        )
+        return make_cache(32)
 
     caches = [new_cache() for _ in range(3)]
     try:
@@ -702,17 +680,7 @@ def test_packed_qkv_matches_separate_tensors_on_the_cache_path():
     q, k, v = rand_qkv(CHUNK)
     packed = torch.cat([q, k, v], dim=1).unsqueeze(0).contiguous()  # [1, S, H + 2 H_kv, D]
     for call in ("separate", "packed"):
-        cache = CausalKVCacheManager(
-            num_layers=1,
-            num_kv_heads=NUM_KV_HEADS,
-            head_dim=HEAD_DIM,
-            dtype=DTYPE,
-            tokens_per_page=32,
-            fixed_capacity=PROMPT_CAPACITY,
-            window_tokens=WINDOW,
-            chunk_tokens=CHUNK,
-            causal_block_sizes=(CHUNK, CHUNK // 4),
-        )
+        cache = make_cache(32)
         try:
             torch.manual_seed(14)  # the same prompt K/V for both calls
             open_with_prompt(cache, 9)

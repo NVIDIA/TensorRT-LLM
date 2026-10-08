@@ -191,18 +191,22 @@ def build_cache(
     Returns the manager plus dense copies of the prompt and of every committed
     history token, oldest first (layer 0's values; other layers get the same).
     """
+    geometry = dict(
+        window_tokens=window_tokens,
+        max_staged_tokens=CHUNK,
+        causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
+    )
     mgr = CausalKVCacheManager(
         num_layers=num_layers,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tokens_per_page,
-        fixed_capacity=max(prompt_len, 1),
-        window_tokens=window_tokens,
-        chunk_tokens=CHUNK,
-        causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
+        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+            tokens_per_page=tokens_per_page, pin_tokens=prompt_len, **geometry
+        ),
     )
-    mgr.open(pin_tokens=prompt_len)
+    mgr.open(pin_tokens=prompt_len, **geometry)
     kp = torch.randn(prompt_len, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     vp = torch.randn_like(kp)
     for layer in range(num_layers):
@@ -216,7 +220,7 @@ def build_cache(
         v = torch.randn_like(k)
         for layer in range(num_layers):
             mgr.write_range(layer, mgr.past_tokens, k, v)
-        mgr.commit()
+        mgr.commit(mgr.max_staged_tokens)
         hist_k.append(k)
         hist_v.append(v)
     return mgr, kp, vp, torch.cat(hist_k), torch.cat(hist_v)
@@ -326,7 +330,7 @@ def chunk_cycle(args, gen) -> None:
     # Each commit at steady state drops pages, so the rotation and the private-page
     # copies for both blockings are exercised every time.
     def refresh_and_commit():
-        mgr.commit()
+        mgr.commit(mgr.max_staged_tokens)
         if args.backend == "trtllm":
             for n, size in ((1, CHUNK), (CHUNK // TOKENS_PER_FRAME, TOKENS_PER_FRAME)):
                 attns[0].metadata.prepare_with_kv_cache(mgr, n, size)

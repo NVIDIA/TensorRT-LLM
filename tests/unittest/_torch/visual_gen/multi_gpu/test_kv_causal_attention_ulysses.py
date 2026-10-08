@@ -127,18 +127,30 @@ def make_backend(name, chunk, prompt=PROMPT, window=WINDOW):
     )
 
 
-def make_cache(chunk, prompt=PROMPT, window=WINDOW):
-    return CausalKVCacheManager(
+def make_cache(chunk, prompt=PROMPT, window=WINDOW, kv_heads=NUM_KV_HEADS // WORLD, sizes=None):
+    """A cache whose pool is sized for this geometry; the geometry rides on the
+    object so ``open_cache`` can open it (tests only)."""
+    geometry = dict(
+        window_tokens=window,
+        max_staged_tokens=chunk,
+        causal_block_sizes=sizes if sizes is not None else (chunk, chunk // 4),
+    )
+    cache = CausalKVCacheManager(
         num_layers=1,
-        num_kv_heads=NUM_KV_HEADS // WORLD,
+        num_kv_heads=kv_heads,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=TPB,
-        fixed_capacity=prompt,
-        window_tokens=window,
-        chunk_tokens=chunk,
-        causal_block_sizes=(chunk, chunk // 4),
+        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+            tokens_per_page=TPB, pin_tokens=prompt, **geometry
+        ),
     )
+    cache.test_geometry = geometry
+    return cache
+
+
+def open_cache(cache, pin_tokens=0):
+    cache.open(pin_tokens=pin_tokens, **cache.test_geometry)
 
 
 def rand_qkv(n):
@@ -200,7 +212,7 @@ def _logic_rollout(rank, world_size, backend):
     cache = make_cache(chunk)
     attn, group = make_ulysses(rank, world_size, backend, chunk)
     try:
-        cache.open(pin_tokens=PROMPT)
+        open_cache(cache, pin_tokens=PROMPT)
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
         cache.commit(PROMPT)
@@ -224,7 +236,7 @@ def _logic_rollout(rank, world_size, backend):
             torch.testing.assert_close(k_back, head_slice(k, rank), msg=f"step {step}: K")
             torch.testing.assert_close(v_back, head_slice(v, rank), msg=f"step {step}: V")
 
-            cache.commit()
+            cache.commit(cache.max_staged_tokens)
             history_k.append(k)
             history_v.append(v)
         assert cache.history_tokens < 8 * chunk, "window never rotated"
@@ -239,7 +251,7 @@ def _logic_causal_blocks(
     cache = make_cache(chunk, prompt, window)
     attn, group = make_ulysses(rank, world_size, backend, chunk, prompt, window)
     try:
-        cache.open(pin_tokens=prompt)
+        open_cache(cache, pin_tokens=prompt)
         _, pk, pv = rand_qkv(prompt)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
         cache.commit(prompt)
@@ -247,7 +259,7 @@ def _logic_causal_blocks(
         for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
             _, k, v = rand_qkv(chunk)
             cache.write_range(0, cache.past_tokens, head_slice(k, rank), head_slice(v, rank))
-            cache.commit()
+            cache.commit(cache.max_staged_tokens)
             history_k.append(k)
             history_v.append(v)
         assert cache.history_tokens > window, "test geometry should hold stale tokens here"
@@ -278,7 +290,7 @@ def _logic_padded_first_chunk(rank, world_size, backend):
     cache = make_cache(chunk)
     attn, group = make_ulysses(rank, world_size, backend, chunk)
     try:
-        cache.open(pin_tokens=PROMPT)
+        open_cache(cache, pin_tokens=PROMPT)
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
         cache.commit(PROMPT)
@@ -308,20 +320,12 @@ def _logic_padded_first_chunk(rank, world_size, backend):
 def _logic_head_count_guard(rank, world_size, backend):
     """A cache built for the wrong head count is refused, not silently written."""
     chunk = 40
-    cache = CausalKVCacheManager(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,  # full count: wrong under Ulysses
-        head_dim=HEAD_DIM,
-        dtype=DTYPE,
-        tokens_per_page=TPB,
-        fixed_capacity=PROMPT,
-        window_tokens=WINDOW,
-        chunk_tokens=chunk,
-        causal_block_sizes=(chunk,),
-    )
+    cache = make_cache(
+        chunk, kv_heads=NUM_KV_HEADS, sizes=(chunk,)
+    )  # full count: wrong under Ulysses
     attn, _ = make_ulysses(rank, world_size, backend, chunk)
     try:
-        cache.open()
+        open_cache(cache)
         q, k, v = rand_qkv(chunk)
         with pytest.raises(ValueError, match="per rank"):
             forward(attn, cache, q, k, v, rank)
@@ -361,7 +365,7 @@ def _logic_through_the_attention_module(rank, world_size, backend):
     cache = make_cache(chunk)
     group = vgm.ulysses_group
     try:
-        cache.open(pin_tokens=PROMPT)
+        open_cache(cache, pin_tokens=PROMPT)
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
         cache.commit(PROMPT)
