@@ -28,7 +28,6 @@ model_path = llm_models_root() / default_model_name
 def test_get_startup_metrics_promotes_model_engine_stages() -> None:
     """Verify startup metrics promote saved engine stages while retaining executor metrics."""
     worker = object.__new__(BaseWorker)
-    worker._is_pytorch_backend = True
     worker.engine = SimpleNamespace(
         metrics={
             "worker_start_seconds": 0.5,
@@ -149,7 +148,6 @@ class FakeWorker(BaseWorker):
             enable_iter_perf_stats=True,
         )
         super().__init__(
-            engine=engine,
             llm_args=llm_args,
             hf_model_dir=engine,
         )
@@ -254,7 +252,6 @@ class TestRpcWorkerBaseTP2:
     def test_create_executor(self):
         futures = self.session.submit(
             TestRpcWorkerBaseTP2.create_executor,
-            engine=model_path,
             llm_args=self.llm_args,
         )
         # Wait for completion
@@ -289,3 +286,68 @@ class TestRpcWorkerBaseTP2:
 if __name__ == "__main__":
     test_worker_base = TestWorkerBase()
     test_worker_base.test_submit_request()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("drop_context_logits", [False, True])
+@pytest.mark.parametrize("top_k,simple", [(0, False), (0, True), (2, False)])
+def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
+        streaming, drop_context_logits, top_k, simple):
+    import math
+
+    from tensorrt_llm.executor.base_worker import _get_logprobs
+    from tensorrt_llm.sampling_params import LogprobParams
+
+    generation_result = SimpleNamespace(
+        _streaming=streaming,
+        _generation_request=SimpleNamespace(prompt_token_ids=[0, 1, 2]),
+        _logprob_params=LogprobParams(prompt_logprobs=top_k,
+                                      drop_context_logits=drop_context_logits,
+                                      prompt_logprobs_simple_format=simple),
+    )
+    worker = SimpleNamespace(_results={7: generation_result})
+    response_result = SimpleNamespace(
+        context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
+        get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
+    )
+
+    def clear_context_logits():
+        response_result.context_logits = None
+
+    response = SimpleNamespace(client_id=7,
+                               result=response_result,
+                               clear_context_logits=clear_context_logits)
+    result = _get_logprobs(worker, response)
+
+    normalizer = math.log(sum(math.exp(i) for i in range(4)))
+    # Context logits predict the next prompt token; the last row predicts
+    # the first generated token. The initial prompt token has no logprob.
+    expected_tokens = [1, 2, 0]
+    for entry, token in zip(result.prompt, expected_tokens):
+        value = entry if simple else entry[token].logprob
+        assert value == pytest.approx(token - normalizer)
+        if not simple:
+            assert entry[token].rank == 4 - token
+    assert len(result.prompt) == len(expected_tokens)
+    assert result.generation is None
+    assert (response_result.context_logits is None) == drop_context_logits
+
+    if streaming:
+        # Later streaming responses can omit the already-consumed logits.
+        response_result.context_logits = None
+        cached_result = _get_logprobs(worker, response)
+        assert cached_result.prompt is result.prompt
+
+
+@pytest.mark.cpu_only
+def test_generation_logprobs_need_no_worker_recomputation():
+    from tensorrt_llm.executor.base_worker import _get_logprobs
+    from tensorrt_llm.sampling_params import LogprobParams
+
+    worker = SimpleNamespace(
+        _results={
+            7: SimpleNamespace(_logprob_params=LogprobParams(logprobs=2))
+        })
+    # No logits or result accessor is needed: generation logprobs come
+    # directly from the sampler's response tensors.
+    assert _get_logprobs(worker, SimpleNamespace(client_id=7)) is None

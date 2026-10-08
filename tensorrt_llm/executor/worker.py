@@ -64,7 +64,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Path,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
@@ -75,7 +74,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         hmac_key: bytes = b"",
     ) -> None:
         super().__init__(
-            engine=engine,
             batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
@@ -235,7 +233,6 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
@@ -448,8 +445,7 @@ def worker_main(
 
     try:
         worker: GenerationExecutorWorker = worker_cls(
-            engine,
-            batched_logits_processor,
+            batched_logits_processor=batched_logits_processor,
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             hf_model_dir=hf_model_dir,
