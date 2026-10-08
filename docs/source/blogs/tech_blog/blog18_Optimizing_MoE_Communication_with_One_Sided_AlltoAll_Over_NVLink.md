@@ -306,9 +306,13 @@ At `bsz = 2048`:
 
 ### Reproduction
 
-The benchmark is available in the TensorRT LLM repository. Example command:
+The benchmark is available in the TensorRT LLM repository; it is not shipped in the release container or the `tensorrt_llm` wheel. Run it from a source checkout that matches the installed TensorRT LLM version, after installing the development requirements. Example command:
 
 ```bash
+# requirements-dev.txt provides the packages the benchmark needs beyond a TensorRT LLM installation:
+# cloudpickle (spawning the benchmark ranks with --ep_size), cupti-python (CUPTI kernel timing and
+# --kernel_breakdown) and cxxfilt (readable kernel names).
+pip install -r requirements-dev.txt
 python tests/microbenchmarks/bench_moe_comm.py --backend NVLINK_ONE_SIDED --profile deepseek_v3 --perfect_router --kernel_breakdown --iter_stats --ep_size 8 -b 1 -e 2048 -f 2 --output_file nvlink_one_sided.json
 ```
 `srun` is required for multi-node NVLink benchmarking. See `python tests/microbenchmarks/bench_moe_comm.py --help` for the full set of options.
