@@ -44,14 +44,14 @@ def kernel_specs() -> tuple[ModuleType, list[Any]]:
 
 
 @pytest.mark.parametrize("sm", [90, 100, 120])
-@pytest.mark.parametrize("dtype", ["fp16", "bf16"])
+@pytest.mark.parametrize("dtype", ["fp16", "bf16", "fp16_fp32"])
 def test_pixtral_head_size_has_a_padding_mask_kernel(
     kernel_specs: tuple[ModuleType, list[Any]],
     sm: int,
     dtype: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Generate the packed-QKV padding-mask kernels Pixtral requests."""
+    """Generate head-104 padding kernels for both FP16 accumulation modes and BF16."""
     module, specs = kernel_specs
     matching = [
         kspec
@@ -87,7 +87,6 @@ def test_pixtral_padding_mask_excludes_other_variants(
     ]
     added_arches = [kspec for kspec in packed if kspec.sm in (90, 120)]
     excluded = {
-        "fp16_fp32": [kspec for kspec in added_arches if kspec.dtype == "fp16_fp32"],
         "fp8": [kspec for kspec in added_arches if kspec.dtype.startswith("e4m3")],
         "skip_softmax": [kspec for kspec in added_arches if kspec.enable_skip_softmax],
         "sm90_non_warp_specialized": [

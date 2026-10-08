@@ -2203,8 +2203,8 @@ def selected_mask_types(kspec):
             # 104 uses warp specialization on SM90 and non-tiled kernels on SM120.
             pixtral_padding = kspec.head_size == 104 and (
                 kspec.sm == 100 or
-                (kspec.sm in (90, 120) and kspec.dtype in ('fp16', 'bf16')
-                 and not kspec.enable_skip_softmax
+                (kspec.sm in (90, 120) and kspec.dtype in
+                 ('fp16', 'bf16', 'fp16_fp32') and not kspec.enable_skip_softmax
                  and kspec.warp_specialization == (kspec.sm == 90) and
                  (kspec.sm != 120 or not kspec.tiled)))
             if (kspec.head_size not in [32, 64, 72, 80, 128]

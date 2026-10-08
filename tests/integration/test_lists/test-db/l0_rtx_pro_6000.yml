@@ -14,6 +14,7 @@ l0_rtx_pro_6000:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - cpp/test_unit_tests.py::test_fmha_head104_unit_tests[120]
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # NCCL-EP v0.2 owns LL shared-memory sizing; cover the factory regression on SM120.
   - unittest/_torch/moe/test_communication_factory.py
