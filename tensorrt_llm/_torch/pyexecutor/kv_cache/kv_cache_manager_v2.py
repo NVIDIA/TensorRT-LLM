@@ -67,6 +67,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
     AttnLifeCycle,
+    Batch,
     BatchDesc,
     BeamIndex,
     BufferConfig,
@@ -1184,6 +1185,8 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
 
 
 class KVCacheManagerV2(BaseResourceManager):
+    # Sparse managers attach a metadata batch during initialization.
+    sparse_metadata_batch: Batch | None = None
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -1339,6 +1342,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._stream = (
             execution_stream if execution_stream is not None else torch.cuda.current_stream()
         )
+        self.sparse_metadata_batch: Batch | None = None
         logger.info(f"[KVCacheManager] execution_stream: {self._stream}")
 
         # Materialize an exact per-local-layer vector for cache and attention consumers.
@@ -1840,6 +1844,19 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self._early_freed_index_requests: set[int] = set()
         self._prepare_page_table_tensor(index_mapper_capacity)
+        self._sparse_layer_group_ids = tuple(
+            sorted(
+                {
+                    self.layer_to_pool_mapping_dict[buf.layer_id]
+                    for buf in self.impl.all_buffer_ids
+                    if self.impl.is_sparse(buf.layer_id, buf.role)
+                }
+            )
+        )
+        if self._sparse_layer_group_ids:
+            self.sparse_metadata_batch = Batch(
+                self.impl, index_mapper_capacity, self.max_blocks_per_seq, self.max_beam_width
+            )
 
         self._log_kv_cache_pool_lifecycle_mapping()
         self._reserve_guard_page()
@@ -3417,9 +3434,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
 
         if not kv_cache.is_active:
-            if not kv_cache.resume(self._stream.cuda_stream):
+            if not kv_cache.resume(self._stream.cuda_stream, is_decoding=True):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
+        elif not kv_cache.enter_decode():
+            return False
 
         if not self._ensure_generation_beam_width(req, kv_cache):
             return False
@@ -3555,6 +3574,10 @@ class KVCacheManagerV2(BaseResourceManager):
         would cause illegal memory accesses during the forward pass.
         """
         self._set_page_index_bufs(request_id, kv_cache)
+
+        if self.sparse_metadata_batch is not None:
+            index = self.index_mapper.get_index(request_id)
+            self.sparse_metadata_batch.add(kv_cache, index)
 
     def _resume_and_restore(self, req_id: int, kv_cache) -> bool:
         """Resume a suspended KV cache and restore its page index buffers.
@@ -3998,6 +4021,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Mirror the main manager. Under one-model spec decoding the
             # scheduler may already have created the context cache.
             self._prepare_draft_resources(scheduled_batch)
+            self._publish_sparse_metadata()
             return
 
         # KV pages are allocated in `KVCacheV2Scheduler`, so by this point every
@@ -4005,6 +4029,18 @@ class KVCacheManagerV2(BaseResourceManager):
         # That is what makes this the place to drive the connector.
         if self.kv_connector_manager is not None:
             self._run_kv_connector_hooks(scheduled_batch)
+        self._publish_sparse_metadata()
+
+    def _publish_sparse_metadata(self) -> None:
+        """Refresh stable GPU rows on the execution stream before model work.
+
+        Batch rows match IndexMapper slots, including holes. Sparse consumers use
+        ``sparse_metadata_batch`` for raw tables and eligible-history counts.
+        Readers on another stream must use Batch.wait_ready/record_read.
+        """
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.publish(self._stream.cuda_stream)
 
     def _run_kv_connector_hooks(self, scheduled_batch: ScheduledRequests) -> None:
         """Serve final-batch queries for connectors without source reservations."""
@@ -4060,6 +4096,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if finalize_prefix_reservations and self._connector_reservations_enabled():
                 self._accept_connector_prefix_reservations(scheduled_batch)
             self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
+        # Connector acceptance can resize requests after prepare_resources.
+        self._publish_sparse_metadata()
 
     # ---- KV connector prefix ----
 
@@ -5335,6 +5373,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # mirrored, and the target may release the same request twice.
             return
         if kv_cache is not None:
+            if self.sparse_metadata_batch is not None:
+                self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+                self.sparse_metadata_batch.remove(kv_cache)
             for beam_idx in range(int(kv_cache.beam_width)):
                 for pool_idx in range(self.num_pools):
                     kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
@@ -5624,6 +5665,10 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.close()
+            self.sparse_metadata_batch = None
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
@@ -6118,6 +6163,21 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
         max_blocks: Optional[int] = None,
     ):
+        self._publish_sparse_metadata()
+        # Sparse history can remain on GPU while offload is deferred. Check all
+        # mapped pages after publication, which can retry the deferred offload.
+        if self.sparse_metadata_batch is not None and any(
+            level is not None and level != GPU_LEVEL
+            for req_id in request_ids
+            for layer_group_id in self._sparse_layer_group_ids
+            for level in self.kv_cache_map[req_id]
+            .get_page_storage_snapshot(layer_group_id)
+            .cache_levels
+        ):
+            raise RuntimeError(
+                "Offloaded sparse history requires Batch metadata and sparse fetch; "
+                "dense attention offsets cannot address host slots"
+            )
         # max_blocks is accepted for signature parity with KVCacheManager; the
         # device-side copy op here already scales with allocated blocks only.
         assert beam_width <= self.max_copy_beam_width
@@ -6213,7 +6273,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if is_dummy:
             self.impl.mark_stats_excluded(request_id)
             kv_cache.discard_pending_stats()
-        self.index_mapper.add_new_sequence(request_id)
+        index = self.index_mapper.add_new_sequence(request_id)
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.add(kv_cache, index)
         self._set_page_index_bufs(request_id, kv_cache)
         return kv_cache
 

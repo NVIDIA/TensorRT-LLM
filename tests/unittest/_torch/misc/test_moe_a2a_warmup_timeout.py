@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from tensorrt_llm._torch.pyexecutor import model_engine
+from tensorrt_llm._torch.pyexecutor.engine.runners import common
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 
 
@@ -34,8 +35,8 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
         with mock.patch.object(
             model_engine.torch.ops.trtllm, "moe_a2a_set_warmup", create=True
         ) as op:
-            model_engine._set_moe_a2a_warmup(True)
-            model_engine._set_moe_a2a_warmup(False)
+            model_engine.set_moe_a2a_warmup(True)
+            model_engine.set_moe_a2a_warmup(False)
         self.assertEqual([c.args[0] for c in op.call_args_list], [True, False])
 
     def test_missing_op_is_tolerated(self):
@@ -46,7 +47,7 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
             create=True,
             side_effect=AttributeError("no such op"),
         ):
-            model_engine._set_moe_a2a_warmup(True)  # must not raise
+            model_engine.set_moe_a2a_warmup(True)  # must not raise
 
     def test_capture_context_selects_steady_state_then_restores(self):
         """CUDA graphs bake the budget in at capture time.
@@ -55,8 +56,8 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
         the kernel the steady-state budget and restore warmup afterwards.
         """
         seen = []
-        with mock.patch.object(model_engine, "_set_moe_a2a_warmup", side_effect=seen.append):
-            with model_engine._moe_a2a_steady_state_budget_for_capture():
+        with mock.patch.object(common, "set_moe_a2a_warmup", side_effect=seen.append):
+            with common.moe_a2a_steady_state_budget_for_capture():
                 self.assertEqual(seen, [False])
             self.assertEqual(seen, [False, True])
 
@@ -70,7 +71,7 @@ class TestMoeA2AWarmupBudget(unittest.TestCase):
         """
         stub = _WarmupFlagStub()
         seen = []
-        with mock.patch.object(model_engine, "_set_moe_a2a_warmup", side_effect=seen.append):
+        with mock.patch.object(model_engine, "set_moe_a2a_warmup", side_effect=seen.append):
             stub.is_warmup = True
             stub.is_warmup = False
 
