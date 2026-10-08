@@ -136,6 +136,19 @@ def test_fused_qk_norm_rope_tail_tokens_are_masked(tokens_per_program, heads_per
 
 
 @requires_cuda
+@pytest.mark.parametrize("heads", [12, 3, 6, 7, 28])
+def test_default_head_grouping_handles_counts_eight_does_not_divide(heads):
+    """The default group is the largest of 8/4/2/1 dividing the head count, never a non-power of two."""
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 9, heads, 96, torch.float32)
+    q, k = apply_minimax_h3_qk_norm_rope_bf16(
+        qkv, weight_q, weight_k, cos, sin, 1e-5, heads, HEAD_DIM
+    )
+    src_q, src_k = _split_heads(qkv, heads)
+    _assert_single_rounding_accuracy(q, src_q, weight_q, cos, sin, 1e-5)
+    _assert_single_rounding_accuracy(k, src_k, weight_k, cos, sin, 1e-5)
+
+
+@requires_cuda
 @pytest.mark.parametrize("tokens_per_program,heads_per_program", [(3, 1), (1, 0), (1, 3), (2, 16)])
 def test_launch_rejects_invalid_launch_shapes(tokens_per_program, heads_per_program):
     qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 7, 8, 96, torch.float32)
@@ -186,6 +199,7 @@ def test_fused_qk_norm_rope_compiles_fullgraph_as_one_op():
         "strided",
         "zero_heads",
         "table_dtype",
+        "strided_weight",
     ],
 )
 def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
@@ -218,5 +232,9 @@ def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
         heads = 0
     elif invalid == "table_dtype":
         cos = cos.double()
+    elif invalid == "strided_weight":
+        # A [128] view with stride 2 passes the shape check but the kernel reads contiguous storage.
+        weight_q = torch.cat([weight_q, weight_q])[::2]
+        assert weight_q.shape == (HEAD_DIM,) and not weight_q.is_contiguous()
     with pytest.raises(ValueError):
         apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, head_dim)

@@ -10,10 +10,9 @@ import triton.language as tl
 # A head row is read as chunks of this many dims so every load is vectorized.
 _CHUNK = 16
 # Launch shape: rows per program = TOKENS_PER_PROGRAM * HEADS_PER_PROGRAM must be a power of two.
-# One token x eight heads per program with one warp measured fastest on B200; HEADS_PER_PROGRAM
-# adapts downward for head counts that eight does not divide.
+# One token x eight heads per program with one warp measured fastest on B200; the head group
+# falls back to 4, 2 or 1 for head counts that eight does not divide.
 _TOKENS_PER_PROGRAM = 1
-_MAX_HEADS_PER_PROGRAM = 8
 _NUM_WARPS = 1
 
 
@@ -125,9 +124,8 @@ def launch_minimax_h3_qk_norm_rope(
     divide the token count; the model uses the defaults through the custom op.
     """
     if heads_per_program is None:
-        heads_per_program = next(
-            h for h in range(_MAX_HEADS_PER_PROGRAM, 0, -1) if num_heads % h == 0
-        )
+        # Largest power of two up to _MAX_HEADS_PER_PROGRAM that divides the head count.
+        heads_per_program = next(h for h in (8, 4, 2, 1) if num_heads % h == 0)
     if (
         heads_per_program < 1
         or heads_per_program & (heads_per_program - 1)
@@ -226,8 +224,11 @@ def validate_minimax_h3_qk_norm_rope_inputs(
             weight.shape != (head_dim,)
             or weight.dtype != torch.bfloat16
             or weight.device != qkv.device
+            or not weight.is_contiguous()
         ):
-            raise ValueError("H3 QK-norm weights must be BF16 [dim] tensors on the qkv device")
+            raise ValueError(
+                "H3 QK-norm weights must be contiguous BF16 [dim] tensors on the qkv device"
+            )
     seq = qkv.shape[1]
     if cos.ndim != 2 or sin.shape != cos.shape or cos.shape[0] != seq:
         raise ValueError("H3 fused RoPE tables must have shape [sequence, rotary_dim]")
