@@ -371,8 +371,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self._run(
@@ -412,8 +412,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
         stream: cuda.CUstream,
     ):
         self._run(
@@ -453,8 +453,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: Optional[cute.Tensor],
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
         stream: cuda.CUstream,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
@@ -508,10 +508,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type cum_seq_lens_q: cute.Tensor
         :param block_split_kvs: The block split KV tensor with shape [batch_size]
         :type block_split_kvs: cute.Tensor
-        :param softmax_scale: The scale factor for softmax
-        :type softmax_scale: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
+        :param softmax_scale: Device tensor containing the scale factor for softmax
+        :type softmax_scale: cute.Tensor
+        :param output_scale: Device tensor containing the scale factor for the output
+        :type output_scale: cute.Tensor
         :param stream: The CUDA stream to execute the kernel on
         :type stream: cuda.CUstream
 
@@ -1037,8 +1037,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # Tmem holding buffer
             tmem_holding_buf: cutlass.Int32
 
-        softmax_scale_log2 = softmax_scale * LOG2_E
-
         if cutlass.const_expr(self.emit_softmax_stats):
             split_kv_kernel = self.split_kv_kernel(
                 qk_tiled_mma,
@@ -1063,7 +1061,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 kv_bounds,
                 cum_seq_lens_q,
                 block_split_kvs,
-                softmax_scale_log2,
+                softmax_scale,
                 output_scale,
                 q_latent_smem_layout_staged,
                 q_rope_smem_layout_staged,
@@ -1102,7 +1100,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 kv_bounds,
                 cum_seq_lens_q,
                 block_split_kvs,
-                softmax_scale_log2,
+                softmax_scale,
                 output_scale,
                 q_latent_smem_layout_staged,
                 q_rope_smem_layout_staged,
@@ -1225,8 +1223,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         kv_bounds: Optional[cute.Tensor],
         cum_seq_lens_q: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
-        softmax_scale_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cute.Tensor,
+        output_scale: cute.Tensor,
         q_latent_smem_layout_staged: cute.ComposedLayout,
         q_rope_smem_layout_staged: cute.ComposedLayout,
         kc_latent_smem_layout_staged: cute.ComposedLayout,
@@ -1292,10 +1290,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: The per-block split_kv values tensor
         :type block_split_kvs: cute.Tensor
-        :param softmax_scale_log2: The log2 scale factor for softmax
-        :type softmax_scale_log2: cutlass.Float32
-        :param output_scale: The scale factor for the output
-        :type output_scale: cutlass.Float32
+        :param softmax_scale: Device tensor containing the scale factor for softmax
+        :type softmax_scale: cute.Tensor
+        :param output_scale: Device tensor containing the scale factor for the output
+        :type output_scale: cute.Tensor
         :param q_latent_smem_layout_staged: Shared memory layout for query tensor
         :type q_latent_smem_layout_staged: cute.ComposedLayout
         :param q_rope_smem_layout_staged: Shared memory layout for query rope tensor
@@ -1324,6 +1322,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
+        softmax_scale_log2 = softmax_scale[0] * LOG2_E
+        output_scale_value = output_scale[0]
         mma_tile_coord_v = bidx % cute.size(tiled_mma_qk.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
@@ -1904,7 +1904,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     )
                     if cutlass.const_expr(self.emit_softmax_stats):
                         compute_epilogue_params = SimpleNamespace(
-                            output_scale=output_scale,
+                            output_scale=output_scale_value,
                             softmax_scale_log2=softmax_scale_log2,
                             mAccLSE=mAccLSE,
                             mLSE=mLSE,
@@ -1912,7 +1912,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         )
                     else:
                         compute_epilogue_params = SimpleNamespace(
-                            output_scale=output_scale,
+                            output_scale=output_scale_value,
                             softmax_scale_log2=softmax_scale_log2,
                             mAccLSE=mAccLSE,
                             mLSE=mLSE,
@@ -5155,6 +5155,15 @@ def run(
     # Get the raw stream pointer as a CUstream
     stream = cuda.CUstream(torch_stream.cuda_stream)
 
+    # The kernel reads both scales from device memory (FP8 KV keeps them as
+    # device tensors so CUDA graph replay never needs a host read).
+    softmax_scale_t = cute.runtime.from_dlpack(
+        torch.tensor([softmax_scale], dtype=torch.float32,
+                     device="cuda")).mark_layout_dynamic()
+    output_scale_t = cute.runtime.from_dlpack(
+        torch.tensor([output_scale], dtype=torch.float32,
+                     device="cuda")).mark_layout_dynamic()
+
     # compile mla kernel
     compiled_mla = cute.compile(
         mla.run_with_softmax_stats if emit_softmax_stats else mla,
@@ -5172,8 +5181,8 @@ def run(
         kv_bounds_ct,
         cum_seq_lens_q,
         block_split_kvs,
-        softmax_scale,
-        output_scale,
+        softmax_scale_t,
+        output_scale_t,
         stream,
         options="--opt-level 2",
     )
@@ -5263,8 +5272,8 @@ def run(
             kv_bounds_ct,
             cum_seq_lens_q,
             block_split_kvs,
-            softmax_scale,
-            output_scale,
+            softmax_scale_t,
+            output_scale_t,
             stream,
         )
         torch.cuda.synchronize()
@@ -5408,8 +5417,8 @@ def run(
             kv_bounds_ct,
             cum_seq_lens_q,
             block_split_kvs,
-            softmax_scale,
-            output_scale,
+            softmax_scale_t,
+            output_scale_t,
             stream,
         )
 
