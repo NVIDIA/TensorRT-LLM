@@ -22,36 +22,18 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer
     FlashinferSiluAndMul,
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
-    LoadPagedKvCacheForMla,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
-    MlaRopeAppendPagedKvAssignQ,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
-    MlaRopeGeneration,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     ThopAttention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import Allgather
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter import Reducescatter
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import BmmOut
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import CublasMm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import Nvfp4Gemm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
-    Fp4BlockScaleMoeRunner,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_moe import FusedMoe
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.noaux_tc_op import NoauxTcOp
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
     FlashinferFusedAddRmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     FlashinferRmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
-    Fp4Quantize,
 )
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -64,6 +46,16 @@ from tensorrt_llm._torch.models.modeling_utils import (
 from tensorrt_llm._torch.speculative import get_spec_worker
 
 from . import weights as _weights
+from .ops.attention.load_paged_kv_cache_for_mla import LoadPagedKvCacheForMla  # noqa: E501
+from .ops.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
+    MlaRopeAppendPagedKvAssignQ,
+)
+from .ops.attention.mla_rope_generation import MlaRopeGeneration
+from .ops.gemm.bmm_out import BmmOut
+from .ops.moe.fp4_block_scale_moe_runner import Fp4BlockScaleMoeRunner  # noqa: E501
+from .ops.moe.fused_moe import FusedMoe
+from .ops.moe.noaux_tc_op import NoauxTcOp
+from .ops.quantization.fp4_quantize import Fp4Quantize
 
 _CACHED_CTX_FIELDS = (
     "enable_context_mla_with_cached_kv",
