@@ -29,6 +29,7 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 # 2-GPU DiT tensor parallelism config: configs/minimax-h3-bf16-tp2.yaml.
 # 2-GPU Ulysses config: configs/minimax-h3-bf16-2gpu.yaml.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
+python models/fasth3.py --visual_gen_args configs/fasth3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3/cosmos3.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"
