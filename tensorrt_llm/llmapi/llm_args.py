@@ -4688,7 +4688,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=True,
         status="prototype",
         description=
-        "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
+        "Whether to use the KV cache manager v2 (experimental). Defaults to "
+        "True. Set False to select V1 for models that support it. 'auto' uses "
         "the model-specific preference and falls back to False when the model "
         "does not declare one.")
 
@@ -5020,7 +5021,9 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default="PYTHON",
         description=
         "The runtime implementation. 'PYTHON' (default) selects the Python "
-        "transceiver, while 'CPP' selects the C++ transceiver. 'auto' adopts "
+        "transceiver, while 'CPP' selects the C++ transceiver and requires "
+        "kv_cache_config.use_kv_cache_manager_v2=False with a model that "
+        "supports V1. 'auto' adopts "
         "the model's preferred runtime when it declares one; otherwise it "
         "selects the Python transceiver, falling back to the C++ transceiver "
         "only when this config itself rules it out (non-NIXL backend or a "

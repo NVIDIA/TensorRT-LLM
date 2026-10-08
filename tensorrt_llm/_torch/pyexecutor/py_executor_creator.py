@@ -1000,11 +1000,11 @@ def _create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the manager-dependent rejections
-        # below fire here only when the config names the manager outright,
-        # sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats them against the manager
-        # that was actually built.
+        # not chosen until model loading, so the manager-dependent
+        # rejections below fire here when the config selects a boolean value,
+        # including the default True, sparing it a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the
+        # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
         # Rejected draft tokens shrink a request's page list, and the freed slot

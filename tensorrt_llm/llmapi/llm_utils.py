@@ -564,18 +564,11 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
                                       pretrained_config: Any = None) -> bool:
     """Resolve the KV cache manager auto setting from the model preference.
 
-    A model preference for V2 is demoted to V1 for routes V2 cannot serve; an
-    explicit user value otherwise wins. The compatibility arms are:
-
-    - Disaggregated serving: hybrid Mamba V2 requires the Python transceiver
-      with NIXL, so any other route falls back to V1. The transceiver runtime
-      auto setting must be resolved first.
-    - Two-model speculative decoding: the draft model runs in a separate engine
-      with its own KV cache manager. ``build_managers`` hands that manager the
-      target's ``kv_cache_config`` unsplit, and V2 capacity is governed solely
-      by ``max_gpu_total_bytes``, so both managers size their pools from the
-      full budget. The model preference falls back to V1, and an explicit
-      ``True`` is rejected rather than deferred to that allocation.
+    A model preference for V2 is demoted to V1 for routes V2 cannot serve; a
+    boolean value otherwise wins, including the default ``True``.
+    Disaggregated serving with V2 requires the Python transceiver with NIXL,
+    so ``auto`` falls back to V1 for any other route. The transceiver runtime
+    auto setting must be resolved first.
 
     The fallback only reaches models whose manager class is selected by
     ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
