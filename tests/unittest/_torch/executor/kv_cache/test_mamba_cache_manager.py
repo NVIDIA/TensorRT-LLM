@@ -4123,6 +4123,79 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
 
 
 @skip_no_cuda
+def test_v2_kda_replay_commit_and_relocation_without_the_replay_caches():
+    """With the verify kernels' draft records (``kda_state_tok``) in place of the per-draft replay caches, the
+    suspend-time commit replays a slot's records onto its V2 SSM state and stores its conv window, bit for bit as the
+    records' replay and the conv store do on their own, and relocation moves a slot's conv caches, records and draft
+    count."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
+        replay_kda_token_records,
+        store_kda_replay_conv_window,
+    )
+
+    num_layers, num_slots, num_spec, num_heads, head_dim, width = 2, 4, 2, 6, 128, 4
+    section_dim = num_heads * head_dim
+    generator = torch.Generator(device="cuda").manual_seed(13)
+
+    def randn(*shape):
+        return 0.1 * torch.randn(*shape, generator=generator, device="cuda")
+
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr._use_kda_replay_update = True
+    mgr._stream = torch.cuda.Stream()
+    mgr.all_ssm_states = [
+        randn(num_slots, num_heads, head_dim, head_dim) for _ in range(num_layers)
+    ]
+    mgr.all_conv_states = [randn(num_slots, 3 * section_dim, width - 1) for _ in range(num_layers)]
+    mgr.kda_conv_q, mgr.kda_conv_k, mgr.kda_conv_v = (
+        randn(num_layers, num_slots, width - 1 + num_spec, section_dim).transpose(-1, -2)
+        for _ in range(3)
+    )
+    mgr.kda_qkg_cache = None
+    mgr.kda_v_cache = None
+    mgr.kda_beta_cache = None
+    mgr.kda_state_tok = randn(num_layers, num_slots, 3, num_spec, num_heads, head_dim)
+    mgr.prev_num_accepted_tokens = torch.tensor([0, 2, 1, 0], dtype=torch.int32, device="cuda")
+
+    slot = 1
+    slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
+    num_accepted = mgr.prev_num_accepted_tokens[slots.long()].clone()
+    expected_ssm, expected_conv = [], []
+    for layer_offset in range(num_layers):
+        ssm = mgr.all_ssm_states[layer_offset].clone()
+        conv = mgr.all_conv_states[layer_offset].clone()
+        replay_kda_token_records(ssm, mgr.kda_state_tok[layer_offset], slots, num_accepted)
+        store_kda_replay_conv_window(
+            conv,
+            mgr.kda_conv_q[layer_offset],
+            mgr.kda_conv_k[layer_offset],
+            mgr.kda_conv_v[layer_offset],
+            slots,
+            num_accepted,
+        )
+        expected_ssm.append(ssm)
+        expected_conv.append(conv)
+
+    mgr._commit_kda_pending_drafts(slot)
+    torch.cuda.synchronize()
+
+    assert mgr.prev_num_accepted_tokens.tolist() == [0, 0, 1, 0]
+    for actual, expected in zip(mgr.all_ssm_states, expected_ssm):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(mgr.all_conv_states, expected_conv):
+        assert torch.equal(actual, expected)
+
+    slot_buffers = (mgr.kda_conv_q, mgr.kda_conv_k, mgr.kda_conv_v, mgr.kda_state_tok)
+    source_rows = [slot_buffer[:, 2].clone() for slot_buffer in slot_buffers]
+
+    mgr._relocate_kda_replay_slots([2], [3])
+
+    assert mgr.prev_num_accepted_tokens.tolist() == [0, 0, 1, 1]
+    for slot_buffer, source_row in zip(slot_buffers, source_rows):
+        assert torch.equal(slot_buffer[:, 3], source_row)
+
+
+@skip_no_cuda
 def test_v2_kda_replay_relocates_live_slot_history():
     mgr = _build_v2_hybrid_with_mamba_layer(
         spec_config=MTPDecodingConfig(max_draft_len=2),

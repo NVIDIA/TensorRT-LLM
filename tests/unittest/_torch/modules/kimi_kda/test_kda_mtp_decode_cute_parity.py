@@ -766,10 +766,10 @@ def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
 
 
 def test_commit_pending_drafts_replays_the_per_token_records():
-    """With per-token verify states, a slot's accepted drafts are replayed onto
-    its pool state, in order, from the per-draft records the Kimi K3 verify
-    kernels keep in its region (vn, beta * k, decay), and the conv window after
-    them is stored; other slots are left alone."""
+    """With the Kimi K3 verify kernels' draft records, a slot's accepted drafts
+    are replayed onto its pool state, in order, from its records (vn,
+    beta * k, decay), and the conv window after them is stored; other slots
+    are left alone."""
     from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import commit_kda_pending_drafts
 
     torch.manual_seed(5)
@@ -784,7 +784,7 @@ def test_commit_pending_drafts_replays_the_per_token_records():
     vn = small(num_slots, num_spec, H, K, scale=2.0**-2)
     beta_k = small(num_slots, num_spec, H, K, scale=2.0**-3)
     decay = torch.randint(1, 3, (num_slots, num_spec, H, K), device="cuda").float() * 0.5
-    state_tok = torch.zeros(num_slots, num_spec, H, K, K, device="cuda")
+    state_tok = torch.zeros(num_slots, 3, num_spec, H, K, device="cuda")
     records = state_tok.view(num_slots, -1)
     size = num_spec * H * K
     for i, part in enumerate((vn, beta_k, decay)):
