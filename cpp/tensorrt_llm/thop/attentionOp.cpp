@@ -509,19 +509,11 @@ public:
                     // kv cache reuse / chunked context cases, latent_cache is not used
                     mla_params.latent_cache = nullptr;
                 }
-                TORCH_CHECK(q_pe.has_value());
-                TORCH_CHECK(q_pe->dim() == 3);
-                TORCH_CHECK(q_pe->strides()[2] == 1);
-
-                mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
-                mla_params.q_pe_ld = q_pe->strides()[1];
-                mla_params.q_pe_stride = q_pe->strides()[0];
-
                 // Fused FP8-Q path: forward caller's quant_q_buffer / scale so
                 // applyMLARopeAndAssignQKVKernelOptContext<kOutputFp8Q=true>
                 // appends rope FP8 in place and the standalone quantize is
-                // skipped. Without this wiring the sparse-MLA context branch
-                // runs the legacy quantize over the bf16 placeholder q.
+                // skipped. A missing q_pe on this path means the upstream q_b
+                // fusion has already written the complete rotated FP8 Q.
                 mla_params.bmm1_scale = mla_bmm1_scale.has_value()
                     ? reinterpret_cast<float*>(mla_bmm1_scale.value().data_ptr())
                     : nullptr;
@@ -534,6 +526,23 @@ public:
                     ? reinterpret_cast<float const*>(quant_scale_qkv.value().data_ptr())
                     : nullptr;
                 mla_params.fuse_q_fp8_in_rope = (quant_q_buffer.has_value() && quant_scale_qkv.has_value());
+                mla_params.q_rope_applied = mla_params.fuse_q_fp8_in_rope && !q_pe.has_value();
+                if (q_pe.has_value())
+                {
+                    TORCH_CHECK(q_pe->dim() == 3);
+                    TORCH_CHECK(q_pe->strides()[2] == 1);
+                    mla_params.q_pe = static_cast<T*>(q_pe->data_ptr());
+                    mla_params.q_pe_ld = q_pe->strides()[1];
+                    mla_params.q_pe_stride = q_pe->strides()[0];
+                }
+                else
+                {
+                    TORCH_CHECK(mla_params.q_rope_applied,
+                        "Sparse MLA context requires q_pe unless quant_q_buffer already contains rotated Q.");
+                    mla_params.q_pe = nullptr;
+                    mla_params.q_pe_ld = 0;
+                    mla_params.q_pe_stride = 0;
+                }
 
                 // Fused kv_a_layernorm: the norm weight implies `latent_cache` is the
                 // RAW kv_a_proj output, with the caller's RMSNorm and concat dropped.

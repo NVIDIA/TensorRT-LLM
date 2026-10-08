@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionInputType, AttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
@@ -485,6 +486,132 @@ def _is_fused_q_fp8_quant_enabled(
     return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
 
+def _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+) -> bool:
+    """Whether q_b can use the SM107 GEMM, norm, and RoPE fusion."""
+    if os.environ.get("TRTLLM_DISABLE_DSV4_Q_B_GEMM_NORM_ROPE_FUSION", "0") == "1":
+        return False
+    num_contexts = attn_metadata.num_contexts
+    num_generations = attn_metadata.num_generations
+    if num_contexts > 0 and num_generations > 0:
+        return False
+    if not _is_fused_q_fp8_quant_enabled(
+        self, num_generations=num_generations, num_contexts=num_contexts
+    ):
+        return False
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return False
+    if self.apply_rotary_emb or position_ids is None:
+        return False
+    # q is the q_a_layernorm output; the wrapper asserts contiguity before launch.
+    if q.dtype != torch.bfloat16 or q.dim() != 2:
+        return False
+    if q.shape != (attn_metadata.num_tokens, self.q_lora_rank):
+        return False
+    if position_ids.numel() != q.shape[0] or position_ids.device != q.device:
+        return False
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    if not isinstance(attention_backend, TrtllmAttention):
+        return False
+    if self.q_b_proj.bias is not None or self.q_b_proj.lora is not None:
+        return False
+    if not self.q_b_proj.has_fp8_block_scales:
+        return False
+    if not (self.q_b_proj.use_cute_dsl_blockscaling_mm or self.q_b_proj.disable_deep_gemm):
+        return False
+    if self.q_b_proj.weight.dtype != torch.float8_e4m3fn:
+        return False
+    if self.q_b_proj.weight_scale.dtype != torch.uint8:
+        return False
+    if self.q_b_proj.weight.shape != (
+        self.num_heads_tp * self.qk_head_dim,
+        self.q_lora_rank,
+    ):
+        return False
+    if self.q_lora_rank % 128 != 0:
+        return False
+    cu_q_seqlens = attn_metadata.cu_q_seqlens
+    if cu_q_seqlens is None and num_contexts == 0:
+        generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+        if generation_cu_seqlens is not None:
+            cu_q_seqlens = generation_cu_seqlens[: num_generations + 1]
+    kv_cache_lengths = getattr(attn_metadata, "kv_lens_cuda_runtime", None)
+    if cu_q_seqlens is None or kv_cache_lengths is None:
+        return False
+    if cu_q_seqlens.numel() != kv_cache_lengths.numel() + 1:
+        return False
+    if cu_q_seqlens.dtype != torch.int32 or kv_cache_lengths.dtype != torch.int32:
+        return False
+    if cu_q_seqlens.device != q.device or kv_cache_lengths.device != q.device:
+        return False
+    return kv_cache_lengths.numel() <= 128
+
+
+def _dsv4_q_b_gemm_cu_q_seqlens(
+    self: MLA, attn_metadata: AttentionMetadata
+) -> Optional[torch.Tensor]:
+    """Per-phase cumulative Q lengths for the fused q_b GEMM.
+
+    Context batches take the ragged prefix sums from the DSA metadata; pure
+    generation batches slice the uniform generation prefix sums.
+    """
+    if attn_metadata.cu_q_seqlens is not None:
+        return attn_metadata.cu_q_seqlens
+    if attn_metadata.num_contexts > 0:
+        prep_ctx = getattr(attn_metadata, "mla_prepare_ctx_cu_seqlens", None)
+        return prep_ctx() if prep_ctx is not None else None
+    generation_cu_seqlens = getattr(attn_metadata, "cu_seq_lens_cuda", None)
+    if generation_cu_seqlens is None:
+        return None
+    return generation_cu_seqlens[: attn_metadata.num_generations + 1]
+
+
+def _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(
+    self: MLA,
+    q: torch.Tensor,
+    position_ids: torch.Tensor,
+    attn_metadata: AttentionMetadata,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse FP8 q_b GEMM, per-head RMSNorm, RoPE, and output quantization.
+
+    Returns `(q_shape_carrier, quant_q_buffer, quant_scale_qkv)`. The FP8 buffer
+    holds the complete rotated Q, so downstream consumers only read the carrier's
+    leading dimension: context keeps the compact q_lora tensor, generation gets a
+    full-width placeholder for the shared q_pe view.
+    """
+    assert q.dim() == 2 and q.shape[1] == self.q_lora_rank
+    assert q.is_contiguous(), "fused q_b GEMM needs a contiguous q_lora"
+    if getattr(self, "_quant_scale_qkv", None) is None:
+        self._quant_scale_qkv = torch.tensor([1.0], dtype=torch.float32, device=q.device)
+    q_fp8, q_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(q)
+    position_ids_i32 = position_ids.reshape(-1)
+    if position_ids_i32.dtype != torch.int32:
+        position_ids_i32 = position_ids_i32.to(torch.int32)
+    attention_backend = getattr(self.mqa, "attn", self.mqa)
+    attention_backend._ensure_rope_table_size(attn_metadata.max_seq_len)
+    quant_q_buffer = torch.ops.trtllm.cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+        q_fp8,
+        self.q_b_proj.weight,
+        q_scale,
+        self.q_b_proj.weight_scale,
+        attention_backend.rotary_cos_sin,
+        _dsv4_q_b_gemm_cu_q_seqlens(self, attn_metadata),
+        attn_metadata.kv_lens_cuda_runtime,
+        position_ids_i32,
+        self._quant_scale_qkv,
+        float(self.q_b_layernorm.variance_epsilon),
+    )
+    if attn_metadata.num_contexts > 0:
+        q_shape_carrier = q
+    else:
+        q_shape_carrier = q.new_empty((q.shape[0], self.num_heads_tp * self.qk_head_dim))
+    return q_shape_carrier, quant_q_buffer, self._quant_scale_qkv
+
+
 def _is_fused_prologue_active(
     self: MLA, *, num_contexts: int, num_generations: int, rope_specs: list
 ) -> bool:
@@ -715,13 +842,18 @@ def forward_generation_sparse_attn(
     fused_q_fp8_pe = getattr(self, "_fused_q_pe", None)
     fused_q_fp8_buf = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_fp8_scale = getattr(self, "_quant_scale_qkv", None)
+    # The q_b GEMM fusion writes the complete rotated Q into the FP8 buffer.
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        fused_q_fp8_pe is not None and fused_q_fp8_buf is not None and fused_q_fp8_scale is not None
+        fused_q_fp8_buf is not None
+        and fused_q_fp8_scale is not None
+        and (fused_q_fp8_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
         # Suffix slice: the Q branch ran over the whole batch.
-        gen_offset = fused_q_fp8_pe.shape[0] - num_tokens
-        q_pe = fused_q_fp8_pe[gen_offset:]
+        gen_offset = fused_q_fp8_buf.shape[0] - num_tokens
+        if not fused_q_rope_applied:
+            q_pe = fused_q_fp8_pe[gen_offset:]
 
     num_seqs = attn_metadata.num_seqs
 
@@ -772,7 +904,7 @@ def forward_generation_sparse_attn(
     _kv_hoisted = getattr(self, "_fused_kv_norm_hoisted", False)
     # q_b_layernorm already rotated the rope segment into the FP8 Q buffer, so no Q
     # work is left -- but the KV half still runs, hence kv_only.
-    _q_rope_done = use_fused_q_fp8 and _fused_kv_norm
+    _q_rope_done = use_fused_q_fp8 and (fused_q_rope_applied or _fused_kv_norm)
     assert not (_q_rope_done and not precomputed_cu_seqlens), (
         "fused Q RoPE drops the kernel that fills cu_q_seqlens; "
         "attention metadata must precompute them"
@@ -799,6 +931,7 @@ def forward_generation_sparse_attn(
             # Non-None tells the launcher q_nope is already FP8, so it drops the q_nope
             # quantize rows (1024 of 1161 at head_num 128) from the grid.
             quant_scale_qkv=quant_scale_qkv,
+            q_rope_applied=fused_q_rope_applied,
             kv_only=_q_rope_done and not _kv_hoisted,
             precomputed_cu_seqlens=precomputed_cu_seqlens,
             # `_deepseek_v4_local_to_global_kernel` emits the tile counter and bmm
@@ -887,22 +1020,27 @@ def forward_context_sparse_attn(
         )
     del compressed_kv, k_pe
     num_tokens = q.shape[0]
-    q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
 
     quant_q_buffer = getattr(self, "_fused_quant_q_buffer", None)
     fused_q_pe = getattr(self, "_fused_q_pe", None)
     quant_scale_qkv = getattr(self, "_quant_scale_qkv", None)
+    # With the q_b GEMM fusion, `q` is the compact q_lora tensor and the FP8 buffer
+    # already holds the rotated Q; the op takes no q_pe in that case.
+    fused_q_rope_applied = getattr(self, "_fused_q_rope_applied", False)
     use_fused_q_fp8 = (
-        quant_q_buffer is not None and fused_q_pe is not None and quant_scale_qkv is not None
+        quant_q_buffer is not None
+        and quant_scale_qkv is not None
+        and (fused_q_pe is not None or fused_q_rope_applied)
     )
     if use_fused_q_fp8:
-        q_pe = fused_q_pe[:num_tokens]
+        q_pe = None if fused_q_rope_applied else fused_q_pe[:num_tokens]
         quant_q_buffer = quant_q_buffer[:num_tokens].view(
             num_tokens,
             self.num_heads_tp,
             self.kv_lora_rank + self.qk_rope_head_dim,
         )
     else:
+        q_pe = q.view(-1, self.num_heads_tp, self.qk_head_dim)[..., self.qk_nope_head_dim :]
         quant_q_buffer = None
         quant_scale_qkv = None
 
@@ -1007,8 +1145,17 @@ def forward_sparse_attn(
     _prelaunch_compressor = _use_indexer_overlap or (
         _v4_extra_overlap and do_multi_stream() and self.compressor_stream is not None
     )
+    # Record the start event before kv_a_proj and launch kv_a_proj before the
+    # aux-stream work, so the caller stream issues the GEMM first and the
+    # compressor and indexer prework overlap with it instead of delaying it.
     if _prelaunch_compressor:
         self.dsv4_compressor_start_event.record()
+
+    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
+        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
+    )
+
+    if _prelaunch_compressor:
         with torch.cuda.stream(self.compressor_stream):
             self.dsv4_compressor_start_event.wait()
             self.compressor(hidden_states, attn_metadata)
@@ -1017,13 +1164,15 @@ def forward_sparse_attn(
 
     # Precompute QR-independent indexer work while the caller stream prepares KV.
     # Passing pre_aux later prevents the indexer from launching this work again.
+    # It shares the compressor's start event, so it is ordered against the same
+    # point of the caller stream.
     _indexer_pre_aux = None
     if _use_indexer_overlap:
-        _indexer_pre_aux = self.indexer.precompute_aux(hidden_states, attn_metadata)
-
-    q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
-        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1
-    )
+        _indexer_pre_aux = self.indexer.precompute_aux(
+            hidden_states,
+            attn_metadata,
+            start_event=self.dsv4_compressor_start_event,
+        )
 
     # Fused kv-norm: the KV kernels apply kv_a_layernorm themselves, so skip the
     # standalone RMSNorm and the concat and hand them the RAW latent. Resolved here,
@@ -1116,6 +1265,17 @@ def forward_sparse_attn(
         )
 
     def _q_branch():
+        self._fused_q_rope_applied = False
+        if _is_dsv4_q_b_gemm_norm_rope_fusion_enabled(self, q, position_ids, attn_metadata):
+            assert position_ids is not None
+            q_shape_carrier, quant_q_buffer, quant_scale_qkv = (
+                _deepseek_v4_q_b_gemm_norm_rope_fused_fp8(self, q, position_ids, attn_metadata)
+            )
+            self._fused_quant_q_buffer = quant_q_buffer
+            self._fused_q_pe = None
+            self._fused_q_rope_applied = True
+            self._quant_scale_qkv = quant_scale_qkv
+            return q_shape_carrier
         if _use_q_b_cute:
             q_proj = _q_b_proj_cute_dsl_bf16(q, self.q_b_proj.weight)
             # The context path detects fusion from these buffers, so clear stale state.
@@ -1280,6 +1440,7 @@ def forward_sparse_attn(
     # generation half.
     self._fused_quant_q_buffer = None
     self._fused_q_pe = None
+    self._fused_q_rope_applied = False
     self._fused_q_rope_cos_sin = None
     self._fused_q_rope_specs_cached = []
     self._fused_kv_norm_active = False

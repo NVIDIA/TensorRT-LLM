@@ -418,6 +418,16 @@ class Runner:
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
             load_format=load_format,
+            # Must agree with `mapping`, which the loader takes separately:
+            # to_mapping() derives world_size from tp*pp*cp, so the 1-GPU defaults
+            # reject every rank above 0.
+            tensor_parallel_size=mapping.tp_size,
+            pipeline_parallel_size=mapping.pp_size,
+            context_parallel_size=mapping.cp_size,
+            moe_expert_parallel_size=mapping.moe_ep_size,
+            moe_cluster_parallel_size=mapping.moe_cluster_size,
+            enable_attention_dp=mapping.enable_attention_dp,
+            gpus_per_node=mapping.gpus_per_node,
             # `ModelLoader(spec_config=...)` below is what reaches
             # `model_config.spec_config`; this keeps `llm_args` consistent with it.
             **({"speculative_config": spec_config} if spec_config is not None else {}),
@@ -432,6 +442,11 @@ class Runner:
             kv_cache_config=KvCacheConfig(
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
+        )
+        # Serving applies these in py_executor_creator; the harness builds llm_args
+        # by hand, so without this every model default is off here only.
+        llm_args = ModelLoader.load_config_and_apply_defaults(
+            pretrained_model_name_or_path, llm_args, checkpoint_loader
         )
         model_loader = ModelLoader(
             llm_args=llm_args,

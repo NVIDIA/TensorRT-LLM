@@ -2635,6 +2635,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
         fuse_fp4_q_quant: bool = False,
+        q_rope_applied: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2656,6 +2657,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
             fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
+            q_rope_applied (bool): quant_q_buffer already holds the complete rotated FP8 Q (the DSv4 q_b GEMM fusion wrote it), so the Q half must not rewrite the rope segment.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2732,6 +2734,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_only,
             kv_done_elsewhere,
             quant_scale_qkv,
+            q_rope_applied,
         )
 
     def _fp4_mla_rope_generation(
