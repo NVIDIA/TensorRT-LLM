@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttentio
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
@@ -376,7 +377,7 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
 def test_graph_replay_survives_commit(cache, backend):
     """A forward captured in a CUDA graph stays correct after commit() moves the cache,
     including across a page rotation: writes land on the new pages and attention
-    reads the new lengths. The step loop refreshes TRTLLM metadata before replay."""
+    reads the new lengths, with nothing refreshed between commit and replay."""
     if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(5)
@@ -419,6 +420,60 @@ def test_graph_replay_survives_commit(cache, backend):
         k_back, v_back = read_kv(cache, 0, positions)
         torch.testing.assert_close(k_back, k, msg=f"replay {step}: K landed on stale pages")
         torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_graph_runner_keys_cached_forwards(backend):
+    """Through VisualGen's CUDAGraphRunner, the way a model runs: with the real token
+    count, the causal block size and the cache registered as extra keys, forwards of
+    equal tensor shapes but different block sizes get their own graphs, and commits
+    between forwards replay them (the cache's device state needs no recapture)."""
+    torch.manual_seed(7)
+    cache = make_cache(32)
+    attn = make_backend(backend)
+    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    for name in ("seq_len", "causal_block_size"):
+        runner.register_extra_key_fn(name, lambda *a, _n=name, **k: k.get(_n))
+    runner.register_extra_key_fn("kv_cache", lambda *a, **k: id(k.get("kv_cache")))
+
+    def step(q, k, v, *, seq_len, causal_block_size, kv_cache):
+        out = attn.forward(
+            q[None],
+            k[None],
+            v[None],
+            batch_size=1,
+            seq_len=seq_len,
+            kv_cache=kv_cache,
+            causal_block_size=causal_block_size,
+        )
+        return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
+
+    graphed = runner.wrap(step)
+    try:
+        pk, pv = open_with_prompt(cache, 9)
+        history_k, history_v = [], []
+        empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        for i in range(6):
+            size = CHUNK if i % 2 == 0 else CHUNK // 4  # denoising step, then clean pass
+            q, k, v = rand_qkv(CHUNK)
+            out = graphed(q, k, v, seq_len=CHUNK, causal_block_size=size, kv_cache=cache)
+            torch.cuda.synchronize()
+            hk = torch.cat(history_k) if history_k else empty
+            hv = torch.cat(history_v) if history_v else empty
+            expected = torch.cat(
+                [
+                    exact_reference(q, pk, pv, hk, hv, k, v, lo, lo + size)
+                    for lo in range(0, CHUNK, size)
+                ]
+            )
+            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"forward {i}")
+            cache.commit(CHUNK)
+            history_k.append(k)
+            history_v.append(v)
+        assert len(runner.graphs) == 2, "one graph per block size, replayed across commits"
+    finally:
+        runner.clear()
+        cache.shutdown()
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

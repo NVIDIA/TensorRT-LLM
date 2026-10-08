@@ -670,12 +670,7 @@ class CuDNNAttention(AttentionBackend):
             )
         if num_tokens < num_rows:
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
-        causal_block_size = num_tokens if causal_block_size is None else causal_block_size
-        if num_tokens % causal_block_size:
-            raise ValueError(
-                f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}."
-            )
-        num_causal_blocks = num_tokens // causal_block_size
+        causal_block_size, num_causal_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
         device = q.device
         buf = kv_cache.kv_buffer(self.layer_idx)
         if q.dtype != buf.dtype:

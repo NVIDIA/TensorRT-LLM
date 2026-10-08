@@ -656,6 +656,24 @@ def test_rejects_bad_geometry():
         cache.shutdown()
 
 
+def test_failed_open_leaves_the_cache_closed(cache, monkeypatch):
+    """An open() that fails while allocating a geometry's device state releases the
+    sequence and leaves nothing looking open, so the caller can open again."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("no room for the geometry's device state")
+
+    monkeypatch.setattr(cache, "_allocate_state", boom)
+    with pytest.raises(RuntimeError, match="no room"):
+        open_cache(cache, pin_tokens=9)
+    assert not cache.is_open
+    with pytest.raises(RuntimeError, match="not open"):
+        cache.table
+    monkeypatch.undo()
+    open_cache(cache, pin_tokens=9)
+    assert cache.is_open and len(set(cache.block_table())) == cache.num_pages
+
+
 def test_each_geometry_keeps_its_device_state(cache):
     """Geometries opened on one pool keep their kernel-facing tensors at fixed
     addresses across other geometries, so a graph captured over one replays when it

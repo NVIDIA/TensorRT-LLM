@@ -73,6 +73,13 @@ class AttentionBackend(ABC):
           cache holds before them.
         * ``causal_block_size``: with ``kv_cache``, cuts the new tokens into causal
           blocks, full attention within a block and causal across blocks.
+
+        Under CUDA graphs a captured forward belongs to (cache, geometry, ``seq_len``,
+        ``causal_block_size``) besides the tensor shapes: those are host values baked
+        into the capture, so a graph runner must key on them. The cache's own state
+        (table, lengths, slot ids) lives in device tensors rewritten in place by
+        ``commit``, so commits need no recapture and ``staging_offset`` must not be
+        part of a key.
         """
 
     @property

@@ -403,8 +403,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     def open(
         self,
-        pin_tokens: int = 0,
         *,
+        pin_tokens: int = 0,
         window_tokens: int,
         max_staged_tokens: int,
         causal_block_sizes: Sequence[int],
@@ -485,6 +485,41 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 raise RuntimeError("K/V pool layout changed: layers are not page-interleaved")
         self._buffers = buffers
         self._kv_cache = kv_cache
+        try:
+            self._lay_out(
+                kv_cache,
+                pages,
+                buf,
+                pin_tokens,
+                window_tokens,
+                max_staged_tokens,
+                sizes,
+                num_pages,
+                num_private,
+            )
+        except Exception:
+            # Nothing may look open after a failed open: release the sequence and
+            # forget the half-built state, so the caller can retry.
+            self._kv_cache = None
+            self._buffers = []
+            self._release(kv_cache)
+            raise
+
+    def _lay_out(
+        self,
+        kv_cache,
+        pages: np.ndarray,
+        buf: torch.Tensor,
+        pin_tokens: int,
+        window_tokens: int,
+        max_staged_tokens: int,
+        sizes: Tuple[int, ...],
+        num_pages: int,
+        num_private: int,
+    ) -> None:
+        """The geometry-dependent half of ``open``: bind the pages, allocate or reuse
+        the geometry's device state and write the kernel-facing tensors."""
+        tpb = self.tokens_per_page
         self.window_tokens = window_tokens
         self.max_staged_tokens = max_staged_tokens
         self.causal_block_sizes = sizes
@@ -784,6 +819,19 @@ class CausalKVCacheManager(KVCacheManagerV2):
         never read. Persistent, refreshed in place by ``commit``.
         """
         return self._layout(causal_block_size).rows
+
+    @staticmethod
+    def causal_blocks(num_tokens: int, causal_block_size: Optional[int]) -> Tuple[int, int]:
+        """The block size and block count a forward of ``num_tokens`` real tokens uses:
+        one block of all of them when ``causal_block_size`` is None; otherwise the size
+        must be positive and divide ``num_tokens``. Shared by the cache and the
+        attention backends so they agree on the contract."""
+        size = num_tokens if causal_block_size is None else int(causal_block_size)
+        if size <= 0 or num_tokens % size:
+            raise ValueError(
+                f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}"
+            )
+        return size, num_tokens // size
 
     def block_offsets(self, causal_block_size: int) -> torch.Tensor:
         """``[1, num_blocks, 2, row_len]`` int32 device tensor: ``page_table`` in the
@@ -1144,14 +1192,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         if k.dtype != buf.dtype or v.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-        size = num_tokens if causal_block_size is None else causal_block_size
+        size, num_blocks = self.causal_blocks(num_tokens, causal_block_size)
         layout = self._layout(size)
-        if num_tokens % size or num_tokens > layout.num_blocks * size:
+        if num_blocks > layout.num_blocks:
             raise ValueError(
-                f"{num_tokens} tokens do not split into at most {layout.num_blocks} causal "
-                f"blocks of {size}"
+                f"{num_tokens} tokens are more than the {layout.num_blocks} causal blocks of "
+                f"{size} this geometry stages"
             )
-        num_blocks = num_tokens // size
         torch.ops.trtllm.scatter_kv_slots_(
             buf,
             k,

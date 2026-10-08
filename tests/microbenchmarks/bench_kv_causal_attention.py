@@ -304,7 +304,7 @@ def chunk_cycle(args, gen) -> None:
         )
         ref = torch.cat(
             [
-                exact_reference(q, kp, vp, hk, hv, k, v, lo, lo + block, window)
+                exact_reference(q.float(), kp, vp, hk, hv, k, v, lo, lo + block, window)
                 for lo in range(0, CHUNK, block)
             ]
         )
@@ -321,27 +321,25 @@ def chunk_cycle(args, gen) -> None:
     # Commit: GPU span by CUPTI (eager, no graph): first kernel start to last kernel
     # end, so it includes launch gaps between the kernels; host time by the wall clock.
     # Each commit at steady state drops pages, so the rotation and the private-page
-    # copies for both blockings are exercised every time.
-    def refresh_and_commit():
+    # copies for both blockings are exercised every time. Nothing else runs between a
+    # commit and the next forward: the kernels read the cache's tensors directly.
+    def commit():
         mgr.commit(mgr.max_staged_tokens)
-        if args.backend == "trtllm":
-            for n, size in ((1, CHUNK), (CHUNK // TOKENS_PER_FRAME, TOKENS_PER_FRAME)):
-                attns[0].metadata.prepare_with_kv_cache(mgr, n, size)
 
-    commit_dev = CuptiTimer(args.iters, args.warmup, False, False).time(
-        refresh_and_commit, "commit"
-    )
+    commit_dev = CuptiTimer(args.iters, args.warmup, False, False).time(commit, "commit")
     host = []
     for _ in range(args.iters):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        refresh_and_commit()
+        commit()
         torch.cuda.synchronize()
         host.append((time.perf_counter() - t0) * 1e3)
     host_ms = statistics.median(host)
 
+    # Elapsed spans throughout: the forwards' medians and the commit's first-to-last
+    # kernel span, so the total is wall time on the device, gaps included.
     forwards = 4 * denoise["median_us"] + clean["median_us"]
-    total = forwards + commit_dev["busy_us"]
+    total = forwards + commit_dev["median_us"]
     print(f"\n{'per chunk, all layers':34s} {'median':>10s}")
     print(f"{'4 denoising forwards':34s} {4 * denoise['median_us'] / 1e3:9.2f} ms")
     print(f"{'1 clean pass':34s} {clean['median_us'] / 1e3:9.2f} ms")
@@ -353,7 +351,7 @@ def chunk_cycle(args, gen) -> None:
     print(f"{'commit, host wall (incl. above)':34s} {host_ms:9.2f} ms")
     print(
         f"{'total device per chunk':34s} {total / 1e3:9.2f} ms  "
-        f"(commit share {100 * commit_dev['busy_us'] / total:.2f}%)"
+        f"(commit share {100 * commit_dev['median_us'] / total:.2f}%)"
     )
     print(
         f"{'per layer per forward':34s} denoise {denoise['median_us'] / layers:.1f} us, "
@@ -499,7 +497,10 @@ def main() -> None:
         [sdpa(q[lo:hi].float(), all_k[: start + hi], all_v[: start + hi]) for lo, hi in blocks]
     )
     ref_exact = torch.cat(
-        [exact_reference(q, kp, vp, k_hist, v_hist, k, v, lo, hi, window) for lo, hi in blocks]
+        [
+            exact_reference(q.float(), kp, vp, k_hist, v_hist, k, v, lo, hi, window)
+            for lo, hi in blocks
+        ]
     )
     chunk_only = sdpa(q.float(), k.float(), v.float())
     for name in chosen:
