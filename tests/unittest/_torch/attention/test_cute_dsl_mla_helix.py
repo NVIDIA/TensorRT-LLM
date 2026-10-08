@@ -19,6 +19,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _scale_inputs(input_dtype: torch.dtype, softmax_scale: float, device) -> list:
+    """FP8 runners read both scales from device tensors at inputs[10:12]."""
+    if input_dtype != torch.float8_e4m3fn:
+        return []
+    return [
+        None,  # kv_bounds
+        torch.tensor([softmax_scale], dtype=torch.float32, device=device),
+        torch.tensor([1.0], dtype=torch.float32, device=device),
+    ]
+
+
+def _scale_kwargs(input_dtype: torch.dtype, softmax_scale: float) -> dict:
+    """FP16/BF16 runners keep their scales as host scalars."""
+    if input_dtype == torch.float8_e4m3fn:
+        return {}
+    return {"softmax_scale": softmax_scale, "output_scale": 1.0}
+
+
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split_kv", [1, 4])
 def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
@@ -98,21 +116,21 @@ def test_cute_dsl_mla_helix_stats_and_empty_local_kv(
         num_heads, seq_len_q, latent_dim, batch_size, cutlass.Float32
     )
     workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    inputs = [
+        q_latent,
+        q_rope,
+        c_latent,
+        c_rope,
+        page_table,
+        cache_seqs,
+        output,
+        workspace,
+        softmax_stats,
+    ]
     runner.forward(
-        [
-            q_latent,
-            q_rope,
-            c_latent,
-            c_rope,
-            page_table,
-            cache_seqs,
-            output,
-            workspace,
-            softmax_stats,
-        ],
+        inputs + _scale_inputs(input_dtype, softmax_scale, device),
         tactic=((128, 128), (128, 256), split_kv, False),
-        softmax_scale=softmax_scale,
-        output_scale=1.0,
+        **_scale_kwargs(input_dtype, softmax_scale),
     )
 
     # The existing Helix sanitizer makes a rank with no local pages the identity

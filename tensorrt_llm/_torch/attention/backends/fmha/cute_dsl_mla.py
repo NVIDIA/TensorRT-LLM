@@ -37,11 +37,36 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
-_LOG2_E = math.log2(math.e)
-
 
 class CuteDslMlaFmha(PhasedFmha):
     """Blackwell CuTe DSL FMHA library for decode-only MLA."""
+
+    @staticmethod
+    def _get_fp8_scales(
+        q: torch.Tensor,
+        fwd: AttentionForwardArgs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the FP8 BMM1/BMM2 scale device tensors the kernel reads.
+
+        The kernel reads element 0 of each tensor on the device, so the scales
+        never need a host read: not on the first call and not under CUDA graph
+        capture.
+        """
+        softmax_scale = fwd.mla_bmm1_scale
+        output_scale = fwd.mla_bmm2_scale
+        if softmax_scale is None or output_scale is None:
+            raise RuntimeError(
+                "CuTe DSL FP8 MLA decode requires mla_bmm1_scale and mla_bmm2_scale device tensors."
+            )
+        for name, scale in (
+            ("mla_bmm1_scale", softmax_scale),
+            ("mla_bmm2_scale", output_scale),
+        ):
+            if scale.dtype != torch.float32 or scale.numel() < 1:
+                raise RuntimeError(f"{name} must contain at least one float32 value.")
+            if scale.device != q.device:
+                raise RuntimeError(f"{name} must be on {q.device}, got {scale.device}.")
+        return softmax_scale, output_scale
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -491,18 +516,7 @@ class CuteDslMlaFmha(PhasedFmha):
         softmax_scale = float(1.0 / (math.sqrt(qk_nope_head_dim + d_rope) * attn.q_scaling))
         output_scale = 1.0
         if kernel_dtype == torch.float8_e4m3fn:
-            cached = getattr(self, "_cute_dsl_fp8_scale", None)
-            if cached is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "CuTe DSL MLA FMHA: fp8 decode scale was not cached for "
-                        f"layer {attn.layer_idx} before CUDA graph capture."
-                    )
-                softmax_scale = float(params.fwd.mla_bmm1_scale[1].item()) / _LOG2_E
-                output_scale = float(params.fwd.mla_bmm2_scale[0].item())
-                self._cute_dsl_fp8_scale = (softmax_scale, output_scale)
-            else:
-                softmax_scale, output_scale = cached
+            softmax_scale, output_scale = self._get_fp8_scales(q, params.fwd)
 
         output_view = output.view(batch_size, seq_len_q, num_heads, d_latent)
 
