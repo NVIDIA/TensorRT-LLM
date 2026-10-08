@@ -3931,7 +3931,9 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=None,
         description=
         "The dynamic batch configuration used by the scheduler to adjust batch size "
-        "and token limits at runtime.")
+        "and token limits at runtime. This option currently has no effect since the "
+        "scheduler does not support dynamic batch adjustments in the pytorch backend."
+    )
 
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
