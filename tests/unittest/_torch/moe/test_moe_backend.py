@@ -19,6 +19,7 @@ import importlib
 import itertools
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1733,6 +1734,46 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 
     moe._alloc_symm_buffer.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(moe)
+
+
+def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
+    """A launcher env describing another world must not seed this MPI world.
+
+    A disaggregated launcher can export its outer RANK/WORLD_SIZE into each
+    server, whose model runs in its own MPI world. The bootstrap must then
+    rendezvous over MPI and overwrite the stale variables.
+    """
+    mpi_comm = MagicMock()
+    mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Get_size.return_value = 4
+    mpi_comm.bcast.return_value = ("model-host", 29501)
+    local_mpi_comm = MagicMock()
+    local_mpi_comm.Get_rank.return_value = 2
+    mpi_comm.Split_type.return_value = local_mpi_comm
+    mpi = SimpleNamespace(COMM_WORLD=mpi_comm, COMM_TYPE_SHARED=1)
+    init_process_group = MagicMock()
+
+    monkeypatch.setitem(sys.modules, "mpi4py", SimpleNamespace(MPI=mpi))
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("MASTER_ADDR", "outer-host")
+    monkeypatch.setenv("MASTER_PORT", "29400")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+
+    MegaMoEDeepGemm._maybe_init_dist_from_mpi()
+
+    mpi_comm.bcast.assert_called_once_with(None, root=0)
+    assert os.environ["MASTER_ADDR"] == "model-host"
+    assert os.environ["MASTER_PORT"] == "29501"
+    assert os.environ["RANK"] == "2"
+    assert os.environ["WORLD_SIZE"] == "4"
+    init_process_group.assert_called_once_with(
+        backend="nccl",
+        rank=2,
+        world_size=4,
+        device_id=None,
+    )
 
 
 def test_megamoe_cache_derived_state_survives_the_read_only_reader_walk():
