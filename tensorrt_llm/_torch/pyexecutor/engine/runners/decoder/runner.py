@@ -4695,7 +4695,10 @@ class DecoderRunner(ScheduledModelRunner):
                 )
 
             with self._cuda_graph_metadata_prepare_scope(
-                attn_metadata, key, execution_requests, execution_promoted_context_ids,
+                attn_metadata,
+                key,
+                execution_requests,
+                execution_promoted_context_ids,
                 enable_spec_decode=enable_spec_decode,
             ):
                 inputs, gather_ids, runtime_draft_len = self._prepare_inputs(

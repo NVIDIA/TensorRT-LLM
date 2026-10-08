@@ -1021,7 +1021,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({1}))
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs, position_id_offsets=None)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
         engine._runner._forward_step.assert_not_called()
         engine._runner._execute_logit_post_processors.assert_called_once_with(
             batch, outputs)
@@ -1076,7 +1078,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         promote.assert_not_called()
         runner.replay.assert_not_called()
         engine._runner._forward_step.assert_called_once()
-        self.assertIs(engine._runner._prepare_inputs.call_args.args[2], metadata)
+        self.assertIs(engine._runner._prepare_inputs.call_args.args[2],
+                      metadata)
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:
@@ -1121,7 +1124,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             semantic_attn_metadata.update_spec_dec_param.call_args.
             kwargs["num_contexts"], 1)
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs, position_id_offsets=None)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(
             self) -> None:
@@ -1208,7 +1213,9 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIs(prepare_args[0], graph_batch)
         self.assertEqual(prepare_args[-1], frozenset({context.py_request_id}))
         prepared_inputs = engine._runner._prepare_inputs.return_value[0]
-        runner.replay.assert_called_once_with(key, prepared_inputs, position_id_offsets=None)
+        runner.replay.assert_called_once_with(key,
+                                              prepared_inputs,
+                                              position_id_offsets=None)
 
     def test_multimodal_graph_miss_preserves_semantic_payload(self) -> None:
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(None)
@@ -1426,10 +1433,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
         def build(kv_cache_manager, draft_kv_cache_manager):
-            engine._runner.attn_metadata = metadata
+            engine.attn_metadata = metadata
             return metadata
 
-        engine._runner._set_up_attn_metadata = Mock(side_effect=build)
+        engine._set_up_attn_metadata = Mock(side_effect=build)
         kv_cache_manager = Mock()
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = kv_cache_manager
@@ -1437,7 +1444,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
         engine._warmup_cute_dsl_radix_topk()
 
-        engine._runner._set_up_attn_metadata.assert_called_once_with(
+        engine._set_up_attn_metadata.assert_called_once_with(
             kv_cache_manager, None)
         metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
         metadata.warmup_selfsampling_topk.assert_called_once_with(
@@ -1451,12 +1458,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine.attn_metadata = None
         engine._config = SimpleNamespace(attention_backend=SimpleNamespace(
             Metadata=TrtllmAttentionMetadata))
-        engine._runner._set_up_attn_metadata = Mock()
+        engine._set_up_attn_metadata = Mock()
 
         engine._ensure_dsa_attn_metadata_for_warmup(Mock())
         engine._warmup_cute_dsl_radix_topk()
 
-        engine._runner._set_up_attn_metadata.assert_not_called()
+        engine._set_up_attn_metadata.assert_not_called()
 
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
@@ -2600,9 +2607,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 engine.model.model_config.pretrained_config.rope_scaling = None
                 engine.model.model = SimpleNamespace(ced_kv_precompute=True,
                                                      decoder_replay_split=20)
-                engine._runner._config = replace(engine._runner._config, disable_overlap_scheduler=True)
+                engine._runner._config = replace(engine._runner._config,
+                                                 disable_overlap_scheduler=True)
                 engine._runner.is_warmup = warmup
-                engine._runner.cuda_graph_runner = SimpleNamespace(enabled=False)
+                engine._runner.cuda_graph_runner = SimpleNamespace(
+                    enabled=False)
                 scheduled = ScheduledRequests()
                 scheduled.reset_context_requests(
                     manager.add_dummy_requests([0],
@@ -2636,9 +2645,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 engine.model.model_config.pretrained_config.rope_scaling = None
                 engine.model.model = SimpleNamespace(ced_kv_precompute=True,
                                                      decoder_replay_split=20)
-                engine._runner._config = replace(engine._runner._config, disable_overlap_scheduler=not overlap)
+                engine._runner._config = replace(
+                    engine._runner._config,
+                    disable_overlap_scheduler=not overlap)
                 engine._runner.is_warmup = False
-                engine._runner.cuda_graph_runner = SimpleNamespace(enabled=not mixed)
+                engine._runner.cuda_graph_runner = SimpleNamespace(
+                    enabled=not mixed)
                 scheduled = ScheduledRequests()
                 if mixed:
                     context = _create_request_with_tokens(list(range(5000)), 7)
@@ -2954,7 +2966,10 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 elif case == "draft_key":
                     selected = key._replace(draft_len=1)
                 with engine._runner._cuda_graph_metadata_prepare_scope(
-                        metadata, selected, batch, promoted,
+                        metadata,
+                        selected,
+                        batch,
+                        promoted,
                         enable_spec_decode=engine.enable_spec_decode):
                     self.assertEqual(metadata._csa2_defer_decode_outputs, case
                                      in ("ordinary", "ordinary_overlap"))
