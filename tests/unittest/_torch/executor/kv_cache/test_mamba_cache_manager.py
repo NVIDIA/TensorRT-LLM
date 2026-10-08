@@ -2373,12 +2373,12 @@ def _build_v2_hybrid_with_mamba_layer(
         block_reuse_config=BlockReuseConfig(
             policy=block_reuse_policy,
             max_num_turns=max_num_turns,
+            enable_branch_snapshot=enable_branch_snapshot,
         ),
         enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
-            enable_branch_snapshot=enable_branch_snapshot,
         ),
         dtype=kv_cache_dtype,
     )
@@ -2968,10 +2968,10 @@ def _branch_snapshot_manager(
     mgr.local_num_mamba_layers = local_num_mamba_layers
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=enable_block_reuse,
+        block_reuse_config=BlockReuseConfig(enable_branch_snapshot=enable_branch_snapshot),
         mamba_state_config=MambaStateConfig(
             periodic_snapshot_interval=periodic_snapshot_interval,
             additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end or []),
-            enable_branch_snapshot=enable_branch_snapshot,
         ),
     )
     mgr._branch_snapshot_points = {}
@@ -3334,7 +3334,7 @@ def test_branch_snapshot_entry_is_released_with_the_request():
         enable_branch_snapshot=True,
     )
     try:
-        assert mgr.kv_cache_config.mamba_state_config.enable_branch_snapshot
+        assert mgr.kv_cache_config.block_reuse_config.enable_branch_snapshot
         request = _fake_context_request(rid=11, prompt_len=128)
         mgr._record_branch_snapshot_point(
             request, _fake_reuse_match(divergence=64), num_lookup_tokens=127
@@ -3376,7 +3376,7 @@ def test_branch_snapshot_coexists_with_per_conversation_and_zero_interval():
     try:
         assert mgr.block_reuse_policy is BlockReusePolicy.PER_CONVERSATION
         assert mgr.kv_cache_config.mamba_state_config.periodic_snapshot_interval == 0
-        assert mgr.kv_cache_config.mamba_state_config.enable_branch_snapshot
+        assert mgr.kv_cache_config.block_reuse_config.enable_branch_snapshot
         assert mgr.tokens_per_block == 32
 
         request = _fake_context_request(rid=13, prompt_len=150)

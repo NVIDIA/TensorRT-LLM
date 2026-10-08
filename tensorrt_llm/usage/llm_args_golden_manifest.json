@@ -583,6 +583,11 @@
       "path": "kv_cache_config.avg_seq_len"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.enable_branch_snapshot"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_cache_config.block_reuse_config.max_num_turns"
@@ -741,11 +746,6 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_config.mamba_ssm_stochastic_rounding"
-    },
-    {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_config.mamba_state_config.enable_branch_snapshot"
     },
     {
       "capture_policy": "int",
