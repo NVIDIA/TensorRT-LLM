@@ -32,6 +32,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <string>
@@ -65,6 +66,7 @@ enum class Nvfp4ColdPageTransform : std::int32_t
 {
     kNvfp4 = 0,
     kLosslessCopy = 1,
+    kNvfp4RopeResidual = 2,
 };
 
 struct Nvfp4ColdPageTestBuffer
@@ -162,6 +164,9 @@ constexpr PageGeometry kModelLikeGeometry{8, 64, 128};
 constexpr PageGeometry kDeepseekV4NopeGeometry{1, 32, 448};
 constexpr PageGeometry kDeepseekV4LargeNopeGeometry{1, 64, 448};
 constexpr std::int32_t kDeepseekV4RowElements = 512;
+constexpr std::int32_t kDeepseekV4RopeElements = 64;
+constexpr std::size_t kResidualPackedRowBytes = (kDeepseekV4RowElements + kDeepseekV4RopeElements) / 2U;
+constexpr std::size_t kResidualScalesPerRow = (kDeepseekV4RowElements + kDeepseekV4RopeElements) / 16U;
 constexpr std::array<std::int32_t, 5> kValidTokenCounts{1, 16, 17, 63, 64};
 constexpr std::array<std::int32_t, 4> kDeepseekV4ValidTokenCounts{1, 16, 17, 31};
 
@@ -446,8 +451,7 @@ float e2m1Value(std::uint8_t nibble)
     return (nibble & 0x8U) != 0 ? -value : value;
 }
 
-//! Independent nearest-level oracle; fixtures avoid ties instead of duplicating
-// production tie rules.
+//! Independent nearest-level oracle with ties rounded to an even E2M1 code.
 std::uint8_t quantizeE2m1(float value)
 {
     bool const negative = std::signbit(value);
@@ -457,7 +461,7 @@ std::uint8_t quantizeE2m1(float value)
     for (std::uint8_t index = 1; index < kE2m1Levels.size(); ++index)
     {
         float const distance = std::abs(magnitude - kE2m1Levels[index]);
-        if (distance < bestDistance)
+        if (distance < bestDistance || (distance == bestDistance && (index & 1U) == 0U && (best & 1U) != 0U))
         {
             best = index;
             bestDistance = distance;
@@ -574,6 +578,90 @@ std::vector<std::uint8_t> decompressReference(ReferenceNvfp4 const& compressed, 
                 std::uint8_t const nibble = (i & 1U) == 0 ? byte & 0xFU : byte >> 4;
                 storeRawValue(raw, kind, blockStart + i, e2m1Value(nibble) * dequantScale, params);
             }
+        }
+    }
+    return raw;
+}
+
+ReferenceNvfp4 compressResidualReference(std::vector<std::uint8_t> const& raw, RawKind kind,
+    Nvfp4ColdPageKernelParams const& params, PageGeometry const& geometry)
+{
+    auto const main = compressReference(raw, kind, params, geometry);
+    auto const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    ReferenceNvfp4 result;
+    result.packed.resize(rows * kResidualPackedRowBytes);
+    result.scales.resize(rows * kResidualScalesPerRow);
+    constexpr std::size_t kMainPackedRowBytes = kDeepseekV4RowElements / 2U;
+    constexpr std::size_t kMainScalesPerRow = kDeepseekV4RowElements / 16U;
+    constexpr std::size_t kRopeStart = kDeepseekV4RowElements - kDeepseekV4RopeElements;
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        std::copy_n(main.packed.begin() + static_cast<std::ptrdiff_t>(row * kMainPackedRowBytes), kMainPackedRowBytes,
+            result.packed.begin() + static_cast<std::ptrdiff_t>(row * kResidualPackedRowBytes));
+        std::copy_n(main.scales.begin() + static_cast<std::ptrdiff_t>(row * kMainScalesPerRow), kMainScalesPerRow,
+            result.scales.begin() + static_cast<std::ptrdiff_t>(row * kResidualScalesPerRow));
+        for (std::size_t residualGroup = 0; residualGroup < kDeepseekV4RopeElements / 16U; ++residualGroup)
+        {
+            std::size_t const elementInRow = kRopeStart + residualGroup * 16U;
+            __nv_fp8_e4m3 mainScale;
+            mainScale.__x = main.scales[row * kMainScalesPerRow + elementInRow / 16U];
+            float const dequantScale = static_cast<float>(mainScale) * params.nvfp4ScaleQuantOrig;
+            std::array<float, 16> residual;
+            float residualMax = 0.0F;
+            for (std::size_t element = 0; element < residual.size(); ++element)
+            {
+                auto const index = row * kDeepseekV4RowElements + elementInRow + element;
+                auto const byte = main.packed[index / 2U];
+                auto const nibble = static_cast<std::uint8_t>((index & 1U) == 0U ? byte & 0xFU : byte >> 4U);
+                residual[element] = loadRawValue(raw, kind, index, params) - e2m1Value(nibble) * dequantScale;
+                residualMax = std::max(residualMax, std::abs(residual[element]));
+            }
+            __nv_fp8_e4m3 const scale(params.nvfp4ScaleOrigQuant * (residualMax / 6.0F));
+            result.scales[row * kResidualScalesPerRow + kMainScalesPerRow + residualGroup] = scale.__x;
+            float const quantScale = params.nvfp4ScaleOrigQuant / std::max(static_cast<float>(scale), 1.0e-12F);
+            for (std::size_t element = 0; element < residual.size(); element += 2U)
+            {
+                auto const low = quantizeE2m1(residual[element] * quantScale);
+                auto const high = quantizeE2m1(residual[element + 1U] * quantScale);
+                auto const offset
+                    = row * kResidualPackedRowBytes + kMainPackedRowBytes + residualGroup * 8U + element / 2U;
+                result.packed[offset] = static_cast<std::uint8_t>(low | (high << 4U));
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> decompressResidualReference(ReferenceNvfp4 const& compressed, RawKind kind,
+    Nvfp4ColdPageKernelParams const& params, PageGeometry const& geometry)
+{
+    std::vector<std::uint8_t> raw(rawBytes(kind, geometry));
+    auto const rows = static_cast<std::size_t>(geometry.numHeads * geometry.tokensPerPage);
+    constexpr std::size_t kRopeStart = kDeepseekV4RowElements - kDeepseekV4RopeElements;
+    for (std::size_t row = 0; row < rows; ++row)
+    {
+        for (std::size_t element = 0; element < kDeepseekV4RowElements; ++element)
+        {
+            auto const mainByte = compressed.packed[row * kResidualPackedRowBytes + element / 2U];
+            auto const mainNibble = static_cast<std::uint8_t>((element & 1U) == 0U ? mainByte & 0xFU : mainByte >> 4U);
+            __nv_fp8_e4m3 mainScale;
+            mainScale.__x = compressed.scales[row * kResidualScalesPerRow + element / 16U];
+            float value = e2m1Value(mainNibble) * (static_cast<float>(mainScale) * params.nvfp4ScaleQuantOrig);
+            if (element >= kRopeStart)
+            {
+                auto const residualElement = element - kRopeStart;
+                auto const residualByte
+                    = compressed
+                          .packed[row * kResidualPackedRowBytes + kDeepseekV4RowElements / 2U + residualElement / 2U];
+                auto const residualNibble
+                    = static_cast<std::uint8_t>((element & 1U) == 0U ? residualByte & 0xFU : residualByte >> 4U);
+                __nv_fp8_e4m3 residualScale;
+                residualScale.__x
+                    = compressed
+                          .scales[row * kResidualScalesPerRow + kDeepseekV4RowElements / 16U + residualElement / 16U];
+                value += e2m1Value(residualNibble) * (static_cast<float>(residualScale) * params.nvfp4ScaleQuantOrig);
+            }
+            storeRawValue(raw, kind, row * kDeepseekV4RowElements + element, value, params);
         }
     }
     return raw;
@@ -1440,6 +1528,173 @@ TEST_P(Nvfp4ColdPageRopePrecisionTest, NonzeroRangeStartAcrossTiles)
 INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4ColdPageRopePrecisionTest,
     testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
 
+void runRopeResidualRoundTrip(
+    RawKind kind, std::int32_t tokensPerPage, InputPattern pattern, std::size_t coldBaseOffset = 0U)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (!tensorrt_llm::common::isSM100Family())
+    {
+        GTEST_SKIP() << "NVFP4 cold-page kernels require an SM100-family GPU";
+    }
+    PageGeometry const geometry{1, tokensPerPage, kDeepseekV4RowElements};
+    auto const params = makeParams(geometry, 1U);
+    auto const rows = static_cast<std::size_t>(tokensPerPage);
+    auto const rawPageBytes = rawBytes(kind, geometry);
+    auto const rawSlotBytes = rawPageBytes + 32U;
+    auto const packed = rows * kResidualPackedRowBytes;
+    auto const scales = rows * kResidualScalesPerRow;
+    constexpr std::size_t kSideBytes = 103U;
+    constexpr std::size_t kSlotCapacity = 8U;
+    constexpr std::array<std::int32_t, 2> kInputSlots{2, 7};
+    constexpr std::array<std::int32_t, 2> kColdSlots{5, 1};
+    constexpr std::array<std::int32_t, 2> kOutputSlots{6, 0};
+    auto const payloadBytes = packed + scales + kSideBytes;
+    auto const coldPageBytes = roundUp(payloadBytes, alignof(uint4));
+    DeviceRegion input(kSlotCapacity * rawSlotBytes);
+    DeviceRegion output(kSlotCapacity * rawSlotBytes);
+    DeviceRegion inputSide(kSlotCapacity * kSideBytes);
+    DeviceRegion outputSide(kSlotCapacity * kSideBytes);
+    MappedHostRegion cold(coldBaseOffset + kSlotCapacity * coldPageBytes);
+    auto* coldBase = cold.bytes() + coldBaseOffset;
+    std::array<std::vector<std::uint8_t>, 2> rawHost;
+    std::array<std::vector<std::uint8_t>, 2> sideHost;
+    std::array<ReferenceNvfp4, 2> references;
+    std::array<PageIndexPair, 2> offload;
+    std::array<PageIndexPair, 2> onboard;
+    for (std::size_t page = 0; page < kInputSlots.size(); ++page)
+    {
+        rawHost[page] = makeRawPage(kind, page, 1U, params, geometry, pattern);
+        references[page] = compressResidualReference(rawHost[page], kind, params, geometry);
+        sideHost[page].resize(kSideBytes);
+        for (std::size_t byte = 0; byte < kSideBytes; ++byte)
+        {
+            sideHost[page][byte] = static_cast<std::uint8_t>(37U * byte + 13U * page);
+        }
+        input.copyFrom(static_cast<std::size_t>(kInputSlots[page]) * rawSlotBytes, rawHost[page]);
+        inputSide.copyFrom(static_cast<std::size_t>(kInputSlots[page]) * kSideBytes, sideHost[page]);
+        offload[page] = {kColdSlots[page], kInputSlots[page]};
+        onboard[page] = {kOutputSlots[page], kColdSlots[page]};
+    }
+    auto const makeMetadata = [&](DeviceRegion const& raw, DeviceRegion const& side)
+    {
+        std::vector<Nvfp4ColdPageTestBuffer> const buffers{
+            {reinterpret_cast<std::uintptr_t>(raw.data()), rawSlotBytes, rawPageBytes, 0U, packed, 0U, 0U,
+                Nvfp4ColdPageTransform::kNvfp4RopeResidual, params},
+            {reinterpret_cast<std::uintptr_t>(side.data()), kSideBytes, kSideBytes, packed + scales, 0U, payloadBytes,
+                static_cast<std::uint32_t>(coldPageBytes - payloadBytes), Nvfp4ColdPageTransform::kLosslessCopy, {}}};
+        return makeNvfp4ColdPageTestMetadata(buffers, coldPageBytes, runtimeType(kind));
+    };
+    auto const inputMetadata = makeMetadata(input, inputSide);
+    auto const outputMetadata = makeMetadata(output, outputSide);
+    CudaStream stream;
+    invokeNvfp4ColdPageEncode(offload.data(), offload.size(), inputMetadata, coldBase, stream);
+    invokeNvfp4ColdPageDecode(onboard.data(), onboard.size(), outputMetadata, coldBase, stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    auto const snapshot = cold.payload();
+    auto const coldRegion = [&](std::size_t slot, std::size_t offset, std::size_t bytes)
+    {
+        auto const begin = coldBaseOffset + slot * coldPageBytes + offset;
+        return std::vector<std::uint8_t>(snapshot.begin() + static_cast<std::ptrdiff_t>(begin),
+            snapshot.begin() + static_cast<std::ptrdiff_t>(begin + bytes));
+    };
+    for (std::size_t page = 0; page < kInputSlots.size(); ++page)
+    {
+        auto const coldSlot = static_cast<std::size_t>(kColdSlots[page]);
+        EXPECT_EQ(coldRegion(coldSlot, 0U, packed), references[page].packed);
+        EXPECT_EQ(coldRegion(coldSlot, packed, scales), references[page].scales);
+        EXPECT_EQ(coldRegion(coldSlot, packed + scales, kSideBytes), sideHost[page]);
+        auto const padding = coldRegion(coldSlot, payloadBytes, coldPageBytes - payloadBytes);
+        EXPECT_TRUE(std::all_of(padding.begin(), padding.end(), [](std::uint8_t byte) { return byte == 0U; }));
+        auto const restored
+            = output.copyToHost(static_cast<std::size_t>(kOutputSlots[page]) * rawSlotBytes, rawPageBytes);
+        EXPECT_EQ(restored, decompressResidualReference(references[page], kind, params, geometry));
+        EXPECT_EQ(outputSide.copyToHost(static_cast<std::size_t>(kOutputSlots[page]) * kSideBytes, kSideBytes),
+            sideHost[page]);
+        auto const main = compressReference(rawHost[page], kind, params, geometry);
+        auto const mainRestored = decompressReference(main, kind, params, geometry);
+        float singleError = 0.0F;
+        float residualError = 0.0F;
+        for (std::size_t row = 0; row < rows; ++row)
+        {
+            for (std::size_t element = 0; element < kDeepseekV4RowElements; ++element)
+            {
+                auto const index = row * kDeepseekV4RowElements + element;
+                if (element < kDeepseekV4RowElements - kDeepseekV4RopeElements)
+                {
+                    auto const offset = index * rawElementBytes(kind);
+                    EXPECT_EQ(
+                        std::memcmp(restored.data() + offset, mainRestored.data() + offset, rawElementBytes(kind)), 0);
+                }
+                else
+                {
+                    auto const original = loadRawValue(rawHost[page], kind, index, params);
+                    singleError += std::abs(original - loadRawValue(mainRestored, kind, index, params));
+                    residualError += std::abs(original - loadRawValue(restored, kind, index, params));
+                }
+            }
+        }
+        EXPECT_LE(residualError, singleError);
+        if (pattern == InputPattern::kRoundingMargins)
+        {
+            EXPECT_LT(residualError, singleError);
+        }
+        for (auto const* raw : {&input, &output})
+        {
+            auto const slot = raw == &input ? kInputSlots[page] : kOutputSlots[page];
+            auto const tail = raw->copyToHost(
+                static_cast<std::size_t>(slot) * rawSlotBytes + rawPageBytes, rawSlotBytes - rawPageBytes);
+            EXPECT_TRUE(std::all_of(tail.begin(), tail.end(), [](std::uint8_t byte) { return byte == kCanary; }));
+        }
+    }
+    for (std::size_t slot = 0; slot < kSlotCapacity; ++slot)
+    {
+        if (std::find(kColdSlots.begin(), kColdSlots.end(), static_cast<std::int32_t>(slot)) == kColdSlots.end())
+        {
+            auto const unused = coldRegion(slot, 0U, coldPageBytes);
+            EXPECT_TRUE(std::all_of(unused.begin(), unused.end(), [](std::uint8_t byte) { return byte == kCanary; }));
+        }
+        if (std::find(kOutputSlots.begin(), kOutputSlots.end(), static_cast<std::int32_t>(slot)) == kOutputSlots.end())
+        {
+            auto const unused = output.copyToHost(slot * rawSlotBytes, rawSlotBytes);
+            EXPECT_TRUE(std::all_of(unused.begin(), unused.end(), [](std::uint8_t byte) { return byte == kCanary; }));
+        }
+    }
+    EXPECT_TRUE(std::all_of(snapshot.begin(), snapshot.begin() + static_cast<std::ptrdiff_t>(coldBaseOffset),
+        [](std::uint8_t byte) { return byte == kCanary; }));
+    input.expectCanaries();
+    output.expectCanaries();
+    inputSide.expectCanaries();
+    outputSide.expectCanaries();
+    cold.expectCanaries();
+}
+
+class Nvfp4ColdPageRopeResidualTest : public testing::TestWithParam<RawKind>
+{
+};
+
+TEST_P(Nvfp4ColdPageRopeResidualTest, OddRowsMatchIndependentTwoComponentReference)
+{
+    runRopeResidualRoundTrip(GetParam(), 17, InputPattern::kRoundingMargins);
+}
+
+TEST_P(Nvfp4ColdPageRopeResidualTest, NonUnitScalesAndUnalignedColdBaseAcrossManyRows)
+{
+    runRopeResidualRoundTrip(GetParam(), 65, InputPattern::kRoundingMargins, 1U);
+}
+
+TEST_P(Nvfp4ColdPageRopeResidualTest, ZeroMainAndResidualRemainZero)
+{
+    runRopeResidualRoundTrip(GetParam(), 1, InputPattern::kAllZero);
+}
+
+TEST_P(Nvfp4ColdPageRopeResidualTest, ExactMainUsesZeroResidual)
+{
+    runRopeResidualRoundTrip(GetParam(), 3, InputPattern::kDense);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllRuntimeTypes, Nvfp4ColdPageRopeResidualTest,
+    testing::Values(RawKind::kFloat16, RawKind::kBfloat16, RawKind::kFp8));
+
 void runUnaryMlaWithLosslessSideRoundTrip(RawKind kind)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -1781,6 +2036,50 @@ TEST(Nvfp4ColdPageValidationTest, EmptyBatchIsAnAsyncNoOp)
 {
     invokeNvfp4ColdPageEncode(nullptr, 0U, Nvfp4ColdPageTestMetadata{}, nullptr, nullptr);
     invokeNvfp4ColdPageDecode(nullptr, 0U, Nvfp4ColdPageTestMetadata{}, nullptr, nullptr);
+}
+
+TEST(Nvfp4ColdPageValidationTest, ResidualFormatRejectsMalformedLayoutBeforeLaunching)
+{
+    auto const params = makeParams(PageGeometry{1, 1, kDeepseekV4RowElements});
+    constexpr std::size_t kRawBytes = kDeepseekV4RowElements * sizeof(half);
+    constexpr std::size_t kPayloadBytes = kResidualPackedRowBytes + kResidualScalesPerRow;
+    auto const pageBytes = roundUp(kPayloadBytes, alignof(uint4));
+    std::vector<Nvfp4ColdPageTestBuffer> const buffers{
+        {1U, kRawBytes, kRawBytes, 0U, kResidualPackedRowBytes, kPayloadBytes,
+            static_cast<std::uint32_t>(pageBytes - kPayloadBytes), Nvfp4ColdPageTransform::kNvfp4RopeResidual, params}};
+    auto const valid = makeNvfp4ColdPageTestMetadata(buffers, pageBytes, Nvfp4ColdPageRuntimeType::kFloat16);
+    PageIndexPair const page{0, 0};
+    // Dummy addresses are safe only because every case must fail before CUDA launch.
+    auto* cold = reinterpret_cast<void*>(1U);
+    auto const expectRejected = [&](Nvfp4ColdPageTestMetadata const& metadata)
+    {
+        EXPECT_THROW(invokeNvfp4ColdPageEncode(&page, 1U, metadata, cold, nullptr), std::exception);
+        EXPECT_THROW(invokeNvfp4ColdPageDecode(&page, 1U, metadata, cold, nullptr), std::exception);
+    };
+    auto bad = valid;
+    bad.integers[0][4] = 448; // Quantized range is not the full 512-element row.
+    expectRejected(bad);
+    bad = valid;
+    bad.integers[0][5] = 576; // A different raw row layout cannot opt into this transform.
+    expectRejected(bad);
+    bad = valid;
+    bad.integers[0][6] = 16; // A residual row must begin its main component at zero.
+    expectRejected(bad);
+    bad = valid;
+    bad.integers[0][2] = 0;
+    expectRejected(bad);
+    bad = valid;
+    --bad.wide[0][2]; // Hot bytes no longer match row count and dtype.
+    expectRejected(bad);
+    bad = valid;
+    bad.wide[0][4] = kResidualPackedRowBytes - 1U; // Scale interval overlaps packed data.
+    expectRejected(bad);
+    bad = valid;
+    bad.coldPageBytes = kPayloadBytes - 1U; // The final residual scale lies outside the Page.
+    expectRejected(bad);
+    bad = valid;
+    bad.wide[0][5] = kPayloadBytes - 1U; // Padding must not erase a residual scale.
+    expectRejected(bad);
 }
 
 } // namespace

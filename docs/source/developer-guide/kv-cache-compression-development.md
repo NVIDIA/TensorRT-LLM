@@ -301,8 +301,10 @@ contiguous piece into NVFP4 (4-bit values plus one scale per 16 numbers) and
 copies everything before and after that piece unchanged. A compressed buffer
 records the piece as `quantized_range_start` and `quantized_range_elements`.
 
-- `skip_rope_quantization: false` (default): the piece is the whole vector, so every K and V
-  number becomes NVFP4.
+- `skip_rope_quantization: false` (default): the piece is the whole vector. DeepSeek-V4
+  target CSA uses single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
+  values. Set `nvfp4_mla_residual_quantization: false` for single NVFP4 throughout.
+  Other models ignore this residual option and continue to use single NVFP4.
 - `skip_rope_quantization: true`: the piece is the NoPE part of the K vector, so the
   RoPE numbers are copied unchanged into the cold page, right after that buffer's
   scales. The codec finds the RoPE part in the model config: the last
@@ -318,9 +320,17 @@ RoPE (nothing left to quantize), RoPE in the middle of the vector (two pieces),
 or a piece whose start or length is not a multiple of 16 numbers (the scale
 group). The switch only takes effect for the model types in
 `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES`, whose RoPE layout the codec knows; other
-models log a warning and quantize whole vectors. Draft-model KV
-caches always quantize whole vectors because the codec holds only the target
-model's config.
+models log a warning and quantize whole vectors. To add a model, first verify
+its physical cache layout: a key-only buffer is assumed to be an MLA latent
+with trailing RoPE; separate key and value buffers are assumed to be
+partial-rotary GQA with leading RoPE. Adding a `model_type` alone is not enough
+for interleaved rotated dimensions or an MLA cache that also exposes a value
+buffer; implement an explicit placement rule and test it before adding that
+model to the allowlist. RoPE widths come from rotary-width fields or partial
+rotary factors, never from theta or `rotary_emb_base`.
+
+Draft-model cold pages ignore both RoPE options and quantize whole vectors with
+single NVFP4 because the codec holds only the target model's config.
 
 ### 4. Add method-specific kernels
 

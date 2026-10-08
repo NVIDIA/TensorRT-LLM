@@ -41,12 +41,14 @@ def _manager(
     model_type="qwen3",
     pretrained_config=None,
     skip_rope_quantization=False,
+    nvfp4_mla_residual_quantization=True,
 ):
     config = ColdPageQuantizationCompressionConfig(
         scale_checkpoint_path=(
             str(scale_checkpoint_path) if scale_checkpoint_path is not None else None
         ),
         skip_rope_quantization=skip_rope_quantization,
+        nvfp4_mla_residual_quantization=nvfp4_mla_residual_quantization,
     )
     return Nvfp4ColdPageQuantizationCompression(
         config,
@@ -794,9 +796,15 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
 
 
 @pytest.mark.parametrize("model_type", ("qwen3", "kimi_k3"))
-def test_non_deepseek_model_skips_deepseek_v4_layout_builder(model_type: str) -> None:
+@pytest.mark.parametrize("nvfp4_mla_residual_quantization", (False, True))
+def test_non_deepseek_model_skips_deepseek_v4_layout_builder(
+    model_type: str, nvfp4_mla_residual_quantization: bool
+) -> None:
     native, _ = _native()
-    manager = _manager(model_type=model_type)
+    manager = _manager(
+        model_type=model_type,
+        nvfp4_mla_residual_quantization=nvfp4_mla_residual_quantization,
+    )
 
     with (
         patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native),
@@ -811,6 +819,9 @@ def test_non_deepseek_model_skips_deepseek_v4_layout_builder(model_type: str) ->
         )
 
     build_deepseek_v4_layouts.assert_not_called()
+    assert all(buffer.rope_residual_elements == 0 for buffer in _layouts(native)[0].buffers)
+    metadata = _configure_default_lifecycle(native, raw_bytes=64 * 128 * 2)
+    assert metadata.integers[:2, 1].tolist() == [0, 0]
 
 
 @pytest.mark.parametrize(
@@ -954,6 +965,7 @@ def test_deepseek_v4_draft_csa_uses_identity_scale(tmp_path) -> None:
 
     scales = _codec_state(native).layer_layouts[1].buffers[0].scales
     assert scales.nvfp4_orig_quant == scales.nvfp4_quant_orig == 1.0
+    assert _codec_state(native).layer_layouts[1].buffers[0].rope_residual_elements == 0
 
 
 @pytest.mark.parametrize("pp_layers", [(), (10, 20)])
@@ -1373,7 +1385,7 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
 
 
 def _text_config(model_type, **fields):
-    """A real HF config with the fields RopeParams.from_config reads."""
+    """A real HF config with explicit rotary widths or partial-rotary fractions."""
 
     config = PretrainedConfig(
         hidden_size=2048, num_attention_heads=8, max_position_embeddings=4096, **fields
@@ -1477,34 +1489,98 @@ def test_skip_rope_quantization_leaves_the_mla_rope_tail() -> None:
 
 
 @pytest.mark.parametrize(
-    ("skip_rope_quantization", "quantized_range", "cold_page_bytes"),
+    ("runtime_dtype", "element_bytes"),
+    [(DataType.BF16, 2), (DataType.FP8, 1)],
+)
+@pytest.mark.parametrize(
+    ("skip_rope_quantization", "residual_quantization", "quantized_range", "transform"),
     [
-        # 8192 B NVFP4 data + 1024 B scales + 2176 B indexer copied whole.
-        (False, (0, 512), 11392),
-        # 7168 B NVFP4 data + 896 B scales + 2048 B RoPE copied + 2176 B indexer copied whole.
-        (True, (0, 448), 12288),
+        (False, False, (0, 512), 0),
+        (False, True, (0, 512), 2),
+        (True, False, (0, 448), 0),
+        (True, True, (0, 448), 0),
     ],
 )
-def test_deepseek_v4_compressed_rows_follow_skip_rope_quantization(
-    skip_rope_quantization, quantized_range, cold_page_bytes
+def test_deepseek_v4_cold_rope_formats_and_skip_precedence(
+    runtime_dtype,
+    element_bytes,
+    skip_rope_quantization,
+    residual_quantization,
+    quantized_range,
+    transform,
 ) -> None:
     native, _ = _native()
     (layout,) = _create(
-        _manager(model_type="deepseek_v4", skip_rope_quantization=skip_rope_quantization),
+        _manager(
+            model_type="deepseek_v4",
+            skip_rope_quantization=skip_rope_quantization,
+            nvfp4_mla_residual_quantization=residual_quantization,
+        ),
+        _deepseek_v4_csa_cache_config(element_bytes=element_bytes),
+        native,
+        runtime_dtype=runtime_dtype,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(),
+        head_dim_per_layer=(),
+    )
+    assert _quantized_range(layout.buffers[0]) == quantized_range
+    residual_elements = 64 if transform == 2 else 0
+    assert layout.buffers[0].rope_residual_elements == residual_elements
+    assert layout.buffers[1].scales is None
+    assert layout.buffers[1].rope_residual_elements == 0
+    metadata = _configure_lifecycle(
+        native,
+        {
+            1: {
+                "deepseek_v4_compress": 32 * 512 * element_bytes,
+                "deepseek_v4_indexer_compress": 32 * 68,
+            }
+        },
+    )
+    encoded_elements = quantized_range[1] + residual_elements
+    packed_bytes = 32 * encoded_elements // 2
+    scale_bytes = 32 * encoded_elements // 16
+    lossless_bytes = 32 * (512 - quantized_range[1]) * element_bytes
+    indexer_offset = packed_bytes + scale_bytes + lossless_bytes
+    cold_page_bytes = indexer_offset + 32 * 68
+    assert metadata.cold_page_bytes == cold_page_bytes
+    assert metadata.wide[:2, 3].tolist() == [0, indexer_offset]
+    assert metadata.wide[:2, 4].tolist() == [packed_bytes, 0]
+    assert metadata.integers[0].tolist() == [0, transform, 1, 32, quantized_range[1], 512, 0]
+    assert metadata.integers[1].tolist() == [0, 1, 0, 0, 0, 0, 0]
+    if transform == 2:
+        assert packed_bytes == 9216
+        assert scale_bytes == 1152
+        assert cold_page_bytes == 12544
+    # Tile sizing follows the quantized range, not the row stride: 32 * 448 / 8 vs 32 * 512 / 8.
+    assert metadata.max_half_groups_per_tile == (1792 if skip_rope_quantization else 2048)
+
+
+def test_cold_rope_configuration_defaults_and_serialization() -> None:
+    config = ColdPageQuantizationCompressionConfig()
+    assert not config.skip_rope_quantization
+    assert config.nvfp4_mla_residual_quantization
+    assert ColdPageQuantizationCompressionConfig.model_validate(config.model_dump()) == config
+
+    native, _ = _native()
+    manager = Nvfp4ColdPageQuantizationCompression(
+        config, pretrained_config=SimpleNamespace(model_type="deepseek_v4")
+    )
+    (layout,) = _create(
+        manager,
         _deepseek_v4_csa_cache_config(element_bytes=1),
         native,
         pp_layers=(0,),
         num_kv_heads_per_layer=(),
         head_dim_per_layer=(),
     )
-    assert _quantized_range(layout.buffers[0]) == quantized_range
+    assert layout.buffers[0].rope_residual_elements == 64
     metadata = _configure_lifecycle(
         native,
         {1: {"deepseek_v4_compress": 32 * 512, "deepseek_v4_indexer_compress": 32 * 68}},
     )
-    assert metadata.cold_page_bytes == cold_page_bytes
-    # Tile sizing follows the quantized range, not the row stride: 32 * 448 / 8 vs 32 * 512 / 8.
-    assert metadata.max_half_groups_per_tile == (1792 if skip_rope_quantization else 2048)
+    assert metadata.integers[0, 1].item() == 2
+    assert metadata.cold_page_bytes == 12544
 
 
 def test_skip_rope_quantization_quantizes_draft_kv_rows_whole() -> None:
@@ -1607,6 +1683,86 @@ def test_skip_rope_quantization_reads_partial_rotary_factor_from_rope_parameters
     )
     layout = _create_kv(native, config, 256, skip_rope_quantization=True)
     assert _quantized_range(layout.buffers[0]) == (64, 192)
+
+
+@pytest.mark.parametrize("rotary_emb_base", (32, 10000))
+def test_skip_rope_quantization_never_uses_rotary_emb_base_as_a_width(rotary_emb_base) -> None:
+    native, _ = _native()
+    config = _text_config(
+        "qwen3_5", head_dim=256, partial_rotary_factor=0.25, rotary_emb_base=rotary_emb_base
+    )
+    layout = _create_kv(native, config, 256, skip_rope_quantization=True)
+    assert _quantized_range(layout.buffers[0]) == (64, 192)
+
+
+@pytest.mark.parametrize("rotary_emb_base", (32, 10000))
+def test_skip_rope_quantization_uses_the_explicit_mla_rotary_width(rotary_emb_base) -> None:
+    native, _ = _native()
+    config = _mla_config()
+    config.rotary_emb_base = rotary_emb_base
+    cache_config = SimpleNamespace(
+        tokens_per_block=64,
+        layers=(
+            AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=64 * 576 * 2)]),
+        ),
+    )
+    (layout,) = _create(
+        _manager(pretrained_config=config, skip_rope_quantization=True),
+        cache_config,
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(1,),
+        head_dim_per_layer=(576,),
+    )
+    assert _quantized_range(layout.buffers[0]) == (0, 512)
+    assert layout.buffers[0].rope_residual_elements == 0
+
+
+@pytest.mark.parametrize("width_field", ("rotary_dim", "qk_rope_head_dim"))
+def test_skip_rope_quantization_reads_explicit_widths_from_rope_parameters(width_field) -> None:
+    native, _ = _native()
+    config = _text_config(
+        "qwen3_5",
+        head_dim=256,
+        partial_rotary_factor=0.5,
+        rope_parameters={width_field: 64, "rope_theta": 1e7},
+    )
+    layout = _create_kv(native, config, 256, skip_rope_quantization=True)
+    assert _quantized_range(layout.buffers[0]) == (64, 192)
+
+
+@pytest.mark.parametrize("factor_field", ("rotary_pct", "partial_rotary_factor"))
+def test_skip_rope_quantization_uses_flat_rope_parameter_fractions(factor_field) -> None:
+    native, _ = _native()
+    config = _text_config(
+        "qwen3_5",
+        head_dim=256,
+        **{factor_field: 0.5},
+        rope_parameters={factor_field: 0.25, "rotary_emb_base": 32},
+    )
+    layout = _create_kv(native, config, 256, skip_rope_quantization=True)
+    assert _quantized_range(layout.buffers[0]) == (64, 192)
+
+
+@pytest.mark.parametrize("factor", (float("nan"), float("inf"), "0.25"))
+def test_skip_rope_quantization_rejects_nonfinite_or_non_numeric_rotary_fractions(factor) -> None:
+    native, _ = _native()
+    with pytest.raises(ValueError, match="partial_rotary_factor must be a finite rotary fraction"):
+        _create_kv(native, _partial_rotary_config(factor), 256, skip_rope_quantization=True)
+    native.create_python_cold_page_codec.assert_not_called()
+
+
+def test_skip_rope_quantization_rejects_layer_specific_rope_parameters() -> None:
+    native, _ = _native()
+    config = _text_config(
+        "qwen3_5",
+        head_dim=256,
+        rope_parameters={"full_attention": {"partial_rotary_factor": 0.25}},
+    )
+    with pytest.raises(NotImplementedError, match="layer-specific rope_parameters"):
+        _create_kv(native, config, 256, skip_rope_quantization=True)
+    native.create_python_cold_page_codec.assert_not_called()
 
 
 def test_skip_rope_quantization_requires_mla_latent_geometry_for_key_only_layers() -> None:

@@ -3860,11 +3860,18 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     skip_rope_quantization: bool = Field(
         default=False,
         description=
-        "False (default): whole K and V vectors become NVFP4 in the compressed "
-        "cache tier. True: the position-encoded (RoPE) part of each K vector is "
-        "copied unchanged and the rest becomes NVFP4, at a lower compression "
-        "ratio. An option to explore; measure its accuracy effect on your model."
-    )
+        "True: preserve the position-encoded (RoPE) part of each K vector in "
+        "its original active-cache precision and quantize the rest to NVFP4. "
+        "False (default): quantize both parts, using residual RoPE quantization "
+        "for DeepSeek-V4 when nvfp4_mla_residual_quantization is enabled. "
+        "An option to explore; measure its accuracy effect on your model.")
+    nvfp4_mla_residual_quantization: bool = Field(
+        default=True,
+        description=
+        "Use two independently scaled FP4 components for DeepSeek-V4 target cold-page "
+        "RoPE: a main component and its residual. False uses a single NVFP4 "
+        "component. Ignored for other models and when skip_rope_quantization "
+        "preserves the original RoPE precision.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,

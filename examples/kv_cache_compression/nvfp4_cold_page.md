@@ -61,7 +61,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 CSA cache | Supported; the compressed KV rows are encoded as NVFP4 (their RoPE part is preserved losslessly when `skip_rope_quantization` is `true`) and the indexer cache is preserved losslessly |
+| DeepSeek-V4 CSA cache | Supported; target NoPE uses NVFP4 and target RoPE defaults to 2FP4, or is preserved in its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
@@ -296,15 +296,38 @@ reusable prefixes when measuring cache-capacity and hit-rate benefits.
 DeepSeek-V4 keeps its compressed sparse attention (CSA) cache as one entry per
 four tokens, each entry a 512-element row: 448 elements without positional
 encoding (NoPE) and 64 with it (RoPE), plus an indexer cache. NVFP4 cold-page
-compression encodes each 512-element row as NVFP4 data with block scales; with
-`skip_rope_quantization: true` the 64 RoPE elements are copied as they are instead,
-which is the layout the runs below used. The indexer cache is always copied as it
+compression is disabled by default. When explicitly enabled, target NoPE uses
+NVFP4 and target RoPE defaults to two FP4 components (2FP4), following native
+DeepSeek-V4's main-plus-residual approach. The second component encodes the first component's
+residual, and their reconstructed values are added before restoring the active
+KV dtype. Other models and draft cold pages continue to use single NVFP4.
+
+`skip_rope_quantization` defaults to `false`. Set it to `true` to preserve RoPE
+in its original precision, which retains DeepSeek-V4's previous cold-page
+behavior. Alternatively, set `nvfp4_mla_residual_quantization: false` to use
+single NVFP4 for RoPE. This second option defaults to `true` and affects only
+DeepSeek-V4 target cold pages. Inference without cold-page compression is unchanged.
+
+| `skip_rope_quantization` | `nvfp4_mla_residual_quantization` | DeepSeek-V4 target RoPE in cold pages |
+| --- | --- | --- |
+| `false` (default) | `true` (default) | 2FP4 |
+| `false` | `false` | Single NVFP4 |
+| `true` | Either value | Original hot-cache precision |
+
+The indexer cache is always copied as it
 is, and the sliding-window, HCA, and compressor caches of the model are preserved
 losslessly in their own lifecycles.
 
 The same two configuration blocks as for the other models enable it. The
 settings below were validated with DeepSeek-V4-Flash on one node (TP=4, EP=4,
-Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300:
+Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300.
+The recipe below uses `skip_rope_quantization: true` to match those serving runs.
+The initial [IFBench accuracy check](#ifbench-accuracy-check) below includes
+the default cold-page 2FP4 format and original-precision RoPE; the native
+active-KV 2FP4 reference is reported separately. These are limited numerical
+checks, not comprehensive accuracy or offload/onboard validation. This is an
+optional feature for exploration; users should validate accuracy on their own
+models and workloads before deployment.
 
 ```yaml
 kv_cache_config:
@@ -329,6 +352,46 @@ DeepSeek-V4 specific requirements:
 * If `scale_checkpoint_path` supplies ModelOpt KV scales, only the per-layer
   K scale is applied to the CSA cache; the V scale is not used. Checkpoints
   without scale metadata use identity scales and need no calibration.
+
+### IFBench accuracy check
+
+DeepSeek-V4-Pro-0813 was evaluated on all 300 IFBench prompts with the original
+checkpoint, FP8 active KV cache, TP=8, EP=8, Attention DP, Max reasoning,
+temperature=1, top_p=1, and four requested seeds (4–7). The accuracy check applies
+one cold-codec NVFP4 quantize/dequantize round trip to each newly written CSA
+row and restores FP8 for Attention. It uses the cold codec's conversion rules
+and identity global scales; it does not use native NVFP4 active KV storage.
+HCA, sliding-window, indexer, and compressor state are unchanged.
+
+Results below are percentages, reported as mean ± sample standard deviation
+across complete 300-prompt runs. The average is the arithmetic mean of the four
+IFBench metrics.
+
+| Representation | Prompt strict | Instruction strict | Prompt loose | Instruction loose | Average |
+| --- | --- | --- | --- | --- | --- |
+| FP8 baseline | 71.33 ± 1.68 | 74.27 ± 1.22 | 76.00 ± 0.86 | 78.63 ± 0.56 | 75.06 ± 1.03 |
+| Cold NVFP4 NoPE / original FP8 RoPE | 73.25 ± 0.74 | 75.94 ± 1.02 | 78.50 ± 1.55 | 80.89 ± 1.78 | 77.15 ± 1.23 |
+| Cold NVFP4 NoPE / 2FP4 RoPE (default) | 71.50 ± 0.43 | 74.27 ± 0.61 | 76.42 ± 0.32 | 79.07 ± 0.34 | 75.31 ± 0.21 |
+| Cold single NVFP4 / all 512 elements | 71.75 ± 1.71 | 74.42 ± 1.36 | 77.08 ± 2.01 | 79.80 ± 1.78 | 75.76 ± 1.69 |
+
+Each format has four complete 300-prompt runs. Only complete, audited runs are
+included; partial or failed attempts are excluded.
+
+No noticeable IFBench accuracy drop was observed for the default cold-page
+2FP4 format in this initial method-level numerical check: its average score
+was 75.31%, versus 75.06% for FP8, an observed difference of +0.25 percentage
+points. Batched sampling does not provide deterministic per-prompt seed pairs;
+higher observed scores do not establish an accuracy improvement.
+This optional feature and its example recipe are provided for exploration and
+have not undergone comprehensive accuracy validation; users should validate
+accuracy on their own models and workloads before deployment.
+
+An earlier native active-KV reference (requested seeds 0–3) used the same original
+checkpoint and 300-prompt recipe, with native NVFP4 storage and 2FP4 RoPE enabled. Its average
+score was **74.96 ± 1.43%**, compared with **75.19 ± 2.11%** for FP8, an observed
+difference of **−0.23 percentage points**. This reference uses the native active-KV
+path and its global scales, not the cold-page codec, and must not be interpreted
+as accuracy validation of the cold-page 2FP4 format.
 
 ## Verify Activation
 
@@ -377,15 +440,15 @@ Pages currently use identity global scales.
 In some models only part of each K vector carries the token's position (RoPE):
 the last 64 of the 576 numbers of an MLA vector, the first 64 of the 256 numbers
 of a Qwen3.5 head, the last 64 of the 512 numbers of a DeepSeek-V4 compressed
-entry. By default the whole K vector and the whole V vector become NVFP4. With
+entry. By default all values are quantized: DeepSeek-V4 target RoPE uses the
+2FP4 format described above, while the remaining values use single NVFP4. With
 `skip_rope_quantization: true` the RoPE part is copied unchanged and the rest
-becomes NVFP4, at a lower compression ratio: for FP8 hot caches MLA 1.78x to 1.64x,
-DeepSeek-V4 1.78x to 1.62x, Qwen3.5 K+V 1.78x to 1.62x; for BF16 hot caches Qwen3.5
-3.56x to 2.69x. This is an option to explore; measure the accuracy effect on your
+becomes NVFP4. Original precision means the hot-cache dtype, such as FP8 or BF16;
+it does not change that dtype. This is an option to explore; measure the accuracy effect on your
 own model and workload. It is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
-and the Qwen3.5 series; other models ignore it with a warning, and the KV cache of
-a draft model always quantizes whole vectors. To add a model, add its `model_type`
-to `_SKIP_ROPE_QUANTIZATION_MODEL_TYPES` in `nvfp4_quantization.py`.
+and the Qwen3.5 series; other models ignore it with a warning. Draft cold pages
+ignore both RoPE options and quantize whole vectors with single NVFP4. For extending model support, see
+the [development guide](../../docs/source/developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
 
 ```yaml
 kv_cache_compression_config:

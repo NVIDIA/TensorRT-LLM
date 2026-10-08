@@ -31,6 +31,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <limits>
 #include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -49,6 +50,12 @@ constexpr std::uint32_t kMappedHostGridSplits = 1;
 constexpr std::uint32_t kMaxTasksPerLaunch = 256;
 constexpr std::uint32_t kElementsPerHalfGroup = 8;
 constexpr std::uint32_t kElementsPerScaleGroup = 16;
+constexpr std::uint32_t kResidualRowElements = 512;
+constexpr std::uint32_t kResidualRopeElements = 64;
+constexpr std::uint32_t kResidualRopeStart = kResidualRowElements - kResidualRopeElements;
+constexpr std::uint32_t kResidualEncodedElements = kResidualRowElements + kResidualRopeElements;
+constexpr std::uint32_t kResidualPackedRowBytes = kResidualEncodedElements / 2U;
+constexpr std::uint32_t kResidualScalesPerRow = kResidualEncodedElements / kElementsPerScaleGroup;
 constexpr std::uint32_t kHalfGroupsPerScaleGroup = kElementsPerScaleGroup / kElementsPerHalfGroup;
 // Bound per-tile shared scale staging to 1 KiB.
 constexpr std::uint32_t kMaxScaleBytesPerTile = 1024;
@@ -117,8 +124,9 @@ struct Nvfp4ColdPageKernelParams
 
 enum class Nvfp4ColdPageTransform : std::int32_t
 {
-    kNvfp4 = 0,        // Quantize one range per row and preserve the prefix and suffix around it.
-    kLosslessCopy = 1, // Copy the entire buffer byte-for-byte.
+    kNvfp4 = 0,             // Quantize one range per row and preserve the prefix and suffix around it.
+    kLosslessCopy = 1,      // Copy the entire buffer byte-for-byte.
+    kNvfp4RopeResidual = 2, // Quantize a 512-value row and add a second component for its final 64 values.
 };
 
 struct Nvfp4ColdPageBuffer
@@ -213,9 +221,12 @@ __device__ Nvfp4ColdPageBuffer loadBuffer(std::uint32_t index, Nvfp4ColdPageWide
 // suffix) immediately after its NVFP4 scales.
 __device__ constexpr std::size_t coldLosslessOffset(Nvfp4ColdPageBuffer const& buffer)
 {
+    auto const encodedElements = buffer.transform == Nvfp4ColdPageTransform::kNvfp4RopeResidual
+        ? kResidualEncodedElements
+        : static_cast<std::uint32_t>(buffer.params.quantizedRangeElements);
     return buffer.coldScaleOffset
         + static_cast<std::size_t>(buffer.params.numKvHeads) * static_cast<std::size_t>(buffer.params.tokensPerPage)
-        * static_cast<std::size_t>(buffer.params.quantizedRangeElements) / kElementsPerScaleGroup;
+        * encodedElements / kElementsPerScaleGroup;
 }
 
 template <typename T>
@@ -649,6 +660,232 @@ __device__ void restoreNvfp4Pair(uint2 packedPair, T* output, std::uint32_t elem
     }
 }
 
+// The residual format is row-packed, independent of the tiled single-component
+// path. Byte accesses also support an unaligned mapped-Host staging base.
+__device__ void storePackedWord(std::uint8_t* destination, std::uint32_t packed)
+{
+#pragma unroll
+    for (std::uint32_t byte = 0; byte < sizeof(packed); ++byte)
+    {
+        destination[byte] = static_cast<std::uint8_t>(packed >> (byte * 8U));
+    }
+}
+
+__device__ std::uint32_t loadPackedWord(std::uint8_t const* source)
+{
+    std::uint32_t packed = 0U;
+#pragma unroll
+    for (std::uint32_t byte = 0; byte < sizeof(packed); ++byte)
+    {
+        packed |= static_cast<std::uint32_t>(source[byte]) << (byte * 8U);
+    }
+    return packed;
+}
+
+// Residuals retain their own E4M3 scale and share the main component's global
+// scale. Values are original minus the FP32 dequantized main component.
+__device__ std::uint32_t quantizeResidualHalfGroup(
+    float2 (&residual)[4], float residualMax, Nvfp4ColdPageKernelParams const& params, std::uint8_t* scaleOutput)
+{
+    __nv_fp8_e4m3 const scale(params.nvfp4ScaleOrigQuant * (residualMax / 6.0F));
+    *scaleOutput = scale.__x;
+    float const quantScale = params.nvfp4ScaleOrigQuant / fmaxf(static_cast<float>(scale), 1.0e-12F);
+#pragma unroll
+    for (std::uint32_t pair = 0; pair < 4U; ++pair)
+    {
+        residual[pair].x *= quantScale;
+        residual[pair].y *= quantScale;
+    }
+    return fp32_vec_to_e2m1(residual);
+}
+
+template <typename T>
+__device__ void offloadRopeResidual(OffloadBufferTask const& task, Nvfp4ColdPageKernelParams const& params)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    auto const* raw = reinterpret_cast<T const*>(task.raw);
+    std::uint32_t const rows
+        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+    {
+        constexpr auto kGroupsPerRow = kResidualRowElements / kElementsPerScaleGroup;
+        for (std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x; group < rows * kGroupsPerRow;
+             group += gridDim.x * blockDim.x)
+        {
+            auto const row = group / kGroupsPerRow;
+            auto const groupInRow = group % kGroupsPerRow;
+            auto const input = reinterpret_cast<PackedVec<T> const*>(raw)[group];
+            std::uint8_t mainScaleByte;
+            uint2 const main
+                = quantizeFp8GrainToNvfp4(input, params.fp8ScaleQuantOrig, params.nvfp4ScaleOrigQuant, &mainScaleByte);
+            auto* dataRow = task.coldData + static_cast<std::size_t>(row) * kResidualPackedRowBytes;
+            auto* scaleRow = task.coldScale + static_cast<std::size_t>(row) * kResidualScalesPerRow;
+            storePackedWord(dataRow + groupInRow * sizeof(uint2), main.x);
+            storePackedWord(dataRow + groupInRow * sizeof(uint2) + sizeof(std::uint32_t), main.y);
+            scaleRow[groupInRow] = mainScaleByte;
+            if (groupInRow >= kResidualRopeStart / kElementsPerScaleGroup)
+            {
+                __nv_fp8_e4m3 mainScale;
+                mainScale.__x = mainScaleByte;
+                float const mainDequantScale = static_cast<float>(mainScale) * params.nvfp4ScaleQuantOrig;
+                float2 residual[2][4];
+                unpackE2m1ToFloat(main.x, residual[0]);
+                unpackE2m1ToFloat(main.y, residual[1]);
+                float residualMax = 0.0F;
+#pragma unroll
+                for (std::uint32_t halfGroup = 0; halfGroup < 2U; ++halfGroup)
+                {
+#pragma unroll
+                    for (std::uint32_t pair = 0; pair < 4U; ++pair)
+                    {
+                        float2 const original = static_cast<float2>(input.elts[halfGroup * 4U + pair]);
+                        residual[halfGroup][pair].x
+                            = original.x * params.fp8ScaleQuantOrig - residual[halfGroup][pair].x * mainDequantScale;
+                        residual[halfGroup][pair].y
+                            = original.y * params.fp8ScaleQuantOrig - residual[halfGroup][pair].y * mainDequantScale;
+                        residualMax = fmaxf(
+                            residualMax, fmaxf(fabsf(residual[halfGroup][pair].x), fabsf(residual[halfGroup][pair].y)));
+                    }
+                }
+                auto const residualGroup = groupInRow - kResidualRopeStart / kElementsPerScaleGroup;
+                auto* residualData = dataRow + kResidualRowElements / 2U + residualGroup * sizeof(uint2);
+                std::uint8_t residualScale;
+                storePackedWord(
+                    residualData, quantizeResidualHalfGroup(residual[0], residualMax, params, &residualScale));
+                storePackedWord(residualData + sizeof(std::uint32_t),
+                    quantizeResidualHalfGroup(residual[1], residualMax, params, &residualScale));
+                scaleRow[kGroupsPerRow + residualGroup] = residualScale;
+            }
+        }
+    }
+    else
+    {
+        constexpr auto kHalfGroupsPerRow = kResidualRowElements / kElementsPerHalfGroup;
+        for (std::uint32_t halfGroup = blockIdx.x * blockDim.x + threadIdx.x; halfGroup < rows * kHalfGroupsPerRow;
+             halfGroup += gridDim.x * blockDim.x)
+        {
+            auto const row = halfGroup / kHalfGroupsPerRow;
+            auto const halfGroupInRow = halfGroup % kHalfGroupsPerRow;
+            auto input = reinterpret_cast<PackedVec<T> const*>(raw)[halfGroup];
+            std::uint8_t mainScaleByte = 0U;
+            auto const main = cvt_warp_fp16_to_fp4<T, kElementsPerScaleGroup, false>(
+                input, params.nvfp4ScaleOrigQuant, &mainScaleByte);
+            auto* dataRow = task.coldData + static_cast<std::size_t>(row) * kResidualPackedRowBytes;
+            auto* scaleRow = task.coldScale + static_cast<std::size_t>(row) * kResidualScalesPerRow;
+            storePackedWord(dataRow + halfGroupInRow * sizeof(main), main);
+            if ((halfGroupInRow & 1U) == 0U)
+            {
+                scaleRow[halfGroupInRow / kHalfGroupsPerScaleGroup] = mainScaleByte;
+            }
+            if (halfGroupInRow >= kResidualRopeStart / kElementsPerHalfGroup)
+            {
+                __nv_fp8_e4m3 mainScale;
+                mainScale.__x = mainScaleByte;
+                float const mainDequantScale = static_cast<float>(mainScale) * params.nvfp4ScaleQuantOrig;
+                float2 residual[4];
+                unpackE2m1ToFloat(main, residual);
+                float residualMax = 0.0F;
+#pragma unroll
+                for (std::uint32_t pair = 0; pair < 4U; ++pair)
+                {
+                    float2 original;
+                    if constexpr (std::is_same_v<T, half>)
+                    {
+                        original = __half22float2(input.elts[pair]);
+                    }
+                    else
+                    {
+                        original = __bfloat1622float2(input.elts[pair]);
+                    }
+                    residual[pair].x = original.x - residual[pair].x * mainDequantScale;
+                    residual[pair].y = original.y - residual[pair].y * mainDequantScale;
+                    residualMax = fmaxf(residualMax, fmaxf(fabsf(residual[pair].x), fabsf(residual[pair].y)));
+                }
+                constexpr std::uint32_t kPairLaneMask = 0x3U;
+                auto const warpPairMask = kPairLaneMask << (threadIdx.x % 32U & ~1U);
+                residualMax = fmaxf(residualMax, __shfl_xor_sync(warpPairMask, residualMax, 1));
+                auto const residualHalfGroup = halfGroupInRow - kResidualRopeStart / kElementsPerHalfGroup;
+                std::uint8_t residualScale;
+                auto const residualPacked = quantizeResidualHalfGroup(residual, residualMax, params, &residualScale);
+                storePackedWord(dataRow + kResidualRowElements / 2U + residualHalfGroup * sizeof(main), residualPacked);
+                if ((halfGroupInRow & 1U) == 0U)
+                {
+                    scaleRow[kResidualRowElements / kElementsPerScaleGroup
+                        + residualHalfGroup / kHalfGroupsPerScaleGroup]
+                        = residualScale;
+                }
+            }
+        }
+    }
+#endif
+}
+
+template <typename T>
+__device__ void onboardRopeResidual(OnboardBufferTask const& task, Nvfp4ColdPageKernelParams const& params)
+{
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr auto kGroupsPerRow = kResidualRowElements / kElementsPerScaleGroup;
+    auto* output = reinterpret_cast<T*>(task.raw);
+    std::uint32_t const rows
+        = static_cast<std::uint32_t>(params.numKvHeads) * static_cast<std::uint32_t>(params.tokensPerPage);
+    for (std::uint32_t group = blockIdx.x * blockDim.x + threadIdx.x; group < rows * kGroupsPerRow;
+         group += gridDim.x * blockDim.x)
+    {
+        auto const row = group / kGroupsPerRow;
+        auto const groupInRow = group % kGroupsPerRow;
+        auto const* dataRow = task.coldData + static_cast<std::size_t>(row) * kResidualPackedRowBytes;
+        auto const* scaleRow = task.coldScale + static_cast<std::size_t>(row) * kResidualScalesPerRow;
+        auto const* mainData = dataRow + groupInRow * sizeof(uint2);
+        uint2 const main = make_uint2(loadPackedWord(mainData), loadPackedWord(mainData + sizeof(std::uint32_t)));
+        auto const elementOffset = group * kElementsPerScaleGroup;
+        if (groupInRow < kResidualRopeStart / kElementsPerScaleGroup)
+        {
+            restoreNvfp4Pair(main, output, elementOffset, onboardDequantScale<T>(scaleRow[groupInRow], params));
+            continue;
+        }
+        auto const residualGroup = groupInRow - kResidualRopeStart / kElementsPerScaleGroup;
+        auto const* residualData = dataRow + kResidualRowElements / 2U + residualGroup * sizeof(uint2);
+        std::uint32_t const mainWords[]{main.x, main.y};
+        std::uint32_t const residualWords[]{
+            loadPackedWord(residualData), loadPackedWord(residualData + sizeof(std::uint32_t))};
+        float const mainScale = onboardDequantScale<half>(scaleRow[groupInRow], params);
+        float const residualScale = onboardDequantScale<half>(scaleRow[kGroupsPerRow + residualGroup], params);
+        std::uint64_t fp8Words[2];
+#pragma unroll
+        for (std::uint32_t halfGroup = 0; halfGroup < 2U; ++halfGroup)
+        {
+            float2 values[4];
+            float2 residual[4];
+            unpackE2m1ToFloat(mainWords[halfGroup], values);
+            unpackE2m1ToFloat(residualWords[halfGroup], residual);
+#pragma unroll
+            for (std::uint32_t pair = 0; pair < 4U; ++pair)
+            {
+                values[pair].x = values[pair].x * mainScale + residual[pair].x * residualScale;
+                values[pair].y = values[pair].y * mainScale + residual[pair].y * residualScale;
+                if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+                {
+                    values[pair].x *= params.fp8ScaleOrigQuant;
+                    values[pair].y *= params.fp8ScaleOrigQuant;
+                }
+            }
+            if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+            {
+                fp8Words[halfGroup] = fp32_vec_to_e4m3(values);
+            }
+            else
+            {
+                store16BitValues(output, elementOffset + halfGroup * kElementsPerHalfGroup, values, 1.0F);
+            }
+        }
+        if constexpr (std::is_same_v<T, __nv_fp8_e4m3>)
+        {
+            reinterpret_cast<uint4*>(output + elementOffset)[0] = collectTwoFp8Words(fp8Words[0], fp8Words[1]);
+        }
+    }
+#endif
+}
+
 // FP16/BF16 GPU Page -> mapped-Host NVFP4 in bounded tiles.
 template <typename T>
 __global__ void offloadFrom16BitTiledKernel(
@@ -667,6 +904,12 @@ __global__ void offloadFrom16BitTiledKernel(
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
     {
         copyLosslessBytes(task.raw, task.coldData, buffer.rawBytes);
+        clearColdPadding(task, buffer);
+        return;
+    }
+    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4RopeResidual)
+    {
+        offloadRopeResidual<T>(task, buffer.params);
         clearColdPadding(task, buffer);
         return;
     }
@@ -754,6 +997,12 @@ __global__ void offloadFromFp8TiledKernel(
     if (buffer.transform == Nvfp4ColdPageTransform::kLosslessCopy)
     {
         copyLosslessBytes(task.raw, task.coldData, buffer.rawBytes);
+        clearColdPadding(task, buffer);
+        return;
+    }
+    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4RopeResidual)
+    {
+        offloadRopeResidual<__nv_fp8_e4m3>(task, buffer.params);
         clearColdPadding(task, buffer);
         return;
     }
@@ -905,6 +1154,11 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
         copyLosslessBytes(task.coldData, task.raw, buffer.rawBytes);
         return;
     }
+    if (buffer.transform == Nvfp4ColdPageTransform::kNvfp4RopeResidual)
+    {
+        onboardRopeResidual<T>(task, buffer.params);
+        return;
+    }
 
     auto const params = buffer.params;
     std::uint32_t const halfGroupsPerBuffer = halfGroupCount(params);
@@ -963,6 +1217,59 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
 #endif
 }
 
+// Transform 2 has a fixed DeepSeek-V4 CSA geometry. Reject a malformed residual
+// layout before any mapped-Host or GPU writes occur.
+void validateResidualLayouts(std::int64_t const* wide, std::int32_t const* integers, std::uint32_t numBuffers,
+    std::size_t coldPageBytes, Nvfp4ColdPageRuntimeType runtimeType)
+{
+    TLLM_CHECK_WITH_INFO(wide != nullptr && integers != nullptr, "Cold-page layout tables must not be null");
+    TLLM_CHECK_WITH_INFO(numBuffers <= kNvfp4ColdPageMaxBuffersPerLaunch, "Too many cold-page buffers");
+    for (std::uint32_t index = 0; index < numBuffers; ++index)
+    {
+        auto const* i = integers + index * kNvfp4ColdPageIntegerFields;
+        if (i[kTransform] != static_cast<std::int32_t>(Nvfp4ColdPageTransform::kNvfp4RopeResidual))
+        {
+            continue;
+        }
+        auto const* w = wide + index * kNvfp4ColdPageWideFields;
+        TLLM_CHECK_WITH_INFO(i[kRawRowStrideElements] == kResidualRowElements
+                && i[kQuantizedRangeElements] == kResidualRowElements && i[kQuantizedRangeStart] == 0,
+            "NVFP4 RoPE residual quantization requires a full 512-element row with a 64-element RoPE suffix");
+        TLLM_CHECK_WITH_INFO(i[kNumKvHeads] > 0 && i[kTokensPerPage] > 0,
+            "NVFP4 RoPE residual rows must have positive head and token counts");
+        auto const rows = static_cast<std::size_t>(i[kNumKvHeads]) * static_cast<std::size_t>(i[kTokensPerPage]);
+        TLLM_CHECK_WITH_INFO(
+            rows <= std::numeric_limits<std::uint32_t>::max() / (kResidualRowElements / kElementsPerHalfGroup),
+            "NVFP4 RoPE residual row count exceeds the kernel index range");
+        auto const elementBytes = runtimeType == Nvfp4ColdPageRuntimeType::kFp8E4m3 ? 1U : 2U;
+        auto const rawBytes = rows * kResidualRowElements * elementBytes;
+        TLLM_CHECK_WITH_INFO(
+            w[kRawBytes] >= 0 && static_cast<std::size_t>(w[kRawBytes]) == rawBytes && w[kRawSlotBytes] >= w[kRawBytes],
+            "NVFP4 RoPE residual hot buffer bytes must match the 512-element rows");
+        auto const packedBytes = rows * kResidualPackedRowBytes;
+        auto const scaleBytes = rows * kResidualScalesPerRow;
+        TLLM_CHECK_WITH_INFO(
+            w[kColdDataOffset] >= 0 && w[kColdScaleOffset] >= 0, "NVFP4 RoPE residual offsets must not be negative");
+        auto const dataOffset = static_cast<std::size_t>(w[kColdDataOffset]);
+        auto const scaleOffset = static_cast<std::size_t>(w[kColdScaleOffset]);
+        TLLM_CHECK_WITH_INFO(dataOffset <= coldPageBytes && packedBytes <= coldPageBytes - dataOffset
+                && scaleOffset <= coldPageBytes && scaleBytes <= coldPageBytes - scaleOffset,
+            "NVFP4 RoPE residual data or scales exceed the cold Page");
+        TLLM_CHECK_WITH_INFO(
+            scaleOffset >= dataOffset + packedBytes, "NVFP4 RoPE residual scales overlap the packed data");
+        TLLM_CHECK_WITH_INFO(i[kColdPaddingBytes] >= 0, "NVFP4 RoPE residual padding must not be negative");
+        if (i[kColdPaddingBytes] != 0)
+        {
+            auto const paddingBytes = static_cast<std::size_t>(i[kColdPaddingBytes]);
+            TLLM_CHECK_WITH_INFO(w[kColdPaddingOffset] >= 0, "NVFP4 RoPE residual padding offset must not be negative");
+            auto const paddingOffset = static_cast<std::size_t>(w[kColdPaddingOffset]);
+            TLLM_CHECK_WITH_INFO(paddingOffset >= scaleOffset + scaleBytes && paddingOffset <= coldPageBytes
+                    && paddingBytes <= coldPageBytes - paddingOffset,
+                "NVFP4 RoPE residual padding overlaps data or exceeds the cold Page");
+        }
+    }
+}
+
 // Submit one whole KVCM Page batch through the fixed 256-descriptor kernel ABI.
 template <typename Kernel, typename ColdPointer>
 void launchPageChunks(Kernel kernel, void const* pages, std::size_t numPages, std::int64_t const* wide,
@@ -1017,6 +1324,7 @@ void invokeNvfp4ColdPageEncode(void const* pages, std::size_t numPages, std::int
     }
     TLLM_CHECK_WITH_INFO(pages != nullptr, "pages must not be null");
     TLLM_CHECK_WITH_INFO(coldBase != nullptr, "coldBase must not be null");
+    validateResidualLayouts(wide, integers, numBuffers, coldPageBytes, runtimeType);
     switch (runtimeType)
     {
     case Nvfp4ColdPageRuntimeType::kFloat16:
@@ -1045,6 +1353,7 @@ void invokeNvfp4ColdPageDecode(void const* pages, std::size_t numPages, std::int
     }
     TLLM_CHECK_WITH_INFO(pages != nullptr, "pages must not be null");
     TLLM_CHECK_WITH_INFO(coldBase != nullptr, "coldBase must not be null");
+    validateResidualLayouts(wide, integers, numBuffers, coldPageBytes, runtimeType);
     switch (runtimeType)
     {
     case Nvfp4ColdPageRuntimeType::kFloat16:
