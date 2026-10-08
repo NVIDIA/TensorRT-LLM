@@ -1535,6 +1535,9 @@ class KvCacheCreator:
                 self._skip_est = True
         model_config = self._model_engine.model.model_config
         if model_config.attn_backend == "VANILLA":
+            # Make build_managers call configure_kv_cache_capacity() for
+            # the V2 memory quota. Non-HELIX CP has no sizing path there;
+            # HELIX is handled above.
             if (self._is_kv_cache_manager_v2
                     and 'cp_type' not in self._mapping.cp_config):
                 self._skip_est = True
