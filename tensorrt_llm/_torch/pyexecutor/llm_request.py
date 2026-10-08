@@ -919,7 +919,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             return_log_probs=return_log_probs,
                              return_context_logits=False,
                              return_generation_logits=False,
                              return_perf_metrics=return_perf_metrics,
@@ -1242,7 +1241,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 self.py_result._log_probs = LogProbStorage()
                 # Initialize the storage and adjust the cum_log_probs to the previous value
                 self.py_result._log_probs._init(py_result.log_probs)
-                self.py_result._log_probs.cum_log_probs = py_result.cum_log_probs
+                self.py_result._log_probs.cum_log_probs = copy(
+                    py_result.cum_log_probs)
 
             # Perform copies of py_result._generation_logits
             if need_deep_copy_generation_logits:

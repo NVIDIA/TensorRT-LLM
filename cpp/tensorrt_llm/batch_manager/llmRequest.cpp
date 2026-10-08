@@ -151,12 +151,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     auto sliceBeams = [&nbBeams](auto beams)
     { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
 
-    if (returnLogProbs())
-    {
-        result.cumLogProbs = sliceBeams(getCumLogProbs());
-        result.logProbs = sliceBeams(getLogProbs());
-    }
-
     if (getReturnContextLogits())
     {
         result.contextLogits = executor::detail::ofITensor(getContextLogitsHost());

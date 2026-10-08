@@ -167,18 +167,12 @@ void initBindings(nb::module_& m)
         .def_prop_ro("state_value", [](GenLlmReq const& self) { return static_cast<int>(self.getState()); })
         .def_prop_rw("streaming", &GenLlmReq::isStreaming, &GenLlmReq::setStreaming)
         .def_rw("seq_slot", &GenLlmReq::mSeqSlot)
-        .def_prop_ro("return_log_probs", &GenLlmReq::returnLogProbs)
         .def_prop_ro("return_context_logits", &GenLlmReq::getReturnContextLogits)
         .def_prop_ro("return_generation_logits", &GenLlmReq::getReturnGenerationLogits)
-        .def_prop_ro("log_probs", nb::overload_cast<>(&GenLlmReq::getLogProbs, nb::const_))
-        .def("get_log_probs", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLogProbs, nb::const_))
-        .def("set_log_probs", &GenLlmReq::setLogProbs, nb::arg("log_probs"), nb::arg("beam"))
         .def("set_return_encoder_output", &GenLlmReq::setReturnEncoderOutput, nb::arg("return_encoder_output"))
         .def("get_return_encoder_output", &GenLlmReq::getReturnEncoderOutput)
         .def("priority", nb::overload_cast<>(&GenLlmReq::priority, nb::const_))
         .def("set_priority", nb::overload_cast<tle::PriorityType>(&GenLlmReq::setPriority))
-        .def_prop_ro("cum_log_probs", &GenLlmReq::getCumLogProbs)
-        .def("set_cum_log_prob", &GenLlmReq::setCumLogProb, nb::arg("cum_log_prob"), nb::arg("beam"))
         .def_prop_ro("orig_prompt_len", &GenLlmReq::getOrigPromptLen)
         .def("has_draft_tokens", &GenLlmReq::hasDraftTokens)
         .def("discard_draft_tokens", &GenLlmReq::discardDraftTokens, nb::arg("num_tokens_to_discard"))
@@ -371,11 +365,11 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<std::optional<std::string>>> multimodal_uuids,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                 std::optional<at::Tensor> lora_config,
-                std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
-                bool return_context_logits, bool return_generation_logits,
-                std::optional<tb::LlmRequest::VecTokens> draft_tokens, bool exclude_input_from_output,
-                std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens, bool return_encoder_output,
-                executor::PriorityType priority, std::optional<tb::LlmRequest::SizeType32> encoder_input_length,
+                std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_context_logits,
+                bool return_generation_logits, std::optional<tb::LlmRequest::VecTokens> draft_tokens,
+                bool exclude_input_from_output, std::optional<tb::LlmRequest::VecTokens> encoder_input_tokens,
+                bool return_encoder_output, executor::PriorityType priority,
+                std::optional<tb::LlmRequest::SizeType32> encoder_input_length,
                 std::optional<tb::LlmRequest::SizeType32> encoder_output_length, tb::LlmRequestType llm_request_type,
                 std::optional<tb::LlmRequest::VecTokenExtraIds> input_token_extra_ids, bool return_perf_metrics,
                 std::optional<executor::ContextPhaseParams> context_phase_params,
@@ -403,8 +397,8 @@ void initBindings(nb::module_& m)
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes, multimodal_positions,
                     multimodal_lengths, multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
-                    kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
-                    draft_tokens, exclude_input_from_output, encoder_input_tokens, return_encoder_output, priority,
+                    kv_cache_retention_config, return_context_logits, return_generation_logits, draft_tokens,
+                    exclude_input_from_output, encoder_input_tokens, return_encoder_output, priority,
                     encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
                     return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
                     multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
@@ -416,12 +410,11 @@ void initBindings(nb::module_& m)
             nb::arg("multimodal_positions") = std::nullopt, nb::arg("multimodal_lengths") = std::nullopt,
             nb::arg("multimodal_uuids") = std::nullopt, nb::arg("lora_task_id") = std::nullopt,
             nb::arg("lora_weights") = std::nullopt, nb::arg("lora_config") = std::nullopt,
-            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
-            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
-            nb::arg("draft_tokens") = std::nullopt, nb::arg("exclude_input_from_output") = false,
-            nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
-            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_length") = std::nullopt,
-            nb::arg("encoder_output_len") = std::nullopt,
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_context_logits") = false,
+            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
+            nb::arg("exclude_input_from_output") = false, nb::arg("encoder_input_tokens") = std::nullopt,
+            nb::arg("return_encoder_output") = false, nb::arg("priority") = executor::Request::kDefaultPriority,
+            nb::arg("encoder_input_length") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("return_perf_metrics") = false,
             nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,

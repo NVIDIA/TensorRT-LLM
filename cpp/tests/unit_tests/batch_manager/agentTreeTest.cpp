@@ -68,7 +68,6 @@ protected:
             /*loraWeights=*/std::nullopt,
             /*loraConfig=*/std::nullopt,
             /*kvCacheRetentionConfig=*/std::nullopt,
-            /*returnLogProbs=*/false,
             /*returnContextLogits=*/false,
             /*returnGenerationLogits=*/false,
             /*draftTokens=*/std::nullopt,
