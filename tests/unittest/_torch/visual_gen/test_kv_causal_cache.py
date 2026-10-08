@@ -155,7 +155,7 @@ def test_geometry_holds_fixed_window_stale_and_chunk(cache):
 
 def test_open_backs_every_page_once_and_publishes_the_table(cache):
     open_cache(cache)
-    assert cache.fixed_tokens == cache.history_tokens == cache.past_tokens == 0
+    assert cache.fixed_tokens == cache.history_tokens == cache.staging_offset == 0
     table = cache.block_table()
     assert len(table) == cache.num_pages
     assert len(set(table)) == cache.num_pages, "pages must be distinct"
@@ -203,7 +203,7 @@ def test_reopen_keeps_device_state_in_place(cache):
         )
     ]
     assert before == after
-    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (0, 0, 0)
+    assert (cache.fixed_tokens, cache.history_tokens, cache.staging_offset) == (0, 0, 0)
     assert cache.table.unique().numel() == cache.num_pages, "fresh pages, no duplicates"
     for layer, (k, v) in enumerate(per_layer):
         cache.write_range(layer, 0, k, v)
@@ -232,17 +232,17 @@ def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
     for layer, (pk, pv) in enumerate(prompts):
         cache.write_range(layer, 0, pk, pv)
     cache.commit(prompt)
-    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (prompt, 0, prompt)
+    assert (cache.fixed_tokens, cache.history_tokens, cache.staging_offset) == (prompt, 0, prompt)
 
     # The first chunk: its first `sink` tokens complete the pinned part.
     firsts = layer_kv(chunk)
     for layer, (hk, hv) in enumerate(firsts):
-        cache.write_range(layer, cache.past_tokens, hk, hv)
+        cache.write_range(layer, cache.staging_offset, hk, hv)
     cache.commit(cache.max_staged_tokens)
     assert (cache.fixed_tokens, cache.history_tokens) == (prompt + sink, chunk - sink)
     for _ in range(3 * cache.capacity // chunk):  # cycle the pool several times
         for layer, (kk, vv) in enumerate(layer_kv(chunk)):
-            cache.write_range(layer, cache.past_tokens, kk, vv)
+            cache.write_range(layer, cache.staging_offset, kk, vv)
         cache.commit(cache.max_staged_tokens)
         assert cache.fixed_tokens == prompt + sink
     for layer in range(NUM_LAYERS):
@@ -336,14 +336,14 @@ def test_edits_to_committed_tokens_reach_the_private_copies(cache):
     for _ in range(3):  # past the window, so both the fixed tail and the window edge are copies
         cache.commit(cache.max_staged_tokens)
     assert cache.history_tokens > cache.window_tokens
-    past = cache.past_tokens
+    past = cache.staging_offset
     positions = torch.arange(past + chunk, device=DEVICE)
     for layer in range(NUM_LAYERS):
         k, v = stamped_kv(positions, layer)
         cache.write_range(layer, 0, k[:past], v[:past])
         cache.write_staged(layer, k[past:], v[past:])
     cache.commit(cache.max_staged_tokens)  # the copies are rebuilt here: the known-good path
-    past = cache.past_tokens
+    past = cache.staging_offset
     for layer in range(NUM_LAYERS):  # the next chunk, so the earlier-block copies hold real tokens
         k, v = stamped_kv(torch.arange(past, past + chunk, device=DEVICE), layer)
         for size in sizes:
@@ -393,7 +393,7 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
             stamp = torch.full(
                 (chunk, NUM_KV_HEADS, HEAD_DIM), float(c + 64 * layer), device=DEVICE, dtype=DTYPE
             )
-            cache.write_range(layer, cache.past_tokens, stamp, -stamp)
+            cache.write_range(layer, cache.staging_offset, stamp, -stamp)
         before = cache.table_version
         cache.commit(cache.max_staged_tokens)
         written.extend([c] * chunk)
@@ -405,7 +405,7 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
         assert stale < tpb
         saw_stale |= stale > 0
         assert cache.history_tokens - stale == min(len(written), window)
-        assert cache.past_tokens == fixed + cache.history_tokens
+        assert cache.staging_offset == fixed + cache.history_tokens
 
         for layer in range(NUM_LAYERS):
             hist = torch.arange(fixed, fixed + cache.history_tokens, device=DEVICE)
@@ -448,7 +448,7 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
         # Fixed stamps are their positions; history stamps are the positions the
         # tokens had when written (eviction shifted them since); chunk stamps are
         # current positions. Resident history is the tail of what was committed.
-        past = cache.past_tokens
+        past = cache.staging_offset
         win_start = max(fixed, start - window)
         resident = written[len(written) - cache.history_tokens :]
         stamps = (
@@ -462,7 +462,7 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
         cached = cache.cached_tokens(block)
         _, kv_len = cache.causal_block_lengths(block)
         for i in range(count):
-            start = cache.past_tokens + i * block
+            start = cache.staging_offset + i * block
             for layer in range(NUM_LAYERS):
                 expected = expected_stamps(start, start + block, layer)
                 if layer == 0:
@@ -473,7 +473,7 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
 
     saw_stale = False
     for step in range(steps):  # from empty history through saturation and several rotations
-        past = cache.past_tokens
+        past = cache.staging_offset
         positions = torch.arange(past, past + chunk, device=DEVICE)
         for layer in range(NUM_LAYERS):
             cache.write_staged(layer, *stamped_kv(positions, layer), size)
@@ -605,10 +605,10 @@ def test_write_staged_matches_write_range(cache):
     for _ in range(3):
         cache.commit(cache.max_staged_tokens)  # move past off a page boundary and rotate once
     chunk = cache.max_staged_tokens
-    positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
+    positions = torch.arange(cache.staging_offset, cache.staging_offset + chunk, device=DEVICE)
     for layer in range(NUM_LAYERS):
         k, v = rand_kv(chunk)
-        cache.write_range(layer, cache.past_tokens, -k, -v)  # poison first
+        cache.write_range(layer, cache.staging_offset, -k, -v)  # poison first
         cache.write_staged(layer, k, v, own_tokens=False)
         k_back, v_back = read_kv(cache, layer, positions)
         torch.testing.assert_close(k_back, k)
@@ -700,10 +700,10 @@ def test_commit_takes_the_tokens_actually_written(cache):
     open_with_fixed(cache, 9)
     first = tpb + 3  # shorter than a chunk, not a page multiple
     k, v = rand_kv(first)
-    cache.write_range(0, cache.past_tokens, k, v)
+    cache.write_range(0, cache.staging_offset, k, v)
     cache.commit(first)
     assert cache.history_tokens == first
-    assert cache.past_tokens == 9 + first
+    assert cache.staging_offset == 9 + first
     k_back, v_back = read_kv(cache, 0, torch.arange(9, 9 + first, device=DEVICE))
     torch.testing.assert_close(k_back, k)
     torch.testing.assert_close(v_back, v)

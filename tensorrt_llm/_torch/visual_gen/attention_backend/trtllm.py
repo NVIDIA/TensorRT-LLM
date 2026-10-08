@@ -461,7 +461,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 that need padded keys must guard at the model level or select the
                 ``VANILLA`` backend.
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
-                tokens only: the fused kernel writes them at ``past_tokens`` and
+                tokens only: the fused kernel writes them at ``staging_offset`` and
                 attends over everything cached before them plus themselves.
                 ``batch_size`` must be 1. Sparse attention is not supported on this path.
             causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts

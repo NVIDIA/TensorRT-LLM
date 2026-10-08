@@ -657,6 +657,13 @@ class Attention(nn.Module):
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
+
+        ``seq_len`` is derived from ``q.shape[1]`` and overrides any caller value,
+        except with a ``kv_cache``: then the caller must pass it, as the number of
+        real tokens of this forward, because the rows may carry padding from the
+        sequence-parallel exchange and the backend writes this forward's K/V into
+        the cache. Only the caller knows where the real tokens end; a padding row
+        written as history would be attended by every later forward of the rollout.
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 

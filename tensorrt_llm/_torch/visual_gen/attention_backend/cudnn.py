@@ -638,7 +638,7 @@ class CuDNNAttention(AttentionBackend):
         key_padding_mask: Optional[torch.Tensor],
         seq_len: Optional[int],
     ) -> torch.Tensor:
-        """Write ``k``/``v`` at ``past_tokens``, then attend over the cache.
+        """Write ``k``/``v`` at ``staging_offset``, then attend over the cache.
 
         ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The
         first ``seq_len`` rows are real (``None``: all of them); rows past that are
@@ -955,7 +955,7 @@ class CuDNNAttention(AttentionBackend):
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
-                tokens only: they are written at ``past_tokens`` and attention runs
+                tokens only: they are written at ``staging_offset`` and attention runs
                 over everything cached before them plus themselves.
             seq_len: Keyword understood by the ``kv_cache`` path only. Number of real
                 tokens; absent, all ``S_q`` rows are real. When smaller than ``S_q``,
