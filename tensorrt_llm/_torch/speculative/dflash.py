@@ -1341,6 +1341,19 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
+    def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
+        """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
+
+        Padding, warmup and attention-DP dummy rows share the dummy slot, which no request owns
+        or frees. Emptying it right after the add keeps it at 0 between steps: those rows attend
+        no context, and their next context K / V starts at column 0, inside the padding
+        request's own pages (past them, its page-table row maps page 0, another request's).
+        The store is to a fixed slot, so a captured step replays it.
+        """
+        self._ctx_len[slots] += num_accepted
+        self._ctx_len.clamp_(max=self._max_ctx)
+        self._ctx_len[self._dummy_slot].zero_()
+
     def _write_ctx_len(self, updates: dict[int, int]) -> None:
         """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
         if not updates:
@@ -2061,8 +2074,7 @@ class DFlashWorker(SpecWorkerBase):
                     if v_new is not None:
                         self._ctx_v_buf[slot_long, :, col_long] = v_new
 
-                self._ctx_len[slots] += gen_num_accepted_long
-                self._ctx_len.clamp_(max=self._max_ctx)
+                self._advance_ctx_len(slots, gen_num_accepted_long)
 
             num_ctx_per_req_t = self._ctx_len[slots]
             if self._ctx_block_tables is not None:
