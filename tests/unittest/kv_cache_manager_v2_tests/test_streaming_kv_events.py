@@ -16,6 +16,7 @@
 import socket
 
 import pytest
+import zmq
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_events import (
     KVEventBatch,
@@ -57,6 +58,29 @@ def test_dropped_batches_leave_a_sequence_gap() -> None:
         assert next_seq == 2
     finally:
         publisher.shutdown()
+
+
+def test_slow_replay_cannot_hold_the_live_publisher_thread() -> None:
+    publisher = ZmqEventPublisher(data_parallel_rank=0, endpoint="inproc://kv-replay-bounds-test")
+
+    class SlowReplay:
+        sends = 0
+
+        def send_multipart(self, frames, flags=0):
+            assert flags == zmq.DONTWAIT
+            self.sends += 1
+            if self.sends > publisher.REPLAY_BATCHES_PER_TICK:
+                raise zmq.Again()
+
+    replay = SlowReplay()
+    publisher._replay = replay
+    publisher._replay_client_id = b"client"
+    publisher._replay_entries = iter((rank, b"event") for rank in range(100))
+    publisher._service_replay_chunk()
+    assert replay.sends == publisher.REPLAY_BATCHES_PER_TICK
+    assert publisher.publish(KVEventBatch(ts=0.0, events=[]))
+    publisher._service_replay_chunk()
+    assert publisher._replay_entries is None
 
 
 def test_construction_binds_nothing_until_start() -> None:

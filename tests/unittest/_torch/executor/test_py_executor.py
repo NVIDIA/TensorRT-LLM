@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
     LlmRequestState,
@@ -665,6 +666,9 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager):
     executor.resource_manager.resource_managers = {
         ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
     }
+    executor.enable_attention_dp = False
+    executor._kv_cache_capacity = executor._read_kv_cache_capacity()
+    executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
 
 
@@ -674,7 +678,8 @@ def test_get_kv_cache_capacity_without_manager():
     assert executor.get_kv_cache_capacity() == {}
 
 
-def test_get_kv_cache_capacity_from_stats():
+@pytest.mark.parametrize("streaming_events", [False, True])
+def test_get_kv_cache_capacity_from_stats(streaming_events):
     """KV capacity is available without consuming iteration stats."""
     kv_stats = Mock()
     kv_stats.max_num_blocks = 123
@@ -682,14 +687,18 @@ def test_get_kv_cache_capacity_from_stats():
 
     kv_cache_manager = Mock()
     kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.streaming_kv_events_enabled = streaming_events
 
     executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
 
-    assert executor.get_kv_cache_capacity() == {
+    expected = {
         "maxNumBlocks": 123,
         "tokensPerBlock": 64,
         "maxNumTokens": 7872,
     }
+    if streaming_events:
+        expected["kvEventsEnabled"] = True
+    assert executor.get_kv_cache_capacity() == expected
 
 
 def test_get_kv_cache_capacity_falls_back_to_manager_pool_size():
@@ -731,6 +740,142 @@ def test_get_kv_cache_capacity_falls_back_to_max_resource_count():
         "tokensPerBlock": 16,
         "maxNumTokens": 8192,
     }
+
+
+def test_get_kv_cache_load_is_non_destructive_and_rate_limited():
+    kv_stats = Mock(max_num_blocks=100, used_num_blocks=25, tokens_per_block=32)
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+    kv_cache_manager.reset_mock()
+
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    first = executor.get_kv_cache_load()
+    second = executor.get_kv_cache_load()
+
+    assert first["usedKvBlocks"] == 25
+    assert first["totalKvBlocks"] == 100
+    assert first["ranks"][0]["rank"] == 0
+    assert second == first
+    kv_cache_manager.get_kv_cache_stats.assert_called_once()
+
+
+def test_idle_entry_refreshes_load_before_waiting():
+    """A short final request must not leave occupied blocks published forever."""
+    kv_stats = types.SimpleNamespace(max_num_blocks=100, used_num_blocks=25, tokens_per_block=32)
+    manager = Mock()
+    manager.get_kv_cache_stats.return_value = kv_stats
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor._kv_load_tracker.idle_sampled = False
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    kv_stats.used_num_blocks = 0
+
+    class ReachedIdleWait(Exception):
+        pass
+
+    def idle_wait(waiting_queue, num_active):
+        assert num_active == 0
+        assert executor.get_kv_cache_load()["usedKvBlocks"] == 0
+        raise ReachedIdleWait
+
+    executor._fetch_and_enqueue_requests = idle_wait
+    with pytest.raises(ReachedIdleWait):
+        executor._fetch_new_requests(FCFSWaitingQueue(), [])
+
+
+def test_capacity_and_load_use_the_same_pool_group_units():
+    class Manager:
+        tokens_per_block = 32
+        blocks_in_primary_pool = 100
+
+        def get_primary_block_counts(self):
+            return 150, 200
+
+    executor = _make_executor_with_kv_cache_manager(Manager())
+    executor._kv_load_tracker.record_local(
+        executor._kv_load_tracker.sample(executor._kv_cache_capacity)
+    )
+    assert executor.get_kv_cache_capacity()["maxNumBlocks"] == 200
+    assert executor.get_kv_cache_load()["totalKvBlocks"] == 200
+    assert executor.get_kv_cache_load()["usedKvBlocks"] == 150
+
+
+def test_kv_pool_rebalance_refreshes_capacity_without_mixing_discovery_metadata():
+    class Manager:
+        tokens_per_block = 32
+
+        def __init__(self):
+            self.total_blocks = 100
+            self.impl = Mock()
+            self.impl.adjust.side_effect = lambda: setattr(self, "total_blocks", 80)
+
+        def get_primary_block_counts(self):
+            return 0, self.total_blocks
+
+    manager = Manager()
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.kv_cache_manager = manager
+    executor.active_requests = []
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+    executor._openengine_discovery = {"node": {"engine_id": "test"}}
+
+    executor._rebalance_kv_pools_now()
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 80,
+        "tokensPerBlock": 32,
+        "maxNumTokens": 2560,
+    }
+    assert executor.get_openengine_discovery() == {"node": {"engine_id": "test"}}
+
+
+def test_adp_running_counts_update_without_a_new_block_sample():
+    """The final request count must update even inside the sampling interval."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.rank_state import RankIterStatsPayload, RankState
+
+    manager = Mock()
+    manager.get_kv_cache_stats.return_value = types.SimpleNamespace(
+        max_num_blocks=100, used_num_blocks=0, tokens_per_block=32
+    )
+    executor = _make_executor_with_kv_cache_manager(manager)
+    executor.enable_attention_dp = True
+    executor.enable_iter_perf_stats = False
+    executor._kv_load_tracker.idle_sampled = True
+    executor.dist = types.SimpleNamespace(rank=0, tp_rank=0)
+    states = [
+        RankState(
+            rank=rank,
+            num_active_requests=1,
+            iter_stats=RankIterStatsPayload(
+                kv_used_blocks=0, kv_total_blocks=100, kv_load_timestamp_ns=123
+            ),
+        )
+        for rank in range(2)
+    ]
+    executor.adp_router = Mock()
+    executor.adp_router.gather_all_rank_states.return_value = states
+
+    class ReachedWait(Exception):
+        pass
+
+    def stop_at_wait(*args):
+        raise ReachedWait
+
+    executor._fetch_and_enqueue_requests = stop_at_wait
+    for running in (1, 0):
+        for state in states:
+            state.num_active_requests = running
+        with pytest.raises(ReachedWait):
+            executor._fetch_new_requests(FCFSWaitingQueue(), [])
+        assert [rank["runningRequests"] for rank in executor.get_kv_cache_load()["ranks"]] == [
+            running,
+            running,
+        ]
 
 
 def _classify_termination(
