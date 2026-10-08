@@ -3483,11 +3483,12 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def invalidate_draft(self, request_id: int) -> None:
-        """Keep target execution alive while withholding incomplete draft KV from reuse."""
+        """Disable drafting and reuse publication until draft KV is complete.
+
+        Cache commitment remains open so a completed rebuild or transfer can
+        restore availability and publish the validated KV.
+        """
         self._unavailable_draft_requests.add(request_id)
-        cache = self.kv_cache_map.get(request_id)
-        if cache is not None:
-            cache.stop_committing()
 
     def complete_draft_rebuild(self, request_id: int, start: int, end: int) -> None:
         """Enable draft layers only after a rebuild covers the entire required range."""
