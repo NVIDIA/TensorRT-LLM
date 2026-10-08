@@ -2636,6 +2636,79 @@ def test_workload_identity_alone_does_not_prime_inner_tactics(
     assert preparation_calls == []
 
 
+@pytest.mark.parametrize("reason", ["disabled", "not_nvfp4", "no_aux_stream"])
+def test_quantize_input_async_falls_back_to_sync(monkeypatch, reason: str):
+    """Without an aux stream, NVFP4, or with the kill switch off, the async
+    quantization is the synchronous one and hands back no event to join."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "ASYNC_INPUT_QUANT", reason != "disabled")
+    calls = []
+    backend = SimpleNamespace(
+        has_nvfp4=reason != "not_nvfp4",
+        quantize_input=lambda x, post_quant_comm: calls.append(post_quant_comm) or (x, None),
+        _has_moe_output_memset_aux_stream=lambda: reason != "no_aux_stream",
+    )
+    x = torch.empty(2, 4)
+
+    x_q, x_sf, event = fused_moe_cute_dsl.CuteDslFusedMoE.quantize_input_async(backend, x)
+
+    assert x_q is x and x_sf is None and event is None
+    assert calls == [False]
+
+
+def test_join_pending_x_ready_waits_once():
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    waits = []
+    backend = SimpleNamespace(_pending_x_ready_event=SimpleNamespace(wait=lambda: waits.append(1)))
+    join = fused_moe_cute_dsl.CuteDslFusedMoE._join_pending_x_ready
+
+    join(backend)
+    join(backend)
+
+    assert waits == [1]
+    assert backend._pending_x_ready_event is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() < 100,
+    reason="NVFP4 quantization needs SM100+",
+)
+def test_quantize_input_async_matches_sync():
+    """The aux-stream quantization produces the same bytes as the main-stream one."""
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+    from tensorrt_llm._torch.utils import AuxStreamType, EventType
+
+    hidden = 256
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        hidden_size=hidden,
+        scaling_vector_size=16,
+        fc31_input_scale=torch.tensor([1.0], device="cuda"),
+        aux_stream_dict={AuxStreamType.MoeOutputMemset: torch.cuda.Stream()},
+        event_dict={
+            EventType.Main: torch.cuda.Event(),
+            EventType.MoeOutputMemset: torch.cuda.Event(),
+        },
+        _x_quant_event=torch.cuda.Event(),
+    )
+    cls = fused_moe_cute_dsl.CuteDslFusedMoE
+    backend.quantize_input = cls.quantize_input.__get__(backend)
+    backend._has_moe_output_memset_aux_stream = cls._has_moe_output_memset_aux_stream.__get__(
+        backend
+    )
+    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda")
+
+    ref_q, ref_sf = backend.quantize_input(x, post_quant_comm=False)
+    x_q, x_sf, event = cls.quantize_input_async(backend, x)
+    assert event is backend._x_quant_event
+    event.wait()
+
+    assert torch.equal(x_q.view(torch.uint8), ref_q.view(torch.uint8))
+    assert torch.equal(x_sf.view(torch.uint8), ref_sf.view(torch.uint8))
+
+
 def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """Drive the real FC12 runner through do_preparation, on CPU.
 
