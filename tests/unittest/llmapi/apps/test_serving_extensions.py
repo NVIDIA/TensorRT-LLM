@@ -158,8 +158,9 @@ class TestBuiltinExtensions:
         from tensorrt_llm.serve.extensions.gpt_oss import GptOssServingExtension
 
         assert isinstance(hook.__self__, GptOssServingExtension)
-        # gpt-oss has no chat-side preprocessing.
-        assert "gpt_oss" not in serving_extensions._BY_MODEL_TYPE
+        # gpt-oss is also registered by model_type, which owns its Harmony
+        # prompt rendering and output mode.
+        assert isinstance(serving_extensions._BY_MODEL_TYPE["gpt_oss"], GptOssServingExtension)
 
     def test_kimi_param_policy_applies_via_generic_dispatch(self, monkeypatch) -> None:
         from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
@@ -293,7 +294,6 @@ class TestOpenAIChatIntegration:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
-        from tensorrt_llm.serve import openai_server
         from tensorrt_llm.serve.openai_protocol import (
             ChatCompletionResponse,
             ChatCompletionResponseChoice,
@@ -301,6 +301,7 @@ class TestOpenAIChatIntegration:
             UsageInfo,
         )
         from tensorrt_llm.serve.openai_server import OpenAIServer
+        from tensorrt_llm.serve.render import chat as render_chat_module
 
         events = ordering_extension
         rendered: dict = {}
@@ -315,7 +316,9 @@ class TestOpenAIChatIntegration:
             rendered.update(kwargs)
             return "rendered prompt"
 
-        monkeypatch.setattr(openai_server, "async_apply_chat_template", fake_apply_chat_template)
+        monkeypatch.setattr(
+            render_chat_module, "async_apply_chat_template", fake_apply_chat_template
+        )
 
         def generate_async(*, inputs, **kwargs):
             return SimpleNamespace(prompt_token_ids=[1, 2, 3], finished=True)
@@ -358,6 +361,8 @@ class TestOpenAIChatIntegration:
             )
         )
 
+        rendered["create_chat_response"] = server._create_chat_response
+
         app = FastAPI()
         app.add_api_route("/v1/chat/completions", server.openai_chat, methods=["POST"])
         return TestClient(app), events, rendered
@@ -381,3 +386,161 @@ class TestOpenAIChatIntegration:
         # The renderer saw the request the extension mutated, with the
         # client's own kwargs preserved.
         assert rendered["chat_template_kwargs"] == {"client_flag": 1, **self.MARKER}
+
+    def test_required_tool_choice_is_rejected_unless_the_extension_allows_it(
+        self, chat_client
+    ) -> None:
+        client, _events, _rendered = chat_client
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [_WEATHER_TOOL],
+                "tool_choice": "required",
+                "max_tokens": 4,
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        assert "tool_choice='required' is not supported" in response.text
+
+    def test_extension_hooks_drive_tools_and_the_usage_offset(self, chat_client) -> None:
+        client, _events, rendered = chat_client
+
+        class HookExtension(ServingExtension):
+            def allows_required_tool_choice(self) -> bool:
+                return True
+
+            def serialize_tool(self, tool) -> dict:
+                return {"custom": tool.function.name}
+
+            def prompt_tokens_excluded_from_usage(self, request) -> int:
+                return 5
+
+        serving_extensions._BY_MODEL_TYPE[self.MODEL_KEY] = HookExtension()
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [_WEATHER_TOOL],
+                "tool_choice": "required",
+                "max_tokens": 4,
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert rendered["tools"] == [{"custom": "get_weather"}]
+        # _create_chat_response(promise, postproc_params, raw_request, ...)
+        postproc_params = rendered["create_chat_response"].call_args.args[1]
+        assert postproc_params.postproc_args.num_prompt_tokens_offset == 5
+
+
+def _chat_request(**overrides):
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    fields = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    fields.update(overrides)
+    return ChatCompletionRequest(**fields)
+
+
+_WEATHER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    },
+}
+
+
+class TestExtensionHooks:
+    """Per-model hooks: defaults match the generic path, built-ins override."""
+
+    def test_unregistered_model_type_gets_the_all_defaults_extension(self) -> None:
+        for model_type in ("not-a-registered-model", "", None):
+            extension = serving_extensions.get_serving_extension(model_type)
+            assert type(extension) is ServingExtension
+
+    def test_registered_model_type_gets_its_extension(self, scratch_extension) -> None:
+        extension = serving_extensions.get_serving_extension(scratch_extension.model_key)
+        assert isinstance(extension, scratch_extension.cls)
+
+    def test_default_hooks_match_the_generic_path(self) -> None:
+        extension = serving_extensions.get_serving_extension(None)
+        request = _chat_request(tools=[_WEATHER_TOOL])
+
+        assert extension.render_prompt(request) is None
+        assert extension.output_mode() is serving_extensions.OutputMode.TEXT
+        assert extension.allows_required_tool_choice() is False
+        assert extension.serialize_tool(request.tools[0]) == request.tools[0].model_dump()
+        assert extension.dynamic_tools(request.messages) == []
+        assert extension.prompt_tokens_excluded_from_usage(request) == 0
+
+    def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
+        assert (
+            serving_extensions._load_builtin_extensions
+            is serving_extensions.load_builtin_extensions
+        )
+
+    @pytest.fixture
+    def kimi(self):
+        return serving_extensions.get_serving_extension("kimi_k3")
+
+    def test_kimi_k3_allows_required_tool_choice(self, kimi) -> None:
+        assert kimi.allows_required_tool_choice() is True
+
+    def test_kimi_k3_serializes_tools_without_null_defaults(self, kimi) -> None:
+        request = _chat_request(tools=[_WEATHER_TOOL])
+        tool = request.tools[0]
+
+        assert kimi.serialize_tool(tool) == tool.model_dump(exclude_none=True)
+        # The default dump carries pydantic-injected nulls that K3 must not render.
+        assert kimi.serialize_tool(tool) != tool.model_dump()
+
+    def test_kimi_k3_collects_message_level_tools(self, kimi) -> None:
+        messages = [{"role": "system", "content": "", "tools": [_WEATHER_TOOL]}]
+        assert kimi.dynamic_tools(messages) == [_WEATHER_TOOL]
+        assert kimi.dynamic_tools([{"role": "user", "content": "hi"}]) == []
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected"),
+        [
+            pytest.param({}, 3, id="native_template_with_generation_prompt"),
+            pytest.param({"add_generation_prompt": False}, 0, id="no_generation_prompt"),
+            pytest.param({"prompt_token_ids": [1, 2, 3]}, 0, id="pre_tokenized"),
+            pytest.param({"prompt_token_ids_b64": "AQAAAA=="}, 0, id="b64_pre_tokenized"),
+            pytest.param({"chat_template": "{{ messages }}"}, 0, id="request_template"),
+        ],
+    )
+    def test_kimi_k3_excludes_the_generation_channel_opener(
+        self, kimi, overrides, expected
+    ) -> None:
+        request = _chat_request(**overrides)
+        assert kimi.prompt_tokens_excluded_from_usage(request) == expected
+
+    def test_gpt_oss_declares_harmony_output(self) -> None:
+        extension = serving_extensions.get_serving_extension("gpt_oss")
+        assert extension.output_mode() is serving_extensions.OutputMode.HARMONY_TOKENS
+
+    def test_gpt_oss_renders_through_the_harmony_tokenizer(self, monkeypatch) -> None:
+        from tensorrt_llm.serve import chat_tokenization
+
+        calls: list = []
+
+        def fake_tokenize_harmony(request, harmony_adapter=None, set_prompt_token_ids=False):
+            calls.append((request, harmony_adapter))
+            return [7, 8, 9]
+
+        monkeypatch.setattr(
+            chat_tokenization, "tokenize_harmony_chat_request", fake_tokenize_harmony
+        )
+        extension = serving_extensions.get_serving_extension("gpt_oss")
+        request = _chat_request()
+        adapter = object()
+
+        assert extension.render_prompt(request, SimpleNamespace(harmony=adapter)) == [7, 8, 9]
+        assert extension.render_prompt(request) == [7, 8, 9]
+        assert calls == [(request, adapter), (request, None)]

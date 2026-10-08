@@ -494,7 +494,9 @@ class TestServingChatTemplateGather:
             captured.update(kwargs)
             return [1, 2, 3]
 
-        monkeypatch.setattr(rg, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
 
         token_ids = await governor._convert_messages(
             messages=[{"role": "user", "content": "hi"}],
@@ -536,7 +538,9 @@ class TestServingChatTemplateGather:
         async def fake_async_apply(**kwargs):
             return [1, 2, 3]
 
-        monkeypatch.setattr(ru, "async_apply_chat_template", fake_async_apply)
+        from tensorrt_llm.serve.render import chat as render_chat_module
+
+        monkeypatch.setattr(render_chat_module, "async_apply_chat_template", fake_async_apply)
 
         request = Mock()
         request.tools = None
