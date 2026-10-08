@@ -1,4 +1,3 @@
-accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_guided_decoding TIMEOUT (60)
 accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
@@ -60,6 +59,10 @@ accuracy/test_glm52.py::TestGLM52NVFP4::test_runtime
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM52NVFP4::test_tep_nvfp4kv[tp_size=8-ep_size=8]
 accuracy/test_glm52.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
+accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv]
+accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_block_reuse[tp_size=4-ep_size=4]
+accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mmmu[tp_size=4-ep_size=4]
+accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4]
 accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[no_overlap]
 accuracy/test_kv_pool_rebalance_accuracy.py::TestKvPoolRebalanceAccuracy::test_rebalance_matches_baseline[overlap]
@@ -458,12 +461,11 @@ accuracy/test_llm_api_pytorch.py::TestLlama4SpeculativeDecoding::test_llama4_eag
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_auto_dtype[tp_size=8-ep_size=8] TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[use_msa=False] TIMEOUT (180)
 accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[use_msa=True] TIMEOUT (45)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False] TIMEOUT (180)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True]
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True] TIMEOUT (60)
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex]
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex]
-accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=False-kv_dtype=fp8] TIMEOUT (180)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=True-kv_dtype=fp8] TIMEOUT (60)
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=False-eval_mode=inferencex-kv_dtype=fp8]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=False-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex-kv_dtype=fp8]
+accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4_eagle3[tp_size=4-ep_size=4-attention_dp=True-overlap_scheduler=True-fuse_qkv_index_projection=True-eval_mode=inferencex-kv_dtype=fp8]
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMinistral8BInstruct::test_fp8
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm]
@@ -623,6 +625,7 @@ accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_decoder_encode_
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_cuda_graph_matches_eager_logits[bert-yelp]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-cuda_graph]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_matches_huggingface_classification[bert-yelp-eager]
+accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encoder_encode_with_token_type_ids_matches_huggingface[bert-yelp]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
 accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
 accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill]
@@ -671,18 +674,18 @@ disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
-disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv
+disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance
 disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
-disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_conditional[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls
+disaggregated/test_disaggregated.py::test_disaggregated_conditional
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4
+disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2
+disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2
+disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_bf16_conditional_v2[DeepSeek-V3-Lite-bf16]
@@ -704,59 +707,54 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_single_gpu_mtp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tp1_two_mtp[DeepSeek-V3-Lite-fp8]
-disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens
+disaggregated/test_disaggregated.py::test_disaggregated_genbs1
 disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
-disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_kv_cache_time_output
+disaggregated/test_disaggregated.py::test_disaggregated_load_balance
 disaggregated/test_disaggregated.py::test_disaggregated_logprobs_serving
 disaggregated/test_disaggregated.py::test_disaggregated_mamba_bs1_concurrency2
 disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8]
-disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_mixed
 disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req120-conc64-qwen3_32b_fp8_mixed_stress]
-disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ngram[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu
+disaggregated/test_disaggregated.py::test_disaggregated_ngram
+disaggregated/test_disaggregated.py::test_disaggregated_overlap
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory
+disaggregated/test_disaggregated.py::test_disaggregated_perf_metrics
 disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
-disaggregated/test_disaggregated.py::test_disaggregated_sa[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_sa_python[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_tinyllama_multi_orchestrator[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_sa
+disaggregated/test_disaggregated.py::test_disaggregated_sa_python
+disaggregated/test_disaggregated.py::test_disaggregated_single_gpu
+disaggregated/test_disaggregated.py::test_disaggregated_qwen3_multi_orchestrator
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer[False-Qwen3-0.6B]
+disaggregated/test_disaggregated_single_gpu.py::test_arbitrary_kv_cache_transfer_missing_blocks[False-Qwen3-0.6B]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-Qwen3-0.6B]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-Qwen3-0.6B]
+disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-False-DeepSeek-V3-Lite-fp8/fp8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[False-True-DeepSeek-V3-Lite-fp8/fp8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-False-DeepSeek-V3-Lite-fp8/fp8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_deepseek[True-True-DeepSeek-V3-Lite-fp8/fp8]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[False-True-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-False-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_llama[True-True-TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-Qwen3-8B-eagle3-Qwen3-8B]
-disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_workers.py::test_workers_conditional_disaggregation
 disaggregated/test_workers.py::test_workers_conditional_disaggregation_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
-disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_workers.py::test_workers_conversation_router
+disaggregated/test_workers.py::test_workers_kv_cache_aware_router
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
-disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction
+disaggregated/test_workers.py::test_workers_kv_cache_events
 kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
 llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (300)
 llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (300)
@@ -777,6 +775,9 @@ test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[Qwen3/Qwen3-0.6B-Qwen3/Qwe
 test_e2e.py::test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
 test_e2e.py::test_trtllm_benchmark_serving[gpt_oss/gpt-oss-20b]
 test_e2e.py::test_trtllm_multimodal_benchmark_serving
+
+# Dense FP4 MLA accuracy (SM107 only)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla
 
 # fine-grained sync tests (SM107+ only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_fine_grained_sync[enable_autotuner=False-moe_backend=TRTLLM-mtp_nextn=0-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]

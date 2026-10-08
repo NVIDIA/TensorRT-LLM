@@ -31,7 +31,8 @@ constexpr int kCompactHeadsWorkThreshold = 144;
 constexpr bool isSupportedHeadCount(int numHeads)
 {
     return numHeads == 1 || numHeads == 2 || numHeads == 3 || numHeads == 4 || numHeads == 6 || numHeads == 8
-        || numHeads == 12 || numHeads == 16 || numHeads == 24 || numHeads == 32 || numHeads == 48 || numHeads == 96;
+        || numHeads == 12 || numHeads == 16 || numHeads == 24 || numHeads == 32 || numHeads == 48 || numHeads == 64
+        || numHeads == 96;
 }
 
 //! Select the compact-head kernel within the measured KDA decode work threshold.
@@ -79,8 +80,6 @@ struct KdaDecodeParams
     void const* outputNormGate;
     float const* outputNormWeight;
     int const* ssmStateIndices;
-    //! Must be arange(batchSize + 1): the kernel only advances each state by one token.
-    int const* cuSeqlens;
     float* state;
     int64_t stateSlotStride;
     int64_t convStateSlotStride;

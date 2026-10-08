@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import atexit
-import json
 import os
 import socket
 import threading
@@ -57,11 +56,11 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
+                       TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
-from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
-                        LlmBuildStats, ModelLoader)
+from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
@@ -390,15 +389,18 @@ class BaseLLM:
                     # Propagate to args construction
                     kwargs["orchestrator_type"] = "ray"
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
             else:
                 raise ValueError(
                     f"Unknown backend: {backend!r}. Supported backends are "
-                    "'pytorch' and '_autodeploy'.")
+                    "'pytorch'.")
+
+            # TRTLLM_MODELING_V2=require promises the run measured a modeling_v2
+            # target. Only the pytorch backend reaches the resolver that could
+            # select one, so on any other backend the promise would be broken
+            # silently -- the one failure that mode exists to prevent.
+            from .._torch._experimental.modeling_v2 import \
+                assert_backend_can_route
+            assert_backend_can_route(backend)
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
@@ -423,6 +425,8 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
+
+            self._capture_usage_startup(llm_args=self.args)
 
         except Exception as e:
             logger.error(
@@ -476,12 +480,9 @@ class BaseLLM:
                         self.args.parallel_config.world_size)
 
         try:
-            # Due to the Executor can only accept a engine path, we need to save the engine to a directory
-            self._engine_dir: Optional[Path] = None
             self._executor: Optional[GenerationExecutor] = None
             self._encode_only: bool = False
             self._encoder_executor = None
-            self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
             self._hf_model_config = None
@@ -489,7 +490,6 @@ class BaseLLM:
             # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
             self._generation_config_explicit_values: dict[str, Any] = {}
 
-            self.llm_build_stats = LlmBuildStats()
             self._build_model()
 
         except Exception:
@@ -511,6 +511,21 @@ class BaseLLM:
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
+    def _capture_usage_startup(self, **context: Any) -> None:
+        """Capture optional startup context without affecting model construction."""
+        try:
+            from tensorrt_llm.usage import record_llm_initialization_attempt
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+
+            args = context.get("llm_args")
+            if (args is not None and hasattr(self, "_usage_attempt_tracked")
+                    and not self._usage_attempt_tracked):
+                self._usage_attempt_tracked = record_llm_initialization_attempt(
+                    args.telemetry_config)
+            _capture_startup_context(**context)
+        except Exception as exc:
+            logger.debug("Usage telemetry startup capture failed: %s", exc)
+
     def _start_usage_reporting(self) -> None:
         """Start the success-only initial report and heartbeat stream."""
         try:
@@ -524,9 +539,20 @@ class BaseLLM:
                     == _usage.UsageContext.UNKNOWN):
                 telemetry_config = telemetry_config.model_copy(
                     update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            pretrained_config = self._hf_model_config
+            if getattr(self, "_encoder_executor", None) is not None:
+                try:
+                    runtime_pretrained_config = (
+                        self._encoder_executor.model_engine.model.model_config.
+                        pretrained_config)
+                    if runtime_pretrained_config is not None:
+                        pretrained_config = runtime_pretrained_config
+                except AttributeError:
+                    # Missing runtime metadata must not suppress usage reporting.
+                    pass
             _usage.report_usage(
                 llm_args=self.args,
-                pretrained_config=self._hf_model_config,
+                pretrained_config=pretrained_config,
                 telemetry_config=telemetry_config,
             )
         except Exception as exc:
@@ -930,13 +956,6 @@ class BaseLLM:
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
-            if self.args.backend == "_autodeploy":
-                raise ValueError(
-                    "Multimodal disaggregated inference (encode -> prefill "
-                    "embedding handoff) is not supported with the AutoDeploy "
-                    "backend. AutoDeploy runs the multimodal encoder in-prefill "
-                    "on raw inputs and does not consume precomputed multimodal "
-                    "embeddings.")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
@@ -1173,8 +1192,11 @@ class BaseLLM:
             batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
             copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
-            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
-                inputs_embeds (reward models).
+            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:
+                token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).
+                With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor
+                value runs that call eagerly.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
@@ -1263,16 +1285,10 @@ class BaseLLM:
         # Build inputs dict — common + model-specific kwargs.
         # Filter keys that are supplied by EncoderRunner itself to avoid
         # "multiple values for keyword argument" errors.
-        _RESERVED_KEYS = {
-            'input_ids',
-            'seq_lens',
-            'multi_item_part_lens',
-            'attn_metadata',
-            'return_context_logits',
-        }
         filtered_kwargs = {
             k: v
-            for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
+            for k, v in model_kwargs.items()
+            if k not in ENCODER_RUNNER_MANAGED_INPUTS
         }
 
         forward_inputs = {
@@ -1488,15 +1504,6 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend not in ["pytorch", "_autodeploy"]:
-            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                sampling_params.return_context_logits = True
-                sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
-                sampling_params.return_generation_logits = True
-                sampling_params._generation_logits_auto_enabled = True
-
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
@@ -1596,68 +1603,15 @@ class BaseLLM:
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
-        if self.args.backend in ["pytorch", "_autodeploy"]:
-            # Check prompt length against max_num_tokens to filter illegal requests.
-            # Skip check for gen-only requests
-            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
-                max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
-                    raise RequestError(
-                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
-                        f"max_num_tokens ({max_num_tokens})")
-            self._check_one_model_speculative_sampling(sampling_params)
-            return
-
-        build_config = self.args.build_config
-
-        built_engine_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_engine_cfg_file) as f:
-            built_engine_cfg = json.load(f)
-        max_seq_len = built_engine_cfg['build_config'][
-            'max_seq_len'] if 'build_config' in built_engine_cfg else build_config.max_seq_len
-        # TODO: Remove this check and left the request verification to cpp runtime
-
-        if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size +
-            (sampling_params.max_tokens or 0) > max_seq_len):
-            raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({max_seq_len})")
-
-        if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-
-        max_batch_size = self.args.max_batch_size
-        if max_batch_size is None:
-            max_batch_size = build_config.max_batch_size
-        if not sampling_params.use_beam_search and sampling_params.best_of > max_batch_size:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-
-        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
-            raise ValueError(
-                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
-                f"in the `BuildConfig` when constructing the LLM. "
-                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
-            )
-
-        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
-            raise ValueError(
-                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
-                f"to be passed explicitly to the `LLM()` constructor.")
+        # Check prompt length against max_num_tokens to filter illegal requests.
+        # Skip check for gen-only requests.
+        if not self.args.enable_chunked_prefill and not is_gen_only:
+            max_num_tokens = self.args.max_num_tokens
+            if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
+                raise RequestError(
+                    f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
+                    f"max_num_tokens ({max_num_tokens})")
+        self._check_one_model_speculative_sampling(sampling_params)
 
         if sampling_params.return_routed_experts and not (
                 self.args.backend == "pytorch"
@@ -1669,11 +1623,8 @@ class BaseLLM:
 
     def _build_model(self):
         model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session,
-                                         workspace=self._workspace,
-                                         llm_build_stats=weakref.proxy(
-                                             self.llm_build_stats))
-        self._engine_dir, self._hf_model_dir = model_loader()
+                                         mpi_session=self.mpi_session)
+        self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -1685,9 +1636,8 @@ class BaseLLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "_autodeploy"
-        ] and self.args.lora_config is not None:
+        if (hasattr(self.args, "backend") and self.args.backend == "pytorch"
+                and self.args.lora_config is not None):
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]
@@ -1748,8 +1698,6 @@ class BaseLLM:
         Mirrors the ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``
         environment-variable behaviour but can be triggered at runtime (for
         example via the ``trtllm-serve`` ``/start_profile`` HTTP endpoint).
-        Only supported when running the PyTorch / AutoDeploy backend; on the
-        TensorRT backend this is a no-op.
 
         See ``PyExecutor.start_profile`` for full argument semantics.
 
@@ -1890,13 +1838,13 @@ class _TorchLLM(BaseLLM):
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
-        usage_attempt_tracked = False
+        self._usage_attempt_tracked = False
         _usage = None
         # Telemetry: Track before construction so initialization failures are visible.
         try:
             import tensorrt_llm.usage as _usage
 
-            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                 telemetry_config,
                 default_usage_context=_usage.UsageContext.LLM_CLASS.value,
             )
@@ -1905,6 +1853,13 @@ class _TorchLLM(BaseLLM):
                 f"Usage telemetry initialization tracking failed: {exc}")
 
         backend = kwargs.pop("backend", "pytorch")
+
+        if self._usage_attempt_tracked:
+            self._capture_usage_startup(
+                requested=dict(kwargs,
+                               backend=backend,
+                               tensor_parallel_size=tensor_parallel_size,
+                               dtype=dtype))
 
         try:
             # Validate that only arguments supported by the PyTorch backend are passed.
@@ -1922,18 +1877,18 @@ class _TorchLLM(BaseLLM):
                              backend=backend,
                              **kwargs)
         except Exception:
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked and _usage is not None:
                 _usage.record_llm_initialization_failure()
             raise
 
         try:
-            if not usage_attempt_tracked and _usage is not None:
-                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            if not self._usage_attempt_tracked and _usage is not None:
+                self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                     getattr(self.args, 'telemetry_config', None),
                     default_usage_context=_usage.UsageContext.LLM_CLASS.value,
                 )
 
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked:
                 self._usage_lifecycle_active = _usage.record_llm_initialized()
         except Exception as exc:
             logger.debug(f"Usage telemetry completion tracking failed: {exc}")
@@ -2017,12 +1972,11 @@ class _TorchLLM(BaseLLM):
 
     def _build_model(self):
         super()._build_model()
-        assert self._engine_dir is None
-
         # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._capture_usage_startup(pretrained_config=self._hf_model_config)
         self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
@@ -2079,7 +2033,7 @@ class _TorchLLM(BaseLLM):
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
-            self._engine_dir,
+            None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,

@@ -28,15 +28,90 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
+    MTPForCausalLM,
     SpecDecOneEngineForCausalLM,
     _build_mtp_one_model_draft,
     _copy_model_config_with_moe_backend,
+    _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+@pytest.mark.cpu_only
+def test_draft_kv_cache_quant_algo_override_updates_all_layers() -> None:
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": QuantAlgo.FP8},
+    )
+    layer_quant_0 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    layer_quant_1 = SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        quant_config_dict={
+            "model.layers.0": layer_quant_0,
+            "model.layers.1": layer_quant_1,
+        },
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_0.kv_cache_quant_algo == QuantAlgo.FP8
+    assert layer_quant_1.kv_cache_quant_algo == QuantAlgo.FP8
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target_algo", [None, QuantAlgo.FP8, QuantAlgo.NVFP4])
+def test_draft_kv_cache_quant_algo_inheritance_preserves_layer_settings(
+    target_algo: QuantAlgo | None,
+) -> None:
+    """Without an override, inherit only the global setting as before."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=target_algo),
+        extra_attrs={},
+    )
+    layer_algos = (None, QuantAlgo.FP8, QuantAlgo.NVFP4)
+    layer_configs = {
+        f"model.layers.{i}": SimpleNamespace(kv_cache_quant_algo=algo)
+        for i, algo in enumerate(layer_algos)
+    }
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.FP8),
+        quant_config_dict=layer_configs,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    assert draft.quant_config.kv_cache_quant_algo == target_algo
+    assert draft.quant_config_dict is layer_configs
+    assert tuple(config.kv_cache_quant_algo for config in layer_configs.values()) == layer_algos
+    assert target.quant_config.kv_cache_quant_algo == target_algo
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, QuantAlgo.FP8])
+def test_draft_kv_cache_quant_algo_without_layer_settings(override: QuantAlgo | None) -> None:
+    """Global inheritance and overrides also support uniform checkpoints."""
+    target = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        extra_attrs={"draft_kv_cache_quant_algo_override": override},
+    )
+    draft = SimpleNamespace(
+        quant_config=SimpleNamespace(kv_cache_quant_algo=None),
+        quant_config_dict=None,
+    )
+
+    _set_draft_kv_cache_quant_algo(draft, target)
+
+    expected_algo = QuantAlgo.NVFP4 if override is None else override
+    assert draft.quant_config.kv_cache_quant_algo == expected_algo
+    assert draft.quant_config_dict is None
+    assert target.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 class _FakeDraftModel(nn.Module):
@@ -505,6 +580,59 @@ def test_internal_mtp_without_override_reuses_target_model_config() -> None:
     assert draft_model is sentinel.draft_model
     assert mtp_cls.call_args.args[0] is target_config
     assert target_model.preload_weight_modules == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "model_type,replacement,head_algo",
+    [
+        ("nemotron_h", True, QuantAlgo.FP8),
+        ("nemotron_h_puzzle", True, QuantAlgo.W4A16_NVFP4),
+        ("nemotron_h", True, QuantAlgo.NVFP4),
+        ("nemotron_h", False, QuantAlgo.FP8),
+        ("qwen3_next", True, QuantAlgo.FP8),
+    ],
+)
+def test_replacement_owns_quantized_mtp_head_across_architectures(
+    monkeypatch, model_type, replacement, head_algo
+):
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_nemotron_h.NemotronHMTP", lambda *args: nn.Identity()
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.models.modeling_qwen3_next.Qwen3NextMTP", lambda *args: nn.Identity()
+    )
+    monkeypatch.setattr("tensorrt_llm._torch.modules.linear.get_sm_version", lambda: 100)
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            model_type=model_type,
+            num_nextn_predict_layers=1,
+            hidden_size=16,
+            vocab_size=32,
+            torch_dtype=torch.bfloat16,
+            tie_word_embeddings=False,
+        ),
+        spec_config=SimpleNamespace(
+            uses_replacement_heads=replacement,
+            max_draft_len=1,
+            spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        ),
+        quant_config_dict={
+            "lm_head": QuantConfig(quant_algo=head_algo, group_size=16),
+        },
+    )
+    with torch.device("cpu"):
+        target_head = nn.Linear(16, 32, bias=False)
+        target = SimpleNamespace(aux_stream_dict={}, embed_tokens=nn.Embedding(32, 16))
+        draft = MTPForCausalLM(config, 2, target_head, target)
+    owns_head = replacement
+    assert draft.owns_lm_head == owns_head
+    assert (draft.lm_head is target_head) == (not owns_head)
+    assert draft.embed_tokens is target.embed_tokens
+    if owns_head:
+        packed = head_algo in (QuantAlgo.W4A16_NVFP4, QuantAlgo.NVFP4)
+        assert draft.lm_head.weight.shape == (32, 8 if packed else 16)
+        assert draft.lm_head.weight.dtype == (torch.uint8 if packed else torch.float8_e4m3fn)
 
 
 @pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])

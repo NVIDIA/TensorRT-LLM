@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -410,6 +412,38 @@ class TestHelixPostProcess(unittest.TestCase):
         with pytest.raises(RuntimeError):
             torch.ops.trtllm.helix_post_process_native(gathered_o, gathered_stats, 1.0, 2)
 
+    @parameterized.expand([("empty",), ("not_a_divisor",)])
+    def test_alltoall_helix_native_rejects_bad_zero_kv_mask_length(self, case):
+        """Reject mask lengths that cannot map all-to-all entries to tokens."""
+        device = torch.device("cuda")
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(num_tokens, cp_size, value_dim, dtype=torch.float16, device=device)
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device=device)
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device=device)
+        mask_size = 0 if case == "empty" else 3
+        mask = torch.zeros(mask_size, dtype=torch.bool, device=device)
+
+        with pytest.raises(RuntimeError, match="must divide the all-to-all entry count"):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
+    @unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 GPUs")
+    def test_alltoall_helix_native_rejects_cross_device_zero_kv_mask(self):
+        """Reject a mask whose pointer cannot be dereferenced on the input device."""
+        num_tokens, cp_size, value_dim = 8, 2, 64
+        partial_o = torch.randn(
+            num_tokens, cp_size, value_dim, dtype=torch.float16, device="cuda:0"
+        )
+        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device="cuda:0")
+        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device="cuda:0")
+        mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda:1")
+
+        with pytest.raises(RuntimeError, match="same device as partial_o"):
+            torch.ops.trtllm.alltoall_helix_native(
+                partial_o, softmax_stats, workspace, 0, cp_size, mask
+            )
+
     @parameterized.expand(
         [
             # (layout,) — "nccl", "fifo_v1", "fifo_v2".
@@ -480,6 +514,41 @@ class TestHelixZeroKvMask(unittest.TestCase):
     seq_lens_cuda. This matters when a sequence spans multiple tokens (e.g.
     speculative decoding), where num_tokens != num_seqs.
     """
+
+    def test_mla_skips_generic_mask_when_per_token_bounds_are_valid(self):
+        from tensorrt_llm._torch.attention.mla import MLA
+
+        num_tokens = 3
+        num_heads = 2
+        kv_lora_rank = 4
+        helix_kv_bounds = torch.tensor([0, 5, 0], dtype=torch.int32)
+        attn_metadata = SimpleNamespace(
+            helix_kv_bounds=helix_kv_bounds,
+            _helix_spec_tokens_valid=True,
+            num_contexts=0,
+            num_generations=1,
+        )
+        attn_backend = Mock()
+        attn_backend.forward.return_value = torch.empty(num_tokens, num_heads * kv_lora_rank)
+        mla = SimpleNamespace(
+            mapping=SimpleNamespace(has_cp_helix=lambda: True),
+            num_heads_tp=num_heads,
+            num_heads_tp_cp=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            aux_stream=None,
+            ln_events=None,
+        )
+        q = torch.empty(num_tokens, 1)
+
+        with (
+            patch("tensorrt_llm._torch.attention.mla._helix_zero_kv_mask") as generic_mask,
+            patch("tensorrt_llm._torch.attention.mla._helix_post_process") as post_process,
+        ):
+            MLA._attn_forward_gen(mla, attn_backend, q, q, q, None, attn_metadata)
+
+        generic_mask.assert_not_called()
+        actual_mask = post_process.call_args.kwargs["zero_kv_mask"]
+        torch.testing.assert_close(actual_mask, helix_kv_bounds == 0)
 
     def test_single_token_per_seq(self):
         # Plain decode: one token per sequence, so per-seq == per-token.

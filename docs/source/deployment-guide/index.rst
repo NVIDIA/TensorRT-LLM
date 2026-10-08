@@ -37,4 +37,5 @@ The deployment guides below provide more detailed instructions for serving speci
    deployment-guide-for-qwen3.8-flash-next-on-trtllm.md
    deployment-guide-for-kimi-k3-on-trtllm.md
    deployment-guide-for-glm-5-on-trtllm.md
+   deployment-guide-for-glm-5.3-flash-on-trtllm.md
    deployment-guide-for-minimax-m3-on-trtllm.md

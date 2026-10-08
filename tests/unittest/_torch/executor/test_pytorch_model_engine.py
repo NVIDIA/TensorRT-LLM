@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import tensorrt_llm
@@ -22,8 +23,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner, KeyType, SampleType, _restore_spec_decode_capture_state,
     _save_spec_decode_capture_state)
+from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
+from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
+from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine, _build_request_multimodal_input,
@@ -53,6 +57,76 @@ from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
 from tensorrt_llm.llmapi import (CudaGraphConfig, SADecodingConfig,
                                  SamplingParams)
 from tensorrt_llm.mapping import CpType, Mapping
+
+
+class TestCachedKvTokenLogging(unittest.TestCase):
+
+    def setUp(self) -> None:
+        self.engine = object.__new__(PyTorchModelEngine)
+        self.engine.iter_states = {}
+        self.real = SimpleNamespace(is_cuda_graph_dummy=False)
+        self.padding = SimpleNamespace(is_cuda_graph_dummy=True)
+
+    def check_counts(
+        self,
+        counts: list[int],
+        groups: tuple[tuple[list[SimpleNamespace], int], ...],
+        expected: list[int],
+        padding: int,
+    ) -> None:
+        self.engine.iter_states['cached_kv_tokens'] = sum(counts)
+        self.engine._record_cached_kv_tokens_per_req(counts, groups)
+        self.assertEqual(
+            self.engine.iter_states, {
+                'cached_kv_tokens': sum(counts),
+                'cached_kv_tokens_per_req': expected,
+                'cached_kv_tokens_cuda_graph_padding': padding,
+            })
+        counts[:] = [999]
+        self.assertEqual(self.engine.iter_states['cached_kv_tokens_per_req'],
+                         expected)
+
+    def test_mtp_padding_before_first_draft_and_generation(self) -> None:
+        # Input packing is context, extend (including padding), first draft, gen.
+        self.check_counts([10, 100, 7, 200, 300],
+                          (([self.real], 1), ([self.real, self.padding], 1),
+                           ([self.real], 1), ([self.real], 1)),
+                          [10, 100, 200, 300], 7)
+
+    def test_beams_preserved_after_context_and_padding(self) -> None:
+        self.check_counts([10, 100, 101, 7, 7, 200, 201],
+                          (([self.real], 1),
+                           ([self.real, self.padding, self.real], 2)),
+                          [10, 100, 101, 200, 201], 14)
+
+    def test_attention_dp_dummy_is_not_graph_padding(self) -> None:
+        adp_dummy = SimpleNamespace(is_dummy=True,
+                                    is_attention_dp_dummy=True,
+                                    is_cuda_graph_dummy=False)
+        self.check_counts([10, 1, 7],
+                          (([self.real, adp_dummy, self.padding], 1), ),
+                          [10, 1], 7)
+
+    def test_padding_only(self) -> None:
+        self.check_counts([7, 7], (([self.padding, self.padding], 1), ), [], 14)
+
+    def test_group_row_count_must_match_counts(self) -> None:
+        for counts, groups in (
+            ([100, 200], (([self.real], 1), )),
+            ([100, 101, 200], (([self.real, self.real], 2), )),
+        ):
+            with self.subTest(counts=counts, groups=groups):
+                with self.assertRaises(AssertionError):
+                    self.engine._record_cached_kv_tokens_per_req(counts, groups)
+
+    def test_steady_batch_clears_previous_padding(self) -> None:
+        self.engine.iter_states['cached_kv_tokens_cuda_graph_padding'] = 7
+        self.check_counts([100, 200], (), [100, 200], 0)
+
+    def test_empty_batch_clears_previous_values(self) -> None:
+        self.engine.iter_states['cached_kv_tokens_per_req'] = [100]
+        self.engine.iter_states['cached_kv_tokens_cuda_graph_padding'] = 7
+        self.check_counts([], (([], 1), ), [], 0)
 
 
 @dataclass
@@ -115,12 +189,14 @@ class DummyModelEngine(PyTorchModelEngine):
         llm_args: TorchLlmArgs,
         dtype: torch.dtype,
         spec_config: DecodingBaseConfig | None = None,
+        is_generation: bool = True,
     ) -> None:
         self.dtype = dtype
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
                           rank=tensorrt_llm.mpi_rank())
         model = DummyModel(self.dtype)
+        model.model_config.is_generation = is_generation
         super().__init__(model_path="dummy",
                          mapping=mapping,
                          model=model,
@@ -223,7 +299,6 @@ def _make_forward_only_engine(
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     engine.is_spec_decode = False
-    engine.is_draft_model = False
     engine.guided_decoder = None
     engine.max_beam_width = 1
     engine._is_encode_only = False
@@ -246,7 +321,8 @@ def _make_forward_only_engine(
     engine._is_encoder_decoder_model = Mock(return_value=False)
     engine._get_draft_kv_cache_manager = Mock(return_value=None)
     engine._runner = None
-    engine.cuda_graph_lora_manager = None
+    engine._fallback_to_engine = True
+    engine._lora = SimpleNamespace(cuda_graph_manager=None)
     engine._force_lora_graph_for_capture = None
 
     semantic_attn_metadata = Mock()
@@ -267,7 +343,7 @@ def _make_forward_only_engine(
         "prepared": True,
         "input_ids": torch.zeros(2, dtype=torch.int32),
     }
-    engine._prepare_inputs = Mock(return_value=(prepared_inputs, None))
+    engine._prepare_inputs = Mock(return_value=(prepared_inputs, None, 0))
     outputs = {"logits": object()}
     engine._forward_step = Mock(return_value=outputs)
     engine._execute_logit_post_processors = Mock()
@@ -356,6 +432,7 @@ def test_cleanup_releases_runner_model_before_release_gc() -> None:
     engine._cleanup_done = False
     engine.model_loader = None
     engine._runner = SimpleNamespace(_model=model)
+    engine._model_caller = ModelCaller(model)
     engine._mm_item_scheduler = None
     engine.model = model
     engine._release_cuda_graphs = Mock()
@@ -664,7 +741,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = True
         request = _make_request_stub(7)
@@ -691,7 +768,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_aggregates_encoder_tokens(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner.max_beam_width = 1
         runner._get_seq_len_mode.return_value = False
@@ -716,7 +793,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_rejects_nonuniform_context_query_lengths(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         first_context = _make_request_stub(1)
@@ -763,7 +840,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_includes_peft_cache_dtype(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
@@ -821,7 +898,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_graph_key_includes_lora_variant(self) -> None:
         runner = Mock()
-        runner.config = SimpleNamespace(is_draft_model=False)
+        runner.config = SimpleNamespace()
         runner._resolve_sample_type.return_value = SampleType.FULL
         runner._get_seq_len_mode.return_value = False
         request = _make_request_stub(7)
@@ -844,7 +921,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
     def test_lora_graph_variant_selection(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
-        engine.cuda_graph_lora_manager = object()
+        engine._lora = SimpleNamespace(cuda_graph_manager=object())
         engine._force_lora_graph_for_capture = None
         lora_config = SimpleNamespace(cuda_graph_specialize_lora=True)
         engine.llm_args = SimpleNamespace(lora_config=lora_config)
@@ -925,7 +1002,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 return_value=event):
             actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertIsNot(graph_batch, batch)
         self.assertEqual(graph_batch.generation_requests, [context, generation])
@@ -956,7 +1034,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 return_value=Mock()):
             actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertIsNot(graph_batch, batch)
         prepare_args = engine._prepare_inputs.call_args.args
@@ -992,7 +1071,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 return_value=Mock()):
             actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context, generation])
         self.assertTrue(
@@ -1025,7 +1105,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 return_value=Mock()):
             actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context])
         prepare_args = engine._prepare_inputs.call_args.args
@@ -1055,7 +1136,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 return_value=Mock()):
             actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         selector.assert_not_called()
         self.assertIs(runner.maybe_get_cuda_graph.call_args.args[0], batch)
         prepare_args = engine._prepare_inputs.call_args.args
@@ -1079,11 +1161,10 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
-            actual_outputs = engine.forward(batch,
-                                            resource_manager,
-                                            gather_context_logits=True)
+            actual_outputs = engine.forward(batch, resource_manager)
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context])
         prepare_args = engine._prepare_inputs.call_args.args
@@ -1132,6 +1213,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 
         batch = ScheduledRequests()
         batch.context_requests_last_chunk = [_make_request_stub(1)]
+        batch.context_requests_last_chunk[0].py_return_context_logits = True
 
         with patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
@@ -1142,10 +1224,10 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             actual_outputs = engine.forward(
                 batch,
                 resource_manager,
-                gather_context_logits=True,
             )
 
-        self.assertIs(actual_outputs, outputs)
+        self.assertEqual(actual_outputs, outputs)
+        self.assertIsNot(actual_outputs, outputs)
         breakable_runner.execute.assert_not_called()
         engine._forward_step.assert_called_once()
 
@@ -1173,7 +1255,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_generation_lora_request_selects_lora_graph(self) -> None:
         key = (1, 0, False, False, True, True)
         engine, runner, resource_manager, _, _ = _make_forward_only_engine(key)
-        engine.cuda_graph_lora_manager = object()
+        engine._lora = SimpleNamespace(cuda_graph_manager=object())
         engine.llm_args.lora_config = SimpleNamespace(
             cuda_graph_specialize_lora=True)
         generation = _make_request_stub(2)
@@ -1198,7 +1280,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         cases = (
             "graphs_disabled",
             "speculative_nonzero_runtime_draft",
-            "speculative_draft_model",
             "beam",
             "encoder_decoder",
             "ple_recurrent_state",
@@ -1209,15 +1290,11 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             with self.subTest(case=case):
                 engine, runner, resource_manager, _, _ = \
                     _make_forward_only_engine(None)
-                gather_context_logits = False
                 if case == "graphs_disabled":
                     runner.enabled = False
                 elif case == "speculative_nonzero_runtime_draft":
                     engine.enable_spec_decode = True
                     engine.runtime_draft_len = 1
-                elif case == "speculative_draft_model":
-                    engine.enable_spec_decode = True
-                    engine.is_draft_model = True
                 elif case == "beam":
                     engine.max_beam_width = 2
                 elif case == "encoder_decoder":
@@ -1240,11 +1317,44 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                     engine.forward(
                         batch,
                         resource_manager,
-                        gather_context_logits=gather_context_logits,
                     )
 
                 selector.assert_not_called()
                 self.assertIs(engine._prepare_inputs.call_args.args[0], batch)
+
+    def test_forward_threads_call_state_and_returns_prepared_length(
+            self) -> None:
+        engine, runner, resource_manager, _, outputs = \
+            _make_forward_only_engine(None)
+        engine.enable_spec_decode = True
+        engine.runtime_draft_len = 2
+        engine.spec_config = SimpleNamespace(is_linear_tree=False)
+        prepared_inputs = engine._prepare_inputs.return_value[0]
+        # Tree input preparation widens the length after graph selection.
+        engine._prepare_inputs.return_value = (prepared_inputs, None, 7)
+        batch = ScheduledRequests()
+        batch.generation_requests = [_make_request_stub(2)]
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                return_value=Mock()):
+            actual_outputs = engine.forward(batch, resource_manager)
+
+        self.assertEqual(actual_outputs, outputs)
+        self.assertEqual(runner.pad_batch.call_args.args[2], 2)
+        self.assertTrue(
+            runner.maybe_get_cuda_graph.call_args.kwargs["enable_spec_decode"])
+        prepare_kwargs = engine._prepare_inputs.call_args.kwargs
+        self.assertEqual(
+            (prepare_kwargs["enable_spec_decode"],
+             prepare_kwargs["runtime_draft_len"], prepare_kwargs["is_dummy"]),
+            (True, 2, False))
+        step_kwargs = engine._forward_step.call_args.kwargs
+        self.assertEqual(
+            (step_kwargs["enable_spec_decode"],
+             step_kwargs["runtime_draft_len"], step_kwargs["is_dummy"]),
+            (True, 7, False))
+        self.assertEqual(engine.runtime_draft_len, 7)
 
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
@@ -1374,6 +1484,116 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(attn_metadata.on_update_kv_lens.call_count, 2)
 
+    def test_decoder_buffers_are_allocated_only_for_engine_decoder(
+            self) -> None:
+        llm_args = TorchLlmArgs(
+            model="dummy",
+            max_batch_size=4,
+            max_num_tokens=64,
+            max_beam_width=2,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
+        decoder_only = ("input_ids_cuda", "position_ids_cuda",
+                        "previous_batch_indices_cuda",
+                        "_steady_gen_positions_pinned", "_steady_gen_cache",
+                        "_prepare_inputs_event", "_lora")
+        for is_generation in (True, False):
+            with self.subTest(is_generation=is_generation):
+                engine = DummyModelEngine(llm_args,
+                                          torch.half,
+                                          is_generation=is_generation)
+
+                self.assertEqual(engine._fallback_to_engine, is_generation)
+                if is_generation:
+                    self.assertIsNone(engine._runner)
+                    self.assertIsNotNone(engine.cuda_graph_runner)
+                    self.assertEqual(
+                        tuple(engine.cache_indirection_attention.shape),
+                        (4, 2, engine.max_seq_len))
+                else:
+                    self.assertIsInstance(engine._runner, PoolingRunner)
+                    self.assertIsNone(engine.cuda_graph_runner)
+                    self.assertIsNone(engine.cache_indirection_attention)
+                for name in decoder_only:
+                    self.assertEqual(hasattr(engine, name), is_generation, name)
+
+    def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
+        runner = Mock()
+        engine = object.__new__(PyTorchModelEngine)
+        engine._fallback_to_engine = False
+        engine._runner = runner
+        engine._torch_compile_backend = None
+        engine.cuda_graph_runner = None
+        engine.breakable_cuda_graph_runner = None
+
+        engine.wait_for_input_copy()
+        engine._release_cuda_graphs()
+        engine._init_cuda_graph_lora_manager(Mock())
+
+        runner.wait_for_input_copy.assert_called_once_with()
+        runner.release_graphs.assert_called_once_with()
+        self.assertFalse(hasattr(engine, "_prepare_inputs_event"))
+        self.assertFalse(hasattr(engine, "_lora"))
+
+    def test_decoder_engine_shared_entries_use_decoder_state(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine._fallback_to_engine = True
+        engine._runner = None
+        engine._torch_compile_backend = None
+        engine._prepare_inputs_event = Mock()
+        engine.cuda_graph_runner = Mock()
+        engine.breakable_cuda_graph_runner = Mock()
+
+        engine.wait_for_input_copy()
+        engine._release_cuda_graphs()
+
+        engine._prepare_inputs_event.synchronize.assert_called_once_with()
+        engine.cuda_graph_runner.clear.assert_called_once_with()
+        engine.breakable_cuda_graph_runner.clear.assert_called_once_with()
+
+    def test_prepare_tp_inputs_fast_path_returns_call_draft_length(
+            self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        engine.guided_decoder = Mock()
+        engine._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+        prepared_inputs = {"prepared": True}
+        engine._apply_steady_gen_fast_prepare = Mock(
+            return_value=(prepared_inputs, None))
+        batch = ScheduledRequests()
+        new_tokens = torch.zeros(1)
+
+        result = engine._prepare_tp_inputs(
+            batch,
+            Mock(),
+            Mock(),
+            new_tensors_device=SimpleNamespace(new_tokens=new_tokens),
+            enable_spec_decode=False,
+            runtime_draft_len=3,
+            is_dummy=True)
+
+        self.assertEqual(result, (prepared_inputs, None, 3))
+        engine.guided_decoder.add_batch.assert_called_once_with(
+            batch, new_tokens=new_tokens, runtime_draft_len=3)
+        engine._can_use_steady_gen_fast_prepare.assert_called_once_with(
+            batch, new_tokens, None, None, True)
+
+    def test_steady_gen_fast_prepare_skips_dummy_passes(self) -> None:
+        engine = object.__new__(PyTorchModelEngine)
+        request = _make_request_stub(7)
+        engine._steady_gen_cache = {
+            "num_requests": 1,
+            "request_ids": [request.py_request_id],
+        }
+        batch = ScheduledRequests()
+        batch.generation_requests = [request]
+        new_tokens = torch.zeros(1)
+
+        self.assertTrue(
+            engine._can_use_steady_gen_fast_prepare(batch, new_tokens, None,
+                                                    None, False))
+        self.assertFalse(
+            engine._can_use_steady_gen_fast_prepare(batch, new_tokens, None,
+                                                    None, True))
+
     def test_promoted_context_uses_prompt_token_during_overlap(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(
@@ -1402,13 +1622,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         overlap_state = SimpleNamespace(new_tokens=new_tokens)
         model_engine._can_use_steady_gen_fast_prepare = Mock(return_value=True)
 
-        inputs, _ = model_engine._prepare_tp_inputs(
+        inputs, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=graph_batch,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
             new_tensors_device=overlap_state,
             resource_manager=resource_manager,
             promoted_context_request_ids=frozenset({context.py_request_id}),
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
         )
 
         self.assertEqual(inputs["input_ids"][:2].cpu().tolist(), [44, 777])
@@ -1420,8 +1643,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(
             model_engine.previous_batch_indices_cuda[:1].cpu().tolist(), [1])
         self.assertEqual(attn_metadata.num_contexts, 0)
-        self.assertEqual(model_engine.previous_request_ids,
-                         [generation.py_request_id])
+        # The promoted row has no previous overlap tensor, so the batch cannot
+        # seed the steady-state generation cache.
+        self.assertIsNone(model_engine._steady_gen_cache)
         kv_cache_manager.shutdown()
 
     def test_promoted_context_precedes_speculative_overlap_generation(
@@ -1432,7 +1656,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         )
         model_engine, kv_cache_manager = create_model_engine_and_kvcache(
             spec_config=spec_config)
-        model_engine.runtime_draft_len = 0
         resource_manager = ResourceManager(
             {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
         attn_metadata = AttentionMetadata(max_num_requests=4,
@@ -1471,7 +1694,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           device="cuda"),
         )
 
-        inputs, _ = model_engine._prepare_tp_inputs(
+        inputs, _, runtime_draft_len = model_engine._prepare_tp_inputs(
             scheduled_requests=graph_batch,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
@@ -1479,6 +1702,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             new_tensors_device=overlap_state,
             resource_manager=resource_manager,
             promoted_context_request_ids=frozenset({context.py_request_id}),
+            enable_spec_decode=True,
+            runtime_draft_len=0,
+            is_dummy=False,
         )
 
         self.assertEqual(inputs["input_ids"][:2].cpu().tolist(), [44, 777])
@@ -1493,8 +1719,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             model_engine.previous_pos_id_offsets_cuda[:2].cpu().tolist(),
             [0, 1])
         self.assertEqual(attn_metadata.num_contexts, 0)
-        self.assertEqual(model_engine.previous_request_ids,
-                         [generation.py_request_id])
+        self.assertEqual(runtime_draft_len, 0)
         self.assertEqual(spec_metadata.request_ids,
                          [context.py_request_id, generation.py_request_id])
         self.assertFalse(generation.py_needs_onehot_draft_probs)
@@ -2051,10 +2276,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.previous_batch_indices_cuda = torch.zeros(
             max_num_tokens, dtype=torch.int32, device='cuda')
 
-        result, _ = model_engine._prepare_tp_inputs(
+        result, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata)
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False)
 
         # Verify expected keys are present.
         self.assertIsNotNone(result)
@@ -2154,10 +2382,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             multimodal_request, dummy_request
         ]
 
-        result, _ = model_engine._prepare_tp_inputs(
+        result, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata)
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False)
 
         position_ids = result["position_ids"]
         self.assertEqual(tuple(position_ids.shape), (3, 1, 2))
@@ -2262,10 +2493,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         scheduled_requests.context_requests_last_chunk = []
         scheduled_requests.generation_requests = requests
 
-        result, _ = model_engine._prepare_tp_inputs(
+        result, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata)
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False)
 
         # One entry per generation request, in batch order. Slot 32 is the
         # reserved zero slot (max_num_tokens * pp_size) standing in for the
@@ -2299,10 +2533,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             self._make_mrope_gen_request(6, 2, 1, None),
         ]
 
-        result, _ = model_engine._prepare_tp_inputs(
+        result, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
-            attn_metadata=attn_metadata)
+            attn_metadata=attn_metadata,
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False)
 
         # An all-zero delta vector is identical to passing no deltas at all.
         self.assertNotIn("mrope_delta_read_seq_slots", result)
@@ -2351,12 +2588,15 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         graph_batch = ScheduledRequests()
         graph_batch.generation_requests = [context]
 
-        inputs, _ = model_engine._prepare_tp_inputs(
+        inputs, _, _ = model_engine._prepare_tp_inputs(
             scheduled_requests=graph_batch,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
             resource_manager=resource_manager,
             promoted_context_request_ids=frozenset({context.py_request_id}),
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            is_dummy=False,
         )
 
         self.assertEqual(inputs["input_ids"][:1].cpu().tolist(), [44])
@@ -2374,7 +2614,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          [0])
         self.assertNotIn("mrope_delta_write_seq_slots", inputs)
         self.assertEqual(attn_metadata.num_contexts, 0)
-        self.assertEqual(model_engine.previous_request_ids, [])
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self) -> None:
@@ -2443,6 +2682,46 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         self.assertEqual(observed.item(), 7)
         kv_cache_manager.shutdown()
+
+
+@pytest.mark.parametrize("draft_capacity", [None, 0, 8])
+def test_runner_input_buffers_support_repeated_cuda_graph_replay(
+        draft_capacity):
+    buffers = InputBuffers.allocate(
+        max_num_tokens=16,
+        max_batch_size=2,
+        max_beam_width=2,
+        max_seq_len=8,
+        use_cache_indirection=True,
+        max_num_draft_tokens=draft_capacity,
+    )
+    assert buffers.cache_indirection.shape == (2, 2, 8)
+    if draft_capacity is None:
+        assert buffers.gather_ids_cuda is None
+        assert buffers.draft_tokens_cuda is None
+    else:
+        assert buffers.gather_ids_cuda.numel() == 16
+        assert buffers.draft_tokens_cuda.numel() == draft_capacity
+    input_ptr = buffers.input_ids_cuda.data_ptr()
+    buffers.input_ids_cuda.fill_(1)
+    buffers.position_ids_cuda.fill_(2)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            output = buffers.input_ids_cuda + buffers.position_ids_cuda
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = buffers.input_ids_cuda + buffers.position_ids_cuda
+    output_ptr = output.data_ptr()
+    for token in (3, 7):
+        buffers.input_ids_cuda.fill_(token)
+        graph.replay()
+        torch.testing.assert_close(output, torch.full_like(output, token + 2))
+        assert output.data_ptr() == output_ptr
+        assert buffers.input_ids_cuda.data_ptr() == input_ptr
+    graph.reset()
 
 
 if __name__ == "__main__":

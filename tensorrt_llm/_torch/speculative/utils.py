@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-from ..pyexecutor.config_utils import match_nemotron_h_layer_types
+from ..pyexecutor.config_utils import (is_nemotron_hybrid,
+                                       match_nemotron_h_layer_types)
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..speculative.interface import SpecMetadata
@@ -338,7 +339,6 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False,
                       max_seq_len=262144,
                       num_seq_slots=None):
     metadata = _build_spec_metadata(spec_config,
@@ -346,7 +346,6 @@ def get_spec_metadata(spec_config,
                                     max_num_requests,
                                     max_num_tokens,
                                     spec_resource_manager=spec_resource_manager,
-                                    is_draft_model=is_draft_model,
                                     max_seq_len=max_seq_len)
     # Set here rather than in each branch below: every one-model mode needs it and
     # the per-mode constructors are easy to miss one of.
@@ -370,7 +369,6 @@ def _build_spec_metadata(spec_config,
                          max_num_requests,
                          max_num_tokens,
                          spec_resource_manager=None,
-                         is_draft_model=False,
                          max_seq_len=262144):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
@@ -790,8 +788,8 @@ def get_num_extra_kv_tokens(spec_config):
 
 def get_draft_kv_cache_manager(spec_config, resource_manager):
     """
-    Returns the draft KV cache manager only in one-model speculative decoding
-    mode where the target model manages a separate draft KV cache.
+    Return the one-model draft cache manager, including a shared draft KV view
+    when the target manager owns the draft cache storage.
     """
     from ..pyexecutor.resource_manager import ResourceManagerType
 
@@ -799,8 +797,14 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
         return None
     if not spec_config.spec_dec_mode.use_one_engine():
         return None
-    return resource_manager.get_resource_manager(
+    draft = resource_manager.get_resource_manager(
         ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+    if draft is not None:
+        return draft
+    target = resource_manager.get_resource_manager(
+        ResourceManagerType.KV_CACHE_MANAGER)
+    get_view = getattr(target, "get_draft_kv_cache_view", None)
+    return get_view() if get_view is not None else None
 
 
 def update_spec_config_from_model_config(spec_config,
@@ -835,6 +839,10 @@ def update_spec_config_from_model_config(spec_config,
             checkpoint_type = _MTPDraftCheckpointType.HEAD_REPLACEMENT
     spec_config._mtp_draft_checkpoint_type = checkpoint_type
 
+    language_config = getattr(model_config, "llm_config", None)
+    if language_config is not None and is_nemotron_hybrid(language_config):
+        model_config = language_config
+
     # When MTP heads live in a separate checkpoint, prefer that checkpoint's
     # layer count / pattern over the target model's (which may have no MTP or
     # an older embedded MTP head that will be overridden at weight load).
@@ -860,6 +868,15 @@ def update_spec_config_from_model_config(spec_config,
                                                "mtp_num_hidden_layers", None)
         if num_nextn_predict_layers is None:
             num_nextn_predict_layers = 1
+    if (draft_nextn is None and num_nextn_predict_layers == 0
+            and spec_config.uses_replacement_heads):
+        # A target without embedded MTP does not declare the replacement's count.
+        # Resolve the shared head before selecting the mode and draft length.
+        num_nextn_predict_layers = 1
+        _set_pretrained_config_attr(model_config, "num_nextn_predict_layers", 1)
+    if spec_config.uses_replacement_heads and num_nextn_predict_layers <= 0:
+        raise ValueError(
+            "A replacement MTP checkpoint must contain at least one head")
     spec_config.num_nextn_predict_layers = num_nextn_predict_layers
     spec_config._validate_moe_backend_compatibility(model_config_resolved=True)
     is_vanilla = spec_config.spec_dec_mode.is_mtp_vanilla()
@@ -961,44 +978,35 @@ def get_static_draft_len(model_engine: "ModelEngine") -> int:
     return model_engine.max_total_draft_tokens
 
 
-def update_draft_len(model_engine: "ModelEngine",
-                     scheduled_batch: "ScheduledRequests",
-                     *,
-                     draft_len: Optional[int] = None,
-                     speculation_permanently_disabled: bool = False) -> None:
-    """Resolve this batch's draft length and synchronize its draft buffers.
+def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
+                      scheduled_batch: "ScheduledRequests",
+                      *,
+                      max_draft_len: int,
+                      static_draft_len: int,
+                      draft_len: Optional[int] = None,
+                      speculation_permanently_disabled: bool = False) -> int:
+    """Synchronize this batch's draft buffers and return its draft length.
 
-    Normal iterations must call this before ``prepare_resources`` so KV cache
-    allocation uses the selected draft length. Dynamic and explicit lengths
-    pad or truncate generation-request buffers to a uniform width, as required
-    by CUDA graph replay and the attention kernel. Static normal decoding
-    preserves the drafter's proposals instead.
-
-    Warmup supplies the explicit length used to allocate its dummy batch,
-    including graph shapes that differ from the normal batch-size schedule.
+    Dynamic and explicit lengths pad or truncate generation-request buffers to
+    a uniform width, as required by CUDA graph replay and the attention kernel.
+    Static decoding preserves the drafter's proposals instead.
     """
-    if not hasattr(model_engine, 'max_draft_len'):
-        return
-
     if speculation_permanently_disabled:
         for request in scheduled_batch.generation_requests:
             request.py_draft_tokens = []
-        model_engine.runtime_draft_len = 0
-        return
+        return 0
 
-    spec_config = model_engine.spec_config
     if draft_len is None:
         if (spec_config is not None
                 and spec_config.draft_len_schedule is not None
                 and spec_config.spec_dec_mode.support_dynamic_draft_len()):
             draft_len = get_draft_len_for_batch_size(
                 spec_config.draft_len_schedule, scheduled_batch.batch_size,
-                model_engine.max_draft_len)
+                max_draft_len)
         else:
             # Static decoding preserves the proposals produced by the drafter,
             # including requests intentionally entering with no draft tokens.
-            model_engine.runtime_draft_len = get_static_draft_len(model_engine)
-            return
+            return static_draft_len
 
     draft_buffer_pad = 0  # Buffer sentinel, not PARD mask_token_id.
     rejection_on = getattr(spec_config, "use_rejection_sampling", False)
@@ -1027,4 +1035,26 @@ def update_draft_len(model_engine: "ModelEngine",
         elif current_num_draft_tokens > draft_len:
             request.py_draft_tokens = request.py_draft_tokens[:draft_len]
 
-    model_engine.runtime_draft_len = draft_len
+    return draft_len
+
+
+def update_draft_len(model_engine: "ModelEngine",
+                     scheduled_batch: "ScheduledRequests",
+                     *,
+                     draft_len: Optional[int] = None,
+                     speculation_permanently_disabled: bool = False) -> None:
+    """Resolve this batch's draft length and store it on the engine.
+
+    Normal iterations must call this before ``prepare_resources`` so KV cache
+    allocation uses the selected draft length.
+    """
+    if not hasattr(model_engine, 'max_draft_len'):
+        return
+
+    model_engine.runtime_draft_len = resolve_draft_len(
+        model_engine.spec_config,
+        scheduled_batch,
+        max_draft_len=model_engine.max_draft_len,
+        static_draft_len=get_static_draft_len(model_engine),
+        draft_len=draft_len,
+        speculation_permanently_disabled=speculation_permanently_disabled)

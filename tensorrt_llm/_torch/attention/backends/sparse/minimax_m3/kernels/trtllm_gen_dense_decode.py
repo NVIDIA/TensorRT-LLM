@@ -27,6 +27,8 @@ import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
+from .msa_utils import check_decode_span_shape
+
 
 @functools.lru_cache(maxsize=None)
 def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> int:
@@ -216,7 +218,15 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
     if get_pool is None or not layer_offsets:
         return 0
-    factors = {int(get_pool(layer_idx, "HND")[1]) for layer_idx in layer_offsets}
+    is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
+    is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
+    # NVFP4 sparse layers and the hybrid draft layer (read through its own view)
+    # never read the staged table and may sit in pools with another factor.
+    factors = {
+        int(get_pool(layer_idx, "HND")[1])
+        for layer_idx in layer_offsets
+        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
+    }
     return factors.pop() if len(factors) == 1 else 0
 
 
@@ -251,6 +261,15 @@ def minimax_m3_trtllm_gen_dense_decode(
     caller sizes it from a geometry it derives for itself.
     """
     import flashinfer
+
+    # The multi-CTA KV counters are sized against max_num_requests, so a batch
+    # read out of a longer q would undersize them.
+    check_decode_span_shape(
+        "MiniMax-M3 trtllm-gen dense decode",
+        int(q.shape[0]),
+        int(seq_lens.shape[0]),
+        decode_query_len,
+    )
 
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
     num_heads = int(q.shape[1])

@@ -4,18 +4,20 @@
 """OpenEngine gRPC server lifecycle for TensorRT-LLM."""
 
 import asyncio
+import gc
 import ipaddress
+import os
 import signal
 from typing import Any
 
 import click
 import grpc
 import uvloop
-from openengine.v1 import openengine_pb2_grpc
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
 
+from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .servicer import OpenEngineInferenceServicer
 
@@ -134,6 +136,18 @@ class OpenEngineServer:
         await self._server.wait_for_termination()
 
 
+def _disable_gc_if_requested() -> None:
+    """Disable Python's cyclic garbage collector when TRTLLM_SERVER_DISABLE_GC=1.
+
+    Same switch and policy as the ``trtllm-serve`` HTTP server: a cyclic
+    collection pauses the event loop, and with it every stream this process
+    serves.
+    """
+    if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+        gc.disable()
+        logger.info("Python cyclic GC disabled (TRTLLM_SERVER_DISABLE_GC=1)")
+
+
 def launch_server(
     host: str,
     port: int,
@@ -154,12 +168,6 @@ def launch_server(
         backend = llm_args.get("backend")
         model = served_model_name or llm_args.get("model", "")
         llm_args.pop("build_config", None)
-        if backend == "_autodeploy":
-            raise click.BadParameter(
-                "OpenEngine generation does not support the AutoDeploy backend because "
-                "AutoDeploy requests cannot currently be cancelled.",
-                param_hint="backend",
-            )
         if backend != "pytorch":
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -187,6 +195,7 @@ def launch_server(
             llm = PyTorchLLM(**llm_args)
             logger.info("Model loaded successfully")
             server = OpenEngineServer(host=host, port=port, llm=llm, model=model)
+            _disable_gc_if_requested()
             await server.start()
             await stop_event.wait()
         finally:

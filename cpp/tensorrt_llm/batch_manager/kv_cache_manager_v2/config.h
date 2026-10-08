@@ -105,6 +105,8 @@ struct BufferConfig
     // If set, overrides tokens_per_block for this buffer.
     // Must be a divisor of KVCacheManagerConfig::tokensPerBlock.
     std::optional<int> tokensPerBlockOverride;
+
+    bool isSparse = false; //!< Whether history uses the sparse attention lifecycle.
 };
 
 // ---------------------------------------------------------------------------
@@ -156,6 +158,13 @@ struct AttentionLayerConfig
     void validate() const
     {
         detail::validateNoDuplicateBufferRoles(buffers);
+        for (auto const& buf : buffers)
+        {
+            if (buf.isSparse != buffers.front().isSparse)
+            {
+                throw std::invalid_argument("Sparse and non-sparse buffers cannot share an attention layer lifecycle");
+            }
+        }
     }
 };
 
@@ -176,7 +185,13 @@ struct SsmLayerConfig
         for (auto const& buf : buffers)
         {
             if (buf.tokensPerBlockOverride.has_value())
+            {
                 throw std::invalid_argument("tokensPerBlockOverride not supported for SSM layers");
+            }
+            if (buf.isSparse)
+            {
+                throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
         }
     }
 };
@@ -191,17 +206,29 @@ struct KVCacheDesc
 {
     int capacity = 0;
     int historyLength = 0;
+    // Beam search does not replicate the whole cache. Blocks that lie entirely
+    // inside the prompt are committed and canonicalized to beam 0 (see
+    // KvCache::_appendBeams(), which skips ordinals below promptLength /
+    // tokensPerBlock and every committed block); only the prompt tail onward is
+    // replicated. Sizing that scales everything by beamWidth would cancel out in
+    // the normalized pool ratio and leave the skew between life cycles in place,
+    // so the split has to be modelled explicitly.
+    int beamWidth = 1;
+    int promptLength = 0;
 
     void validate() const
     {
         TLLM_CHECK(0 <= historyLength && historyLength <= capacity);
+        TLLM_CHECK(beamWidth >= 1);
+        TLLM_CHECK(0 <= promptLength);
     }
 
     // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
     // bindings replace. Required so tests can compare descs by value.
     bool operator==(KVCacheDesc const& other) const noexcept
     {
-        return capacity == other.capacity && historyLength == other.historyLength;
+        return capacity == other.capacity && historyLength == other.historyLength && beamWidth == other.beamWidth
+            && promptLength == other.promptLength;
     }
 
     bool operator!=(KVCacheDesc const& other) const noexcept
@@ -313,6 +340,10 @@ struct KVCacheManagerConfig
     // path without scanning. A per-KvCache text_only override may only tighten this
     // (a text-only deployment forbids a request claiming otherwise). Default false.
     bool textOnly = false;
+
+    // Publish a finalized partial block for reuse when committing stops.
+    // Beam search disables this while retaining full-block reuse.
+    bool enablePartialCommit = true;
 
     bool enableSwaScratchReuse() const noexcept
     {

@@ -223,7 +223,9 @@ public:
     // If an unused buffer of at least the requested size exists for this communicator, it will be reused.
     // Uses best-fit strategy: selects the smallest available buffer that meets the size requirement.
     // Otherwise, a new buffer is allocated and registered.
-    NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size);
+    // Uses the supplied stream for capture detection and allocation synchronization.
+    // Callers using a non-default stream must pass it explicitly.
+    NCCLWindowBuffer requestBuffer(ncclComm_t comm, size_t size, cudaStream_t stream = nullptr);
 
     // Search for a buffer by pointer. Returns an invalid buffer if not found.
     // This matches the UBManager.search_buffer() interface.
@@ -264,7 +266,7 @@ private:
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
-    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle);
+    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, cudaStream_t stream);
 
     // Record a failed new symmetric allocation (assumes mMutex is already locked).
     void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);
@@ -303,13 +305,13 @@ private:
 class ScopedNCCLWindowBuffer
 {
 public:
-    ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size)
+    ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size, cudaStream_t stream = nullptr)
         : mComm(std::move(comm))
         , mBuffer{}
     {
         if (mComm && *mComm)
         {
-            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size);
+            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size, stream);
         }
     }
 
@@ -384,7 +386,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
-        buffer = allocator.requestBuffer(*comm, buffer_size);
+        buffer = allocator.requestBuffer(*comm, buffer_size, at::cuda::getCurrentCUDAStream().stream());
     }
     catch (std::exception const& e)
     {

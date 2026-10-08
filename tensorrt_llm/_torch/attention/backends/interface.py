@@ -958,12 +958,17 @@ class AttentionForwardArgs:
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
     sage_attn_qk_int8: bool = False
+    sage_attn_smooth_k: bool = False
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[torch.Tensor] = None
+    # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
+    # algorithm, resolved on the host by the caller. When set, backends use it
+    # instead of reading ``timestep``, which CUDA Graph capture cannot do.
+    sparse_attn_phase: Optional[int] = None
 
     sparse_backend_args: Optional[SparseBackendForwardArgs] = None
     sparse_runtime_params: SparseRuntimeParams = field(
@@ -1078,6 +1083,11 @@ class AttentionBackend(Generic[TMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return False
+
+    @classmethod
+    def support_fp4_kv_cache(cls) -> bool:
+        """Whether the backend can execute attention with an FP4 KV cache."""
         return False
 
     @classmethod

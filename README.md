@@ -8,9 +8,9 @@ TensorRT LLM
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NVIDIA/TensorRT-LLM)
 [![python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/downloads/release/python-3123/)
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
-[![cuda](https://img.shields.io/badge/cuda-13.2.1-green)](https://developer.nvidia.com/cuda-downloads)
-[![torch](https://img.shields.io/badge/torch-2.12.0-green)](https://pytorch.org)
-[![version](https://img.shields.io/badge/release-1.3.0rc28-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
+[![cuda](https://img.shields.io/badge/cuda-13.4.1-green)](https://developer.nvidia.com/cuda-downloads)
+[![torch](https://img.shields.io/badge/torch-2.14.0-green)](https://pytorch.org)
+[![version](https://img.shields.io/badge/release-1.4.0rc0-green)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](https://github.com/NVIDIA/TensorRT-LLM/blob/main/LICENSE)
 
 [Architecture](https://nvidia.github.io/TensorRT-LLM/developer-guide/overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](https://nvidia.github.io/TensorRT-LLM/developer-guide/perf-overview.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](https://nvidia.github.io/TensorRT-LLM/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -318,9 +318,11 @@ deployment, and not linked to users. The data we collect includes:
 - Ingress point (e.g., LLM API, CLI, serve command)
 - Deployment duration (via periodic heartbeats)
 - GPU SKUs, count, memory, and CUDA version
-- Public model architecture class name (e.g., `LlamaForCausalLM`); architectures
-  outside the checked-in public allowlist are sent only as a deterministic
-  SHA-256 hash, never as the original free-form name
+- Public model architecture identifier (e.g., `LlamaForCausalLM` or
+  `Qwen3ForTextEmbedding`). This may be an upstream checkpoint architecture or
+  a publicly documented TensorRT-LLM runtime architecture. Identifiers outside
+  the checked-in public allowlist are sent only as a deterministic SHA-256
+  hash, never as the original free-form name
 - Parallelism configuration (TP/PP/CP/MoE-EP/MoE-TP sizes), quantization algorithm, dtype, KV cache dtype
 - System information (OS platform, Python version, CPU architecture, CPU count)
 - TRT-LLM version and backend
@@ -332,6 +334,9 @@ deployment, and not linked to users. The data we collect includes:
 - Capture diagnostics for that payload: a schema checksum (for provenance), the count of captured fields, and whether any free-form value was skipped
 
 Telemetry is automatically disabled in CI and test environments.
+
+If LLM startup fails, an initial report can still include the available environment
+and sanitized configuration information, marked as partial context.
 
 ### Opting Out of Telemetry Data Collection
 
@@ -357,5 +362,4 @@ reference of exactly what is collected, see the
 ## Useful Links
 - [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT LLM.
 - [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo): A datacenter scale distributed inference serving framework that works seamlessly with TensorRT LLM.
-- [AutoDeploy](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html): A beta backend for TensorRT LLM to simplify and accelerate the deployment of PyTorch models.
 - [WeChat Discussion Group](https://github.com/NVIDIA/TensorRT-LLM/issues/5359): A real-time channel for TensorRT LLM Q&A and news.

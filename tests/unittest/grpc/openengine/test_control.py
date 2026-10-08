@@ -7,15 +7,18 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip(
-    "openengine",
-    reason='OpenEngine dependency not installed (pip install "tensorrt_llm[openengine]")',
+grpc = pytest.importorskip(  # noqa: E402
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
-
-import grpc  # noqa: E402
 from conftest import AbortError, FakeServicerContext  # noqa: E402
-from openengine.v1 import kv_pb2, lifecycle_pb2, lora_pb2, model_pb2, server_pb2  # noqa: E402
 
+from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    kv_pb2,
+    lifecycle_pb2,
+    lora_pb2,
+    model_pb2,
+    server_pb2,
+)
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
 
