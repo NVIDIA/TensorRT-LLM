@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
@@ -1740,24 +1740,24 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         spec_config=spec_config,
     )
     try:
-        engine = SimpleNamespace(
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+        runner = object.__new__(DecoderRunner)
+        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
+        runner._config = SimpleNamespace(
             spec_config=spec_config,
             max_draft_len=draft_len,
             max_draft_loop_tokens=draft_len,
             max_seq_len=manager.max_seq_len,
             max_beam_width=1,
             use_mrope=False,
-            get_runtime_tokens_per_gen_step=lambda length: length + 1,
-            _get_draft_kv_cache_manager=lambda _: None,
-            _is_encoder_decoder_model=lambda: False,
-            model=SimpleNamespace(
-                model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
-            ),
+        )
+        runner.get_runtime_tokens_per_gen_step = lambda length: length + 1
+        runner._get_draft_kv_cache_manager = lambda _: None
+        runner.model = SimpleNamespace(
+            model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-        batch = PyTorchModelEngine._create_cuda_graph_warmup_request(
-            engine, resources, batch_size=2, draft_len=draft_len
+        batch = runner._create_cuda_graph_warmup_request(
+            resources, batch_size=2, draft_len=draft_len
         )
         assert batch is not None
         assert len(batch.generation_requests) == 2

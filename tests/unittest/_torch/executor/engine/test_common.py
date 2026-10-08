@@ -15,7 +15,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.common import (
     get_top_level_model,
     make_scheduled_inputs,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -131,26 +130,6 @@ def test_attention_dp_padding_uses_all_rank_context_and_token_counts(
         )
         == expected
     )
-
-
-def test_set_spec_metadata_all_rank_counts_for_one_model() -> None:
-    mode = SimpleNamespace(
-        is_mtp_eagle_one_model=Mock(return_value=True),
-        is_eagle3_one_model=Mock(return_value=False),
-    )
-    spec_metadata = SimpleNamespace(spec_dec_mode=mode)
-
-    set_spec_metadata_all_rank_num_tokens(
-        spec_metadata,
-        [8, 9],
-        [2, 3],
-        [1, 2],
-    )
-
-    assert spec_metadata.all_rank_num_tokens == [8, 9]
-    assert spec_metadata.all_rank_num_seqs == [2, 3]
-    assert spec_metadata.all_rank_num_gens == [1, 2]
-    assert spec_metadata.subseq_all_rank_num_tokens == [2, 3]
 
 
 def test_position_offset_helpers_preserve_identity_and_unwrap_models() -> None:
