@@ -15,6 +15,14 @@ TestGPTOSS::test_dflash:
 TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
+# Not a copy of the DeepGEMM row above: that one is measured on the FP8 export,
+# this backend is the only one that serves the NVFP4 export, and the two differ
+# in both the MoE numerics and the checkpoint. The baseline was measured on the
+# same NVFP4 export (2x4 GB300, DEP8, GSM8K 96.21) before the aggregate test
+# moved to one-node DEP4.
+TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl:
+  ref_al: 4.433448078026391
+  min_al: 4.211775674125072
 TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4:
   ref_al: 4.0738
   min_al: 3.8701
