@@ -375,6 +375,23 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
+        # Async input quantization (backends providing quantize_input_async,
+        # currently CuteDSL NVFP4): quantize x on the MoE aux stream now so it
+        # overlaps routing (top-k) and the backend's moe_sort on the main
+        # stream -- at decode batch 8 these three latency-bound kernels
+        # otherwise serialize to ~25 us per layer. Only when nothing modifies
+        # x before quantization (no apply_router_weight_on_input) and no comm
+        # strategy decides the quantize/dispatch order.
+        async_quant = None
+        x_ready_event = None
+        if (
+            moe.comm is None
+            and not moe.apply_router_weight_on_input
+            and not isinstance(x, Fp4QuantizedTensor)
+            and hasattr(moe.backend, "quantize_input_async")
+        ):
+            async_quant = moe.backend.quantize_input_async(x)
+
         # ========== Step 2: Apply routing ==========
         # External dispatch (Step 5) sends per-token expert/scale payloads, so
         # routing must be precomputed whenever a comm strategy is active — even
@@ -573,8 +590,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 if not uses_internal_dispatch_quantization:
                     x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
-            # No comm: just quantize
-            if not used_fused_route_quant:
+            # No comm: just quantize (or pick up the async result forked above)
+            if async_quant is not None:
+                x, x_sf, x_ready_event = async_quant
+            elif not used_fused_route_quant:
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
@@ -590,6 +609,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            x_ready_event=x_ready_event,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -839,6 +859,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -852,6 +873,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales=token_final_scales,
             x=x,
             x_sf=x_sf,
+            x_ready_event=x_ready_event,
             output_dtype=output_dtype,
             do_finalize=do_finalize,
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
