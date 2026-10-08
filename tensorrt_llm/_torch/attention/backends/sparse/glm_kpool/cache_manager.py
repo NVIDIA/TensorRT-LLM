@@ -16,11 +16,22 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
 
 import torch
 
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
+
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
+    KDAIntermediateState,
+    KDAReplayState,
+    get_kda_replay_num_spec,
+)
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
     unwrap_glm5_next_text_config,
@@ -29,6 +40,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 
@@ -44,11 +56,14 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     release and disaggregated transfer with the base manager.
     """
 
+    @override
     def __init__(
         self,
         *args,
         sparse_layer_ids: Sequence[int] | None = None,
         index_state_dim: int = 0,
+        kda_replay_num_spec: int | None = None,
+        use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
         """Build the hybrid manager with one indexer buffer per sparse layer.
@@ -77,8 +92,128 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 "glm5_next sparse layers need a positive index_state_dim "
                 f"(got {self.index_state_dim})"
             )
+        if use_replay_state_update:
+            raise ValueError("GLM KDA does not support Mamba2 replay")
+        self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
+        self._requested_num_spec = kda_replay_num_spec
+        self._kda_replay: KDAReplayState | None = None
+        kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
+    @override
+    def _initialize_spec_state(self) -> KDAIntermediateState | KDAReplayState:
+        num_spec = self._requested_num_spec
+        if num_spec is None:
+            num_spec = get_kda_replay_num_spec(self.spec_config, manager_supports_replay=True)
+        if num_spec is not None:
+            self._kda_replay = KDAReplayState(
+                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+            )
+            self._kda_replay.validate(self._state_layout)
+            return self._kda_replay
+        return KDAIntermediateState()
+
+    @property
+    def use_kda_replay_update(self) -> bool:
+        return self._kda_replay is not None
+
+    @override
+    def _extra_scratch_bytes_per_slot(self) -> int:
+        if self._kda_replay is None:
+            return 0
+        return sum(
+            self._kda_replay.bytes_per_slot(self._state_layout, layer_id)
+            for layer_id in self.mamba_pp_layers
+        )
+
+    @override
+    def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
+        if self._kda_replay is None:
+            return
+        self._kda_replay.relocate_slots(old_slots, new_slots)
+        fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
+        if fresh_slots:
+            slots = torch.tensor(
+                fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
+            )
+            self._kda_replay.reset_slots(slots, fresh_slots)
+
+    @override
+    def update_resources(
+        self, scheduled_batch, attn_metadata=None, kv_cache_dtype_byte_size=None
+    ) -> None:
+        super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+        if (
+            self.local_num_mamba_layers
+            and self._kda_replay is not None
+            and getattr(self.spec_config, "decoding_type", None) == "NGram"
+        ):
+            self._record_replay_request_acceptance(scheduled_batch)
+
+    def _record_replay_request_acceptance(self, scheduled_batch: object) -> None:
+        replay = self._kda_replay
+        if replay.prev_num_accepted_tokens is None:
+            return
+        generation_requests = scheduled_batch.generation_requests
+        drafted_requests = [
+            request
+            for request in generation_requests
+            if request.py_draft_tokens is not None and len(request.py_draft_tokens) > 0
+        ]
+        if not drafted_requests:
+            return
+        if len(drafted_requests) != len(generation_requests):
+            raise RuntimeError(
+                "Mixed drafted/undrafted generation batch is not supported "
+                "for KDA replay bookkeeping"
+            )
+        state_index_map = self._request_id_to_state_index
+        dummy_map = self._request_id_to_is_dummy
+        active_requests = [
+            request for request in generation_requests if request.py_request_id in state_index_map
+        ]
+        if not active_requests:
+            return
+        device = replay.prev_num_accepted_tokens.device
+        state_indices = torch.tensor(
+            [state_index_map[request.py_request_id] for request in active_requests],
+            dtype=torch.int32,
+            device=device,
+        )
+        accepted_drafts = torch.tensor(
+            [request.py_num_accepted_draft_tokens for request in active_requests],
+            dtype=torch.int32,
+            device=device,
+        )
+        is_dummy_request = torch.tensor(
+            [dummy_map.get(request.py_request_id, False) for request in active_requests],
+            dtype=torch.bool,
+            device=device,
+        )
+        replay.record_acceptance(state_indices, accepted_drafts, is_dummy_request)
+
+    @override
+    def on_state_transfer_complete(self, request_ids: list[int]) -> None:
+        replay = self._kda_replay
+        if replay is None or replay.prev_num_accepted_tokens is None:
+            return
+        slots = sorted(
+            {
+                self._request_id_to_state_index[request_id]
+                for request_id in request_ids
+                if request_id in self._request_id_to_state_index
+            }
+        )
+        if slots:
+            replay.seed_transferred_slots(
+                torch.tensor(slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device)
+            )
+
+    def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
+        """Compatibility entry point; the executor uses the generic transfer hook."""
+        self.on_state_transfer_complete(request_ids)
+
+    @override
     def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, list[BufferConfig]]:
         """One ``Role.INDEX_KEY`` buffer per sparse layer, keyed by local id."""
         return {
@@ -95,6 +230,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             if layer_id in self.layer_offsets
         }
 
+    @override
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: DataRole) -> int:
         index_bytes = (
             self.index_state_dim * torch.bfloat16.itemsize
@@ -106,6 +242,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         return cache_bytes + index_bytes if data_role == Role.ALL else cache_bytes
 
+    @override
     def _attention_cache_bytes_per_token(self) -> int:
         return sum(
             self.get_layer_bytes_per_token(local_layer_idx, Role.ALL)
@@ -113,6 +250,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         )
 
     @staticmethod
+    @override
     def get_cache_size_per_token(
         model_config: ModelConfig,
         mapping: Mapping,
@@ -247,3 +385,33 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             stride=(stride * flat.stride(0), *flat.stride()[1:]),
             storage_offset=flat.storage_offset(),
         )
+
+
+def get_glm5_next_cache_params(config, *, spec_config=None, quant_config=None):
+    """Resolve GLM KDA geometry and its required FP32 recurrent state."""
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        build_mamba_kv_cache_params,
+        get_glm5_next_layer_masks,
+    )
+
+    linear = unwrap_glm5_next_text_config(config).linear_attn_config
+    attention, recurrent = get_glm5_next_layer_masks(config)
+    params = build_mamba_kv_cache_params(
+        config,
+        state_size=linear["head_dim"],
+        conv_kernel=linear["short_conv_kernel_size"],
+        num_heads=linear["num_heads"],
+        n_groups=linear["num_heads"],
+        head_dim=linear["head_dim"],
+        mamba_mask=recurrent,
+        target_full_attn_mask=attention,
+        spec_config=spec_config,
+        quant_config=quant_config,
+    )
+    if params.mamba_ssm_cache_dtype != torch.float32:
+        logger.info(
+            f"glm5_next KDA: overriding mamba_ssm_cache_dtype "
+            f"{params.mamba_ssm_cache_dtype} -> torch.float32"
+        )
+        params.mamba_ssm_cache_dtype = torch.float32
+    return params

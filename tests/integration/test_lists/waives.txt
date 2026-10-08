@@ -273,7 +273,6 @@ unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_hybrid_cache
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_hybrid_cache_manager_factory_v2_preference_does_not_select_v2 SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_disagg_python_nixl_routes_to_mixed_manager SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_disagg_rejects_non_python_transceiver_route SKIP (https://nvbugs/6818710)
-unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_explicit_v2_manager_enables_kda_replay SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_explicit_v2_manager_geometry SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_explicit_v2_manager_uses_qkv_convolution_layout SKIP (https://nvbugs/6818710)
 unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_kimi_without_v2_preference_uses_mixed_manager SKIP (https://nvbugs/6818710)

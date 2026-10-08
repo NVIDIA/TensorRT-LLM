@@ -504,10 +504,27 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
             )
     allocate.assert_called_once()
     assert allocate.call_args.kwargs["dtype"] == (DataType.FP8 if fp8_kv_cache else DataType.BF16)
+    assert allocate.call_args.kwargs["conv_state_layout"] == "q_k_v"
+    assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+    manager = object.__new__(Glm5NextCacheManager)
+    manager._requested_num_spec = None
+    manager._kda_replay = None
+    manager._mamba_ssm_stochastic_rounding = False
+    manager.spec_config = spec_config
+    manager._state_layout = SimpleNamespace(
+        spec_config=spec_config,
+        mamba_pp_layers=(),
+        conv_state_layout="q_k_v",
+        conv_section_dims=(),
+    )
+    with patch(
+        "tensorrt_llm._torch.modules.kimi_kda._kda_kernels.is_kda_mtp_verify_available",
+        return_value=verify_kernel is True,
+    ):
+        state = manager._initialize_spec_state()
+    assert manager.use_kda_replay_update is (verify_kernel is True)
     if verify_kernel is True:
-        assert allocate.call_args.kwargs["kda_replay_num_spec"] == 3
-    else:
-        assert "kda_replay_num_spec" not in allocate.call_args.kwargs
+        assert state.num_speculative_tokens == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -153,6 +153,8 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
     manager.index_state_dim = 384
     manager.num_local_layers = 2
     manager.local_num_mamba_layers = 1
+    manager.mamba_pp_layers = [0]
+    manager._kda_replay = None
     manager.num_kv_heads_per_layer = [0, 1]
     manager.head_dim_per_layer = [512, 512]
     manager.kv_cache_type = CacheTypeCpp.SELFKONLY
