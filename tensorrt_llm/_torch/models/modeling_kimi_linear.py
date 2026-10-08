@@ -104,7 +104,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import is_sm_100f
+from ..._utils import get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -802,12 +802,27 @@ def _helix_cp_v_b_shard(
 # ---------------------------------------------------------------------------
 
 
+def _rubin_mxfp8_is_available() -> bool:
+    """Whether this rank can run the SM107 native block-scaled MXFP8 GEMM.
+
+    Recomputed rather than cached: the SM version cannot change within a run,
+    so weight preparation and forward always agree.
+    """
+    from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    return get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+
 class _Fp8BlockScaleWeightReadLinear(nn.Module):
     """Bias-free FP8 block-scale GEMM for checkpoint attention and converted MLPs.
 
     Attention loads checkpoint E4M3 codes and 128x128 scales directly. The optional
-    MLP path quantizes BF16 weights once at load. Both prepare UE8M0 scales
-    for DeepGEMM and quantize BF16 activations inside the GEMM.
+    MLP path quantizes BF16 weights once at load. On SM100/SM103 the UE8M0
+    scales are packed for DeepGEMM, which quantizes BF16 activations inside the
+    GEMM. On Rubin (SM107) the scales are packed into the CuTe DSL K32 R128c4
+    layout and the activation is quantized by the specialized CuTe quantizer
+    before the native MXFP8 GEMM, which runs with K3's fine-grained low-M
+    tuning buckets.
     """
 
     def __init__(
@@ -834,9 +849,14 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         """Match the ``Linear`` interface consumed by ``GatedMLP``."""
         return False
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        """Whether a producer may hand this GEMM an FP8 activation in CuTe layout."""
+        return _rubin_mxfp8_is_available()
+
     @staticmethod
     def quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """BF16 ``[out, in]`` weight -> (FP8 weight, deep_gemm-ready scale).
+        """BF16 ``[out, in]`` weight -> (FP8 weight, backend-ready scale).
 
         Both dims must be multiples of 128. Because the 128x128 block scale is
         computed per block, concatenating several such weights along ``out``
@@ -856,14 +876,22 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from ...quantization.utils.fp8_utils import (
             resmooth_to_fp8_e8m0,
+            transform_k128_scales_to_cutedsl_mxfp8_layout,
             transform_sf_into_required_layout,
         )
 
-        # fp8_swap_ab_gemm with disable_ue8m0_cast=True consumes packed,
-        # TMA-aligned UE8M0 scales rather than the checkpoint's FP32 grid.
+        # Both GEMMs consume UE8M0 scales rather than the checkpoint's FP32 grid.
         weight_fp8, weight_scale = resmooth_to_fp8_e8m0(
             weight_fp8.contiguous(), weight_scale.contiguous().float()
         )
+        if _rubin_mxfp8_is_available():
+            # cute_dsl_mxfp8_gemm_rubin reads K32 R128c4 UE8M0 scales.
+            weight_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(
+                weight_scale, mn=weight_fp8.shape[0], k=weight_fp8.shape[1]
+            )
+            return weight_fp8, weight_scale
+        # fp8_swap_ab_gemm with disable_ue8m0_cast=True consumes packed,
+        # TMA-aligned UE8M0 scales.
         weight_scale = transform_sf_into_required_layout(
             weight_scale,
             mn=weight_fp8.shape[0],
@@ -909,14 +937,54 @@ class _Fp8BlockScaleWeightReadLinear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         out_shape = (*x.shape[:-1], self.out_features)
-        out = torch.ops.trtllm.fp8_swap_ab_gemm(
-            x.reshape(-1, x.shape[-1]),
-            self.weight,
-            self.weight_scale,
-            output_dtype=x.dtype,
-            disable_ue8m0_cast=True,
-        )
+        x_flat = x.reshape(-1, x.shape[-1])
+        if _rubin_mxfp8_is_available():
+            act_fp8, act_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x_flat)
+            out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                act_fp8,
+                self.weight,
+                act_scale,
+                self.weight_scale,
+                output_dtype=torch.bfloat16,
+                fine_grained_m=True,
+            )
+        else:
+            out = torch.ops.trtllm.fp8_swap_ab_gemm(
+                x_flat,
+                self.weight,
+                self.weight_scale,
+                output_dtype=x.dtype,
+                disable_ue8m0_cast=True,
+            )
         return out.reshape(out_shape)
+
+    def forward_prequantized(
+        self,
+        activation: torch.Tensor,
+        activation_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project an FP8 activation a fused producer already quantized.
+
+        Args:
+            activation: ``[..., in_features]`` ``float8_e4m3fn`` activation.
+            activation_scale: ``uint8`` UE8M0 scales in the CuTe K32 R128c4
+                layout that ``fp8_quantize_1x128_cutedsl_ue8m0`` produces.
+        """
+        if activation.dtype is not torch.float8_e4m3fn:
+            raise TypeError("prequantized Kimi K3 activation must be float8_e4m3fn")
+        if not self.supports_prequantized_input:
+            raise RuntimeError("prequantized Kimi K3 activation requires the Rubin CuTe GEMM")
+        if activation_scale.dtype is not torch.uint8:
+            raise TypeError("prequantized Kimi K3 activation scale must be uint8 R128c4")
+        out = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            activation.reshape(-1, activation.shape[-1]),
+            self.weight,
+            activation_scale,
+            self.weight_scale,
+            output_dtype=torch.bfloat16,
+            fine_grained_m=True,
+        )
+        return out.reshape(activation.shape[:-1] + (self.out_features,))
 
 
 def _swap_linear_to_fp8_weight_read(

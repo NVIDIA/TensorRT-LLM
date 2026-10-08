@@ -142,6 +142,28 @@ def test_single_cute_scale_is_built_on_rubin():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @RUBIN
+def test_checkpoint_pair_carries_cute_scale():
+    """A fused checkpoint FP8 pair must be prepared into the CuTe scale layout."""
+    in_features, parts = 1024, [512, 512]
+    torch.random.manual_seed(6)
+    weights, scales = [], []
+    for p in parts:
+        wp = torch.randn((p, in_features), device="cuda", dtype=torch.bfloat16) / in_features**0.5
+        q, s = per_block_cast_to_fp8(wp)
+        weights.append(q)
+        scales.append(s.float())
+
+    weight, weight_scale = K3Fp8Linear._prepare_weights(
+        torch.cat(weights, dim=0), torch.cat(scales, dim=0)
+    )
+    mod = K3Fp8Linear(weight, weight_scale, sum(parts))
+    assert mod.weight_scale.numel() > 0
+    assert mod.weight_scale.dtype is torch.uint8
+    assert not hasattr(mod, "gemm_alpha")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
 def test_weight_preparation_returns_only_cute_pair():
     """Both construction routes return exactly FP8 weight + prepared scale."""
     torch.random.manual_seed(7)

@@ -13958,6 +13958,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 use_cuda_graph=True,
             )
 
+        class CuteDSLKimiK3MXFP8RubinLinear(CuteDSLMXFP8RubinLinear):
+            """MXFP8 runner with fine-grained tuning for K3's low-M range."""
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0, 0, _get_kimi_k3_mxfp8_tuning_buckets,
+                    _kimi_k3_mxfp8_tuning_bucket), ),
+                constraint_specs=(ConstraintSpec(2, 0,
+                                                 mxfp8_scale_infer_shape), ),
+                use_cold_l2_cache=True,
+                distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+                use_cuda_graph=True,
+            )
+
         class CuteDSLNVFP4InplaceRubinLinear(CuteDSLNVFP4RubinLinear):
             kernel_cache = dict()
             tuning_config = TuningConfig(
@@ -13981,8 +13995,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: torch.Tensor,
             output_dtype: torch.dtype = torch.bfloat16,
             use_tvm_ffi: bool = True,
+            fine_grained_m: bool = False,
         ) -> torch.Tensor:
-            """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales."""
+            """Run the SM107 dense MXFP8 GEMM with K32 R128c4 UE8M0 scales.
+
+            ``fine_grained_m`` enables Kimi K3's 16-token low-M tuning buckets.
+            """
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL MXFP8 only supports bfloat16 output, got "
@@ -13998,8 +14016,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError("CuteDSL MXFP8 scales must be UE8M0 uint8")
 
             alpha = _get_mxfp8_gemm_alpha(input.device)
-            runner = CuteDSLMXFP8RubinLinear(output_dtype=output_dtype,
-                                             use_tvm_ffi=use_tvm_ffi)
+            runner_cls = (CuteDSLKimiK3MXFP8RubinLinear
+                          if fine_grained_m else CuteDSLMXFP8RubinLinear)
+            runner = runner_cls(output_dtype=output_dtype,
+                                use_tvm_ffi=use_tvm_ffi)
             inputs = [input, weight, input_scale, weight_scale, alpha]
             _, best_tactic = AutoTuner.get().choose_one(
                 "trtllm::cute_dsl_mxfp8_gemm_rubin",
@@ -14017,6 +14037,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: torch.Tensor,
             output_dtype: torch.dtype = torch.bfloat16,
             use_tvm_ffi: bool = True,
+            fine_grained_m: bool = False,
         ) -> torch.Tensor:
             shape = list(mat_a.shape)
             shape[-1] = mat_b.shape[-2]
