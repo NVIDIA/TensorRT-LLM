@@ -345,6 +345,13 @@ def render_chat(
     prepared = prepare_chat_request(request, res)
 
     if res.use_harmony:
+        if getattr(request.tool_choice, "function", None) is not None:
+            # The Harmony chat route refuses a named tool_choice rather than degrade it to
+            # "auto"; ids rendered for it would not be an executable prompt.
+            raise UnsupportedRenderError(
+                "tool_choice with a named function is not yet supported for harmony / "
+                "GPT-OSS models."
+            )
         token_ids = res.extension.render_prompt(request, res)
         if token_ids is not None:
             return RenderedPrompt(token_ids=list(token_ids))
