@@ -131,10 +131,9 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
 
 
 def test_native_prefetch_skipped_when_checkpoint_exceeds_cgroup_budget(tmp_path, monkeypatch):
-    # Regression test for #19933: a checkpoint that fits host-wide memory
-    # but exceeds the cgroup budget must skip native prefetch (the native
-    # getter previously read host-wide memory and prefetched it), while
-    # normal weight loading continues.
+    # Native prefetch is gated on cgroup-aware availability: a checkpoint
+    # that fits host-wide memory but exceeds the cgroup budget skips
+    # prefetch while normal weight loading proceeds.
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead as read_ahead
@@ -174,6 +173,50 @@ def test_native_prefetch_skipped_when_checkpoint_exceeds_cgroup_budget(tmp_path,
     prefetch_files.assert_not_called()
     load_weights_in_parallel.assert_called_once()
     assert set(weights.keys()) == {"foo.weight"}
+
+
+def test_rank_striped_fallback_skips_native_prefetch_on_cgroup_budget(tmp_path, monkeypatch):
+    # Rank-striped admission rejects the load on its cgroup budget, native
+    # fallback runs, and native prefetch stays skipped while normal loading
+    # proceeds to completion.
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models.checkpoints.hf import rank_striped_read_ahead as read_ahead
+    from tensorrt_llm._torch.models.checkpoints.hf import weight_loader as wl
+
+    GiB = 1 << 30
+    monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
+    monkeypatch.setattr(wl, "ENABLE_MULTI_DEVICE", False)
+    monkeypatch.setattr(
+        read_ahead.psutil,
+        "virtual_memory",
+        lambda: SimpleNamespace(available=256 * GiB),
+    )
+    monkeypatch.setattr(read_ahead, "cgroup_available_host_memory", lambda: 32 * GiB)
+
+    checkpoint_dir = tmp_path / "foo"
+    checkpoint_dir.mkdir()
+    sparse_file = checkpoint_dir / "model.safetensors"
+    sparse_file.touch()
+    os.truncate(sparse_file, 64 * GiB)
+
+    loader = HfWeightLoader(checkpoint_io_policy="rank_striped_read_ahead")
+    with (
+        mock.patch.object(
+            loader,
+            "_load_weights_in_parallel",
+            return_value=ConsumableWeightsDict({"foo.weight": object()}),
+        ) as load_weights_in_parallel,
+        mock.patch.object(loader, "prefetch_files") as prefetch_files,
+    ):
+        with loader.open_weight_session(str(checkpoint_dir), mapping=Mapping()) as weights:
+            assert set(weights.keys()) == {"foo.weight"}
+
+    prefetch_files.assert_not_called()
+    load_weights_in_parallel.assert_called_once()
+    status = loader.last_checkpoint_io_status
+    assert status.effective == "native"
+    assert "exceed available host memory" in status.fallback_reason
 
 
 def test_weight_cache_reuses_raw_weights_with_fresh_consumable_wrapper(tmp_path, monkeypatch):

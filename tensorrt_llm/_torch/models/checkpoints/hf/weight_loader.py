@@ -313,11 +313,8 @@ class HfWeightLoader(BaseWeightLoader):
         because the ranks that think prefetch is enabled will wait at a local
         mpi barrier indefinitely for the ranks that do not.
 
-        The cgroup-aware effective availability is used (instead of raw
-        host-wide ``psutil.virtual_memory().available``) so that a load
-        rejected by rank-striped read-ahead admission for exceeding its
-        cgroup budget cannot re-enter native fallback and prefetch the full
-        checkpoint against the larger host budget.
+        Uses cgroup-aware availability, consistent with rank-striped
+        read-ahead admission.
         """
         available_host_memory = effective_available_host_memory()
         if ENABLE_MULTI_DEVICE:
