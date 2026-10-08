@@ -12,7 +12,6 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.compilation.backend import Backend
-from tensorrt_llm._torch.pyexecutor.engine import metadata as metadata_module
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners import resolve_runner_type
@@ -70,14 +69,6 @@ def _make_runner(
     buffers = InputBuffers(
         input_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
         position_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
-        gather_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int)
-        if config.spec_config is not None
-        else None,
-        draft_tokens_cuda=torch.empty(
-            config.max_draft_loop_tokens * config.max_batch_size, dtype=torch.int
-        )
-        if config.spec_config is not None
-        else None,
     )
     kwargs = dict(mapping=SimpleNamespace(), dist=SimpleNamespace(), moe_load_balancer=None)
     if issubclass(runner_type, PoolingRunner):
@@ -99,12 +90,6 @@ def _config() -> NoKVCacheRunnerConfig:
         prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
         prefill_cuda_graph_num_tokens=[],
         mm_encoder_cache_enabled=False,
-        spec_config=None,
-        num_seq_slots=None,
-        original_max_draft_len=0,
-        original_max_total_draft_tokens=0,
-        spec_dec_max_total_draft_tokens=0,
-        max_draft_loop_tokens=0,
     )
 
 
@@ -396,64 +381,6 @@ def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.num_heads_per_kv == 4
     assert first.block_ids_per_seq is None
     assert first.kv_block_ids_per_seq is None
-
-
-def test_no_kv_cache_runner_owns_spec_metadata_setup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec_mode = SimpleNamespace(
-        attention_need_spec_dec_mode=Mock(return_value=True),
-        is_parallel_draft=Mock(return_value=False),
-    )
-    spec_metadata = SimpleNamespace(
-        spec_dec_mode=spec_mode,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=False,
-    )
-    get_spec_metadata = Mock(return_value=spec_metadata)
-    monkeypatch.setattr(metadata_module, "get_spec_metadata", get_spec_metadata)
-    runner = _make_runner(
-        PoolingRunner,
-        _model(is_generation=False),
-        replace(
-            _config(),
-            spec_config=SimpleNamespace(
-                get_runtime_tokens_per_gen_step=lambda runtime_draft_len: runtime_draft_len + 1,
-            ),
-            original_max_draft_len=2,
-            spec_dec_max_total_draft_tokens=3,
-        ),
-    )
-    attn_metadata = SimpleNamespace(update_spec_dec_param=Mock())
-    scheduled_requests = SimpleNamespace(
-        batch_size=2,
-        num_context_requests=2,
-        context_requests=[object(), object()],
-        generation_requests=[],
-    )
-    resource_manager = SimpleNamespace(get_resource_manager=Mock(return_value=None))
-
-    result = runner.setup_spec_metadata(
-        scheduled_requests,
-        resource_manager,
-        attn_metadata,
-        runtime_draft_len=1,
-    )
-
-    assert result is spec_metadata
-    assert spec_metadata.runtime_draft_len == 1
-    assert spec_metadata.runtime_tokens_per_gen_step == 2
-    attn_metadata.update_spec_dec_param.assert_called_once_with(
-        batch_size=2,
-        is_spec_decoding_enabled=True,
-        is_spec_dec_tree=True,
-        is_spec_dec_dynamic_tree=False,
-        max_draft_len=2,
-        max_total_draft_tokens=3,
-        spec_metadata=spec_metadata,
-        spec_tree_manager=None,
-        num_contexts=2,
-    )
 
 
 def test_pooling_runner_owns_forward_output_processing(

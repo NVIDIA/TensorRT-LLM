@@ -565,6 +565,11 @@ class PyTorchModelEngine(ModelEngine):
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
+        if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):
+            raise ValueError(
+                f"{runner_cls.__name__} does not support speculative decoding; "
+                "pooling and multimodal encoder models must not set "
+                "speculative_config.")
 
         if self.is_spec_decode:
             update_spec_config_from_loaded_model(self.spec_config, self.model)
@@ -685,14 +690,6 @@ class PyTorchModelEngine(ModelEngine):
             attention_backend=self.attn_backend,
             attention_runtime_features=self.attn_runtime_features,
             mm_encoder_cache_enabled=self._mm_encoder_cache_enabled,
-            spec_config=self.spec_config,
-            num_seq_slots=self.max_num_seq_slots,
-            original_max_draft_len=self.original_max_draft_len,
-            original_max_total_draft_tokens=(
-                self.original_max_total_draft_tokens),
-            spec_dec_max_total_draft_tokens=(
-                self._spec_dec_max_total_draft_tokens),
-            max_draft_loop_tokens=self.max_draft_loop_tokens,
         )
         if issubclass(runner_cls, PoolingRunner):
             return runner_cls(

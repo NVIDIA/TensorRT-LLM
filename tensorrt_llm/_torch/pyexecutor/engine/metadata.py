@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
-    from .runners.interface import SpecDecodeRunnerConfig
+    from .runners.decoder.config import DecoderRunnerConfig
 
 __all__ = [
     "build_attention_metadata",
@@ -111,7 +111,7 @@ def get_spec_managers(
 
 
 def create_spec_metadata(
-    config: SpecDecodeRunnerConfig,
+    config: DecoderRunnerConfig,
     pretrained_config: object,
     spec_resource_manager: BaseResourceManager | None,
 ) -> SpecMetadata | None:
@@ -129,7 +129,7 @@ def create_spec_metadata(
 
 def update_spec_metadata(
     spec_metadata: SpecMetadata,
-    config: SpecDecodeRunnerConfig,
+    config: DecoderRunnerConfig,
     scheduled_requests: ScheduledRequests,
     attn_metadata: AttentionMetadata,
     spec_tree_manager: SpecTreeManager | None,

@@ -1534,6 +1534,23 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 for name in decoder_only:
                     self.assertEqual(hasattr(runner, name), is_generation, name)
 
+    def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
+        for mm_encoder_only, runner_name in ((False, "PoolingRunner"),
+                                             (True, "MultimodalEncoderRunner")):
+            with self.subTest(runner=runner_name):
+                llm_args = TorchLlmArgs(model="dummy",
+                                        max_batch_size=4,
+                                        max_num_tokens=64,
+                                        mm_encoder_only=mm_encoder_only)
+                with self.assertRaisesRegex(
+                        ValueError,
+                        f"{runner_name} does not support speculative decoding"):
+                    DummyModelEngine(
+                        llm_args,
+                        torch.half,
+                        spec_config=SADecodingConfig(max_draft_len=1),
+                        is_generation=False)
+
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
         runner = Mock()
         engine = object.__new__(PyTorchModelEngine)
