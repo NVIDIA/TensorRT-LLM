@@ -59,6 +59,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
+    BufferId,
     CacheLevel,
     CudaStream,
     DataRole,
@@ -390,6 +391,8 @@ def _make_manager_for_cache_tier_test(
         fake_impl.layer_grouping = [[0]]
         fake_impl.pool_group_descs = []
         fake_impl.get_layer_group_id.side_effect = lambda _: 0
+        fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
+        fake_impl.is_sparse.return_value = False
 
     module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
     with (
@@ -2434,6 +2437,8 @@ def _index_mapper_capacity_for(
     fake_impl.layer_grouping = [[0]]
     fake_impl.pool_group_descs = []
     fake_impl.get_layer_group_id.side_effect = lambda _: 0
+    fake_impl.all_buffer_ids = [BufferId(LayerId(0), Role.KEY)]
+    fake_impl.is_sparse.return_value = False
 
     def build_base_config(
         self: KVCacheManagerV2,
