@@ -1,9 +1,9 @@
 schema_version: 1
 vendors:
   flashinfer-prims-ts:
-    url: https://github.com/flashinfer-ai/flashinfer.git
-    branch: main
-    commit: 461037fbf52227e6343ccbc9fc977337c1bf672b
+    url: https://github.com/harrisonzhy/flashinfer.git
+    branch: harrisonzhy/primsts_fmha_qk16v8_perf-bringup
+    commit: 4a58d3d13460b64fa4f7d7b19fb21215d86b3687
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
