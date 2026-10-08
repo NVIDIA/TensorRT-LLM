@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
         torch.complex128,
     ],
 )
-@pytest.mark.parametrize("shape", [(7,), (1, 1), (3, 1), (8, 1235), (5, 64)])
+@pytest.mark.parametrize("shape", [(7,), (1, 1), (3, 1), (8, 1235), (5, 64), (3, 0), (0, 4)])
 @pytest.mark.parametrize("shift", [0, 1, 3, 63, 64, 65, -1, -1300, 1300])
 def test_matches_torch_roll(dtype, shape, shift):
     torch.manual_seed(0)
