@@ -485,6 +485,14 @@ Use ``trtllm-serve-disagg-config.schema.json`` for ``disaggregated --config`` an
 ``trtllm-serve-visual-gen-config.schema.json`` for ``--visual_gen_args``, in the same
 schema directory. These describe YAML files, not CLI flags or ``--set`` assignments.
 
+View or download the JSON schemas for this documentation version:
+
+* `Serving schema <../../_static/schemas/trtllm-serve-config.schema.json>`_
+* `Disaggregated serving schema <../../_static/schemas/trtllm-serve-disagg-config.schema.json>`_
+* `VisualGen schema <../../_static/schemas/trtllm-serve-visual-gen-config.schema.json>`_
+
+To save a schema, right-click its link and select **Save link as**.
+
 Schemas check field names, nested structure, types, and declarative constraints.
 Runtime checks still determine model/GPU compatibility, file existence, and
 cross-field validity. Custom Python validators, free-form mappings, and the

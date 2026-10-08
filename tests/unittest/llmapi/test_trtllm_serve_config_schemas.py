@@ -200,6 +200,48 @@ def test_serving_field_guard_rejects_empty_scan() -> None:
         _assert_serving_fields_in_schema("def serve(): pass", "serve", {})
 
 
+@pytest.mark.parametrize(
+    ("name", "definition", "field", "valid_values", "invalid_values"),
+    [
+        (
+            "free_gpu_memory_fraction",
+            "KvCacheConfig",
+            "free_gpu_memory_fraction",
+            (None, 0, 0.5, 1),
+            (-0.1, 1.1, "bad"),
+        ),
+        ("kv_cache_dtype", "KvCacheConfig", "dtype", ("auto", "fp8"), (None, 42)),
+        (
+            "video_pruning_rate",
+            "MultimodalConfig",
+            "video_pruning_rate",
+            (None, 0, 0.5),
+            (-0.1, 1, "bad"),
+        ),
+    ],
+)
+def test_disagg_flat_fields_reuse_nested_schemas(
+    schemas: dict[str, dict],
+    name: str,
+    definition: str,
+    field: str,
+    valid_values: tuple,
+    invalid_values: tuple,
+) -> None:
+    schema = schemas[generator.DISAGG_SCHEMA]
+    expected = schemas[generator.SERVE_SCHEMA]["$defs"][definition]["properties"][field]
+    assert schema["properties"][name] == expected
+    assert schema["$defs"]["DisaggServerBlock"]["properties"][name] == expected
+    validator = Draft202012Validator(schema)
+    for section in (None, "context_servers", "generation_servers"):
+        for valid, values in ((True, valid_values), (False, invalid_values)):
+            for value in values:
+                config = {name: value}
+                if section is not None:
+                    config = {section: config}
+                assert validator.is_valid(config) == valid, config
+
+
 def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
     from tensorrt_llm.llmapi.disagg_utils import DISAGG_NODE_ID_BITS
 

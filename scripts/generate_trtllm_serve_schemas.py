@@ -36,6 +36,7 @@ VISUAL_GEN_SCHEMA = "trtllm-serve-visual-gen-config.schema.json"
 class ServeSchemaGenerator(GenerateJsonSchema):
     """Keep YAML-representable union branches and ignore autodoc-only type labels."""
 
+    # Recheck these overrides on Pydantic upgrades; they inspect its schema internals.
     def handle_invalid_for_json_schema(
         self, schema: core_schema.CoreSchema, error_info: str
     ) -> JsonSchemaValue:
@@ -101,29 +102,34 @@ def generate_serve_schema() -> dict:
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig
     from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, TorchLlmArgs
 
+    # Annotated fields are derived; config changes still require snapshot regeneration and CPU tests.
     schema = _schema_for(TorchLlmArgs)
     # MODEL is supplied on the command line; nested required fields still apply.
     schema["required"] = [name for name in schema.get("required", []) if name != "model"]
     properties = schema["properties"]
+    # Keep YAML-only fields/aliases aligned with serve.py and update_llm_args_with_extra_dict().
     properties.update(
         hf_revision=copy.deepcopy(properties["revision"]),
         allow_request_chat_template={"type": "boolean", "default": False},
         internal_request_auth_key=_nullable({"type": "string", "minLength": 1}),
         disagg_cluster=_nullable(_schema_for(DisaggClusterConfig, schema)),
     )
-    # Serving and field validators normalize these values before model validation.
+    # Update these input exceptions when serving merges or llm_args.py validators change normalization.
     properties["env_overrides"] = _nullable({"type": "object", "additionalProperties": True})
     properties["multimodal_config"] = _nullable(properties["multimodal_config"])
     properties["telemetry_config"] = _nullable(properties["telemetry_config"])
     # The runtime infers mode when it is omitted; both variants can match a partial config.
+    # Revisit this relaxation when infer_cuda_graph_config_mode() changes.
     for branch in properties["cuda_graph_config"]["anyOf"]:
         if "oneOf" in branch:
             branch["anyOf"] = branch.pop("oneOf")
             branch.pop("discriminator", None)
+    # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer().
     schema["$defs"]["MoeConfig"]["properties"]["load_balancer"] = {
         "anyOf": [_schema_for(MoeLoadBalancerConfig, schema), {"type": ["string", "null"]}]
     }
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
+    # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):
         properties[name] = {
             "type": "null",
@@ -133,7 +139,7 @@ def generate_serve_schema() -> dict:
     user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
     user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
     user_draft["resource_manager"] = {"type": "null"}
-    # The deprecated native decoding config is accepted as a mapping by the YAML loader.
+    # Update this mapping exception when the YAML loader changes legacy DecodingConfig support.
     properties["decoding_config"] = {"type": ["object", "null"]}
     return schema
 
@@ -150,15 +156,19 @@ def generate_disagg_schema() -> dict:
 
     schema = generate_serve_schema()
     properties = schema["properties"]
-    properties.update(
-        free_gpu_memory_fraction={"type": "number", "minimum": 0, "maximum": 1},
-        kv_cache_dtype={"type": "string"},
-        video_pruning_rate={"type": "number"},
-    )
+    # Keep flat aliases aligned with get_llm_args(); constraints come from the nested schemas.
+    for name, (definition, field) in {
+        "free_gpu_memory_fraction": ("KvCacheConfig", "free_gpu_memory_fraction"),
+        "kv_cache_dtype": ("KvCacheConfig", "dtype"),
+        "video_pruning_rate": ("MultimodalConfig", "video_pruning_rate"),
+    }.items():
+        properties[name] = copy.deepcopy(schema["$defs"][definition]["properties"][field])
     worker = _schema_for(extract_ctx_gen_cfgs, schema)
+    # Only type is required and supplied internally; revisit if worker inputs gain required fields.
     worker["properties"].pop("type")
     worker.pop("required", None)
     worker["properties"] = properties | worker["properties"]
+    # Keep the default aligned with extract_router_config(); router-specific keys stay open.
     worker["properties"]["router"] = {
         "type": "object",
         "properties": {"type": {"type": "string", "default": "round_robin"}},
@@ -168,6 +178,7 @@ def generate_disagg_schema() -> dict:
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]
+    # Update these refinements when extract_disagg_cfg() changes its untyped mapping inputs.
     for name in ("context_servers", "generation_servers"):
         orchestrator[name] = _nullable({"$ref": "#/$defs/DisaggServerBlock"})
     orchestrator["conditional_disagg_config"] = _nullable(
@@ -176,6 +187,7 @@ def generate_disagg_schema() -> dict:
     orchestrator["otlp_config"] = _nullable(_schema_for(OtlpConfig, schema))
     orchestrator["disagg_cluster"] = properties["disagg_cluster"]
     orchestrator["internal_request_auth_key"] = properties["internal_request_auth_key"]
+    # Mirror extract_disagg_cfg()'s node_id validation; the bit limit is shared.
     orchestrator["node_id"] = {
         "type": ["integer", "null"],
         "minimum": 0,
