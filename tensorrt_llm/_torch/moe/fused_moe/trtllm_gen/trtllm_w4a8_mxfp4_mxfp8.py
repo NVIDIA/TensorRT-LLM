@@ -61,6 +61,10 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         896 experts, top-16, hidden 3584 and at most 64 tokens. The checks
         below mirror its ``TORCH_CHECK``s so a miss declines quietly instead of
         raising, which keeps every other model and shape on the unfused path.
+
+        It runs as ``trtllm::k3_route_quant``, the CuTe DSL form of
+        ``trtllm::kimi_k3_noaux_tc_mxfp8_quant``: the same outputs bit for bit
+        (top-16 order included), in about a third of the time.
         """
         if os.environ.get("TLLM_K3_DISABLE_FUSED_ROUTE_QUANT", "0") == "1" or isinstance(
             x, MxFp8QuantizedTensor
@@ -93,6 +97,9 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         ):
             return None
 
-        return torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+        # Registers trtllm::k3_route_quant.
+        from ....cute_dsl_kernels.k3_route_quant import op as _k3_route_quant_op  # noqa: F401
+
+        return torch.ops.trtllm.k3_route_quant(
             router_logits, bias, x, routing.routed_scaling_factor
         )

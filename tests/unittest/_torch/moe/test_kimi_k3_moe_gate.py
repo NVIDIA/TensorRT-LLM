@@ -3,6 +3,7 @@
 """Parity tests for the production Kimi K3 MoE routing method."""
 
 import dataclasses
+import types
 
 import pytest
 import torch
@@ -103,3 +104,35 @@ def test_fused_route_quant_matches_unfused_chain(num_tokens):
     assert torch.equal(scales.view(torch.int16), ref_scales.to(torch.bfloat16).view(torch.int16))
     assert torch.equal(quantized.view(torch.uint8), ref_quantized.view(torch.uint8))
     assert torch.equal(quant_scales, ref_quant_scales.view(num_tokens, -1))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0),
+    reason="the TRTLLM-Gen backend's fused route+quant runs trtllm::k3_route_quant (CuTe DSL), sm_100",
+)
+@pytest.mark.parametrize("num_tokens", [1, 8, 9, 64])
+def test_backend_fused_route_quant_matches_kimi_k3_noaux_tc_mxfp8_quant(num_tokens):
+    """The TRTLLM-Gen W4A8 MXFP4 backend's fused Kimi K3 route + MXFP8 quant returns what
+    kimi_k3_noaux_tc_mxfp8_quant returns for the same inputs, bit for bit (the top-16 order included)."""
+    from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_w4a8_mxfp4_mxfp8 import (
+        TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
+    )
+
+    torch.manual_seed(0x5EED + num_tokens)
+    scores = torch.randn(num_tokens, 896, dtype=torch.float32, device="cuda")
+    bias = torch.randn(896, dtype=torch.float32, device="cuda")
+    hidden_states = torch.randn(num_tokens, 3584, dtype=torch.bfloat16, device="cuda")
+    routed_scaling_factor = 2.446
+    routing = DeepSeekV3MoeRoutingMethod(16, 1, 1, routed_scaling_factor, lambda: bias)
+    backend = types.SimpleNamespace(routing_method=routing)
+
+    got = TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.try_fused_route_quant(backend, hidden_states, scores)
+    want = torch.ops.trtllm.kimi_k3_noaux_tc_mxfp8_quant(
+        scores, bias, hidden_states, routed_scaling_factor
+    )
+
+    assert got is not None
+    for name, g, w in zip(("experts", "scales", "quantized", "quant_scales"), got, want):
+        assert g.dtype == w.dtype and g.shape == w.shape, name
+        assert torch.equal(g.contiguous().view(torch.uint8), w.contiguous().view(torch.uint8)), name

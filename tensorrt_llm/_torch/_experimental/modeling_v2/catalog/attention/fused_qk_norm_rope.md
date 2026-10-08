@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 9}
+  sm_100: {status: passed, tests: 10}
 ---
 
 # fused_qk_norm_rope
@@ -156,3 +157,7 @@ purely per-token).
 - TRT-LLM's own caller derives `factor/low/high/attention_factor` from a
   YaRN config and uses `rotary_dim = head_dim * partial_rotary_factor`;
   this entry exposes them raw.
+- Kimi K3's DSpark drafter calls it with `head_dim` 64, 6 query heads per KV head (6 / 1 at TP16, 24 / 4 at TP4),
+  1-64 tokens, `eps` 1e-5, `base` 10000, NeoX: `test_bf16_neox_kimi_k3_drafter`, which runs on sm_100 only. The
+  sm_100 receipt covers the whole file (10 tests). The sm_103 receipt pre-dates that cell and covers the other 9;
+  CI's `l0_b300` run re-certifies them, since the K3 cell skips off SM 10.0.
