@@ -21,8 +21,6 @@ pyyaml>=6.0.1,<6.0.3
 requests>=2.32.4,<3
 boto3
 einops
-# Reference implementation for KDA kernel parity tests.
-flash-linear-attention==0.5.2
 lpips
 graphviz
 mypy==1.19.1
