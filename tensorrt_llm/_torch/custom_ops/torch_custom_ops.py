@@ -39,6 +39,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from ..moe.workspace import register_cutlass_workspace
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
@@ -382,6 +383,7 @@ def fused_moe(
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
     run_moe_args.append(swiglu_clamp_after_silu)
+    register_cutlass_workspace(moe_runner.fused_moe_runner, input.device)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:

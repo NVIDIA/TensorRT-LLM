@@ -20,8 +20,48 @@ This can reduce memory retained after workload spikes, but demand tracking and
 repeated reclamation/reallocation can affect performance. It does not reduce the
 initial spike's allocation requirement or necessarily reduce allocator-reserved
 memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
-this behavior if it causes performance regression. Currently this setting only
-controls eager attention workspace reclamation, not all GPU memory management.
+this behavior if it causes performance regression. This setting also controls eager CUTLASS MoE runner workspace reclamation.
+CUTLASS uses its native workspace sizing to accumulate the maximum demand across
+all layers and chunks in a model forward. After three successful forwards using at most half the retained capacity, it
+replaces the backing with the largest actual requirement in that window. Unlike
+the attention policy, maximum-shape warmup is not a permanent minimum for this
+pure scratch buffer; it can shrink after warmup even without a serving spike.
+Previously observed demand is reserved at the next model-forward entry so model
+intermediates do not consume and fragment the released burst-sized block first.
+This reduces active allocations; allocator-reserved and device memory can remain
+unchanged even when the released capacity is successfully reused.
+Runners/streams first encountered after warmup are not reclaimed. Captured
+workspace, cross-engine sharing, and use outside the tracked forward opt out;
+speculative, CP, encoder-decoder, compiled, breakable-graph and multi-stream
+execution are excluded. CUDA graph allocations remain unchanged. This setting
+does not control all GPU memory management.
+
+#### CUTLASS reclamation validation
+
+`pytest tests/unittest/_torch/moe/test_workspace_cuda.py` runs FP16/BF16
+output parity across 50 growth/reclamation cycles and CUDA graph replay checks.
+It requires native libraries built from the same source revision.
+For manual operator measurements, run each allocator in a fresh process:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=backend:native python tests/unittest/_torch/moe/test_workspace_cuda.py --benchmark --output /tmp/moe-native.json
+PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync python tests/unittest/_torch/moe/test_workspace_cuda.py --benchmark --output /tmp/moe-async.json
+```
+
+The benchmark alternates enabled/disabled order across five fresh runner pairs,
+with no reclamation and low/medium/high-frequency workloads. It compares output
+tensors outside timing. For memory comparisons, run `--memory-only --enabled 0`
+and `--memory-only --enabled 1` in separate fresh processes (with distinct
+`--output` files), holding the allocator fixed and reversing arm order on a
+second pair. This avoids contamination by earlier arms' allocator pools.
+Memory sequences include native-sized workspace growth, three underfilled
+forwards, a synthetic later allocation, and regrowth. JSON records allocated/reserved peaks, boundary device usage,
+and 5 ms NVML samples; startup/warmup are excluded from those memory peaks.
+Compare enabled/disabled arms within the same allocator. These are operator
+measurements, not model throughput, OOM capacity, or representative serving
+traffic. Sampled device peaks can miss transients. Full-model validation must
+also keep attention reclamation fixed to isolate the MoE change, since the
+shared environment variable controls both.
 
 ### Profiling Features
 

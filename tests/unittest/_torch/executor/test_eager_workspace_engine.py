@@ -170,6 +170,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = object.__new__(PyTorchModelEngine)
         self.engine._eager_workspace_reclaimer = None
+        self.engine._moe_workspace_reclaimer = None
         self.engine.is_spec_decode = False
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
@@ -178,6 +179,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
+        self.metadata._num_tokens = 128
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
         self.engine.attn_metadata = self.metadata
         self.engine.model = SimpleNamespace(
@@ -228,6 +230,40 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.assertEqual(self.call(), 42)
         scope.assert_called_once_with(self.metadata)
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
+
+    def test_moe_scope_tracks_warmup_and_serving_but_not_profiling(self) -> None:
+        reclaimer = Mock()
+        reclaimer.forward.return_value = ExitStack()
+        self.engine._moe_workspace_reclaimer = reclaimer
+        self.assertEqual(self.call(is_dummy=True), 42)
+        reclaimer.forward.assert_not_called()
+        self.engine._is_warmup = True
+        self.assertEqual(self.call(is_dummy=True), 42)
+        reclaimer.forward.assert_called_once_with(warmup=True, num_tokens=128)
+        self.engine._is_warmup = False
+        reclaimer.reset_mock()
+        self.assertEqual(self.call(), 42)
+        reclaimer.forward.assert_called_once_with(warmup=False, num_tokens=128)
+
+    def test_moe_reclamation_eligibility_and_escape_hatch(self) -> None:
+        with (
+            patch.object(self.engine, "_is_encoder_decoder_model", return_value=False),
+            patch(f"{_ENGINE_MODULE}.CutlassWorkspaceReclaimer") as factory,
+        ):
+            for flag, expected in [("0", False), ("1", True)]:
+                with patch.dict(os.environ, {"TRTLLM_RECLAIM_WORKSPACE": flag}):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertEqual(self.engine._moe_workspace_reclaimer is not None, expected)
+            factory.assert_called_once()
+            for name, value in [
+                ("is_spec_decode", True),
+                ("_torch_compile_backend", object()),
+                ("breakable_cuda_graph_runner", object()),
+            ]:
+                with patch.object(self.engine, name, value):
+                    self.engine._initialize_moe_workspace_reclaimer()
+                    self.assertIsNone(self.engine._moe_workspace_reclaimer)
+            factory.assert_called_once()
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
         self.freeze(is_encoder_decoder=True)
