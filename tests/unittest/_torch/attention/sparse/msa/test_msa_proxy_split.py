@@ -1,11 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 MSA indexer proxy: segmented, KV-split fmha_sm100 plans.
-
-The CPU tests pin the split rule and the segment/page layout. The CUDA tests
-compare the segmented plans bitwise against the unsplit reference and check
-that prewarm loads every fmha_sm100 variant they run.
-"""
+"""MiniMax-M3 MSA indexer proxy: segmented, KV-split fmha_sm100 plans."""
 
 from types import ModuleType, SimpleNamespace
 
@@ -23,7 +18,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 @pytest.mark.parametrize(
     ("qo_lens", "qo_offsets", "num_index_heads", "expected"),
     [
-        # About one wave of 148 SMs.
         ([1025], [131072], 1, 16),
         ([2080], [131072], 1, 8),
         ([4128], [131072], 1, 4),
@@ -50,7 +44,6 @@ def test_proxy_kv_splits_fill_one_wave(
 
 @pytest.mark.cpu_only
 def test_segmented_proxy_plan_keeps_causal_windows_and_row_pages() -> None:
-    """Each segment sees exactly its queries' keys and reads its own row's leading pages."""
     planned = {}
 
     def fmha_sm100_plan(qo_lens, kv_lens, **kwargs):
@@ -77,7 +70,6 @@ def test_segmented_proxy_plan_keeps_causal_windows_and_row_pages() -> None:
 
 
 def _fmha_sm100_or_skip() -> ModuleType:
-    """The packaged fmha_sm100 module, skipping where it cannot run."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability()[0] != 10:
@@ -111,11 +103,7 @@ _SEGMENTED_PROXY_ROWS = {
 def test_segmented_proxy_scores_match_unsplit_bitwise(
     indexer_dtype: torch.dtype, num_index_heads: int, rows: tuple[tuple[int, int], ...]
 ) -> None:
-    """Segmenting the proxy plan and splitting it along KV must not change a bit.
-
-    Top-k block selection ranks these scores, so the whole buffer, including
-    the -inf entries a query cannot see, has to match the unsplit plan's.
-    """
+    """Top-k ranks these scores, so the whole buffer, -inf entries included, must match."""
     fmha_sm100 = _fmha_sm100_or_skip()
     page_size = head_dim = 128
     sm_scale = head_dim**-0.5
@@ -185,8 +173,6 @@ def test_segmented_proxy_scores_match_unsplit_bitwise(
 
 
 def test_prewarm_loads_every_segmented_proxy_variant(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A segmented proxy plan may only run variants prewarm loaded; any other
-    would compile inline on the first long-prefix chunk, stalling serving."""
     fmha_sm100 = _fmha_sm100_or_skip()
     from fmha_sm100 import api as fmha_api
 

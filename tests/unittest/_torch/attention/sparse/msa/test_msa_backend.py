@@ -1368,11 +1368,6 @@ def test_plan_rows_narrow_to_the_rows_fmha_sm100_still_runs():
 def test_long_prefix_chunk_gets_a_split_proxy_plan_over_its_own_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A chunk after a long cached prefix gets a segmented, KV-split proxy plan.
-
-    Its page table is gathered from the context row's pages only, never the
-    generation rows'.
-    """
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import msa_backend, msa_indexer
 
     def fmha_sm100_plan(qo_lens, kv_lens, **kwargs):
@@ -1383,8 +1378,9 @@ def test_long_prefix_chunk_gets_a_split_proxy_plan_over_its_own_pages(
     )
     monkeypatch.setattr(msa_backend, "_cache_device", lambda metadata: torch.device("cpu"))
     monkeypatch.setattr(msa_indexer, "_num_sms", lambda: 148)
-    # 1025 new tokens over 131072 cached, then two generation rows.
-    metadata = _span_metadata(num_contexts=1, qo_lens=(1025, 1, 1), kv_lens=(132097, 50000, 60000))
+    metadata = _span_metadata(
+        num_contexts=1, qo_lens=(1025, 1, 1), kv_lens=(131072 + 1025, 50000, 60000)
+    )
     metadata._set_decode_span()
     metadata._msa_fields_ready = True
     metadata._msa_params = SimpleNamespace(
@@ -1401,12 +1397,10 @@ def test_long_prefix_chunk_gets_a_split_proxy_plan_over_its_own_pages(
     proxy = metadata.msa_prefill_proxy_plan
     assert proxy["qo_lens"] == [128] * 8 + [1]
     assert proxy["num_kv_splits"] == 16 and proxy["output_maxscore"]
-    # Segment i reads its row's leading ceil(kv_len_i / 128) pages.
     expected = torch.cat(
         [torch.arange(7, 7 + 1025 + i) for i in range(8)] + [torch.arange(7, 7 + 1033)]
     )
     assert torch.equal(metadata.msa_prefill_proxy_kv_indices, expected.to(torch.int32))
-    # The attention plans still cover the context row whole.
     assert metadata.msa_prefill_dense_plan["qo_lens"] == [1025]
 
 

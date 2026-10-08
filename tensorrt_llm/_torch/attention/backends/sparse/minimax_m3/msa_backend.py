@@ -282,11 +282,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
 
     @property
     def msa_prefill_proxy_kv_indices(self) -> Optional[torch.Tensor]:
-        """Flattened page table msa_prefill_proxy_plan reads.
-
-        msa_kv_indices, unless the plan cut its rows into segments, each of
-        which reads its own copy of its row's pages; see plan_proxy.
-        """
+        """Flattened page table msa_prefill_proxy_plan reads; see plan_proxy."""
         kv_indices = self._msa_prefill_proxy_kv_indices
         return self.msa_kv_indices if kv_indices is None else kv_indices
 

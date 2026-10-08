@@ -162,8 +162,7 @@ def _proxy_max_score(
 # fmha_sm100 splits KV only on its 128-query tile, so a split proxy plan cuts
 # each row into segments of at most this many queries.
 _PROXY_SEGMENT_LEN = 128
-# Below this cached prefix the unsplit proxy is already short, and the split
-# plan's longer GPU planner pass would take back most of what splitting saves.
+# Below this cached prefix the split plan's longer GPU planner pass eats most of the saving.
 _PROXY_SPLIT_MIN_PREFIX = 4096
 # fmha_sm100 allocates about 2.6 MB of plan workspace per split.
 _PROXY_MAX_KV_SPLITS = 16
@@ -171,19 +170,16 @@ _PROXY_MAX_KV_SPLITS = 16
 
 @functools.lru_cache(maxsize=1)
 def _num_sms() -> int:
-    """SM count fmha_sm100 schedules a plan over: the current device's."""
-    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    return torch.cuda.get_device_properties().multi_processor_count
 
 
 def _proxy_kv_splits(qo_lens: list[int], qo_offsets: list[int], num_index_heads: int) -> int:
     """KV splits for a segmented proxy plan over these rows, or 0 to plan them unsplit.
 
     The unsplit plan gives a short chunk after a long cached prefix a handful
-    of CTAs, each walking the whole prefix. Splitting each segment's keys
-    fills about one wave of SMs; with a wave of segments already there is
-    nothing to gain. Rows all of at most 64 queries stay unsplit: segments
-    that short select fmha_sm100 variants prewarm_split_proxy_variants does
-    not load.
+    of CTAs; splitting each segment's keys fills about one wave of SMs. Rows
+    all of at most 64 queries stay unsplit: segments that short select
+    fmha_sm100 variants prewarm_split_proxy_variants does not load.
     """
     if max(qo_offsets) < _PROXY_SPLIT_MIN_PREFIX or max(qo_lens) <= 64:
         return 0
@@ -205,18 +201,15 @@ def _segmented_proxy_plan(
 ) -> tuple[tuple, torch.Tensor]:
     """Plan rows as segments of at most _PROXY_SEGMENT_LEN queries, split along KV.
 
-    Segment [first, first + n) of a row with cached prefix p is a request of n
-    queries over p + first + n keys at causal offset p + first, so each query
-    sees exactly the keys it sees in its row. Every (query, head, 128-key
-    block) max is still written once, from the same Q.K products, into the
-    same [heads, max_k_tiles, tokens] layout, so the scores are bitwise those
-    of the unsplit plan. fmha_sm100 gives each request its own span of the
-    page table, sized by its kv_len, so each segment gets a copy of its row's
-    leading pages, gathered from `kv_indices` on the device.
+    Segment [first, first + n) of a row with cached prefix p runs at causal
+    offset p + first, so each query sees the keys it sees in its row. Every
+    (query, head, 128-key block) max is still written once, from the same Q.K
+    products, into the same layout, so the scores are bitwise those of the
+    unsplit plan. fmha_sm100 sizes each request's page-table span by its
+    kv_len, so each segment reads its own copy of its row's leading pages.
     """
     seg_qo_lens, seg_kv_lens, seg_offsets = [], [], []
-    # Per segment: its page count, and the shift from its first slot in the
-    # gathered table to its row's first page in kv_indices.
+    # seg_shifts: the row's first page in kv_indices minus the segment's first gathered slot.
     seg_pages, seg_shifts = [], []
     row_first_page = num_gathered = 0
     for qo_len, prefix in zip(qo_lens, qo_offsets):
@@ -311,8 +304,7 @@ def prewarm_split_proxy_variants(dtype: torch.dtype, num_index_heads: int, page_
     and fmha_sm100 compiles a missing variant inline, for over a minute,
     while every rank waits on its lock. A segmented plan's longest segment
     holds 65 to 128 queries, so it runs fmha_sm100's 128-query, unpacked,
-    two-warpgroup variant, with or without split KV; one dummy segment
-    through each loads both.
+    two-warpgroup variant, with or without split KV.
 
     Args:
         dtype: Index-K cache dtype, which index Q is cast to.
