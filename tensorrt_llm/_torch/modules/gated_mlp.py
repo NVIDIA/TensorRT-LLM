@@ -41,6 +41,7 @@ class GatedMLP(nn.Module):
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         split_gate_up: bool = False,
+        enable_locality_domain_bf16_linear: bool = False,
     ):
 
         super().__init__()
@@ -67,6 +68,7 @@ class GatedMLP(nn.Module):
             swiglu_beta) if swiglu_beta is not None else None
 
         config = config or ModelConfig()
+        locality_domain_policy = getattr(config, "locality_domain_policy", None)
         use_cute_dsl_bf16_gemm = getattr(config, "use_cute_dsl_bf16_gemm",
                                          False)
         self.mapping = config.mapping
@@ -136,6 +138,9 @@ class GatedMLP(nn.Module):
                 and not bias
                 and (swiglu_limit is None or swiglu_limit == float("inf"))),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
@@ -186,6 +191,9 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )

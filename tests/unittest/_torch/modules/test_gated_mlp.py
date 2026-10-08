@@ -10,8 +10,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import Linear as _RealLinear
+from tensorrt_llm._torch.visual_gen import config as visual_gen_config
 
 
 def _make_gate_up_proj(
@@ -38,6 +42,25 @@ def _make_down_proj() -> nn.Module:
     down_proj.has_fp8_block_scales = False
     down_proj.forward = Mock(side_effect=lambda value, **kwargs: value + 1)
     return down_proj
+
+
+@pytest.mark.cpu_only
+def test_diffusion_config_without_locality_domain_policy() -> None:
+    config = visual_gen_config.DiffusionModelConfig()
+    mlp = GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=config,
+    )
+
+    assert mlp.gate_up_proj.weight.shape == (32, 8)
+    assert mlp.down_proj.weight.shape == (8, 16)
+    for projection in (mlp.gate_up_proj, mlp.down_proj):
+        assert not projection._locality_domain_policy.enabled
+        assert not projection.partition_plan.enabled
+        assert projection._locality_domain_weight_shards is None
 
 
 def test_gate_up_partition_falls_back_to_swiglu(
@@ -120,3 +143,50 @@ def test_activation_controls_fp8_quant_fusion_capability(
     monkeypatch.setattr(gated_mlp_module, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
 
     assert mlp._can_fuse_swiglu_fp8_quant() is expected
+
+
+@pytest.mark.parametrize(
+    ("mlp_kwargs", "expected_enabled"),
+    [
+        pytest.param({}, False, id="default"),
+        pytest.param(
+            {"enable_locality_domain_bf16_linear": True},
+            True,
+            id="explicit-opt-in",
+        ),
+    ],
+)
+def test_locality_domain_bf16_linear_opt_in_propagates_to_both_projections(
+    monkeypatch: pytest.MonkeyPatch,
+    mlp_kwargs: dict[str, bool],
+    expected_enabled: bool,
+) -> None:
+    policy = LocalityDomainPolicy(enabled=True)
+    config = ModelConfig(
+        use_cute_dsl_bf16_gemm=True,
+        locality_domain_policy=policy,
+    )
+    linear_constructor = Mock(side_effect=[nn.Module(), nn.Module()])
+    # GatedMLP.__init__ calls Linear._calc_shard for uneven-TP sharding;
+    # the Mock must delegate to the real staticmethod or the arithmetic
+    # downstream operates on Mock objects.
+    linear_constructor._calc_shard = _RealLinear._calc_shard
+    monkeypatch.setattr(gated_mlp_module, "Linear", linear_constructor)
+
+    GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        bias=False,
+        dtype=torch.bfloat16,
+        config=config,
+        **mlp_kwargs,
+    )
+
+    assert linear_constructor.call_count == 2
+    gate_up_call, down_call = linear_constructor.call_args_list
+    assert gate_up_call.args == (8, 32)
+    assert down_call.args == (16, 8)
+    for projection_call in (gate_up_call, down_call):
+        assert projection_call.kwargs["use_cute_dsl_bf16_gemm"] is True
+        assert projection_call.kwargs["enable_locality_domain_bf16_linear"] is expected_enabled
+        assert projection_call.kwargs["locality_domain_policy"] is policy
