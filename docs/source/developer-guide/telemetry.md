@@ -232,7 +232,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `ray_placement_config.defer_workers_init` | `bool` | `value` |  |
 | `ray_placement_config.per_worker_gpu_share` | `float\|none` | `value` |  |
 | `ray_placement_config.placement_bundle_indices` | `list[list[int]]\|none` | `value` |  |
-| `reasoning_parser` | `allowlist\|none` | `categorical` | `auto`, `deepseek-r1`, `poolside_v1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
+| `reasoning_parser` | `allowlist\|none` | `categorical` | `auto`, `deepseek-r1`, `poolside_v1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25`, `k-exaone` |
 | `reorder_policy_config.policy_args.agent_inflight_seq_num` | `int` | `value` |  |
 | `reorder_policy_config.policy_args.agent_percentage` | `float` | `value` |  |
 | `reorder_policy_config.policy_name` | `literal\|none` | `categorical` | `AgentTree` |
