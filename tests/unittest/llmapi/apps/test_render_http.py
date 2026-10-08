@@ -33,6 +33,7 @@ from tensorrt_llm.serve.render import (
     render_endpoints_enabled,
 )
 from tensorrt_llm.serve.render._http import build_render_app
+from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 from .render_helpers import SERVER_TEMPLATE, WEATHER_TOOL, chat_request, make_tokenizer, resources
 
@@ -472,3 +473,21 @@ class TestGenerateSkipsRendering:
         assert response.status_code == 200, response.text
         assert inputs["inputs"]["prompt_token_ids"] == prepared["token_ids"]
         assert rendered_calls == []
+
+
+class TestHarmonyConversionErrors:
+    """Harmony reports messages it cannot convert as a RuntimeError; the chat route answers 400."""
+
+    class _FailingHarmony(ServingExtension):
+        def render_prompt(self, request, res=None):
+            raise RuntimeError("Failed to convert messages to harmony tokens: boom")
+
+    def test_a_conversion_failure_is_a_400_not_a_500(self, tokenizer) -> None:
+        app = build_render_app(
+            resources(tokenizer, use_harmony=True, extension=self._FailingHarmony())
+        )
+
+        response = TestClient(app).post("/v1/chat/completions/render", json=CHAT_BODY)
+
+        assert response.status_code == 400
+        assert "boom" in response.text

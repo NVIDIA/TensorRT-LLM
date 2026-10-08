@@ -93,10 +93,11 @@ class ServingRender:
         # The extension preprocessing mutates the request while rendering, and
         # the executing side applies it again; ship the body as it arrived.
         original = copy.deepcopy(body)
+        resources = self._resources_factory()
         try:
             rendered = await arender_chat(
                 request,
-                self._resources_factory(),
+                resources,
                 tokenize=True,
                 # The route's fallback when the request model rejects the messages.
                 raw_messages=copy.deepcopy(original.get("messages")),
@@ -104,6 +105,12 @@ class ServingRender:
         except UnsupportedRenderError as error:
             raise RenderRequestError(400, str(error)) from error
         except ValueError as error:
+            raise RenderRequestError(400, str(error)) from error
+        except RuntimeError as error:
+            # Harmony reports messages it cannot convert (a tool without a description,
+            # null content) as a RuntimeError; the chat route answers those with a 400.
+            if not resources.use_harmony:
+                raise
             raise RenderRequestError(400, str(error)) from error
         return GenerateRequest(
             kind="chat",
