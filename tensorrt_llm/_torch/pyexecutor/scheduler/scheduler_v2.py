@@ -305,6 +305,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         # adapters that can't be evicted mid-iteration.
         pending_ctx: RequestList = []
 
+        # Requests whose pages were given up during this pass. A victim that is
+        # itself a started context request still sits in pending_ctx, so
+        # re-admitting it would spend the pages its own preemption released.
+        preempted_ids: set[int] = set()
+
         # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
         # In the overlap executor these requests are no longer scheduled
         # (state outside schedulable range) but their adapters haven't
@@ -395,6 +400,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                     req_it_end,
                     evicted,
                     scheduled_beam_width,
+                    scheduled_gen,
+                    inflight_request_ids,
+                    preempted_ids,
                 )
                 if action is ScheduleAction.STOP:
                     break
@@ -405,11 +413,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
             req_it += 1
-
-        # Requests whose pages were given up during this pass. A victim that is
-        # itself a started context request still sits in pending_ctx, so
-        # re-admitting it would spend the pages its own preemption released.
-        preempted_ids: set[int] = set()
 
         def preempt_for_pages(req: LlmRequest) -> bool:
             protected = {r.py_request_id for r in scheduled_gen}
@@ -968,6 +971,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end: int,
         evicted: RequestList,
         scheduled_beam_width: int,
+        scheduled_gen: RequestList,
+        inflight_request_ids: set[int],
+        preempted_ids: set[int],
     ) -> tuple[ScheduleAction, int, int, int]:
         """Try to schedule a generation request.
 
@@ -990,6 +996,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not success:
             req_it_end, success = self._try_evict_for_gen(
                 req, requests_list, req_it, req_it_end, evicted
+            )
+
+        if not success:
+            success = self._try_preempt_for_gen(
+                req, requests_list, scheduled_gen, inflight_request_ids, evicted, preempted_ids
             )
 
         if success:
@@ -1112,6 +1123,103 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return False
 
+    def _is_preemption_candidate(
+        self, req: LlmRequest, inflight_request_ids: set[int], preempted_ids: set[int]
+    ) -> bool:
+        """A started request whose pages can be given up and later recomputed."""
+        if req.py_request_id in preempted_ids:
+            return False
+        if req.request_id in inflight_request_ids:
+            return False
+        # `_is_started_request` accepts GENERATION_TO_COMPLETE, which is
+        # outside the schedulable range and may still be finalizing.
+        if req.state_value == self._gen_to_complete_state_value:
+            return False
+        # Multimodal prefill releases the inputs and embeddings a replay
+        # needs, leaving an empty or MRoPE-only dict behind as the marker.
+        if req.is_generation_in_progress_state and isinstance(
+            getattr(req, "py_multimodal_data", None), dict
+        ):
+            return False
+        return self._is_started_request(req)
+
+    def _try_preempt_for_gen(
+        self,
+        req: LlmRequest,
+        requests_list: RequestList,
+        scheduled_gen: RequestList,
+        inflight_request_ids: set[int],
+        evicted: RequestList,
+        preempted_ids: set[int],
+    ) -> bool:
+        """Release other requests' pages so a generation step can allocate.
+
+        The generation-side counterpart of `_try_preempt_for_pages`, which
+        runs only from the deferred context phase. A disaggregated generation
+        server never enters that phase, and `_try_evict_for_gen` reclaims
+        nothing there, so without this a full pool stays full: suspension
+        leaves the pages HELD and `_KVCache.resume` refuses above
+        `max_util_for_resume`.
+
+        Unlike eviction, an already-suspended request is a useful victim here.
+        Suspension only unpinned its pages; closing its cache hands them back.
+        """
+        if self.kv_cache_manager.has_cache_tier_below_gpu:
+            return False
+
+        protected = {r.py_request_id for r in scheduled_gen}
+        protected.add(req.py_request_id)
+
+        while True:
+            if self.kv_cache_manager.has_pending_preemption():
+                # One victim at a time, or a full pool would preempt the whole
+                # batch while the first release is still draining.
+                return False
+
+            # Newest first, so the requests closest to completing keep their
+            # pages and the pool drains instead of thrashing.
+            victim = next(
+                (
+                    candidate
+                    for candidate in reversed(requests_list)
+                    if candidate.py_request_id not in protected
+                    and self._is_preemption_candidate(
+                        candidate, inflight_request_ids, preempted_ids
+                    )
+                ),
+                None,
+            )
+            if victim is None:
+                return False
+
+            if not self.kv_cache_manager.preempt_request(victim):
+                # Parked rather than released, so the victim still holds its
+                # pages and has to stay off `evicted`; see the same case in
+                # `_try_preempt_for_pages`.
+                preempted_ids.add(victim.py_request_id)
+                logger.debug(
+                    f"[V2Scheduler] Preemption of request {victim.py_request_id} "
+                    "deferred until its connector saves retire"
+                )
+                return False
+
+            logger.debug(
+                f"[V2Scheduler] Preempting request {victim.py_request_id} "
+                f"(state={victim.state.name}) to free pages for generation "
+                f"request {req.py_request_id}"
+            )
+            self._clear_request_runtime_state(victim)
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.free_resources(victim)
+            victim.pause(self.max_input_len)
+            # A victim `_try_evict_for_gen` suspended is already on `evicted`.
+            if not any(victim is other for other in evicted):
+                evicted.append(victim)
+            preempted_ids.add(victim.py_request_id)
+
+            if self.kv_cache_manager.try_allocate_generation(req):
+                return True
+
     # Consecutive scheduling passes that reclaimed nothing before this counts
     # as a suspected deadlock. A stalled pass costs ~2ms, so it trips within
     # seconds, while transient one-iteration deferrals (multimodal chunk
@@ -1159,6 +1267,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             for r in pending_ctx
             if r.py_request_id not in preempted_ids and r.request_id not in inflight_request_ids
         )
+        # Zero means every generation candidate is already suspended, so
+        # neither eviction nor self-eviction has anything left to give up.
+        num_gen_evictable = sum(
+            1
+            for r in active_requests
+            if r.is_generation_in_progress_state
+            and not r.is_generation_to_complete_state
+            and r.request_id not in inflight_request_ids
+            and self.kv_cache_manager.is_request_active(r.py_request_id)
+        )
         if num_gen_candidates == 0 and num_ctx_candidates == 0:
             # Legitimately idle: nothing to schedule.
             self._reset_stall_state()
@@ -1189,7 +1307,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"and {num_ctx_candidates} context request(s) active but none could "
             f"be scheduled, suspended or preempted in "
             f"{self._stalled_schedules} consecutive attempts over "
-            f"{stalled_seconds:.3f}s. The KV cache "
+            f"{stalled_seconds:.3f}s "
+            f"({num_gen_evictable} of the generation request(s) still hold GPU "
+            f"pages, cache tier below GPU: "
+            f"{self.kv_cache_manager.has_cache_tier_below_gpu}). The KV cache "
             f"pool is likely exhausted. Configure "
             f"kv_cache_config.host_cache_size, increase "
             f"kv_cache_config.max_tokens, or lower max_batch_size. "

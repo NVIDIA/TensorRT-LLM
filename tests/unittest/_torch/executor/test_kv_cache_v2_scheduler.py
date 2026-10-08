@@ -1045,6 +1045,172 @@ class TestContextPreemption:
 
 
 # ===========================================================================
+# Generation-side reclamation with GPU as the last cache level
+# ===========================================================================
+
+
+class _GpuOnlyPool:
+    """The pool a disaggregated generation server runs: GPU and nothing below.
+
+    Suspension unpins a page but has nowhere to migrate it, so it reclaims
+    nothing, and `_KVCache.resume` refuses once GPU utilization passes
+    `max_util_for_resume`. Only preemption returns pages here.
+    """
+
+    def __init__(self, kv_cache_map, total_blocks, free_blocks, max_util_for_resume=0.95):
+        self._kv_cache_map = kv_cache_map
+        self.total_blocks = total_blocks
+        self.free_blocks = free_blocks
+        self._max_util_for_resume = max_util_for_resume
+        self._blocks_held = {}
+
+    @property
+    def utilization(self):
+        return (self.total_blocks - self.free_blocks) / self.total_blocks
+
+    def hold(self, request_id, blocks):
+        self._blocks_held[request_id] = blocks
+        self.free_blocks -= blocks
+
+    def try_allocate_generation(self, req):
+        cache = self._kv_cache_map[req.py_request_id]
+        if not cache.is_active:
+            if self.utilization > self._max_util_for_resume:
+                return False
+            cache.is_active = True
+        if self.free_blocks == 0:
+            return False
+        self.free_blocks -= 1
+        self._blocks_held[req.py_request_id] += 1
+        return True
+
+    def suspend(self, req):
+        self._kv_cache_map[req.py_request_id].is_active = False
+
+    def preempt(self, req):
+        self.free_blocks += self._blocks_held.pop(req.py_request_id, 0)
+        self._kv_cache_map[req.py_request_id].is_active = False
+        return True
+
+
+def _make_full_generation_server(num_requests=8, blocks_per_request=4):
+    """A generation-only batch holding every block in the pool."""
+    mgr = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    pool = _GpuOnlyPool(
+        mgr.kv_cache_map,
+        total_blocks=num_requests * blocks_per_request,
+        free_blocks=num_requests * blocks_per_request,
+    )
+    mgr.try_allocate_generation.side_effect = pool.try_allocate_generation
+    mgr.suspend_request.side_effect = pool.suspend
+    mgr.preempt_request.side_effect = pool.preempt
+    sched = make_scheduler(mgr, max_num_tokens=1024)
+    reqs = [make_gen_request(i) for i in range(num_requests)]
+    for req in reqs:
+        pool.hold(req.py_request_id, blocks_per_request)
+    return mgr, pool, sched, reqs
+
+
+class TestGenerationOnlyPoolExhaustion:
+    """Reclaiming pages for a generation request on a full GPU-only pool.
+
+    These cover a disaggregated generation server, which has no context
+    requests at all and so never reaches the deferred context phase that
+    `_try_preempt_for_pages` hangs off. With suspension unable to free a
+    page, the generation path needs its own destructive reclaim.
+    """
+
+    def test_a_full_pool_drains_instead_of_stalling(self):
+        mgr, pool, sched, reqs = _make_full_generation_server()
+
+        out = sched.schedule_request(reqs, set())
+
+        assert mgr.preempt_request.called
+        assert ids(out.generation_requests)
+        assert pool.free_blocks > 0
+
+    def test_repeated_passes_keep_making_progress(self):
+        """Every pass schedules something, so the batch never wedges."""
+        _, _, sched, reqs = _make_full_generation_server()
+
+        for _ in range(5):
+            out = sched.schedule_request(reqs, set())
+            assert ids(out.generation_requests)
+
+    def test_no_stall_is_reported(self, stall_warnings):
+        _, _, sched, reqs = _make_full_generation_server()
+        sched._DEADLOCK_STALL_ITERS = 2
+
+        for _ in range(8):
+            sched.schedule_request(reqs, set())
+
+        assert stall_messages(stall_warnings) == []
+
+    def test_victim_is_reset_to_context_state(self):
+        mgr, _, sched, reqs = _make_full_generation_server()
+        sched.max_input_len = 4096
+        # Victims are taken newest first.
+        victim = reqs[-1]
+        victim.py_batch_idx = 7
+
+        out = sched.schedule_request(reqs, set())
+
+        victim.pause.assert_called_once_with(4096)
+        assert victim.py_batch_idx is None
+        assert victim.py_request_id in ids(out.paused_requests)
+        assert victim.py_request_id not in ids(out.generation_requests)
+
+    def test_a_suspended_request_is_still_a_useful_victim(self):
+        """`_try_evict_for_gen` suspends every candidate before preemption
+        runs, so skipping suspended requests would leave nothing to take."""
+        mgr, _, sched, reqs = _make_full_generation_server()
+
+        sched.schedule_request(reqs, set())
+
+        victim = mgr.preempt_request.call_args_list[0].args[0]
+        assert any(call.args[0] is victim for call in mgr.suspend_request.call_args_list)
+
+    def test_scheduled_and_inflight_requests_are_protected(self):
+        mgr, _, sched, reqs = _make_full_generation_server()
+
+        out = sched.schedule_request(reqs, {reqs[-1].request_id})
+
+        preempted = {call.args[0].py_request_id for call in mgr.preempt_request.call_args_list}
+        assert reqs[-1].py_request_id not in preempted
+        assert preempted.isdisjoint(ids(out.generation_requests))
+
+    def test_skipped_when_a_cache_tier_exists_below_gpu(self):
+        """Suspension keeps the pages and does reclaim there."""
+        mgr, _, sched, reqs = _make_full_generation_server()
+        mgr.has_cache_tier_below_gpu = True
+
+        sched.schedule_request(reqs, set())
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_one_victim_at_a_time_while_a_release_is_draining(self):
+        mgr, _, sched, reqs = _make_full_generation_server()
+        mgr.has_pending_preemption.return_value = True
+
+        sched.schedule_request(reqs, set())
+
+        mgr.preempt_request.assert_not_called()
+
+    def test_deferred_release_stops_after_one_victim(self):
+        """A connector still reading these pages defers the release, so the
+        victim keeps them and no second victim is taken."""
+        mgr, _, sched, reqs = _make_full_generation_server()
+        mgr.preempt_request.side_effect = lambda req: False
+
+        out = sched.schedule_request(reqs, set())
+
+        assert mgr.preempt_request.call_count == 1
+        victim = mgr.preempt_request.call_args.args[0]
+        victim.pause.assert_not_called()
+        assert ids(out.generation_requests) == []
+
+
+# ===========================================================================
 # Deadlock detection
 # ===========================================================================
 
