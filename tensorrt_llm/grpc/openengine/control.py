@@ -37,6 +37,7 @@ from .bindings import (
 from .capabilities import supported_guides
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
+from .request_mapping import conversation_affinity_enabled
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -243,9 +244,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             info.extra.update({"trtllm_node": node})
         info.capacity.CopyFrom(capacity)
 
-        # Optional engine metadata, not a routing policy or a protocol extension.
-        # The request handler still validates every strict DP-rank hint.
-        info.extra.update({"trtllm_supports_dp_rank_targeting": True})
+        # Advertise strict targeting only when the conversation router does not own rank placement.
+        info.extra.update(
+            {"trtllm_supports_dp_rank_targeting": not conversation_affinity_enabled(self._llm)}
+        )
         if events_config(self._llm) is not None:
             info.extra.update({"trtllm_kv_event_hash_algo": "v2_sha256_64"})
         if self._capacity_reporting_enabled:

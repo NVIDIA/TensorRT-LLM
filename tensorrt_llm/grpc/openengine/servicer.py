@@ -21,6 +21,7 @@ from .formatting import _engine_error_response, _stop_texts
 from .request_mapping import (
     _input_from_request,
     _metadata_from_context,
+    conversation_affinity_enabled,
     conversation_params_from_request,
     sampling_params_from_request,
 )
@@ -128,6 +129,10 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             inputs = _input_from_request(request)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
             trace_headers, target_dp_rank = _metadata_from_context(context)
+            # Match Dynamo's in-process default: the conversation router owns
+            # rank placement when affinity is enabled, even if Dynamo sent a hint.
+            if conversation_affinity_enabled(self._llm):
+                target_dp_rank = None
             if target_dp_rank is not None:
                 if sampling_params.n > 1:
                     raise ValueError(

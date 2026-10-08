@@ -797,6 +797,31 @@ def test_generate_maps_target_dp_rank_to_strict_scheduling(
     assert scheduling_params.attention_dp_relax is False
 
 
+def test_generate_lets_conversation_affinity_own_dp_rank() -> None:
+    """A Dynamo rank hint must not override TensorRT-LLM's conversation binding."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.tensor_parallel_size = 4
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "2"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="request-conversation-rank",
+        model="test-model",
+        prompt="hello",
+    )
+    request.extra.update({"conversation_id": "session-a"})
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(collect_responses())
+
+    assert llm.generate_kwargs["scheduling_params"] is None
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "session-a"
+
+
 def test_generate_rejects_target_dp_rank_with_multiple_sequences() -> None:
     llm = _FakeLlm([])
     llm.args.enable_attention_dp = True
