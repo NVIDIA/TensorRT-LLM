@@ -1,6 +1,7 @@
 ---
 receipts:
   sm_103: {status: passed, tests: 10}
+  sm_100: {status: passed, tests: 11}
 ---
 
 # load_paged_kv_cache_for_mla
@@ -314,3 +315,7 @@ A caller violating none of these gets a correct result.
   prefill, with its own `kv_scale_quant_orig`),
   `trtllm::merge_chunked_attention_for_mla`, and the context FMHA that
   consumes the up-projected K/V.
+- Kimi K3's cached-KV context gather: bf16 pool, page 64, C / R 512 / 64, layer 1 of a two-layer pool, context
+  sequences of 57 cached + 7 new tokens (across a page boundary), 64 + 64 (cached up to a boundary) and 0 + 1, two
+  trailing generation sequences; a bitwise copy: `test_kimi_k3_bf16_page64`. The sm_100 receipt covers the whole file (11 tests); the sm_103 receipt predates that
+  cell and covers the other 10.
