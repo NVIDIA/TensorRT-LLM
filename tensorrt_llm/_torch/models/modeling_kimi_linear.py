@@ -1359,6 +1359,45 @@ class KimiK3MoERuntime(nn.Module):
             hidden_states, projection.weight.t(), None, None
         )
 
+    def _can_fuse_router_down(self, hidden_states: torch.Tensor) -> bool:
+        """Whether one fused GEMM can produce the router logits and the latent
+        down-projection (trtllm::dsv3_router_latent_gemm_op).
+
+        Scoped to the validated configuration (TP MEGAMOE_CUTEDSL with fused
+        communication on SM107); the fusion itself does not depend on it.
+        """
+        if (
+            torch.compiler.is_compiling()
+            or _K3_DISABLE_MIN_LATENCY_LATENT_PROJ
+            or not hidden_states.is_cuda
+            or self.routed_experts.use_dp
+            or self.routed_experts.parallel_size <= 1
+            or self.routed_experts.moe_backend != "MEGAMOE_CUTEDSL"
+            or self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
+            or get_sm_version() != 107
+        ):
+            return False
+        down = self.routed_expert_down_proj
+        if not isinstance(down, nn.Linear) or down.bias is not None:
+            return False
+        if (
+            hidden_states.ndim != 2
+            or not 1 <= hidden_states.shape[0] <= 16
+            or hidden_states.shape[1] != 7168
+            or self.gate.weight.shape != (896, 7168)
+            or down.weight.shape != (3584, 7168)
+        ):
+            return False
+        # Inspect the loaded weights: FP8 conversion can replace the down module.
+        return all(
+            tensor.dtype == torch.bfloat16
+            and tensor.is_cuda
+            and tensor.device == hidden_states.device
+            and tensor.stride() == (7168, 1)
+            and tensor.data_ptr() % 16 == 0
+            for tensor in (hidden_states, self.gate.weight, down.weight)
+        )
+
     @staticmethod
     def _select_moe_tp_ep(mapping: Mapping) -> Tuple[int, int]:
         """Resolve the routed-expert ``(moe_tp, moe_ep)`` split.
@@ -1581,7 +1620,13 @@ class KimiK3MoERuntime(nn.Module):
     def forward(self, hidden_states: torch.Tensor, all_rank_num_tokens=None) -> torch.Tensor:
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
-        router_logits = self.gate.compute_logits(hidden_states)
+        projected_input = None
+        if self._can_fuse_router_down(hidden_states):
+            router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
+                hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
+            )
+        else:
+            router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
             self._defer_shared_allreduce
@@ -1601,7 +1646,11 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            routed_in = (
+                projected_input
+                if projected_input is not None
+                else self._routed_projection(hidden_states, self.routed_expert_down_proj)
+            )
             y = self.routed_experts(
                 routed_in,
                 router_logits,
