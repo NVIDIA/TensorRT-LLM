@@ -267,6 +267,21 @@ class TestExtensions:
         with pytest.raises(UnsupportedRenderError, match="own input processor"):
             render_chat(chat_request(), resources(tokenizer, model_type="mistral_common"))
 
+    def test_a_named_tool_choice_is_refused_for_harmony_like_the_chat_route(
+        self, tokenizer
+    ) -> None:
+        class NeverRendered(ServingExtension):
+            def render_prompt(self, request, res=None):
+                raise AssertionError("the request must be refused before Harmony renders it")
+
+        request = chat_request(
+            tools=[WEATHER_TOOL],
+            tool_choice={"type": "function", "function": {"name": "get_weather"}},
+        )
+
+        with pytest.raises(UnsupportedRenderError, match="named function is not yet supported"):
+            render_chat(request, resources(tokenizer, use_harmony=True, extension=NeverRendered()))
+
     def test_the_extension_preprocesses_and_serializes_tools(
         self, tokenizer, extension_model
     ) -> None:

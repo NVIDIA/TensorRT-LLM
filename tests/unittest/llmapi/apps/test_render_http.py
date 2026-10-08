@@ -331,6 +331,33 @@ class TestGenerate:
             m["content"] for m in CHAT_BODY["messages"]
         ]
 
+    def test_a_harmony_worker_runs_its_harmony_chat_route(self, worker) -> None:
+        # A gpt-oss worker serves chat on chat_harmony, which parses channels and tool
+        # calls out of the token stream; the plain chat route would return them raw.
+        from tensorrt_llm.serve.render import RenderResources
+
+        async def chat_harmony(request, raw_request):
+            worker.seen["harmony"] = request
+            return {"ok": "harmony"}
+
+        worker.server.use_harmony = True
+        worker.server.chat_harmony = chat_harmony
+        prepared = {
+            "schema_version": GENERATE_REQUEST_SCHEMA_VERSION,
+            "kind": "chat",
+            "fingerprint": RenderResources.from_server(worker.server).fingerprint(),
+            "token_ids": [7, 8, 9],
+            "tokens_trusted": True,
+            "request": CHAT_BODY,
+        }
+
+        response = worker.client.post("/generate", json=prepared)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"ok": "harmony"}
+        assert worker.seen["harmony"].prompt_token_ids == [7, 8, 9]
+        assert "chat" not in worker.seen
+
     def test_runs_the_completions_route_for_a_completion_request(self, worker, tokenizer) -> None:
         (prepared,) = (
             TestClient(build_render_app(resources(tokenizer)))
