@@ -101,7 +101,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig as KVC
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..config_utils import uses_vswa_kv_cache_layout
+from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
@@ -634,6 +634,49 @@ def _extend_swa_windows_for_reuse(
             else retention_window
         )
     return retention_windows
+
+
+def _derive_request_windows_from_layer_types(
+    model_config: ModelConfigPython,
+    local_layer_ids: Sequence[int],
+    max_seq_len: int,
+) -> Optional[List[Optional[int]]]:
+    """Per-local-layer retention windows derived from ``layer_types``.
+
+    The static budget estimator only sees ``kv_cache_config.max_attention_window``,
+    while runtime manager creation also derives per-layer windows from the model's
+    ``layer_types``/``sliding_window`` schedule. This mirrors that derivation for
+    per-request spend estimation only (never for the per-token slope, whose
+    full-growth accounting is deliberate). Returns ``None`` when the schedule
+    yields no window below ``max_seq_len`` or cannot be derived.
+    """
+    config = model_config.pretrained_config
+    if not getattr(config, "layer_types", None):
+        return None
+    try:
+        windows = [get_layer_attention_window(config, layer_idx) for layer_idx in local_layer_ids]
+    except (NotImplementedError, ValueError):
+        return None
+    normalized = [
+        None if window is None or int(window) <= 0 or int(window) >= max_seq_len else int(window)
+        for window in windows
+    ]
+    if all(window is None for window in normalized):
+        return None
+    return normalized
+
+
+def _gpu_alloc_granularity(quota: int) -> int:
+    """GPU pool allocation granularity for a given quota.
+
+    Mirrors ``CacheLevelManager::cacheTierGranularity`` (storageManager.cpp):
+    2 MiB physical chunks, doubled up to 32 MiB as the quota grows past
+    multiples of 1 GiB.
+    """
+    page = 2 << 20
+    ratio = quota // (page * 512)
+    exponent = 0 if ratio == 0 else min(4, int(math.log2(ratio)))
+    return page << exponent
 
 
 def _get_static_cache_size_layer_components(
@@ -5699,6 +5742,266 @@ class KVCacheManagerV2(BaseResourceManager):
             cache_size_per_token,
             fixed_cost,
         )
+
+    @classmethod
+    def _get_per_request_layer_tokens(
+        cls,
+        model_config: ModelConfigPython,
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        max_seq_len: Optional[int] = None,
+        spec_config=None,
+        is_draft: bool = False,
+    ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
+        """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
+        plus the block-rounded full-sequence token count.
+
+        ``retained_tokens`` is the block-rounded token count one max-length
+        request pins in this layer's pool: the full sequence for growing
+        layers and every draft mirror (reserved at the request's full context
+        length regardless of the drafter's own windows — resize with
+        ``history = full token count`` is the cache's contract, see
+        ``update_resources``), the retention window otherwise.
+        ``intercept_tokens`` is the part of that retention the affine
+        intercept of ``get_cache_size_per_token`` already reserves per request
+        (its SWA fixed cost uses the same window accounting), so callers can
+        separate intercept-funded retention from slope-funded growth.
+
+        Returns ``None`` when no estimate is possible: unknown
+        ``max_seq_len``, a hybrid recurrent/attention model whose attention
+        layers are a strict subset of the hidden layers (the static component
+        helper distributes the attention-only layer count over the full-model
+        pp partition without a hybrid layer mask, so ``Mapping.pp_layers``
+        rejects an explicit ``pp_partition`` and even divisions place the
+        layers wrong; the hybrid managers' per-request recurrent-state spend
+        is already carried as the affine intercept), or no local layers.
+        """
+        if max_seq_len is None or int(max_seq_len) <= 0:
+            return None
+        if num_layers is None:
+            total_hidden_layers = getattr(model_config.pretrained_config, "num_hidden_layers", None)
+            if (
+                total_hidden_layers is not None
+                and model_config.get_num_attention_layers() != total_hidden_layers
+            ):
+                return None
+        max_seq_len = int(max_seq_len)
+        tokens_per_block = int(tokens_per_block)
+        layer_sizes, covered_windows = _get_static_cache_size_layer_components(
+            model_config,
+            mapping,
+            num_layers=num_layers,
+            max_seq_len=max_seq_len,
+            kv_cache_config=kv_cache_config,
+            is_external_draft=(
+                is_draft
+                and spec_config is not None
+                and spec_config.spec_dec_mode.is_external_drafter()
+            ),
+        )
+        if not layer_sizes:
+            return None
+        # ``covered_windows`` are the windows ``get_cache_size_per_token``
+        # charges as fixed per-request retention in the affine intercept; keep
+        # them in lockstep with its accounting (reuse backoff included).
+        if (
+            kv_cache_config is not None
+            and kv_cache_config.enable_block_reuse
+            and cls._supports_reuse_match_backoff
+        ):
+            from tensorrt_llm._torch.speculative import draft_prompt_lookahead
+
+            backoff = draft_prompt_lookahead(spec_config) or 0
+            covered_windows = _extend_swa_windows_for_reuse(covered_windows, backoff, max_seq_len)
+        if is_draft:
+            # Draft mirrors are reserved at the request's full context length
+            # (measured: a 41k-token context charges 41k tokens per mirror
+            # against the draft pool), so the drafter's own windows do not
+            # bound per-request retention.
+            retained_windows = [None] * len(layer_sizes)
+        elif all(window is None for window in covered_windows):
+            # The static estimator only sees windows the config carries.
+            # Runtime manager creation additionally derives per-layer windows
+            # from ``layer_types`` (see
+            # ``_derive_layer_type_attention_windows``); mirror that here so
+            # callers weigh the retention the runtime will enforce. These
+            # derived windows are NOT in the affine intercept (the config
+            # carried none), so they stay out of ``intercept_tokens``.
+            if num_layers is None:
+                total_attention_layers = model_config.get_num_attention_layers()
+                local_layer_ids, _ = get_pp_layers(total_attention_layers, mapping)
+            else:
+                local_layer_ids = list(range(max(num_layers, 1)))
+            derived = _derive_request_windows_from_layer_types(
+                model_config, local_layer_ids, max_seq_len
+            )
+            retained_windows = derived if derived is not None else list(covered_windows)
+            if derived is not None and (
+                kv_cache_config is not None
+                and kv_cache_config.enable_block_reuse
+                and cls._supports_reuse_match_backoff
+            ):
+                from tensorrt_llm._torch.speculative import draft_prompt_lookahead
+
+                backoff = draft_prompt_lookahead(spec_config) or 0
+                retained_windows = _extend_swa_windows_for_reuse(
+                    retained_windows, backoff, max_seq_len
+                )
+        else:
+            retained_windows = list(covered_windows)
+        _, generation_capacity_headroom = _get_generation_kv_capacity(
+            spec_config, is_draft=is_draft
+        )
+        full_tokens = (
+            math.ceil((max_seq_len + generation_capacity_headroom) / tokens_per_block)
+            * tokens_per_block
+        )
+
+        def window_tokens(window_size: Optional[int]) -> int:
+            if window_size is None or window_size <= 0 or window_size >= max_seq_len:
+                return full_tokens
+            # Match _estimate_swa_cache_size: the live interval holds
+            # window_size + headroom - 1 tokens across all page offsets.
+            window_blocks = (
+                math.ceil((window_size + generation_capacity_headroom - 2) / tokens_per_block) + 1
+            )
+            return min(window_blocks * tokens_per_block, full_tokens)
+
+        entries = []
+        for layer_size, retained_window, covered_window in zip(
+            layer_sizes, retained_windows, covered_windows
+        ):
+            retained = window_tokens(retained_window)
+            covered = (
+                window_tokens(covered_window)
+                if covered_window is not None and 0 < covered_window < max_seq_len
+                else 0
+            )
+            entries.append((layer_size, retained, covered))
+        return entries, full_tokens
+
+    @classmethod
+    def get_cache_bytes_per_request(
+        cls,
+        model_config: ModelConfigPython,
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        max_seq_len: Optional[int] = None,
+        spec_config=None,
+        is_draft: bool = False,
+        **kwargs,
+    ) -> Optional[int]:
+        """Slope-funded pool bytes ONE max-length request pins in this manager.
+
+        ``KvCacheCreator`` uses this to weight the target/draft budget split by
+        per-request spend instead of per-token cost. The split reserves both
+        managers' affine intercepts up front, and the intercept already pays
+        the SWA retention of ``max_batch_size`` requests, so the weight counts
+        only the per-request spend the remaining (slope) budget funds:
+        full-sequence growth plus any retention window the intercept does not
+        carry (e.g. windows derived from ``layer_types`` when the config has
+        none). Counting intercept-funded retention again would shrink the
+        draft share while the surplus sits idle in the target pool.
+
+        Returns ``None`` when the estimate would be proportional to the
+        per-token slope anyway — no windowed layer bounds this manager's
+        retention below ``max_seq_len`` — or when no estimate is possible
+        (see ``_get_per_request_layer_tokens``), so the caller keeps the
+        per-token split. Zero is a valid weight: a target whose entire
+        retention is intercept-funded spends nothing per request from the
+        slope budget. A draft manager always reports: its mirrors are
+        reserved full-length regardless of the drafter's own windows.
+        """
+        layer_tokens = cls._get_per_request_layer_tokens(
+            model_config,
+            mapping,
+            num_layers,
+            tokens_per_block=tokens_per_block,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=max_seq_len,
+            spec_config=spec_config,
+            is_draft=is_draft,
+        )
+        if layer_tokens is None:
+            return None
+        entries, full_tokens = layer_tokens
+        if not is_draft and all(
+            covered == 0 and retained == full_tokens for _, retained, covered in entries
+        ):
+            # No window (configured or derived) bounds retention below
+            # max_seq_len: per-request spend is the per-token slope times
+            # max_seq_len, so weighting by it changes nothing. Report that by
+            # declining.
+            return None
+        return sum(
+            layer_size * max(retained - covered, 0) for layer_size, retained, covered in entries
+        )
+
+    @classmethod
+    def get_cache_quota_per_request(
+        cls,
+        model_config: ModelConfigPython,
+        mapping: Mapping,
+        num_layers: Optional[int] = None,
+        *,
+        tokens_per_block: int,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        max_seq_len: Optional[int] = None,
+        spec_config=None,
+        is_draft: bool = False,
+        **kwargs,
+    ) -> Optional[int]:
+        """Allocator quota ONE max-length request makes this manager insist on.
+
+        When ``pool_ratio`` is unset and ``avg_seq_len`` is configured, pool
+        sizing registers capacity constraints that become per-pool slot floors
+        scaled by ``1 / max_util_for_resume`` and rounded up to the GPU
+        allocation granularity (``StorageManager::computeSlotsFromConstraints``
+        and ``cacheTierGranularity``). The allocator raises any smaller quota
+        to that floor no matter what the budget split assigned, so the split
+        must reserve at least this much for the manager. The estimate rounds
+        per layer with the granularity implied by this one-request quota; the
+        runtime rounds per pool buffer against the configured quota, which
+        only differs once the quota is far above this floor.
+
+        Returns ``None`` when the runtime builds no such constraints
+        (``pool_ratio`` set or ``avg_seq_len`` unset) or when no per-request
+        estimate is possible, in which case the split has nothing to reserve.
+        """
+        if (
+            kv_cache_config is None
+            or kv_cache_config.pool_ratio is not None
+            or kv_cache_config.avg_seq_len is None
+        ):
+            return None
+        layer_tokens = cls._get_per_request_layer_tokens(
+            model_config,
+            mapping,
+            num_layers,
+            tokens_per_block=tokens_per_block,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=max_seq_len,
+            spec_config=spec_config,
+            is_draft=is_draft,
+        )
+        if layer_tokens is None:
+            return None
+        entries, _ = layer_tokens
+        tokens_per_block = int(tokens_per_block)
+        resume_util = float(np.float32(kv_cache_config.max_util_for_resume))
+        layer_bytes = [
+            math.ceil((retained // tokens_per_block) / resume_util) * tokens_per_block * layer_size
+            for layer_size, retained, _ in entries
+        ]
+        granularity = _gpu_alloc_granularity(sum(layer_bytes))
+        quota = sum(math.ceil(bytes_ / granularity) * granularity for bytes_ in layer_bytes)
+        return quota if quota > 0 else None
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):
         """Update KV cache for context requests in the current batch.

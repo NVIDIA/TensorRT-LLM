@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor import _util
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequestState,
     PyResult,
@@ -14,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 from tensorrt_llm._torch.pyexecutor.sampler import EarlyStopWithMMResult, MultimodalResult
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.mapping import Mapping
 
 
 @pytest.mark.parametrize(
@@ -166,6 +168,60 @@ def test_mm_encoder_sampler_aligns_mixed_batch_by_request_index():
     assert mm_embedding_lengths == [4]
     assert text_request.py_result.mrope_position is None
     assert mm_request.py_result.mrope_position == ("mm-pos", "mm-delta")
+
+
+@pytest.mark.parametrize(
+    "mapping,exports_results",
+    [
+        pytest.param(Mapping(), True, id="single_rank"),
+        pytest.param(Mapping(world_size=2, rank=1, tp_size=2), False, id="tp_follower"),
+        pytest.param(
+            Mapping(world_size=2, rank=1, tp_size=2, enable_attention_dp=True),
+            True,
+            id="attention_dp_follower",
+        ),
+        pytest.param(
+            Mapping(world_size=4, rank=2, tp_size=2, pp_size=2, enable_attention_dp=True),
+            False,
+            id="attention_dp_later_pp_stage",
+        ),
+    ],
+)
+@pytest.mark.cpu_only
+def test_mm_encoder_sampler_exports_results_only_on_response_ranks(mapping, exports_results):
+    """Ranks whose responses never reach the frontend must not export MM results."""
+    sampler = _util.instantiate_sampler(
+        SimpleNamespace(max_seq_len=16, spec_config=None),
+        SimpleNamespace(
+            sampler_force_async_worker=False,
+            disable_overlap_scheduler=True,
+            enable_speculative_beam_history_d2h=False,
+        ),
+        mapping,
+        max_batch_size=1,
+        max_beam_width=1,
+        mm_encoder_only=True,
+        speculative_config=None,
+        max_num_sequences=1,
+    )
+    request = _FakeRequest(multimodal_lengths=[4])
+    state = sampler.SampleState(
+        requests=[request],
+        data=MultimodalResult(
+            mm_embeddings=[torch.ones(4, 2)],
+            mm_embedding_request_indices=[0],
+            mm_embedding_lengths=[[4]],
+            num_context_requests=1,
+            extra_data={"mrope_position_ids": ["pos"], "mrope_position_deltas": ["delta"]},
+        ),
+    )
+
+    sampler.update_requests(state)
+
+    assert request.state == LlmRequestState.GENERATION_COMPLETE
+    assert request.finished_reason == (FinishReason.LENGTH, 0)
+    assert bool(request.py_result.mm_embeddings) is exports_results
+    assert (request.py_result.mrope_position is not None) is exports_results
 
 
 @pytest.mark.cpu_only
