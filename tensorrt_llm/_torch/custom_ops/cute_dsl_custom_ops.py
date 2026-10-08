@@ -6,6 +6,7 @@ import functools
 import itertools
 import math
 import os
+from dataclasses import replace
 from typing import ClassVar, List, Optional, Tuple, Type
 
 import torch
@@ -14022,6 +14023,190 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape[-1] = mat_b.shape[-2]
             return mat_a.new_empty(shape, dtype=torch.bfloat16)
 
+        _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS = (32, 128, 192, 256)
+        _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET = 16384
+        _DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX = 7
+
+        def _gen_dsv4_qb_fusion_tuning_buckets(
+                max_num_tokens: int) -> Tuple[int, ...]:
+            buckets = _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS
+            if max_num_tokens >= _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET:
+                buckets += (_DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET, )
+            return buckets
+
+        def _map_dsv4_qb_fusion_tuning_bucket(num_tokens: int) -> int:
+            for bucket in _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS:
+                if num_tokens <= bucket:
+                    return bucket
+            if num_tokens < _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET:
+                return _DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS[-1]
+            return _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET
+
+        def _prepare_dsv4_qb_fusion_tuning_inputs(
+                inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+            # Resized integer tensors are otherwise filled with arbitrary
+            # values. Keep every tuning row inside the RoPE cache.
+            position_ids = inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX]
+            inputs[_DSV4_QB_FUSION_POSITION_IDS_INPUT_INDEX] = torch.zeros_like(
+                position_ids)
+            return inputs
+
+        class CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner(TunableRunner):
+            """Tune the SM107 q_b GEMM, RMSNorm, RoPE, and FP8 fusion."""
+
+            tuning_config = TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0,
+                    0,
+                    _gen_dsv4_qb_fusion_tuning_buckets,
+                    _map_dsv4_qb_fusion_tuning_bucket,
+                ), ),
+                constraint_specs=(
+                    ConstraintSpec(2, 0, mxfp8_scale_infer_shape),
+                    ConstraintSpec(7, 0, infer_output_m_shape),
+                ),
+                inputs_pre_hook=_prepare_dsv4_qb_fusion_tuning_inputs,
+                # Do not let the generic tuner append the actual warmup M:
+                # runtime maps every 257..16383 shape back to the 256 bucket,
+                # so profiling that large output cannot affect dispatch.
+                tune_max_num_tokens=_DSV4_QB_FUSION_SMALL_M_TUNING_BUCKETS[-1],
+                use_cold_l2_cache=True,
+                use_cuda_graph=True,
+                # CuTe modules are cached in process, so every rank must tune
+                # and compile its selected tactic during warmup.
+                exclude_from_cache=True,
+                distributed_tuning_strategy=(
+                    DistributedTuningStrategy.INDEPENDENT),
+            )
+
+            large_m_tuning_config = replace(
+                tuning_config,
+                tune_max_num_tokens=_DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET)
+
+            # (name, mma_inst_tile, cluster_shape_mn, fallback_cluster_shape_mn,
+            #  store_mode, swizzle_size, raster_along_m, tma_prefetch_dist)
+            _tactics = (
+                (
+                    "1cta_cluster_1x1",
+                    (128, 256),
+                    (1, 1),
+                    None,
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+                (
+                    "2cta_cluster_2x2_fallback_2x1",
+                    (256, 256),
+                    (2, 2),
+                    (2, 1),
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+                (
+                    "2cta_cluster_2x1",
+                    (256, 256),
+                    (2, 1),
+                    None,
+                    "stg256",
+                    1,
+                    True,
+                    0,
+                ),
+            )
+
+            def unique_id(self):
+                return ()
+
+            def get_valid_tactics(
+                self,
+                inputs: List[torch.Tensor],
+                profile: OptimizationProfile,
+                **kwargs,
+            ) -> List[Tuple]:
+                if get_sm_version() != 107:
+                    return []
+                # M buckets define profiling shapes, not fixed dispatch rules.
+                # Let the autotuner compare every registered configuration.
+                return list(self.__class__._tactics)
+
+            @classmethod
+            def _fallback_tactic(cls, num_tokens: int) -> Tuple:
+                """Use a correctness fallback when autotuning is unavailable."""
+                return cls._tactics[0]
+
+            def forward(
+                self,
+                inputs: List[torch.Tensor],
+                tactic,
+                eps: float,
+            ) -> torch.Tensor:
+                (
+                    input,
+                    weight,
+                    input_scale,
+                    weight_scale,
+                    cos_sin_cache,
+                    cu_q_seqlens,
+                    kv_cache_lengths,
+                    position_ids,
+                    quant_scale_qkv,
+                ) = inputs
+                if tactic == -1:
+                    tactic = self._fallback_tactic(input.shape[0])
+                (
+                    _,
+                    mma_inst_tile,
+                    cluster_shape_mn,
+                    fallback_cluster_shape_mn,
+                    store_mode,
+                    swizzle_size,
+                    raster_along_m,
+                    tma_prefetch_dist,
+                ) = tactic
+
+                output = input.new_empty((input.shape[0], weight.shape[0]),
+                                         dtype=torch.float8_e4m3fn)
+                compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
+                    mma_inst_tile=mma_inst_tile,
+                    cluster_shape_mn=cluster_shape_mn,
+                    fallback_cluster_shape_mn=fallback_cluster_shape_mn,
+                    store_mode=store_mode,
+                    swizzle_size=swizzle_size,
+                    raster_along_m=raster_along_m,
+                    with_quant_scale=True,
+                    tma_prefetch_dist=tma_prefetch_dist,
+                )
+
+                from cutlass.cute.runtime import from_dlpack
+
+                def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
+                    return from_dlpack(tensor,
+                                       assumed_align=alignment,
+                                       enable_tvm_ffi=True)
+
+                compiled(
+                    _from_dlpack(input),
+                    _from_dlpack(
+                        input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                    _from_dlpack(weight),
+                    _from_dlpack(
+                        weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
+                    _from_dlpack(output, 32),
+                    _from_dlpack(cos_sin_cache.reshape(1, -1)),
+                    _from_dlpack(cu_q_seqlens, 4),
+                    _from_dlpack(kv_cache_lengths, 4),
+                    _from_dlpack(position_ids.reshape(-1), 4),
+                    _from_dlpack(quant_scale_qkv.reshape(-1), 4),
+                    eps,
+                    cuda.CUstream(
+                        torch.cuda.current_stream(input.device).cuda_stream),
+                )
+                return output
+
         @torch.library.custom_op(
             "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
             mutates_args=(),
@@ -14089,43 +14274,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 raise ValueError(
                     "quant_scale_qkv must be a non-empty FP32 tensor")
 
-            output = input.new_empty((input.shape[0], weight.shape[0]),
-                                     dtype=torch.float8_e4m3fn)
-            compiled = compile_dsv4_qb_gemm_fused_rmsnorm_rope_quant(
-                mma_inst_tile=(256, 256),
-                cluster_shape_mn=(4, 2),
-                fallback_cluster_shape_mn=(2, 1),
-                store_mode="stg256",
-                swizzle_size=1,
-                raster_along_m=True,
-                with_quant_scale=True,
+            runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+            inputs = [
+                input,
+                weight,
+                input_scale,
+                weight_scale,
+                cos_sin_cache,
+                cu_q_seqlens,
+                kv_cache_lengths,
+                position_ids,
+                quant_scale_qkv,
+            ]
+            tuning_config = (runner.__class__.large_m_tuning_config
+                             if input.shape[0]
+                             >= _DSV4_QB_FUSION_LARGE_M_TUNING_BUCKET else
+                             runner.__class__.tuning_config)
+            _, best_tactic = AutoTuner.get().choose_one(
+                "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant",
+                [runner],
+                tuning_config,
+                inputs,
+                eps=eps,
             )
-
-            from cutlass.cute.runtime import from_dlpack
-
-            def _from_dlpack(tensor: torch.Tensor, alignment: int = 16):
-                return from_dlpack(tensor,
-                                   assumed_align=alignment,
-                                   enable_tvm_ffi=True)
-
-            compiled(
-                _from_dlpack(input),
-                _from_dlpack(
-                    input_scale.view(torch.float8_e8m0fnu).reshape(-1)),
-                _from_dlpack(weight),
-                _from_dlpack(
-                    weight_scale.view(torch.float8_e8m0fnu).reshape(-1)),
-                _from_dlpack(output, 32),
-                _from_dlpack(cos_sin_cache.reshape(1, -1)),
-                _from_dlpack(cu_q_seqlens, 4),
-                _from_dlpack(kv_cache_lengths, 4),
-                _from_dlpack(position_ids.reshape(-1), 4),
-                _from_dlpack(quant_scale_qkv.reshape(-1), 4),
-                eps,
-                cuda.CUstream(
-                    torch.cuda.current_stream(input.device).cuda_stream),
-            )
-            return output
+            return runner(inputs, tactic=best_tactic, eps=eps)
 
         @torch.library.register_fake(
             "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant")
