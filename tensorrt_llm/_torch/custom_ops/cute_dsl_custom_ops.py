@@ -12016,9 +12016,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[8] (softmax_stats): Optional contiguous float32 tensor
                         of shape (B * S_q, H, 2). The kernel writes an equivalent
                         softmax (max, sum) pair for Helix reduction.
+                    inputs[9] (kv_bounds): Optional contiguous int32 tensor of
+                        shape (B * S_q,) for Helix speculative verify groups.
+                    inputs[10] (softmax_scale): FP8 runner only. float32 device
+                        tensor; element 0 is the BMM1 (softmax) scale.
+                    inputs[11] (output_scale): FP8 runner only. float32 device
+                        tensor; element 0 is the BMM2 (output) scale.
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
-                **kwargs: Optional softmax_scale and output_scale values.
+                **kwargs: Optional scalar softmax_scale and output_scale values
+                    for the FP16/BF16 runner.
 
             Returns:
                 torch.Tensor: Output tensor of shape (H, D, S_q, B). The LSE
@@ -12029,8 +12036,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # inputs[9] (optional): helix per-token attention bounds of shape
             # (B * S_q,), int32 — speculative verify groups only.
             kv_bounds = inputs[9] if len(inputs) > 9 else None
-            softmax_scale = float(kwargs.get("softmax_scale", 1.0))
-            output_scale = float(kwargs.get("output_scale", 1.0))
+            # FP8 KV keeps its scales on the device so neither the first call
+            # nor CUDA graph replay needs a host read of the scale tensors.
+            has_fp8_input = self.in_dtype == cutlass.Float8E4M3FN
+            if has_fp8_input:
+                if len(inputs) != 12:
+                    raise RuntimeError(
+                        "CuteDSLNVMlaDecodeBlackwellRunner FP8 input requires "
+                        "softmax_scale and output_scale tensors at inputs[10:12]."
+                    )
+                softmax_scale, output_scale = inputs[10:12]
+                for name, scale in (("softmax_scale", softmax_scale),
+                                    ("output_scale", output_scale)):
+                    if scale.dtype != torch.float32 or scale.numel() < 1:
+                        raise RuntimeError(
+                            f"{name} must contain at least one float32 value.")
+                    if scale.device != q_latent.device:
+                        raise RuntimeError(
+                            f"{name} must be on {q_latent.device}, got "
+                            f"{scale.device}.")
+            else:
+                softmax_scale = float(kwargs.get("softmax_scale", 1.0))
+                output_scale = float(kwargs.get("output_scale", 1.0))
 
             if not (isinstance(tactic, tuple) and len(tactic) == 4):
                 raise RuntimeError(
@@ -12200,6 +12227,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 if kv_bounds is not None else None)
                 # Variable split-KV (block_split_kvs) is not used on this path:
                 block_split_kvs_ct = None
+                if has_fp8_input:
+                    softmax_scale_ct = cute.runtime.from_dlpack(
+                        softmax_scale).mark_layout_dynamic()
+                    output_scale_ct = cute.runtime.from_dlpack(
+                        output_scale).mark_layout_dynamic()
+                else:
+                    softmax_scale_ct = cutlass.Float32(softmax_scale)
+                    output_scale_ct = cutlass.Float32(output_scale)
 
                 compile_args = [
                     q_latent_ct,
@@ -12220,8 +12255,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cache_seqs_ct,
                     kv_bounds_ct,
                     block_split_kvs_ct,
-                    cutlass.Float32(softmax_scale),
-                    cutlass.Float32(output_scale),
+                    softmax_scale_ct,
+                    output_scale_ct,
                     stream,
                 ])
                 CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache[cache_key] = (
@@ -12283,8 +12318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        softmax_scale: float,
-        output_scale: float,
+        softmax_scale: torch.Tensor,
+        output_scale: torch.Tensor,
         # Keep the trailing arguments required in the custom-op schema. PyTorch
         # elides trailing default-valued arguments before its mutation fallback,
         # while mutates_args retains their positional indices.
@@ -12294,6 +12329,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103/SM107).
 
+        softmax_scale / output_scale: float32 device tensors whose element 0
+        is the BMM1 (softmax) and BMM2 (output) scale.
         kv_bounds: helix speculative verify groups -- per-token rank-local
         attention bounds of shape (B * seq_len_q,), int32.
         """
@@ -12314,7 +12351,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
-            workspace, softmax_stats, kv_bounds
+            workspace, softmax_stats, kv_bounds, softmax_scale, output_scale
         ]
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
@@ -12328,12 +12365,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # is_persistent still come from a length-4 tactic.
         if not (isinstance(best_tactic, tuple) and len(best_tactic) == 4):
             best_tactic = runner.default_tactic(int(q_latent.shape[-1]))
-        runner(
-            inputs,
-            tactic=best_tactic,
-            softmax_scale=softmax_scale,
-            output_scale=output_scale,
-        )
+        runner(inputs, tactic=best_tactic)
 
     @torch.library.register_fake("trtllm::cute_dsl_mla_decode_fp8_blackwell")
     def _(
@@ -12348,8 +12380,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_heads: int,
         seq_len_q: int,
         page_size: int,
-        softmax_scale: float,
-        output_scale: float,
+        softmax_scale: torch.Tensor,
+        output_scale: torch.Tensor,
         max_batch_size: int,
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],

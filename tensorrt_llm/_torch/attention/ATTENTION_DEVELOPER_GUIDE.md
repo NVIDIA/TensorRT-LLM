@@ -440,6 +440,9 @@ The FMHA package is split by role:
   `TrtllmAttention` can pair it with a later causal-generation provider through
   `CombinedFmha`.
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
+  With an FP8 KV cache it passes `mla_bmm1_scale` / `mla_bmm2_scale` to the
+  kernel as device tensors (element 0 of each), so the scales need no host
+  read and stay valid under CUDA graph replay.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
