@@ -5386,7 +5386,7 @@ class PyExecutor:
                 # modifying any host memory copied to GPU. Scheduler V2
                 # modifies the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can
-                # be pushed later, e.g. before model_engine._prepare_inputs().
+                # be pushed later, e.g. before DecoderRunner._prepare_inputs().
                 self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
 
