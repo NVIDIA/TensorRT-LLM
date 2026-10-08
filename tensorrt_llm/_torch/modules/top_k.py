@@ -109,7 +109,10 @@ class TopK(nn.Module):
                 ``[num_requests, top_k]`` on ``scores.device``. The
                 self-sampling engine does not consume this state.
                 ``gvr_row_order`` is an optional int32 request ordering with
-                shape ``[num_requests]`` on the same device.
+                shape ``[num_requests]`` on the same device. ``gvr_block_max``
+                (self-sampling path only) is the indexer epilogue's per-32-
+                position maxima, ``[num_rows, >= ceil(n/32)]`` fp32; the
+                streaming engine families skip the blocks below their line.
             radix_aux_indices: Caller-owned int32 workspace for native CUDA
                 Radix split work.
             radix_aux_logits: Caller-owned float32 workspace for native CUDA
@@ -346,6 +349,7 @@ class TopK(nn.Module):
         radix_aux_logits: torch.Tensor | None,
         gvr_prior_indices: torch.Tensor | None = None,
         gvr_row_order: torch.Tensor | None = None,
+        gvr_block_max: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.decode_implementation == TopKImplementation.CUTE_DSL_GVR and self.gvr_self_sampling:
             assert max_seq_len is not None
@@ -388,6 +392,7 @@ class TopK(nn.Module):
                     next_n=next_n,
                     compress_ratio=self.compress_ratio,
                     max_seq_len=max_seq_len * self.compress_ratio,
+                    block_max=gvr_block_max,
                 )
                 return output_indices
             logger.warning_once(
