@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -53,10 +54,15 @@ def worker_task(directory_name: str, scenario: str, batch: int, size: int) -> tu
     if scenario == "async_drain" and batch == 0:
         _wait_for_markers(directory, ["engine-exiting"])
 
-    if scenario == "all_failure":
+    if scenario in ("all_failure", "worker_system_exit"):
         _wait_for_markers(directory, [f"started-{batch}-{peer}" for peer in range(size)])
-        _mark(directory, f"failed-{batch}-{rank}")
-        raise RuntimeError("injected MPI lifecycle failure")
+        if scenario == "all_failure":
+            _mark(directory, f"failed-{batch}-{rank}")
+            raise RuntimeError("injected MPI lifecycle failure")
+        if rank == size - 1:
+            # The failure must traverse MPI, rather than rank0's thread pool.
+            _mark(directory, f"failed-{batch}-{rank}")
+            sys.exit("injected MPI lifecycle exit")
 
     if scenario in ("mixed_failure", "mixed_collective", "all_hang"):
         _wait_for_markers(directory, [f"started-{batch}-{peer}" for peer in range(size)])
@@ -112,10 +118,18 @@ def main() -> int:
         assert isinstance(response, list), response
         assert sorted(response) == [(rank, batch) for rank in range(args.ranks)], response
 
-    if args.scenario == "all_failure":
+    if args.scenario in ("all_failure", "worker_system_exit"):
+        system_exit = args.scenario == "worker_system_exit"
+        failed_ranks = [args.ranks - 1] if system_exit else range(args.ranks)
+        expected_error = (
+            "Remote MPI worker died: SystemExit: injected MPI lifecycle exit"
+            if system_exit
+            else "injected MPI lifecycle failure"
+        )
+        exit_status = 24 if system_exit else 23
         try:
             client.submit(remote_task, str(directory), args.scenario, 0, args.ranks)
-            _wait_for_markers(directory, [f"failed-0-{rank}" for rank in range(args.ranks)])
+            _wait_for_markers(directory, [f"failed-0-{rank}" for rank in failed_ranks])
             delayed_at = time.monotonic()
             _mark(directory, "client-poll-delayed", {"monotonic": delayed_at})
             # A remote proxy may wait five seconds before checking worker death.
@@ -124,7 +138,7 @@ def main() -> int:
             while time.monotonic() - delayed_at < 30:
                 error = client.check_worker_error()
                 if error is not None:
-                    assert "injected MPI lifecycle failure" in str(error), error
+                    assert expected_error in str(error), error
                     try:
                         raise error
                     except RuntimeError:
@@ -135,8 +149,8 @@ def main() -> int:
                             "error-observed",
                             {"error": str(error), "traceback": error_trace},
                         )
-                    _mark(directory, "engine-exiting", {"status": 23})
-                    return 23
+                    _mark(directory, "engine-exiting", {"status": exit_status})
+                    return exit_status
                 time.sleep(5.1)
             raise TimeoutError("No worker failure reached the delayed client")
         finally:

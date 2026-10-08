@@ -5,7 +5,7 @@
 
 import threading
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import CancelledError, Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -97,14 +97,18 @@ def test_stop_is_processed_while_all_futures_are_pending(monkeypatch):
 
 @pytest.mark.parametrize("peer_fails", [False, True], ids=["stuck-peer", "all-failed"])
 @pytest.mark.parametrize("send_stop", [False, True], ids=["deadline", "stop"])
+@pytest.mark.parametrize("error_type", [ValueError, SystemExit, KeyboardInterrupt])
 def test_async_failure_waits_for_client_without_starting_more_work(
-    monkeypatch: pytest.MonkeyPatch, peer_fails: bool, send_stop: bool
+    monkeypatch: pytest.MonkeyPatch,
+    peer_fails: bool,
+    send_stop: bool,
+    error_type: type[BaseException],
 ) -> None:
     now = [100.0]
     monkeypatch.setattr(mpi.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(mpi, "_mgmn_shutdown_grace_seconds", lambda: 10)
     failed, peer = Future(), Future()
-    error = ValueError("rank failed")
+    error = error_type("rank failed")
     queue = _Queue([mpi.RemoteTask(_task, (0,), {}), mpi.RemoteTask(_task, (1,), {})])
     server = _server(queue, [[failed, peer]])
 
@@ -128,7 +132,7 @@ def test_async_failure_waits_for_client_without_starting_more_work(
     with pytest.raises(RuntimeError, match="asynchronous task failed") as raised:
         server.serve()
     assert raised.value.__cause__ is error
-    assert queue.sent == [mpi.RemoteWorkerDeath("ValueError", "rank failed")]
+    assert queue.sent == [mpi.RemoteWorkerDeath(error_type.__name__, "rank failed")]
     assert queue.thread_ids == {threading.get_ident()}
     assert queue.polls == (8 if send_stop else 13)
     server.session.submit.assert_called_once()
@@ -149,18 +153,61 @@ def test_failed_error_delivery_still_shuts_down():
     queue.socket.setsockopt.assert_any_call(zmq.LINGER, 1000)
 
 
-def test_sync_error_does_not_leak_responses_into_next_batch():
+@pytest.mark.parametrize("error_type", [ValueError, SystemExit, KeyboardInterrupt])
+def test_sync_error_does_not_leak_responses_into_next_batch(
+    error_type: type[BaseException],
+) -> None:
     def stop_after_responses(queue):
         if len(queue.sent) == 2:
             queue.messages.append(None)
 
     queue = _Queue([mpi.RemoteTask(_task, (), {}, True)] * 2, on_poll=stop_after_responses)
-    error = ValueError("first batch failed")
+    error = error_type("first batch failed")
     server = _server(queue, [[_future(7), _future(error=error)], [_future(8), _future(9)]])
     server.serve()
     assert queue.sent == [error, [8, 9]]
     assert queue.thread_ids == {threading.get_ident()}
     assert server.session.submit.call_count == 2
+
+
+@pytest.mark.parametrize("sync", [False, True], ids=["async", "sync"])
+def test_cancelled_future_sends_one_error_response(sync: bool) -> None:
+    def stop_after_response(queue: _Queue) -> None:
+        if queue.sent:
+            queue.messages.append(None)
+
+    cancelled = Future()
+    assert cancelled.cancel()
+    queue = _Queue([mpi.RemoteTask(_task, (), {}, sync)], on_poll=stop_after_response)
+    server = _server(queue, [[cancelled, _future(7)]])
+    if sync:
+        server.serve()
+        assert len(queue.sent) == 1
+        assert isinstance(queue.sent[0], CancelledError)
+    else:
+        with pytest.raises(RuntimeError, match="asynchronous task failed") as raised:
+            server.serve()
+        assert isinstance(raised.value.__cause__, CancelledError)
+        assert queue.sent == [mpi.RemoteWorkerDeath("CancelledError", "")]
+    server._shutdown_session.assert_called_once()
+    assert queue.closed
+
+
+@pytest.mark.parametrize("operation", ["exception", "result"])
+def test_server_local_interrupt_is_not_reported_as_worker_death(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    future = _future(7)
+    interrupt = KeyboardInterrupt("server interrupted")
+    monkeypatch.setattr(future, operation, Mock(side_effect=interrupt))
+    queue = _Queue([mpi.RemoteTask(_task, (), {})])
+    server = _server(queue, [[future, _future(8)]])
+    with pytest.raises(KeyboardInterrupt) as raised:
+        server.serve()
+    assert raised.value is interrupt
+    assert queue.sent == []
+    server._shutdown_session.assert_called_once()
+    assert queue.closed
 
 
 def test_sync_multiple_failures_send_one_response():

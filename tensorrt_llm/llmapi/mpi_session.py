@@ -12,7 +12,7 @@ import time
 import traceback
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from concurrent.futures import wait as futures_wait
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
@@ -1055,9 +1055,13 @@ class RemoteMpiCommSessionServer():
                     if not future.done():
                         continue
                     pending.remove(future)
-                    try:
+                    # Inspect stored worker failures without raising them here;
+                    # server-local interrupts must still propagate normally.
+                    error = (CancelledError()
+                             if future.cancelled() else future.exception())
+                    if error is None:
                         results.append(future.result())
-                    except Exception as error:
+                    else:
                         logger.error(f"Remote MPI worker failed: {error!r}")
                         if first_error is None:
                             first_error = error

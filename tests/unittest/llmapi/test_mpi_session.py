@@ -135,12 +135,14 @@ def run_client(server_addr, values_to_process, hmac_key: bytes):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("response",
-                         [[1, 1], RuntimeError("remote task failed")],
-                         ids=["results", "error"])
+@pytest.mark.parametrize(
+    "response",
+    [[1, 1], RuntimeError("remote task failed"),
+     SystemExit(7)],
+    ids=["results", "error", "system-exit"])
 def test_remote_mpi_submit_sync_response_after_empty_poll(
         monkeypatch: pytest.MonkeyPatch,
-        response: list[int] | RuntimeError) -> None:
+        response: list[int] | BaseException) -> None:
     """A response following an empty poll must wake the waiting client."""
     first_empty_poll = threading.Event()
     release_server = threading.Event()
@@ -195,8 +197,8 @@ def test_remote_mpi_submit_sync_response_after_empty_poll(
 
     assert first_empty_poll.is_set()
     assert elapsed < 2, f"Client waited {elapsed:.3f}s after an empty poll"
-    if isinstance(response, RuntimeError):
-        assert isinstance(actual, RuntimeError)
+    if isinstance(response, BaseException):
+        assert type(actual) is type(response)
         assert actual.args == response.args
     else:
         assert actual == response

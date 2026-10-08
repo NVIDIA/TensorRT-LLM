@@ -79,6 +79,7 @@ def _cleanup_processes(identities: dict[int, float]) -> None:
         "mixed_failure",
         "mixed_collective",
         "all_failure",
+        "worker_system_exit",
         "all_hang",
         "all_return",
         "no_submission",
@@ -111,7 +112,9 @@ def test_remote_mpi_worker_lifecycle(scenario: str, ranks: int, tmp_path: Path) 
         OMPI_ALLOW_RUN_AS_ROOT_CONFIRM="1",
         PRTE_ALLOW_RUN_AS_ROOT="1",
         PRTE_ALLOW_RUN_AS_ROOT_CONFIRM="1",
-        TLLM_MGMN_SHUTDOWN_GRACE_SECONDS="60" if scenario == "all_failure" else "5",
+        TLLM_MGMN_SHUTDOWN_GRACE_SECONDS=(
+            "60" if scenario in ("all_failure", "worker_system_exit") else "5"
+        ),
         TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT="90",
         TLLM_LLMAPI_ZMQ_DEBUG="1",
         TLLM_LOG_LEVEL="info",
@@ -226,18 +229,29 @@ def test_remote_mpi_worker_lifecycle(scenario: str, ranks: int, tmp_path: Path) 
         # mixed-failure path needs no new interpreter and has a tighter bound.
         teardown_budget = 120 if scenario == "all_hang" else 20
         assert exited - triggered < teardown_budget, f"Teardown exceeded its bounded budget:\n{log}"
-    elif scenario == "all_failure":
-        assert process.returncode == 23, log
+    elif scenario in ("all_failure", "worker_system_exit"):
+        system_exit = scenario == "worker_system_exit"
+        exit_status = 24 if system_exit else 23
+        assert process.returncode == exit_status, log
         delayed_at = json.loads((tmp_path / "client-poll-delayed.json").read_text())["monotonic"]
         first_poll = json.loads((tmp_path / "client-first-poll.json").read_text())["monotonic"]
         assert first_poll - delayed_at > 5, log
         error = json.loads((tmp_path / "error-observed.json").read_text())
-        assert "injected MPI lifecycle failure" in error["error"], error
+        expected_error = (
+            "Remote MPI worker died: SystemExit: injected MPI lifecycle exit"
+            if system_exit
+            else "injected MPI lifecycle failure"
+        )
+        assert expected_error in error["error"], error
         assert "Traceback (most recent call last):" in error["traceback"], error
         assert error["traceback"].strip().splitlines()[-1] in log, log
-        assert json.loads((tmp_path / "engine-exiting.json").read_text())["status"] == 23
-        assert "Rank0 Task exit code: 23" in log, log
+        assert json.loads((tmp_path / "engine-exiting.json").read_text())["status"] == exit_status
+        assert f"Rank0 Task exit code: {exit_status}" in log, log
         assert "MPI Comm server exited before the task" not in log, log
+        if system_exit:
+            assert (tmp_path / f"failed-0-{ranks - 1}.json").exists(), log
+            for rank in range(ranks - 1):
+                assert (tmp_path / f"finished-0-{rank}.json").exists(), log
     elif scenario == "no_submission":
         assert process.returncode == 3, log
     elif scenario == "async_drain":
