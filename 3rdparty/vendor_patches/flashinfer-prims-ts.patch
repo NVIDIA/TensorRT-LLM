@@ -57,20 +57,29 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29d692b430 100644
+index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..5dd3045f2355c1b6e81fd157661389e2bda363a3 100644
 --- a/context.py
 +++ b/context.py
 @@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
  position.
  
  PrimTS context entry points are intentionally excluded from ``fi_trace`` for
--now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
+-now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators do not
 -register trace templates.
-+now; their ``@flashinfer_api`` decorators do not register trace templates.
++now; their ``@flashinfer_experimental_api`` decorators do not register trace templates.
  """
  
  from dataclasses import dataclass
-@@ -438,7 +437,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -46,7 +45,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
+ 
+ import torch
+ 
+-from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
+ 
+ if TYPE_CHECKING:
+@@ -488,7 +487,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):

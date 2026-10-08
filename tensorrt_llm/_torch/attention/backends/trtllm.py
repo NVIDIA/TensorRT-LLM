@@ -25,6 +25,7 @@ import torch
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
@@ -1631,6 +1632,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_create_weights_in_init: bool = False,
         attention_chunk_size: Optional[int] = None,
         sparse_params: Optional[SparseParams] = None,
+        quant_attention_config: Optional["QuantAttentionConfig"] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
         **kwargs,
@@ -1651,6 +1653,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_params (SparseParams): Optional sparse-attention backend parameters
                 (e.g. skip-softmax). Algorithm-specific fields are documented on the
                 corresponding ``SparseParams`` subclass.
+            quant_attention_config (QuantAttentionConfig): Optional attention operand
+                quantization recipe (Q/K and V dtypes with their block sizes).
             kv_cache_dtype (str): KV-cache dtype selected by ``KvCacheConfig``. Accepted
                 values are ``auto``, ``fp8``, ``fp8_ds_mla``, ``nvfp4``, and supported
                 torch dtype strings. ``fp8_ds_mla`` selects the packed sparse-MLA cache
@@ -1661,6 +1665,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.quant_attention_config = quant_attention_config
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         self.is_mla_enable = mla_params is not None
