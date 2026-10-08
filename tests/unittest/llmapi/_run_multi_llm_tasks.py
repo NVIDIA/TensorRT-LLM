@@ -11,7 +11,7 @@ sys.path.append(
 
 from test_common.llm_data import llm_models_root  # noqa: E402
 
-model_path = llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
+model_path = llm_models_root() / "Qwen3" / "Qwen3-0.6B"
 
 
 def run_llm_tp2():

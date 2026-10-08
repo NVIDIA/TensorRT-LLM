@@ -15,7 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA checkpoints."""
+"""TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
 import time
 from io import BytesIO
@@ -28,9 +28,15 @@ from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
+from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
 from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
+from tensorrt_llm._torch.visual_gen.pipeline import (
+    BasePipeline,
+    ExtraParamSchema,
+    RefSlotSpec,
+    RoleSpec,
+)
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
@@ -60,6 +66,7 @@ from .packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from .ref2va import load_references, prepare_references, validate_reference_order
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 
@@ -109,11 +116,13 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
     hf_ids=["MiniMaxAI/MiniMax-H3"],
+    defaults={"workflow": "fl2va"},
     download_patterns=[
         "modular_model_index.json",
         "LICENSE",
         "README.md",
         "transformer/*",
+        "transformer_ref/*",
         "text_encoder/*",
         "tokenizer/*",
         "processor/*",
@@ -124,7 +133,7 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
     ],
     doc=(
         "MiniMax-H3 initial BF16 support for text-to-video-with-audio and "
-        "first/last-frame FL2VA using the converted top-level checkpoint."
+        "first/last-frame FL2VA or image/video/audio-conditioned Ref2VA."
     ),
 )
 class MiniMaxH3Pipeline(BasePipeline):
@@ -169,6 +178,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             raise NotImplementedError(
                 "CUDA graphs are not yet supported for MiniMax-H3's packed layout inputs."
             )
+        self.workflow = pipeline_config.extra_attrs.get("workflow", "fl2va")
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
@@ -188,6 +198,13 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def ref_slot_specs(self) -> dict[str, RefSlotSpec]:
+        if self.workflow == "ref2va":
+            return {
+                f"{kind}_reference": RefSlotSpec(
+                    modality=kind, roles=[RoleSpec(role="reference", min=0, max=limit)]
+                )
+                for kind, limit in (("image", 9), ("video", 3), ("audio", 3))
+            }
         return {
             "image_reference": RefSlotSpec(
                 modality="image",
@@ -197,6 +214,27 @@ class MiniMaxH3Pipeline(BasePipeline):
                 ],
             ),
         }
+
+    @property
+    def extra_param_specs(self) -> dict[str, ExtraParamSchema]:
+        if self.workflow != "ref2va":
+            return {}
+        return {
+            "reference_order": ExtraParamSchema(
+                type="list",
+                default=None,
+                validator=validate_reference_order,
+                description="Ordered image:N/video:N/audio:N references (zero-based); "
+                "defaults to images, videos, then audio, preserving each slot's order.",
+            )
+        }
+
+    def load_transformer_weights(self, checkpoint_dir: str) -> dict:
+        if self.workflow == "ref2va":
+            return WeightLoader(components="transformer_ref").load_weights(
+                checkpoint_dir, self.mapping
+            )
+        return super().load_transformer_weights(checkpoint_dir)
 
     @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
@@ -217,6 +255,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         num_frames: int,
         steps: int,
     ) -> None:
+        # Ref2VA needs real reference geometry; its first request initializes
+        # attention for that packed layout instead of issuing a text-only request.
+        if self.workflow == "ref2va":
+            return
         self.forward(
             prompt="warmup",
             seed=42,
@@ -339,6 +381,13 @@ class MiniMaxH3Pipeline(BasePipeline):
     def prepare_request(self, req: Any) -> None:
         """Resolve mode-dependent canvas geometry before warmup lookup."""
 
+        if self.workflow == "ref2va":
+            req.prepared_inputs["references"] = load_references(req.params)
+            if (req.params.height is None) != (req.params.width is None):
+                raise ValueError("MiniMax-H3 height and width must be set together.")
+            if req.params.height is None:
+                req.params.height, req.params.width = resolve_canvas_size(16, 9)
+            return
         keyframes, keyframe_anchors = self._load_request_keyframes(req)
         req.prepared_inputs["keyframes"] = keyframes
         req.prepared_inputs["keyframe_anchors"] = keyframe_anchors
@@ -371,11 +420,18 @@ class MiniMaxH3Pipeline(BasePipeline):
         prepared_inputs = getattr(req, "prepared_inputs", {})
         keyframes = prepared_inputs.get("keyframes")
         keyframe_anchors = prepared_inputs.get("keyframe_anchors")
-        if keyframes is None or keyframe_anchors is None:
+        if self.workflow != "ref2va" and (keyframes is None or keyframe_anchors is None):
             keyframes, keyframe_anchors = self._load_request_keyframes(req)
 
         return self.forward(
             prompt=prompt,
+            references=(
+                prepared_inputs.get("references")
+                if "references" in prepared_inputs
+                else load_references(req.params)
+            )
+            if self.workflow == "ref2va"
+            else None,
             seed=req.params.seed,
             height=req.params.height,
             width=req.params.width,
@@ -445,14 +501,6 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt: str,
         keyframes: list[Image.Image],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_layers = self.text_encoder.config.text_config.num_hidden_layers
-        if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
-            raise ValueError(
-                "MiniMax-H3 requires the unnormalized hidden state after Qwen3-VL "
-                f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
-                f"{num_layers} layers."
-            )
-
         pixel_values = None
         image_grid_thw = None
         token_ids = []
@@ -485,28 +533,48 @@ class MiniMaxH3Pipeline(BasePipeline):
         prompt_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
         token_ids.extend(prompt_ids)
         token_tags.extend([MINIMAX_H3_TEXT_TAG] * len(prompt_ids))
+        vision_inputs = {}
+        if pixel_values is not None:
+            vision_inputs = {"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+        return self._encode_text_tokens(token_ids, vision_inputs), torch.tensor(
+            token_tags, dtype=torch.long
+        )
+
+    def _encode_text_tokens(
+        self, token_ids: list[int], vision_inputs: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Encode one H3 presentation, shared by keyframes and mixed references."""
+        num_layers = self.text_encoder.config.text_config.num_hidden_layers
+        if num_layers <= MINIMAX_H3_TEXT_ENCODER_LAYER:
+            raise ValueError(
+                "MiniMax-H3 requires the unnormalized hidden state after Qwen3-VL "
+                f"layer {MINIMAX_H3_TEXT_ENCODER_LAYER}, but the encoder has "
+                f"{num_layers} layers."
+            )
+
         input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         mm_token_type_ids = torch.tensor(
             self.processor.create_mm_token_type_ids([token_ids]),
             dtype=torch.long,
             device=self.device,
         )
+        vision_kwargs = {
+            name: value.to(self.device, self.text_encoder.dtype)
+            if name.startswith("pixel_")
+            else value.to(self.device)
+            for name, value in vision_inputs.items()
+        }
         outputs = self.text_encoder.model(
             input_ids=input_ids,
             attention_mask=torch.ones_like(input_ids),
             mm_token_type_ids=mm_token_type_ids,
-            pixel_values=None
-            if pixel_values is None
-            else pixel_values.to(self.device, self.text_encoder.dtype),
-            image_grid_thw=None if image_grid_thw is None else image_grid_thw.to(self.device),
             use_cache=False,
             output_hidden_states=True,
+            **vision_kwargs,
         )
-        prompt_embeds = outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
-            device=self.device,
-            dtype=self.dtype,
+        return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
+            device=self.device, dtype=self.dtype
         )
-        return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
     def _encode_keyframes(
         self,
@@ -518,38 +586,42 @@ class MiniMaxH3Pipeline(BasePipeline):
         if not keyframes:
             return None
 
+        del latent_height, latent_width
+        latents = []
+        for image in keyframes:
+            pixels = torch.from_numpy(np.array(image)).to(self.device)
+            pixels = pixels.permute(2, 0, 1)[None, :, None]
+            latents.append(self._encode_visual_condition(pixels))
+        return self._prepare_condition_rows(latents, generator)
+
+    def _encode_visual_condition(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode uint8 [1, 3, T, H, W] pixels as normalized FP32 CPU latents."""
         latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1, 1)
         latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1, 1)
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
-        rows = []
-        for image in keyframes:
-            pixels = torch.from_numpy(np.array(image)).to(self.device)
-            pixels = pixels.permute(2, 0, 1)[None, :, None]
-            pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
-            posterior = self.vae.encode(pixels).latent_dist
-            encode_generator = torch.Generator().manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-            latents = posterior.sample(generator=encode_generator)
-            latents = latents.to(torch.float16).float().cpu()
-            rows.append(
-                patchify_video_latents(
-                    (latents - latents_mean) / latents_std,
-                    self.transformer.config.patch_size,
-                )
-            )
-        condition_latents = torch.cat(rows).to(self.device)
+        pixels = (pixels.to(torch.float32).div(255.0) - pixel_mean) / pixel_std
+        posterior = self.vae.encode(pixels).latent_dist
+        encode_generator = torch.Generator().manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
+        latents = posterior.sample(generator=encode_generator).to(torch.float16).float().cpu()
+        return (latents - latents_mean) / latents_std
+
+    def _prepare_condition_rows(
+        self, latents: list[torch.Tensor], generator: torch.Generator
+    ) -> torch.Tensor:
+        """Pack and noise heterogeneous visual references in request order."""
+        patch_size = self.transformer.config.patch_size
+        condition_rows = torch.cat(
+            [patchify_video_latents(value, patch_size) for value in latents]
+        ).to(self.device)
         noise = keyframe_condition_noise(
-            ((1, latent_height, latent_width),) * len(keyframes),
-            self.transformer.config.patch_size,
+            tuple(tuple(value.shape[2:]) for value in latents),
+            patch_size,
             self.vae.config.latent_channels,
             generator=generator,
             device=self.device,
         )
-        return self.scheduler.scale_noise(
-            condition_latents,
-            MINIMAX_H3_KEYFRAME_NOISE_AUG,
-            noise,
-        )
+        return self.scheduler.scale_noise(condition_rows, MINIMAX_H3_KEYFRAME_NOISE_AUG, noise)
 
     def _prepare_latents(
         self,
@@ -660,6 +732,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         num_inference_steps: int,
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
+        references: Optional[list] = None,
     ) -> PipelineOutput:
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -687,28 +760,40 @@ class MiniMaxH3Pipeline(BasePipeline):
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(num_frames)
 
-        prompt_embeds, text_token_tags = self._encode_prompt(prompt, keyframes)
-        layout = build_packed_sequence(
-            text_token_tags,
-            num_latent_frames,
-            latent_height,
-            latent_width,
-            num_audio_latents,
-            self.transformer.config.patch_size,
-            keyframe_anchors,
-        )
+        audio_condition_latents = None
+        if self.workflow == "ref2va":
+            if keyframes:
+                raise ValueError("Ref2VA accepts references, not first/last keyframes.")
+            prompt_embeds, layout, condition_latents, audio_condition_latents = prepare_references(
+                self, references or [], prompt, height, width, num_frames, generator
+            )
+        else:
+            if references:
+                raise ValueError(
+                    "Reference conditioning requires pipeline_config workflow='ref2va'."
+                )
+            prompt_embeds, text_token_tags = self._encode_prompt(prompt, keyframes)
+            layout = build_packed_sequence(
+                text_token_tags,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                self.transformer.config.patch_size,
+                keyframe_anchors,
+            )
+            condition_latents = self._encode_keyframes(
+                keyframes,
+                latent_height,
+                latent_width,
+                generator,
+            )
         position_ids = layout.position_ids.to(self.device)
         token_tags = layout.token_tags.to(self.device)
         video_indices = layout.video_indices.to(self.device)
         audio_indices = layout.audio_indices.to(self.device)
         text_indices = layout.text_indices.to(self.device)
 
-        condition_latents = self._encode_keyframes(
-            keyframes,
-            latent_height,
-            latent_width,
-            generator,
-        )
         latents, audio_latents = self._prepare_latents(
             num_latent_frames=num_latent_frames,
             latent_height=latent_height,
@@ -751,6 +836,12 @@ class MiniMaxH3Pipeline(BasePipeline):
         )
         condition_rows = layout.num_condition_video_rows
         condition_prefix = latents[:condition_rows][None]
+        audio_condition_rows = layout.num_condition_audio_rows
+        audio_condition_prefix = (
+            audio_condition_latents[None]
+            if audio_condition_latents is not None
+            else audio_latents[None, :0]
+        )
         # H3's native time increases toward clean. Attention and graph-phase
         # scheduling use descending normalized noise, protecting both streams.
         attention_timesteps = 1.0 - torch.minimum(
@@ -769,7 +860,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             unique_timesteps, timestep_indices = row_timestep_plan[index]
             video_velocity, audio_velocity = self.transformer(
                 hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
-                audio_hidden_states=extra_stream_latents["audio"],
+                audio_hidden_states=torch.cat(
+                    (audio_condition_prefix, extra_stream_latents["audio"]), dim=1
+                ),
                 encoder_hidden_states=None,
                 timestep=attention_timesteps[index : index + 1],
                 conditioning_timesteps=unique_timesteps,
@@ -788,6 +881,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             # loudly at the step that produced it instead of shipping the
             # corruption downstream.
             _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
+            audio_velocity = audio_velocity[:, audio_condition_rows:]
             _check_denoise_step(audio_velocity, "audio", index)
             return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 

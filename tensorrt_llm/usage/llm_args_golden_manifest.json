@@ -521,6 +521,11 @@
       "path": "guided_decoding_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "iter_stats_max_iterations"
@@ -1093,6 +1098,11 @@
       "path": "peft_cache_config.optimal_adapter_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "per_request_spec_decode_stats"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "perf_metrics_max_requests"
@@ -1190,7 +1200,8 @@
         "nano-v3",
         "gemma4",
         "kimi_k2",
-        "kimi_k25"
+        "kimi_k25",
+        "k-exaone"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",

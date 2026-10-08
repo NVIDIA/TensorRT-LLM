@@ -36,11 +36,13 @@ def bare_mm_item_scheduler(
     return MultimodalItemScheduler(model=model, input_processor=input_processor)
 
 
-def make_llm_request(request_id: int, multimodal_data: dict[str, Any] | None = None) -> LlmRequest:
+def make_llm_request(
+    request_id: int, multimodal_data: dict[str, Any] | None = None, *, prompt_len: int = 3
+) -> LlmRequest:
     return LlmRequest(
         request_id=request_id,
         max_new_tokens=1,
-        input_tokens=[1, 2, 3],
+        input_tokens=list(range(1, prompt_len + 1)),
         sampling_config=SamplingConfig(),
         is_streaming=False,
         py_multimodal_data=multimodal_data,
@@ -61,7 +63,16 @@ def record_output(
     )
 
 
-def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] = ()) -> LlmRequest:
+def make_mm_request(
+    request_id: int,
+    costs: list[int],
+    *,
+    ready: Sequence[int] = (),
+    embedding_lengths: Sequence[int] | None = None,
+    prompt_len: int = 3,
+) -> LlmRequest:
+    if embedding_lengths is None:
+        embedding_lengths = [1] * len(costs)
     request = make_llm_request(
         request_id,
         multimodal_data={
@@ -69,10 +80,11 @@ def make_mm_request(request_id: int, costs: list[int], *, ready: Sequence[int] =
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
                 item_refs=[("image", item_idx) for item_idx in range(len(costs))],
                 encoder_token_lengths=costs,
-                output_embedding_lengths=[1] * len(costs),
+                output_embedding_lengths=list(embedding_lengths),
             ),
-            "multimodal_embedding_lengths": [1] * len(costs),
+            "multimodal_embedding_lengths": list(embedding_lengths),
         },
+        prompt_len=prompt_len,
     )
     initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
     for item_idx in ready:

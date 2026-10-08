@@ -1781,6 +1781,50 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
+// Which build of <tarName> this stage tests.
+//
+// Deterministic, not discovered. The pipeline already decided whether the build
+// published a BOLTed variant, so there is nothing to probe for: fetch
+// bolted-<tarName> and let a missing object fail the stage. A probe-and-fall-back
+// shape cannot distinguish "no BOLTed build was published" from "the probe
+// itself failed", and both outcomes produce a normal-looking log while the stage
+// quietly tests un-BOLTed binaries.
+//
+// Also asserts the artifact carries the bundle this pipeline pinned. Addressing
+// by name proves only that something is there; the property proves it is the
+// right something, which is what keeps the tested build and the released wheel
+// on one profile set. Absent property means an artifact predating the label:
+// reported and allowed rather than failed.
+def boltedTarUrl(String config, String tarName)
+{
+    def base = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}"
+    // Only the SBSA build is BOLTed, so only its tarball has a bolted- variant.
+    // Asking for one on any other config would 404 the stage rather than fail
+    // honestly, so the arch gate has to match the build's exactly.
+    if (!BOLT_TEST_BOLTED_TARBALL || config != LINUX_AARCH64_CONFIG) {
+        return "${base}/${tarName}"
+    }
+    if (BOLT_PINNED_REF) {
+        def propsUrl = "${URM_ARTIFACTORY_BASE}/api/storage/${ARTIFACT_PATH}/bolted-${tarName}?properties"
+        // -L: Artifactory redirects metadata reads, and without it curl returns
+        // the redirect rather than the document.
+        def got = sh(returnStdout: true, script: """
+            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 '${propsUrl}' 2>/dev/null \\
+              | tr -d ' \\n' \\
+              | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p' || true
+        """).trim()
+        if (got && got != BOLT_PINNED_REF) {
+            error("[BOLT] bolted-${tarName} carries bolt.ref=${got}, but this pipeline pinned ${BOLT_PINNED_REF}. " +
+                  "Refusing to test a build optimized with a different profile bundle than the release artifacts use.")
+        }
+        if (!got) {
+            echo "[BOLT] bolted-${tarName} carries no bolt.ref (artifact predates the label); proceeding on pin ${BOLT_PINNED_REF}"
+        }
+    }
+    echo "[BOLT] testing the BOLTed build: bolted-${tarName}"
+    return "${base}/bolted-${tarName}"
+}
+
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -1824,7 +1868,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmTarfile = boltedTarUrl(config, tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -3164,7 +3208,15 @@ def BOLT_CONSUME_BUILD = "bolt_consume_build"
 @Field
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+@Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+// Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
+// is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
+// so reading it inside them throws MissingPropertyException; Build.groovy handles
+// BOLT_CONSUME_ENABLED the same way.
+BOLT_PINNED_REF = ""
+BOLT_TEST_BOLTED_TARBALL = false
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3178,6 +3230,7 @@ def globalVars = [
     // silently dropped -- which for this one would mean running unpinned
     // without saying so.
     (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): false,
     (BOLT_PROFILE_BRANCH): "",
 ]
 
@@ -5097,7 +5150,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+        def llmTarfile = boltedTarUrl(config, tarName)
         timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
         }
@@ -5114,21 +5167,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                // TODO(dlfw-26.08): reinstate causal-conv1d and mamba-ssm once
-                // upstream publishes wheels built against this base image's torch.
-                // They used to be installed here, from
-                //   causal-conv1d v1.6.2  causal_conv1d-1.6.1+cu13torch26.04cxx11abiTRUE
-                //   mamba v2.3.0          mamba_ssm-2.3.0+cu13torch26.01cxx11abiTRUE
-                // but the newest builds upstream offers target torch 26.07 and 26.04,
-                // so on DLFW 26.08 the extension loads with an undefined c10 symbol,
-                // materialize_cow_storage(StorageImpl&). A broken install is worse
-                // than none: transformers gates its causal_conv1d import on a
-                // package-metadata probe, which a broken install still passes, so
-                // modeling_qwen3_5_moe raises at import and every test collected from
-                // a module that imports it dies as a collection error. Absent, the
-                // gate says no and the model falls back to its Python path -- slower,
-                // and it OOMs on Nemotron-H, which is why
-                // test_llm_update_weights_nemotron_h is waived under nvbugs/6729495.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash ${llmSrc}/jenkins/scripts/install_mamba.sh")
             }
             if (!skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
@@ -5712,7 +5751,8 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 // a missing bundle as a skip; it has to, because the same switch covers x86_64,
 // where nothing is promoted yet. This path is aarch64-only and the switch is
 // main-only, so there is always a bundle to find.
-def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltProfileRef = "",
+                           String boltProfileBranch = "")
 {
     def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
     // apply_latest.sh resolves exactly one branch, so try the build's own branch
@@ -5723,6 +5763,13 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
         .collect { it?.toString()?.trim() }
         .findAll { it }
         .unique()
+    // A pin now supplies its own branch, so nothing is left to guess: the ref
+    // names one object under that branch's promote directory. Walking candidates
+    // would only add ways to fetch something other than what was pinned.
+    if (boltProfileRef && boltProfileBranch) {
+        branches = [boltProfileBranch]
+        echo "[bolt-wheel] pinned to BOLT bundle ${boltProfileRef} on ${boltProfileBranch}"
+    }
 
     stage("BOLT release wheel") {
         sh """
@@ -5748,14 +5795,23 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
         for (b in branches) {
             rc = sh(returnStatus: true, script: """
                 export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                export BOLT_PROFILE_REF='${boltProfileRef}'
+                # Quoted: the branch comes from job env and the wheel name from a
+                # directory listing, so an unquoted expansion would let a shell
+                # metacharacter in either run before apply_latest.sh starts.
                 bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
-                     ${b} ${cpu_arch} ${wheel} ${wheel}.bolted
+                     '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
             """)
             if (rc != 3) {
                 appliedFrom = b
                 break
             }
             echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        }
+        if (rc == 3 && boltProfileRef) {
+            error("[bolt-wheel] pinned BOLT bundle ${boltProfileRef} (${cpu_arch}) not found under any of " +
+                  "${branches.join(', ')}. This pipeline pinned a bundle the release wheel cannot fetch; " +
+                  "refusing to publish a wheel optimized with anything else.")
         }
         if (rc == 3) {
             error("[bolt-wheel] no promoted BOLT bundle for any of ${branches.join(', ')} (${cpu_arch}); " +
@@ -5766,7 +5822,8 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch)
             error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
         }
         sh "mv -f ${wheel}.bolted ${wheel}"
-        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch})"
+        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch}" +
+             (boltProfileRef ? ", bundle ${boltProfileRef})" : ")")
     }
 }
 
@@ -5779,7 +5836,9 @@ def runLLMBuild(
     cpver="cp312",
     plat_name="",
     is_dlfw=false,
-    boltConsume=false)
+    boltConsume=false,
+    boltProfileRef="",
+    boltProfileBranch="")
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -5815,9 +5874,7 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
-        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -5842,7 +5899,8 @@ def runLLMBuild(
     // inside an already-released image to prove that image can still build from
     // source; optimizing it would prove nothing and only add a failure mode.
     if (boltConsume && cpu_arch == AARCH64_TRIPLE && !wheel_path) {
-        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch)
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch,
+                               boltProfileRef, boltProfileBranch)
     }
 
     def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
@@ -6337,6 +6395,8 @@ def infraDeferPredicate(Map stageScopes) {
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -7018,11 +7078,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             // Same switch the build helpers use for the tarball, so the released
             // wheel and the released tarball are never optimized differently.
             def boltConsume = globalVars[BOLT_CONSUME_BUILD]?.toString() == "true"
+            // The bundle this pipeline pinned, so the released wheel is optimized
+            // with the same profiles the tested build was. Empty means unpinned:
+            // apply_latest.sh then takes whatever `latest` is, i.e. today's
+            // behaviour.
+            def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+            def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
                 wheelPath = runLLMBuild(
                     pipeline, cpu_arch, values[3], "", versionOverride, cpver,
-                    values[7], isDlfw, boltConsume)
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
