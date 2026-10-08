@@ -58,6 +58,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+# Appended rather than prepended: internal/ is a directory of helper scripts,
+# and putting it ahead of the stdlib would let any future file in there shadow
+# a module this script already depends on.
+sys.path.append(str(Path(__file__).resolve().parent / "internal"))
+from check_a53_veneers import find_veneers  # noqa: E402
+
 # Keep in sync with bolt_lib.sh::optimize_libraries.
 DEFAULT_BOLT_FLAGS = [
     "-lite",
@@ -119,6 +125,34 @@ def is_elf(path: Path) -> bool:
         return False
 
 
+def is_bolt_applicable(path: Path) -> bool:
+    """Whether this ELF carries the relocations BOLT needs to rewrite it.
+
+    Only an ENABLE_BOLT_COMPATIBLE=ON build emits .rela.text (via
+    -Wl,--emit-relocs). Without it llvm-bolt has to guess at the control flow it
+    is reordering, and it will do so and exit 0 rather than refuse -- so this is
+    the difference between "optimized" and "rewritten on bad information", not
+    between "optimized" and "error". bolt_lib.sh has enforced this on the tarball
+    path since the beginning; the wheel path here did not, which meant a build
+    that lost the flag would still be BOLTed and still be published.
+    """
+    try:
+        proc = subprocess.run(["readelf", "-S", str(path)], capture_output=True, text=True)
+    except OSError:
+        # No readelf in this image. Not a reason to refuse to optimize.
+        return True
+    if proc.returncode != 0:
+        # readelf ran but could not read the sections, so there is no verdict
+        # here. Saying False would report "this build lost ENABLE_BOLT_COMPATIBLE",
+        # which is a different and misleading claim.
+        err(
+            f"readelf -S failed for {path.name} (rc={proc.returncode}); "
+            "cannot check .rela.text, continuing"
+        )
+        return True
+    return ".rela.text" in proc.stdout
+
+
 class BoltApplyError(RuntimeError):
     """An in-scope ELF did not optimize.
 
@@ -139,6 +173,15 @@ def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: b
         log(f"  would bolt {rel}  <-  {profile.name}")
         return
 
+    # Must happen before llvm-bolt runs: BOLT turns these veneers into an x16
+    # trampoline planted mid-function and exits 0, so there is nothing to
+    # detect afterwards short of running the result. See check_a53_veneers.py.
+    veneers = find_veneers(str(elf))
+    if veneers:
+        err(f"{rel} carries {len(veneers)} cortex-a53-843419 veneers; BOLT would miscompile it")
+        err("    rebuild with ENABLE_BOLT_COMPATIBLE=ON (passes -mno-fix-cortex-a53-843419)")
+        raise BoltApplyError(f"{rel} has cortex-a53-843419 veneers")
+
     out = elf.with_suffix(elf.suffix + ".bolted")
     cmd = ["llvm-bolt", str(elf), "-o", str(out), f"-data={profile}"] + flags
     log(f"  bolting {rel}  <-  {profile.name}")
@@ -149,6 +192,20 @@ def bolt_elf(elf: Path, profile: Path, flags: list[str], strip: bool, dry_run: b
             err(f"    {line}")
         out.unlink(missing_ok=True)
         raise BoltApplyError(f"llvm-bolt failed for {rel} (rc={rc})")
+
+    # llvm-bolt reports how much of the profile it could actually use, and how
+    # much it had to infer, on stdout -- then exits 0 either way. Dropping that
+    # on success left no way to tell a clean apply from one that matched almost
+    # nothing, which is exactly the distinction wanted when a bolted binary turns
+    # out to be broken. Warnings always; the stats lines because "N functions
+    # with valid profile" is the one number that says whether this bundle still
+    # belongs to this binary.
+    for line in output.splitlines():
+        s = line.strip()
+        if s.startswith("BOLT-WARNING") or s.startswith("BOLT-ERROR"):
+            log(f"    {s}")
+        elif s.startswith("BOLT-INFO") and ("profile" in s or "stale" in s or "function" in s):
+            log(f"    {s}")
 
     if strip:
         rc_s, _ = run(["llvm-strip", "--strip-all", str(out)])
@@ -199,9 +256,19 @@ def repack_wheel(root: Path, dest: Path, original_infos: dict[str, zipfile.ZipIn
 
 
 def process_wheel(
-    wheel: Path, profiles_dir: Path, flags: list[str], strip: bool, dry_run: bool
+    wheel: Path,
+    profiles_dir: Path,
+    flags: list[str],
+    strip: bool,
+    dry_run: bool,
+    manifest: Path | None = None,
+    strict: bool = False,
 ) -> int:
     """Bolt matching libs inside a wheel and regenerate its RECORD.
+
+    `manifest` is for the standalone-wheel path only: the tarball path verifies
+    the whole extracted tree once, before it gets here. Passing it says "check
+    these libs against the binaries the profiles were recorded from".
 
     Returns the number of bolted members.
     """
@@ -215,6 +282,9 @@ def process_wheel(
             original_infos = {info.filename: info for info in zf.infolist()}
             zf.extractall(wd)
 
+        if manifest is not None:
+            verify_manifest(manifest, wd, strict)
+
         bolted = 0
         changed: list[Path] = []
         for f in sorted(wd.rglob("*")):
@@ -223,6 +293,12 @@ def process_wheel(
             prof = profile_for(f.name, profiles_dir)
             if prof is None:
                 continue
+            if not is_bolt_applicable(f):
+                raise BoltApplyError(
+                    f"{f.relative_to(wd)} has a profile but no .rela.text, so it was "
+                    "not built with ENABLE_BOLT_COMPATIBLE=ON. Optimizing it anyway "
+                    "produces a binary BOLT cannot reason about."
+                )
             bolt_elf(f, prof, flags, strip, dry_run)
             bolted += 1
             changed.append(f)
@@ -252,7 +328,13 @@ def process_wheel(
 
 
 def bolt_standalone_wheel(
-    wheel: Path, output: Path, profiles_dir: Path, strip: bool, dry_run: bool
+    wheel: Path,
+    output: Path,
+    profiles_dir: Path,
+    strip: bool,
+    dry_run: bool,
+    manifest: Path | None = None,
+    strict: bool = False,
 ) -> int:
     """BOLT a .whl that is not packed inside a release tarball.
 
@@ -261,7 +343,9 @@ def bolt_standalone_wheel(
     """
     log(f"Standalone wheel: {wheel.name}")
     if dry_run:
-        bolted = process_wheel(wheel, profiles_dir, DEFAULT_BOLT_FLAGS, strip, True)
+        bolted = process_wheel(
+            wheel, profiles_dir, DEFAULT_BOLT_FLAGS, strip, True, manifest, strict
+        )
         log(f"dry-run: {bolted} member(s) would be bolted; skipping repack.")
         return 0
 
@@ -278,7 +362,9 @@ def bolt_standalone_wheel(
     output.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(wheel, output)
     try:
-        bolted = process_wheel(output, profiles_dir, DEFAULT_BOLT_FLAGS, strip, False)
+        bolted = process_wheel(
+            output, profiles_dir, DEFAULT_BOLT_FLAGS, strip, False, manifest, strict
+        )
     except BoltApplyError:
         # Partially bolted: drop it rather than leave something uploadable that
         # looks finished.
@@ -439,9 +525,18 @@ def _apply(args: argparse.Namespace, workdir: Path) -> int:
         f"{len(list(profiles_dir.glob('*.fdata')))} fdata)"
     )
 
+    # Every promoted bundle ships its manifest.json next to the profiles, so the
+    # check that says "these profiles came from a different build than the one
+    # you are optimizing" is available without the caller having to pass a path.
+    # It was opt-in, and nothing opted in, so the drift it exists to report has
+    # never actually been reported.
+    manifest = args.manifest
+    if manifest is None and (profiles_dir / "manifest.json").is_file():
+        manifest = profiles_dir / "manifest.json"
+
     if args.wheel:
         return bolt_standalone_wheel(
-            args.wheel, args.output, profiles_dir, args.strip, args.dry_run
+            args.wheel, args.output, profiles_dir, args.strip, args.dry_run, manifest, args.strict
         )
 
     # Extract the tarball.
@@ -456,8 +551,8 @@ def _apply(args: argparse.Namespace, workdir: Path) -> int:
     tree = roots[0] if len(roots) == 1 else extract
     log(f"Tarball root: {tree.name}")
 
-    if args.manifest:
-        verify_manifest(args.manifest, tree, args.strict)
+    if manifest:
+        verify_manifest(manifest, tree, args.strict)
 
     total = 0
     # 1) Loose ELFs in the layout (benchmarks/cpp, triton_backend, etc.).
@@ -467,6 +562,12 @@ def _apply(args: argparse.Namespace, workdir: Path) -> int:
         prof = profile_for(f.name, profiles_dir)
         if prof is None:
             continue
+        if not is_bolt_applicable(f):
+            raise BoltApplyError(
+                f"{f.relative_to(tree)} has a profile but no .rela.text, so it was "
+                "not built with ENABLE_BOLT_COMPATIBLE=ON. Optimizing it anyway "
+                "produces a binary BOLT cannot reason about."
+            )
         bolt_elf(f, prof, DEFAULT_BOLT_FLAGS, args.strip, args.dry_run)
         total += 1
 
