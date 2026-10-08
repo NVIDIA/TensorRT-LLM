@@ -31,7 +31,7 @@ from .interface import Evaluator
 
 
 class MMLU(Evaluator):
-    DATASET_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
+    DATASET_URL = "https://huggingface.co/datasets/cais/mmlu/resolve/main/data.tar"
 
     CHOICES = ["A", "B", "C", "D"]
     SUBJECT_TO_SUBCATEGORIES = {
@@ -258,7 +258,7 @@ class MMLU(Evaluator):
         type=str,
         default=None,
         help="The path to MMLU dataset. The commands to prepare the dataset: "
-        "wget https://people.eecs.berkeley.edu/~hendrycks/data.tar && tar -xf data.tar. "
+        "wget https://huggingface.co/datasets/cais/mmlu/resolve/main/data.tar && tar -xf data.tar. "
         "If unspecified, the dataset is downloaded automatically.")
     @click.option(
         "--num_samples",
