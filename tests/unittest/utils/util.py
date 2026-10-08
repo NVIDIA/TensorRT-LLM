@@ -98,6 +98,11 @@ def isSM100Family():
     return sm >= 100 and sm < 110
 
 
+def isSM120Family():
+    sm = getSMVersion()
+    return sm >= 120 and sm < 130
+
+
 skip_pre_ada = pytest.mark.skipif(
     getSMVersion() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -114,7 +119,7 @@ skip_blackwell = pytest.mark.skipif(
     isSM100Family(),
     reason="This test is not supported in Blackwell architecture")
 skip_blackwell_geforce = pytest.mark.skipif(
-    getSMVersion() == 120, reason="This test is not supported on SM 120")
+    isSM120Family(), reason="This test is not supported on SM 120 family")
 skip_rubin = pytest.mark.skipif(
     100 <= getSMVersion() < 110 and getSMVersion() not in (100, 103),
     reason="This test is not supported on non-Blackwell 100f architectures")

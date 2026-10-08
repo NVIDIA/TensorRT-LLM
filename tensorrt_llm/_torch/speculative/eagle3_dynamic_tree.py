@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 
 from ..attention.backends import AttentionMetadata
 from ..pyexecutor.sampler.ops.flashinfer import sample_from_logits_op
@@ -313,9 +313,9 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             max_batch_size * buf_dim * mask_width, dtype=torch.int32, device="cuda"
         )
 
-        # sm>=100 (except 120/121): prepareCustomMask keeps padded 3D; no 1D repack.
+        # SM100 family: prepareCustomMask keeps padded 3D; no 1D repack.
         sm = get_sm_version()
-        self._needs_mask_repack = sm < 100 or sm in (120, 121)
+        self._needs_mask_repack = not is_sm_100f(sm)
 
         # No draft-side buffers needed: target-only rejection sampling does not
         # require unique draft logits, topk score indices, or draft prob indices.

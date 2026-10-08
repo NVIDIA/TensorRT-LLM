@@ -52,10 +52,14 @@ def test_built_architectures_are_supported():
 
 
 @pytest.mark.cpu_only
-def test_sm121_runs_the_sm120_kernels():
-    assert 121 not in SUPPORTED_CUDA_ARCHITECTURES
-    assert is_cuda_architecture_built(121) == (120 in CUDA_ARCHITECTURES)
+def test_architectures_are_matched_exactly():
+    # SM 121 runs the same sm_120f kernels as SM 120, but each must be named.
     assert is_cuda_architecture_supported(121)
+    assert not is_cuda_architecture_supported(129)
+    if 120 in CUDA_ARCHITECTURES and 121 not in CUDA_ARCHITECTURES:
+        assert not is_cuda_architecture_built(121)
+    if 100 in CUDA_ARCHITECTURES and 103 not in CUDA_ARCHITECTURES:
+        assert not is_cuda_architecture_built(103)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

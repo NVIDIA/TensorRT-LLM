@@ -85,7 +85,7 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
 {
     TLLM_CHECK_WITH_INFO((mSM == kSM_80 || mSM == kSM_86 || mSM == kSM_89 || mSM == kSM_90
-                             || tensorrt_llm::common::isSM100Family(mSM) || mSM == kSM_120 || mSM == kSM_121),
+                             || tensorrt_llm::common::isSM100Family(mSM) || tensorrt_llm::common::isSM120Family(mSM)),
         "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(
         (mFixedParams.dataType == DATA_TYPE_FP16 || mFixedParams.dataType == DATA_TYPE_BF16 || isFp8Selected()),
@@ -93,6 +93,10 @@ FusedMHARunnerV2::FusedMHARunnerV2(MHARunnerFixedParams fixedParams)
     if (tensorrt_llm::common::isSM100Family(mSM))
     {
         mSM = kSM_100;
+    }
+    else if (tensorrt_llm::common::isSM120Family(mSM))
+    {
+        mSM = kSM_120;
     }
     xmmaKernel = getXMMAKernelsV2(mFixedParams.dataType, mFixedParams.dataTypeOut, mSM);
 
@@ -358,7 +362,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     bool const isSm80 = (mSM == kSM_80);
     bool const isSm89 = (mSM == kSM_89);
     bool const isSm100f = tensorrt_llm::common::isSM100Family(mSM);
-    bool const isSm120f = (mSM == kSM_120 || mSM == kSM_121);
+    bool const isSm120f = tensorrt_llm::common::isSM120Family(mSM);
 
     // Sliding_or_chunked_causal mask.
     if ((runnerParams.kvSeqLen > runnerParams.slidingWindowSize

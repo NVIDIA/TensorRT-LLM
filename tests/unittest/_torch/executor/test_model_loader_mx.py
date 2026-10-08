@@ -2082,7 +2082,7 @@ def test_linear_transform_weights_is_idempotent():
 
 @pytest.mark.cpu_only
 def test_mla_transform_weights_is_idempotent(monkeypatch):
-    monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
+    monkeypatch.setattr(mla_mod, "is_sm_120f", lambda: True)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
     mla = MLA.__new__(MLA)
     mla._weights_transformed = False

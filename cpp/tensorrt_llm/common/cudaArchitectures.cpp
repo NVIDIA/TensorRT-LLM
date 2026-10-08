@@ -41,17 +41,9 @@ namespace common
 namespace
 {
 
-//! The CMAKE_CUDA_ARCHITECTURES entry providing the kernels for a GPU of SM version `smVersion`. SM 121 runs the
-//! SM 120 kernels; getSMVersion() reports it as SM 120.
-int getKernelArchitecture(int smVersion)
+bool isListed(std::vector<int> const& architectures, int smVersion)
 {
-    return smVersion == 121 ? 120 : smVersion;
-}
-
-bool containsArchitecture(std::vector<int> const& architectures, int smVersion)
-{
-    int const kernelArchitecture = getKernelArchitecture(smVersion);
-    return std::find(architectures.begin(), architectures.end(), kernelArchitecture) != architectures.end();
+    return std::find(architectures.begin(), architectures.end(), smVersion) != architectures.end();
 }
 
 std::string joinArchitectures(std::vector<int> const& architectures)
@@ -74,7 +66,7 @@ std::vector<int> const& getBuiltCudaArchitectures()
 
 bool isCudaArchitectureBuilt(int smVersion)
 {
-    return containsArchitecture(getBuiltCudaArchitectures(), smVersion);
+    return isListed(getBuiltCudaArchitectures(), smVersion);
 }
 
 std::vector<int> const& getSupportedCudaArchitectures()
@@ -85,7 +77,7 @@ std::vector<int> const& getSupportedCudaArchitectures()
 
 bool isCudaArchitectureSupported(int smVersion)
 {
-    return containsArchitecture(getSupportedCudaArchitectures(), smVersion);
+    return isListed(getSupportedCudaArchitectures(), smVersion);
 }
 
 void checkCudaArchitectureSupported(int device)
@@ -105,12 +97,11 @@ void checkCudaArchitectureSupported(int device)
     std::string const built = joinArchitectures(getBuiltCudaArchitectures());
     if (isCudaArchitectureSupported(smVersion))
     {
-        int const required = getKernelArchitecture(smVersion);
         throw std::runtime_error(fmtstr(
             "GPU %d (%s, compute capability %d.%d) is not included in this TensorRT-LLM build, which was built for "
             "CUDA architectures \"%s\". Rebuild TensorRT-LLM with %d included, e.g. with "
             "--cuda_architectures \"%s;%d\".",
-            device, prop.name, major, minor, built.c_str(), required, built.c_str(), required));
+            device, prop.name, major, minor, built.c_str(), smVersion, built.c_str(), smVersion));
     }
     auto const& supported = getSupportedCudaArchitectures();
     int const oldestSupported = *std::min_element(supported.begin(), supported.end());
