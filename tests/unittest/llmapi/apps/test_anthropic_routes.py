@@ -609,23 +609,33 @@ def test_handle_exception_maps_status_and_counter(exception, expected_status, ex
     assert incremented == {expected_counter}
 
 
+_FAKE_DEFAULT_TEMPLATE = "FAKE-DEFAULT-TEMPLATE"
+
+
 class _FakeTokenizer:
     """Renders a prompt the way a chat template would, and counts words."""
 
-    def apply_chat_template(self, messages, **kwargs):
+    def get_chat_template(self, chat_template=None, tools=None):
+        return chat_template or _FAKE_DEFAULT_TEMPLATE
+
+    def apply_chat_template(self, messages=None, **kwargs):
+        if messages is None:
+            # The chat pipeline passes the conversation by keyword.
+            messages = kwargs.pop("conversation")
         parts = [str(m.get("content", "")) for m in messages]
         # Tools and the thinking prefix change the real prompt, so reflect them
         # here too - a count that ignored them would not be worth taking.
         for tool in kwargs.get("tools") or []:
             parts.append(str(tool))
         # A real template changes the rendered prompt, so a fake that dropped
-        # it would make any test of template plumbing pass vacuously.
+        # it would make any test of template plumbing pass vacuously. The
+        # tokenizer's own default template is not an override.
         template = kwargs.get("chat_template")
-        if template:
+        if template and template != _FAKE_DEFAULT_TEMPLATE:
             parts.append(str(template))
         return " ".join(parts)
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=True, **kwargs):
         return text.split()
 
 

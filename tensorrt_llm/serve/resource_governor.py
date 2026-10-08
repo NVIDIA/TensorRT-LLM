@@ -28,7 +28,7 @@ from fastapi import FastAPI
 from starlette.responses import JSONResponse, Response
 
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
-from tensorrt_llm.inputs.utils import ConversationMessage, async_apply_chat_template
+from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (
     parse_chat_messages_coroutines,
@@ -39,6 +39,8 @@ from tensorrt_llm.serve.openai_protocol import (
     KVCacheTruncateTokensRequest,
     ensure_request_chat_template_allowed,
 )
+from tensorrt_llm.serve.render import RenderResources, legacy_render_enabled, render_conversation
+from tensorrt_llm.serve.serving_extensions import get_serving_extension
 
 
 class ResourceGovernor:
@@ -58,11 +60,15 @@ class ResourceGovernor:
         processor=None,
         allow_request_chat_template: bool = False,
         harmony_adapter_factory: Optional[Callable] = None,
+        chat_template: Optional[str] = None,
     ):
         self.resource_governor_queue = resource_governor_queue
         self.tokenizer = tokenizer
         self.model_config = model_config
         self.processor = processor
+        # Server-side ``--chat_template``: the truncation must tokenize the
+        # prompt the chat route executes, so it renders with the same template.
+        self.chat_template = chat_template
         self.allow_request_chat_template = allow_request_chat_template
         self._harmony_adapter_factory = harmony_adapter_factory
         self._harmony_adapter = None
@@ -109,6 +115,23 @@ class ResourceGovernor:
         queue.put(request)
         return None
 
+    def _render_resources(self) -> RenderResources:
+        """Resources for the shared prompt-preparation core."""
+        model_type = (
+            resolve_top_level_model_type(self.model_config)
+            if self.model_config is not None
+            else None
+        )
+        resources = RenderResources(
+            tokenizer=self.tokenizer,
+            model_type=model_type,
+            processor=self.processor,
+            hf_config=self.model_config,
+            default_chat_template=getattr(self, "chat_template", None),
+            extension=get_serving_extension(model_type),
+        )
+        return resources.legacy_view() if legacy_render_enabled() else resources
+
     async def _convert_messages(
         self,
         messages,
@@ -123,27 +146,28 @@ class ResourceGovernor:
         conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
             messages, self.model_config, None
         )
-        token_task = async_apply_chat_template(
-            model_type=resolve_top_level_model_type(self.model_config),
-            tokenizer=self.tokenizer,
-            processor=self.processor,
+        render_task = render_conversation(
+            self._render_resources(),
             conversation=conversation,
-            add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,
+            add_generation_prompt=add_generation_prompt,
             tools=tool_dicts,
             documents=documents,
             chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs or {},
-            enable_tokenize=True,
+            chat_template_kwargs=chat_template_kwargs,
+            tokenize=True,
         )
-        token_ids, _ = await asyncio.gather(token_task, mm_coroutines)
-        return token_ids
+        rendered, _ = await asyncio.gather(render_task, mm_coroutines)
+        return rendered.token_ids
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:
         try:
             ensure_request_chat_template_allowed(request, self.allow_request_chat_template)
+            extension = self._render_resources().extension
             tool_dicts = (
-                None if request.tools is None else [tool.model_dump() for tool in request.tools]
+                None
+                if request.tools is None
+                else [extension.serialize_tool(tool) for tool in request.tools]
             )
             chat_template_kwargs = request.chat_template_kwargs or {}
 

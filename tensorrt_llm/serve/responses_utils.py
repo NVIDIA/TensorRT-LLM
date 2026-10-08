@@ -45,7 +45,6 @@ from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
@@ -71,7 +70,10 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse)
+from tensorrt_llm.serve.render import (RenderResources, legacy_render_enabled,
+                                       render_conversation)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.serving_extensions import get_serving_extension
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -1066,6 +1068,7 @@ async def _create_input_tokens(
     tokenizer: Union[TransformersTokenizer, TokenizerBase],
     model_config: PretrainedConfig,
     processor: AutoProcessor,
+    chat_template: Optional[str] = None,
 ) -> Tuple[list[int], Optional[dict[str, list[Any]]]]:
     """
     Create input tokens for the model. Also return the mm data if the model is multimodal.
@@ -1085,8 +1088,21 @@ async def _create_input_tokens(
 
     conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
         messages, model_config)
+    # Same pipeline as the chat route: the server template and the model
+    # extension's tool serialization apply here too.
+    model_type = resolve_top_level_model_type(model_config)
+    render_resources = RenderResources(
+        tokenizer=tokenizer,
+        model_type=model_type,
+        processor=processor,
+        hf_config=model_config,
+        default_chat_template=chat_template,
+        extension=get_serving_extension(model_type),
+    )
+    if legacy_render_enabled():
+        render_resources = render_resources.legacy_view()
     tools_dict = [
-        tool.model_dump()
+        render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     # Carry the request's reasoning configuration into the chat template.
@@ -1104,24 +1120,22 @@ async def _create_input_tokens(
     # which expects the thinking-mode framing - leaves it in the visible text.
     chat_template_kwargs = reasoning_chat_template_kwargs(request)
 
-    token_task = async_apply_chat_template(
-        model_type=resolve_top_level_model_type(model_config),
-        tokenizer=tokenizer,
-        processor=processor,
+    render_task = render_conversation(
+        render_resources,
         conversation=conversation,
+        mm_placeholder_counts=mm_placeholder_counts,
         add_generation_prompt=True,
         tools=tools_dict,
-        mm_placeholder_counts=mm_placeholder_counts,
         chat_template_kwargs=chat_template_kwargs or None,
-        enable_tokenize=True,
         injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
             request),
+        tokenize=True,
     )
-    token_ids, (mm_data,
-                _mm_embeddings) = await asyncio.gather(token_task,
-                                                       mm_coroutines)
+    rendered, (mm_data,
+               _mm_embeddings) = await asyncio.gather(render_task,
+                                                      mm_coroutines)
 
-    return token_ids, mm_data
+    return rendered.token_ids, mm_data
 
 
 async def _create_input_tokens_harmony(
@@ -1155,6 +1169,7 @@ async def request_preprocess(
     model_config: Optional[PretrainedConfig] = None,
     processor: Optional[AutoProcessor] = None,
     reasoning_parser: Optional[str] = None,
+    chat_template: Optional[str] = None,
 ) -> tuple[list[int], SamplingParams]:
 
     sampling_params = request.to_sampling_params(
@@ -1199,6 +1214,7 @@ async def request_preprocess(
             tokenizer=tokenizer,
             model_config=model_config,
             processor=processor,
+            chat_template=chat_template,
         )
 
     _responses_debug_log("======= Complete Inputs to model =======")

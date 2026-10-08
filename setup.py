@@ -705,7 +705,8 @@ setup(
         'console_scripts': [
             'trtllm-bench=tensorrt_llm.commands.bench:main',
             'trtllm-serve=tensorrt_llm.commands.serve:main',
-            'trtllm-eval=tensorrt_llm.commands.eval:main'
+            'trtllm-eval=tensorrt_llm.commands.eval:main',
+            'trtllm-render=tensorrt_llm.serve.render.__main__:main'
         ],
     },
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
