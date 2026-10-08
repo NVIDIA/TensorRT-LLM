@@ -18,8 +18,9 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
 import time
+from contextlib import nullcontext
 from io import BytesIO
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -68,6 +69,9 @@ from .packing import (
 )
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+
+if TYPE_CHECKING:
+    from ...sleep import PipelineSleepManager
 
 
 def _component_skipped(
@@ -182,7 +186,28 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
+        self._sleep_manager: Optional["PipelineSleepManager"] = None
         super().__init__(pipeline_config)
+
+    def sleep(self) -> None:
+        """Reject new generation and wait for the active call before releasing GPU memory."""
+        if self._sleep_manager is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        if self.mapping.world_size != 1:
+            raise ValueError("MiniMax-H3 sleep/wake currently requires world_size=1")
+        self._sleep_manager.sleep()
+
+    def wake_up(self) -> None:
+        """Restore managed GPU memory before admitting more inference."""
+        if self._sleep_manager is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        if self.mapping.world_size != 1:
+            raise ValueError("MiniMax-H3 sleep/wake currently requires world_size=1")
+        self._sleep_manager.wake_up()
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleep_manager is not None and self._sleep_manager.is_sleeping
 
     @property
     def default_generation_params(self) -> dict:
@@ -733,6 +758,33 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
         references: Optional[list] = None,
+    ) -> PipelineOutput:
+        manager = getattr(self, "_sleep_manager", None)
+        with manager.generation() if manager is not None else nullcontext():
+            return self._forward(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                num_inference_steps=num_inference_steps,
+                keyframes=keyframes,
+                keyframe_anchors=keyframe_anchors,
+            )
+
+    def _forward(
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        num_inference_steps: int,
+        keyframes: Optional[list[Image.Image]] = None,
+        keyframe_anchors: Optional[tuple[str, ...]] = None,
     ) -> PipelineOutput:
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
