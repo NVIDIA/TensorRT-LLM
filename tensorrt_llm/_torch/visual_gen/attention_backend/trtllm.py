@@ -205,7 +205,13 @@ class TrtllmAttentionMetadata:
         forward valid after ``commit()``. Neither creation nor re-preparation may
         happen during capture: warm up eagerly first, and call this before replay.
         """
-        cache_key = ("kv_cache", id(kv_cache), num_causal_blocks, causal_block_size)
+        cache_key = (
+            "kv_cache",
+            id(kv_cache),
+            kv_cache.geometry,
+            num_causal_blocks,
+            causal_block_size,
+        )
         state = (kv_cache.table_version, kv_cache.past_tokens)
         cached = self._metadata_cache.get(cache_key)
         if cached is None:
@@ -217,7 +223,7 @@ class TrtllmAttentionMetadata:
             self._drop_metadata_of_shut_down_caches()
             metadata = BaseTrtllmAttentionMetadata(
                 max_num_requests=kv_cache.max_causal_blocks,
-                max_num_tokens=kv_cache.chunk_tokens,
+                max_num_tokens=kv_cache.max_staged_tokens,
                 max_num_sequences=kv_cache.max_causal_blocks,
                 kv_cache_manager=kv_cache,
                 mapping=kv_cache.mapping,
@@ -612,9 +618,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             )
         num_causal_blocks = num_tokens // causal_block_size
         # The fused kernel writes each block's own tokens into the block's private
-        # pages; the shared pages, which later blocks and later chunks read, get
-        # the chunk here.
-        kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
+        # pages; the shared pages, which later blocks and later forwards read, are
+        # staged here.
+        kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
         if packed is not None:
             qkv = packed.reshape(num_tokens, -1)
