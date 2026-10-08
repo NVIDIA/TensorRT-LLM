@@ -21,6 +21,8 @@ layout against an unfused reference built from the HF checkpoint's split
 
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import cloudpickle
@@ -204,13 +206,21 @@ def test_gated_mlp_supports_fused_situ(situ_beta, situ_linear_beta):
 
 
 @pytest.mark.parametrize(
-    "attention_dp,tp_size,rank,expected_shared_tp,expected_shared_rank",
+    "attention_dp,tp_size,rank,expected_shared_tp,expected_shared_rank,moe_backend,scheduler_kind",
     [
-        (True, 8, 7, 1, 0),
-        (False, 1, 0, 1, 0),
-        (False, 8, 7, 8, 7),
+        (True, 8, 7, 1, 0, "TRTLLM", "EXTERNAL_COMM"),
+        (False, 1, 0, 1, 0, "TRTLLM", "EXTERNAL_COMM"),
+        (False, 8, 7, 8, 7, "TRTLLM", "EXTERNAL_COMM"),
+        (True, 8, 7, 1, 0, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
+        (False, 8, 7, 8, 7, "MEGAMOE_CUTEDSL", "FUSED_COMM"),
     ],
-    ids=["attention_dp", "single_rank", "direct_tp"],
+    ids=[
+        "attention_dp",
+        "single_rank",
+        "direct_tp",
+        "megamoe_attention_dp",
+        "megamoe_direct_tp",
+    ],
 )
 def test_kimi_k3_shared_expert_parallel_construction(
     monkeypatch,
@@ -219,6 +229,8 @@ def test_kimi_k3_shared_expert_parallel_construction(
     rank,
     expected_shared_tp,
     expected_shared_rank,
+    moe_backend,
+    scheduler_kind,
 ):
     """Shared experts are replicated or sharded for the selected parallel mode."""
     from tensorrt_llm._torch import distributed
@@ -241,7 +253,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
             # the runtime reads it unguarded; the stand-in must too.
             self.backend = SimpleNamespace(
                 initial_local_expert_ids=[0, 1, 2, 3],
-                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+                scheduler_kind=MoESchedulerKind[scheduler_kind],
             )
             self.comm = None
             self.layer_load_balancer = None
@@ -268,7 +280,7 @@ def test_kimi_k3_shared_expert_parallel_construction(
     model_config = ModelConfig(
         mapping=mapping,
         quant_config=QuantConfig(),
-        moe_backend="TRTLLM",
+        moe_backend=moe_backend,
     )
     config = _runtime_config()
     aux_stream_dict = _make_aux_stream_dict()
@@ -280,6 +292,16 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
 
     shared = runtime.shared_experts
+    assert runtime._defer_shared_allreduce is (
+        not attention_dp
+        and tp_size > 1
+        and moe_backend == "MEGAMOE_CUTEDSL"
+        and scheduler_kind == "FUSED_COMM"
+    )
+    assert (runtime.moe_routed_event is not None) is runtime._defer_shared_allreduce
+    if runtime._defer_shared_allreduce:
+        assert runtime.moe_routed_event is not runtime.moe_main_event
+        assert runtime.moe_routed_event is not runtime.moe_shared_event
     assert create_moe_kwargs["aux_stream_dict"] is aux_stream_dict
     assert AuxStreamType.MoeBalancer in create_moe_kwargs["aux_stream_dict"]
     assert runtime.shared_expert_stream is aux_stream_dict[AuxStreamType.MoeShared]
@@ -300,6 +322,142 @@ def test_kimi_k3_shared_expert_parallel_construction(
     )
     assert shared.gate_up_proj.weight.shape == (2 * local_intermediate, config.hidden_size)
     assert shared.down_proj.weight.shape == (config.hidden_size, local_intermediate)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "defer,multi_stream,is_compiling,has_aux_stream",
+    [
+        (False, True, False, True),
+        (True, True, False, True),
+        (True, False, False, True),
+    ],
+    ids=["ordinary_shared", "parallel", "serial"],
+)
+def test_kimi_k3_shared_allreduce_ordering(
+    monkeypatch: pytest.MonkeyPatch,
+    defer: bool,
+    multi_stream: bool,
+    is_compiling: bool,
+    has_aux_stream: bool,
+) -> None:
+    """Check shared-allreduce dependencies and result propagation without CUDA work."""
+    from tensorrt_llm._torch.distributed import AllReduceParams
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    calls = []
+    current_stream = "main"
+    aux_stream = object() if has_aux_stream else None
+    parallel = multi_stream and has_aux_stream and not is_compiling
+    overlap = defer and parallel
+
+    class _Event:
+        def __init__(self, name: str, enabled: bool) -> None:
+            self.name = name
+            self.enabled = enabled
+            self.recorded = False
+
+        def record(self) -> None:
+            assert self.enabled
+            assert not self.recorded
+            self.recorded = True
+            calls.append((f"{self.name}_record", current_stream))
+
+        def wait(self) -> None:
+            assert self.enabled
+            assert self.recorded
+            self.recorded = False
+            calls.append((f"{self.name}_wait", current_stream))
+
+    @contextmanager
+    def use_stream(stream: object) -> Iterator[None]:
+        nonlocal current_stream
+        assert parallel and stream is aux_stream
+        previous_stream = current_stream
+        current_stream = "aux"
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class _Projection(nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value
+
+    def routed_experts(value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+        calls.append(("routed_moe", current_stream))
+        return value * 2
+
+    def shared_allreduce(value: torch.Tensor) -> torch.Tensor:
+        calls.append(("shared_allreduce", current_stream))
+        return value + 5
+
+    class _Shared(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.down_proj = SimpleNamespace(all_reduce=shared_allreduce)
+
+        def forward(
+            self, value: torch.Tensor, final_all_reduce_params: AllReduceParams | None = None
+        ) -> torch.Tensor:
+            calls.append(("shared_local", current_stream))
+            partial = value * 3
+            if defer:
+                assert final_all_reduce_params.enable_allreduce is False
+                return partial
+            assert final_all_reduce_params is None
+            return self.down_proj.all_reduce(partial)
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
+    runtime.routed_experts = routed_experts
+    runtime.routed_expert_down_proj = _Projection("routed_down")
+    runtime.routed_expert_norm = _Projection("routed_norm")
+    runtime.routed_expert_up_proj = _Projection("routed_up")
+    runtime.shared_experts = _Shared()
+    runtime._reduce_routed_output = False
+    runtime._defer_shared_allreduce = defer
+    runtime.shared_expert_stream = aux_stream
+    runtime.moe_main_event = _Event("fork", parallel)
+    runtime.moe_shared_event = _Event("shared_done", parallel)
+    midpoint_event = _Event("midpoint", overlap) if defer else None
+    runtime.moe_routed_event = midpoint_event
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
+
+    shared_stream = "aux" if parallel else "main"
+
+    # Reusing the same owner must record fresh dependencies without replacing events.
+    for _ in range(2):
+        calls.clear()
+        with with_multi_stream(multi_stream):
+            output = runtime(torch.ones(2, 4))
+        assert runtime.moe_routed_event is midpoint_event
+        assert sum(name == "shared_allreduce" for name, _ in calls) == 1
+        allreduce = calls.index(("shared_allreduce", shared_stream))
+        assert calls.index(("shared_local", shared_stream)) < allreduce
+        if overlap:
+            # Fence all routed chunks, but leave the norm/up tail free to overlap.
+            recorded = calls.index(("midpoint_record", "main"))
+            assert calls.index(("routed_moe", "main")) < recorded
+            assert recorded < calls.index(("routed_norm", "main"))
+            assert recorded < calls.index(("midpoint_wait", "aux")) < allreduce
+        if parallel:
+            # The final join must cover the shared all-reduce.
+            completed = calls.index(("shared_done_record", "aux"))
+            assert allreduce < completed < calls.index(("shared_done_wait", "main"))
+        elif defer:
+            assert calls.index(("routed_moe", "main")) < allreduce
+        torch.testing.assert_close(output, torch.full((2, 4), 10.0))
 
 
 def _make_kimi_k3_moe_weights(config):
