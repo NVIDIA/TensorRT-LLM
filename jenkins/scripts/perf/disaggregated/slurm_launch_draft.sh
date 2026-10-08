@@ -7,6 +7,11 @@ cleanup_on_failure() {
 
 mkdir -p $jobWorkspace
 mkdir -p "$testOutputDir"
+
+# Remove stale worker addresses and benchmark status from a previous run or requeue.
+rm -rf "${testOutputDir:?}"/hostnames-*
+rm -f "${testOutputDir:?}"/benchmark_status.*.txt
+
 chmod +x $runScript
 chmod +x $installScript
 
