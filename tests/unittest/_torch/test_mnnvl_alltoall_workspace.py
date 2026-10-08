@@ -829,3 +829,69 @@ def test_one_sided_failed_registration_does_not_publish_new_workspace(
     assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {}
     assert NVLinkOneSided._WORKSPACE is None
     lifecycle.unregister.assert_not_called()
+
+
+def test_second_cft_layout_falls_back_to_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A workspace that cannot own the endpoints builds in fence mode instead of aborting.
+
+    CFT binds logical endpoints to one workspace per process. Models whose layers
+    differ in top-k allocate distinct workspaces, so every later layout must fall
+    back rather than fail construction.
+    """
+
+    class _Memory:
+        mapped = True
+
+        @staticmethod
+        def initialize() -> None:
+            pass
+
+        def __init__(self, mapping: object, size: int) -> None:
+            self.comm = _FakeComm()
+            self.local_mem_handle = 0
+
+        def as_torch_strided_tensor(self, dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(2, 64, dtype=torch.uint8)
+
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACES", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", None)
+    monkeypatch.setattr(NVLinkOneSided, "_CFT_OWNER_SHAPE", None)
+    monkeypatch.setattr(NVLinkOneSided, "is_platform_supported", Mock(return_value=True))
+    monkeypatch.setattr(NVLinkOneSided, "_init_constants", Mock())
+    monkeypatch.setattr(NVLinkOneSided, "FLAG_VAL_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(NVLinkOneSided, "COMBINE_COMPLETION_FLAGS_OFFSET_INDEX", 0)
+    monkeypatch.setattr(one_sided_module, "MnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "CftMnnvlMemory", _Memory)
+    monkeypatch.setattr(one_sided_module, "select_cft_counted_writes", Mock(return_value=True))
+    monkeypatch.setattr(
+        _MnnvlAlltoAllWorkspaceLifecycle, "get_or_create", Mock(return_value=Mock())
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm, "moe_a2a_initialize", Mock(return_value=torch.tensor([1]))
+    )
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_initialize", Mock())
+
+    def build(top_k: int) -> NVLinkOneSided:
+        mapping = SimpleNamespace(
+            world_size=2,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            has_cp_helix=Mock(return_value=False),
+        )
+        return NVLinkOneSided(mapping=mapping, num_slots=8, top_k=top_k, max_num_tokens_per_rank=1)
+
+    first = build(top_k=2)
+    assert first.can_use_cft_counted_writes, "the first workspace should own the endpoints"
+
+    # Same layout: reuses the bound workspace, so CFT must not be given up.
+    assert build(top_k=2).can_use_cft_counted_writes
+
+    # Distinct layouts: a different workspace cannot own the endpoints.
+    for top_k in (4, 6):
+        other = build(top_k=top_k)
+        assert not other.can_use_cft_counted_writes, (
+            f"top_k={top_k} allocates its own workspace and must fall back to fence"
+        )
+        assert other._workspace_key != first._workspace_key

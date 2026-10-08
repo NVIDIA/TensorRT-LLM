@@ -288,6 +288,13 @@ class NVLinkOneSided(Communication):
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
     _WORKSPACE: dict | None = None
+    # Layout of the workspace holding the process-wide CFT logical endpoints, if any.
+    # The endpoints are bound to a single allocation once per process, so only one
+    # workspace can use counted writes; a model whose MoE layers differ in layout
+    # allocates several, and the rest fall back to fence. Nemotron-H Puzzle is one
+    # such model: its top_k varies across MoE layers. Remove once the endpoints can
+    # be bound per workspace.
+    _CFT_OWNER_SHAPE: Tuple[object, ...] | None = None
     _timeout_initialized = False
 
     @staticmethod
@@ -507,6 +514,26 @@ class NVLinkOneSided(Communication):
         self.eplb_stats_num_experts = num_experts
         self._force_cft = get_force_cft()
         can_use_cft_counted_writes = select_cft_counted_writes(self._force_cft)
+        self._cft_shape = (
+            self.ep_size,
+            max_num_tokens_per_rank,
+            self.eplb_stats_num_experts,
+            self.num_experts,
+            self.top_k,
+            hidden_size,
+            dtype,
+            use_low_precision_combine,
+        )
+        if can_use_cft_counted_writes:
+            owner = NVLinkOneSided._CFT_OWNER_SHAPE
+            if owner is not None and owner != self._cft_shape:
+                tllm_logger.warning_once(
+                    "CFT counted writes disabled for this workspace: logical endpoints are "
+                    "already bound to a workspace with a different layout, and only one "
+                    "workspace per process may use them. Falling back to fence.",
+                    key="moe_a2a_cft_workspace_already_bound",
+                )
+                can_use_cft_counted_writes = False
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -719,6 +746,7 @@ class NVLinkOneSided(Communication):
                 self.ep_size,
             )
             workspace_state["cft_initialized"] = True
+            NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
 
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
@@ -781,6 +809,7 @@ class NVLinkOneSided(Communication):
         else:
             if self._workspace_state.get("cft_initialized", False):
                 torch.ops.trtllm.moe_a2a_cft_destroy(self.workspace, self.ep_rank)
+                NVLinkOneSided._CFT_OWNER_SHAPE = None
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
             workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
             if NVLinkOneSided._WORKSPACE is workspace_state:
