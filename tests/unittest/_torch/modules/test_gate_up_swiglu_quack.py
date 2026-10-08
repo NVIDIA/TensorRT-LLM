@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the BF16 gate/up GEMM with SwiGLU in the epilogue (QuACK, SM100 family)."""
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,6 +13,8 @@ from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def _kernel_available_or_fail() -> bool:
@@ -28,6 +32,7 @@ requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and get_sm_version() in (100, 103)),
     reason="needs an SM100/SM103 GPU",
 )
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
 def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -40,9 +45,31 @@ def _oracle(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+def _make_mlp(hidden: int = 256, intermediate: int = 512, seed: int = 0, **kwargs) -> GatedMLP:
+    torch.manual_seed(seed)
+    mlp = GatedMLP(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        bias=False,
+        dtype=torch.bfloat16,
+        fuse_bf16_gate_up_swiglu=True,
+        **kwargs,
+    ).cuda()
+    for p in mlp.parameters():
+        p.data.normal_(std=0.05)
+    return mlp
+
+
 @requires_kernel
 @pytest.mark.parametrize(
-    "tokens,hidden,intermediate", [(1, 256, 512), (257, 512, 1024), (4096, 5376, 14336)]
+    "tokens,hidden,intermediate",
+    [
+        (1, 256, 512),
+        (257, 512, 1024),
+        (133, 256, 200),  # 2I is not a multiple of the 256-wide default tile
+        (257, 264, 1032),  # K and I multiples of 8 only
+        (4096, 5376, 14336),  # MiniMax-H3
+    ],
 )
 def test_fused_epilogue_matches_unfused_path(tokens, hidden, intermediate):
     _kernel_available_or_fail()
@@ -65,34 +92,33 @@ def test_fused_epilogue_matches_unfused_path(tokens, hidden, intermediate):
 
 
 @requires_kernel
-def test_fused_epilogue_rejects_invalid_inputs():
+@pytest.mark.parametrize(
+    "case",
+    ["fp32 x", "odd 2I", "3-D x", "K mismatch", "K not a multiple of 8", "I not a multiple of 8"],
+)
+def test_fused_epilogue_rejects_invalid_inputs(case):
+    """The op enforces what the dispatch predicate enforces: a direct caller gets an error, not a kernel fault."""
     _kernel_available_or_fail()
     x = torch.randn((4, 64), device="cuda", dtype=torch.bfloat16)
     weight = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError):
-        fused.gate_up_swiglu_quack_bf16(x.float(), weight)
-    with pytest.raises(ValueError):
-        fused.gate_up_swiglu_quack_bf16(x, weight[:127])
-    with pytest.raises(ValueError):
-        fused.gate_up_swiglu_quack_bf16(x[None], weight)
+    bad_x, bad_w = {
+        "fp32 x": (x.float(), weight),
+        "odd 2I": (x, weight[:127]),
+        "3-D x": (x[None], weight),
+        "K mismatch": (x[:, :56], weight),
+        "K not a multiple of 8": (x[:, :60].contiguous(), weight[:, :60].contiguous()),
+        "I not a multiple of 8": (x, weight[:100]),
+    }[case]
+    assert fused.gate_up_swiglu_quack_bf16(x, weight).shape == (4, 64)
+    with pytest.raises(ValueError, match="gate_up_swiglu_quack_bf16 needs BF16 x"):
+        fused.gate_up_swiglu_quack_bf16(bad_x, bad_w)
 
 
 @requires_kernel
 def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
     _kernel_available_or_fail()
-    torch.manual_seed(1)
-    mlp = GatedMLP(
-        hidden_size=256,
-        intermediate_size=512,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    ).cuda()
-    for p in mlp.parameters():
-        p.data.normal_(std=0.05)
-    # GatedMLP consumes 2-D [tokens, hidden] activations (the SwiGLU kernel requires it).
+    mlp = _make_mlp(seed=1)
     x = torch.randn((133, 256), device="cuda", dtype=torch.bfloat16)
-    assert mlp._can_fuse_gate_up_swiglu_bf16()
     calls = []
     op = gated_mlp_module.gate_up_swiglu_quack_bf16
 
@@ -102,9 +128,10 @@ def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
 
     monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
     with torch.inference_mode():
+        assert mlp._can_fuse_gate_up_swiglu_bf16(x)
         fused_out = mlp(x)
-        monkeypatch.setattr(mlp, "use_quack_swiglu_epilogue", False)
-        assert not mlp._can_fuse_gate_up_swiglu_bf16()
+        monkeypatch.setattr(mlp, "fuse_bf16_gate_up_swiglu", False)
+        assert not mlp._can_fuse_gate_up_swiglu_bf16(x)
         unfused_out = mlp(x)
     assert calls == [True]
     assert fused_out.shape == unfused_out.shape == x.shape
@@ -113,79 +140,134 @@ def test_gated_mlp_dispatches_bf16_epilogue(monkeypatch):
     ).abs().max() <= unfused_out.float().abs().max() * 2**-6
 
 
-def test_gated_mlp_bf16_epilogue_is_opt_in_and_excludes_bias_quant_and_tp(monkeypatch):
+@requires_kernel
+def test_gated_mlp_bf16_epilogue_flattens_higher_rank_inputs(monkeypatch):
+    """A [batch, seq, hidden] activation runs the fused GEMM on its 2-D view, as the NVFP4 path does."""
+    _kernel_available_or_fail()
+    mlp = _make_mlp(seed=3)
+    x = torch.randn((3, 37, 256), device="cuda", dtype=torch.bfloat16)
+    calls = []
+    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+
+    fused_outputs = []
+
+    def tracked(*args, **kwargs):
+        calls.append(tuple(args[0].shape))
+        fused_outputs.append(op(*args, **kwargs))
+        return fused_outputs[-1]
+
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    with torch.inference_mode():
+        assert mlp._can_fuse_gate_up_swiglu_bf16(x)
+        out = mlp(x)
+        flat = mlp(x.reshape(-1, 256))
+    assert calls == [(111, 256), (111, 256)]
+    assert torch.equal(*fused_outputs)  # the op saw the same 2-D view both times
+    assert out.shape == x.shape
+    torch.testing.assert_close(out.reshape(-1, 256), flat, rtol=2**-7, atol=2**-7)
+
+
+@requires_cuda
+def test_gated_mlp_bf16_epilogue_predicate(monkeypatch):
+    """The predicate is the one place that decides; every exclusion flips it, nothing else does.
+
+    A pure predicate test: kernel availability is patched in, the modules stay on the CPU and
+    only ``x`` is on the GPU, so it runs on any CUDA device.
+    """
     monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
-    mlp = GatedMLP(hidden_size=16, intermediate_size=128, bias=False, dtype=torch.bfloat16)
-    assert (
-        not mlp._can_fuse_gate_up_swiglu_bf16()
-    )  # default off: every other model keeps cuBLAS + SwiGLU
-    mlp = GatedMLP(
-        hidden_size=16,
-        intermediate_size=128,
-        bias=True,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    )
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # bias
-    mlp = GatedMLP(
-        hidden_size=16,
-        intermediate_size=128,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    )
-    assert mlp._can_fuse_gate_up_swiglu_bf16()
-    monkeypatch.setattr(type(mlp.gate_up_proj), "has_any_quant", True)
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # quantized projection
-    monkeypatch.undo()
-    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
-    mlp = GatedMLP(
-        hidden_size=16,
-        intermediate_size=128,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    )
-    assert mlp._can_fuse_gate_up_swiglu_bf16()
-    monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 2)
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # tensor parallel
-    monkeypatch.setattr(mlp.gate_up_proj, "tp_size", 1)
-    mlp.swiglu_limit = 7.0
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # clamped SwiGLU stays on the Triton kernel
-    mlp.swiglu_limit = None
-    mlp = GatedMLP(
-        hidden_size=16,
-        intermediate_size=96,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    )
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # intermediate size not a multiple of 128
-    mlp = GatedMLP(
-        hidden_size=16,
-        intermediate_size=128,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    )
-    monkeypatch.setattr(mlp.gate_up_proj, "use_cute_dsl_bf16_gemm", True, raising=False)
-    assert not mlp._can_fuse_gate_up_swiglu_bf16()  # another GEMM provider was selected
+    x = torch.zeros((4, 16), device="cuda", dtype=torch.bfloat16)
+
+    def mlp(**kwargs):
+        args = dict(hidden_size=16, intermediate_size=128, bias=False, dtype=torch.bfloat16)
+        args.update(kwargs)
+        return GatedMLP(**args)
+
+    with torch.no_grad():
+        # Default off: every other model keeps cuBLAS + the SwiGLU kernel.
+        assert not mlp()._can_fuse_gate_up_swiglu_bf16(x)
+        on = mlp(fuse_bf16_gate_up_swiglu=True)
+        assert on._can_fuse_gate_up_swiglu_bf16(x)
+        # The activation: CUDA BF16 of rank >= 2.
+        assert on._can_fuse_gate_up_swiglu_bf16(x[None])
+        assert not on._can_fuse_gate_up_swiglu_bf16(x.float())
+        assert not on._can_fuse_gate_up_swiglu_bf16(x[0])
+        assert not on._can_fuse_gate_up_swiglu_bf16(x.cpu())
+        # The projection.
+        assert not mlp(fuse_bf16_gate_up_swiglu=True, bias=True)._can_fuse_gate_up_swiglu_bf16(x)
+        assert not mlp(
+            fuse_bf16_gate_up_swiglu=True, split_gate_up=True
+        )._can_fuse_gate_up_swiglu_bf16(x)
+        # has_any_quant reads the projection's quant_config.
+        monkeypatch.setattr(on.gate_up_proj, "quant_config", QuantConfig(quant_algo=QuantAlgo.FP8))
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)  # quantized projection
+        monkeypatch.setattr(on.gate_up_proj, "quant_config", None)
+        assert on._can_fuse_gate_up_swiglu_bf16(x)
+        monkeypatch.setattr(on.gate_up_proj, "tp_size", 2)
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)  # tensor parallel
+        monkeypatch.setattr(on.gate_up_proj, "tp_size", 1)
+        monkeypatch.setattr(on.gate_up_proj, "use_cute_dsl_bf16_gemm", True)
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)  # another GEMM provider was selected
+        monkeypatch.setattr(on.gate_up_proj, "use_cute_dsl_bf16_gemm", False)
+        monkeypatch.setattr(on.gate_up_proj, "use_custom_cublas_mm", True)
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)
+        monkeypatch.setattr(on.gate_up_proj, "use_custom_cublas_mm", False)
+        assert on._can_fuse_gate_up_swiglu_bf16(x)
+        # The activation function.
+        on.swiglu_limit = 7.0
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)  # clamped SwiGLU stays on the Triton kernel
+        on.swiglu_limit = None
+        assert not mlp(
+            fuse_bf16_gate_up_swiglu=True, swiglu_alpha=1.702, swiglu_beta=1.0
+        )._can_fuse_gate_up_swiglu_bf16(x)
+        # Shapes: K and I multiples of 8 (16-byte rows), nothing coarser.
+        assert mlp(
+            fuse_bf16_gate_up_swiglu=True, intermediate_size=96
+        )._can_fuse_gate_up_swiglu_bf16(x)
+        assert not mlp(
+            fuse_bf16_gate_up_swiglu=True, intermediate_size=100
+        )._can_fuse_gate_up_swiglu_bf16(x)
+        assert not mlp(fuse_bf16_gate_up_swiglu=True, hidden_size=12)._can_fuse_gate_up_swiglu_bf16(
+            x[:, :12]
+        )
+    # Grad mode: the op has no backward, so the unfused path must take the call.
+    with torch.enable_grad():
+        assert not on._can_fuse_gate_up_swiglu_bf16(x)
+
+
+@requires_kernel
+def test_gated_mlp_bf16_epilogue_compiles_fullgraph():
+    """torch.compile captures the custom op as one node and matches eager."""
+    _kernel_available_or_fail()
+    mlp = _make_mlp(seed=4)
+    x = torch.randn((133, 256), device="cuda", dtype=torch.bfloat16)
+    fused_nodes = []
+    unfused_nodes = []
+
+    def backend(gm, example_inputs):
+        del example_inputs
+        targets = [str(node.target) for node in gm.graph.nodes if node.op == "call_function"]
+        fused_nodes.append(targets.count("trtllm.gate_up_swiglu_quack_bf16.default"))
+        unfused_nodes.extend(t for t in targets if "swiglu" in t and "gate_up" not in t)
+        return gm.forward
+
+    try:
+        with torch.inference_mode():
+            assert mlp._can_fuse_gate_up_swiglu_bf16(x)
+            expected = mlp(x)
+            compiled = torch.compile(mlp, backend=backend, fullgraph=True)
+            actual = compiled(x)
+    finally:
+        torch._dynamo.reset()
+    assert fused_nodes == [1]
+    assert unfused_nodes == []  # no separate SwiGLU kernel left in the graph
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @requires_kernel
 def test_gated_mlp_bf16_epilogue_replays_under_cuda_graph(monkeypatch):
     """The fused op must capture and replay in a CUDA graph (shared-module consumers may use graphs)."""
     _kernel_available_or_fail()
-    torch.manual_seed(2)
-    mlp = GatedMLP(
-        hidden_size=256,
-        intermediate_size=512,
-        bias=False,
-        dtype=torch.bfloat16,
-        use_quack_swiglu_epilogue=True,
-    ).cuda()
-    for p in mlp.parameters():
-        p.data.normal_(std=0.05)
+    mlp = _make_mlp(seed=2)
     calls = []
     op = gated_mlp_module.gate_up_swiglu_quack_bf16
 
@@ -215,22 +297,25 @@ def test_gated_mlp_bf16_epilogue_replays_under_cuda_graph(monkeypatch):
             assert torch.equal(static_out, eager)
 
 
-def test_availability_falls_back_when_the_probe_fails(monkeypatch):
-    """A QuACK/CUTLASS DSL mismatch shows up at kernel compile time; availability must report False."""
-    import types
-
+def test_availability_falls_back_when_quack_does_not_import(monkeypatch):
+    """Without an importable QuACK the module reports unavailable and GatedMLP stays unfused."""
     fused._quack_gemm_act.cache_clear()
-    broken = types.ModuleType("quack.gemm_interface")
-
-    def gemm_act(*args, **kwargs):
-        raise ValueError("too many values to unpack (expected 3)")
-
-    broken.gemm_act = gemm_act
-    monkeypatch.setitem(__import__("sys").modules, "quack.gemm_interface", broken)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.cute_dsl_utils.install_cutlass_dsl_compatibility", lambda: None
+    )
+    monkeypatch.setitem(sys.modules, "quack.gemm_interface", None)  # import raises ImportError
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(fused, "get_sm_version", lambda: 100)
     try:
         assert fused._quack_gemm_act() is None
         assert not fused.gate_up_swiglu_quack_available()
+        mlp = GatedMLP(
+            hidden_size=16,
+            intermediate_size=128,
+            bias=False,
+            dtype=torch.bfloat16,
+            fuse_bf16_gate_up_swiglu=True,
+        )
+        assert not mlp.fuse_bf16_gate_up_swiglu
     finally:
         fused._quack_gemm_act.cache_clear()

@@ -25,11 +25,13 @@ from diffusers.models.transformers.transformer_minimax_h3 import (
     MiniMaxH3Transformer3DModel as HFMiniMaxH3Transformer3DModel,
 )
 
+from tensorrt_llm._torch.modules import gated_mlp as gated_mlp_module
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionModelConfig,
     create_attention_metadata_state,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -1226,3 +1228,54 @@ def test_ref2va_norm_initialization_supports_deferred_weight_loading() -> None:
         if isinstance(module, h3.RMSNorm):
             assert module.weight.device.type != "meta"
             torch.testing.assert_close(module.weight, torch.ones_like(module.weight))
+
+
+def _ff_modules(model: h3.MiniMaxH3Transformer3DModel) -> list[nn.Module]:
+    return [block.ff for block in model.token_refiner.refiner_blocks] + [
+        block.ff for block in model.transformer_blocks
+    ]
+
+
+def test_bf16_configuration_opts_into_the_fused_swiglu_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model decides once: on for BF16 on every block, off for quantized configurations."""
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_available", lambda: True)
+    bf16 = h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=2, num_refiner_layers=1))
+    assert len(_ff_modules(bf16)) == 3
+    assert all(ff.fuse_bf16_gate_up_swiglu for ff in _ff_modules(bf16))
+    for config in (
+        _make_dynamic_fp8_model_config(num_layers=1, num_refiner_layers=1),
+        _make_dynamic_nvfp4_model_config(num_layers=1, num_refiner_layers=1),
+    ):
+        assert not any(
+            ff.fuse_bf16_gate_up_swiglu
+            for ff in _ff_modules(h3.MiniMaxH3Transformer3DModel(config))
+        )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and get_sm_version() in (100, 103)),
+    reason="needs an SM100/SM103 GPU",
+)
+def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With eligible shapes every refiner and transformer block's FFN takes the fused op once."""
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_model_config(num_layers=2, num_refiner_layers=1, **_NVFP4_SHAPES)
+    ).to("cuda")
+    _initialize_weights(model, scale=0.1)
+    calls: list[int] = []
+    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+
+    def tracked(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(1)
+        return op(*args, **kwargs)
+
+    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    hidden_states = torch.randn(7, 32, dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode():
+        for ff in _ff_modules(model):
+            assert ff.fuse_bf16_gate_up_swiglu
+            assert ff._can_fuse_gate_up_swiglu_bf16(hidden_states)
+            ff(hidden_states)
+    assert len(calls) == 3

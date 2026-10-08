@@ -268,6 +268,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         qk_norm_eps: float,
         model_config: DiffusionModelConfig,
         layer_idx: int,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -293,7 +294,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
-            use_quack_swiglu_epilogue=True,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -319,6 +320,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         qk_norm_eps: float,
         final_norm_eps: float,
         model_config: DiffusionModelConfig,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.refiner_blocks = nn.ModuleList(
@@ -332,6 +334,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     qk_norm_eps=qk_norm_eps,
                     model_config=model_config,
                     layer_idx=layer_idx,
+                    fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                 )
                 for layer_idx in range(num_layers)
             ]
@@ -362,6 +365,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         qk_norm_eps: float,
         model_config: DiffusionModelConfig,
         layer_idx: int,
+        fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(
@@ -387,7 +391,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             config=model_config,
             layer_idx=layer_idx,
             reduce_output=model_config.mapping.tp_size > 1,
-            use_quack_swiglu_epilogue=True,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
         self.adaln_proj = MiniMaxH3AdaLayerNormModulation(
             time_embed_dim=time_embed_dim,
@@ -473,6 +477,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 "the dynamic loader does not calibrate Linear.input_scale, so the "
                 "static activation-scale path would read an uninitialized scale."
             )
+
+        # GatedMLP's BF16 gate/up GEMM with SwiGLU in its epilogue is opt-in
+        # because the fused GEMM is slightly slower than cuBLAS at small M. H3's
+        # feed-forward sees M = every packed video and audio token of the clip
+        # (about 19k at 544x960, 38k at the default 768x1344), where dropping the
+        # [M, 2I] intermediate wins, so the BF16 configuration opts in for all
+        # blocks here. The token refiner runs once per request on the text
+        # tokens, so its cost either way is negligible. Quantized
+        # configurations run their own fused GEMMs.
+        fuse_bf16_gate_up_swiglu = quant_algo is None
 
         cfg = model_config.pretrained_config
         num_attention_heads = cfg.num_attention_heads
@@ -573,6 +587,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             qk_norm_eps=qk_norm_eps,
             final_norm_eps=final_norm_eps,
             model_config=model_config,
+            fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
         )
         self.transformer_blocks = nn.ModuleList(
             [
@@ -586,6 +601,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     qk_norm_eps=qk_norm_eps,
                     model_config=model_config,
                     layer_idx=layer_idx,
+                    fuse_bf16_gate_up_swiglu=fuse_bf16_gate_up_swiglu,
                 )
                 for layer_idx in range(num_layers)
             ]
