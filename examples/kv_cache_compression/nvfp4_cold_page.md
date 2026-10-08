@@ -304,14 +304,15 @@ KV dtype. Other models and draft cold pages continue to use single NVFP4.
 
 `skip_rope_quantization` defaults to `false`. Set it to `true` to preserve RoPE
 in its original precision, which retains DeepSeek-V4's previous cold-page
-behavior. Alternatively, set `nvfp4_mla_residual_quantization: false` to use
-single NVFP4 for RoPE. This second option defaults to `true` and affects only
-DeepSeek-V4 target cold pages. Inference without cold-page compression is unchanged.
+behavior. Alternatively, set `nvfp4_residual_dim: 0` to use single NVFP4 for
+RoPE. This second option defaults to `64`, matching native DeepSeek-V4's residual
+width, and affects only target cold pages. Only `0` and `64` are supported;
+intermediate widths are rejected. Inference without cold-page compression is unchanged.
 
-| `skip_rope_quantization` | `nvfp4_mla_residual_quantization` | DeepSeek-V4 target RoPE in cold pages |
+| `skip_rope_quantization` | `nvfp4_residual_dim` | DeepSeek-V4 target RoPE in cold pages |
 | --- | --- | --- |
-| `false` (default) | `true` (default) | 2FP4 |
-| `false` | `false` | Single NVFP4 |
+| `false` (default) | `64` (default) | 2FP4 |
+| `false` | `0` | Single NVFP4 |
 | `true` | Either value | Original hot-cache precision |
 
 The indexer cache is always copied as it

@@ -41,14 +41,14 @@ def _manager(
     model_type="qwen3",
     pretrained_config=None,
     skip_rope_quantization=False,
-    nvfp4_mla_residual_quantization=True,
+    nvfp4_residual_dim=64,
 ):
     config = ColdPageQuantizationCompressionConfig(
         scale_checkpoint_path=(
             str(scale_checkpoint_path) if scale_checkpoint_path is not None else None
         ),
         skip_rope_quantization=skip_rope_quantization,
-        nvfp4_mla_residual_quantization=nvfp4_mla_residual_quantization,
+        nvfp4_residual_dim=nvfp4_residual_dim,
     )
     return Nvfp4ColdPageQuantizationCompression(
         config,
@@ -796,14 +796,14 @@ def test_mla_all_non_latent_roles_are_explicit_lossless_spans() -> None:
 
 
 @pytest.mark.parametrize("model_type", ("qwen3", "kimi_k3"))
-@pytest.mark.parametrize("nvfp4_mla_residual_quantization", (False, True))
+@pytest.mark.parametrize("nvfp4_residual_dim", (0, 64))
 def test_non_deepseek_model_skips_deepseek_v4_layout_builder(
-    model_type: str, nvfp4_mla_residual_quantization: bool
+    model_type: str, nvfp4_residual_dim: int
 ) -> None:
     native, _ = _native()
     manager = _manager(
         model_type=model_type,
-        nvfp4_mla_residual_quantization=nvfp4_mla_residual_quantization,
+        nvfp4_residual_dim=nvfp4_residual_dim,
     )
 
     with (
@@ -1493,19 +1493,19 @@ def test_skip_rope_quantization_leaves_the_mla_rope_tail() -> None:
     [(DataType.BF16, 2), (DataType.FP8, 1)],
 )
 @pytest.mark.parametrize(
-    ("skip_rope_quantization", "residual_quantization", "quantized_range", "transform"),
+    ("skip_rope_quantization", "nvfp4_residual_dim", "quantized_range", "transform"),
     [
-        (False, False, (0, 512), 0),
-        (False, True, (0, 512), 2),
-        (True, False, (0, 448), 0),
-        (True, True, (0, 448), 0),
+        (False, 0, (0, 512), 0),
+        (False, 64, (0, 512), 2),
+        (True, 0, (0, 448), 0),
+        (True, 64, (0, 448), 0),
     ],
 )
 def test_deepseek_v4_cold_rope_formats_and_skip_precedence(
     runtime_dtype,
     element_bytes,
     skip_rope_quantization,
-    residual_quantization,
+    nvfp4_residual_dim,
     quantized_range,
     transform,
 ) -> None:
@@ -1514,7 +1514,7 @@ def test_deepseek_v4_cold_rope_formats_and_skip_precedence(
         _manager(
             model_type="deepseek_v4",
             skip_rope_quantization=skip_rope_quantization,
-            nvfp4_mla_residual_quantization=residual_quantization,
+            nvfp4_residual_dim=nvfp4_residual_dim,
         ),
         _deepseek_v4_csa_cache_config(element_bytes=element_bytes),
         native,
@@ -1559,7 +1559,7 @@ def test_deepseek_v4_cold_rope_formats_and_skip_precedence(
 def test_cold_rope_configuration_defaults_and_serialization() -> None:
     config = ColdPageQuantizationCompressionConfig()
     assert not config.skip_rope_quantization
-    assert config.nvfp4_mla_residual_quantization
+    assert config.nvfp4_residual_dim == 64
     assert ColdPageQuantizationCompressionConfig.model_validate(config.model_dump()) == config
 
     native, _ = _native()
@@ -1581,6 +1581,12 @@ def test_cold_rope_configuration_defaults_and_serialization() -> None:
     )
     assert metadata.integers[0, 1].item() == 2
     assert metadata.cold_page_bytes == 12544
+
+
+@pytest.mark.parametrize("residual_dim", (-1, 1, 16, 32, 48, 128, "maybe", True))
+def test_cold_rope_configuration_rejects_unsupported_residual_width(residual_dim) -> None:
+    with pytest.raises(ValueError, match="nvfp4_residual_dim"):
+        ColdPageQuantizationCompressionConfig(nvfp4_residual_dim=residual_dim)
 
 
 def test_skip_rope_quantization_quantizes_draft_kv_rows_whole() -> None:

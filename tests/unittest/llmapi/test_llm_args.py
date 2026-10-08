@@ -3680,7 +3680,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
         "skip_rope_quantization": False,
-        "nvfp4_mla_residual_quantization": True,
+        "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
     }
     assert not cold_config.changes_physical_kv_length
@@ -3705,15 +3705,15 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         },
     ).kv_cache_compression_config
     assert cold_config_skip_rope.skip_rope_quantization is True
-    assert cold_config_skip_rope.nvfp4_mla_residual_quantization is True
+    assert cold_config_skip_rope.nvfp4_residual_dim == 64
     cold_config_single_fp4 = TorchLlmArgs(
         model="/tmp/dummy_model",
         kv_cache_compression_config={
             "algorithm": "quantization_for_cold_page",
-            "nvfp4_mla_residual_quantization": False,
+            "nvfp4_residual_dim": 0,
         },
     ).kv_cache_compression_config
-    assert cold_config_single_fp4.nvfp4_mla_residual_quantization is False
+    assert cold_config_single_fp4.nvfp4_residual_dim == 0
     assert ColdPageQuantizationCompressionConfig.model_validate_json(
         cold_config_single_fp4.model_dump_json()) == cold_config_single_fp4
     with pytest.raises(ValidationError):
@@ -3729,7 +3729,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
             model="/tmp/dummy_model",
             kv_cache_compression_config={
                 "algorithm": "quantization_for_cold_page",
-                "nvfp4_mla_residual_quantization": "maybe",
+                "nvfp4_residual_dim": "maybe",
             },
         )
 

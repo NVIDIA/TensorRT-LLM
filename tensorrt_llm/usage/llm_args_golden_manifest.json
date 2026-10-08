@@ -532,9 +532,13 @@
       "path": "kv_cache_compression_config.normalize_scores"
     },
     {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "kv_cache_compression_config.nvfp4_mla_residual_quantization"
+      "allowed_values": [
+        0,
+        64
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.nvfp4_residual_dim"
     },
     {
       "allowed_values": [

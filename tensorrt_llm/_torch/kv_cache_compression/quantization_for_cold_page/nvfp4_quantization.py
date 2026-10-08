@@ -211,7 +211,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         super().__init__(config, pretrained_config=pretrained_config)
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
         self._skip_rope_quantization = bool(config.skip_rope_quantization)
-        self._nvfp4_mla_residual_quantization = config.nvfp4_mla_residual_quantization
+        self._nvfp4_residual_dim = config.nvfp4_residual_dim
         model_type = getattr(pretrained_config, "model_type", None)
         if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
             logger.warning(
@@ -436,11 +436,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                         quantized_range_start=range_start,
                         quantized_range_elements=range_elements,
                         rope_residual_elements=(
-                            _DEEPSEEK_V4_ROPE_DIM
-                            if self._nvfp4_mla_residual_quantization
-                            and not skip_rope
-                            and not is_draft
-                            else 0
+                            self._nvfp4_residual_dim if not skip_rope and not is_draft else 0
                         ),
                     )
                     if str(buffer.role) == _DEEPSEEK_V4_COMPRESS

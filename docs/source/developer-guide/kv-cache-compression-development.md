@@ -303,7 +303,8 @@ records the piece as `quantized_range_start` and `quantized_range_elements`.
 
 - `skip_rope_quantization: false` (default): the piece is the whole vector. DeepSeek-V4
   target CSA uses single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
-  values. Set `nvfp4_mla_residual_quantization: false` for single NVFP4 throughout.
+  values. Set `nvfp4_residual_dim: 0` for single NVFP4 throughout; the default
+  `64` matches DeepSeek-V4's native residual width. Other widths are rejected.
   Other models ignore this residual option and continue to use single NVFP4.
 - `skip_rope_quantization: true`: the piece is the NoPE part of the K vector, so the
   RoPE numbers are copied unchanged into the cold page, right after that buffer's

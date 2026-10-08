@@ -435,12 +435,12 @@ class TestDeepseekV4CacheManager:
             cache_manager.shutdown()
 
     @pytest.mark.parametrize(
-        ("dtype", "skip_rope_quantization", "residual_quantization", "cold_page_bytes"),
+        ("dtype", "skip_rope_quantization", "residual_dim", "cold_page_bytes"),
         [
             (DataType.BF16, False, None, 13568),
             (DataType.FP8, False, None, 13056),
-            (DataType.BF16, False, False, 12416),
-            (DataType.FP8, False, False, 11904),
+            (DataType.BF16, False, 0, 12416),
+            (DataType.FP8, False, 0, 11904),
             (DataType.BF16, True, None, 15360),
             (DataType.FP8, True, None, 12800),
         ],
@@ -449,7 +449,7 @@ class TestDeepseekV4CacheManager:
         self,
         dtype: DataType,
         skip_rope_quantization: bool,
-        residual_quantization: bool | None,
+        residual_dim: int | None,
         cold_page_bytes: int,
     ) -> None:
         prompt_len = 64 * self.tokens_per_block
@@ -458,10 +458,8 @@ class TestDeepseekV4CacheManager:
         # Leave the switch unset in default cases; test the opt-in lossless layout too.
         if skip_rope_quantization:
             compression_config = ColdPageQuantizationCompressionConfig(skip_rope_quantization=True)
-        elif residual_quantization is False:
-            compression_config = ColdPageQuantizationCompressionConfig(
-                nvfp4_mla_residual_quantization=False
-            )
+        elif residual_dim == 0:
+            compression_config = ColdPageQuantizationCompressionConfig(nvfp4_residual_dim=0)
         else:
             compression_config = ColdPageQuantizationCompressionConfig()
         provider = Nvfp4ColdPageQuantizationCompression(
@@ -503,9 +501,7 @@ class TestDeepseekV4CacheManager:
             try:
                 assert create_codec.call_count == 1
                 metadata = create_codec.call_args.args[1].lifecycle_metadata[0]
-                expected_transform = (
-                    2 if not skip_rope_quantization and residual_quantization is None else 0
-                )
+                expected_transform = 2 if not skip_rope_quantization and residual_dim is None else 0
                 assert metadata.integers[:3, 1].tolist() == [expected_transform, 1, 1]
                 first = self._create_request(request_id=0, prompt_len=prompt_len)
                 requests.append(first)
@@ -589,7 +585,7 @@ class TestDeepseekV4CacheManager:
                 )
                 if skip_rope_quantization:
                     assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
-                elif residual_quantization is False:
+                elif residual_dim == 0:
                     assert not torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
 
                 expected_indexer = expected[0, DeepseekV4AttentionType.INDEXER_COMPRESS]

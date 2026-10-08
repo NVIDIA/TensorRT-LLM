@@ -219,8 +219,9 @@ how that part is stored:
 - `true`: copy the supported target RoPE part unchanged at the hot-cache
   precision, such as FP8 or BF16. The remaining values use NVFP4.
 
-For DeepSeek-V4 target CSA, `nvfp4_mla_residual_quantization` defaults to `true`.
-Set both options to `false` for single NVFP4 throughout the row. Setting
+For DeepSeek-V4 target CSA, `nvfp4_residual_dim` defaults to `64`, matching
+the native residual width. Set it to `0` with `skip_rope_quantization: false`
+for single NVFP4 throughout the row. Only `0` and `64` are supported. Setting
 `skip_rope_quantization` to `true` preserves RoPE regardless of the residual
 option. See the [DeepSeek-V4 example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4)
 for the three formats and limited accuracy results.
