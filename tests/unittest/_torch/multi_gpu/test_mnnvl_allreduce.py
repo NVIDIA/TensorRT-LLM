@@ -386,6 +386,59 @@ def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
 
 
 @torch.inference_mode()
+def mnnvl_rms_norm_fusion_forward(
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    dtype: torch.dtype,
+    tensor_parallel_size: int,
+    tensor_parallel_rank: int,
+    reference_norm: torch.Tensor,
+):
+    input = input.cuda()
+    norm_weight = norm_weight.cuda()
+    reference_norm = reference_norm.cuda()
+
+    os.environ["TLLM_TEST_MNNVL"] = "1"
+    MPI.COMM_WORLD.barrier()
+
+    allreduce = AllReduce(
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        strategy=AllReduceStrategy.MNNVL,
+        dtype=dtype,
+    )
+    assert allreduce.mnnvl_allreduce is not None
+    params = AllReduceParams(
+        fusion_op=AllReduceFusionOp.RMS_NORM,
+        norm_weight=norm_weight,
+        eps=eps,
+    )
+    # Call the MNNVL module directly: AllReduce.forward would silently fall
+    # back to another strategy if MNNVL declined the fusion.
+    output = allreduce.mnnvl_allreduce(input, all_reduce_params=params)
+    assert isinstance(output, torch.Tensor), type(output)
+    torch.testing.assert_close(output, reference_norm, rtol=0.05, atol=0.15)
+
+
+def run_rms_norm_single_rank(tensor_parallel_size, input, norm_weight, eps,
+                             dtype, reference_norm):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        mnnvl_rms_norm_fusion_forward(input, norm_weight, eps, dtype,
+                                      tensor_parallel_size, rank,
+                                      reference_norm)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
 def mnnvl_quant_fusion_forward(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -748,6 +801,41 @@ def test_mnnvl_quant_fusion(seq_len, hidden_size, dtype, fusion_op,
             fusion_op,
             reference_norm,
             reference_residual,
+        ) for i in range(tensor_parallel_size)]),
+    )
+    for r in results:
+        assert r is True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("seq_len, hidden_size", (
+    pytest.param(16, 3584, id="oneshot_m16_n3584"),
+    pytest.param(2048, 3584, id="twoshot_m2048_n3584"),
+))
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_mnnvl_rms_norm_fusion_without_residual(seq_len, hidden_size,
+                                                mpi_pool_executor):
+    """AllReduce + RMSNorm with no residual operand (Kimi K3 routed latent)."""
+    torch.manual_seed(42)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    dtype = torch.bfloat16
+    eps = 1e-5
+
+    x = torch.randn((tensor_parallel_size, seq_len, hidden_size), dtype=dtype)
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype)
+    reference_norm = rms_norm(
+        torch.sum(x, dim=0).to(torch.float32), norm_weight, eps).to(dtype)
+
+    results = mpi_pool_executor.map(
+        run_rms_norm_single_rank,
+        *zip(*[(
+            tensor_parallel_size,
+            x[i, :, :],
+            norm_weight,
+            eps,
+            dtype,
+            reference_norm,
         ) for i in range(tensor_parallel_size)]),
     )
     for r in results:
