@@ -421,16 +421,20 @@ def preparation_context(
         # A server-level chat template may end differently, so the route reports
         # unadjusted usage when one is configured.
         excluded = int(res.extension.prompt_tokens_excluded_from_usage(request) or 0)
-    thinking: Optional[bool] = None
-    parser = res.reasoning_parser
-    if parser and rendered.template_text and request.add_generation_prompt:
+    thinking: Dict[str, bool] = {}
+    if rendered.template_text and request.add_generation_prompt:
         # Deferred: the reasoning parsers module is only needed here.
         from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
-        if ReasoningParserFactory.resolves_thinking_from_prompt(parser):
-            thinking = ReasoningParserFactory.resolve_prefilled_thinking(
-                parser, rendered.template_text
-            )
+        # For every parser that reads its mode off the prompt, not only the one this
+        # renderer was configured with: that setting is not part of the compatibility
+        # check, so the executing worker picks the entry for its own parser.
+        for parser in ReasoningParserFactory.keys():
+            if not ReasoningParserFactory.resolves_thinking_from_prompt(parser):
+                continue
+            mode = ReasoningParserFactory.resolve_prefilled_thinking(parser, rendered.template_text)
+            if mode is not None:
+                thinking[parser] = mode
     return {"prompt_tokens_excluded_from_usage": excluded, "resolved_thinking": thinking}
 
 
