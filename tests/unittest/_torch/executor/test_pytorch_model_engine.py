@@ -356,7 +356,6 @@ def _make_forward_only_engine(
         extra_attrs={},
         model_config=SimpleNamespace(pretrained_config=SimpleNamespace(
             rope_scaling=None)))
-    decoder.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     engine.enable_spec_decode = False
     decoder._config = SimpleNamespace(
         compile_only_piecewise_graphs=False,
@@ -434,7 +433,6 @@ def _make_forward_only_engine(
         model=decoder.model,
         sparse_attention_config=None,
         metrics={},
-        kv_cache_manager_key=decoder.kv_cache_manager_key,
         dummy_requests=None,
         agreement=None,
         metadata=decoder._metadata,
@@ -1963,8 +1961,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
-                                           buffers=None)
-        engine.kv_cache_manager_key = "kv"
+                                           buffers=None,
+                                           attention_runtime_features=None)
         metadata = Mock(spec=DSAtrtllmAttentionMetadata)
 
         def build(kv_cache_manager, draft_kv_cache_manager):
@@ -1995,7 +1993,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._metadata = DecoderMetadata(config=engine._config,
                                            mapping=None,
                                            model=None,
-                                           buffers=None)
+                                           buffers=None,
+                                           attention_runtime_features=None)
         engine._metadata.setup_attention = Mock()
 
         engine._ensure_dsa_attn_metadata_for_warmup(Mock())
@@ -2154,7 +2153,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             model=None,
             sparse_attention_config=None,
             metrics={},
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
             dummy_requests=None,
             agreement=None,
             metadata=None,

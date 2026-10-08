@@ -172,10 +172,9 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
     def setUp(self) -> None:
         self.warmup = object.__new__(DecoderWarmup)
         self.warmup._eager_workspace_reclaimable = True
-        self.warmup._config = SimpleNamespace(is_spec_decode=False)
+        self.warmup._config = SimpleNamespace(is_spec_decode=False, torch_compile_enabled=False)
         self.warmup.mapping = SimpleNamespace(cp_size=1)
         self.warmup.sparse_attention_config = None
-        self.warmup._torch_compile_backend = None
         self.warmup._graphs = SimpleNamespace(breakable_cuda_graph_runner=None)
         self.metadata = object.__new__(TrtllmAttentionMetadata)
         self.metadata._num_tokens = 128
@@ -187,9 +186,8 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         )
         self.engine._eager_workspace_reclaimer = None
         self.engine._moe_workspace_reclaimer = None
-        self.engine._config = SimpleNamespace(is_spec_decode=False)
+        self.engine._config = SimpleNamespace(is_spec_decode=False, torch_compile_enabled=False)
         self.engine.mapping = SimpleNamespace(cp_size=1)
-        self.engine._torch_compile_backend = None
         self.engine._graphs = self.warmup._graphs
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
@@ -290,7 +288,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
                 (self.engine._config, "is_spec_decode", True),
                 (self.engine.mapping, "cp_size", 2),
                 (self.engine, "_eager_workspace_reclaim_supported", False),
-                (self.engine, "_torch_compile_backend", object()),
+                (self.engine._config, "torch_compile_enabled", True),
                 (self.engine._graphs, "breakable_cuda_graph_runner", object()),
             ]:
                 with patch.object(target, name, value):
@@ -305,7 +303,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.reclaimer_class.assert_not_called()
         for target, name, value in [
             (self.warmup._config, "is_spec_decode", True),
-            (self.warmup, "_torch_compile_backend", object()),
+            (self.warmup._config, "torch_compile_enabled", True),
             (self.warmup._graphs, "breakable_cuda_graph_runner", object()),
             (self.warmup, "sparse_attention_config", object()),
         ]:

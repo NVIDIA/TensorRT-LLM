@@ -192,18 +192,16 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
         runner = DecoderRunner(
             model,
             config,
-            input_processor=Mock(),
             model_caller=Mock(),
             mapping=Mock(),
             dist=None,
             moe_load_balancer=None,
             sparse_attention_config=None,
-            torch_compile_backend=None,
+            attention_runtime_features=Mock(),
             get_runtime_tokens_per_gen_step=Mock(),
             warmup_timer=Mock(),
             iter_states={},
             metrics={},
-            kv_cache_manager_key=Mock(),
         )
         assert runner.model.model is model.model
 

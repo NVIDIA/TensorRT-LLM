@@ -36,7 +36,6 @@ from tensorrt_llm.mapping import CpType, Mapping
 from .metadata import resolve_mamba_metadata_cls
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.compilation.backend import Backend
     from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -238,8 +237,6 @@ class DecoderWarmup:
         dist: Distributed | None,
         model: torch.nn.Module,
         sparse_attention_config: BaseSparseAttentionConfig | None,
-        torch_compile_backend: Backend | None,
-        kv_cache_manager_key: ResourceManagerType,
         warmup_timer: _WarmupTimer,
         metrics: dict[str, float],
         agreement: WarmupAgreement,
@@ -258,8 +255,6 @@ class DecoderWarmup:
         self.dist = dist
         self.model = model
         self.sparse_attention_config = sparse_attention_config
-        self._torch_compile_backend = torch_compile_backend
-        self.kv_cache_manager_key = kv_cache_manager_key
         self._warmup_timer = warmup_timer
         self._metrics = metrics
         self._agreement = agreement
@@ -282,7 +277,9 @@ class DecoderWarmup:
 
     def run(self, resource_manager: ResourceManager) -> EagerWorkspaceReclaimer | None:
         """Warm up and capture graphs; return the eager workspace reclaimer to serve with."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
             return self._warmup_scheduled(resource_manager, kv_cache_manager)
@@ -294,7 +291,9 @@ class DecoderWarmup:
         Returns warmup configs covering the maximum context and generation shapes.
         """
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         token_num_upper_bound = min(
             self._config.max_num_tokens,
             self._config.max_batch_size * (self._config.max_seq_len - 1),
@@ -529,7 +528,7 @@ class DecoderWarmup:
             self._config.is_spec_decode
             or self.mapping.cp_size != 1
             or self.sparse_attention_config is not None
-            or self._torch_compile_backend is not None
+            or self._config.torch_compile_enabled
             or self._graphs.breakable_cuda_graph_runner is not None
         ):
             logger.info(
@@ -738,7 +737,9 @@ class DecoderWarmup:
         metadata_cls = getattr(self._config.attention_backend, "Metadata", None)
         if metadata_cls is None or not issubclass(metadata_cls, DSAtrtllmAttentionMetadata):
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None:
             return
         self._metadata.setup_attention(
@@ -1043,7 +1044,9 @@ class DecoderWarmup:
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if generation_only:
             tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
             num_gen_requests = min(
@@ -1240,7 +1243,9 @@ class DecoderWarmup:
         """
         if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
             return
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
         if kv_cache_manager is None or not isinstance(kv_cache_manager, MambaHybridCacheManager):
             return
 

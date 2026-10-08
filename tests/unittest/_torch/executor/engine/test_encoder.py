@@ -61,7 +61,6 @@ def _encoder_config(
         max_beam_width=1,
         without_logits=False,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
         enable_autotuner=False,
     )
     if encoder_decoder:
@@ -150,8 +149,8 @@ def test_encoder_only_attention_metadata_uses_runner_cache_indirection() -> None
         max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
     )
+    runner._attention_runtime_features = AttentionRuntimeFeatures()
     runner._mapping = object()
     runner._buffers = SimpleNamespace(cache_indirection=cache_indirection)
     runner._attn_metadata = None
@@ -182,8 +181,8 @@ def test_encoder_decoder_attention_metadata_omits_decoder_cache_indirection() ->
         max_num_tokens=16,
         max_beam_width=2,
         attention_backend=TrtllmAttention,
-        attention_runtime_features=AttentionRuntimeFeatures(),
     )
+    runner._attention_runtime_features = AttentionRuntimeFeatures()
     runner._mapping = object()
     runner._encoder_config = SimpleNamespace(is_encoder_decoder=True)
 
