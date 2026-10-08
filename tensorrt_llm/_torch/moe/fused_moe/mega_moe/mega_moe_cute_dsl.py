@@ -818,12 +818,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """
         if not dist.is_available() or dist.is_initialized():
             return
-        from tensorrt_llm._utils import local_mpi_comm, mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 
         try:
             world = mpi_world_size()
             rank = mpi_rank()
-            local_rank = local_mpi_comm().Get_rank()
         except Exception as e:  # not under MPI either -> leave uninitialized
             logger.debug(
                 f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
@@ -868,15 +867,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        # The executor already bound this rank's device before the model was
+        # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
+        # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
+        # node) and would move only the layers built after this point, so bind
+        # NCCL to the current device instead of selecting one.
         device_id = None
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            device_index = local_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_index)
-            device_id = torch.device("cuda", device_index)
+        if torch.cuda.is_available():
+            device_id = torch.device("cuda", torch.cuda.current_device())
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
-            f"local_rank={local_rank}, device={device_id}, "
+            f"device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )

@@ -1529,7 +1529,12 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     assert moe._weights_transformed is True
 
 
-def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
+def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
+    """The bootstrap must bind NCCL to the device the executor already chose.
+
+    The executor binds global_mpi_rank() % device_count before the model is
+    built; re-selecting a device here would move later layers to another GPU.
+    """
     import tensorrt_llm._utils as utils
 
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
@@ -1537,7 +1542,6 @@ def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
     mpi_comm = MagicMock()
     mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
     local_mpi_comm = MagicMock()
-    local_mpi_comm.Get_rank.return_value = 5
     init_process_group = MagicMock()
     set_device = MagicMock()
 
@@ -1547,19 +1551,22 @@ def test_megamoe_cutedsl_mpi_bootstrap_binds_local_cuda_device(monkeypatch):
     monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
     monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
     monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
-    monkeypatch.setattr(utils, "local_mpi_comm", lambda: local_mpi_comm)
+    monkeypatch.setattr(utils, "local_mpi_comm", local_mpi_comm)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
     monkeypatch.setattr(torch.cuda, "set_device", set_device)
 
     moe._maybe_init_torch_dist_under_mpi()
 
-    set_device.assert_called_once_with(1)
+    set_device.assert_not_called()
+    # Split_type is a collective; it must not run in this bootstrap.
+    local_mpi_comm.assert_not_called()
     init_process_group.assert_called_once_with(
         backend="cuda:nccl,cpu:gloo",
         rank=3,
         world_size=8,
-        device_id=torch.device("cuda", 1),
+        device_id=torch.device("cuda", 2),
     )
 
 
