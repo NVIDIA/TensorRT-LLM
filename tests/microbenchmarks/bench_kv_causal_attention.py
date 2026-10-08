@@ -219,7 +219,7 @@ def build_cache(
         k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
         v = torch.randn_like(k)
         for layer in range(num_layers):
-            mgr.write_range(layer, mgr.past_tokens, k, v)
+            mgr.write_range(layer, mgr.staging_offset, k, v)
         mgr.commit(mgr.max_staged_tokens)
         hist_k.append(k)
         hist_v.append(v)
@@ -426,7 +426,7 @@ def main() -> None:
     mgr, kp, vp, k_hist, v_hist = build_cache(
         args.prompt_len, window, args.history_chunks, args.tokens_per_page, gen
     )
-    start = mgr.past_tokens
+    start = mgr.staging_offset
     seq_len = start + CHUNK
 
     q = torch.randn(CHUNK, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)

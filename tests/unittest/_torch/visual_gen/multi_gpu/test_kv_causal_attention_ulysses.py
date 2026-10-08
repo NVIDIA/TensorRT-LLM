@@ -231,7 +231,9 @@ def _logic_rollout(rank, world_size, backend):
             ]
             torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"step {step}")
 
-            positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device="cuda")
+            positions = torch.arange(
+                cache.staging_offset, cache.staging_offset + chunk, device="cuda"
+            )
             k_back, v_back = read_kv(cache, positions)
             torch.testing.assert_close(k_back, head_slice(k, rank), msg=f"step {step}: K")
             torch.testing.assert_close(v_back, head_slice(v, rank), msg=f"step {step}: V")
@@ -258,7 +260,7 @@ def _logic_causal_blocks(
         history_k, history_v = [], []
         for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
             _, k, v = rand_qkv(chunk)
-            cache.write_range(0, cache.past_tokens, head_slice(k, rank), head_slice(v, rank))
+            cache.write_range(0, cache.staging_offset, head_slice(k, rank), head_slice(v, rank))
             cache.commit(cache.max_staged_tokens)
             history_k.append(k)
             history_v.append(v)
@@ -307,7 +309,7 @@ def _logic_padded_first_chunk(rank, world_size, backend):
         expected = full[rank * per : (rank + 1) * per]
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
 
-        positions = torch.arange(cache.past_tokens, cache.past_tokens + block, device="cuda")
+        positions = torch.arange(cache.staging_offset, cache.staging_offset + block, device="cuda")
         k_back, v_back = read_kv(cache, positions)
         torch.testing.assert_close(k_back, head_slice(k, rank))
         torch.testing.assert_close(v_back, head_slice(v, rank))

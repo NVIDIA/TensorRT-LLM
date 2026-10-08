@@ -196,7 +196,7 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
             )
 
         # The call wrote this chunk's K/V where the next forward expects them.
-        positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+        positions = torch.arange(cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE)
         k_back, v_back = read_kv(cache, 0, positions)
         torch.testing.assert_close(k_back, k)
         torch.testing.assert_close(v_back, v)
@@ -227,7 +227,7 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_bloc
             assert (out[lo:hi].float() - leaky.float()).abs().max() > 1e-2, (
                 f"causal block {i} leaks"
             )
-    positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
+    positions = torch.arange(cache.staging_offset, cache.staging_offset + chunk, device=DEVICE)
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k)
     torch.testing.assert_close(v_back, v)
@@ -246,7 +246,7 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     history_k, history_v = [], []
     for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
         _, k, v = rand_qkv(CHUNK)
-        cache.write_range(0, cache.past_tokens, k, v)
+        cache.write_range(0, cache.staging_offset, k, v)
         cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
@@ -308,7 +308,9 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     cache.commit(prompt)
     for c in range(commits):
         first = prompt + c * CHUNK
-        cache.write_range(0, cache.past_tokens, keys(CHUNK), indicator_values(watch, first, CHUNK))
+        cache.write_range(
+            0, cache.staging_offset, keys(CHUNK), indicator_values(watch, first, CHUNK)
+        )
         cache.commit(cache.max_staged_tokens)
     assert cache.fixed_tokens == fixed
 
@@ -359,7 +361,7 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     )
     torch.testing.assert_close(out[:CHUNK], expected, rtol=2e-2, atol=2e-2)
     assert out[CHUNK:].abs().max().item() == 0.0, "padding rows must be zero"
-    positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+    positions = torch.arange(cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE)
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k[:CHUNK])
     torch.testing.assert_close(v_back, v[:CHUNK])
@@ -376,13 +378,13 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
     torch.manual_seed(1)
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
-    past = cache.past_tokens
+    past = cache.staging_offset
     last_k = last_v = None
     for _ in range(4):
         q, last_k, last_v = rand_qkv(CHUNK)
         run(attn, cache, q, last_k, last_v)
     torch.cuda.synchronize()
-    assert cache.past_tokens == past, "dirty steps must not advance the window"
+    assert cache.staging_offset == past, "dirty steps must not advance the window"
     positions = torch.arange(past, past + CHUNK, device=DEVICE)
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, last_k)
@@ -402,7 +404,7 @@ def test_graph_replay_survives_commit(cache, backend):
     history_k, history_v = [], []
     for _ in range(2):
         _, k, v = rand_qkv(CHUNK)
-        cache.write_range(0, cache.past_tokens, k, v)
+        cache.write_range(0, cache.staging_offset, k, v)
         cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
@@ -432,7 +434,7 @@ def test_graph_replay_survives_commit(cache, backend):
         hk, hv = torch.cat(history_k), torch.cat(history_v)
         expected = exact_reference(q, pk, pv, hk, hv, k, v, 0, CHUNK)
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"replay {step}")
-        positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+        positions = torch.arange(cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE)
         k_back, v_back = read_kv(cache, 0, positions)
         torch.testing.assert_close(k_back, k, msg=f"replay {step}: K landed on stale pages")
         torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")
@@ -526,7 +528,7 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     history_k, history_v = [], []
     for _ in range(3):
         _, k, v = rand_qkv(CHUNK)
-        cache.write_range(0, cache.past_tokens, k, v)
+        cache.write_range(0, cache.staging_offset, k, v)
         cache.commit(cache.max_staged_tokens)
         history_k.append(k)
         history_v.append(v)
@@ -553,7 +555,7 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     )
     torch.testing.assert_close(out[:CHUNK], expected, rtol=2e-2, atol=2e-2)
     assert out[CHUNK:].abs().max().item() == 0.0, "padding rows must be zero"
-    positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+    positions = torch.arange(cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE)
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k[:CHUNK])
     torch.testing.assert_close(v_back, v[:CHUNK])
@@ -696,7 +698,9 @@ def test_packed_qkv_matches_separate_tensors_on_the_cache_path():
                     causal_block_size=CHUNK // 4,
                 )
             torch.cuda.synchronize()
-            positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+            positions = torch.arange(
+                cache.staging_offset, cache.staging_offset + CHUNK, device=DEVICE
+            )
             outs.append(out.reshape(CHUNK, -1).clone())
             kvs.append(tuple(x.clone() for x in read_kv(cache, 0, positions)))
         finally:

@@ -54,7 +54,26 @@ class AttentionBackend(ABC):
         k: torch.Tensor | None = None,
         v: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor: ...
+    ) -> torch.Tensor:
+        """Attention over ``q``, ``k``, ``v`` in the backend's ``preferred_layout``.
+
+        Keyword contract shared by every backend (unknown keywords are ignored):
+
+        * ``batch_size``, ``seq_len``, ``seq_len_kv``: the batch and the query and
+          key sequence lengths. ``seq_len`` is the number of query tokens this call
+          computes, as in the engine's attention metadata, not a cached total. The
+          Attention module derives it from ``q.shape[1]``; with a ``kv_cache`` the
+          caller passes it and it may be smaller than ``q.shape[1]``: rows past it
+          are padding added so the sequence splits evenly across ranks, and they
+          are neither written to the cache nor attended, and come back zero.
+        * ``attention_mask``, ``key_padding_mask``: the mask, if the backend takes one.
+        * ``kv_cache``: a ``CausalKVCacheManager``; only backends whose
+          ``support_kv_cache()`` is true accept it. ``k``/``v`` are then this call's
+          new tokens, staged into the cache and attended together with what the
+          cache holds before them.
+        * ``causal_block_size``: with ``kv_cache``, cuts the new tokens into causal
+          blocks, full attention within a block and causal across blocks.
+        """
 
     @property
     @abstractmethod

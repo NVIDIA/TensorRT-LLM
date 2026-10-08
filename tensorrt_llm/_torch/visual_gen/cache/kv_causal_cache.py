@@ -568,8 +568,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return self._history_tokens
 
     @property
-    def past_tokens(self) -> int:
-        """Logical position where the staged tokens' K/V are written."""
+    def staging_offset(self) -> int:
+        """Logical position where the staged tokens' K/V are written: the fixed region
+        plus the resident history. A position in the resident sequence, not a count of
+        tokens generated: it falls by a page whenever eviction drops one. Rotary
+        positions are absolute over the rollout and are the caller's business."""
         return self._fixed_tokens + self._history_tokens
 
     @property
@@ -598,12 +601,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
     # ------------------------------------------------------------------ the window
 
     def commit(self, num_tokens: int) -> None:
-        """The ``num_tokens`` staged tokens, written at ``past_tokens``, are final. Those
+        """The ``num_tokens`` staged tokens, written at ``staging_offset``, are final. Those
         that fall within the first ``pin_tokens`` become fixed; the rest become
         history, and the window slides. The count is the caller's: a forward may stage
         fewer tokens than ``max_staged_tokens``."""
         self._require_open()
-        pinned = max(0, min(self._pin_tokens, self.past_tokens + num_tokens) - self._fixed_tokens)
+        pinned = max(
+            0, min(self._pin_tokens, self.staging_offset + num_tokens) - self._fixed_tokens
+        )
         if num_tokens <= 0 or num_tokens - pinned > self.max_staged_tokens:
             raise ValueError(
                 f"commit of {num_tokens} tokens, {pinned} of them pinned; the rest may be at "
@@ -801,7 +806,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # Staged token t lands at slot id view_page * tpb + slot, with view_page the
         # table entry of its logical page and slot its offset in that page.
         tpb = self.tokens_per_page
-        torch.arange(self.past_tokens, self.past_tokens + self.max_staged_tokens, out=self._logical)
+        torch.arange(
+            self.staging_offset, self.staging_offset + self.max_staged_tokens, out=self._logical
+        )
         torch.floor_divide(self._logical, tpb, out=self._logical_page)
         torch.index_select(self._table, 0, self._logical_page, out=self._view_page)
         torch.remainder(self._logical, tpb, out=self._staged_slots)
@@ -848,7 +855,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         first the visible slots of the pages it sees only partly, in logical order,
         then its own tokens.
         """
-        past, size = self.past_tokens, blk.block_size
+        past, size = self.staging_offset, blk.block_size
         blk.host["rows"].fill(0)
         for i in range(blk.num_blocks):
             spans = self._visible_spans(past + i * size)
@@ -1114,7 +1121,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         ``k``/``v`` are ``[T, num_kv_heads, head_dim]`` with a contiguous ``head_dim``;
         token and head strides are free, so slices of a fused QKV projection go in
-        without a copy. They go to the logical positions from ``past_tokens`` (where
+        without a copy. They go to the logical positions from ``staging_offset`` (where
         later blocks and, after commit, later forwards read them) and to the blocks'
         private regions: the earlier blocks' tokens on each block's partial pages,
         and, with ``own_tokens``, each block's own tokens. One scatter kernel reads
