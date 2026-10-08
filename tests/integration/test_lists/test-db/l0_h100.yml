@@ -234,6 +234,11 @@ l0_h100:
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[no-overlap-chunked]
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[offload-chunked]
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix[offload-no-chunked]
+  # Orphaned-GPU-process sweep of the test harness; needs a real GPU and NVML.
+  - test_trt_test_alternative_gpu.py::test_sweep_kills_orphaned_cuda_process
+  - test_trt_test_alternative_gpu.py::test_failed_launch_kills_orphaned_cuda_process
+  - test_trt_test_alternative_gpu.py::test_successful_launch_keeps_cuda_process
+  - test_trt_test_alternative_gpu.py::test_sweep_keeps_cuda_process_of_another_launch
 - condition:
     ranges:
       system_gpu_count:

@@ -198,6 +198,7 @@ l0_cpu:
   - unittest/scaffolding
   - unittest/scripts
   - unittest/tools
+  - unittest/tools/test_trt_test_alternative_cleanup.py
   - unittest/usage
   - unittest/utils/test_logger.py
   - unittest/utils/test_confidential_compute.py
