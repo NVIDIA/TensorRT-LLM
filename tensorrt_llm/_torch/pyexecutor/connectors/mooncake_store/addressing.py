@@ -23,6 +23,10 @@ Region order is therefore the value's serialization, stable for a given model
 and parallel layout because `build_kv_cache_layout_v2` derives it from the
 allocator's own aggregation. `bytes_per_page` goes into the key namespace so a
 geometry change cannot be read as a valid page.
+
+A layer group yields two pages rather than one, since its shard-specific and
+replicated regions are keyed separately. Groups with no replicated role report
+an empty second page, which the worker skips.
 """
 
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -91,8 +95,8 @@ def merge_intervals(intervals: Iterable[Tuple[int, int]]) -> List[Tuple[int, int
 
     A range may not be registered twice, but several regions routinely live
     inside one pool allocation: sliding-window layer groups share it, and a
-    non-uniform slot such as MiniMax-M3's index-K beside K/V splits one pool
-    into several regions. Merging first spares the caller that distinction.
+    pool holding both region classes (MiniMax-M3's index-K beside K/V) splits
+    into interleaved regions. Merging first spares the caller that distinction.
     """
     ordered = sorted((int(start), int(end)) for start, end in intervals if end > start)
     merged: List[Tuple[int, int]] = []
@@ -111,8 +115,11 @@ class PageAddressing:
     def __init__(self, layout: KvCacheLayout):
         self._layout = layout
         self._regions: Dict[int, Tuple[KvCacheRegion, ...]] = {}
+        self._replicated_regions: Dict[int, Tuple[KvCacheRegion, ...]] = {}
         self._origins: Dict[int, Tuple[int, ...]] = {}
+        self._replicated_origins: Dict[int, Tuple[int, ...]] = {}
         self._bytes_per_page: Dict[int, int] = {}
+        self._replicated_bytes_per_page: Dict[int, int] = {}
         self._num_slots: Dict[int, int] = {}
         boundary = layout.gpu_pool_mapping_bytes
         for group in layout.groups:
@@ -122,15 +129,25 @@ class PageAddressing:
                     "is nothing for the connector to transfer"
                 )
             self._regions[group.layer_group_id] = group.regions
+            self._replicated_regions[group.layer_group_id] = group.replicated_regions
             # Asked once per region here rather than per transfer: a region's
-            # reservation is fixed for the lifetime of the pools.
+            # reservation is fixed for the lifetime of the pools. Each class
+            # carries its own origins because the two interleave inside a pool,
+            # and a region has to be cut against the reservation it sits in.
             self._origins[group.layer_group_id] = tuple(
                 mapping_origin(region.base, boundary) for region in group.regions
             )
+            self._replicated_origins[group.layer_group_id] = tuple(
+                mapping_origin(region.base, boundary) for region in group.replicated_regions
+            )
             self._bytes_per_page[group.layer_group_id] = group.bytes_per_page
+            self._replicated_bytes_per_page[group.layer_group_id] = group.replicated_bytes_per_page
             # Regions of a group come from the same pool group and so share a
             # slot count. Disagreement would make the page index ambiguous.
-            slot_counts = {region.num_slots for region in group.regions}
+            # Replicated regions share that space, so they are held to it too.
+            slot_counts = {
+                region.num_slots for region in (*group.regions, *group.replicated_regions)
+            }
             if len(slot_counts) != 1:
                 raise ValueError(
                     f"layer group {group.layer_group_id} mixes slot counts "
@@ -156,7 +173,12 @@ class PageAddressing:
         from the driver and the boundaries are being assumed; see
         `mapping_origin`.
         """
-        origins = {origin for group in self._origins.values() for origin in group}
+        origins = {
+            origin
+            for by_group in (self._origins, self._replicated_origins)
+            for group in by_group.values()
+            for origin in group
+        }
         return tuple(sorted(origins))
 
     @property
@@ -170,15 +192,23 @@ class PageAddressing:
         return self._layout.tokens_per_block
 
     def bytes_per_page(self, layer_group_id: int) -> int:
-        """Total payload size of one page of `layer_group_id`."""
+        """Payload size of one shard-specific page of `layer_group_id`."""
         return self._bytes_per_page[layer_group_id]
+
+    def replicated_bytes_per_page(self, layer_group_id: int) -> int:
+        """Payload size of one replicated page of `layer_group_id`, or 0."""
+        return self._replicated_bytes_per_page[layer_group_id]
+
+    def has_replicated(self, layer_group_id: int) -> bool:
+        """Whether `layer_group_id` holds any replicated-role bytes."""
+        return bool(self._replicated_regions[layer_group_id])
 
     def num_slots(self, layer_group_id: int) -> int:
         """Number of page slots addressable in `layer_group_id`."""
         return self._num_slots[layer_group_id]
 
     def buffers(self, layer_group_id: int, page_index: int) -> Tuple[List[int], List[int]]:
-        """Addresses and sizes of one page, in the order they concatenate.
+        """Addresses and sizes of one shard-specific page, in concatenation order.
 
         A region whose bytes for this page cross a GPU pool mapping boundary
         contributes several consecutive buffers rather than one, which leaves
@@ -191,7 +221,44 @@ class PageAddressing:
         Returns:
             Parallel lists of device addresses and byte counts.
         """
-        regions = self._regions[layer_group_id]
+        return self._locate(
+            self._regions[layer_group_id],
+            self._origins[layer_group_id],
+            layer_group_id,
+            page_index,
+        )
+
+    def replicated_buffers(
+        self, layer_group_id: int, page_index: int
+    ) -> Tuple[List[int], List[int]]:
+        """Addresses and sizes of one replicated page, in concatenation order.
+
+        The bytes match on every rank but the addresses do not, since each rank
+        names the copy in its own memory. A region crossing a GPU pool mapping
+        boundary is split the same way as in `buffers`.
+
+        Args:
+            layer_group_id: Layer group the page index is scoped to.
+            page_index: Page slot index within that group.
+
+        Returns:
+            Parallel lists of device addresses and byte counts. Both are empty
+            when the group holds no replicated roles.
+        """
+        return self._locate(
+            self._replicated_regions[layer_group_id],
+            self._replicated_origins[layer_group_id],
+            layer_group_id,
+            page_index,
+        )
+
+    def _locate(
+        self,
+        regions: Sequence[KvCacheRegion],
+        origins: Sequence[int],
+        layer_group_id: int,
+        page_index: int,
+    ) -> Tuple[List[int], List[int]]:
         num_slots = self._num_slots[layer_group_id]
         if not 0 <= page_index < num_slots:
             raise IndexError(
@@ -201,7 +268,7 @@ class PageAddressing:
         boundary = self._layout.gpu_pool_mapping_bytes
         addresses: List[int] = []
         sizes: List[int] = []
-        for region, origin in zip(regions, self._origins[layer_group_id]):
+        for region, origin in zip(regions, origins):
             start = region.base + region.stride * page_index
             for address, size in split_at_boundaries(start, region.size, boundary, origin):
                 addresses.append(address)
@@ -214,7 +281,9 @@ class PageAddressing:
         A region's slots are strided rather than packed, so its range spans
         from the first slot to the end of the last. Registering the whole span
         is what makes every slot's address valid for RDMA, and merging keeps a
-        shared pool from being registered once per region.
+        shared pool from being registered once per region. Both region classes
+        are covered, since replicated bytes are transferred like any other and
+        an unregistered range cannot be transferred at all.
 
         Merged spans are then cut at GPU pool mapping boundaries, measured from
         the reservation each pool was mapped into, since a registration covering
@@ -227,7 +296,14 @@ class PageAddressing:
         # group is the same cover as merging all the spans together.
         spans_by_origin: Dict[int, List[Tuple[int, int]]] = {}
         for layer_group_id, regions in self._regions.items():
-            for region, origin in zip(regions, self._origins[layer_group_id]):
+            paired = (
+                *zip(regions, self._origins[layer_group_id]),
+                *zip(
+                    self._replicated_regions[layer_group_id],
+                    self._replicated_origins[layer_group_id],
+                ),
+            )
+            for region, origin in paired:
                 span_end = region.base + region.stride * (region.num_slots - 1) + region.size
                 spans_by_origin.setdefault(origin, []).append((region.base, span_end))
 
@@ -248,6 +324,8 @@ class PageAddressing:
             f"layers={len(group.layer_ids)}, "
             f"regions={len(group.regions)}, "
             f"bytes/page={group.bytes_per_page}, "
+            f"replicated_regions={len(group.replicated_regions)}, "
+            f"replicated_bytes/page={group.replicated_bytes_per_page}, "
             f"slots={self._num_slots[group.layer_group_id]}, "
             f"window={group.window_size})"
             for group in self._layout.groups

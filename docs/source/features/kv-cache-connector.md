@@ -73,6 +73,7 @@ These methods run on all workers (GPU processes) and interact with the actual GP
   * **Description**: Called at initialization **instead of** `register_kv_caches` when the KV cache manager is `KVCacheManagerV2`, whose memory cannot be expressed as one tensor: there is one slot address space per pool and one page-index space per layer group. The default implementation raises, so a connector that does not implement it can only run on V1.
   * **Arguments**: `layout` describes the byte ranges that repeat per page slot. Each `KvCacheLayerGroupLayout` carries a tuple of `KvCacheRegion`s, and the bytes for page slot `i` of a region live at `region.base + region.stride * i` for `region.size` bytes, or equivalently at `region.as_tensor()[i]`. Page indices arriving in `RequestData.new_block_ids_by_layer_group` are scoped to a layer group and index that group's regions.
   * **Why regions rather than a tensor**: because the ranges are described rather than implied, the same structure covers MLA (a pool simply has no `value` buffer), sliding-window and hybrid models (one layer group per window size), and non-uniform slots such as MiniMax-M3's index-K buffer sitting beside K/V, without any of them being a special case.
+  * **Replicated roles**: a group's ranges come in two sets. `regions` holds bytes particular to one attention shard, while `replicated_regions` holds bytes identical on every shard. MiniMax-M3's index-K is computed from a replicated projection, so all TP ranks hold the same values. The manager declares which roles those are through `get_replicated_roles()`, itself derived from the `get_disagg_role_mapper_kinds()` declaration that the native disaggregation path already uses. V2 may interleave the two classes within one pool, so the split is produced by aggregating each class separately rather than by slicing a merged range; a connector that ignores `replicated_regions` will simply not transfer those bytes.
 
 * **`start_load_kv(self, stream: torch.cuda.Stream)`**
   * **Description**: Initiates the loading of KV blocks from the external source into the GPU memory.
@@ -143,7 +144,8 @@ explicitly opt in.
 The built-in `mooncake-store` adapter shares one unsharded attention namespace
 across ADP owners. Each owner opens its own store client and contributes its
 configured segment to the common master. TP uses separate keys for each
-attention shard and still requires all shards for a prefix hit. A disaggregated
+attention shard and still requires all shards for a prefix hit, except for roles
+the manager declares replicated, which the whole TP group stores once. A disaggregated
 DEP4 prefill / TEP8 decode deployment attaches the store connector to prefill;
 decode can donate host memory while keeping its native KV transceiver. The
 store does not convert attention shard layouts during prefill-to-decode handoff.
