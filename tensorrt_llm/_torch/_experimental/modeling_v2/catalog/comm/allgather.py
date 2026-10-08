@@ -60,8 +60,16 @@ class Allgather(OpWrapper):
         input: torch.Tensor,
         sizes: Optional[List[int]],
         group: List[int],
+        process_group: Optional[object] = None,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.allgather(input, sizes, group)
+        """`process_group` selects the communicator flavor, mirroring the
+        product router in `_torch/distributed/ops.py`: None runs the
+        MPI-session symbol -- the one a dep4 serving world calls -- and a boxed
+        c10d ProcessGroup runs the `_pg` symbol the non-MPI backends use.
+        """
+        if process_group is None:
+            return torch.ops.trtllm.allgather(input, sizes, group)
+        return torch.ops.trtllm.allgather_pg(input, sizes, group, process_group)
 
     def reference(
         self,
@@ -99,6 +107,7 @@ class Allgather(OpWrapper):
         input: torch.Tensor,
         sizes: Optional[List[int]],
         group: List[int],
+        process_group: Optional[object] = None,
     ) -> None:
         # Each guard is for a violation measured to end in silent corruption or
         # a process kill rather than an error.
