@@ -14,7 +14,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
@@ -58,34 +57,6 @@ def get_all_rank_ctx_requests(
         assert dist is not None, "attention DP requires a distributed communicator"
         return dist.tp_allgather_int64([num_ctx_requests])[:, 0].tolist()
     return None
-
-
-def set_spec_metadata_all_rank_num_tokens(
-    spec_metadata: SpecMetadata,
-    spec_all_rank_num_tokens: list[int],
-    all_rank_num_seqs: list[int],
-    all_rank_num_gens: list[int] | None = None,
-) -> None:
-    # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
-    # draft loop iterations i>0 (per-sequence counts, since each
-    # sequence contributes one token per iteration).
-    spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-    spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-    # DSpark can draft only after the target processes the current bonus token,
-    # because it consumes captured target-layer hidden states for that token.
-    # Prefill computes hidden states for prompt tokens; the first generated token
-    # is sampled from the last prompt logits and has not itself passed through the
-    # target layers. Thus context requests seed the rolling window but do not run
-    # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
-    # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
-    # chunk loop identical across EP ranks.
-    if all_rank_num_gens is not None:
-        spec_metadata.all_rank_num_gens = all_rank_num_gens
-    if (
-        spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-    ):
-        spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
 
 
 def get_padding_params(

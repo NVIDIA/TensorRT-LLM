@@ -18,7 +18,6 @@ from .common import (
     get_position_id_offset,
     get_top_level_model,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
 from .decoder import DecoderRunner
@@ -41,7 +40,6 @@ __all__ = [
     "EncoderRunner",
     "prepare_multimodal_indices",
     "resolve_runner_type",
-    "set_spec_metadata_all_rank_num_tokens",
     "ship_multimodal_indices",
 ]
 

@@ -98,12 +98,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
-from ...metadata import (
-    build_attention_metadata,
-    create_spec_metadata,
-    get_spec_managers,
-    update_spec_metadata,
-)
+from ...metadata import build_attention_metadata
 from ...model_call import ModelCaller
 from ..common import (
     apply_position_id_offset,
@@ -115,11 +110,16 @@ from ..common import (
     moe_a2a_steady_state_budget_for_capture,
     prepare_multimodal_indices,
     resolve_mrope_position_deltas_cache,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
+from .speculative import (
+    create_spec_metadata,
+    get_spec_managers,
+    set_spec_metadata_all_rank_num_tokens,
+    update_spec_metadata,
+)
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> int:
