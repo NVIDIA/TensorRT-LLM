@@ -23,6 +23,7 @@ This file tests:
 """
 
 import builtins
+import functools
 import random
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -4556,6 +4557,9 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         meta.prepare_for_draft_forward.return_value = None
+        meta.draft_replay_swapped_attrs = {}
+        for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+            setattr(meta, helper, functools.partial(getattr(TrtllmAttentionMetadata, helper), meta))
         return meta
 
     @staticmethod
@@ -4588,7 +4592,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
-        assert saved["target_kv_cache_manager"] is original_kv_mgr
+        assert meta.draft_replay_swapped_attrs["kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert "saved_backend_state" not in saved
         meta.prepare_for_draft_forward.assert_called_once_with()

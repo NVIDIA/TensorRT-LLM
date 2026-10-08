@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import json
+import logging
+import os
+import socket
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 from test_common import s3_output, s3_output_hooks
 from test_common.s3_output import UploadLogPlugin
+
+pytestmark = pytest.mark.cpu_only
 
 
 class Report:
@@ -131,6 +136,221 @@ def process_report(plugin, report):
         next(hook)
 
 
+def assert_empty_spool_root(output_path):
+    spool_root = s3_output._spool_root(str(output_path))
+    assert spool_root.is_dir()
+    assert not any(spool_root.iterdir())
+
+
+def test_spool_config_retries_when_directory_disappears(tmp_path, monkeypatch):
+    spool_root = s3_output._spool_root(str(tmp_path))
+    original_makedirs = os.makedirs
+    removals = []
+
+    def remove_spool_dir_once(path, *args, **kwargs):
+        original_makedirs(path, *args, **kwargs)
+        if Path(path).parent == spool_root and not removals:
+            Path(path).rmdir()
+            removals.append(path)
+
+    monkeypatch.setattr(s3_output.os, "makedirs", remove_spool_dir_once)
+    plugin = make_uploading_plugin(tmp_path, monkeypatch, RecordingS3Client())
+
+    assert any(spool_root.rglob("upload-config.json"))
+    plugin.pytest_sessionfinish(None, 0)
+    assert_empty_spool_root(tmp_path)
+
+
+def test_configure_continues_when_spool_creation_fails(tmp_path, monkeypatch, caplog):
+    spool_root = s3_output._spool_root(str(tmp_path))
+    original_makedirs = os.makedirs
+
+    def fail_spool_dir(path, *args, **kwargs):
+        if Path(path).parent == spool_root:
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        original_makedirs(path, *args, **kwargs)
+
+    monkeypatch.setattr(s3_output.os, "makedirs", fail_spool_dir)
+    monkeypatch.setattr(s3_output, "_create_s3_client", lambda *args: RecordingS3Client())
+    config = Config(
+        **{
+            "--s3-upload-path": "logs",
+            "--output-dir": str(tmp_path),
+            "--s3-secret-key": "secret",
+            "--s3-endpoint": "https://example.com",
+            "--s3-username": "user",
+            "--s3-bucket": "bucket",
+            "capture": "fd",
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger=s3_output.__name__):
+        s3_output_hooks.pytest_configure(config)
+        plugin = config.pluginmanager.getplugin("upload_log_plugin")
+        report = Report([("Captured stdout call", "original output")])
+        process_report(plugin, report)
+        plugin.pytest_runtest_logfinish(report.nodeid, None)
+        plugin.pytest_sessionfinish(None, 0)
+
+    assert report.sections == [("Captured stdout call", "original output")]
+    warnings = [
+        record.message for record in caplog.records if "S3 log spooling disabled" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "initializing spool config" in warnings[0]
+    assert str(tmp_path) in warnings[0]
+    assert f"hostname={socket.gethostname()!r}" in warnings[0]
+    assert f"pid={os.getpid()}" in warnings[0]
+    assert "errno=2" in warnings[0]
+
+
+def test_spool_append_retries_when_test_directory_disappears(tmp_path, monkeypatch):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
+    original_makedirs = os.makedirs
+    removals = []
+
+    def remove_test_dir_once(path, *args, **kwargs):
+        original_makedirs(path, *args, **kwargs)
+        if Path(path).parent == Path(plugin._spool_dir) and not removals:
+            Path(path).rmdir()
+            removals.append(path)
+
+    monkeypatch.setattr(s3_output.os, "makedirs", remove_test_dir_once)
+    report = Report([("Captured stdout call", "retry me")])
+
+    process_report(plugin, report)
+
+    assert report.sections[0][0] == "Captured stdout"
+    source_path = next(s3_output._spool_root(str(tmp_path)).rglob("stdout.log"))
+    assert source_path.read_text(encoding="utf-8") == "retry me"
+
+
+def test_report_keeps_native_capture_when_spool_append_fails(tmp_path, monkeypatch, caplog):
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=0)
+    original_makedirs = os.makedirs
+
+    def remove_test_dir(path, *args, **kwargs):
+        original_makedirs(path, *args, **kwargs)
+        if Path(path).parent == Path(plugin._spool_dir):
+            Path(path).rmdir()
+
+    monkeypatch.setattr(s3_output.os, "makedirs", remove_test_dir)
+    first = Report([("Captured stdout call", "original output")])
+    second = Report([("Captured stderr call", "later output")], nodeid="test_later.py::test_case")
+
+    with caplog.at_level(logging.WARNING, logger=s3_output.__name__):
+        process_report(plugin, first)
+        process_report(plugin, second)
+        plugin.pytest_runtest_logfinish(first.nodeid, None)
+        plugin.pytest_sessionfinish(None, 0)
+
+    assert first.sections == [("Captured stdout call", "original output")]
+    assert second.sections == [("Captured stderr call", "later output")]
+    warnings = [
+        record.message for record in caplog.records if "S3 log spooling disabled" in record.message
+    ]
+    assert len(warnings) == 1
+    assert "processing a test report" in warnings[0]
+    assert str(tmp_path) in warnings[0]
+    assert f"pid={os.getpid()}" in warnings[0]
+    assert "errno=2" in warnings[0]
+
+
+@pytest.mark.parametrize("upload_mode", ["sync", "deferred"])
+def test_logfinish_uploads_existing_logs_after_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upload_mode: str
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode=upload_mode
+    )
+    call_report = Report([("Captured stdout call", "earlier output")])
+    process_report(plugin, call_report)
+    assert "/stdout.log" in call_report.sections[0][1]
+
+    def fail_append(_test_name: str, _filename: str, _content: str) -> str:
+        raise OSError("spool unavailable")
+
+    monkeypatch.setattr(plugin, "_append_spool_file", fail_append)
+    teardown_section = ("Captured stderr teardown", "keep this error")
+    teardown_report = Report([teardown_section], when="teardown")
+    process_report(plugin, teardown_report)
+    plugin.pytest_runtest_logfinish(call_report.nodeid, None)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert teardown_report.sections == [teardown_section]
+    assert [upload[0] for upload in client.uploads] == [b"earlier output"]
+    assert client.uploads[0][2].endswith("/stdout.log")
+
+
+@pytest.mark.parametrize("upload_mode", ["sync", "deferred"])
+def test_sessionfinish_uploads_existing_logs_after_capture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, upload_mode: str
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode=upload_mode
+    )
+    call_report = Report([("Captured stdout call", "unfinished output")])
+    process_report(plugin, call_report)
+
+    def fail_append(_test_name: str, _filename: str, _content: str) -> str:
+        raise OSError("spool unavailable")
+
+    monkeypatch.setattr(plugin, "_append_spool_file", fail_append)
+    teardown_section = ("Captured stderr teardown", "keep this error")
+    teardown_report = Report([teardown_section], when="teardown")
+    process_report(plugin, teardown_report)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert teardown_report.sections == [teardown_section]
+    assert [upload[0] for upload in client.uploads] == [b"unfinished output"]
+    assert client.uploads[0][2].endswith("/stdout.log")
+
+
+def test_failed_upload_scheduling_keeps_other_streams_and_recovery_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = RecordingS3Client()
+    plugin = make_uploading_plugin(
+        tmp_path, monkeypatch, client, inline_output_max_bytes=0, upload_mode="deferred"
+    )
+    report = Report(
+        [
+            ("Captured stdout call", "recover this output"),
+            ("Captured stderr call", "upload this error"),
+        ]
+    )
+    process_report(plugin, report)
+    schedule_upload = plugin._schedule_upload
+
+    def fail_stdout_upload(
+        source_path: str, object_key: str, test_name: str, filename: str
+    ) -> None:
+        if filename == "stdout.log":
+            raise OSError("upload scheduling unavailable")
+        schedule_upload(source_path, object_key, test_name, filename)
+
+    monkeypatch.setattr(plugin, "_schedule_upload", fail_stdout_upload)
+    plugin.pytest_runtest_logfinish(report.nodeid, None)
+    plugin.pytest_sessionfinish(None, 0)
+
+    assert [upload[0] for upload in client.uploads] == [b"upload this error"]
+    stdout_path = next(s3_output._spool_root(str(tmp_path)).rglob("stdout.log"))
+    assert stdout_path.read_text(encoding="utf-8") == "recover this output"
+    config_path = Path(plugin._spool_config_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["pid"] = 99999999
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
+    assert [upload[0] for upload in client.uploads] == [
+        b"upload this error",
+        b"recover this output",
+    ]
+    assert_empty_spool_root(tmp_path)
+
+
 def test_small_stdout_remains_inline(tmp_path):
     plugin = make_plugin(tmp_path, inline_output_max_bytes=4)
     report = Report([("Captured stdout call", "ok\n")])
@@ -139,7 +359,7 @@ def test_small_stdout_remains_inline(tmp_path):
     plugin.pytest_runtest_logfinish(report.nodeid, None)
 
     assert report.sections == [("Captured stdout call", "ok\n")]
-    assert not s3_output._spool_root(str(tmp_path)).exists()
+    assert_empty_spool_root(tmp_path)
 
 
 def test_stdout_at_threshold_is_replaced_with_url(tmp_path):
@@ -213,7 +433,7 @@ def test_sync_upload_transforms_native_sections(tmp_path, monkeypatch):
     assert client.uploads[1][2].endswith("/stderr.log")
     assert report.sections[1] == ("custom", "keep me")
     assert all("uploaded to" in report.sections[index][1] for index in (0, 2))
-    assert not s3_output._spool_root(str(tmp_path)).exists()
+    assert_empty_spool_root(tmp_path)
 
 
 def test_duplicate_capture_sections_share_one_object(tmp_path):
@@ -341,7 +561,7 @@ def test_deferred_upload_starts_before_session_finish(tmp_path, monkeypatch):
     client.release.set()
     plugin.pytest_sessionfinish(None, 0)
     assert client.uploads[0][0] == b"background output"
-    assert not s3_output._spool_root(str(tmp_path)).exists()
+    assert_empty_spool_root(tmp_path)
 
 
 def test_deferred_upload_reuses_cumulative_section(tmp_path, monkeypatch):
@@ -456,7 +676,7 @@ def test_parent_drain_retries_upload_left_by_failed_process(tmp_path, monkeypatc
     assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
     assert client.uploads[0][0] == b"recover me"
     assert client.uploads[0][2].endswith("/stdout.log")
-    assert not s3_output._spool_root(str(tmp_path)).exists()
+    assert_empty_spool_root(tmp_path)
 
 
 def test_parent_drain_uses_configured_upload_workers(tmp_path, monkeypatch):
@@ -478,7 +698,7 @@ def test_parent_drain_uses_configured_upload_workers(tmp_path, monkeypatch):
 
     assert s3_output.drain_pending_uploads(str(tmp_path), secret_key="secret")
     assert sorted(upload[0] for upload in client.uploads) == [b"stderr", b"stdout"]
-    assert not s3_output._spool_root(str(tmp_path)).exists()
+    assert_empty_spool_root(tmp_path)
 
 
 def test_parent_drain_skips_live_pytest_process(tmp_path, monkeypatch):

@@ -15,6 +15,7 @@
 """Unit tests for the OpenEngine gRPC adapter."""
 
 import asyncio
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -101,3 +102,57 @@ def test_is_loopback_classifies_bind_hosts() -> None:
     assert not _is_loopback("10.0.0.7")
     # An unresolvable name is not assumed safe.
     assert not _is_loopback("some-host")
+
+
+class _StopLaunch(Exception):
+    """Ends launch_server once the server would start accepting requests."""
+
+
+@pytest.mark.parametrize(
+    ("value", "gc_enabled"),
+    [("1", False), ("0", True), (None, True)],
+)
+def test_launch_server_disables_gc_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, gc_enabled: bool
+) -> None:
+    """TRTLLM_SERVER_DISABLE_GC=1 turns cyclic GC off before serving, as trtllm-serve does."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    if value is None:
+        monkeypatch.delenv("TRTLLM_SERVER_DISABLE_GC", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", value)
+    seen = {}
+
+    class _Llm:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def shutdown(self) -> None:
+            pass
+
+    class _Server:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            seen["gc_enabled"] = gc.isenabled()
+            raise _StopLaunch
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(oe_server, "PyTorchLLM", _Llm)
+    monkeypatch.setattr(oe_server, "OpenEngineServer", _Server)
+    gc_was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        with pytest.raises(_StopLaunch):
+            oe_server.launch_server("127.0.0.1", 0, {"backend": "pytorch", "model": "test-model"})
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+    assert seen["gc_enabled"] is gc_enabled

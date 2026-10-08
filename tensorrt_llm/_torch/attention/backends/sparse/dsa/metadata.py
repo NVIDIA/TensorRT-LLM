@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, FrozenSet, List, Optional
 
 import torch
 
@@ -124,6 +124,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
     gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
+    # Rebound by on_update_kv_lens(); the decode graph recomputes it.
+    graph_temporary_attrs: ClassVar[FrozenSet[str]] = frozenset(
+        {"gen_indexer_kv_lens_cuda_runtime"}
+    )
     # Temporal-GVR prior state: allocated only when the two-level dispatch
     # selects the temporal engine (the self-sampling engine keeps no
     # cross-step state).
@@ -309,15 +313,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # CUDA graph capture, so the target and draft segments of the graph
         # bake distinct addresses (like draft_kv_cache_block_offsets) and no
         # graph-recorded copy from a transient host buffer is needed.
-        self.host_indexer_k_cache_block_offsets = self.host_draft_indexer_k_cache_block_offsets
-        self.indexer_k_cache_block_offsets = self.draft_indexer_k_cache_block_offsets
-        self.host_slot_mapping_fp8 = self.host_draft_slot_mapping_fp8
-        self.slot_mapping_fp8 = self.draft_slot_mapping_fp8
-        self.host_slot_mapping_scale = self.host_draft_slot_mapping_scale
-        self.slot_mapping_scale = self.draft_slot_mapping_scale
-        self.block_table = self.draft_block_table
-        self.block_table_expanded = self.draft_block_table_expanded
-        self.host_block_table_expanded = self.host_draft_block_table_expanded
+        self.swap_for_draft(
+            "host_indexer_k_cache_block_offsets", self.host_draft_indexer_k_cache_block_offsets
+        )
+        self.swap_for_draft(
+            "indexer_k_cache_block_offsets", self.draft_indexer_k_cache_block_offsets
+        )
+        self.swap_for_draft("host_slot_mapping_fp8", self.host_draft_slot_mapping_fp8)
+        self.swap_for_draft("slot_mapping_fp8", self.draft_slot_mapping_fp8)
+        self.swap_for_draft("host_slot_mapping_scale", self.host_draft_slot_mapping_scale)
+        self.swap_for_draft("slot_mapping_scale", self.draft_slot_mapping_scale)
+        self.swap_for_draft("block_table", self.draft_block_table)
+        self.swap_for_draft("block_table_expanded", self.draft_block_table_expanded)
+        self.swap_for_draft("host_block_table_expanded", self.host_draft_block_table_expanded)
+        # recompute_context_kv_gather_mappings() rebinds the aliases below.
+        self.record_draft_swap("slot_mapping_fp8_fullkv")
+        self.record_draft_swap("slot_mapping_scale_fullkv")
         self._invalidate_pool_view_cache()
 
         # Recording a capture executes no kernels, so the draft mappings only
@@ -339,22 +350,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if saved_state is None:
             return
 
-        self.host_indexer_k_cache_block_offsets = saved_state["host_indexer_k_cache_block_offsets"]
-        self.indexer_k_cache_block_offsets = saved_state["indexer_k_cache_block_offsets"]
-        self.host_slot_mapping_fp8 = saved_state["host_slot_mapping_fp8"]
-        self.host_slot_mapping_scale = saved_state["host_slot_mapping_scale"]
-        self.slot_mapping_fp8 = saved_state["slot_mapping_fp8"]
-        self.slot_mapping_scale = saved_state["slot_mapping_scale"]
-        self.block_table = saved_state["block_table"]
-        self.block_table_expanded = saved_state["block_table_expanded"]
-        self.host_block_table_expanded = saved_state["host_block_table_expanded"]
+        # restore_draft_swaps() has already rebound the swapped fields.
         self._invalidate_pool_view_cache()
-        if "slot_mapping_fp8_fullkv" in saved_state:
-            self.slot_mapping_fp8_fullkv = saved_state["slot_mapping_fp8_fullkv"]
-            self.slot_mapping_scale_fullkv = saved_state["slot_mapping_scale_fullkv"]
-        else:
-            # The draft recomputation rebound the aliases to the draft tensors;
-            # point them back at the restored target tensors.
+        if "slot_mapping_fp8_fullkv" not in saved_state:
+            # Without cached-KV context MLA the aliases track the target mappings.
             self.slot_mapping_fp8_fullkv = self.slot_mapping_fp8
             self.slot_mapping_scale_fullkv = self.slot_mapping_scale
 

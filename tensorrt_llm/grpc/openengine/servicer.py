@@ -17,7 +17,12 @@ from .bindings import error_pb2, generation_pb2, openengine_pb2_grpc
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
-from .request_mapping import _input_from_request, _trace_headers, sampling_params_from_request
+from .request_mapping import (
+    _input_from_request,
+    _trace_headers,
+    conversation_params_from_request,
+    sampling_params_from_request,
+)
 from .streaming import (
     RESPONSE_STALL_TIMEOUT_SECONDS,
     ActiveRequest,
@@ -121,6 +126,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
 
             inputs = _input_from_request(request)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
+            conversation_params = conversation_params_from_request(request)
             trace_headers = _trace_headers(context)
             cache_salt = (
                 request.kv.cache_salt
@@ -154,6 +160,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 sampling_params=sampling_params,
                 streaming=True,
                 trace_headers=trace_headers,
+                conversation_params=conversation_params,
                 cache_salt=cache_salt,
                 priority=DEFAULT_REQUEST_PRIORITY,
                 disaggregated_params=disaggregated_params,
@@ -211,7 +218,15 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             asyncio.get_running_loop(), RESPONSE_STALL_TIMEOUT_SECONDS, on_stall
         )
 
-        context.add_done_callback(lambda _: abort_request("RPC completed before generation"))
+        # Task callbacks are released on completion. ServicerContext callbacks
+        # retain the context in a reference cycle even after the RPC finishes.
+        rpc_task = asyncio.current_task()
+        assert rpc_task is not None
+
+        def on_rpc_done(_: asyncio.Task) -> None:
+            abort_request("RPC completed before generation")
+
+        rpc_task.add_done_callback(on_rpc_done)
 
         try:
             # Register inside the try so the finally below always releases the
@@ -272,10 +287,14 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             watchdog.pending()
             yield _engine_error_response(request_id, str(error), result_handle)
         finally:
+            rpc_task.remove_done_callback(on_rpc_done)
             watchdog.close()
             if not engine_terminal:
                 abort_request("response stream closed")
             registration.release()
+            # A task callback already scheduled on the event loop can still
+            # hold this cell. abort_request is a no-op after this cleanup.
+            result_handle = None
 
 
 __all__ = ["OpenEngineInferenceServicer"]

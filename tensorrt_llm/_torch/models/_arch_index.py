@@ -50,7 +50,7 @@ MODEL_ARCH_TO_MODULE = {
     "Eagle3DeepSeekV3ForCausalLM": "modeling_speculative",
     "Exaone4ForCausalLM": "modeling_exaone4",
     "Exaone4_5_ForConditionalGeneration": "modeling_exaone4_5",
-    "ExaoneMoEForCausalLM": "modeling_exaone_moe",
+    "ExaoneMoeForCausalLM": "modeling_exaone_moe",
     "Gemma3ForCausalLM": "modeling_gemma3",
     "Gemma3ForConditionalGeneration": "modeling_gemma3vl",
     "Gemma4AssistantForCausalLM": "modeling_gemma4",
@@ -114,7 +114,6 @@ MODEL_ARCH_TO_MODULE = {
     "Qwen3_5MoeForConditionalGeneration": "modeling_qwen3_5",
     "Qwen4ExpForCausalLM": "modeling_qwen4_exp",
     "Qwen4ExpForConditionalGeneration": "modeling_qwen4_exp",
-    "QwenImageBenchForConditionalGeneration": "modeling_qwen_image_bench",
     "SeedOssForCausalLM": "modeling_seedoss",
     "SiglipVisionModel": "modeling_siglip",
     "Starcoder2ForCausalLM": "modeling_starcoder2",
@@ -188,7 +187,6 @@ MODEL_CLASS_TO_MODULE = {
     "Qwen3_5VLModel": "modeling_qwen3_5",
     "Qwen4ExpForCausalLM": "modeling_qwen4_exp",
     "Qwen4ExpForConditionalGeneration": "modeling_qwen4_exp",
-    "QwenImageBenchModel": "modeling_qwen_image_bench",
     "SeedOssForCausalLM": "modeling_seedoss",
     "SiglipVisionModel": "modeling_siglip",
     "Starcoder2ForCausalLM": "modeling_starcoder2",
@@ -202,9 +200,7 @@ MODEL_CLASS_TO_MODULE = {
 # Multimodal ``model_type`` (HF ``config.model_type``, as passed to
 # ``register_input_processor`` / ``set_placeholder_metadata``) -> providing
 # module. Lets the multimodal placeholder registry resolve a model type
-# without eagerly importing the zoo. ``qwen3_5`` is also registered by
-# ``modeling_qwen_image_bench`` with byte-identical metadata; the real model's
-# module is indexed.
+# without eagerly importing the zoo.
 MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "glm5_next": "modeling_glm5_next_vision",
     "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",

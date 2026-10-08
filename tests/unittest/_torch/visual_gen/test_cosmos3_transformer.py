@@ -525,6 +525,32 @@ class TestCosmos3Action:
         # A video-only request keys exactly as before: absent scalars drop out.
         assert runner.get_graph_key(fps=None, action_fps=None) == runner.get_graph_key()
 
+    def test_graph_key_separates_step_precisions(self, action_model_config):
+        """The step precision swaps quantization methods at identical shapes, so
+        an FP8 step and a 16-bit step must not replay the same graph."""
+        from tensorrt_llm._torch.visual_gen.cuda_graph_runner import (
+            CUDAGraphRunner,
+            CUDAGraphRunnerConfig,
+        )
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.step_precision import (
+            StepPrecisionController,
+        )
+
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        model.register_cuda_graph_extra_key_fns(runner)
+        no_policy = runner.get_graph_key()
+
+        # Installed after the runner, as post_load_weights() does.
+        model.step_precision_controller = StepPrecisionController(first_steps=3, last_steps=3)
+        model.set_denoising_step(step_index=10, num_steps=50)
+        fp8 = runner.get_graph_key()
+        model.set_denoising_step(step_index=0, num_steps=50)
+        a16 = runner.get_graph_key()
+
+        assert fp8 != a16
+        assert no_policy not in (fp8, a16)
+
     @pytest.mark.high_cuda_memory
     def test_action_rope_table_built_once_per_request(self, action_model_config):
         """Chunk size, prompt lengths, fps and the frame offset are fixed for a

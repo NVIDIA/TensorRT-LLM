@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -11,7 +26,12 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
-from tensorrt_llm._torch.models.modeling_exaone_moe import ExaoneMoeForCausalLM
+from tensorrt_llm._torch.models.modeling_exaone_moe import (
+    ExaoneMoeForCausalLM,
+    get_exaone_attention_window,
+    get_exaone_swiglu_limit,
+)
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -28,7 +48,7 @@ WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
 
 EXAONE_MOE_CONFIG = {
-    "architectures": ["ExaoneMoEForCausalLM"],
+    "architectures": ["ExaoneMoeForCausalLM"],
     "attention_dropout": 0.0,
     "bos_token_id": 1,
     "dtype": "bfloat16",
@@ -90,6 +110,42 @@ class Scenario:
 
 
 class TestExaoneMoe(unittest.TestCase):
+    def test_config_defaults(self) -> None:
+        config_dict = deepcopy(EXAONE_MOE_CONFIG)
+        config = ExaoneMoeConfig.from_dict(config_dict)
+
+        self.assertIs(MODEL_CLASS_MAPPING["ExaoneMoeForCausalLM"], ExaoneMoeForCausalLM)
+        self.assertEqual(get_exaone_attention_window(config, 0, False), WINDOW_SIZE)
+        self.assertEqual(get_exaone_attention_window(config, 1, False), WINDOW_SIZE)
+        self.assertIsNone(get_exaone_attention_window(config, 3, False))
+        self.assertIsNone(get_exaone_attention_window(config, 4, True))
+        self.assertIsNone(get_exaone_swiglu_limit(config, 62))
+
+    def test_per_layer_config_lists(self) -> None:
+        config_dict = deepcopy(EXAONE_MOE_CONFIG)
+        # 0 is the config's spelling of "not enabled for this layer".
+        config_dict["sliding_windows"] = [4096, 8192, WINDOW_SIZE, 0]
+        config_dict["swiglu_limits"] = [0.0, 0.0, 7.0, 5.0]
+        config_dict["mtp_layer_types"] = ["sliding_attention"]
+        config_dict["mtp_sliding_windows"] = [WINDOW_SIZE]
+        config = ExaoneMoeConfig.from_dict(config_dict)
+
+        # Per-layer values take precedence over `sliding_window`.
+        self.assertEqual(get_exaone_attention_window(config, 0, False), 4096)
+        self.assertEqual(get_exaone_attention_window(config, 1, False), 8192)
+        self.assertEqual(get_exaone_attention_window(config, 2, False), WINDOW_SIZE)
+        # Layer 3 is full attention, so its window stays unset.
+        self.assertIsNone(get_exaone_attention_window(config, 3, False))
+        self.assertEqual(get_exaone_attention_window(config, NUM_HIDDEN_LAYERS, True), WINDOW_SIZE)
+
+        self.assertIsNone(get_exaone_swiglu_limit(config, 0))
+        self.assertIsNone(get_exaone_swiglu_limit(config, 1))
+        self.assertEqual(get_exaone_swiglu_limit(config, 2), 7.0)
+        self.assertEqual(get_exaone_swiglu_limit(config, 3), 5.0)
+
+        config.mtp_layer_types = ["full_attention"]
+        self.assertIsNone(get_exaone_attention_window(config, NUM_HIDDEN_LAYERS, True))
+
     @parameterized.expand([None, "FP8"])
     def test_exaone_moe_sanity(self, quant_algo):
         """Test basic EXAONE-MoE model forward pass with optional quantization."""

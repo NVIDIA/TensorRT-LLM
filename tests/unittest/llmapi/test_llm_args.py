@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import \
     HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.models.modeling_qwen3 import Qwen3ForCausalLM
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
@@ -85,6 +86,20 @@ def test_generation_config_mode_defaults_and_validation() -> None:
 
     with pytest.raises(ValidationError, match="generation_config"):
         TorchLlmArgs(model=llama_model_path, generation_config="invalid")
+
+
+@pytest.mark.cpu_only
+def test_iter_perf_stats_interval_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).iter_perf_stats_interval == 1
+    args = TorchLlmArgs(model=llama_model_path,
+                        enable_iter_perf_stats=True,
+                        iter_perf_stats_interval=16)
+    assert args.iter_perf_stats_interval == 16
+
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError, match="iter_perf_stats_interval"):
+            TorchLlmArgs(model=llama_model_path,
+                         iter_perf_stats_interval=invalid)
 
 
 @pytest.mark.cpu_only
@@ -3514,16 +3529,16 @@ class TestServeDefaults:
 
 class TestPyTorchBackendModelDefaults:
 
-    def get_tinyllama_path(self):
+    def get_qwen_path(self):
         # Use local model path if available, otherwise use HuggingFace ID
         model_root = llm_models_root()
         if model_root:
-            local_path = model_root / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+            local_path = model_root / "Qwen3/Qwen3-0.6B"
             if local_path.exists():
                 return str(local_path)
 
         # Fallback to HuggingFace model ID
-        return "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        return "Qwen/Qwen3-0.6B"
 
     @pytest.fixture(autouse=True)
     def setup(self, monkeypatch, tmp_path):
@@ -3542,17 +3557,17 @@ class TestPyTorchBackendModelDefaults:
                 }
             }
 
-        self.original_get_model_defaults = getattr(LlamaForCausalLM,
+        self.original_get_model_defaults = getattr(Qwen3ForCausalLM,
                                                    'get_model_defaults', None)
-        setattr(LlamaForCausalLM, 'get_model_defaults',
+        setattr(Qwen3ForCausalLM, 'get_model_defaults',
                 classmethod(mock_get_model_defaults))
 
         yield
 
         if self.original_get_model_defaults is None:
-            delattr(LlamaForCausalLM, 'get_model_defaults')
+            delattr(Qwen3ForCausalLM, 'get_model_defaults')
         else:
-            setattr(LlamaForCausalLM, 'get_model_defaults',
+            setattr(Qwen3ForCausalLM, 'get_model_defaults',
                     self.original_get_model_defaults)
 
     @pytest.mark.part0
@@ -3560,7 +3575,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 skip_tokenizer_init=True,
                 env_overrides={"TLLM_WORKER_USE_SINGLE_PROCESS": "1"},
@@ -3577,7 +3592,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 enable_chunked_prefill=False,
                 max_batch_size=42,
@@ -3599,7 +3614,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 max_batch_size=42,
                 skip_tokenizer_init=True,
@@ -3624,7 +3639,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
 
         with TorchLLM(
-                model=self.get_tinyllama_path(),
+                model=self.get_qwen_path(),
                 backend='pytorch',
                 kv_cache_config=KvCacheConfig(),
                 skip_tokenizer_init=True,
