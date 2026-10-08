@@ -106,3 +106,6 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_bf16_tep4_cutlass
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8_Flash_Next::test_fp8_adp4_mtp3_prefix_cache
   - accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse]
+  # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
+  # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (240)
