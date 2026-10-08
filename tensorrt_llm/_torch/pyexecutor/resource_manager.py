@@ -1206,27 +1206,7 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-                # Target manager only: the rewind restores target-forward
-                # coverage for drafter hidden-state capture, and the V2
-                # counterpart (_spec_recompute_target) no-ops on draft pools
-                # for the same reason.
-                if self._spec_recompute_tail and not self.is_draft:
-                    if self.enable_chunked_prefill:
-                        self._maybe_rewind_reused_context(batch_llm_requests)
-                    else:
-                        # The scheduler admits cache-hit requests at their
-                        # reuse-discounted token cost, so a rewound batch can
-                        # exceed max_num_tokens; only chunked prefill
-                        # (fit_token_budget) can shrink it back under the
-                        # budget. Checked here rather than in __init__ because
-                        # enable_chunked_prefill is finalized after
-                        # construction by _create_kv_cache_manager.
-                        logger.warning(
-                            "context_recompute_tail requires chunked prefill: "
-                            "without it a batch of rewound cache-hit requests "
-                            "can exceed max_num_tokens. Disabling the spec "
-                            "recompute tail.")
-                        self._spec_recompute_tail = 0
+                self._maybe_apply_spec_recompute_tail(batch_llm_requests)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -1252,6 +1232,47 @@ class KVCacheManager(BaseResourceManager):
         # `context_requests_last_chunk` in `add_sequence` due to KV cache
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
+
+    def _maybe_apply_spec_recompute_tail(
+            self, batch_llm_requests: List[LlmRequest]) -> None:
+        """Gate and apply the spec-recompute rewind for this batch.
+
+        Target manager only: the rewind restores target-forward coverage for
+        drafter hidden-state capture, and the V2 counterpart
+        (_spec_recompute_claim_limit) no-ops on draft pools for the same
+        reason. The gates run here rather than in __init__ because
+        enable_chunked_prefill and the final attention windows are settled
+        after construction.
+        """
+        if not self._spec_recompute_tail or self.is_draft:
+            return
+        # Entries <= 0 are not attention windows (recurrent-state sentinels).
+        if any(window is not None and 0 < window < self.max_seq_len
+               for window in self.max_attention_window_vec):
+            # The rewind reattaches no blocks, and a sliding-window layer
+            # detaches out-of-window blocks (placeholder page-list slots), so
+            # a rewound cursor would read and write spans with no pages behind
+            # them. Unlike the V2 manager, which caps the reuse claim instead
+            # of rewinding, this manager cannot shorten the C++ match.
+            logger.warning(
+                "context_recompute_tail is unsupported with sliding-window "
+                "attention layers on this KV cache manager: a rewound cursor "
+                "would cross spans whose out-of-window blocks are detached. "
+                "Disabling the spec recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        if not self.enable_chunked_prefill:
+            # The scheduler admits cache-hit requests at their reuse-discounted
+            # token cost, so a rewound batch can exceed max_num_tokens; only
+            # chunked prefill (fit_token_budget) can shrink it back under the
+            # budget.
+            logger.warning("context_recompute_tail requires chunked prefill: "
+                           "without it a batch of rewound cache-hit requests "
+                           "can exceed max_num_tokens. Disabling the spec "
+                           "recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        self._maybe_rewind_reused_context(batch_llm_requests)
 
     def _maybe_rewind_reused_context(
             self, batch_llm_requests: List[LlmRequest]) -> None:

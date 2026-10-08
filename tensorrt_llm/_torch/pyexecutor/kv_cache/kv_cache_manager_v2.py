@@ -1139,57 +1139,32 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
-def _spec_recompute_target(
+def _spec_recompute_claim_limit(
     req: LlmRequest,
-    committed: int,
     *,
     tail: int,
     tokens_per_block: int,
     is_draft: bool,
-) -> int:
-    """Cap the reuse start position so a prompt tail is recomputed.
+) -> int | None:
+    """Reuse-claim cap leaving at least ``tail`` prompt tokens to recompute.
 
-    Hidden-state-conditioned drafters (DFlash/DSpark) capture target
-    hidden states only for tokens that physically pass through a target
-    forward. A prefix-cache hit skips the reused tokens, so the drafter's
-    cross-attention context never sees them and acceptance length drops
-    (measured -15% AL at a 100% prefix-hit rate). Rewinding the context
-    position keeps the blocks reused (the allocation/dedup win stays, and
-    the recompute rewrites them with identical values; try_commit_blocks
-    skips re-commit below the committed watermark) while restoring the
-    drafter's inputs.
+    Hidden-state drafters (DFlash/DSpark) capture target hidden states only
+    for tokens that pass through a target forward, so a prefix-cache hit
+    starves the drafter and acceptance length drops (measured -15% AL at a
+    100% hit rate). Capping the reuse claim (not rewinding after it) keeps the
+    recompute sound for sliding-window layers: the core prunes a match to an
+    endpoint whose required pages exist, whereas a post-claim rewind walks the
+    cursor into spans whose pages an SWA life cycle never onboarded.
 
-    ``tail`` is the manager's ``_spec_recompute_tail``, resolved at
-    construction from the spec config's ``context_recompute_tail`` (0 — off —
-    by default; an explicit None resolves from the draft model config): each
-    cache-hit request starts its
-    context at a block-aligned position leaving at least that many prompt
-    tokens to recompute. For a drafter whose context attention
-    is windowed (e.g. DFlash2 ``swa_window_size``), a tail of the window
-    size reproduces the no-reuse drafter inputs exactly; ``-1`` forces a
-    full re-prefill for non-windowed drafters. The scheduler reads
-    ``context_remaining_length`` after ``prepare_context``, so budget and
-    chunk sizing account for the recomputed tail natively.
-
-    A module-level function taking the manager scalars explicitly, like the
-    cursor helpers above: no-op cases (nothing committed, draft pool, dummy
-    request) are decided from the request alone, before ``tail`` is read.
+    ``tail`` is the manager's ``_spec_recompute_tail`` (see __init__). Returns
+    None for no cap, 0 for a full re-prefill (``tail`` < 0), else the
+    block-aligned claim limit.
     """
-    if committed <= 0 or is_draft or req.is_dummy or not tail:
-        return committed
-    prompt_len = req.prompt_len
+    if not tail or is_draft or req.is_dummy:
+        return None
     if tail < 0:
-        target = 0
-    else:
-        if prompt_len - committed >= tail:
-            return committed  # already recomputing at least the tail
-        target = max(
-            0,
-            (prompt_len - tail) // tokens_per_block * tokens_per_block,
-        )
-    if target >= committed:
-        return committed
-    return target
+        return 0
+    return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
 class KVCacheManagerV2(BaseResourceManager):
@@ -1198,14 +1173,10 @@ class KVCacheManagerV2(BaseResourceManager):
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
     # Declared on the class for the same reason: prepare_context and the
     # connector-reservation cap read it on instances tests build without
-    # running __init__ (which overwrites it from the spec config). Zero
-    # disables the spec recompute tail.
+    # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
-    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
-    # Mamba/GDN managers override this: a reused request's recurrent slot
-    # already summarizes the matched prefix, so a partial rewind would apply
-    # the tokens between the rewind target and the matched length to that
-    # state a second time. Only a full re-prefill (rewind target 0) is safe.
+    # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
+    # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
@@ -1279,39 +1250,32 @@ class KVCacheManagerV2(BaseResourceManager):
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
-        # Recompute tail for hidden-state-conditioned drafters with block
-        # reuse: rewind cache-hit context requests so at least this many
-        # prompt tokens pass through the target forward. Resolved from the
-        # draft model config (or set explicitly) on the spec config; see
-        # _spec_recompute_target for why drafters need it. None means the
-        # auto value never resolved; recompute everything rather than
-        # silently serving a degraded drafter.
+        # Recompute tail for hidden-state drafters with block reuse: cap the
+        # reuse claim of cache-hit context requests so at least this many
+        # prompt tokens pass through the target forward (see
+        # _spec_recompute_claim_limit). None on the spec config means the auto
+        # value never resolved; recompute everything rather than silently
+        # serving a degraded drafter.
         tail = getattr(spec_config, "context_recompute_tail", 0)
         tail = -1 if tail is None else int(tail)
         if tail and self.block_reuse_policy is not BlockReusePolicy.ALL_REUSABLE:
-            # Deferred-commit policies advance the cache's history marker to
-            # the context cursor after every chunk (update_context_resources
-            # -> _resize_context_history). A rewound first chunk can end below
-            # the matched history, and KvCache.resize refuses to decrease
-            # history length, so the rewind and these policies are mutually
-            # exclusive.
+            # The cap acts on fresh radix claims. per_conversation reuse
+            # resumes the prior turn's cache (no claim to cap), and the
+            # deferred-commit protocols are unvalidated with the tail.
             logger.warning(
                 "context_recompute_tail requires block_reuse_config.policy="
                 f"'{BlockReusePolicy.ALL_REUSABLE}' (got "
-                f"'{self.block_reuse_policy}'): deferred-commit policies "
-                "resize cache history to the context cursor each chunk and a "
-                "rewound cursor cannot decrease it. Disabling the spec "
-                "recompute tail."
+                f"'{self.block_reuse_policy}'). Disabling the spec recompute "
+                "tail."
             )
             tail = 0
         if tail > 0 and self._has_recurrent_state:
-            # A partial rewind double-applies the rewound span to the
-            # recurrent state (see _has_recurrent_state); only a full
-            # re-prefill rebuilds that state from scratch.
+            # Conservative: a capped claim is equivalent to a shorter match,
+            # but the hybrid snapshot/commit protocol is unvalidated with a
+            # partial tail, so take the full re-prefill.
             logger.warning(
                 "context_recompute_tail > 0 is unsupported on recurrent-state "
-                "cache managers: a partial rewind would apply reused tokens "
-                "to the conv/SSM state twice. Forcing a full re-prefill "
+                "cache managers. Forcing a full re-prefill "
                 "(context_recompute_tail=-1)."
             )
             tail = -1
@@ -3729,21 +3693,28 @@ class KVCacheManagerV2(BaseResourceManager):
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        reused = self.prepare_context_cache(req)
+        # Hidden-state drafters need a recomputed prompt tail: cap the reuse
+        # CLAIM rather than rewinding the cursor afterwards. A capped claim is
+        # just a shorter match, so the core materializes every page the
+        # recompute needs (for SWA life cycles only sink and live-window pages
+        # at the matched endpoint are onboarded; a cursor rewound below that
+        # endpoint would read and write spans with no pages behind them). The
+        # tail check runs first: partially constructed managers carry only the
+        # class-level zero tail.
+        limit = None
+        if self._spec_recompute_tail:
+            limit = _spec_recompute_claim_limit(
+                req,
+                tail=self._spec_recompute_tail,
+                tokens_per_block=self.tokens_per_block,
+                is_draft=self.is_draft,
+            )
+        reused = self.prepare_context_cache(req, limit)
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix
         # until context end, so reapplying later would rewind the cursor.
         if req.is_first_context_chunk and self.enable_block_reuse:
-            # Hidden-state drafters need a recomputed prompt tail; cap the
-            # reuse start (blocks stay reused, the cursor rewinds further).
-            reused = _spec_recompute_target(
-                req,
-                reused,
-                tail=self._spec_recompute_tail,
-                tokens_per_block=self.tokens_per_block,
-                is_draft=self.is_draft,
-            )
             _settle_context_cursor(req, reused, self.tokens_per_block)
         self._prepare_connector_prefix_reservation(req)
         return True
@@ -3830,13 +3801,11 @@ class KVCacheManagerV2(BaseResourceManager):
         reused = self.prepare_context_cache(req)
         if reused is None:
             return False
-        # Deliberately NO _spec_recompute_target here: the context-recompute
-        # tail applies at local prefill only. A disagg generation-init request
+        # Deliberately no claim cap here: a disagg generation-init request
         # receives its prompt KV from the context worker and never runs a
-        # target prefill forward on this engine, so there are no drafter
-        # hidden states to recover by rewinding. Speculative decoding on a
-        # disaggregated engine is guard-refused anyway (disagg_dflash_error),
-        # making this site unreachable for hidden-state drafters.
+        # prefill forward on this engine, so there is no drafter hidden state
+        # to recover. Spec decode on a disagg engine is guard-refused anyway
+        # (disagg_dflash_error).
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 
@@ -4163,19 +4132,17 @@ class KVCacheManagerV2(BaseResourceManager):
         end = min(reservation.end, req.prompt_len - 1)
         end = end // self.tokens_per_block * self.tokens_per_block
         # A connector-served prefix starves a hidden-state drafter exactly like
-        # local reuse does -- served tokens never pass a target forward -- and
-        # the cursor cannot rewind below py_connector_served_position once the
-        # load is accepted (_settle_context_cursor floors on it). Cap the
-        # reservation at the same recomputed-tail boundary as local reuse, so
-        # the tail stays local by construction; a full-re-prefill tail (-1)
-        # caps to zero and releases the reservation below.
-        end = _spec_recompute_target(
+        # local reuse does. Cap the reservation at the same claim limit, so
+        # the recomputed tail stays local by construction; a full-re-prefill
+        # tail (-1) caps to zero and releases the reservation below.
+        limit = _spec_recompute_claim_limit(
             req,
-            end,
             tail=self._spec_recompute_tail,
             tokens_per_block=self.tokens_per_block,
             is_draft=self.is_draft,
         )
+        if limit is not None:
+            end = min(end, limit)
         if end <= local_end:
             self.kv_connector_manager.release_prefix_reservation(req)
             return

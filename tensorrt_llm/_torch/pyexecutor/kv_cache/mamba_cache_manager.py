@@ -1636,10 +1636,9 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     Does not support block reuse / prefix caching for mamba states.
     """
 
-    # The recurrent (conv/SSM) state of a reused request summarizes the whole
-    # matched prefix, so a partial spec-recompute rewind would apply the
-    # rewound span to it twice; only a full re-prefill is safe. See
-    # _has_recurrent_state on the attention-only base classes.
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
     def __init__(
@@ -2222,10 +2221,9 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
     """
 
-    # The recurrent (conv/SSM) state of a reused request summarizes the whole
-    # matched prefix, so a partial spec-recompute rewind would apply the
-    # rewound span to it twice; only a full re-prefill is safe. See
-    # _has_recurrent_state on the attention-only base classes.
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
     def __init__(
@@ -2990,10 +2988,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
 
-    # The recurrent (conv/SSM) state of a reused request summarizes the whole
-    # matched prefix, so a partial spec-recompute rewind would apply the
-    # rewound span to it twice; only a full re-prefill is safe. See
-    # _has_recurrent_state on the attention-only base classes.
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other

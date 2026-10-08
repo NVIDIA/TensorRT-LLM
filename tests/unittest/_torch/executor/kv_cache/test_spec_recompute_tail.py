@@ -16,17 +16,19 @@
 
 Hidden-state-conditioned drafters capture target hidden states only for tokens
 that physically run through a target forward, so a prefix-cache hit starves the
-drafter of context. ``_spec_recompute_target`` (V2 manager) and
-``KVCacheManager._maybe_rewind_reused_context`` (V1 manager) rewind the context
-start of a cache-hit request to a block-aligned position that leaves at least
-``context_recompute_tail`` prompt tokens to recompute.
+drafter of context. ``_spec_recompute_claim_limit`` (V2 manager) caps the reuse
+CLAIM of a cache-hit request at a block-aligned position that leaves at least
+``context_recompute_tail`` prompt tokens to recompute; capping the claim (rather
+than rewinding the cursor after it) keeps every page the recompute needs
+materialized, which a rewind cannot guarantee for sliding-window layers.
+``KVCacheManager._maybe_rewind_reused_context`` (V1 manager) rewinds the context
+start instead, and is therefore gated to managers without windowed layers.
 
-``_spec_recompute_target`` is deliberately a module-level function taking the
-manager scalars explicitly: the V2 scheduler tests bind the real
-``prepare_context`` onto a bare ``Mock`` manager, where a method-dispatched
-helper would resolve to an auto-created Mock attribute and feed a Mock into the
-cursor arithmetic. The request-only no-op guards run before ``tail`` is read,
-so that binding stays safe.
+``_spec_recompute_claim_limit`` is deliberately a module-level function taking
+the manager scalars explicitly: the V2 scheduler tests bind the real
+``prepare_context`` onto a bare ``Mock`` manager (setting ``_spec_recompute_tail``
+to 0), where a method-dispatched helper would resolve to an auto-created Mock
+attribute and feed a Mock into the cursor arithmetic.
 """
 
 from types import SimpleNamespace
@@ -36,7 +38,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
-    _spec_recompute_target,
+    _spec_recompute_claim_limit,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
@@ -47,46 +49,42 @@ def _req(prompt_len, is_dummy=False):
     return SimpleNamespace(prompt_len=prompt_len, is_dummy=is_dummy)
 
 
-class TestSpecRecomputeTarget:
-    def test_nothing_committed_is_a_no_op(self):
-        req = _req(prompt_len=16)
-        assert _spec_recompute_target(req, 0, tail=4, tokens_per_block=4, is_draft=False) == 0
+def _limit(req, *, tail, tokens_per_block=4, is_draft=False):
+    return _spec_recompute_claim_limit(
+        req, tail=tail, tokens_per_block=tokens_per_block, is_draft=is_draft
+    )
 
-    def test_the_draft_pool_never_rewinds(self):
-        req = _req(prompt_len=16)
-        assert _spec_recompute_target(req, 8, tail=4, tokens_per_block=4, is_draft=True) == 8
 
-    def test_a_dummy_request_never_rewinds(self):
-        req = _req(prompt_len=16, is_dummy=True)
-        assert _spec_recompute_target(req, 8, tail=4, tokens_per_block=4, is_draft=False) == 8
+class TestSpecRecomputeClaimLimit:
+    def test_a_zero_tail_means_no_cap(self):
+        assert _limit(_req(prompt_len=16), tail=0) is None
 
-    def test_a_zero_tail_disables_the_recompute(self):
-        req = _req(prompt_len=16)
-        assert _spec_recompute_target(req, 8, tail=0, tokens_per_block=4, is_draft=False) == 8
+    def test_the_draft_pool_is_never_capped(self):
+        assert _limit(_req(prompt_len=16), tail=4, is_draft=True) is None
+
+    def test_a_dummy_request_is_never_capped(self):
+        assert _limit(_req(prompt_len=16, is_dummy=True), tail=4) is None
 
     def test_a_negative_tail_forces_a_full_re_prefill(self):
-        req = _req(prompt_len=10)
-        assert _spec_recompute_target(req, 8, tail=-1, tokens_per_block=4, is_draft=False) == 0
+        assert _limit(_req(prompt_len=10), tail=-1) == 0
 
-    def test_the_rewind_target_is_block_aligned_and_covers_the_tail(self):
-        req = _req(prompt_len=13)
-        # 13 - 12 = 1 < 6: rewind to floor_block(13 - 6) = 4, leaving 9 >= 6
-        # prompt tokens to recompute from a block boundary.
-        assert _spec_recompute_target(req, 12, tail=6, tokens_per_block=4, is_draft=False) == 4
+    def test_the_cap_is_block_aligned_and_leaves_the_tail(self):
+        # floor_block(13 - 6) = 4: a claim of at most 4 leaves 9 >= 6 prompt
+        # tokens to recompute from a block boundary.
+        assert _limit(_req(prompt_len=13), tail=6) == 4
 
-    def test_an_uncommitted_span_covering_the_tail_is_left_alone(self):
-        req = _req(prompt_len=12)
-        # 12 - 4 = 8 >= 4: the natural recompute already covers the tail.
-        assert _spec_recompute_target(req, 4, tail=4, tokens_per_block=4, is_draft=False) == 4
+    def test_a_tail_covering_the_whole_prompt_caps_the_claim_to_zero(self):
+        assert _limit(_req(prompt_len=3), tail=4) == 0
 
-    def test_request_only_guards_run_before_the_manager_scalars_are_read(self):
+    def test_the_tail_guard_runs_before_the_other_manager_scalars_are_read(self):
         # The V2 scheduler tests bind the real prepare_context onto a Mock
-        # manager, so tail/is_draft arrive as auto-created Mock attributes.
-        # A zero-reuse request must pass through before either is inspected.
-        req = _req(prompt_len=16)
+        # manager with _spec_recompute_tail = 0; the remaining scalars arrive
+        # as auto-created Mock attributes and must not be touched.
         assert (
-            _spec_recompute_target(req, 0, tail=Mock(), tokens_per_block=Mock(), is_draft=Mock())
-            == 0
+            _spec_recompute_claim_limit(
+                _req(prompt_len=16), tail=0, tokens_per_block=Mock(), is_draft=Mock()
+            )
+            is None
         )
 
 
@@ -143,6 +141,55 @@ class TestV1RewindReusedContext:
         assert req.context_chunk_size == 12
 
 
+def _v1_tail_gate(mgr, requests):
+    """Run the prepare_resources gate slice that guards the V1 rewind."""
+    KVCacheManager._maybe_apply_spec_recompute_tail(mgr, requests)
+
+
+class TestV1WindowedLayerGate:
+    """The V1 rewind reattaches no pages, so it is only sound when every
+    matched block of every layer is attached: a sliding-window layer detaches
+    out-of-window blocks, and a rewound cursor would read and write through
+    their placeholder slots."""
+
+    def _mgr(self, *, windows, tail=4, chunked=True):
+        return SimpleNamespace(
+            _spec_recompute_tail=tail,
+            tokens_per_block=4,
+            is_draft=False,
+            enable_chunked_prefill=chunked,
+            max_attention_window_vec=windows,
+            max_seq_len=16,
+            _maybe_rewind_reused_context=Mock(),
+        )
+
+    def test_full_attention_layers_keep_the_tail(self):
+        mgr = self._mgr(windows=[16, 16])
+        req = _V1Req(prompt_len=16, prepopulated=16)
+        _v1_tail_gate(mgr, [req])
+        assert mgr._spec_recompute_tail == 4
+        mgr._maybe_rewind_reused_context.assert_called_once_with([req])
+
+    def test_a_windowed_layer_disables_the_tail(self):
+        mgr = self._mgr(windows=[16, 8])
+        req = _V1Req(prompt_len=16, prepopulated=16)
+        _v1_tail_gate(mgr, [req])
+        assert mgr._spec_recompute_tail == 0
+        mgr._maybe_rewind_reused_context.assert_not_called()
+
+    def test_missing_chunked_prefill_disables_the_tail(self):
+        mgr = self._mgr(windows=[16], chunked=False)
+        _v1_tail_gate(mgr, [_V1Req(prompt_len=16, prepopulated=16)])
+        assert mgr._spec_recompute_tail == 0
+        mgr._maybe_rewind_reused_context.assert_not_called()
+
+    def test_the_draft_pool_never_rewinds(self):
+        mgr = self._mgr(windows=[16])
+        mgr.is_draft = True
+        _v1_tail_gate(mgr, [_V1Req(prompt_len=16, prepopulated=16)])
+        mgr._maybe_rewind_reused_context.assert_not_called()
+
+
 class _ConnectorReq:
     """The slice of LlmRequest that _prepare_connector_prefix_reservation touches."""
 
@@ -189,8 +236,8 @@ class TestConnectorReservationRecomputeCap:
     """A connector-served prefix starves the drafter exactly like local reuse:
     served tokens never pass a target forward, and once the load is accepted
     the cursor cannot rewind below ``py_connector_served_position``. The
-    reservation end is therefore capped at the same recomputed-tail boundary
-    as local reuse, so the tail stays local by construction."""
+    reservation end is therefore capped at the same claim limit as local
+    reuse, so the tail stays local by construction."""
 
     def test_a_reservation_is_capped_so_the_tail_stays_local(self):
         req = _ConnectorReq(prompt_len=33)

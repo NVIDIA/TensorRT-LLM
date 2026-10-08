@@ -1927,6 +1927,7 @@ def _make_spec_recompute_manager(
     policy: str,
     context_recompute_tail: int,
     manager_cls: type[KVCacheManagerV2] = KVCacheManagerV2,
+    max_attention_window: list[int] | None = None,
 ) -> KVCacheManagerV2:
     """A real target manager with a DFlash spec config carrying the tail."""
     spec = DFlashDecodingConfig(
@@ -1939,7 +1940,7 @@ def _make_spec_recompute_manager(
             enable_block_reuse=True,
             enable_partial_reuse=True,
             max_gpu_total_bytes=16 << 20,
-            max_attention_window=[MAX_SEQ_LEN],
+            max_attention_window=max_attention_window or [MAX_SEQ_LEN],
             max_util_for_resume=1.0,
             block_reuse_config=BlockReuseConfig(policy=policy),
         ),
@@ -1977,13 +1978,12 @@ def _drive_context_chunks(
 
 @pytest.mark.parametrize("policy", ["per_request", "per_conversation"])
 def test_deferred_commit_policies_disable_the_spec_recompute_tail(policy: str) -> None:
-    """Deferred-commit policies resize cache history to the context cursor
-    after every chunk (update_context_resources -> _resize_context_history),
-    and KvCache.resize refuses to decrease history length. A rewound cache-hit
-    request whose first chunk ends below the matched length would therefore
-    raise mid-flight. The manager disables the recompute tail for these
-    policies at construction; a chunked cache-hit request must then run start
-    to finish with its cursor held at the matched prefix.
+    """The recompute tail is enforced by capping the fresh radix claim, and
+    per_conversation reuse resumes the prior turn's cache without a claim to
+    cap; the deferred-commit protocols are unvalidated with the tail. The
+    manager disables the recompute tail for these policies at construction; a
+    chunked cache-hit request must then run start to finish with its cursor
+    held at the matched prefix.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2015,10 +2015,10 @@ def test_deferred_commit_policies_disable_the_spec_recompute_tail(policy: str) -
 
 
 def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
-    """Under ALL_REUSABLE the recompute tail stays enabled: a cache-hit request
-    is rewound (here to a full re-prefill) while its blocks stay reused, and
-    chunked prefill completes because this policy never resizes history to the
-    cursor (try_commit_blocks skips re-commits below the committed watermark).
+    """Under ALL_REUSABLE the recompute tail stays enabled: a cache-hit
+    request's reuse claim is capped (here to a full re-prefill, which claims
+    nothing), the cursor starts at the claim, and chunked prefill completes
+    and commits the recomputed blocks.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2034,11 +2034,53 @@ def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
 
         batch = _prepare_context_resources(manager, request_b)
         assert manager.prepare_context(request_b)
-        # Blocks are reused (the match was claimed)...
-        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens > 0
-        # ...but the cursor is rewound to a full re-prefill.
+        # A full re-prefill claims no reuse, so every prompt token passes the
+        # target forward and every page it touches is freshly allocated.
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == 0
         assert request_b.context_current_position == 0
         assert request_b.prepopulated_prompt_len == 0
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+def test_windowed_layers_keep_the_recompute_tail_claim_capped() -> None:
+    """Sliding-window regression for the claim cap: a match is claimed only up
+    to the recompute boundary, so the pages the recomputed span needs (the
+    window at the CLAIMED endpoint) are materialized by the core. The old
+    rewind approach claimed the full match and walked the cursor back, where a
+    windowed life cycle has no pages behind the out-of-window span.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    window = 2 * TOKENS_PER_BLOCK  # 8 < MAX_SEQ_LEN: a real sliding window
+    manager = _make_spec_recompute_manager(
+        "all_reusable",
+        context_recompute_tail=6,
+        max_attention_window=[window],
+    )
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == 6
+
+        _run_context(manager, request_a)
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        committed = manager.kv_cache_map[request_b.py_request_id].num_committed_tokens
+        # floor_block(16 - 6) = 8: the claim stops at the recompute boundary
+        # (and the window at that endpoint is fully materialized), instead of
+        # claiming the full match and rewinding below its live window.
+        assert committed == 8
+        assert request_b.context_current_position == committed
+        assert request_b.prepopulated_prompt_len == committed
 
         _drive_context_chunks(manager, batch, request_b)
         assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
@@ -2052,11 +2094,10 @@ def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
 def test_recurrent_state_managers_allow_only_a_full_reprefill_tail(
     has_recurrent_state: bool, expected_tail: int
 ) -> None:
-    """A positive tail rewinds to 0 < T < matched length, and on a hybrid
-    Mamba/GDN target the recurrent slot already summarizes the whole matched
-    prefix, so the mixers would apply [T, matched) twice. Managers with
-    recurrent state coerce a positive tail to a full re-prefill (T == 0);
-    attention-only managers keep it.
+    """Managers with recurrent state coerce a positive tail to a full
+    re-prefill; attention-only managers keep it. Conservative: a capped claim
+    is equivalent to a shorter match, but the hybrid snapshot/commit protocol
+    is unvalidated with a partial tail.
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")

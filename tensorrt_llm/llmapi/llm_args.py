@@ -3010,10 +3010,11 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "from the draft model config: dflash_config.swa_window_size when the "
         "drafter's context attention is windowed (a tail of the window size "
         "reproduces the no-reuse drafter inputs exactly), else -1. -1 forces "
-        "a full re-prefill on a hit. Blocks stay reused either way, so the "
-        "allocation/dedup win is kept. Requires chunked prefill and the "
-        "all_reusable block-reuse policy; the KV cache managers disable it "
-        "with a warning otherwise.")
+        "a full re-prefill on a hit. Prefix reuse ahead of the recomputed "
+        "tail is kept. Requires chunked prefill and the all_reusable "
+        "block-reuse policy, and sliding-window attention layers are "
+        "unsupported on the V1 KV cache manager; the KV cache managers "
+        "disable it with a warning otherwise.")
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 

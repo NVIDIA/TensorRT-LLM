@@ -189,7 +189,7 @@ def make_kv_cache_manager(
     mgr.num_extra_kv_tokens = 0
     # Real scalars, not auto-created Mocks: tests bind the real
     # prepare_context/_prepare_connector_prefix_reservation onto this mock,
-    # and both feed _spec_recompute_tail/is_draft into cursor arithmetic.
+    # and both feed _spec_recompute_tail/is_draft into the reuse-claim cap.
     mgr._spec_recompute_tail = 0
     mgr.is_draft = False
     mgr.can_evict = can_evict
