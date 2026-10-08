@@ -39,7 +39,7 @@ def _request(
     return SimpleNamespace(
         get_tokens=Mock(return_value=tokens),
         py_request_id=request_id,
-        position_ids=position_ids,
+        py_position_ids=position_ids,
         py_multimodal_data=multimodal_data,
         py_mm_item_order=None,
         py_seq_slot=request_id,
