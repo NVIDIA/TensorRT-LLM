@@ -75,6 +75,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_projection_shard_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_five_way_loader_returns_exact_generic_skip
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_qwen3_5_lm_head_quant.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
