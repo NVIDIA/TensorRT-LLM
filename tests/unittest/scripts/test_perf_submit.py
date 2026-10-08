@@ -148,6 +148,30 @@ def test_example_worker_environment_exports_positive_concurrency(example_submit_
     assert worker_environment["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] == "4301"
 
 
+def test_example_replace_env_in_file_replaces_all_variables(
+    example_submit_module: ModuleType,
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "task.yaml"
+    config_path.write_text(
+        "model_root: LLM_MODELS_ROOT\nhf_home: HF_HOME\n",
+        encoding="utf-8",
+    )
+
+    output_dir = example_submit_module.replace_env_in_file(
+        tmp_path,
+        config_path,
+        {
+            "LLM_MODELS_ROOT": "/models",
+            "HF_HOME": "/cache",
+        },
+    )
+
+    assert (Path(output_dir) / config_path.name).read_text(encoding="utf-8") == (
+        "model_root: /models\nhf_home: /cache\n"
+    )
+
+
 def test_ci_submit_selects_same_least_duration_shard_as_pytest_split(
     ci_submit_module: ModuleType,
     tmp_path: Path,
