@@ -897,8 +897,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             torch.Tensor] = encoder_input_features
         if encoder_input_features is not None:
             kwargs["encoder_input_length"] = encoder_input_features.shape[0]
-            kwargs["skip_encoder_input_length_validation"] = (
-                encoder_input_features.ndim >= 4)
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
         if return_encoder_output:
             kwargs["return_encoder_output"] = False

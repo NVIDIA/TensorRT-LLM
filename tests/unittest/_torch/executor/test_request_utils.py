@@ -174,11 +174,7 @@ def test_encoder_feature_metadata_drives_native_request(shape, output_length) ->
     # length accounts for encoder downsampling.
     assert request.encoder_output_len == (12 if output_length is None else output_length)
     assert request.py_encoder_input_features is features
-    if len(shape) < 4:
-        with pytest.raises(RuntimeError, match="Encoder length"):
-            request.validate(20, 30, 0, 10)
-    else:
-        request.validate(20, 30, 0, 10)
+    request.validate(10, 30, 0)
     request.pause(20)
     assert request.state.name == "ENCODER_INIT"
     assert request.py_encoder_input_features is features
@@ -204,8 +200,7 @@ def test_executor_request_to_llm_request_owns_encoder_features_in_python() -> No
     for request in (llm_request, child):
         assert request.encoder_output_len == 6
         assert request.state.name == "ENCODER_INIT"
-        with pytest.raises(RuntimeError, match="Encoder length"):
-            request.validate(20, 30, 0, 10)
+        request.validate(10, 30, 0)
         request.pause(20)
         assert request.state.name == "ENCODER_INIT"
         assert request.encoder_output_len == 6

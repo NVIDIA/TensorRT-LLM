@@ -60,15 +60,7 @@ TEST_F(LlmRequestTest, encoderFeatureMetadata)
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
         EXPECT_EQ(llmReq.tryGetEncoderInputLen(), 12);
         EXPECT_EQ(llmReq.tryGetEncoderOutputLen(), 6);
-        if (imageInput)
-        {
-            EXPECT_NO_THROW(llmReq.validate(20, 30, 0, 10));
-        }
-        else
-        {
-            EXPECT_THROW(llmReq.validate(20, 30, 0, 10), std::exception);
-            EXPECT_NO_THROW(llmReq.validate(20, 30, 0, 12));
-        }
+        EXPECT_NO_THROW(llmReq.validate(10, 30, 0));
         llmReq.setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
         llmReq.pause(20);
         EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
@@ -206,7 +198,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setPromptTuningConfig(config);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 1, std::nullopt, true);
+            llmReq.validate(500, 1000, 1, true);
         };
         lambdaErrMsgs.emplace_back(lambda, "Input token extra ids must be provided");
     }
@@ -254,7 +246,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
 
         EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
-        llmReq.validate(500, 1000, 1, std::nullopt, true);
+        llmReq.validate(500, 1000, 1, true);
     }
     {
         using AdditionalModelOutput = texec::AdditionalModelOutput;
@@ -266,7 +258,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, std::nullopt, false);
+        llmReq.validate(10, 60, 2, false);
         auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
         EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
         EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);

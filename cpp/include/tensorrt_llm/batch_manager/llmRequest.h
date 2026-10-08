@@ -140,7 +140,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt, bool skipEncoderInputLengthValidation = false)
+        std::optional<std::string> cacheSalt = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens->size())
         , mMaxNewTokens(maxNewTokens)
@@ -175,7 +175,6 @@ public:
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mEncoderInputLength(encoderInputLength)
-        , mSkipEncoderInputLengthValidation(skipEncoderInputLengthValidation)
         , mEncoderOutputLength(encoderOutputLength)
         , mLlmRequestType(llmRequestType)
         , mContextPhaseParams(contextPhaseParams)
@@ -381,7 +380,6 @@ public:
         if (encoderInputFeatures.has_value())
         {
             mEncoderInputLength = encoderInputFeatures->getShape()[0];
-            mSkipEncoderInputLengthValidation = encoderInputFeatures->getShape().size() >= 4;
         }
         else
         {
@@ -1828,8 +1826,6 @@ protected:
 
     // Encoder feature length drives admission without retaining the feature payload.
     std::optional<SizeType32> mEncoderInputLength{std::nullopt};
-    // Image features do not use the sequence-length validation limit.
-    bool mSkipEncoderInputLengthValidation{false};
 
     // Setting buffer sizes correctly for models like Whisper,
     // which encoder output shape cannot be inferred from encoder input shape due to downsampling.
@@ -2029,7 +2025,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt, bool skipEncoderInputLengthValidation = false)
+        std::optional<std::string> cacheSalt = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
             samplingConfig, isStreaming, std::move(promptEmbeddingTable), promptVocabSize,
             multimodalHashes.has_value()
@@ -2064,7 +2060,7 @@ public:
             multimodalRunLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            std::move(cacheSalt), skipEncoderInputLengthValidation)
+            std::move(cacheSalt))
     {
     }
 
@@ -2087,8 +2083,8 @@ public:
     /// @return True if tokens are within range.
     bool checkTokenIdRange(SizeType32 vocabSize);
 
-    void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-        std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);
+    void validate(
+        SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse = false);
 
     std::shared_ptr<LlmRequest> createChildRequest(RequestIdType requestId);
 

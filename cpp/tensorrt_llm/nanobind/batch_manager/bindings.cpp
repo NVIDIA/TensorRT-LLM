@@ -384,7 +384,7 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths,
-                std::optional<std::string> cache_salt, bool skip_encoder_input_length_validation)
+                std::optional<std::string> cache_salt)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor)
                 {
@@ -408,7 +408,7 @@ void initBindings(nb::module_& m)
                     encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
                     return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
                     multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
-                    std::move(cache_salt), skip_encoder_input_length_validation};
+                    std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("prompt_embedding_table") = std::nullopt,
@@ -427,12 +427,11 @@ void initBindings(nb::module_& m)
             nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,
             nb::arg("agent_hierarchy") = std::nullopt, nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
             nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt,
-            nb::arg("cache_salt") = std::nullopt, nb::arg("skip_encoder_input_length_validation") = false)
+            nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
-            nb::arg("max_draft_len"), nb::arg("max_endocer_input_len") = std::nullopt,
-            nb::arg("enable_kv_cache_reuse") = false)
+            nb::arg("max_draft_len"), nb::arg("enable_kv_cache_reuse") = false)
         .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
