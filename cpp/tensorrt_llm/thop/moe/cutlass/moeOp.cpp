@@ -27,6 +27,7 @@
 #include "tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h"
 
 #include "cutlass/gemm_coord.h"
+#include "eagerMoeWorkspace.h"
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -379,6 +380,23 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
+    bool beginWorkspaceForward(int64_t owner, bool warmup)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const stream = at::cuda::getCurrentCUDAStream();
+        return mStreamWorkspaces[{stream.device_index(), stream.stream()}].scratch.beginForward(owner, warmup);
+    }
+
+    void finishWorkspaceForward(bool completed)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto const stream = at::cuda::getCurrentCUDAStream();
+        auto& info = mStreamWorkspaces.at({stream.device_index(), stream.stream()});
+        info.scratch.finishForward(completed);
+        // Rebound from the current backing on the next getWorkspaceInfo call.
+        info.src_to_dest_map = nullptr;
+    }
+
     // Release internal workspace buffers to free GPU memory.
     // Workspaces will be re-allocated on the next runMoe/runGemmProfile call.
     void clearWorkspaces()
@@ -723,7 +741,7 @@ public:
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
             unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, lora_active,
             lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
@@ -738,7 +756,7 @@ public:
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
             num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, lora_active, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
@@ -951,7 +969,7 @@ public:
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size,
             unpadded_hidden_size_val, inter_size, num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
@@ -966,7 +984,7 @@ public:
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
             num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
             num_experts_total, static_cast<int>(experts_per_token),
-            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<char*>(workspace_info.scratch.tensor().data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
@@ -1078,7 +1096,7 @@ public:
 private:
     struct WorkspaceInfo
     {
-        torch::Tensor workspace{};
+        EagerMoeWorkspace scratch;
         void* src_to_dest_map{};
     };
 
@@ -1092,7 +1110,7 @@ private:
     // e.g. 16 nvfp4 elements are packed into a single int64 element
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
-    std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
+    std::map<std::pair<int, cudaStream_t>, WorkspaceInfo> mStreamWorkspaces;
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
@@ -1305,33 +1323,16 @@ private:
             experts_per_token, activation_type, parallelismConfig, use_lora, mUseDeepSeekFP8BlockScaling,
             min_latency_mode, mUseW4GroupScaling);
         size_t src_to_dest_map_size = experts_per_token * num_rows * sizeof(int);
-        auto& workspace_info = mStreamWorkspaces[stream];
+        auto& workspace_info = mStreamWorkspaces[{c10::cuda::current_device(), stream}];
 
         std::vector<size_t> workspaces{moe_workspace_size, src_to_dest_map_size};
 
         int64_t const total_workspace_size = common::calculateTotalWorkspaceSize(workspaces.data(), workspaces.size());
 
         bool is_capturing = tensorrt_llm::common::isCapturing(stream);
-        // Always allocate workspace when capturing cuda graph to avoid illegal memory access during replay
-        if (is_capturing || workspace_info.workspace.numel() < total_workspace_size)
-        {
-            if (is_capturing)
-            {
-                TLLM_LOG_DEBUG(
-                    "Allocating MoE workspace with %ld bytes size during cuda graph capture", total_workspace_size);
-            }
-            else
-            {
-                TLLM_LOG_DEBUG("MoE workspace size is not enough, increase the size from %ld bytes to %ld bytes",
-                    workspace_info.workspace.numel(), total_workspace_size);
-            }
-            // Release memory first to avoid OOM.
-            workspace_info = WorkspaceInfo();
-            workspace_info.workspace = torch::empty({static_cast<long>(total_workspace_size)},
-                torch::dtype(torch::kInt8).device(torch::kCUDA).requires_grad(false));
-        }
+        auto const& workspace = workspace_info.scratch.get(total_workspace_size, is_capturing);
         workspace_info.src_to_dest_map
-            = common::nextWorkspacePtr(static_cast<int8_t*>(workspace_info.workspace.data_ptr()), moe_workspace_size);
+            = common::nextWorkspacePtr(static_cast<int8_t*>(workspace.data_ptr()), moe_workspace_size);
 
         return workspace_info;
     }
@@ -2505,5 +2506,7 @@ TORCH_LIBRARY(trtllm, m)
         .def("run_moe", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoe)
         .def("run_moe_min_latency", &tensorrt_llm::torch_ext::FusedMoeRunner::runMoeMinLantency)
         .def("reserve_lora_host_buffers", &tensorrt_llm::torch_ext::FusedMoeRunner::reserveLoraHostBuffers)
+        .def("begin_workspace_forward", &tensorrt_llm::torch_ext::FusedMoeRunner::beginWorkspaceForward)
+        .def("finish_workspace_forward", &tensorrt_llm::torch_ext::FusedMoeRunner::finishWorkspaceForward)
         .def("clear_workspaces", &tensorrt_llm::torch_ext::FusedMoeRunner::clearWorkspaces);
 }

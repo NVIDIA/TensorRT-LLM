@@ -765,3 +765,18 @@ The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFus
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
 - **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the 10-field tactic pattern (with legacy 8-field compatibility) (mma_tiler/cluster_shape as `list[int]`, `epi_flag_batch` as a nested `(int, int)` tuple, the rest as `bool`/`int`/`str`; `_unpack_tactic` is the single source of truth for the field order). The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
 - **Use `distributed_tuning_strategy=DistributedTuningStrategy.MERGE` on a multi-rank `FUSED_COMM` backend's `TuningConfig`** — Every EP rank must converge on the same compiled tactic for every chunk, otherwise the in-kernel NVLink dispatch barrier deadlocks. `PARALLEL` can profile different tactics on different ranks and is unsafe for fused collectives. Reference: `Sm100MegaMoENvfp4Runner.get_tuning_config`.
+
+### CUTLASS eager scratch reclamation
+
+The scheduled decoder engine supplies a `CutlassWorkspaceReclaimer` scope around
+one complete model forward, including warmup. `torch_custom_ops.fused_moe`
+registers each native runner/stream once per scope, after autotuning. The native
+`EagerMoeWorkspace` accumulates exact workspace requirements across layers and
+chunks and replaces excess backing after three underfilled successful forwards,
+never below the completed warmup floor. Routing pointers are rebound by
+`getWorkspaceInfo` on the next call. A new runner/stream without warmup does not
+reclaim; capture, another engine owner or unscoped use disables reclamation for
+that workspace. Graph storage and LoRA-specific persistent scratch are excluded.
+`TRTLLM_RECLAIM_WORKSPACE=0` disables the engine scope. All cleanup runs on each
+allocation's original CUDA stream; no device synchronization or payload copy is
+needed for pure scratch. Do not count individual layer/chunk calls as forwards.

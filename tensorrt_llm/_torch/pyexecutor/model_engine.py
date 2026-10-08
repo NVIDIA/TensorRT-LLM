@@ -62,6 +62,7 @@ from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                MoeLoadBalancerIterContext)
+from ..moe.workspace import CutlassWorkspaceReclaimer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -860,6 +861,8 @@ class PyTorchModelEngine(ModelEngine):
         # the batch composition changes (new encoder request arrives).
         self._cross_attn_stable_cached_tokens: Optional[List[int]] = None
         self._cross_attn_stable_request_ids: Optional[List[int]] = None
+        self._moe_workspace_reclaimer: Optional[
+            CutlassWorkspaceReclaimer] = None
         self._eager_workspace_reclaimer: Optional[
             EagerWorkspaceReclaimer] = None
         # Steady-state generation-only prepare cache (non-speculative overlap
@@ -1468,6 +1471,7 @@ class PyTorchModelEngine(ModelEngine):
         # cuda_graph_config=None flashinfer's sampling kernels would be
         # JIT-built mid-serving.
         self._eager_workspace_reclaimer = None
+        self._initialize_moe_workspace_reclaimer()
         with self._warmup_timer.phase("sampling_module_prewarm",
                                       metrics=self._metrics,
                                       metric_name="sampling_warmup_seconds"):
@@ -1636,6 +1640,15 @@ class PyTorchModelEngine(ModelEngine):
         maybe_bolt_clear_counters()
 
         self._freeze_eager_workspace_floor()
+
+    def _initialize_moe_workspace_reclaimer(self) -> None:
+        self._moe_workspace_reclaimer = None
+        if (os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") != "0"
+                and not self.is_spec_decode and self.mapping.cp_size == 1
+                and not self._is_encoder_decoder_model()
+                and self._torch_compile_backend is None
+                and self.breakable_cuda_graph_runner is None):
+            self._moe_workspace_reclaimer = CutlassWorkspaceReclaimer()
 
     def _freeze_eager_workspace_floor(self) -> None:
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
@@ -6427,7 +6440,11 @@ class PyTorchModelEngine(ModelEngine):
                          if reclaimer is not None and not is_dummy
                          and isinstance(metadata, TrtllmAttentionMetadata) else
                          contextlib.nullcontext())
-        with reclaim_scope:
+        moe_reclaimer = self._moe_workspace_reclaimer
+        moe_scope = contextlib.nullcontext()
+        if moe_reclaimer is not None and (not is_dummy or self.is_warmup):
+            moe_scope = moe_reclaimer.forward(warmup=self.is_warmup)
+        with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 
     @nvtx_range("_forward_step")
