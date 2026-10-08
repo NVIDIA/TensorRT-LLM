@@ -210,6 +210,16 @@ def test_fuse_input_embeds_success_oov_path(device):
     torch.testing.assert_close(out_embeds_v2, out_embeds)
     torch.testing.assert_close(out_ids_v2, out_ids)
 
+    # Explicit indices from other callers may be int32 or on the host.
+    _, out_embeds_int32 = fuse_input_embeds(
+        emb,
+        input_ids,
+        mm_embeds=[mm_emb],
+        mm_token_ids=None,
+        text_token_indices=text_idx.int().cpu(),
+        mm_token_indices=mm_idx.int().cpu())
+    torch.testing.assert_close(out_embeds_int32, out_embeds)
+
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
