@@ -6443,7 +6443,8 @@ class PyTorchModelEngine(ModelEngine):
         moe_reclaimer = self._moe_workspace_reclaimer
         moe_scope = contextlib.nullcontext()
         if moe_reclaimer is not None and (not is_dummy or self.is_warmup):
-            moe_scope = moe_reclaimer.forward(warmup=self.is_warmup)
+            moe_scope = moe_reclaimer.forward(warmup=self.is_warmup,
+                                              num_tokens=metadata.num_tokens)
         with reclaim_scope, moe_scope:
             return self._model_caller(**kwargs)
 

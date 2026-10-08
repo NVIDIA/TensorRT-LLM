@@ -380,11 +380,12 @@ public:
     FusedMoeRunner(FusedMoeRunner const&) = delete;
     void operator=(FusedMoeRunner const&) = delete;
 
-    bool beginWorkspaceForward(int64_t owner, bool warmup)
+    bool beginWorkspaceForward(int64_t owner, bool warmup, int64_t numTokens)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         auto const stream = at::cuda::getCurrentCUDAStream();
-        return mStreamWorkspaces[{stream.device_index(), stream.stream()}].scratch.beginForward(owner, warmup);
+        return mStreamWorkspaces[{stream.device_index(), stream.stream()}].scratch.beginForward(
+            owner, warmup, numTokens);
     }
 
     void finishWorkspaceForward(bool completed)

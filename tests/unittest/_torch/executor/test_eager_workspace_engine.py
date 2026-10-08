@@ -179,6 +179,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.breakable_cuda_graph_runner = None
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
+        self.metadata._num_tokens = 128
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
         self.engine.attn_metadata = self.metadata
         self.engine.model = SimpleNamespace(
@@ -238,11 +239,11 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         reclaimer.forward.assert_not_called()
         self.engine._is_warmup = True
         self.assertEqual(self.call(is_dummy=True), 42)
-        reclaimer.forward.assert_called_once_with(warmup=True)
+        reclaimer.forward.assert_called_once_with(warmup=True, num_tokens=128)
         self.engine._is_warmup = False
         reclaimer.reset_mock()
         self.assertEqual(self.call(), 42)
-        reclaimer.forward.assert_called_once_with(warmup=False)
+        reclaimer.forward.assert_called_once_with(warmup=False, num_tokens=128)
 
     def test_moe_reclamation_eligibility_and_escape_hatch(self) -> None:
         with (
