@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 
 namespace tensorrt_llm::testing
@@ -37,6 +38,15 @@ public:
     static void simulatePrefillCompletion(batch_manager::LlmRequest& llmRequest)
     {
         llmRequest.setContextCurrentPosition(llmRequest.getPromptLen());
+    }
+
+    /// @brief Return mutable BlockManager access for tests that need to force internal block state.
+    ///
+    /// NEVER CALL FROM PRODUCTION CODE. This keeps const-cast based test setup in one explicit test-only helper.
+    static batch_manager::kv_cache_manager::BlockManager& mutableBlockManager(
+        batch_manager::kv_cache_manager::BaseKVCacheManager& kvCacheManager)
+    {
+        return const_cast<batch_manager::kv_cache_manager::BlockManager&>(kvCacheManager.getBlockManager());
     }
 };
 
