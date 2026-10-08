@@ -361,9 +361,19 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
 class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
     """
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
+
+    Args:
+        return_mm_results: Whether to attach the multimodal outputs to the
+            requests' results. Disable it on ranks whose responses never reach
+            the frontend: the results are exported as CUDA IPC handles, and
+            PyTorch keeps an exported allocation alive until a consumer opens
+            and releases its handle.
     """
 
     SampleState: TypeAlias = SampleStateWithMMResult
+
+    def __init__(self, return_mm_results: bool = True) -> None:
+        self.return_mm_results = return_mm_results
 
     @override
     def sample_async(
@@ -397,6 +407,9 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
+
+        if not self.return_mm_results:
+            return
 
         request_indices = state.data.mm_embedding_request_indices
         for result_index, (request_index, mm_embedding) in enumerate(

@@ -4308,8 +4308,14 @@ def instantiate_sampler(
         return get_spec_decoder(sampler_args, engine.spec_config)
 
     if mm_encoder_only:
-        # NOTE: handle model outputs specially for mm encoder executor/engine
-        return EarlyStopWithMMResult()
+        # NOTE: handle model outputs specially for mm encoder executor/engine.
+        # Only export results on ranks whose responses reach the frontend
+        # (see PyExecutor._enqueue_responses): rank 0, plus the attention-DP
+        # ranks gathered into it. A CUDA IPC handle exported on any other rank
+        # is never opened, so PyTorch would never release its allocation.
+        returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
+                                                  and 0 in mapping.tp_group)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
