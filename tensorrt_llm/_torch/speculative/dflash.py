@@ -28,7 +28,6 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManagerType
 from .accept_stats import maybe_create_recorder
@@ -668,17 +667,14 @@ class DFlashWorker(SpecWorkerBase):
         # graph compatible.
         self._ctx_buf_inited = False
         self._ctx_len = None
-        self._ctx_position_offset = None
+        self._ctx_available = None
         self._managed_cache_bindings = {}
-        self._managed_request_ids = ()
-        self._managed_snapshot_slots: Optional[torch.Tensor] = None
         # Host shadows of _ctx_len and of each request's prompt progress.
         self._ctx_len_host = None
         self._req_ctx_pos = {}
         # Snapshot for rolling back in-place _ctx_len updates when a forward
         # fails (or after warmup). See _ensure_spec_dec_state_restored.
         self._saved_ctx_len = None
-        self._saved_ctx_position_offset = None
         self._saved_ctx_len_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
@@ -807,7 +803,6 @@ class DFlashWorker(SpecWorkerBase):
     def _prepare_managed_history(self, request_ids: list[int]) -> list[int]:
         """Restore newly resident histories without rewinding overlapping iterations."""
         updates = {self._dummy_slot: 0}
-        offsets = {self._dummy_slot: 0}
         restore_rows = []
         real_request_ids = {
             request_id
@@ -820,44 +815,30 @@ class DFlashWorker(SpecWorkerBase):
             if request_id not in real_request_ids:
                 slot = self._req_to_slot.pop(request_id)
                 updates[slot] = 0
-                offsets[slot] = 0
                 self._req_ctx_pos.pop(request_id, None)
                 self._managed_cache_bindings.pop(request_id, None)
                 self._free_slots.append(slot)
         for row, request_id in enumerate(request_ids):
-            if request_id in real_request_ids:
-                self._assign_slot(request_id)
+            if request_id in real_request_ids and self._assign_slot(request_id) is None:
+                self._ctx_kv_manager.invalidate_draft(request_id)
             slot = self._req_to_slot.get(request_id)
             if slot is not None:
                 cache = self._ctx_kv_manager.kv_cache_map[request_id]
-                if self._managed_cache_bindings.get(request_id) is cache:
+                available = self._ctx_kv_manager.is_draft_available(request_id)
+                if self._managed_cache_bindings.get(request_id) == (cache, available):
+                    if not available:
+                        self._ctx_available[slot] = False
                     continue
-                history = self._ctx_kv_manager.get_draft_history(request_id)
-                updates[slot] = history.valid_length if history is not None else 0
-                self._req_ctx_pos[request_id] = history.position if history is not None else 0
-                offsets[slot] = self._req_ctx_pos[request_id] - updates[slot]
-                self._managed_cache_bindings[request_id] = cache
+                start, end = self._ctx_kv_manager.get_draft_history_range(request_id)
+                updates[slot] = end - start if available else 0
+                self._ctx_available[slot] = available
+                self._req_ctx_pos[request_id] = end if available else 0
+                self._managed_cache_bindings[request_id] = (cache, available)
                 restore_rows.append(row)
         self._write_ctx_len(updates)
-        for slot, offset in offsets.items():
-            self._ctx_position_offset[slot] = offset
         self._batch_to_slot[: len(request_ids)].copy_(
             torch.tensor(
                 [self._req_to_slot.get(request_id, self._dummy_slot) for request_id in request_ids],
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=prefer_pinned(),
-            ),
-            non_blocking=True,
-        )
-        self._managed_request_ids = tuple(
-            request_id for request_id in request_ids if request_id in real_request_ids
-        )
-        # Each upload owns fresh host storage. PyTorch's pinned allocator defers
-        # recycling it until the asynchronous copy completes.
-        self._managed_snapshot_slots[: len(self._managed_request_ids)].copy_(
-            torch.tensor(
-                [self._req_to_slot[request_id] for request_id in self._managed_request_ids],
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=prefer_pinned(),
@@ -892,26 +873,19 @@ class DFlashWorker(SpecWorkerBase):
             return
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata, manager)
         spec_metadata._dflash_worker = self
-        restore_rows = self._prepare_managed_history(spec_metadata.request_ids)
+        if (
+            spec_metadata.runtime_draft_len == 0
+            or spec_metadata.captured_hidden_states is None
+            or not hasattr(draft_model, "fc")
+            or not hasattr(draft_model, "hidden_norm")
+        ):
+            for request_id in spec_metadata.request_ids:
+                manager.invalidate_draft(request_id)
         self._refresh_ctx_block_tables(
             attn_metadata, attn_metadata.num_seqs, spec_metadata.request_ids
         )
+        restore_rows = self._prepare_managed_history(spec_metadata.request_ids)
         self._gather_managed_context(spec_metadata.request_ids, restore_rows)
-
-    def snapshot_managed_draft_history(self) -> DraftHistoryUpdate | None:
-        """Queue iteration-owned readback; the executor publishes after completion."""
-        if not self._has_unified_draft_cache() or not self._managed_request_ids:
-            return None
-        # Preparation, forward, snapshot gathers and the next preparation run
-        # on the execution stream, so its next upload cannot overtake this read.
-        slots = self._managed_snapshot_slots[: len(self._managed_request_ids)]
-        lengths = self._ctx_len[slots]
-        positions = lengths + self._ctx_position_offset[slots]
-        return DraftHistoryUpdate.capture(
-            self._ctx_kv_manager,
-            self._managed_request_ids,
-            torch.stack((lengths, positions), dim=1),
-        )
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -1097,7 +1071,7 @@ class DFlashWorker(SpecWorkerBase):
         if self._ctx_block_tables is None or num_seqs <= 0:
             return False
         if self._has_unified_draft_cache():
-            table = self._ctx_kv_manager.get_draft_block_table(request_ids[:num_seqs])
+            table = self._ctx_kv_manager.get_draft_execution_block_table(request_ids[:num_seqs])
             self._ctx_block_tables[:num_seqs].copy_(table, non_blocking=True)
             self._ctx_block_counts[:num_seqs].copy_(
                 torch.tensor(
@@ -1218,16 +1192,14 @@ class DFlashWorker(SpecWorkerBase):
         self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
-        self._ctx_position_offset = torch.zeros_like(self._ctx_len)
+        self._ctx_available = torch.zeros(num_slots, dtype=torch.bool, device="cuda")
         self._ctx_len_host = [0] * num_slots
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
-        self._managed_snapshot_slots = torch.empty_like(self._batch_to_slot) if unified else None
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
         self._managed_cache_bindings = {}
-        self._managed_request_ids = ()
 
         # checkpoint's trained block width
         self._resolved_block_size = getattr(draft_model, "block_size", None) or (
@@ -1254,7 +1226,7 @@ class DFlashWorker(SpecWorkerBase):
         nkv = draft_model._num_kv_heads
         hd = draft_model._head_dim
         kv_factor = getattr(draft_model, "_kv_factor", 2)
-        capacity = self._max_ctx + self._compute_block_size
+        capacity = self._max_ctx + max(self._compute_block_size, self.max_draft_len + 1)
         # Published before any drafter table is built, so a drafter may read it
         # instead of its config cap. _max_ctx is attn_metadata.max_seq_len, which
         # py_executor_creator raises past model_config.max_seq_len and never
@@ -1417,6 +1389,7 @@ class DFlashWorker(SpecWorkerBase):
         def clear(slot: int) -> None:
             if updates is None:
                 self._write_ctx_len({slot: 0})
+                self._ctx_available[slot] = False
             else:
                 updates[slot] = 0
 
@@ -1426,14 +1399,11 @@ class DFlashWorker(SpecWorkerBase):
             self._free_slots.append(old_slot)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
-                if self._has_unified_draft_cache():
-                    raise RuntimeError("Unified DSpark has no free request staging slot")
                 return None
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             if self._has_unified_draft_cache():
                 self._managed_cache_bindings.pop(req_id, None)
-                self._ctx_position_offset[slot] = 0
             clear(slot)
         return self._req_to_slot[req_id]
 
@@ -1554,8 +1524,6 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_len_host = list(self._saved_ctx_len_host)
         if self._saved_req_ctx_pos is not None:
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
-        if self._has_unified_draft_cache() and self._saved_ctx_position_offset is not None:
-            self._ctx_position_offset.copy_(self._saved_ctx_position_offset)
 
     def _store_prefill_context(
         self,
@@ -1627,6 +1595,8 @@ class DFlashWorker(SpecWorkerBase):
             reset = self._req_ctx_pos.get(req_id) != first_pos
             if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
                 logger.warning("DFlash: no free slots, skipping context store")
+                if self._has_unified_draft_cache():
+                    self._ctx_kv_manager.invalidate_draft(req_id)
                 self._req_ctx_pos.pop(req_id, None)
                 offset += slen
                 continue
@@ -1634,12 +1604,21 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
-            if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
+            if (
+                cur == 0
+                and first_pos > 0
+                and self._ctx_reuse_addressable
+                and (
+                    not self._has_unified_draft_cache()
+                    or self._ctx_kv_manager.is_draft_available(req_id)
+                )
+            ):
                 # Reuse let the target skip [0, first_pos), so only the tail
                 # reaches the capture buffer. The prefix K/V are still in the
                 # paired pool: precompute_context_kv is per-token in (hidden, p).
                 cur = first_pos
-            if cur + slen > cap:
+            missing_context = first_pos > 0 and cur == 0
+            if cur + slen > cap or missing_context:
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
                 # forward would take every other in-flight request with it.
@@ -1650,10 +1629,13 @@ class DFlashWorker(SpecWorkerBase):
                 )
                 self._req_ctx_pos.pop(req_id, None)
                 ctx_len_updates[slot] = 0
+                self._ctx_available[slot] = False
                 if self._has_unified_draft_cache():
-                    # Keep a slot for managed history snapshots.
-                    self._ctx_position_offset[slot] = first_pos + slen
-                    self._managed_cache_bindings[req_id] = self._ctx_kv_manager.kv_cache_map[req_id]
+                    self._ctx_kv_manager.invalidate_draft(req_id)
+                    self._managed_cache_bindings[req_id] = (
+                        self._ctx_kv_manager.kv_cache_map[req_id],
+                        self._ctx_kv_manager.is_draft_available(req_id),
+                    )
                 else:
                     self._req_to_slot.pop(req_id, None)
                     self._free_slots.append(slot)
@@ -1700,9 +1682,19 @@ class DFlashWorker(SpecWorkerBase):
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     if chunk_v is not None:
                         self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
+            self._ctx_available[slot] = True
             if self._has_unified_draft_cache():
-                self._ctx_position_offset[slot] = self._req_ctx_pos[req_id] - end
-                self._managed_cache_bindings[req_id] = self._ctx_kv_manager.kv_cache_map[req_id]
+                required_start, required_end = self._ctx_kv_manager.get_draft_history_range(req_id)
+                if first_pos - cur <= required_start and first_pos + slen >= required_end:
+                    self._ctx_kv_manager.complete_draft_rebuild(
+                        req_id, first_pos - cur, first_pos + slen
+                    )
+                else:
+                    self._ctx_available[slot] = False
+                self._managed_cache_bindings[req_id] = (
+                    self._ctx_kv_manager.kv_cache_map[req_id],
+                    self._ctx_kv_manager.is_draft_available(req_id),
+                )
             offset += slen
 
         self._write_ctx_len(ctx_len_updates)
@@ -1726,6 +1718,7 @@ class DFlashWorker(SpecWorkerBase):
             # A failed forward must not keep this iteration's in-place
             # _ctx_len updates: roll back to the pre-forward snapshot.
             self._ctx_len.copy_(self._saved_ctx_len)
+            self._ctx_available.copy_(self._saved_ctx_available)
             self._restore_ctx_len_host()
             self._ctx_len_restore_pending = False
 
@@ -1780,8 +1773,7 @@ class DFlashWorker(SpecWorkerBase):
             # during capture aborts the graph itself, and captured ops do not
             # mutate _ctx_len until replay.
             self._saved_ctx_len = self._ctx_len.clone()
-            if self._has_unified_draft_cache():
-                self._saved_ctx_position_offset = self._ctx_position_offset.clone()
+            self._saved_ctx_available = self._ctx_available.clone()
             self._saved_ctx_len_host = list(self._ctx_len_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
@@ -1919,6 +1911,18 @@ class DFlashWorker(SpecWorkerBase):
                     num_contexts=num_contexts,
                 )
 
+                available = self._ctx_available[inputs["ctx_slots"]]
+                placeholder_token = self._d2t[0] if self._d2t is not None else 0
+                gen_draft_tokens = torch.where(
+                    available.unsqueeze(1), gen_draft_tokens, placeholder_token
+                )
+                if spec_metadata.draft_probs is not None:
+                    prob_slots = spec_metadata.batch_slot_ids[num_contexts:batch_size]
+                    probs = spec_metadata.draft_probs[prob_slots, :K]
+                    probs.masked_fill_(~available[:, None, None], 0)
+                    probs[..., 0] += (~available).to(probs.dtype).unsqueeze(1)
+                    spec_metadata.draft_probs[prob_slots, :K] = probs
+
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
                 # recorder (None here -> no calibration rows collected; the
@@ -1974,6 +1978,7 @@ class DFlashWorker(SpecWorkerBase):
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
             self._ctx_len.copy_(self._saved_ctx_len)
+            self._ctx_available.copy_(self._saved_ctx_available)
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
@@ -1984,6 +1989,19 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _apply_force_accepted_tokens(
+        self, num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=None
+    ):
+        counts = super()._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=spec_metadata
+        )
+        if self._ctx_available is not None:
+            slots = self._batch_to_slot[num_contexts : counts.shape[0]]
+            counts[num_contexts:] = torch.where(
+                self._ctx_available[slots], counts[num_contexts:], 1
+            )
+        return counts
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -2187,10 +2205,14 @@ class DFlashWorker(SpecWorkerBase):
             bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
 
             ctx_len_gen = self._ctx_len[slots]
+            ready = self._ctx_available[slots] & (ctx_len_gen + gen_num_accepted <= self._max_ctx)
+            if not has_target_features:
+                ready = torch.zeros_like(ready)
+            self._ctx_available[slots] = ready
             j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
-            query_position = (ctx_len_gen + gen_num_accepted.long()).clamp(max=self._max_ctx)
+            query_position = torch.where(ready, ctx_len_gen + gen_num_accepted.long(), 0)
             query_position_ids = query_position.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
@@ -2215,18 +2237,21 @@ class DFlashWorker(SpecWorkerBase):
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                 if self._ctx_block_tables is not None:
-                    # Bound by what the manager handed THIS request: the masked
-                    # entries below are still written (fixed-size, for graph
-                    # safety) and a placeholder page resolves to another's.
-                    gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
-                    col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
-                if self._ctx_block_tables is None or self._ctx_k_buf is not None:
-                    col_idx = col_idx.clamp(max=self._max_ctx - 1)
+                    scratch_pages = (
+                        max(K_plus_1, block_size) + self._ctx_page_size - 1
+                    ) // self._ctx_page_size
+                    scratch_start = (
+                        self._ctx_block_counts[gen_rows_out] - scratch_pages
+                    ) * self._ctx_page_size
+                else:
+                    scratch_start = torch.full_like(ctx_len_gen, self._max_ctx)
+                col_idx = torch.where(
+                    ready.unsqueeze(1),
+                    col_idx,
+                    scratch_start.unsqueeze(1) + offsets_kp1.unsqueeze(0),
+                )
+                write_mask &= ready.unsqueeze(1)
 
-                # Fixed-size writes for CUDA graph compatibility:
-                # Write ALL entries but zero out invalid ones. Invalid
-                # writes land at clamped column indices beyond valid
-                # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
                 proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
@@ -2256,27 +2281,37 @@ class DFlashWorker(SpecWorkerBase):
                         rows_long = slot_long
                     self._store_context_kv_paged(k_new, v_new, rows_long, col_long)
                 if self._ctx_k_buf is not None:
-                    self._ctx_k_buf[slot_long, :, col_long] = k_new
+                    dense_cols = torch.where(
+                        ready.unsqueeze(1),
+                        ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0),
+                        self._max_ctx + offsets_kp1.unsqueeze(0),
+                    ).reshape(-1)
+                    self._ctx_k_buf[slot_long, :, dense_cols] = k_new
                     if v_new is not None:
-                        self._ctx_v_buf[slot_long, :, col_long] = v_new
+                        self._ctx_v_buf[slot_long, :, dense_cols] = v_new
 
-                self._ctx_len[slots] += gen_num_accepted_long
-                if self._has_unified_draft_cache():
-                    self._ctx_position_offset[slots] += (
-                        self._ctx_len[slots] - self._max_ctx
-                    ).clamp_min(0)
-                self._ctx_len.clamp_(max=self._max_ctx)
-
-            num_ctx_per_req_t = self._ctx_len[slots]
-            if self._ctx_block_tables is not None:
-                # The write above clamps columns to the request's allocation, so
-                # a context that outruns it has its tail written over the last
-                # valid slot. Truncate what is advertised to match, or the read
-                # attends that clobbered value -- or another request's page.
-                allocated = dflash_allocated_ctx_limit(
-                    self._ctx_block_counts, self._ctx_page_size, block_size
+                self._ctx_len[slots] = torch.where(
+                    ready, ctx_len_gen + gen_num_accepted_long, ctx_len_gen
                 )
-                num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+
+            num_ctx_per_req_t = torch.where(ready, self._ctx_len[slots], 0)
+            execution_table = self._ctx_block_tables
+            if execution_table is not None:
+                # Disabled rows execute placeholders exclusively in uncommitted
+                # scratch. Their outputs are withheld from speculative acceptance.
+                scratch_pages = (
+                    max(K_plus_1, block_size) + self._ctx_page_size - 1
+                ) // self._ctx_page_size
+                first_scratch = self._ctx_block_counts[gen_rows_out] - scratch_pages
+                columns = torch.arange(execution_table.shape[1], device=execution_table.device)
+                source = (first_scratch.unsqueeze(1) + columns).clamp(
+                    max=execution_table.shape[1] - 1
+                )
+                scratch_table = execution_table[gen_rows_out].gather(1, source)
+                execution_table = execution_table.clone()
+                execution_table[gen_rows_out] = torch.where(
+                    ready.unsqueeze(1), execution_table[gen_rows_out], scratch_table
+                )
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
@@ -2293,9 +2328,11 @@ class DFlashWorker(SpecWorkerBase):
             slots = torch.empty(0, dtype=torch.long, device="cuda")
             gen_rows_out = slots
             bonus = torch.empty(0, dtype=torch.long, device="cuda")
+            execution_table = self._ctx_block_tables
 
         return {
             "noise_embedding": noise_embedding,
+            "ctx_slots": slots,
             "query_positions": query_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
             "ctx_k_cache": self._ctx_k_buf,
@@ -2312,8 +2349,6 @@ class DFlashWorker(SpecWorkerBase):
             "first_prev_tokens": bonus,
             "ctx_kv_cache": self._ctx_kv_buf,
             "ctx_page_table": (
-                self._ctx_block_tables
-                if self._ctx_block_tables is not None
-                else self._ctx_page_table
+                execution_table if execution_table is not None else self._ctx_page_table
             ),
         }

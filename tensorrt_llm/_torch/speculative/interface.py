@@ -36,7 +36,6 @@ from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
-    from ..pyexecutor.kv_cache.standalone_draft_cache import DraftHistoryUpdate
     from ..pyexecutor.llm_request import LlmRequest
     from ..pyexecutor.resource_manager import ResourceManager
 
@@ -1612,10 +1611,6 @@ class SpecWorkerBase(nn.Module, ABC):
         resource_manager: "ResourceManager",
     ) -> None:
         """Stage manager-owned draft history before eager execution or replay."""
-
-    def snapshot_managed_draft_history(self) -> Optional["DraftHistoryUpdate"]:
-        """Snapshot this execution's history for publication at completion."""
-        return None
 
     def commit_auxiliary_speculative_states(
         self,

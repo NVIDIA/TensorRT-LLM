@@ -210,6 +210,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         # Request progress is slot-indexed; managed KV lives only in its pages.
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
+        self._draft_available: Optional[torch.Tensor] = None
         self._valid_len: Optional[torch.Tensor] = None  # [max_batch] written window entries
         self._win = 0
         self._draft_kv_manager = None
@@ -321,6 +322,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
             self._ctx_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
+            self._draft_available = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
             self._batch_to_slot = torch.full(
                 (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
             )
@@ -412,7 +414,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         ]
         real_ids = [request_ids[row] for row in real_rows]
         self._release_inactive_slots(real_ids)
-        batch_indices = self._draft_kv_manager.get_draft_block_indices(real_ids)
+        table = (
+            self._draft_kv_manager.get_draft_execution_block_table(real_ids) if real_ids else None
+        )
+        batch_indices = [
+            table[row, : self._draft_kv_manager.get_draft_num_blocks(request_id)].tolist()
+            for row, request_id in enumerate(real_ids)
+        ]
         mappings = {row: tuple(indices) for row, indices in zip(real_rows, batch_indices)}
         updates = []
         for row in sorted(self._draft_page_indices.keys() | mappings.keys()):
@@ -434,22 +442,25 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._draft_page_indices = mappings
         self._ctx_len[self._scratch_slot] = 0
         self._valid_len[self._scratch_slot] = 0
+        self._draft_available[self._scratch_slot] = False
         batch_slots = [self._scratch_slot] * len(request_ids)
         for row in real_rows:
             request_id = request_ids[row]
             cache = self._draft_kv_manager.kv_cache_map[request_id]
             slot = self._assign_slot(request_id)
             batch_slots[row] = slot
-            if self._managed_residency.get(request_id) is cache:
+            available = self._draft_kv_manager.is_draft_available(request_id)
+            self._draft_available[slot] = available
+            if self._managed_residency.get(request_id) == (cache, available):
                 continue
-            position = cache.history_length
+            start, position = self._draft_kv_manager.get_draft_history_range(request_id)
             if row >= num_contexts and position == 0:
                 raise ValueError(
                     f"Embedded DSpark generation request {request_id} has no committed KV history"
                 )
             self._ctx_len[slot] = position
-            self._valid_len[slot] = min(self._win, position)
-            self._managed_residency[request_id] = cache
+            self._valid_len[slot] = position - start if available else 0
+            self._managed_residency[request_id] = (cache, available)
         # Staging may still be read by an earlier asynchronous H2D. Reuse it
         # only after its copy event, independently of overlapped model execution.
         count = sum(len(indices) for _, _, indices in updates)
@@ -533,6 +544,17 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
                 self._valid_len[slot] = torch.clamp(self._valid_len[slot] + keep, max=self._win)
             self._ctx_len[slot] = chunk_positions[-1] + 1
+            if captured is not None and slot != self._scratch_slot:
+                host_positions = spec_metadata.host_position_ids
+                first = (
+                    int(host_positions[context_offset])
+                    if host_positions is not None
+                    else int(chunk_positions[0])
+                )
+                start, end = self._draft_kv_manager.get_draft_history_range(req_id)
+                if first <= start and first + chunk_len >= end:
+                    self._draft_kv_manager.complete_draft_rebuild(req_id, first, first + chunk_len)
+                    self._draft_available[slot] = True
             context_offset += chunk_len
 
     def _advance_generation_state(
@@ -649,6 +671,19 @@ class DSv4DSparkWorker(SpecWorkerBase):
             all_rank_num_tokens=all_rank_num_tokens,
         )
         return block_logits
+
+    def _apply_force_accepted_tokens(
+        self, num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=None
+    ):
+        counts = super()._apply_force_accepted_tokens(
+            num_accepted_tokens, num_contexts, runtime_draft_len, spec_metadata=spec_metadata
+        )
+        if self._draft_available is not None:
+            slots = self._batch_to_slot[num_contexts : counts.shape[0]]
+            counts[num_contexts:] = torch.where(
+                self._draft_available[slots], counts[num_contexts:], 1
+            )
+        return counts
 
     def _sample_draft_tokens_guided(
         self,

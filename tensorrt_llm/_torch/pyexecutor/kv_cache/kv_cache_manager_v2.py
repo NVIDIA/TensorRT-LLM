@@ -131,7 +131,6 @@ from ..resource_manager import (
     request_context,
 )
 from ..scheduler import ScheduledRequests
-from .standalone_draft_cache import StandaloneDraftHistory
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -1274,7 +1273,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.draft_attention_backend = draft_attention_backend
         self.draft_max_position_embeddings = draft_max_position_embeddings
         self.draft_layer_ids: tuple[int, ...] = ()
-        self.draft_history: dict[int, StandaloneDraftHistory] = {}
+        self._unavailable_draft_requests: set[int] = set()
         self._draft_dummy_request_ids: set[int] = set()
         self._standalone_draft_reserve = draft_scratch_tokens
         self.mapping = mapping
@@ -3465,127 +3464,181 @@ class KVCacheManagerV2(BaseResourceManager):
             "window_size": self.draft_window_size,
         }
 
-    def _draft_history_uses_kv_history(self) -> bool:
-        """Embedded DSpark writes the complete live suffix of target history."""
-        return getattr(self, "draft_attention_backend", None) == "DSv4"
+    def get_draft_history_range(self, request_id: int) -> tuple[int, int]:
+        """Required absolute token range, derived from the cache's history marker."""
+        cache = self.kv_cache_map[request_id]
+        end = cache.history_length
+        start = 0 if self.draft_window_size is None else max(0, end - self.draft_window_size)
+        return start, end
 
-    def get_draft_block_indices(
-        self,
-        request_ids: List[int],
-        histories: Optional[Sequence[StandaloneDraftHistory]] = None,
-    ) -> List[List[int]]:
-        """Validated rank-local mappings for allocated draft pages, without padding."""
-        for request_id in request_ids:
-            cache = self.kv_cache_map.get(request_id)
-            if cache is None or not cache.is_active:
-                raise ValueError(f"Standalone draft request {request_id} has no active cache")
-        expanded = self._helix_cp_size > 1
-        layer_idx = self.draft_layer_ids[0]
-        batch_indices = self.get_batch_cache_indices(request_ids, layer_idx, raw_indices=expanded)
-        if expanded:
-            converter = self.impl.get_page_index_converter(self.layer_offsets[layer_idx], Role.KEY)
-            batch_indices = [converter(indices, PageIndexMode.SHARED) for indices in batch_indices]
-        for row, indices in enumerate(batch_indices):
-            cache = self.kv_cache_map[request_ids[row]]
-            if (
-                len(indices) != self.get_draft_num_blocks(request_ids[row])
-                or len(indices) > self.draft_max_blocks_per_seq
-            ):
-                raise ValueError("Standalone draft cache has an incomplete or oversized page table")
-            first_required_block = 0
-            if self.draft_window_size is not None:
-                history = None
-                if not self._draft_history_uses_kv_history():
-                    history = (
-                        histories[row]
-                        if histories is not None
-                        else self.get_draft_history(request_ids[row])
-                    )
-                history_start = (
-                    history.position - history.valid_length
-                    if history is not None
-                    else max(0, cache.history_length - self.draft_window_size)
-                )
-                first_required_block = history_start // self.tokens_per_block
-            if any(index == BAD_PAGE_INDEX for index in indices[first_required_block:]):
-                raise ValueError(
-                    "Draft cache contains missing pages in its required history or scratch"
-                )
-        return batch_indices
+    def is_draft_available(self, request_id: int) -> bool:
+        """Whether draft layers cover their retention policy through committed history."""
+        cache = self.kv_cache_map.get(request_id)
+        if cache is None or not cache.is_active or request_id in self._unavailable_draft_requests:
+            return False
+        return (
+            self.draft_window_size is not None
+            or self.draft_max_position_embeddings is None
+            or cache.history_length <= self.draft_max_position_embeddings
+        )
+
+    def invalidate_draft(self, request_id: int) -> None:
+        """Keep target execution alive while withholding incomplete draft KV from reuse."""
+        self._unavailable_draft_requests.add(request_id)
+        cache = self.kv_cache_map.get(request_id)
+        if cache is not None:
+            cache.stop_committing()
+
+    def complete_draft_rebuild(self, request_id: int, start: int, end: int) -> None:
+        """Enable draft layers only after a rebuild covers the entire required range."""
+        required_start, required_end = self.get_draft_history_range(request_id)
+        if start > required_start or end < required_end or start < 0:
+            raise ValueError("Draft rebuild does not cover the manager's required history")
+        if self.draft_window_size is None and (
+            self.draft_max_position_embeddings is not None
+            and end > self.draft_max_position_embeddings
+        ):
+            raise ValueError("Draft rebuild exceeds the draft position limit")
+        self.get_draft_block_table([request_id], require_available=False)
+        self._unavailable_draft_requests.discard(request_id)
 
     def get_draft_block_table(
-        self,
-        request_ids: List[int],
-        histories: Optional[Sequence[StandaloneDraftHistory]] = None,
+        self, request_ids: list[int], *, require_available: bool = True
     ) -> torch.Tensor:
-        """Current rank-local page mappings; unused tail entries point to page zero."""
-        batch_indices = self.get_draft_block_indices(request_ids, histories)
+        """Validate retained history and speculative scratch for every draft layer."""
+        expanded = self._helix_cp_size > 1
         table = torch.zeros((len(request_ids), self.draft_max_blocks_per_seq), dtype=torch.int32)
-        for row, indices in enumerate(batch_indices):
-            table[row, : len(indices)] = torch.tensor(indices, dtype=torch.int32)
+        for layer_idx in self.draft_layer_ids:
+            for request_id in request_ids:
+                cache = self.kv_cache_map.get(request_id)
+                if cache is None or not cache.is_active:
+                    raise ValueError(f"Standalone draft request {request_id} has no active cache")
+                if require_available and not self.is_draft_available(request_id):
+                    raise ValueError(f"Standalone draft request {request_id} is unavailable")
+            batch_indices = self.get_batch_cache_indices(
+                request_ids, layer_idx, raw_indices=expanded
+            )
+            if expanded:
+                converter = self.impl.get_page_index_converter(
+                    self.layer_offsets[layer_idx], Role.KEY
+                )
+                batch_indices = [
+                    converter(indices, PageIndexMode.SHARED) for indices in batch_indices
+                ]
+            for row, indices in enumerate(batch_indices):
+                if (
+                    len(indices) != self.get_draft_num_blocks(request_ids[row])
+                    or len(indices) > self.draft_max_blocks_per_seq
+                ):
+                    raise ValueError(
+                        "Standalone draft cache has an incomplete or oversized page table"
+                    )
+                start, _ = self.get_draft_history_range(request_ids[row])
+                if any(
+                    index == BAD_PAGE_INDEX for index in indices[start // self.tokens_per_block :]
+                ):
+                    raise ValueError(
+                        "Draft cache contains missing pages in its required history or scratch"
+                    )
+                if layer_idx == self.draft_layer_ids[0]:
+                    table[row, : len(indices)] = torch.tensor(indices, dtype=torch.int32)
         return table
 
-    def get_draft_history(self, request_id: int) -> Optional[StandaloneDraftHistory]:
-        return self.draft_history.get(request_id)
+    def get_draft_block_indices(self, request_ids: list[int]) -> list[list[int]]:
+        """Validated mappings for allocated draft pages, without padding."""
+        table = self.get_draft_block_table(request_ids)
+        return [
+            table[row, : self.get_draft_num_blocks(request_id)].tolist()
+            for row, request_id in enumerate(request_ids)
+        ]
 
-    def set_draft_history(self, request_id: int, valid_length: int, position: int) -> None:
-        cache = self.kv_cache_map.get(request_id)
-        if cache is None or not cache.is_active:
-            raise ValueError(
-                f"Standalone draft request {request_id} has no active cache allocation"
-            )
-        history = StandaloneDraftHistory(valid_length, position)
-        if history.position > cache.capacity:
-            raise ValueError("Standalone draft history exceeds allocated capacity")
-        if self.draft_window_size is not None and history.valid_length > self.draft_window_size:
-            raise ValueError("Draft history exceeds its retention window")
-        self.draft_history[request_id] = history
-
-    def export_draft_history(self, request_id: int) -> Optional[dict]:
-        if not self.draft_layer_ids:
-            return None
-        if self._draft_history_uses_kv_history():
+    def get_draft_execution_block_table(self, request_ids: list[int]) -> torch.Tensor:
+        """Keep unavailable rows addressable only through their private scratch pages."""
+        rows = []
+        for request_id in request_ids:
+            if self.is_draft_available(request_id):
+                try:
+                    rows.append(self.get_draft_block_table([request_id])[0])
+                    continue
+                except ValueError:
+                    self.invalidate_draft(request_id)
+            # No retained KV is read for this row. Only the trailing scratch
+            # pages may be written by the fixed-shape draft execution.
             cache = self.kv_cache_map[request_id]
             if not cache.is_active:
-                raise ValueError("Embedded DSpark transfer requires an active cache")
-            return {
-                "valid_length": min(cache.history_length, self.draft_window_size),
-                "position": cache.history_length,
-                "layout": self.get_draft_transfer_identity(),
-            }
-        history = self.get_draft_history(request_id)
-        if history is None:
-            raise ValueError(
-                f"Standalone draft request {request_id} has no valid history to transfer"
-            )
+                raise ValueError("Draft execution requires an active cache")
+            expanded = self._helix_cp_size > 1
+            table = None
+            for layer_idx in self.draft_layer_ids:
+                indices = self.get_batch_cache_indices(
+                    [request_id], layer_idx, raw_indices=expanded
+                )[0]
+                if expanded:
+                    converter = self.impl.get_page_index_converter(
+                        self.layer_offsets[layer_idx], Role.KEY
+                    )
+                    indices = converter(indices, PageIndexMode.SHARED)
+                scratch_start = (
+                    cache.history_length + self.tokens_per_block - 1
+                ) // self.tokens_per_block
+                if (
+                    len(indices) != self.get_draft_num_blocks(request_id)
+                    or len(indices) > self.draft_max_blocks_per_seq
+                    or scratch_start >= len(indices)
+                    or any(index == BAD_PAGE_INDEX for index in indices[scratch_start:])
+                ):
+                    raise ValueError("Unavailable draft cache is missing its speculative scratch")
+                if table is None:
+                    table = torch.full(
+                        (self.draft_max_blocks_per_seq,), indices[-1], dtype=torch.int32
+                    )
+                    table[: len(indices)] = torch.tensor(
+                        [index if index != BAD_PAGE_INDEX else indices[-1] for index in indices],
+                        dtype=torch.int32,
+                    )
+            rows.append(table)
+        return torch.stack(rows)
+
+    def export_draft_history(self, request_id: int) -> dict | None:
+        """Transfer the manager watermark and explicit draft availability."""
+        if not self.draft_layer_ids:
+            return None
+        cache = self.kv_cache_map[request_id]
+        if not cache.is_active:
+            raise ValueError("Draft transfer requires an active cache")
+        start, end = self.get_draft_history_range(request_id)
+        available = self.is_draft_available(request_id)
+        if available:
+            try:
+                self.get_draft_block_table([request_id])
+            except ValueError:
+                self.invalidate_draft(request_id)
+                available = False
         return {
-            "valid_length": history.valid_length,
-            "position": history.position,
+            "available": available,
+            "valid_length": end - start if available else 0,
+            "position": end,
             "layout": self.get_draft_transfer_identity(),
         }
 
     def restore_draft_history(self, request_id: int, metadata: dict) -> None:
+        """Validate received coverage against local history before enabling drafting."""
         if not self.draft_layer_ids or metadata.get("layout") != self.get_draft_transfer_identity():
             raise ValueError("Standalone draft transfer layout does not match the receiving worker")
-        valid_length = metadata.get("valid_length")
-        position = metadata.get("position")
-        if self._draft_history_uses_kv_history():
-            cache = self.kv_cache_map[request_id]
-            # Receive admission establishes the global prompt watermark; the
-            # transfer completion path validates that the received KV covers it.
-            if (
-                type(position) is not int
-                or type(valid_length) is not int
-                or position != cache.history_length
-                or valid_length != min(position, self.draft_window_size)
-            ):
-                raise ValueError("Embedded DSpark transfer does not match the admitted KV history")
-            self.get_draft_block_table([request_id])
-            return
-        history = StandaloneDraftHistory(valid_length, position)
-        # Validate receiver-local allocation before publishing history.
-        self.get_draft_block_table([request_id], [history])
-        self.set_draft_history(request_id, valid_length, position)
+        start, end = self.get_draft_history_range(request_id)
+        available = metadata.get("available")
+        if (
+            type(available) is not bool
+            or type(metadata.get("position")) is not int
+            or type(metadata.get("valid_length")) is not int
+            or metadata["position"] != end
+            or metadata["valid_length"] != (end - start if available else 0)
+        ):
+            raise ValueError("Draft transfer does not match the admitted KV history")
+        if available:
+            self.complete_draft_rebuild(request_id, start, end)
+        else:
+            self.invalidate_draft(request_id)
 
     def get_index_k_buffer(
         self,
@@ -4164,19 +4217,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.enable_swa_scratch_reuse = False
             if not self._resume_and_restore(req.py_request_id, kv_cache):
                 return None
-            if (
-                self.draft_layer_ids
-                and not self._draft_history_uses_kv_history()
-                and req.py_request_id not in self.draft_history
-            ):
-                # The reuse match covers every cache domain. Initialize once,
-                # after resume succeeds, so overlap/chunk retries cannot rewind
-                # draft history that has already advanced on the device.
-                reused = kv_cache.num_committed_tokens
-                valid_length = reused
-                if self.draft_window_size is not None:
-                    valid_length = min(valid_length, self.draft_window_size)
-                self.set_draft_history(req.py_request_id, valid_length, reused)
             return kv_cache.num_committed_tokens
 
         # Subsequent chunk: cache must exist from first chunk. It may be
@@ -4312,6 +4352,8 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
+        if self.draft_layer_ids:
+            self.invalidate_draft(req.py_request_id)
         success = kv_cache.resize(capacity, prompt_len)
         if not success:
             if req.is_first_context_chunk:
@@ -5813,6 +5855,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
             and not request.is_dummy_request
             and not self._draft_context_exceeds_limit(request)
+            and (not self.draft_layer_ids or self.is_draft_available(request.py_request_id))
         )
         if not should_block_reuse:
             return
@@ -5878,7 +5921,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         if self.draft_layer_ids:
-            self.draft_history.pop(request.py_request_id, None)
+            self._unavailable_draft_requests.discard(request.py_request_id)
             self._draft_dummy_request_ids.discard(request.py_request_id)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
@@ -6151,7 +6194,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         if self.draft_layer_ids:
-            self.draft_history.clear()
+            self._unavailable_draft_requests.clear()
             self._draft_dummy_request_ids.clear()
         self._disagg_receive_ready.clear()
         self._request_stats_enabled_ids.clear()
@@ -6310,12 +6353,15 @@ class KVCacheManagerV2(BaseResourceManager):
             # update still needs to process it. The request will be resumed by
             # the scheduler next iteration.
             if not kv_cache.is_active:
+                if self.draft_layer_ids:
+                    self.invalidate_draft(req.py_request_id)
                 continue
             should_block_reuse = (
                 self.enable_block_reuse
                 and self._can_publish_block_reuse
                 and not req.is_dummy_request
                 and not self._draft_context_exceeds_limit(req)
+                and (not self.draft_layer_ids or self.is_draft_available(req.py_request_id))
             )
             is_all_reusable = self.block_reuse_policy == BlockReusePolicy.ALL_REUSABLE
             should_resize = not should_block_reuse or not is_all_reusable
@@ -6363,6 +6409,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # needs to process it. Skip suspended caches — the request
             # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
+                if self.draft_layer_ids:
+                    self.invalidate_draft(req.py_request_id)
                 continue
             accepted_draft_len = req.py_num_accepted_draft_tokens
             runtime_draft_len = req.py_rewind_len + accepted_draft_len
@@ -6382,15 +6430,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
                 else kv_cache.capacity - rewind_len
             )
-            embedded_draft = KVCacheManagerV2._draft_history_uses_kv_history(self)
-            if self.draft_layer_ids and not embedded_draft and new_capacity is not None:
-                draft_history = self.get_draft_history(req.py_request_id)
-                if draft_history is not None:
-                    # Rejected target verification slots do not revoke draft
-                    # feature history. Retain it and its next-forward scratch.
-                    new_capacity = max(
-                        new_capacity, draft_history.position + self._standalone_draft_reserve
-                    )
             history_length = (
                 None
                 # Reuse (history's consumer) is disabled under helix, and
@@ -6398,14 +6437,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )
-            if embedded_draft and self._has_cp_helix:
+            if self.draft_layer_ids and self._has_cp_helix:
                 # HELIX stores rank-local prompt tokens but generated tokens
                 # are replicated. The cache ledger uses global positions.
                 history_length = (
                     req.total_input_len_cp + req.max_beam_num_tokens - req.py_prompt_len - 1
                 )
-            if embedded_draft and new_capacity is not None and history_length is not None:
-                new_capacity = max(new_capacity, history_length)
+            if self.draft_layer_ids and new_capacity is not None:
+                committed = kv_cache.history_length if history_length is None else history_length
+                new_capacity = max(new_capacity, committed + self._standalone_draft_reserve)
+                if (
+                    self.draft_window_size is None
+                    and self.draft_max_position_embeddings is not None
+                    and committed > self.draft_max_position_embeddings
+                ):
+                    self.invalidate_draft(req.py_request_id)
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(

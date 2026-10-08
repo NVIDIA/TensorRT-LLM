@@ -6426,16 +6426,6 @@ class PyTorchModelEngine(ModelEngine):
                             restore_attn_metadata_after_draft_replay(
                                 attn_metadata, saved_draft)
 
-            if (spec_worker is not None and not is_dummy
-                    and not self.cuda_graph_runner.is_warmup_only):
-                draft_history_update = spec_worker.snapshot_managed_draft_history(
-                )
-                if draft_history_update is not None:
-                    # Graph output dictionaries persist across replays. Each
-                    # overlapped iteration must retain its own host readback.
-                    outputs = dict(outputs)
-                    outputs['draft_history_update'] = draft_history_update
-
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 

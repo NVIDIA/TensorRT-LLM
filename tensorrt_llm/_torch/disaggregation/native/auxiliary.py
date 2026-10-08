@@ -114,8 +114,8 @@ def build_aux_transfer_layout(
 
 AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
 
-_DRAFT_HISTORY_VERSION = 2
-_DRAFT_HISTORY_FIELDS = 10
+_DRAFT_HISTORY_VERSION = 3
+_DRAFT_HISTORY_FIELDS = 11
 _DRAFT_DTYPE_CODES = {"torch.float16": 1, "torch.bfloat16": 2}
 _DRAFT_BACKEND_CODES = {"VANILLA": 1, "TRTLLM": 2, "DSv4": 3}
 
@@ -127,6 +127,7 @@ def _encode_draft_history(history: dict[str, Any]) -> list[int]:
     layout = history["layout"]
     return [
         _DRAFT_HISTORY_VERSION,
+        int(history["available"]),
         history["valid_length"],
         history["position"],
         layout["num_layers"],
@@ -144,6 +145,7 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
         raise ValueError("Missing or unsupported standalone draft history metadata version")
     (
         _,
+        available,
         valid_length,
         position,
         num_layers,
@@ -154,6 +156,8 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
         kv_factor,
         window_size,
     ) = values
+    if available not in (0, 1):
+        raise ValueError("Invalid draft availability in transfer metadata")
     dtypes = {code: name for name, code in _DRAFT_DTYPE_CODES.items()}
     backends = {code: name for name, code in _DRAFT_BACKEND_CODES.items()}
     layout = {
@@ -166,6 +170,7 @@ def _decode_draft_history(values: list[int]) -> dict[str, Any]:
         "window_size": window_size or None,
     }
     return {
+        "available": bool(available),
         "valid_length": valid_length,
         "position": position,
         "layout": layout,

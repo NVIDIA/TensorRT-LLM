@@ -1902,8 +1902,12 @@ class KvCacheCreator:
                 if self._mapping.has_cp_helix() else self._mapping)
 
     def _get_draft_scratch_tokens(self) -> int:
-        return 0 if self._is_embedded_dspark(
-        ) else self._speculative_config.max_draft_len + 1
+        if self._is_embedded_dspark():
+            return 0
+        block = self._speculative_config.max_draft_len + 1
+        # GPU history can lead the committed watermark by one verification
+        # step. Preserve that prefix, the draft block, and page alignment.
+        return 2 * block + self._tokens_per_block
 
     def _get_unified_draft_cache_kwargs(self) -> dict:
         """Pass draft storage properties separately from its history requirements."""

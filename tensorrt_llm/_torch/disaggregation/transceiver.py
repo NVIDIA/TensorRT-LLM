@@ -661,18 +661,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return req.prompt_len
 
     def _validate_draft_history_range(self, req: LlmRequest, history: dict) -> None:
-        # Full-attention drafters can skip an oversized context store; rolling
-        # drafters retain their complete live suffix. Neither includes scratch.
         window_size = history["layout"]["window_size"]
-        max_positions = self._kv_cache_manager.draft_max_position_embeddings
         prompt_len = self._global_prompt_len(req)
+        if type(history.get("available")) is not bool:
+            raise ValueError("Draft transfer requires explicit availability")
         expected_length = prompt_len
         if window_size is not None:
             if type(window_size) is not int or window_size <= 0:
                 raise ValueError("Invalid draft history window size")
             expected_length = min(expected_length, window_size)
-        elif max_positions is not None and prompt_len > max_positions:
-            expected_length = min(history["valid_length"], max_positions)
+        if not history["available"]:
+            expected_length = 0
         if history["valid_length"] != expected_length or history["position"] != prompt_len:
             raise ValueError(
                 "DSpark transfer requires valid draft history and sequence position "
@@ -694,17 +693,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         has_draft = bool(getattr(manager, "draft_layer_ids", ()))
         if history is None:
             if has_draft:
-                raise ValueError(
-                    "Standalone DSpark generation requires draft history from a prefill worker "
-                    "with matching speculative configuration; draft history metadata is missing."
-                )
+                manager.invalidate_draft(req.py_request_id)
             return
         if not has_draft:
             raise ValueError(
                 "Received standalone DSpark draft history without a manager-owned draft cache."
             )
         self._validate_draft_history_range(req, history)
-        # K/V already occupies receiver-local pages; restore only validity and position.
+        # Validate completed writes against the admitted manager history.
         self._kv_cache_manager.restore_draft_history(req.py_request_id, history)
 
     def _prepare_received_history(self, session: RxSessionBase, req: LlmRequest) -> None:
