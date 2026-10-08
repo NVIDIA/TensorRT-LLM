@@ -20,6 +20,7 @@ import itertools
 import logging
 import os
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1923,6 +1924,172 @@ def test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics() -> None:
         # This clamp-heavy input is intentionally wider than the generic
         # MegaMoE sweep and needs one percentage point of NVFP4 headroom.
         check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
+
+
+@pytest.fixture(scope="module")
+def _run_megamoe_prologue_helper() -> Callable[[int, bool], torch.Tensor]:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("The scheduler helper regression requires an SM107 CUDA GPU")
+
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("cutlass-dsl is not available")
+
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    import cutlass.utils as utils
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cutlass_dsl import Boolean, Int32
+    from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.api import ImplDesc, ProblemDesc
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.device_workspace import (
+        DeviceWorkspace,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.helpers.smem_workspace import (
+        SmemWorkspace,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_mapping import (
+        BlockPhase,
+        map_phase_interleaved_fc12_work_id,
+        resolve_phase_interleaved_fc1_claim_target,
+    )
+    from tensorrt_llm._torch.cute_dsl_kernels.cutedsl_megamoe.kernel_src.schedulers.fc12_scheduler import (
+        PhaseInterleavedFc12Scheduler,
+    )
+
+    class PrologueProbe:
+        def __init__(self) -> None:
+            self.scheduler = PhaseInterleavedFc12Scheduler(
+                ProblemDesc(dict(expert_count=1, intermediate_gateup_size=128, hidden_size=128)),
+                ImplDesc(
+                    dict(
+                        num_scheduler_consumer_threads=32,
+                        mma_tiler_mnk=(128, 128, 64),
+                        cluster_shape_mn=(1, 1),
+                        use_2cta_instrs=False,
+                        hint=1,
+                        token_padding_block=128,
+                        sf_padding_block=128,
+                        work_id_mode="atomic_counter",
+                        is_swap_ab=False,
+                        launch_cluster_count=3,
+                    )
+                ),
+            )
+            assert self.scheduler.minimum_global_fc1_claims == 3
+            self.smem = SmemWorkspace()
+            self.device = DeviceWorkspace()
+            self.scheduler.register_smem_regions(self.smem)
+            self.scheduler.register_device_workspace(self.device)
+            self.smem.finalize()
+            self.device.finalize()
+            alignment = self.smem.base_alignment
+            self.smem_launch_bytes = (
+                (self.smem.total_bytes + alignment - 1) // alignment * alignment
+            )
+            assert self.smem_launch_bytes >= self.smem.storage_class().size_in_bytes()
+
+        @cute.jit
+        def __call__(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+            stream: cuda.CUstream,
+        ) -> None:
+            self.kernel(counts, workspace, exhausted, output).launch(
+                grid=(1, 1, 1), block=(32, 1, 1), smem=self.smem_launch_bytes, stream=stream
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            counts: cute.Tensor,
+            workspace: cute.Tensor,
+            exhausted: cute.Tensor,
+            output: cute.Tensor,
+        ) -> None:
+            storage = utils.SmemAllocator().allocate(self.smem.storage_class())
+            self.device.assign_device_members(workspace.iterator)
+            self.scheduler.assign_device_members(
+                expert_token_sizes=counts,
+                expert_token_prefix_sum=None,
+                actual_expert_shape=None,
+                block_idx=cute.arch.block_idx(),
+                smem_workspace=self.smem,
+                smem_base=storage.buffer.data_ptr(),
+                device_workspace=self.device,
+            )
+            pipeline_init_arrive(cluster_shape_mn=(1, 1), is_relaxed=True)
+            pipeline_init_wait(cluster_shape_mn=(1, 1))
+            worker = self.scheduler._work_id_worker
+            state = self.scheduler._task_mapping_state
+            _, fc1_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear1), (Int32(0), Int32(0), Int32(0)), state
+            )
+            _, fc2_valid, state = map_phase_interleaved_fc12_work_id(
+                Int32(0), Int32(BlockPhase.Linear2), (Int32(0), Int32(0), Int32(0)), state
+            )
+            target, short_stream = resolve_phase_interleaved_fc1_claim_target(
+                Int32(self.scheduler.minimum_global_fc1_claims), state
+            )
+            input_exhausted = Boolean(exhausted[0])
+            pointer = worker.get_atomic_counter_pointer(Int32(0))
+            result = self.scheduler._wait_for_fc1_prologue_claims(input_exhausted, worker, state)
+            tid, _, _ = cute.arch.thread_idx()
+            output[tid, 0] = Int32(result)
+            output[tid, 1] = cute.arch.load(pointer, Int32, sem="acquire", scope="gpu")
+            output[tid, 2] = target
+            output[tid, 3] = Int32(short_stream)
+            output[tid, 4] = Int32(fc1_valid)
+            output[tid, 5] = Int32(fc2_valid)
+
+    probe = PrologueProbe()
+    counts = torch.tensor([1], device="cuda", dtype=torch.int32)
+    workspace = torch.zeros(probe.device.total_bytes("local"), device="cuda", dtype=torch.uint8)
+    exhausted = torch.zeros(1, device="cuda", dtype=torch.int32)
+    output = torch.full((32, 6), -1, device="cuda", dtype=torch.int32)
+    tensors = tuple(
+        from_dlpack(t, assumed_align=16) for t in (counts, workspace, exhausted, output)
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(probe, *tensors, stream)
+    counter_index = probe.device.offset(probe.scheduler._work_id_worker.work_id_counter_region) // 4
+
+    def run(counter: int, input_exhausted: bool) -> torch.Tensor:
+        workspace.zero_()
+        workspace.view(torch.int32)[counter_index] = counter
+        workspace.view(torch.int32)[counter_index + 1] = 1
+        exhausted.fill_(int(input_exhausted))
+        output.fill_(-1)
+        compiled(*tensors, stream)
+        torch.cuda.synchronize()
+        return output.cpu()
+
+    return run
+
+
+@pytest.mark.parametrize(
+    "counter,input_exhausted",
+    [(1, False), (3, False), (2, True)],
+    ids=["slow-peek", "fast-peek", "already-exhausted"],
+)
+def test_fc1_prologue_wait_preserves_exhaustion(
+    _run_megamoe_prologue_helper: Callable[[int, bool], torch.Tensor],
+    counter: int,
+    input_exhausted: bool,
+) -> None:
+    # One observer warp represents a three-cluster snapshot with one real FC1
+    # tile. Counter 1 precedes peer arrivals; counter 3 includes two invalid peer
+    # claims. Already-exhausted controls include an invalid local claim.
+    actual = _run_megamoe_prologue_helper(counter, input_exhausted)
+    expected = torch.tensor(
+        [int(input_exhausted), counter, 1, 1, 1, 1], dtype=torch.int32
+    ).expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def run_backend_moe(

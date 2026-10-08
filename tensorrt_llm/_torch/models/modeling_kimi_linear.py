@@ -116,7 +116,7 @@ from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from ..modules.linear import Linear as TrtllmLinear
 from ..modules.linear import TensorParallelMode, load_weight_shard
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
@@ -1296,6 +1296,16 @@ class KimiK3MoERuntime(nn.Module):
         # Direct MoE-TP leaves both branches as partials for one concatenated
         # all-reduce.
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
+        # Fused-comm MegaMoE runs its own cross-rank exchange inside the
+        # kernel. Order the shared-expert all-reduce after the routed MoE
+        # instead of running the two collectives concurrently (startup
+        # deadlocks). CuteDSL is the validated scope, not a correctness
+        # dependency: DeepGEMM rejects TP without attention DP.
+        self._defer_shared_allreduce = (
+            use_shared_tp
+            and routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL"
+            and self.routed_experts.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
         self._reduce_routed_output = (
             use_shared_tp
             and self.routed_experts.backend.scheduler_kind != MoESchedulerKind.FUSED_COMM
@@ -1328,6 +1338,7 @@ class KimiK3MoERuntime(nn.Module):
         self.shared_expert_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
+        self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
@@ -1572,6 +1583,12 @@ class KimiK3MoERuntime(nn.Module):
         identity = hidden_states
         router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
+        overlap_shared_allreduce = (
+            self._defer_shared_allreduce
+            and do_multi_stream()
+            and self.shared_expert_stream is not None
+            and not torch.compiler.is_compiling()
+        )
 
         def _routed_output():
             # Latent down/up projections via the min-latency fused GEMM op:
@@ -1590,27 +1607,47 @@ class KimiK3MoERuntime(nn.Module):
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
             )
+            if overlap_shared_allreduce:
+                self.moe_routed_event.record()
             if self._reduce_routed_output:
                 return y
             # Communication-backed paths return a complete routed result.
             y = self.routed_expert_norm(y)
             return self._routed_projection(y, self.routed_expert_up_proj)
 
+        def _shared_output():
+            shared_out = self.shared_experts(
+                identity,
+                final_all_reduce_params=(
+                    AllReduceParams(enable_allreduce=False)
+                    if self._defer_shared_allreduce
+                    else None
+                ),
+            )
+            if overlap_shared_allreduce:
+                # Wait for all routed chunks, but overlap the norm/up tail.
+                self.moe_routed_event.wait()
+                shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
+            return shared_out
+
         # Shared experts depend only on the block input, so overlap their GEMMs
         # with the routed dispatch/expert/combine chain. Multi-stream engages
         # only under CUDA graphs; otherwise both branches run in order on the
         # default stream. The shared GatedMLP includes its output all-reduce on
-        # the auxiliary stream. The join below must precede the routed
-        # all-reduce: concurrent collectives on different streams can corrupt
-        # SYMM_MEM all-reduce state.
+        # the auxiliary stream (deferred past the routed MoE for fused-comm
+        # MegaMoE). The final join includes the shared all-reduce, so it
+        # precedes the routed all-reduce: concurrent collectives on different
+        # streams can corrupt SYMM_MEM all-reduce state.
         routed_out, shared_out = maybe_execute_in_parallel(
             _routed_output,
-            lambda: self.shared_experts(identity),
+            _shared_output,
             self.moe_main_event,
             self.moe_shared_event,
             self.shared_expert_stream,
             disable_on_compile=True,
         )
+        if self._defer_shared_allreduce and not overlap_shared_allreduce:
+            shared_out = self.shared_experts.down_proj.all_reduce(shared_out)
         if self._reduce_routed_output:
             # RMSNorm folded into the routed all-reduce (RMS_NORM fusion): the
             # MNNVL kernel normalizes straight out of the lamport buffer, so
