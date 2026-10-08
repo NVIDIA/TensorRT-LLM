@@ -21,11 +21,13 @@ and the block itself. Stale tokens the whole-page eviction keeps resident must
 not be seen.
 """
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
+from utils.kv_causal_reference import exact_reference as _exact_reference
+from utils.kv_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
@@ -64,28 +66,7 @@ def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
     )
 
 
-def reference_attention(q, keys, values):
-    """q [T, H, D]; keys/values [S, H_kv, D] already restricted to the visible set."""
-    rep = NUM_HEADS // NUM_KV_HEADS
-    kx = keys.repeat_interleave(rep, dim=1)
-    vx = values.repeat_interleave(rep, dim=1)
-    out = F.scaled_dot_product_attention(
-        q.transpose(0, 1).float().unsqueeze(0),
-        kx.transpose(0, 1).float().unsqueeze(0),
-        vx.transpose(0, 1).float().unsqueeze(0),
-    )
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
-
-
-def exact_reference(q, pk, pv, hk, hv, k, v, start, end):
-    """Attention of the new tokens ``[start, end)`` of the chunk ``k``/``v`` over what the
-    window allows: the prompt, the ``WINDOW`` keys before ``start`` and the chunk up
-    to ``end``. ``hk``/``hv`` are every history token committed so far, oldest first."""
-    keys = torch.cat([pk, hk, k[:end]])
-    values = torch.cat([pv, hv, v[:end]])
-    pos = torch.arange(keys.shape[0], device=keys.device)
-    visible = (pos < pk.shape[0]) | (pos >= pk.shape[0] + hk.shape[0] + start - WINDOW)
-    return reference_attention(q[start:end], keys[visible], values[visible])
+exact_reference = partial(_exact_reference, window=WINDOW)
 
 
 @pytest.fixture(params=[32, 64], ids=["tpb32", "tpb64"])

@@ -32,7 +32,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
+from utils.kv_causal_reference import exact_reference
 
 from tensorrt_llm._torch.distributed import all_to_all_4d
 from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
@@ -85,29 +85,6 @@ def run_distributed(test_fn):
     spawn_with_retry(
         lambda port: mp.spawn(_worker, args=(WORLD, test_fn, port), nprocs=WORLD, join=True)
     )
-
-
-def exact_reference(q, pk, pv, hk, hv, k, v, start, end, window):
-    """The new tokens ``[start, end)`` over the prompt, the ``window`` keys before
-    ``start`` and the chunk up to ``end``; ``hk``/``hv`` all committed history."""
-    keys = torch.cat([pk, hk, k[:end]])
-    values = torch.cat([pv, hv, v[:end]])
-    pos = torch.arange(keys.shape[0], device=keys.device)
-    visible = (pos < pk.shape[0]) | (pos >= pk.shape[0] + hk.shape[0] + start - window)
-    return reference_attention(q[start:end], keys[visible], values[visible])
-
-
-def reference_attention(q, keys, values):
-    """Full heads: q [T, H, D], keys/values [S, H_kv, D] restricted to the visible set."""
-    rep = q.shape[1] // keys.shape[1]
-    kx = keys.repeat_interleave(rep, dim=1)
-    vx = values.repeat_interleave(rep, dim=1)
-    out = F.scaled_dot_product_attention(
-        q.transpose(0, 1).float().unsqueeze(0),
-        kx.transpose(0, 1).float().unsqueeze(0),
-        vx.transpose(0, 1).float().unsqueeze(0),
-    )
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
 
 
 def make_backend(name, chunk, prompt=PROMPT, window=WINDOW):

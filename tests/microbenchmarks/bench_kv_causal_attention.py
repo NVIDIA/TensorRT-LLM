@@ -43,6 +43,7 @@ import statistics
 import sys
 import time
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +51,10 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+
+# The fp32 reference shared with the unit tests lives in the unittest tree.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "unittest"))
+from utils.kv_causal_reference import exact_reference  # noqa: E402
 
 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 32, 8, 128
 TOKENS_PER_FRAME, FRAMES_PER_CHUNK = 394, 4
@@ -230,18 +235,6 @@ def sdpa(q, k, v):
     return F.scaled_dot_product_attention(
         q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None], enable_gqa=True
     )[0].transpose(0, 1)
-
-
-def exact_reference(q, kp, vp, hk, hv, k, v, lo, hi, window):
-    """Reference for block ``[lo, hi)`` of the chunk.
-
-    Over the prompt, the ``window`` keys before the block and the chunk up to
-    ``hi``; ``hk``/``hv`` are every committed history token.
-    """
-    keys, values = torch.cat((kp, hk, k[:hi])), torch.cat((vp, hv, v[:hi]))
-    pos = torch.arange(keys.shape[0], device=keys.device)
-    visible = (pos < kp.shape[0]) | (pos >= kp.shape[0] + hk.shape[0] + lo - window)
-    return sdpa(q[lo:hi].float(), keys[visible].float(), values[visible].float())
 
 
 def chunk_cycle(args, gen) -> None:

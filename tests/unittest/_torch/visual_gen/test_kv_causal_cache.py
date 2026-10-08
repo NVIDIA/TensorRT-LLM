@@ -394,10 +394,10 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
                 (chunk, NUM_KV_HEADS, HEAD_DIM), float(c + 64 * layer), device=DEVICE, dtype=DTYPE
             )
             cache.write_range(layer, cache.staging_offset, stamp, -stamp)
-        before = cache.table_version
+        before = cache.block_table()
         cache.commit(cache.max_staged_tokens)
         written.extend([c] * chunk)
-        saw_rotation |= cache.table_version != before
+        saw_rotation |= cache.block_table() != before
 
         # Whole-page eviction leaves fewer than one page of stale tokens resident.
         assert cache.history_tokens <= window + tpb - 1

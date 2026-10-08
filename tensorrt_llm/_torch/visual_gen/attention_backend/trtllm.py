@@ -43,10 +43,9 @@ from .interface import AttentionBackend, AttentionTensorLayout
 
 # The only page size with shipped trtllm-gen paged context kernels: every paged
 # context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant, and
-# log2(tokens per page) is part of the kernel hash, so any other value misses the
-# lookup and the attention op falls back to an unfused path that silently ignores
-# the cached prefix. Nothing in the tree exposes this number; it lives in the cubin
-# inventory only.
+# log2(tokens per page) is part of the kernel hash, so any other value has no kernel
+# and the attention op refuses the configuration. Nothing in the tree exposes this
+# number; it lives in the cubin inventory only.
 TRTLLM_GEN_TOKENS_PER_PAGE = 32
 
 
@@ -195,8 +194,9 @@ class TrtllmAttentionMetadata:
         self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
     ) -> BaseTrtllmAttentionMetadata:
         """Metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
-        ``causal_block_size`` tokens, request ``i`` with ``past + i*causal_block_size``
-        tokens already cached. All requests are the one sequence and share its table.
+        ``causal_block_size`` tokens, request ``i`` with the fixed region, its window
+        and the ``i`` earlier blocks already cached (``kv_cache.cached_tokens``). All
+        requests are the one sequence; each reads its own row of the cache's table.
 
         One object per (cache, geometry, blocking) for the life of the cache, shared
         by every layer through the model-scoped state. It is built once, eagerly, and
@@ -606,7 +606,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
             if packed is not None:
                 packed = packed[:, :num_tokens]
-        causal_block_size = causal_block_size or num_tokens
+        causal_block_size = num_tokens if causal_block_size is None else causal_block_size
         if num_tokens % causal_block_size:
             raise ValueError(
                 f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}."
