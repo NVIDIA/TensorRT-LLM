@@ -299,6 +299,15 @@ def test_disaggregated_leader_cleanup_timeout_retains_guard(
             raise original_error
 
     monkeypatch.setattr(serve, "_child_p_global", None)
+    # The leader writes these directly; restore their original state at teardown.
+    for name in (
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS.value,
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value,
+        serve.LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value,
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.value,
+        serve.DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX.value,
+    ):
+        monkeypatch.setenv(name, "placeholder")
     monkeypatch.setattr(serve, "find_free_ipc_addr", lambda: "ipc://fake-proxy")
     monkeypatch.setattr(serve.subprocess, "Popen", mock.Mock(return_value=child))
     monkeypatch.setattr(mgmn_leader_node, "launch_server_main", run_server)
