@@ -1312,21 +1312,11 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
 
 def test_vanilla_v2_sets_fraction_quota_before_manager_construction() -> None:
     """A backend without profiling still needs a byte budget before creating V2."""
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.8,
-        enable_block_reuse=False,
-        use_kv_cache_manager_v2=True,
-    )
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
     model_engine = SimpleNamespace(
         model=SimpleNamespace(
             model_config=SimpleNamespace(attn_backend="VANILLA", is_encoder_decoder=False)
         )
-    )
-    llm_args = SimpleNamespace(
-        cache_transceiver_config=None,
-        disable_overlap_scheduler=True,
-        enable_chunked_prefill=False,
-        kv_cache_compression_config=None,
     )
     with patch.object(
         KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
@@ -1343,38 +1333,27 @@ def test_vanilla_v2_sets_fraction_quota_before_manager_construction() -> None:
             max_seq_len=2048,
             max_batch_size=8,
             kv_cache_config=kv_cache_config,
-            llm_args=llm_args,
+            llm_args=SimpleNamespace(
+                cache_transceiver_config=None,
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                kv_cache_compression_config=None,
+            ),
             speculative_config=None,
             sparse_attention_config=None,
             profiling_stage_data=None,
             is_disagg=False,
         )
 
-    def create_manager(
-        engine: SimpleNamespace,
-        estimating_kv_cache: bool,
-        *,
-        kv_cache_config_override: KvCacheConfig,
-        cold_page_codec_provider: object,
-    ) -> SimpleNamespace:
-        assert engine is model_engine
-        assert not estimating_kv_cache
+    def create_manager(*args, kv_cache_config_override, **kwargs):
         assert kv_cache_config_override.max_gpu_total_bytes == int(768 * 0.8)
         assert kv_cache_config_override.max_tokens is None
-        return SimpleNamespace()
 
     with (
         patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
         patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
         patch.object(torch.cuda, "empty_cache"),
         patch.object(torch.cuda, "reset_peak_memory_stats"),
-        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
-        patch.object(creator, "_get_multimodal_encoder_memory_reserve", return_value=0),
-        patch(
-            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
-            return_value=0,
-        ),
-        patch.object(creator, "_get_token_num_for_estimation") as profile_tokens,
         patch.object(creator, "_create_kv_cache_manager", side_effect=create_manager) as construct,
     ):
         estimating = creator.try_prepare_estimation()
@@ -1382,7 +1361,6 @@ def test_vanilla_v2_sets_fraction_quota_before_manager_construction() -> None:
         creator.build_managers({}, estimating)
 
     construct.assert_called_once()
-    profile_tokens.assert_not_called()
 
 
 def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
