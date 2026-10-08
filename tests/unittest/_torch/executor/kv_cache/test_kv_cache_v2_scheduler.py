@@ -49,7 +49,9 @@ def test_generation_admits_decode_before_capacity_growth(
     manager._restore_page_index_bufs = Mock()
     manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
     manager._generation_draft_slots = Mock(return_value=0)
+    manager._overlap_slack_tokens = Mock(return_value=0)
     manager._allocated_draft_lens = {}
+    manager._pending_overlap_slack = {}
     manager._has_cp_helix = False
     manager._fill_fresh_kv_pages = Mock()
     manager._log_window_crossing = Mock()

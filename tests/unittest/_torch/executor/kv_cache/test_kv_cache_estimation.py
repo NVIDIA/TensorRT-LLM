@@ -877,7 +877,7 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
         max_seq_len=4096,
         max_batch_size=3,
         kv_cache_config=KvCacheConfig(
-            max_attention_window=[64],
+            max_attention_window=[63],
             max_util_for_resume=1.0,
         ),
         spec_config=spec_config,
@@ -916,7 +916,7 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
                 | {
                     "kv_cache_config": KvCacheConfig(
                         enable_block_reuse=False,
-                        max_attention_window=[64],
+                        max_attention_window=[63],
                         max_util_for_resume=1.0,
                     )
                 }
@@ -924,9 +924,9 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
         )
     )
 
-    # W=64 plus the base generation token can retain two boundary pages.
-    # One-model draft reuse extends retention to W+D=65; its two-token
-    # generation step can therefore cross into a third page.
+    # W=63 plus the generation lead (base token, one draft and one
+    # overlap-slack token) still fits two boundary pages. One-model draft reuse
+    # extends retention to W+D=64, so that lead can cross into a third page.
     assert no_draft == CacheCost(slope=0, intercept=3 * 128 * 64)
     assert unsupported == no_draft
     assert block_reuse_disabled == no_draft

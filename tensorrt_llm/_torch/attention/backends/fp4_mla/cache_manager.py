@@ -412,8 +412,14 @@ class Fp4MlaV2CacheLayoutPolicy:
             LayerId(local_layer) for local_layer in bf16_local_layers
         ]
         if bf16_local_layers:
+            # Cover the largest capacity a generation allocation can reach,
+            # including the overlap-scheduler slack (one draft length).
             bf16_lifecycle_window = (
-                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
+                self.max_seq_len
+                + self.num_extra_kv_tokens
+                + self._kv_reserve_draft_tokens
+                + 1
+                + self.max_total_draft_tokens
             )
             for local_layer in bf16_local_layers:
                 cache_layers[local_layer] = AttentionLayerConfig(

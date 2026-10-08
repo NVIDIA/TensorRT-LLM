@@ -548,8 +548,16 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
         draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
+    # Each generation allocation also grants up to one draft length of
+    # overlap-scheduler slack (KVCacheManagerV2._overlap_slack_tokens). Count
+    # it here so SWA retention, the block table and static profiling cover the
+    # same capacity the allocator grants.
+    overlap_slack = spec_config.max_total_draft_tokens
     headroom = (
-        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+        get_num_extra_kv_tokens(spec_config)
+        + spec_config.tokens_per_gen_step
+        + dynamic_reserve
+        + overlap_slack
     )
     return reserve, headroom
 
@@ -1742,6 +1750,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # unbounded capacity growth.
 
         self._allocated_draft_lens: dict[int, int] = {}
+
+        # Overlap-scheduler slack (one extra draft length of capacity per
+        # generation allocation, see _overlap_slack_tokens) granted to each
+        # request and not yet reclaimed. update_resources trims it back
+        # separately from the draft-slot rewind so it stays a constant offset
+        # instead of compounding by draft_len every iteration.
+        self._pending_overlap_slack: dict[int, int] = {}
         # Defensive cap for get_num_available_tokens: when host cache is
         # enabled, clamp_max_seq_len_for_mem may return a value that spans
         # both GPU and host tiers.  Storing the explicit max_tokens (if set)
@@ -1766,7 +1781,8 @@ class KVCacheManagerV2(BaseResourceManager):
             self.max_seq_len = int(max_num_tokens)
 
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
-        # Include the same maximum generation lead used by allocation and sizing.
+        # Include the same maximum generation lead used by allocation and sizing;
+        # the headroom already covers the overlap slack.
         max_seq_capacity = self.max_seq_len + self._generation_kv_capacity_headroom
         self.max_blocks_per_seq = (
             max_seq_capacity + self._ledger_tokens_per_block - 1
@@ -3410,9 +3426,48 @@ class KVCacheManagerV2(BaseResourceManager):
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens.
+        Grows *current_capacity* by 1 + draft tokens + the overlap slack (see
+        ``_overlap_slack_tokens``).
         """
-        return current_capacity + BASE_GENERATION_TOKEN_COUNT + self._generation_draft_slots(req)
+        return (
+            current_capacity
+            + BASE_GENERATION_TOKEN_COUNT
+            + self._generation_draft_slots(req)
+            + self._overlap_slack_tokens(req)
+        )
+
+    def _overlap_slack_tokens(self, req: LlmRequest) -> int:
+        """Extra capacity granted per generation allocation for speculative decoding.
+
+        Under the overlap scheduler the device-side KV position runs one
+        verification round ahead of host bookkeeping (up to draft_len
+        accepted-but-uncommitted tokens), and the MTP draft layers then append
+        draft KV beyond that position. Without this slack the draft KV append
+        can address a block the host has not allocated yet whenever the overrun
+        crosses a tokens_per_block boundary, which faults in the MLA RoPE
+        generation kernel (observed with DeepSeek-V4 DEP + MTP3 at 128k).
+
+        The slack is recorded in ``_pending_overlap_slack`` when granted and
+        trimmed by ``update_resources``, so it is a constant offset over the
+        request's lifetime rather than a per-iteration leak.
+        """
+        return self._effective_draft_len(req)
+
+    def _grant_overlap_slack(self, request_id: int, slack: int) -> None:
+        if slack > 0:
+            self._pending_overlap_slack[request_id] = (
+                self._pending_overlap_slack.get(request_id, 0) + slack
+            )
+
+    def _revoke_overlap_slack(self, request_id: int, slack: int) -> int:
+        """Give back up to ``slack`` pending tokens; return how many were pending."""
+        pending = self._pending_overlap_slack.get(request_id, 0)
+        revoked = min(pending, max(slack, 0))
+        if pending - revoked > 0:
+            self._pending_overlap_slack[request_id] = pending - revoked
+        else:
+            self._pending_overlap_slack.pop(request_id, None)
+        return revoked
 
     def _generation_draft_slots(self, req: LlmRequest) -> int:
         """Physical draft width reserved for one iteration. Dynamic-tree draft pools
@@ -3427,7 +3482,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
-        draft tokens). Returns True on success, False if allocation failed.
+        draft tokens + overlap slack). Returns True on success, False if
+        allocation failed.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -3445,12 +3501,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
         request_id = req.py_request_id
         draft_slots = self._generation_draft_slots(req)
+        overlap_slack = self._overlap_slack_tokens(req)
         self._allocated_draft_lens.pop(request_id, None)
         is_helix_req = self._has_cp_helix and not req.is_dummy_request
         if is_helix_req:
             self._set_helix_rank_fields(req)
         pre_capacity = kv_cache.capacity
-        new_capacity = pre_capacity + 1 + draft_slots
+        new_capacity = pre_capacity + 1 + draft_slots + overlap_slack
         if not kv_cache.resize(new_capacity):
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
@@ -3460,6 +3517,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # same step instead of skipping one.
             req.py_helix_decode_group_index += 1
         self._allocated_draft_lens[request_id] = draft_slots
+        self._grant_overlap_slack(request_id, overlap_slack)
         return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
@@ -3479,13 +3537,16 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
             return
+        # The reverted growth included this allocation's overlap slack; deduct
+        # it so update_resources does not trim slack that no longer exists.
+        overlap_slack = self._revoke_overlap_slack(request_id, self._overlap_slack_tokens(req))
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
         if self._has_cp_helix and not req.is_dummy_request and req.py_helix_decode_group_index > 0:
             # The forward pass for this step is skipped; give the step back.
             req.py_helix_decode_group_index -= 1
-        reverted_cap = kv_cache.capacity - 1 - draft_slots
+        reverted_cap = kv_cache.capacity - 1 - draft_slots - overlap_slack
         if reverted_cap < 0:
             return
         if not kv_cache.resize(reverted_cap):
@@ -3867,9 +3928,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if allocated is None:
             return
         current_draft_len = get_draft_token_length(request)
-        delta = current_draft_len - allocated
-        if delta <= 0:
+        draft_delta = current_draft_len - allocated
+        if draft_delta <= 0:
             return
+        # The overlap slack tracks the draft length, so it grows by the same
+        # amount as the draft slots.
+        delta = 2 * draft_delta
         kv_cache = self.kv_cache_map[request.py_request_id]
         new_capacity = kv_cache.capacity + delta
         success = kv_cache.resize(new_capacity)
@@ -3880,6 +3944,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
+        self._grant_overlap_slack(request.py_request_id, draft_delta)
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
@@ -4457,6 +4522,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {new_cap} tokens"
                         f"{self._draft_pool_diagnostic()}"
                     )
+                self._grant_overlap_slack(req.py_request_id, self._overlap_slack_tokens(req))
 
     def _reuse_token_source(self, req: LlmRequest) -> Sequence[int]:
         """Beam-0 tokens for block reuse, in the form the active backend consumes.
@@ -5404,6 +5470,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._pending_overlap_slack.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
@@ -6133,11 +6200,17 @@ class KVCacheManagerV2(BaseResourceManager):
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
             rewind_len = max(allocated_draft_slots - accepted_draft_len, 0)
-            new_capacity = (
-                None
-                if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT)
-                else kv_cache.capacity - rewind_len
-            )
+            # Reclaim the overlap slack granted since the last update so it does
+            # not compound.
+            overlap_slack = self._pending_overlap_slack.pop(req.py_request_id, 0)
+            if req.state in (LlmRequestState.GENERATION_COMPLETE, LlmRequestState.CONTEXT_INIT):
+                new_capacity = None
+            else:
+                new_capacity = kv_cache.capacity - rewind_len - overlap_slack
+                if overlap_slack > 0 and not self._has_cp_helix:
+                    # Never trim below the committed history. Helix is excluded
+                    # because max_beam_num_tokens is a global count there.
+                    new_capacity = max(new_capacity, req.max_beam_num_tokens - 1)
             history_length = (
                 None
                 # Reuse (history's consumer) is disabled under helix, and
