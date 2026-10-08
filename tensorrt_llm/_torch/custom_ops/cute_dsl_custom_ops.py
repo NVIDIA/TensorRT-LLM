@@ -17908,16 +17908,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc1_sfc = torch.empty(m * interm_size // sf_vec,
                                       dtype=fc1_sfa.dtype,
                                       device=fc1_sfa.device)
-                # Three atomic counters: allocate + memset-zero every launch.
-                fc1_ready = torch.zeros(num_tiles,
-                                        dtype=torch.int32,
-                                        device=fc1_a.device)
-                fc1_scheduler_counter = torch.zeros(1,
-                                                    dtype=torch.int32,
-                                                    device=fc1_a.device)
-                fc2_scheduler_counter = torch.zeros(1,
-                                                    dtype=torch.int32,
-                                                    device=fc1_a.device)
+                # Three atomic counters zeroed by one fill (they sit on the
+                # routing chain); each scheduler counter on its own 128 B line.
+                ints_per_line = 32
+                fc1_at = ((num_tiles + ints_per_line - 1) // ints_per_line *
+                          ints_per_line)
+                fc2_at = fc1_at + ints_per_line
+                counters = torch.zeros(fc2_at + ints_per_line,
+                                       dtype=torch.int32,
+                                       device=fc1_a.device)
+                fc1_ready = counters[:num_tiles]
+                fc1_scheduler_counter = counters[fc1_at:fc1_at + 1]
+                fc2_scheduler_counter = counters[fc2_at:fc2_at + 1]
 
                 # Zero the scatter-add output right before the fused kernel so
                 # the memset becomes the kernel's immediate stream predecessor

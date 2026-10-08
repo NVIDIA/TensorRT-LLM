@@ -1339,6 +1339,16 @@ class KimiK3MoERuntime(nn.Module):
         self.moe_main_event = torch.cuda.Event()
         self.moe_shared_event = torch.cuda.Event()
         self.moe_routed_event = torch.cuda.Event() if self._defer_shared_allreduce else None
+        # CuteDSL already quantizes the MoE input on the MoeOutputMemset stream;
+        # the latent down-projection runs there too, beside the routing chain.
+        self.latent_down_stream = (
+            aux_stream_dict.get(AuxStreamType.MoeOutputMemset)
+            if routed_moe_model_config.moe_backend in ("CUTEDSL", "CUTEDSL_FC12")
+            else None
+        )
+        has_latent_stream = self.latent_down_stream is not None
+        self.moe_latent_fork_event = torch.cuda.Event() if has_latent_stream else None
+        self.moe_latent_ready_event = torch.cuda.Event() if has_latent_stream else None
         self.routed_expert_down_proj = nn.Linear(
             cfg.hidden_size, self.moe_hidden_size, bias=False, dtype=dtype
         )
@@ -1621,11 +1631,29 @@ class KimiK3MoERuntime(nn.Module):
         """``hidden_states``: ``[num_tokens, hidden_size]`` bf16."""
         identity = hidden_states
         projected_input = None
+        early_routed_in = None
         if self._can_fuse_router_down(hidden_states):
             router_logits, projected_input = torch.ops.trtllm.dsv3_router_latent_gemm_op(
                 hidden_states, self.gate.weight, self.routed_expert_down_proj.weight
             )
         else:
+            if (
+                self.latent_down_stream is not None
+                and do_multi_stream()
+                and not torch.compiler.is_compiling()
+            ):
+                # Forked ahead of the router GEMM: the latent chain needs only
+                # hidden_states.
+                self.moe_latent_fork_event.record()
+                with torch.cuda.stream(self.latent_down_stream):
+                    self.moe_latent_fork_event.wait()
+                    early_routed_in = self._routed_projection(
+                        hidden_states, self.routed_expert_down_proj
+                    )
+                    self.moe_latent_ready_event.record()
+                # No record_stream (under graph capture it holds every layer's
+                # blocks until capture ends): both tensors are read on main only
+                # after the join, and later work on this stream forks from main.
             router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
         overlap_shared_allreduce = (
@@ -1646,15 +1674,20 @@ class KimiK3MoERuntime(nn.Module):
             # replaced the projection module, call it directly: its weight is
             # an e4m3 buffer the bf16 dsv3 op must not read, and its forward
             # is already a single fused GEMM (fp8_swap_ab_gemm).
-            routed_in = (
-                projected_input
-                if projected_input is not None
-                else self._routed_projection(hidden_states, self.routed_expert_down_proj)
-            )
+            moe_kwargs = {}
+            if projected_input is not None:
+                routed_in = projected_input
+            elif early_routed_in is not None:
+                routed_in = early_routed_in
+                # ConfigurableMoE joins the event before its first read of x.
+                moe_kwargs = {"input_ready_event": self.moe_latent_ready_event}
+            else:
+                routed_in = self._routed_projection(hidden_states, self.routed_expert_down_proj)
             y = self.routed_experts(
                 routed_in,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
+                **moe_kwargs,
             )
             if overlap_shared_allreduce:
                 self.moe_routed_event.record()
