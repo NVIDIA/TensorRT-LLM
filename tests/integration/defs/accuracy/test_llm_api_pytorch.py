@@ -4881,6 +4881,17 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(2)
     def test_bf16_2gpu_mtp_ar(self):
+        self._run_bf16_2gpu_mtp_ar()
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_2gpu_mtp_ar_flashinfer_ring_replay(self, monkeypatch):
+        """Same as test_bf16_2gpu_mtp_ar with GDN replay on the FlashInfer ring kernel."""
+        # "force" fails the test instead of silently falling back to Triton.
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+        self._run_bf16_2gpu_mtp_ar()
+
+    def _run_bf16_2gpu_mtp_ar(self):
         max_draft_len = 3
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
