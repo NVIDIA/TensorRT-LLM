@@ -74,9 +74,9 @@ class LoraParamBuilder:
     def __init__(
         self,
         *,
-        spec_config: DecodingBaseConfig | None,
         attn_backend: type[AttentionMetadata],
         cuda_graph_manager: CudaGraphLoraManager | None,
+        spec_config: DecodingBaseConfig | None = None,
     ) -> None:
         self._spec_config = spec_config
         self._attn_backend = attn_backend
@@ -87,8 +87,8 @@ class LoraParamBuilder:
         scheduled_requests: ScheduledRequests,
         attn_metadata: AttentionMetadata,
         *,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
+        enable_spec_decode: bool = False,
+        runtime_draft_len: int = 0,
         peft_cache_manager: PeftCacheManager | None = None,
         maybe_graph: bool = False,
         use_lora_graph: bool = False,

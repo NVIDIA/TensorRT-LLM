@@ -43,7 +43,7 @@ from _torch.moe.moe_test_utils import (
 )
 from _torch.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import check_accuracy
+from utils.util import check_accuracy, skip_pre_blackwell
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
@@ -63,7 +63,9 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     SwigluBiasActivation,
     materialize_activation_params,
 )
+from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoE,
@@ -119,6 +121,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     W4A16NVFP4CutlassFusedMoEMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
+    FlashinferTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
 )
@@ -465,6 +468,7 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
     plan = scheduler._build_comm_plan(
         all_rank_num_tokens=None,
         output_dtype=torch.bfloat16,
+        do_finalize=True,
         use_deep_ep_direct_metadata=use_direct_metadata,
     )
 
@@ -475,6 +479,328 @@ def test_scheduler_threads_deep_ep_expert_metadata_to_cutedsl(
         assert plan.recv_expert_count is None
         assert plan.deep_ep_expert_capacity is None
     assert plan.use_deep_ep_direct_metadata is expected
+
+
+# =====================================================================
+# do_finalize=False: construction-time validation, the model-owned
+# finalize the scheduler runs before the combine, and the one-sided
+# workspace plan for that path.
+# =====================================================================
+
+_HOOK_HIDDEN = 5
+_HOOK_TOP_K = 4
+_HOOK_DISPATCHED_ROWS = 12
+
+
+class _HookBackend:
+    """Named only so refusal messages have something to report."""
+
+    def supports_unfinalized_output(self) -> bool:
+        return True
+
+    def validate_configurable_moe(self, moe) -> None:
+        del moe
+
+
+class _HookRefusingBackend(_HookBackend):
+    def supports_unfinalized_output(self) -> bool:
+        return False
+
+
+class _HookComm:
+    def supports_finalize_before_combine(self) -> bool:
+        return True
+
+
+class _HookRefusingComm(_HookComm):
+    def supports_finalize_before_combine(self) -> bool:
+        return False
+
+
+def _validating_moe(
+    *,
+    hook,
+    backend=None,
+    comm=None,
+    apply_router_weight_on_input: bool = False,
+) -> ConfigurableMoE:
+    """A ``ConfigurableMoE`` carrying exactly what ``validate_backend`` reads.
+
+    ``validate_backend`` runs from ``__init__`` after every wrapper-owned
+    attribute is assigned; these tests pin those attributes directly so each
+    refusal is exercised without building a real layer.
+    """
+    moe = ConfigurableMoE.__new__(ConfigurableMoE)
+    moe.unfinalized_combine_fn = hook
+    moe.comm = comm
+    moe.apply_router_weight_on_input = apply_router_weight_on_input
+    moe._using_load_balancer = lambda: False
+    return moe
+
+
+def test_unfinalized_combine_fn_construction_accepts_a_capable_configuration():
+    moe = _validating_moe(hook=lambda **kwargs: None, comm=_HookComm())
+    moe.validate_backend(_HookBackend())  # does not raise
+
+
+def test_a_backend_without_the_unfinalized_triple_is_refused_at_construction():
+    moe = _validating_moe(hook=lambda **kwargs: None, comm=_HookComm())
+    with pytest.raises(ValueError, match="cannot return the unfinalized"):
+        moe.validate_backend(_HookRefusingBackend())
+
+
+def test_a_combine_that_is_not_an_unweighted_row_sum_is_refused_at_construction():
+    """``DeepEPLowLatency.combine`` consumes expert-major rows and applies the
+    routing weights itself; partials finalized per token cannot feed it."""
+    moe = _validating_moe(hook=lambda **kwargs: None, comm=_HookRefusingComm())
+    with pytest.raises(ValueError, match="unweighted row sum"):
+        moe.validate_backend(_HookBackend())
+
+
+def test_router_weights_folded_into_the_activations_are_refused_at_construction():
+    moe = _validating_moe(
+        hook=lambda **kwargs: None, comm=_HookComm(), apply_router_weight_on_input=True
+    )
+    with pytest.raises(ValueError, match="apply_router_weight_on_input"):
+        moe.validate_backend(_HookBackend())
+
+
+def test_a_non_callable_hook_is_refused_at_construction():
+    moe = _validating_moe(hook=object())
+    with pytest.raises(ValueError, match="callable"):
+        moe.validate_backend(_HookBackend())
+
+
+def test_no_hook_skips_the_hook_validation_entirely():
+    """Registered-hook checks must not reject the common hook-less layer."""
+    moe = _validating_moe(hook=None, comm=_HookRefusingComm())
+    moe.validate_backend(_HookRefusingBackend())  # does not raise
+
+
+def test_the_capability_declarations_match_the_kernels():
+    """The leaves that plumb ``do_finalize`` through say so; the default does not."""
+    assert TrtllmTrtllmGenNvfp4Impl.__new__(TrtllmTrtllmGenNvfp4Impl).supports_unfinalized_output()
+    assert not TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl.__new__(
+        TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
+    ).supports_unfinalized_output()
+    assert not CutlassFusedMoE.__new__(CutlassFusedMoE).supports_unfinalized_output()
+    assert not DeepEPLowLatency.__new__(DeepEPLowLatency).supports_finalize_before_combine()
+
+
+def _hook_scheduler(*, finalize_fn, comm=True) -> ExternalCommMoEScheduler:
+    moe = SimpleNamespace(
+        backend=_HookBackend(),
+        comm=_HookComm() if comm else None,
+        unfinalized_combine_fn=finalize_fn,
+        hidden_size=_HOOK_HIDDEN,
+    )
+    return ExternalCommMoEScheduler(moe)
+
+
+def _unfinalized_triple(
+    *, rows: int = _HOOK_DISPATCHED_ROWS, flattened: bool = False
+) -> List[torch.Tensor]:
+    """What ``run_moe`` returns for ``do_finalize=False``.
+
+    ``expanded_idx_to_permuted_idx`` covers ``num_tokens * top_k`` slots.
+    FlashInfer returns it flattened; neither its leading dimension nor the
+    expert-major ``gemm2_output`` height is necessarily the token count.
+    """
+    return [
+        torch.randn(rows * _HOOK_TOP_K, _HOOK_HIDDEN),
+        torch.empty(rows, _HOOK_TOP_K),  # the kernel leaves this buffer uninitialized
+        torch.zeros((rows * _HOOK_TOP_K,) if flattened else (rows, _HOOK_TOP_K), dtype=torch.int32),
+    ]
+
+
+@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
+@pytest.mark.parametrize("rows", [0, 8, _HOOK_DISPATCHED_ROWS])
+def test_the_finalize_runs_on_the_dispatched_rows(flattened: bool, rows: int) -> None:
+    seen = {}
+
+    def finalize(
+        *,
+        gemm2_output,
+        expanded_idx_to_permuted_idx,
+        token_selected_slots,
+        routing_weights,
+        num_tokens,
+    ):
+        seen.update(
+            gemm2=gemm2_output,
+            index=expanded_idx_to_permuted_idx,
+            slots=token_selected_slots,
+            weights=routing_weights,
+            num_tokens=num_tokens,
+        )
+        return torch.ones(num_tokens, _HOOK_HIDDEN, dtype=torch.float32)
+
+    triple = _unfinalized_triple(rows=rows, flattened=flattened)
+    slots = torch.zeros(rows, _HOOK_TOP_K, dtype=torch.int32)
+    scales = torch.rand(rows, _HOOK_TOP_K, dtype=torch.bfloat16)
+
+    out = _hook_scheduler(finalize_fn=finalize)._finalize_before_combine(
+        triple,
+        token_selected_slots=slots,
+        token_final_scales=scales,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert seen["gemm2"] is triple[0]
+    assert seen["index"] is triple[2]
+    # A per-expert transform needs the slot each row belongs to; the index map
+    # alone cannot answer that.
+    assert seen["slots"] is slots
+    # The POST-dispatch weights, not the model's own: under attention DP this
+    # rank holds rows for tokens it does not own, and only the dispatched copy
+    # covers them.
+    assert seen["weights"] is scales
+    assert seen["num_tokens"] == rows
+    assert out.shape == (rows, _HOOK_HIDDEN)
+
+
+def test_the_result_is_cast_down_before_the_combine_not_after():
+    """The one-sided combine region is sized from ``(hidden_size, act_dtype)``.
+
+    The finalize accumulates in FP32; handing that to ``combine`` would need
+    twice the symmetric-memory region the workspace reserved.
+    """
+    scheduler = _hook_scheduler(
+        finalize_fn=lambda **kwargs: torch.ones(
+            kwargs["num_tokens"], _HOOK_HIDDEN, dtype=torch.float32
+        )
+    )
+    out = scheduler._finalize_before_combine(
+        _unfinalized_triple(),
+        token_selected_slots=torch.zeros(_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K, dtype=torch.int32),
+        token_final_scales=torch.rand(_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K),
+        output_dtype=torch.bfloat16,
+    )
+    assert out.dtype == torch.bfloat16
+
+
+def test_a_model_that_registered_no_finalize_is_refused_by_name():
+    """The one refusal left at runtime: ``do_finalize`` is a forward argument.
+
+    Every other model keeps ``do_finalize=False`` and a comm strategy apart, so
+    this combination is unreachable for them today. If one ever reaches it, the
+    message has to say which layer and which strategy -- not an
+    ``AttributeError`` four frames down inside the comm layer.
+    """
+    scheduler = _hook_scheduler(finalize_fn=None)
+    with pytest.raises(NotImplementedError, match="unfinalized_combine_fn"):
+        scheduler._finalize_before_combine(
+            _unfinalized_triple(),
+            token_selected_slots=None,
+            token_final_scales=torch.rand(_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K),
+            output_dtype=torch.bfloat16,
+        )
+
+
+def test_a_backend_that_ignored_do_finalize_is_refused():
+    """A dense tensor here means the backend already ran its own finalize.
+
+    That finalize is the weighted sum *without* the model's per-expert
+    transform. Running the model's finalize on top of it would apply the
+    transform to the combined result, which is a different function.
+    """
+    scheduler = _hook_scheduler(finalize_fn=lambda **kwargs: None)
+    with pytest.raises(NotImplementedError, match="triple"):
+        scheduler._finalize_before_combine(
+            torch.randn(_HOOK_DISPATCHED_ROWS, _HOOK_HIDDEN),
+            token_selected_slots=None,
+            token_final_scales=torch.rand(_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K),
+            output_dtype=torch.bfloat16,
+        )
+
+
+def test_missing_dispatched_routing_weights_are_refused():
+    """``token_final_scales`` has no post-dispatch copy to hand the finalize."""
+    scheduler = _hook_scheduler(finalize_fn=lambda **kwargs: None)
+    with pytest.raises(NotImplementedError, match="token_final_scales"):
+        scheduler._finalize_before_combine(
+            _unfinalized_triple(),
+            token_selected_slots=None,
+            token_final_scales=None,
+            output_dtype=torch.bfloat16,
+        )
+
+
+@pytest.mark.parametrize("flattened", [False, True], ids=["matrix", "flat-flashinfer"])
+@pytest.mark.parametrize(
+    "shape", [(_HOOK_DISPATCHED_ROWS - 1, _HOOK_TOP_K), (_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K - 1)]
+)
+def test_the_weights_and_the_index_map_have_to_cover_the_same_rows(
+    flattened: bool, shape: Tuple[int, int]
+) -> None:
+    """The two come from different places and must agree.
+
+    ``token_final_scales`` comes back from ``comm.dispatch``; the index map
+    comes out of the MoE kernel. A mismatch means one of them is the
+    pre-dispatch copy, which would weight each token's experts with another
+    token's routing weights.
+    """
+    scheduler = _hook_scheduler(finalize_fn=lambda **kwargs: None)
+    with pytest.raises(AssertionError, match="index map"):
+        scheduler._finalize_before_combine(
+            _unfinalized_triple(flattened=flattened),
+            token_selected_slots=None,
+            token_final_scales=torch.rand(shape),
+            output_dtype=torch.bfloat16,
+        )
+
+
+def test_a_hook_that_returns_the_padded_hidden_size_is_caught():
+    """``gemm2_output`` is hidden-padded; the hook owns the slice back down."""
+    scheduler = _hook_scheduler(
+        finalize_fn=lambda **kwargs: torch.ones(kwargs["num_tokens"], _HOOK_HIDDEN + 3)
+    )
+    with pytest.raises(AssertionError, match="hidden-padded"):
+        scheduler._finalize_before_combine(
+            _unfinalized_triple(),
+            token_selected_slots=None,
+            token_final_scales=torch.rand(_HOOK_DISPATCHED_ROWS, _HOOK_TOP_K),
+            output_dtype=torch.bfloat16,
+        )
+
+
+def _onesided_scheduler(*, workspace_tensor=None):
+    comm = MagicMock(spec=NVLinkOneSided)
+    comm.get_combine_payload_tensor_in_workspace.return_value = workspace_tensor
+    backend = MagicMock()
+    backend.supports_moe_output_in_alltoall_workspace.return_value = True
+    backend.input_requirement.onesided_workspace_dtype = None
+    moe = SimpleNamespace(comm=comm, backend=backend, hidden_size=_HOOK_HIDDEN)
+    return ExternalCommMoEScheduler(moe), comm
+
+
+def test_the_combine_payload_is_not_claimed_to_be_in_the_workspace():
+    """``do_finalize=False`` means the backend writes no combine payload.
+
+    ``combine()`` passes ``payload_in_workspace`` to ``moe_a2a_combine`` as a
+    flag, independent of the tensor argument, so a stale ``True`` makes the
+    kernel reduce an unwritten workspace region and return garbage without
+    raising. The finalize that runs before the combine produces a fresh
+    tensor, which is staged like any other caller-owned payload.
+    """
+    scheduler, comm = _onesided_scheduler()
+    moe_output, payload_in_workspace = scheduler._plan_onesided_workspace(
+        all_rank_num_tokens=[4, 4], output_dtype=torch.bfloat16, do_finalize=False
+    )
+    assert moe_output is None
+    assert payload_in_workspace is False
+    assert not comm.get_combine_payload_tensor_in_workspace.called
+
+
+def test_a_backend_that_does_finalize_still_gets_the_workspace_payload():
+    """The opposite case, so the guard above cannot quietly disable the fast path."""
+    sentinel = torch.zeros(8, _HOOK_HIDDEN)
+    scheduler, _ = _onesided_scheduler(workspace_tensor=sentinel)
+    moe_output, payload_in_workspace = scheduler._plan_onesided_workspace(
+        all_rank_num_tokens=[4, 4], output_dtype=torch.bfloat16, do_finalize=True
+    )
+    assert moe_output is sentinel
+    assert payload_in_workspace is True
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
@@ -585,9 +911,15 @@ def create_test_backend(
     activation_type: ActivationType = ActivationType.Swiglu,
     locality_domain_policy: Optional[LocalityDomainPolicy] = None,
     n_shared_experts: int = 0,
+    moe_cls: Optional[type] = None,
 ) -> MoE:
-    """Create a MoE backend for testing."""
-    backend_cls = get_backend_class(
+    """Create a MoE backend for testing.
+
+    ``moe_cls`` pins the leaf class directly, for the providers the default
+    lookup never selects (resolution prefers the native TRTLLM-Gen leaf
+    whenever one exists for the format).
+    """
+    backend_cls = moe_cls or get_backend_class(
         backend_type, None if quant_config is None else quant_config.quant_algo
     )
     if locality_domain_policy is None:
@@ -640,6 +972,109 @@ def create_test_backend(
     if n_shared_experts > 0:
         backend.create_weights()
     return backend
+
+
+# The quantized FlashInfer provider is otherwise never run: resolution prefers
+# the native TRTLLM-Gen leaf whenever one exists for the format (only the bf16
+# leaf is FlashInfer-exclusive), so without pinning the class the FlashInfer
+# NVFP4 kernels have zero coverage. The real provider is exercised here, which
+# needs Blackwell: FlashInfer's FP4 path has no pre-Blackwell backend.
+@skip_pre_blackwell
+def test_flashinfer_provider_nvfp4_matches_reference(tmp_path: Path):
+    pytest.importorskip("flashinfer")
+
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    seq_len = 8
+    dtype = torch.bfloat16
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=model_config.top_k)
+        x = torch.randn((seq_len, model_config.hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, model_config.num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=model_config.num_experts,
+            dtype=dtype,
+            intermediate_size=model_config.intermediate_size,
+            hidden_size=model_config.hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            activation_type=ActivationType.Swiglu,
+        )
+        NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
+
+        backend = create_test_backend(
+            backend_type=MoeBackendType.TRTLLM,
+            routing_method=routing_method,
+            num_experts=model_config.num_experts,
+            hidden_size=model_config.hidden_size,
+            intermediate_size=model_config.intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            weight_loading_mode=getattr(
+                quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+            ),
+            moe_cls=FlashinferTrtllmGenNvfp4Impl,
+        )
+        assert backend.use_flashinfer
+
+        ref_cls = quant_kwargs.pop("ref_cls", None)
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        if ref_cls is not None:
+            ref_fused_moe = quantize_util.create_ref_module(routing_method, ref_cls=ref_cls)
+        else:
+            ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        def run_moe():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                MoeBackendType.TRTLLM,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        autotuner = AutoTuner.get()
+        autotuner.warmup = 0
+        autotuner.repeat = 1
+        autotuner.stream_delay_micro_secs = 10
+        autotuner.clear_cache()
+        with (
+            torch.inference_mode(),
+            autotune(cache_path=str(tmp_path / "moe_autotuner_cache.json")),
+        ):
+            _ = run_moe()
+        with torch.inference_mode():
+            output = run_moe()
+        ref_fused_moe.check_accuracy(output, ref_output)
 
 
 # =====================================================================
