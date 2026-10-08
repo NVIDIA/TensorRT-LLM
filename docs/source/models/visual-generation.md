@@ -37,6 +37,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | Text-to-Video (3-step distilled) |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
+| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | Text-to-Video (with Audio, 4-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -66,6 +67,7 @@ Models are auto-detected from the checkpoint directory. Diffusers-format models 
 | **FastWan 2.2** | Yes | Yes | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **LTX-2** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No | Yes |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | No | No | Yes | Yes | No | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | No | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No | No |
 | **Qwen-Image-Layered** | No | No | No | No | No | No | No | No | Yes | Yes | Yes | No | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | No | No | Yes | No | No | Yes | Yes | Yes | No | No | No | No |
@@ -162,6 +164,10 @@ The same fields carry references over `trtllm-serve`; see [`examples/visual_gen/
 
 ## MiniMax-H3 Notes
 
+- FastH3 uses the MiniMax-H3 pipeline and transformer architecture with a
+  distilled 4-step checkpoint. TensorRT-LLM currently runs it through the dense
+  MiniMax-H3 attention path; model-specific VSA gate/metadata wiring is not yet
+  implemented for the H3 transformer.
 - Text-to-video (T2VA), first/last-frame-to-video (FL2VA), and reference-to-video
   with audio (Ref2VA) are supported on one GPU. Enable Ref2VA with
   `pipeline_config: {workflow: ref2va}`; it requires `transformer_ref/` weights.

@@ -608,6 +608,14 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
+
+        fastvideo_inference_path = checkpoint_path / "fastvideo_inference.json"
+        if fastvideo_inference_path.exists():
+            with open(fastvideo_inference_path) as f:
+                fastvideo_inference = json.load(f)
+            if str(fastvideo_inference.get("schema_version", "")).startswith("fasth3-"):
+                extra_attrs["fastvideo_inference"] = fastvideo_inference
+
         for key in ("spatial_upsampler_path", "distilled_lora_path"):
             value = resolved_pipeline_config.get(key)
             if value:

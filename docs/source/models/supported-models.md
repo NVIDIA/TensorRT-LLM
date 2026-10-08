@@ -205,6 +205,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 | `MiniMaxAI/MiniMax-H3` | Text-to-Video (with Audio), First/Last-Frame-to-Video (with Audio) |
+| `FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree` | Text-to-Video (with Audio, 4-step distilled) |
 | `Qwen/Qwen-Image` | Text-to-Image |
 | `Qwen/Qwen-Image-2512` | Text-to-Image |
 | `Qwen/Qwen-Image-Layered` | Image-to-Image |
@@ -225,6 +226,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
 | **MiniMax-H3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
+| **FastH3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |

@@ -25,6 +25,7 @@ python models/wan_i2v.py --visual_gen_args configs/wan2.2-i2v-fp4-1gpu.yaml --im
 python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 # FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
+python models/fasth3.py --visual_gen_args configs/fasth3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml
 python models/cosmos3_ti2v.py --visual_gen_args configs/cosmos3-nano-1gpu.yaml --prompt "A robot arm picks fruit in a grocery store"

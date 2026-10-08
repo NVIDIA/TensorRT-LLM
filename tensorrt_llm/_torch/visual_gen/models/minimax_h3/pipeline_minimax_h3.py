@@ -115,10 +115,16 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
 
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
-    hf_ids=["MiniMaxAI/MiniMax-H3"],
+    hf_ids=[
+        "MiniMaxAI/MiniMax-H3",
+        "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+    ],
     defaults={"workflow": "fl2va"},
     download_patterns=[
         "modular_model_index.json",
+        "fastvideo_inference.json",
+        "checkpoint_content.json",
+        "checkpoint_metadata.json",
         "LICENSE",
         "README.md",
         "transformer/*",
@@ -186,6 +192,9 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def default_generation_params(self) -> dict:
+        fastvideo_inference = getattr(self.pipeline_config, "extra_attrs", {}).get(
+            "fastvideo_inference", {}
+        )
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -193,7 +202,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": 28,
+            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
         }
 
     @property
