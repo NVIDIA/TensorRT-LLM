@@ -42,7 +42,7 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 
 ### LIBFABRIC Backend Setup
 
-**Important Note:** The TensorRT LLM container does not include libfabric or the NIXL-LIBFABRIC plugin by default. You must either rebuild NIXL with libfabric support or provide a pre-compiled plugin.
+**Note:** The TensorRT LLM container includes libfabric (via the AWS EFA installation already present in the base image, at `/opt/amazon/efa`) and builds the NIXL-LIBFABRIC plugin against it by default (see `docker/common/install_nixl.sh`). On EFA-enabled instances, no extra installation is needed — just set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC`. The manual rebuild/pre-compiled-plugin options below are only needed for a custom libfabric installation (e.g. non-EFA fabrics) or a libfabric version other than the one bundled in the container.
 
 #### Prerequisites
 
@@ -51,11 +51,13 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 **Required Dependencies:**
 
 **Libfabric**
-- Custom libfabric installation is available via [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
+- Bundled in the container via the AWS EFA installation at `/opt/amazon/efa`. No action needed on EFA-enabled instances.
+- For a custom libfabric installation, see [https://ofiwg.github.io/libfabric/](https://ofiwg.github.io/libfabric/)
 - **Minimum required version:** v1.21.0
-- For EFA-enabled AWS instances, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
+- For EFA-enabled AWS instances using a non-bundled version, install through the [AWS EFA installer](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa-start.html) (recommend using the latest version)
 
 **hwloc**
+- Bundled in the container (`libhwloc-dev`, installed in `docker/common/install_base.sh`). No action needed.
 - hwloc is used to understand the underlying architecture to optimize application performance
 - **Suggested version:** 2.10.0 or newer
 
@@ -66,24 +68,26 @@ If an unsupported backend is specified, NIXL will automatically fall back to UCX
 
 UCX is typically pre-installed in NVIDIA GPU containers. No additional installation is usually required.
 
-#### Installation Options
+#### Installation Options (custom libfabric only)
 
-##### Option 1: Rebuild NIXL with LIBFABRIC Support (Recommended)
+The container already builds NIXL with the LIBFABRIC plugin against the bundled AWS EFA libfabric. Use these options only if you need a different libfabric installation.
+
+##### Option 1: Rebuild NIXL with a Custom LIBFABRIC Installation
 
 1. **Install libfabric dependencies:**
    - Follow the installation instructions from the links above based on your system
 
 2. **Install hwloc:**
-   - Use your package manager or build from source
+   - Already bundled in the container (`libhwloc-dev`); only needed if building outside the container
 
 3. **Reinstall NIXL after installing libfabric:**
-   - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin
-   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`
-   - Modify the meson setup command in the script to include the libfabric path:
+   - After installing libfabric and hwloc, you must rebuild NIXL to generate the LIBFABRIC plugin against your custom path
+   - You can base your installation on the TensorRT LLM NIXL installation script located at `docker/common/install_nixl.sh`, which already sets `-Dlibfabric_path` for the bundled AWS EFA install
+   - Point the meson setup command in the script at your custom libfabric path instead:
      ```bash
      meson setup builddir \
          ...
-         -Dlibfabric_path=/path/to/libfabric \  # Add this line
+         -Dlibfabric_path=/path/to/libfabric \  # Override the bundled AWS EFA path
          --buildtype=release
      ```
    - For more details, see the [NIXL LIBFABRIC Plugin documentation](https://github.com/ai-dynamo/nixl/tree/6ee64753605b3110f8ef96c7cfc2f1315675c9c7/src/plugins/libfabric#nixl-libfabric-plugin)
@@ -608,7 +612,8 @@ When removing servers, special attention is required in the current version. You
 
 **Q: Why does NIXL fail to use LIBFABRIC backend even when `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` is set?**
 
-A: The TensorRT-LLM container doesn't include the NIXL LIBFABRIC plugin by default. You need to either:
+A: The container builds the NIXL LIBFABRIC plugin against the bundled AWS EFA libfabric install by default, so this usually means something other than a missing plugin. Check:
 
-1. **Rebuild NIXL**: Install libfabric and hwloc first, then rebuild NIXL following the installation instructions above
-2. **Use a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory
+1. **Not running on an EFA-enabled instance**: Confirm EFA devices are present and passed through to the container.
+2. **Custom libfabric version mismatch**: If you rebuilt NIXL against a different libfabric installation, confirm it meets the minimum required version (v1.21.0) and that the plugin was built against that same libfabric.
+3. **Using a pre-compiled plugin**: If you have a compatible `libplugin_LIBFABRIC.so`, set `NIXL_PLUGINS_DIR` to point to its directory.
