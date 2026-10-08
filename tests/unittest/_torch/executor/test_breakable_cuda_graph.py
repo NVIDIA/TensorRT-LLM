@@ -268,8 +268,8 @@ def test_runner_warmup_capture_execute_and_shared_output(through_model_engine):
 
         decoder_runner = object.__new__(DecoderRunner)
         decoder_runner._forward_decoder = decoder_forward
+        decoder_runner.model = SimpleNamespace(extra_attrs={})
         engine = object.__new__(PyTorchModelEngine)
-        engine.model = SimpleNamespace(extra_attrs={})
         engine._runner = decoder_runner
         engine._is_warmup = True
         engine.enable_spec_decode = False

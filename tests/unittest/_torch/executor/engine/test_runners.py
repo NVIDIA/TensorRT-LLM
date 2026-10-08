@@ -99,6 +99,7 @@ def _model(*, is_generation: bool, is_encoder_decoder: bool = False) -> SimpleNa
         num_key_value_heads=2,
     )
     return SimpleNamespace(
+        extra_attrs={},
         model_config=SimpleNamespace(
             is_generation=is_generation,
             is_encoder_decoder=is_encoder_decoder,
@@ -635,6 +636,42 @@ def test_forward_warmup_runs_local_call_state_in_forward_context():
     assert (inputs.enable_spec_decode, inputs.runtime_draft_len) == (True, 1)
     assert engine._runner._forward_decoder.call_args.kwargs == {"is_dummy": True}
     assert outputs["runtime_draft_len"] == 3
+    assert get_model_extra_attrs() is None
+
+
+def test_decoder_runner_forward_enters_model_context():
+    engine, resources = _model_engine_with_runner(None, kv_cache_manager=object())
+    inputs = ScheduledInputs(batch=ScheduledRequests())
+
+    def decoder_forward(inputs, resource_manager, *, is_dummy):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is engine.model.extra_attrs
+        return {"logits": object()}
+
+    engine._runner._forward_decoder = Mock(side_effect=decoder_forward)
+
+    engine._runner.forward(inputs, resource_manager=resources)
+
+    engine._runner._forward_decoder.assert_called_once_with(inputs, resources, is_dummy=False)
+    assert get_model_extra_attrs() is None
+
+
+def test_no_kv_forward_enters_model_context():
+    model = _model(is_generation=False)
+
+    def model_forward(**kwargs):
+        assert torch.is_inference_mode_enabled()
+        assert get_model_extra_attrs() is model.extra_attrs
+        return {"hidden_states": object()}
+
+    caller = Mock(side_effect=model_forward)
+    runner = _make_runner(PoolingRunner, model, model_caller=caller)
+    runner.prepare_inputs = Mock(return_value=PreparedInputs({}))
+    resources = SimpleNamespace(get_resource_manager=Mock(return_value=None))
+
+    runner.forward(ScheduledInputs(batch=ScheduledRequests()), resource_manager=resources)
+
+    caller.assert_called_once()
     assert get_model_extra_attrs() is None
 
 

@@ -297,6 +297,8 @@ class DecoderRunner(ScheduledModelRunner):
     def max_beam_width(self) -> int:
         return self._config.max_beam_width
 
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(
         self,
         inputs: ScheduledInputs,
@@ -4391,8 +4393,6 @@ class DecoderRunner(ScheduledModelRunner):
             is_dummy=is_dummy,
         )
 
-    @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def _forward_warmup(
         self,
         batch: ScheduledRequests,
@@ -4409,7 +4409,7 @@ class DecoderRunner(ScheduledModelRunner):
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,
         )
-        return self._forward_decoder(inputs, resource_manager, is_dummy=True)
+        return self.forward(inputs, resource_manager=resource_manager, is_dummy=True)
 
     def _forward_decoder(
         self,

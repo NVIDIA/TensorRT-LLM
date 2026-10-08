@@ -43,8 +43,7 @@ from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
-from ..utils import (get_per_request_prefill_cuda_graph_flag,
-                     set_torch_compiling, with_model_extra_attrs)
+from ..utils import get_per_request_prefill_cuda_graph_flag, set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
@@ -1258,8 +1257,6 @@ class PyTorchModelEngine(ModelEngine):
             getattr(getattr(self.model, "model_config", None),
                     "is_encoder_decoder", False))
 
-    @torch.inference_mode()
-    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
     def forward(self,
                 batch: Union[ScheduledRequests, PackedInputs],
                 resource_manager: Optional[ResourceManager] = None,

@@ -85,7 +85,6 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
         "logits": logits if inputs.gather_context_logits else logits[2::3]
     }
     engine = object.__new__(PyTorchModelEngine)
-    engine.model = types.SimpleNamespace(extra_attrs={})
     engine._runner = runner
     engine.enable_spec_decode = False
     engine.runtime_draft_len = 0

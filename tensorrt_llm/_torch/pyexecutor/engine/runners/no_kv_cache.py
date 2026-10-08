@@ -21,7 +21,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
+from tensorrt_llm._torch.utils import (
+    set_per_request_prefill_cuda_graph_flag,
+    with_model_extra_attrs,
+)
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
@@ -289,6 +292,8 @@ class NoKVCacheRunner(ScheduledModelRunner):
         """Validate the resources used by this runner before execution."""
         self._validate_resources(resource_manager)
 
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def forward(
         self,
         inputs: ScheduledInputs,
