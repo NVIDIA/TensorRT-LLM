@@ -248,9 +248,13 @@ class TrtllmAttentionMetadata:
         metadata.kv_cache_block_offsets = kv_cache.block_offsets(size)[:, :n]
         metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
         # host_past_key_value_lengths and the context total only bound the kernel's
-        # work; the per-block lengths come from the device tensor above.
-        metadata.kv_lens_runtime = torch.full((n,), kv_cache.capacity, dtype=torch.int32)
-        metadata.host_total_kv_lens[0] = n * kv_cache.capacity
+        # work; the per-block lengths come from the device tensor above. The bound is
+        # the pool, the most that can ever be resident on it: pin_tokens is not part of
+        # the geometry, so a later rollout of this geometry may hold more than the
+        # current one and still reuse this metadata and the graphs captured over it.
+        bound = kv_cache.pool_tokens
+        metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
+        metadata.host_total_kv_lens[0] = n * bound
         metadata.host_total_kv_lens[1] = 0
         self._metadata_cache[cache_key] = {"metadata": metadata}
         return metadata
