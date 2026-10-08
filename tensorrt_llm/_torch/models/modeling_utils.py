@@ -702,9 +702,10 @@ class DecoderModelForCausalLM(nn.Module,
             pretrained_config: Any = None) -> Optional[Literal["V1", "V2"]]:
         """Return the model's preferred KV cache manager version.
 
-        The preference is adopted only when the user leaves
-        ``kv_cache_config.use_kv_cache_manager_v2`` at ``"auto"``. Return
-        ``None`` to use the built-in V1 fallback.
+        The preference is adopted only when the user explicitly sets
+        ``kv_cache_config.use_kv_cache_manager_v2`` to ``"auto"``. The default
+        is ``True`` and does not consult this preference. Return ``None`` to
+        use the built-in V1 fallback for ``"auto"``.
 
         Args:
             pretrained_config: The loaded Hugging Face config. Shared model
@@ -722,9 +723,10 @@ class DecoderModelForCausalLM(nn.Module,
 
         Subclasses can override this to pin a specific transceiver
         implementation ('CPP' or 'PYTHON') that is adopted verbatim when the
-        user leaves ``cache_transceiver_config.transceiver_runtime`` at its
-        default 'auto'; unsupported configurations then fail loudly at
-        transceiver creation rather than being rerouted. Return None to
+        user explicitly sets ``cache_transceiver_config.transceiver_runtime``
+        to 'auto'. The default is 'PYTHON' and does not consult this preference.
+        Unsupported configurations fail loudly at transceiver creation rather
+        than being rerouted. Return None to
         defer to the global default: the Python transceiver, falling back to
         C++ only for conditions decidable from the transceiver config itself
         (non-NIXL backend or an infinite ``kv_transfer_timeout_ms``) — other
