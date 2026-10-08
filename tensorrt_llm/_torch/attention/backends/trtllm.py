@@ -18,7 +18,8 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, List,
+                    Optional, Tuple)
 
 import torch
 
@@ -229,6 +230,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_block_ids_per_seq: Optional[torch.Tensor] = None
     draft_kv_block_ids_per_seq: Optional[torch.Tensor] = None
+    # Originals of attributes swapped for draft replay, recorded by
+    # swap_for_draft; the strict buffer check validates these instead.
+    draft_replay_swapped_attrs: Dict[str, Any] = field(default_factory=dict,
+                                                       init=False,
+                                                       repr=False,
+                                                       compare=False)
+    # Tensors produced and consumed inside the captured graph; the strict
+    # buffer check skips them.
+    graph_temporary_attrs: ClassVar[FrozenSet[str]] = frozenset()
 
     # Batch-shared FP4 state; other attention paths allocate none of it.
     fp4_mla_state: Optional[Fp4MlaState] = field(init=False,
@@ -356,6 +366,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        # Each copy records and restores its own draft swaps.
+        self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
 
     def update_position_offsets_for_cpp(self, query_len: int) -> None:
@@ -864,6 +876,25 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                          out=self.mla_ctx_cu_q_seqlens[1:num_ctx + 1])
             self._mla_ctx_cu_seqlens_valid = True
         return self.mla_ctx_cu_q_seqlens[:num_ctx + 1]
+
+    def record_draft_swap(self, name: str) -> None:
+        """Record name's current value so restore_draft_swaps can rebind it."""
+        self.draft_replay_swapped_attrs.setdefault(name,
+                                                   getattr(self, name, None))
+
+    def swap_for_draft(self, name: str, draft_value: Any) -> None:
+        """Rebind name to draft_value, recording the original first."""
+        self.record_draft_swap(name)
+        setattr(self, name, draft_value)
+
+    def restore_draft_swaps(self) -> None:
+        """Rebind every recorded attribute to its original and clear the record.
+
+        Swaps do not nest: this restores all swaps made since the last restore.
+        """
+        for name, original in self.draft_replay_swapped_attrs.items():
+            setattr(self, name, original)
+        self.draft_replay_swapped_attrs = {}
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
