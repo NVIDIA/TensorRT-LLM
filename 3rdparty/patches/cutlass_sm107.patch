@@ -1,0 +1,168 @@
+diff --git a/include/cutlass/arch/config.h b/include/cutlass/arch/config.h
+index 995d82ee..b87abd14 100644
+--- a/include/cutlass/arch/config.h
++++ b/include/cutlass/arch/config.h
+@@ -85,7 +85,10 @@
+ // SM100, SM100a
+ #if !CUTLASS_CLANG_CUDA && (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 8))
+   #define CUTLASS_ARCH_MMA_SM100_SUPPORTED 1
+-  #if (!defined(CUTLASS_ARCH_MMA_SM100_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1000)
++  // SM107 (Rubin) reuses the SM100 (Blackwell) kernel family. Treat __CUDA_ARCH__ 1070
++  // like 1000 so the sm_107f cubin enables SM100 MMA/TMA/tcgen05 instead of the disabled
++  // PTX stubs (which crash with cudaErrorLaunchFailure).
++  #if (!defined(CUTLASS_ARCH_MMA_SM100_ENABLED) && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1070))
+     #define CUTLASS_ARCH_MMA_SM100_ENABLED 1
+
+     #if (!defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) && defined(__CUDA_ARCH_FEAT_SM100_ALL))
+@@ -97,7 +100,7 @@
+     #define CUTLASS_ARCH_MMA_SM100F_SUPPORTED 1
+     #endif
+
+-    #if (!defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && CUDA_ARCH_FAMILY(1000))
++    #if (!defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) && (CUDA_ARCH_FAMILY(1000) || CUDA_ARCH_FAMILY(1070)))
+       #define CUTLASS_ARCH_MMA_SM100F_ENABLED CUTLASS_ARCH_MMA_SM100F_SUPPORTED
+     #endif
+   #endif
+diff --git a/include/cute/config.hpp b/include/cute/config.hpp
+index fc5b1167..ce575b46 100644
+--- a/include/cute/config.hpp
++++ b/include/cute/config.hpp
+@@ -112,0 +113,28 @@
++#if defined(__CUDACC_RTC__)
++// Load the tuple protocol from the layout provided by the active CCCL version.
++// Older CUDA toolkits may not provide the public <cuda/std/tuple> entry point,
++// while newer releases may remove the legacy detail/libcxx include path.
++#  if defined(__has_include)
++#    if __has_include(<cuda/std/__tuple_dir/structured_bindings.h>)
++#      include <cuda/std/__tuple_dir/structured_bindings.h>
++#    elif __has_include(<cuda/std/detail/libcxx/include/__tuple_dir/structured_bindings.h>)
++#      include <cuda/std/detail/libcxx/include/__tuple_dir/structured_bindings.h>
++#    elif __has_include(<cuda/std/tuple>)
++#      include <cuda/std/tuple>
++#      if !__has_include(<cuda/std/__cccl/version.h>)
++#        define CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS
++#      endif
++#    elif __has_include(<cuda/std/__tuple_dir/tuple_size.h>) && \
++          __has_include(<cuda/std/__tuple_dir/tuple_element.h>)
++#      include <cuda/std/__tuple_dir/tuple_size.h>
++#      include <cuda/std/__tuple_dir/tuple_element.h>
++#    else
++#      define CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS
++#    endif
++#  elif (__CUDACC_VER_MAJOR__ >= 13)
++#    include <cuda/std/tuple>
++#  else
++#    define CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS
++#  endif
++#endif
++
+diff --git a/include/cute/container/array.hpp b/include/cute/container/array.hpp
+index 0e57859f..10b6ab05 100644
+--- a/include/cute/container/array.hpp
++++ b/include/cute/container/array.hpp
+@@ -450 +450,3 @@ namespace std
+-#if (__CUDACC_VER_MAJOR__ >= 13)
++#if defined(CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS)
++template <class _Tp>
++struct tuple_size;
+@@ -452,10 +454,2 @@ namespace std
+-#include <cuda/std/__tuple_dir/structured_bindings.h>
+-
+-#else
+-#if defined(__CUDACC_RTC__)
+-  template <class... _Tp>
+-  struct tuple_size;
+-
+-  template <size_t _Ip, class... _Tp>
+-  struct tuple_element;
+-#endif
++template <size_t _Ip, class _Tp>
++struct tuple_element;
+diff --git a/include/cute/container/array_subbyte.hpp b/include/cute/container/array_subbyte.hpp
+index 2e634714..9918f7b4 100644
+--- a/include/cute/container/array_subbyte.hpp
++++ b/include/cute/container/array_subbyte.hpp
+@@ -620 +620,3 @@ namespace std
+-#if (__CUDACC_VER_MAJOR__ >= 13)
++#if defined(CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS)
++template <class _Tp>
++struct tuple_size;
+@@ -622,10 +624,2 @@ namespace std
+-#include <cuda/std/__tuple_dir/structured_bindings.h>
+-
+-#else
+-#if defined(__CUDACC_RTC__)
+-  template <class... _Tp>
+-  struct tuple_size;
+-
+-  template <size_t _Ip, class... _Tp>
+-  struct tuple_element;
+-#endif
++template <size_t _Ip, class _Tp>
++struct tuple_element;
+diff --git a/include/cute/container/tuple.hpp b/include/cute/container/tuple.hpp
+index f7cfca94..2dc3d3d5 100644
+--- a/include/cute/container/tuple.hpp
++++ b/include/cute/container/tuple.hpp
+@@ -704 +704,3 @@ namespace std
+-#if (__CUDACC_VER_MAJOR__ >= 13)
++#if defined(CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS)
++template <class _Tp>
++struct tuple_size;
+@@ -706,10 +708,2 @@ namespace std
+-#include <cuda/std/__tuple_dir/structured_bindings.h>
+-
+-#else
+-#if defined(__CUDACC_RTC__)
+-  template <class... _Tp>
+-  struct tuple_size;
+-
+-  template <size_t _Ip, class... _Tp>
+-  struct tuple_element;
+-#endif
++template <size_t _Ip, class _Tp>
++struct tuple_element;
+diff --git a/include/cute/container/type_list.hpp b/include/cute/container/type_list.hpp
+index 62ebf9df..154399d5 100644
+--- a/include/cute/container/type_list.hpp
++++ b/include/cute/container/type_list.hpp
+@@ -106 +106,3 @@ namespace std
+-#if (__CUDACC_VER_MAJOR__ >= 13)
++#if defined(CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS)
++template <class _Tp>
++struct tuple_size;
+@@ -108,10 +110,2 @@ namespace std
+-#include <cuda/std/__tuple_dir/structured_bindings.h>
+-
+-#else
+-#if defined(__CUDACC_RTC__)
+-  template <class... _Tp>
+-  struct tuple_size;
+-
+-  template <size_t _Ip, class... _Tp>
+-  struct tuple_element;
+-#endif
++template <size_t _Ip, class _Tp>
++struct tuple_element;
+diff --git a/include/cute/numeric/arithmetic_tuple.hpp b/include/cute/numeric/arithmetic_tuple.hpp
+index 01dde5f1..7f353788 100644
+--- a/include/cute/numeric/arithmetic_tuple.hpp
++++ b/include/cute/numeric/arithmetic_tuple.hpp
+@@ -516 +516,3 @@ namespace std
+-#if (__CUDACC_VER_MAJOR__ >= 13)
++#if defined(CUTE_CUDA_STD_NEEDS_TUPLE_PRIMARY_DECLARATIONS)
++template <class _Tp>
++struct tuple_size;
+@@ -518,10 +520,2 @@ namespace std
+-#include <cuda/std/__tuple_dir/structured_bindings.h>
+-
+-#else
+-#if defined(__CUDACC_RTC__)
+-  template <class... _Tp>
+-  struct tuple_size;
+-
+-  template <size_t _Ip, class... _Tp>
+-  struct tuple_element;
+-#endif
++template <size_t _Ip, class _Tp>
++struct tuple_element;
