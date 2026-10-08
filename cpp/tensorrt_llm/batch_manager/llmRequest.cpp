@@ -245,8 +245,7 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
     std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
-    if (getEncoderInputFeatures()
-        && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
+    if (mEncoderInputLength.has_value() && !mSkipEncoderInputLengthValidation)
     {
         TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
             "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),

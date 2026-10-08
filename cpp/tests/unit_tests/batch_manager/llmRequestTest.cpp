@@ -45,6 +45,49 @@ protected:
     void TearDown() override {}
 };
 
+TEST_F(LlmRequestTest, encoderFeatureMetadata)
+{
+    for (bool const imageInput : {false, true})
+    {
+        texec::Request execReq(VecTokens{1, 2, 3}, 10);
+        texec::SamplingConfig samplingConfig;
+        samplingConfig.setNumReturnSequences(2);
+        execReq.setSamplingConfig(samplingConfig);
+        execReq.setEncoderInputFeatures(imageInput ? texec::Tensor::cpu(texec::DataType::kFP32, {12, 3, 2, 2})
+                                                   : texec::Tensor::cpu(texec::DataType::kFP32, {12, 8}));
+        execReq.setEncoderOutputLength(6);
+        tb::LlmRequest llmReq(77, execReq);
+        EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
+        EXPECT_EQ(llmReq.tryGetEncoderInputLen(), 12);
+        EXPECT_EQ(llmReq.tryGetEncoderOutputLen(), 6);
+        if (imageInput)
+        {
+            EXPECT_NO_THROW(llmReq.validate(20, 30, 0, 10));
+        }
+        else
+        {
+            EXPECT_THROW(llmReq.validate(20, 30, 0, 10), std::exception);
+            EXPECT_NO_THROW(llmReq.validate(20, 30, 0, 12));
+        }
+        llmReq.setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
+        llmReq.pause(20);
+        EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kENCODER_INIT);
+        EXPECT_EQ(llmReq.tryGetEncoderInputLen(), 12);
+        auto child = llmReq.createChildRequest(78);
+        EXPECT_EQ(child->tryGetEncoderInputLen(), 12);
+        EXPECT_EQ(child->tryGetEncoderOutputLen(), 6);
+    }
+
+    texec::Request tokenReq(VecTokens{1, 2, 3}, 10);
+    tokenReq.setEncoderInputTokenIds(VecTokens{4, 5});
+    tb::LlmRequest encoderReq(79, tokenReq);
+    EXPECT_EQ(encoderReq.tryGetEncoderInputLen(), 2);
+    EXPECT_EQ(encoderReq.tryGetEncoderOutputLen(), 2);
+    tb::LlmRequest decoderReq(80, texec::Request(VecTokens{1, 2, 3}, 10));
+    EXPECT_FALSE(decoderReq.tryGetEncoderInputLen().has_value());
+    EXPECT_FALSE(decoderReq.tryGetEncoderOutputLen().has_value());
+}
+
 TEST_F(LlmRequestTest, fromExecutorRequest)
 {
     VecTokens inputTokens{1, 2, 3, 4, 5};

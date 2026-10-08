@@ -75,7 +75,7 @@ protected:
             /*excludeInputFromOutput=*/false,
             /*encoderInputTokens=*/std::nullopt,
             /*returnEncoderOutput=*/false, tensorrt_llm::executor::Request::kDefaultPriority,
-            /*encoderInputFeatures=*/std::nullopt,
+            /*encoderInputLength=*/std::nullopt,
             /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             /*inputTokenExtraIds=*/std::nullopt,
             /*returnPerfMetrics=*/false,
