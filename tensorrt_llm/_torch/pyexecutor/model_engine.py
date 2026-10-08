@@ -10,6 +10,7 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Sequence,
                     Tuple, Type, Union)
 
@@ -1459,6 +1460,50 @@ class PyTorchModelEngine(ModelEngine):
         # Retain a partial summary when a phase raises.
         with self._warmup_timer:
             self._warmup_scheduled(resource_manager, kv_cache_manager)
+        self._init_jit_prefetch()
+
+    def _init_jit_prefetch(self) -> None:
+        """Start JIT prefetch / JIT stats after warmup (env-gated, see
+        ``tensorrt_llm/_torch/jit_prefetch.py``)."""
+        from ..jit_prefetch import (JitPrefetcher, prefetch_enabled,
+                                    providers_enabled)
+        prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
+        self._jit_prefetcher = prefetcher
+        if prefetcher is None or not prefetch_enabled():
+            return
+        if not providers_enabled():
+            prefetcher.wait_ready()
+            return
+        from ..modules.mamba.jit_prefetch import MambaSSDProvider
+        provider = MambaSSDProvider(self.model,
+                                    max_num_tokens=self.max_num_tokens,
+                                    max_batch_size=self.batch_size)
+        if provider and prefetcher.register("mamba_ssd", provider):
+            logger.info(f"[JIT prefetch] Mamba SSD provider: "
+                        f"{len(provider.shapes)} distinct layer shape(s)")
+        # Helpers were started when the prefetcher was created; make sure
+        # their start-up is paid here, inside warmup, not by a request.
+        prefetcher.wait_ready()
+
+    def _plan_jit_prefetch(self, scheduled_requests: ScheduledRequests,
+                           resource_manager: ResourceManager) -> None:
+        prefetcher = getattr(self, "_jit_prefetcher", None)
+        if prefetcher is None or self.is_warmup:
+            return
+        prefetcher.bind_executor_thread()
+        if not prefetcher.prefetch:
+            return
+        ctx = scheduled_requests.context_requests
+        if not ctx:
+            return
+        # The same facts _prepare_tp_inputs and Mamba2Metadata.prepare derive
+        # later: per-request chunk length and whether any request has a cached
+        # prefix (num_cached_tokens_per_seq > 0 -> HAS_INITSTATES).
+        lens = [r.context_chunk_size for r in ctx]
+        any_cached = any(r.context_current_position -
+                         r.py_num_compressed_tokens > 0 for r in ctx)
+        prefetcher.plan(
+            SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached))
 
     def _warmup_scheduled(self, resource_manager: ResourceManager,
                           kv_cache_manager) -> None:
