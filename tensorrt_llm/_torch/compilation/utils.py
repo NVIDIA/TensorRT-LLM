@@ -248,6 +248,9 @@ def inplace_info():
         "cute_dsl_bf16_gemm_rubin": {
             1: "output"
         },
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
         "cute_dsl_fp8_bmm_rubin": {
             1: "output"
         },
