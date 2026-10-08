@@ -226,7 +226,12 @@ class Glm4ToolParser(BaseToolParser):
         name = parts and self._call_name(parts[0], parts[1], tools)
         pairs = parse_argument_text(parts[2]) if name else None
         if pairs is None:
-            logger.warning(f"Releasing {len(segment)} characters of unparsable tool-call markup")
+            parser_name = type(self).__name__
+            logger.warning_once(
+                f"{parser_name} released unparsable tool-call markup as text; "
+                "later occurrences are not logged",
+                key=f"{parser_name}.unparsable_call",
+            )
             return [], segment
         arguments = parse_argument_pairs(pairs, name, tools)
         return self.parse_base_json({"name": name, "parameters": arguments}, tools), ""

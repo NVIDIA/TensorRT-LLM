@@ -6083,9 +6083,13 @@ class TestGlmStreamingMatchesWholeParse:
                           dict(cmd="8000", max_output_tokens=8000))]
 
     def test_a_long_separator_run_streams_in_linear_time(self, parser_cls):
-        """A long run of literal backslash-n separators, two per increment."""
+        """A long run of literal backslash-n separators, two per increment.
+
+        A linear parse takes a fraction of a second; one that rescans the
+        buffer on every increment takes tens of seconds, well past the bound.
+        """
         text = _glm_raw_call(parser_cls, "f",
-                             _glm_pairs(("code", "ls")) + "\\n" * 20000)
+                             _glm_pairs(("code", "ls")) + "\\n" * 40000)
         chunks = [text[i:i + 2] for i in range(0, len(text), 2)]
         start = time.monotonic()
 
