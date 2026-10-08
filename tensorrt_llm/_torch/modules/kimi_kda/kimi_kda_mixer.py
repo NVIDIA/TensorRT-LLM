@@ -1045,7 +1045,10 @@ class KimiKDALinearAttention(nn.Module):
         # so drafted batches always take the verify path.
         self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
 
-        return out.squeeze(1)
+        # FLA's gated norm is [tokens * heads, head_dim]; the optimized
+        # fallback kernel is [B, 1, H, V]. Prefill returns [tokens, H, V],
+        # so a mixed batch can cat the two cores only after this reshape.
+        return self._store_core(out, output)
 
     def forward_verify(
         self,
