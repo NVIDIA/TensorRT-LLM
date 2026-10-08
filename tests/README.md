@@ -117,8 +117,7 @@ hint.
 
 TRT-LLM C++ runtime tests are using [google-test](https://github.com/google/googletest) framework, and Pytest is used to run sets of these tests.
 
-The current C++ unit tests exercise shared runtime components and kernels without
-building serialized TensorRT engines. They are launched by
+The current C++ unit tests exercise shared runtime components and kernels. They are launched by
 [`test_unit_tests.py`](integration/defs/cpp/test_unit_tests.py).
 The targets are defined in [`cpp/tests/CMakeLists.txt`](../cpp/tests/CMakeLists.txt).
 
