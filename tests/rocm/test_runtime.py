@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from pydantic import ValidationError
 
+import tensorrt_llm
 from tensorrt_llm._backend import select_backend
 from tensorrt_llm.rocm.runtime import architecture_name, diagnostics, resolve_device, resolve_dtype
 from tensorrt_llm.rocm.sampling import SamplingParams
@@ -141,3 +144,30 @@ def test_sampling_rejects_invalid_and_unsupported_fields(arguments) -> None:
 
 def test_sampling_allows_beams() -> None:
     assert SamplingParams(temperature=0, n=2, beam_width=2).n == 2
+
+
+def test_static_exports_preserve_the_lazy_public_namespace() -> None:
+    tree = ast.parse(Path(tensorrt_llm.__file__).read_text())
+    type_checking = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "TYPE_CHECKING"
+    )
+    exports = {
+        alias.asname or alias.name.rsplit(".", 1)[-1]
+        for node in type_checking.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    assert set(tensorrt_llm._LAZY_ATTRS) <= exports
+
+
+def test_strict_config_compatibility_export() -> None:
+    from tensorrt_llm._config import StrictBaseModel
+    from tensorrt_llm.llmapi.utils import StrictBaseModel as compatibility_export
+
+    assert compatibility_export is StrictBaseModel
+    with pytest.raises(ValidationError):
+        compatibility_export(unknown_option=True)

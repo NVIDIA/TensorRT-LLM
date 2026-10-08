@@ -24,8 +24,7 @@
 
 import sys
 
-from ._bootstrap import (_init, _prepare_environment,
-                         _prepare_native_environment)
+from ._bootstrap import _init, _prepare_environment, _prepare_native_environment
 
 # Backend-independent defaults must precede PyTorch. NVIDIA library preparation
 # is deferred until its build identifies the backend, before loading native ops.
@@ -45,10 +44,11 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
+from trtllm_profile import enable_from_argv
+
 from ._backend import select_backend
 from .logger import logger
 from .version import __version__
-from trtllm_profile import enable_from_argv
 
 _BACKEND = select_backend(torch.version.hip)
 if _BACKEND == "cuda":
@@ -58,26 +58,44 @@ if _BACKEND == "cuda":
 enable_from_argv()
 
 if TYPE_CHECKING:
-    import tensorrt_llm._torch.models as torch_models
-    import tensorrt_llm.math_utils as math_utils
-    import tensorrt_llm.models as models
-    import tensorrt_llm.quantization as quantization
-    import tensorrt_llm.runtime as runtime
-    import tensorrt_llm.tools as tools
+    # These imports declare public re-exports for static tooling.
+    import tensorrt_llm._torch.models as torch_models  # noqa: F401
+    import tensorrt_llm.math_utils as math_utils  # noqa: F401
+    import tensorrt_llm.models as models  # noqa: F401
+    import tensorrt_llm.quantization as quantization  # noqa: F401
+    import tensorrt_llm.runtime as runtime  # noqa: F401
+    import tensorrt_llm.tools as tools  # noqa: F401
 
-    from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
-    from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
-                         mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
-                         set_mpi_comm, str_dtype_to_torch)
-    from .disaggregated_params import DisaggregatedParams
-    from .llmapi import LLM, AsyncLLM, KvCacheConfig, MultimodalEncoder
-    from .llmapi.llm_args import LlmArgs, TorchLlmArgs
-    from .mapping import Mapping
-    from .models.automodel import AutoConfig, AutoModelForCausalLM
-    from .sampling_params import SamplingParams
-    from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
-                             VisualGenMetrics, VisualGenOutput, VisualGenParams,
-                             VisualGenResult)
+    from ._mnnvl_utils import MnnvlMemory  # noqa: F401
+    from ._mnnvl_utils import MnnvlMoe  # noqa: F401
+    from ._mnnvl_utils import MoEAlltoallInfo  # noqa: F401
+    from ._utils import default_gpus_per_node  # noqa: F401
+    from ._utils import local_mpi_rank  # noqa: F401
+    from ._utils import local_mpi_size  # noqa: F401
+    from ._utils import mpi_barrier  # noqa: F401
+    from ._utils import mpi_comm  # noqa: F401
+    from ._utils import mpi_rank  # noqa: F401
+    from ._utils import mpi_world_size  # noqa: F401
+    from ._utils import set_mpi_comm  # noqa: F401
+    from ._utils import str_dtype_to_torch  # noqa: F401
+    from .disaggregated_params import DisaggregatedParams  # noqa: F401
+    from .llmapi import LLM  # noqa: F401
+    from .llmapi import AsyncLLM  # noqa: F401
+    from .llmapi import KvCacheConfig  # noqa: F401
+    from .llmapi import MultimodalEncoder  # noqa: F401
+    from .llmapi.llm_args import LlmArgs  # noqa: F401
+    from .llmapi.llm_args import TorchLlmArgs  # noqa: F401
+    from .mapping import Mapping  # noqa: F401
+    from .models.automodel import AutoConfig  # noqa: F401
+    from .models.automodel import AutoModelForCausalLM  # noqa: F401
+    from .sampling_params import SamplingParams  # noqa: F401
+    from .visual_gen import ExtraParamSchema  # noqa: F401
+    from .visual_gen import VisualGen  # noqa: F401
+    from .visual_gen import VisualGenArgs  # noqa: F401
+    from .visual_gen import VisualGenMetrics  # noqa: F401
+    from .visual_gen import VisualGenOutput  # noqa: F401
+    from .visual_gen import VisualGenParams  # noqa: F401
+    from .visual_gen import VisualGenResult  # noqa: F401
 
 # Public name -> (source module, attribute); attribute None = the module itself.
 _LAZY_ATTRS = {
@@ -121,16 +139,17 @@ _LAZY_ATTRS = {
     'VisualGenResult': ('tensorrt_llm.visual_gen', 'VisualGenResult'),
 }
 
-
 if _BACKEND == "rocm":
     _LAZY_ATTRS['LLM'] = ('tensorrt_llm.rocm', 'LLM')
     _LAZY_ATTRS['SamplingParams'] = ('tensorrt_llm.rocm', 'SamplingParams')
 
 
 def __getattr__(name):
-    if _BACKEND == "rocm" and name in _LAZY_ATTRS and name not in ('LLM', 'SamplingParams'):
+    if _BACKEND == "rocm" and name in _LAZY_ATTRS and name not in (
+            'LLM', 'SamplingParams'):
         raise NotImplementedError(
-            f"{name} is NVIDIA-only in this checkout. See docs/source/installation/rdna4.md for the ROCm support matrix.")
+            f"{name} is NVIDIA-only in this checkout. See docs/source/rocm-rdna4.md for the ROCm support matrix."
+        )
     entry = _LAZY_ATTRS.get(name)
     if entry is not None:
         module_name, attr = entry
@@ -203,6 +222,7 @@ else:
     # Do not import bindings, TensorRT, MPI, NVML, FlashInfer, or CUDA custom ops.
     __all__ = ['LLM', 'SamplingParams', 'logger', '__version__']
 
-print(f"[TensorRT-LLM] TensorRT LLM version: {__version__} (backend: {_BACKEND})")
+print(
+    f"[TensorRT-LLM] TensorRT LLM version: {__version__} (backend: {_BACKEND})")
 
 sys.stdout.flush()

@@ -60,9 +60,17 @@ See [architecture diagram](.github/tava_architecture_diagram.md) for the full Me
 
 | Backend | Status | Entry Point | Key Path |
 |---------|--------|-------------|----------|
-| **PyTorch** | Default | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
+| **PyTorch (NVIDIA)** | Default on CUDA | `TorchLlmArgs` | `_torch/pyexecutor/` → `PyExecutor` → PyTorch Engine |
+| **ROCm (RDNA4)** | Separate portable backend | `rocm.LLM`, `trtllm-rdna4` | `rocm/llm.py` → HF causal model → HIP PyTorch / optional wave32 HIP ops |
 
-### Shared C++ Core (via Nanobind)
+ROCm selects automatically with a HIP PyTorch build, or explicitly with
+`TRTLLM_BACKEND=rocm`. Packaging uses `TRTLLM_BUILD_BACKEND=rocm` without building
+NVIDIA bindings. See [the support and dependency review](docs/source/rocm-rdna4.md).
+Portable tests use `pytest --confcutdir=tests/rocm tests/rocm`; CPU tests do not
+qualify native HIP arithmetic. The ROCm path is single-device and does not use the
+NVIDIA scheduler, distributed executor or VisualGen.
+
+### NVIDIA Shared C++ Core (via Nanobind)
 
 Both backends share these C++ components:
 - **Scheduling pipeline**: Scheduler → BatchManager (in-flight batching) → KV Cache Manager

@@ -36,6 +36,52 @@ extensions or unsupported SDPA is not made portable merely by loading its weight
 Select `attn_backend="eager"` for models without SDPA; custom remote code and model
 families outside the native integration list need their own qualification.
 
+## Dependency review and trusted checkpoints
+
+The 2026-10-08 review resolved `requirements-rocm.txt` with `pip-audit` using the
+PyPI vulnerability service. It scanned 31 packages and reported **9 findings
+covering 6 distinct advisory IDs in Transformers 4.57.6** (some PyPI records are
+duplicated). No other package in that resolution was flagged. This is a snapshot
+of one resolution, not a claim that every version allowed by the requirements is
+safe. User-installed ROCm PyTorch and its native libraries require a separate
+review; the ROCm requirements deliberately do not resolve or replace Torch.
+
+| Advisory ID | Affected Transformers path |
+| --- | --- |
+| PYSEC-2025-217 / CVE-2025-14929 | X-CLIP checkpoint conversion deserialization |
+| PYSEC-2026-2288 / CVE-2026-1839 | Trainer RNG-state checkpoint loading |
+| PYSEC-2026-2289 / CVE-2026-4372 | Model configuration selecting a remote attention kernel, bypassing remote-code consent |
+| PYSEC-2026-2290 / CVE-2026-5241 | LightGlue nested configuration overriding remote-code consent |
+| PYSEC-2026-3929 / CVE-2026-9856 | Tokenizer/processor chat-template filename traversal on save |
+| PYSEC-2026-4174 / CVE-2026-80047 | Custom generation module written to cache before remote-code consent |
+
+**The Transformers 4.x dependency is not vulnerability-free.** The fixed versions
+listed by the service for several advisories are in Transformers 5.x (including
+5.3.0 and 5.10.0); some records list no fixed version. The backend's attention and
+mask integration is currently qualified only against 4.x. A 5.x migration needs
+separate API/parity qualification rather than silently loosening that major-version
+constraint to make an audit appear green.
+
+Use only trusted model weights, configuration and tokenizer files, prefer
+safetensors, and isolate inference from credentials and other sensitive files.
+`trust_remote_code=False` and `--local-files-only` **do not establish a security
+boundary** against the published configuration/cache vulnerabilities. Do not load
+untrusted checkpoints with this 4.x dependency; local-only loading does not make an
+already malicious local checkpoint safe. Trainer, X-CLIP conversion and LightGlue
+are not used by this causal-inference backend, but that does not dismiss the
+model-loading and tokenizer advisories.
+
+Resolved PyPI license metadata declares MIT, BSD/0BSD, Apache-2.0, PSF-2.0,
+CNRI-Python, Zlib, CC0-1.0 and MPL-2.0 terms. In particular, certifi declares MPL-2.0
+and tqdm declares MPL-2.0/MIT; redistributors must retain notices and comply with
+applicable component-license obligations. Metadata review is not legal approval.
+To repeat the vulnerability review in a disposable environment:
+
+```bash
+python -m pip install pip-audit
+python -m pip_audit -r requirements-rocm.txt --vulnerability-service pypi
+```
+
 ## Install without CUDA/TensorRT build stages
 
 1. Install AMD's Linux driver/ROCm stack and **a HIP PyTorch wheel explicitly supporting
@@ -128,7 +174,9 @@ trtllm-bench --model /path/to/hf-checkpoint throughput --local-files-only \
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`.
 Chat requires a tokenizer chat template. Unknown request fields, streaming and
-unsupported sampling/logprob features are rejected. The server has no TLS and no
+unsupported sampling/logprob features are rejected. The server binds to loopback
+(`127.0.0.1`) by default; use `--host 0.0.0.0` only when external access is intended.
+It has no TLS and no
 production scheduler; put authentication/TLS/rate limiting in front of it when
 exposing it outside a trusted machine. Without `TRTLLM_API_KEY`, it is unauthenticated.
 

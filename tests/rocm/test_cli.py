@@ -102,3 +102,23 @@ def test_benchmark_prompt_equal_to_mode_is_not_a_positional_mode(monkeypatch) ->
     cli.main(["bench", "--model", "latency", "--prompt", "latency"])
     assert captured[0].benchmark == "throughput"
     assert captured[0].model_option == "latency" and captured[0].prompt == ["latency"]
+
+
+def test_serve_defaults_to_loopback_and_allows_explicit_network_binding(monkeypatch) -> None:
+    from tensorrt_llm.rocm import cli
+
+    captured = []
+    monkeypatch.setattr(cli, "_serve", captured.append)
+    cli.main(["serve", "--model", "checkpoint"])
+    assert captured[0].host == "127.0.0.1"
+    cli.main(["serve", "--model", "checkpoint", "--host", "0.0.0.0"])
+    assert captured[1].host == "0.0.0.0"
+
+
+def test_tiny_tokenizer_preserves_special_token_ids() -> None:
+    model, tokenizer = tiny_model_and_tokenizer()
+    assert tokenizer.pad_token_id == model.config.pad_token_id == 0
+    assert tokenizer.bos_token_id == model.config.bos_token_id == 1
+    assert tokenizer.eos_token_id == model.config.eos_token_id == 2
+    assert tokenizer.unk_token_id == 3
+    assert tokenizer("not_in_the_vocabulary")["input_ids"] == [3]

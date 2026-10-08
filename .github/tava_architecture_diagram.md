@@ -49,6 +49,38 @@ graph TB
         CustomOps --> CUDAKernel
     end
 
+    subgraph "ROCm_RDNA4_Flow"
+        BackendSelection[CUDA or ROCm backend selection]
+        RocmLLM[Portable single-device LLM]
+        HFCausalModel[Hugging Face causal model and cache]
+        HIPPyTorch[HIP PyTorch SDPA and ROCm BLAS]
+        NativeHIP[Optional wave32 HIP norm and attention ops]
+        RDNA4[RDNA4 gfx1200 or gfx1201]
+        CLI --> BackendSelection
+        LLMAPI --> BackendSelection
+        BackendSelection --> |ROCm|RocmLLM
+        RocmLLM --> HFCausalModel
+        HFCausalModel --> HIPPyTorch
+        HFCausalModel --> |explicit native-kernel opt-in|NativeHIP
+        HIPPyTorch --> RDNA4
+        NativeHIP --> RDNA4
+    end
+
+    subgraph "Opt_In_Performance_Profiling"
+        ProfileSession[Local profiling session]
+        HostProfile[Per-source Python host timing]
+        DeviceProfile[Current-stream HIP or CUDA event spans]
+        ResourceProfile[CPU RAM GPU and VRAM sampling]
+        ProfileFiles[Local JSON text Chrome and cProfile reports]
+        CLI --> |--profile|ProfileSession
+        ProfileSession --> HostProfile
+        ProfileSession --> DeviceProfile
+        ProfileSession --> ResourceProfile
+        HostProfile --> ProfileFiles
+        DeviceProfile --> ProfileFiles
+        ResourceProfile --> ProfileFiles
+    end
+
     subgraph "Visual_Gen_Flow"
         VisualGenAPI[VisualGen API]
         DiffusionClient[DiffusionRemoteClient]
@@ -103,6 +135,7 @@ graph TB
     TensorRT_Flow --> Output_Results
     PyTorch_Flow --> Output_Results
     Visual_Gen_Flow --> Output_Results
+    ROCm_RDNA4_Flow --> Output_Results
 
     %% Force Output_Results to be between PyTorch_flow and TensorRT_flow
     PyTorch_Flow ~~~ Output_Results
@@ -143,3 +176,13 @@ graph TB
     classDef result fill:#fbb,stroke:#333,stroke-width:2px;
     class Tokens,Stats,Metrics,GenImages,GenVideos result;
 ```
+
+The NVIDIA paths retain their own executor and shared C++ components. The ROCm
+path is a separate single-device Hugging Face executor: it does not use TensorRT
+plans, the NVIDIA scheduler, distributed KV-cache exchange or VisualGen. Native
+wave32 HIP kernels require explicit opt-in and RDNA4 hardware qualification.
+
+Opt-in performance reports are local files and are separate from the upstream
+usage-telemetry reporting path. The profiler also supports the standalone Python
+launcher, including scripts that do not call the LLM API. See the
+[ROCm support matrix and profiling guide](../docs/source/rocm-rdna4.md).

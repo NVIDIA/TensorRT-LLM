@@ -36,17 +36,20 @@ def tiny_model_and_tokenizer():
     from tokenizers.pre_tokenizers import Whitespace
     from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
-    vocabulary = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
+    special = {
+        "pad_token": "<pad>",
+        "bos_token": "<bos>",
+        "eos_token": "<eos>",
+        "unk_token": "<unk>",
+    }
+    vocabulary = {text: index for index, text in enumerate(special.values())}
     vocabulary.update({f"tok{index}": index for index in range(4, 64)})
-    tokenizer = Tokenizer(WordLevel(vocabulary, unk_token="<unk>"))
+    tokenizer = Tokenizer(WordLevel(vocabulary, unk_token=special["unk_token"]))
     tokenizer.pre_tokenizer = Whitespace()
     fast = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
-        pad_token="<pad>",
-        bos_token="<bos>",
-        eos_token="<eos>",
-        unk_token="<unk>",
         model_max_length=128,
+        **special,
     )
     fast.chat_template = "{% for message in messages %}{{ message['content'] }} {% endfor %}"
     config = LlamaConfig(

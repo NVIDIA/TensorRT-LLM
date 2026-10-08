@@ -235,7 +235,9 @@ def _parser(command: str, program: str) -> argparse.ArgumentParser:
         parser.add_argument("--iterations", type=_positive, default=3)
         parser.add_argument("--output", help="Write benchmark JSON")
     if command == "serve":
-        parser.add_argument("--host", default="0.0.0.0")
+        parser.add_argument(
+            "--host", default="127.0.0.1", help="Bind address; defaults to loopback only"
+        )
         parser.add_argument("--port", type=_positive, default=8000)
         parser.add_argument("--served-model-name")
     return parser

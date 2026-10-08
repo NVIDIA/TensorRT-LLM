@@ -45,8 +45,10 @@ from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
 
-from tensorrt_llm._config import StrictBaseModel as StrictBaseModel
+from tensorrt_llm import _config
 from tensorrt_llm.logger import Singleton, logger
+
+StrictBaseModel = _config.StrictBaseModel
 
 
 def print_traceback_on_error(func):
