@@ -259,12 +259,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
         llmReq.validate(10, 60, 2, false);
-        auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
-        EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
-        EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);
-        auto const& additionalGenerationOutputs = llmReq.getAdditionalGenerationOutputs();
-        EXPECT_EQ(additionalGenerationOutputs.count("context_gen_output"), 1);
-        EXPECT_EQ(additionalGenerationOutputs.count("gen_output"), 1);
     }
 }
 
@@ -304,53 +298,6 @@ TEST_F(LlmRequestTest, pause)
     EXPECT_EQ(llmReq.mMaxNewTokens, 59);
     EXPECT_EQ(llmReq.getState(), tb::LlmRequestState::kCONTEXT_INIT);
     EXPECT_EQ(llmReq.getMaxNumGeneratedTokens(), 0);
-}
-
-TEST_F(LlmRequestTest, testAllocateLogitsBuffer)
-{
-    auto inputTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5});
-    SizeType32 maxNewTokens(60);
-    tb::LlmRequest::RequestIdType requestId{77};
-
-    tb::LlmRequest llmReq(requestId, maxNewTokens, inputTokens, tensorrt_llm::executor::SamplingConfig(1), false);
-
-    EXPECT_EQ(llmReq.mPromptLen, 5);
-
-    SizeType32 vocabSizePadded = 32000;
-    tensorrt_llm::DataType logitsDataType = tensorrt_llm::DataType::kFLOAT;
-
-    // Test the allocation of context logits
-    EXPECT_EQ(llmReq.getContextLogitsHost(), nullptr);
-    llmReq.allocContextLogitsHost(vocabSizePadded, logitsDataType);
-    auto contextLogitsHostShape = llmReq.getContextLogitsHost()->getShape();
-    EXPECT_EQ(contextLogitsHostShape.nbDims, 2);
-    EXPECT_EQ(contextLogitsHostShape.d[0], 5);
-    EXPECT_EQ(contextLogitsHostShape.d[1], vocabSizePadded);
-
-    // Test the allocation of generation logits
-    EXPECT_EQ(llmReq.getGenerationLogitsHost(), nullptr);
-    llmReq.allocGenerationLogitsHost(vocabSizePadded, logitsDataType);
-    auto generationLogitsHostShape = llmReq.getGenerationLogitsHost()->getShape();
-    EXPECT_EQ(generationLogitsHostShape.nbDims, 3);
-    EXPECT_EQ(generationLogitsHostShape.d[0], 1);
-    EXPECT_EQ(generationLogitsHostShape.d[1], maxNewTokens);
-    EXPECT_EQ(generationLogitsHostShape.d[2], vocabSizePadded);
-
-    // Test the allocation of target model's accepted token logits
-    // Set draft token
-    EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
-    auto draftTokens = std::make_shared<VecTokens>(VecTokens{7, 8, 9});
-    llmReq.setDraftTokens(draftTokens);
-    EXPECT_EQ(llmReq.getNumDraftTokens(), 3);
-    // Clean the generation logits
-    llmReq.setGenerationLogitsHost(nullptr);
-    EXPECT_EQ(llmReq.getGenerationLogitsHost(), nullptr);
-    llmReq.allocTargetModelAcceptedTokenLogitsHost(vocabSizePadded, logitsDataType);
-    auto targetModelAcceptedTokenLogitShape = llmReq.getGenerationLogitsHost()->getShape();
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.nbDims, 3);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[0], 1);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[1], 4);
-    EXPECT_EQ(targetModelAcceptedTokenLogitShape.d[2], vocabSizePadded);
 }
 
 TEST_F(LlmRequestTest, testLastTokensSetIndependence)
@@ -720,7 +667,7 @@ TEST_F(LlmRequestTest, createResultDisaggContextComplete)
     // This is the regression case — without the fix, createResult() returns nullopt
     // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
     // or its context-phase branch.
-    auto resultOpt = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    auto resultOpt = llmReq.createResult();
     ASSERT_TRUE(resultOpt.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
     EXPECT_TRUE(resultOpt->contextPhaseParams.has_value())
         << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";

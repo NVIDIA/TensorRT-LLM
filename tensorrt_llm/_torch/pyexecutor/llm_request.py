@@ -897,9 +897,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             torch.Tensor] = encoder_input_features
         if encoder_input_features is not None:
             kwargs["encoder_input_length"] = encoder_input_features.shape[0]
-        return_encoder_output = bool(kwargs.get("return_encoder_output", False))
-        if return_encoder_output:
-            kwargs["return_encoder_output"] = False
+        return_encoder_output = bool(kwargs.pop("return_encoder_output", False))
         if (llm_request is None and encoder_input_tokens is not None
                 and self.py_encoder_input_features is None
                 and encoder_output_len is None):
@@ -916,8 +914,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             super().__init__(llm_request)
         else:
             super().__init__(*args,
-                             return_context_logits=False,
-                             return_generation_logits=False,
                              return_perf_metrics=return_perf_metrics,
                              **kwargs)
         if encoder_output_len is not None and not hasattr(
@@ -1200,13 +1196,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         parent class's serialized result in a PyTorch-specific LlmResponse object.
 
         Args:
-            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
-            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
-            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
-            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
-            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
-            model, that produces the generation logits. This helps transfer logits from the draft model to the
-            target model without going through the serialization/transport path.
+            use_fast_logits: Reserved; does not affect response construction.
+            mpi_world_rank: Reserved; does not affect response construction.
 
         Returns:
             LlmResponse | None: An LlmResponse object containing the request results
@@ -1220,8 +1211,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             Returns None if the serialized result is empty (len(result) == 0),
             indicating no output was generated for this request iteration.
         """
-        result, is_final = super().create_serialized_result(
-            use_fast_logits, mpi_world_rank)
+        result, is_final = super().create_serialized_result()
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.

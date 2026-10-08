@@ -20,7 +20,6 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
-#include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 
@@ -93,7 +92,6 @@ std::optional<std::chrono::steady_clock::duration>& globalSteadyClockOffset();
 template <typename TTensor>
 class GenericLlmRequest
 {
-    using TensorMap = runtime::StringPtrMap<runtime::ITensor>;
 
 public:
     using SizeType32 = runtime::SizeType32;
@@ -123,10 +121,9 @@ public:
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<std::shared_ptr<VecTokens>> const& draftTokens = std::nullopt,
         bool excludeInputFromOutput = false,
-        std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
+        std::optional<std::shared_ptr<VecTokens>> encoderInputTokens = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<SizeType32> encoderInputLength = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
@@ -164,11 +161,8 @@ public:
         , mContextChunkSizeDraft{mPromptLen}
         , mDraftTokens(draftTokens.value_or(std::make_shared<VecTokens>()))
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
-        , mReturnContextLogits(returnContextLogits)
-        , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderTokens(std::move(encoderInputTokens))
-        , mReturnEncoderOutput(returnEncoderOutput)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mEncoderInputLength(encoderInputLength)
@@ -194,10 +188,9 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt, bool returnContextLogits = false,
-        bool returnGenerationLogits = false, std::optional<VecTokens> draftTokens = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<VecTokens> draftTokens = std::nullopt,
         bool excludeInputFromOutput = false, std::optional<VecTokens> encoderInputTokens = std::nullopt,
-        bool returnEncoderOutput = false, executor::PriorityType priority = executor::Request::kDefaultPriority,
+        executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<std::string> cacheSalt = std::nullopt)
         : mRequestId(requestId)
@@ -216,11 +209,8 @@ public:
         , mContextChunkSizeDraft(mPromptLen)
         , mDraftTokens(std::make_shared<VecTokens>(draftTokens.value_or(VecTokens())))
         , mReturnAllGeneratedTokens(isStreaming && (samplingConfig.getBeamWidth() > 1))
-        , mReturnContextLogits(returnContextLogits)
-        , mReturnGenerationLogits(returnGenerationLogits)
         , mExcludeInputFromOutput(excludeInputFromOutput)
         , mEncoderTokens(std::make_shared<VecTokens>(encoderInputTokens.value_or(VecTokens())))
-        , mReturnEncoderOutput(returnEncoderOutput)
         , mPriority(priority)
         , mFinishReasons(samplingConfig.getBeamWidth())
         , mContextPhaseParams(contextPhaseParams)
@@ -246,10 +236,7 @@ public:
         , mContextChunkSizeDraft{mPromptLen}
         , mDraftTokens(std::make_shared<VecTokens>())
         , mReturnAllGeneratedTokens(req.getReturnAllGeneratedTokens())
-        , mReturnContextLogits(req.getOutputConfig().returnContextLogits)
-        , mReturnGenerationLogits(req.getOutputConfig().returnGenerationLogits)
         , mExcludeInputFromOutput(req.getOutputConfig().excludeInputFromOutput)
-        , mReturnEncoderOutput(req.getOutputConfig().returnEncoderOutput)
         , mPriority(req.getPriority())
         , mFinishReasons(mSamplingConfig.getBeamWidth())
         , mEncoderOutputLength(req.getEncoderOutputLength())
@@ -270,19 +257,6 @@ public:
                 "WARNING: using this option may increase network usage significantly (quadratically w.r.t output "
                 "length).");
             mReturnAllGeneratedTokens = true;
-        }
-
-        if (mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && mReturnGenerationLogits)
-        {
-            // In streaming mode with beam search, intermediate logits are returned before finalization,
-            // so they cannot be reordered to match the final beam paths. Non-streaming mode handles
-            // reordering in postProcessRequest() after gatherTree finalization.
-            TLLM_LOG_WARNING(
-                "Returning generation logits when streaming is enabled and beamWidth > 1 is not allowed. "
-                "This is because intermediate logits cannot be reordered to match the final beam paths "
-                "until finalization. Use non-streaming mode for correct generation logits with beam search. "
-                "Disabling returnGenerationLogits.");
-            mReturnGenerationLogits = false;
         }
 
         if (req.getEncoderInputTokenIds().has_value() || req.getEncoderInputFeatures().has_value())
@@ -351,20 +325,6 @@ public:
                 mLoraConfig = tensorrt_llm::runtime::ITensor::view(
                     executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
-            }
-        }
-
-        if (req.getOutputConfig().additionalModelOutputs.has_value())
-        {
-            auto const& outputConfig = req.getOutputConfig();
-            auto const& additionalModelOutputs = outputConfig.additionalModelOutputs.value();
-            for (auto const& modelOutput : additionalModelOutputs)
-            {
-                if (modelOutput.gatherContext)
-                {
-                    mAdditionalContextOutputTensors.emplace(modelOutput.name, TensorPtr{});
-                }
-                mAdditionalGenerationOutputTensors.emplace(modelOutput.name, TensorPtr{});
             }
         }
 
@@ -1024,32 +984,6 @@ public:
         mDraftTokens->resize(getNumDraftTokens() - numTokensToDiscard);
     }
 
-    void setReturnEncoderOutput(bool const returnEncoderOutput)
-    {
-        mReturnEncoderOutput = returnEncoderOutput;
-    }
-
-    [[nodiscard]] bool getReturnEncoderOutput() const
-    {
-        return mReturnEncoderOutput;
-    }
-
-    [[nodiscard]] TensorPtr const& getEncoderOutputHost() const
-    {
-        return mEncoderOutputHost;
-    }
-
-    void setEncoderOutputHost(TensorPtr encoderOutputHost)
-    {
-        mEncoderOutputHost = std::move(encoderOutputHost);
-    }
-
-    void allocEncoderOutputHost(SizeType32 encoderHiddenSize, tensorrt_llm::DataType dataType)
-    {
-        mEncoderOutputHost = runtime::BufferManager::pinned(
-            runtime::ITensor::makeShape({getEncoderOutputLen(), encoderHiddenSize}), dataType);
-    }
-
     [[nodiscard]] bool constexpr getReturnPerfMetrics() const noexcept
     {
         return mReturnPerfMetrics;
@@ -1098,127 +1032,6 @@ public:
     [[nodiscard]] bool getReturnAllGeneratedTokens()
     {
         return mReturnAllGeneratedTokens;
-    }
-
-    void setReturnContextLogits(bool const returnContextLogits)
-    {
-        mReturnContextLogits = returnContextLogits;
-    }
-
-    [[nodiscard]] bool getReturnContextLogits() const
-    {
-        return mReturnContextLogits;
-    }
-
-    void setReturnGenerationLogits(bool const returnGenerationLogits)
-    {
-        TLLM_CHECK_WITH_INFO(!(mIsStreaming && mSamplingConfig.getBeamWidth() > 1 && returnGenerationLogits),
-            "returnGenerationLogits must be false if streaming AND beam search are used.");
-        mReturnGenerationLogits = returnGenerationLogits;
-    }
-
-    [[nodiscard]] bool getReturnGenerationLogits() const
-    {
-        return mReturnGenerationLogits;
-    }
-
-    [[nodiscard]] TensorPtr const& getContextLogitsHost() const
-    {
-        return mContextLogitsHost;
-    }
-
-    /// @param contextLogitsHost Expected shape [promtLen, vocabSizePadded]
-    void setContextLogitsHost(TensorPtr contextLogitsHost)
-    {
-        mContextLogitsHost = std::move(contextLogitsHost);
-    }
-
-    void allocContextLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
-    {
-        mContextLogitsHost = runtime::BufferManager::pinnedPool(
-            runtime::ITensor::makeShape({mPromptLen, vocabSizePadded}), logitsDataType);
-    }
-
-    [[nodiscard]] TensorPtr const& getGenerationLogitsHost() const
-    {
-        return mGenerationLogitsHost;
-    }
-
-    /// @param generationLogitsHost Expected shape
-    /// * [beamWidth, maxNewTokens, vocabSizePadded] for non-speculative decoding
-    /// * [1, numDraftTokens + 1, vocabSizePadded] for speculative decoding
-    void setGenerationLogitsHost(TensorPtr generationLogitsHost)
-    {
-        mGenerationLogitsHost = std::move(generationLogitsHost);
-    }
-
-    void allocGenerationLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
-    {
-        if (mIsStreaming)
-        {
-            // If streaming mode, the complete generation logits shape will be [1, beamWidth, vocabSizePadded],
-            // or [allGeneratedTokens, beamWidth, vocabSizePadded] if mReturnAllGeneratedTokens is True.
-            // This could reduce unnecessary format conversions and allows the data to be returned directly.
-            mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-                runtime::ITensor::makeShape({mMaxNewTokens, mSamplingConfig.getBeamWidth(), vocabSizePadded}),
-                logitsDataType);
-        }
-        else
-        {
-            mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-                runtime::ITensor::makeShape({mSamplingConfig.getBeamWidth(), mMaxNewTokens, vocabSizePadded}),
-                logitsDataType);
-        }
-    }
-
-    void allocTargetModelAcceptedTokenLogitsHost(SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDataType)
-    {
-        mGenerationLogitsHost = runtime::BufferManager::pinnedPool(
-            runtime::ITensor::makeShape({1, getNumDraftTokens() + 1, vocabSizePadded}), logitsDataType);
-    }
-
-    [[nodiscard]] bool hasAdditionalOutputs() const noexcept
-    {
-        return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
-    }
-
-    [[nodiscard]] TensorMap const& getAdditionalContextOutputs() const
-    {
-        return mAdditionalContextOutputTensors;
-    }
-
-    [[nodiscard]] TensorMap const& getAdditionalGenerationOutputs() const
-    {
-        return mAdditionalGenerationOutputTensors;
-    }
-
-    template <typename TypeFunc, typename ShapeFunc>
-    void allocAdditionalOutputs(TypeFunc getTensorDataType, ShapeFunc getTensorShape)
-    {
-        for (auto& outputTensor : mAdditionalContextOutputTensors)
-        {
-            auto const& outputTensorName = outputTensor.first;
-            auto const dataType = getTensorDataType(outputTensorName);
-            auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
-                outputTensorName.c_str());
-            shape.d[0] = mPromptLen;
-            auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
-            outputTensor.second = std::move(tensor);
-        }
-        for (auto& outputTensor : mAdditionalGenerationOutputTensors)
-        {
-            auto const& outputTensorName = outputTensor.first;
-            auto const dataType = getTensorDataType(outputTensorName);
-            auto shape = getTensorShape(outputTensorName);
-            TLLM_CHECK_WITH_INFO(shape.d[0] == -1, "First dimension of additional output tensor '%s' must be dynamic",
-                outputTensorName.c_str());
-            shape.d[0] = mMaxNewTokens;
-            shape = runtime::ITensor::unsqueeze(shape, 0);
-            shape.d[0] = mSamplingConfig.getBeamWidth();
-            auto tensor = runtime::BufferManager::pinnedPool(shape, dataType);
-            outputTensor.second = std::move(tensor);
-        }
     }
 
     void setState(LlmRequestState state)
@@ -1745,21 +1558,12 @@ protected:
 
     // whether to return the full beams on each iteration. True when doing streaming + beamsearch
     bool mReturnAllGeneratedTokens;
-    // Save logits
-    bool mReturnContextLogits;
-    bool mReturnGenerationLogits;
-    TensorPtr mContextLogitsHost;    // [mPromptLen, vocabSizePadded]
-    TensorPtr mGenerationLogitsHost; // [beamSize, mMaxNewTokens, vocabSizePadded]
 
     bool mExcludeInputFromOutput;
 
     // Encoder-only and Encoder-Decoder models
     // Encoder input tokens
     std::optional<std::shared_ptr<VecTokens>> mEncoderTokens{std::nullopt};
-
-    bool mReturnEncoderOutput;
-
-    TensorPtr mEncoderOutputHost; // [mEncoderOutputLength, encoderHiddenSize]
 
     SizeType32 mDecodingIter{0};
 
@@ -1802,12 +1606,6 @@ protected:
 
     // Timepoint at which the request started. Used for tracking the timeout
     std::chrono::steady_clock::time_point mStartTime;
-
-    // Tensors containing the additional context output.
-    TensorMap mAdditionalContextOutputTensors;
-
-    // Tensors containing the additional generation output.
-    TensorMap mAdditionalGenerationOutputTensors;
 
     bool mIsDummyRequest{false};
 
@@ -1950,9 +1748,8 @@ public:
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
         std::optional<TensorPtr> loraConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
-        bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, bool excludeInputFromOutput = false,
-        std::optional<VecTokens> encoderInputTokens = std::nullopt, bool returnEncoderOutput = false,
+        std::optional<VecTokens> encoderInputTokens = std::nullopt,
         executor::PriorityType priority = executor::Request::kDefaultPriority,
         std::optional<SizeType32> encoderInputLength = std::nullopt,
         std::optional<SizeType32> encoderOutputLength = std::nullopt,
@@ -1980,13 +1777,12 @@ public:
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
             loraTaskId, std::move(loraWeights), std::move(loraConfig), std::move(kvCacheRetentionConfig),
-            returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             excludeInputFromOutput,
             encoderInputTokens ? std::make_optional(std::make_shared<VecTokens>(std::move(*encoderInputTokens)))
                                : std::optional<std::shared_ptr<VecTokens>>(std::nullopt),
-            returnEncoderOutput, priority, encoderInputLength, encoderOutputLength, llmRequestType,
+            priority, encoderInputLength, encoderOutputLength, llmRequestType,
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             returnPerfMetrics, contextPhaseParams, arrivalTime, std::move(agent_hierarchy),
@@ -2012,10 +1808,9 @@ public:
     LlmRequest(LlmRequest&& request) = default;
     LlmRequest(LlmRequest const& request) = default;
 
-    std::optional<executor::Result> createResult(bool useFastLogits = false, int32_t mpiWorldRank = 0);
+    std::optional<executor::Result> createResult();
 
-    void createSerializedResult(
-        std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0);
+    void createSerializedResult(std::vector<char>& serializedResult, bool& isFinal);
 
     /// @brief Check if the (user-provided) tokens fall within the vocabulary range.
     /// @details Currently only supports invocation before context phase is completed.

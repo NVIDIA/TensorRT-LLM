@@ -52,10 +52,9 @@ runtime::SizeType32 GenericLlmRequest<TTensor>::getBeamWidthByIter(bool const fo
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-void LlmRequest::createSerializedResult(
-    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
+void LlmRequest::createSerializedResult(std::vector<char>& serializedResult, bool& isFinal)
 {
-    auto result = createResult(useFastLogits, mpiWorldRank);
+    auto result = createResult();
     if (result.has_value())
     {
         std::ostringstream oStream;
@@ -68,7 +67,7 @@ void LlmRequest::createSerializedResult(
 }
 
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
-std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
+std::optional<executor::Result> LlmRequest::createResult()
 {
     auto const streamingInProgress = mIsStreaming
         && (mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE);
@@ -151,37 +150,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     auto sliceBeams = [&nbBeams](auto beams)
     { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
 
-    if (getReturnContextLogits())
-    {
-        result.contextLogits = executor::detail::ofITensor(getContextLogitsHost());
-    }
-
-    if (getReturnGenerationLogits())
-    {
-        bool hasDraftTokens = mDraftTokens && !mDraftTokens->empty();
-        if (isStreaming() && !hasDraftTokens)
-        {
-            auto startGenTokenPos = startTokenPos - getOrigPromptLen();
-            TensorPtr generationLogitsHostCurrentStep
-                = runtime::ITensor::slice(getGenerationLogitsHost(), startGenTokenPos, maxNbTokensOut);
-            result.generationLogits = executor::detail::ofITensor(generationLogitsHostCurrentStep);
-        }
-        else if (useFastLogits)
-        {
-            result.specDecFastLogitsInfo = executor::SpeculativeDecodingFastLogitsInfo{mRequestId, mpiWorldRank};
-        }
-        else
-        {
-            result.generationLogits
-                = executor::detail::ofITensor(runtime::ITensor::slice(getGenerationLogitsHost(), 0, nbBeams));
-        }
-    }
-
-    if (getReturnEncoderOutput())
-    {
-        result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
-    }
-
     if (getReturnPerfMetrics())
     {
         mPerfMetrics.kvCacheMetrics.kvCacheHitRate = getKVCacheHitRatePerRequest();
@@ -199,22 +167,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
     result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
-
-    if (hasAdditionalOutputs())
-    {
-        std::string prefix = "context_";
-        for (auto const& outputTensorMap : {mAdditionalContextOutputTensors, mAdditionalGenerationOutputTensors})
-        {
-            for (auto const& outputTensor : outputTensorMap)
-            {
-                TLLM_LOG_DEBUG("Adding tensor %s with shape %s to result.", outputTensor.first.c_str(),
-                    runtime::ITensor::toString(outputTensor.second->getShape()).c_str());
-                result.additionalOutputs.emplace_back(
-                    prefix + outputTensor.first, executor::detail::ofITensor(outputTensor.second));
-            }
-            prefix = "generation_";
-        }
-    }
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
