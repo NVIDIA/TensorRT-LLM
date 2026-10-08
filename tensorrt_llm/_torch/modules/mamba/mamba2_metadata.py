@@ -404,6 +404,9 @@ class Mamba2Metadata:
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
             return
+        # FlashInfer ring replay folds in-kernel and never reads work items.
+        if getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False):
+            return
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
         if use_gdn_all_layer_commit:
