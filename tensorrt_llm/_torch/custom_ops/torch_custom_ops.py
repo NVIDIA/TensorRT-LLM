@@ -906,6 +906,74 @@ class FP4GemmRunner(TunableRunner):
         return out
 
 
+class CublasLtBF16GemmRunner(TunableRunner):
+    """CublasLt-based BF16 GEMM runner that tunes the algorithm for M <= 16 on SM121."""
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, tuple(range(1, 17)), lambda m: m), ),
+                                 use_cold_l2_cache=True)
+
+    def __init__(self, output_buffer_kind, group, has_bias):
+        self.output_buffer_kind = output_buffer_kind
+        self.group = group
+        self.has_bias = has_bias
+
+    def unique_id(self):
+        return (self.output_buffer_kind, self.has_bias)
+
+    def get_valid_tactics(self, inputs, profile, **kwargs):
+        a, b = inputs
+        count = torch.ops.trtllm.cublas_mm_num_tactics(a, b, kwargs.get('bias'))
+        return list(range(count))
+
+    def forward(self, inputs, tactic=-1, bias=None, **kwargs):
+        a, b = inputs
+        return torch.ops.trtllm.cublas_mm_tactic(a, b, bias, None,
+                                                 self.output_buffer_kind,
+                                                 self.group, tactic)
+
+
+@torch.library.custom_op("trtllm::cublas_mm_tuned", mutates_args=())
+def cublas_mm_tuned(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """cublas_mm that autotunes the cuBLASLt algorithm for small-M BF16 GEMMs on SM121."""
+    capability = torch.cuda.get_device_capability(mat_a.device)
+    if (capability != (12, 1) or mat_a.dtype != torch.bfloat16
+            or mat_b.dtype != torch.bfloat16
+            or out_dtype not in (None, torch.bfloat16) or mat_a.shape[0] > 16
+            or mat_a.stride() != (mat_a.shape[1], 1)
+            or mat_b.stride() != (1, mat_b.shape[0])
+            or mat_a.data_ptr() % 256 != 0 or mat_b.data_ptr() % 256 != 0):
+        return torch.ops.trtllm.cublas_mm(mat_a, mat_b, bias, out_dtype,
+                                          output_buffer_kind, group)
+    runner = CublasLtBF16GemmRunner(output_buffer_kind, group, bias is not None)
+    _, tactic = AutoTuner.get().choose_one("trtllm::cublas_mm_tuned::bf16",
+                                           [runner],
+                                           runner.tuning_config, [mat_a, mat_b],
+                                           bias=bias)
+    return runner([mat_a, mat_b], tactic=tactic, bias=bias)
+
+
+@cublas_mm_tuned.register_fake
+def _(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
+) -> torch.Tensor:
+    shape = list(mat_a.shape)
+    shape[-1] = mat_b.shape[-1]
+    return mat_a.new_empty(
+        shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+
+
 class CublasLtFP4GemmRunner(TunableRunner):
     """CublasLt-based FP4 GEMM runner with auto-tuning support.
 
