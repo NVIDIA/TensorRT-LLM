@@ -324,6 +324,8 @@ def _make_forward_only_engine(
     engine._fallback_to_engine = True
     engine._lora = SimpleNamespace(cuda_graph_manager=None)
     engine._force_lora_graph_for_capture = None
+    engine._compile_only_piecewise_graphs = False
+    engine._prefill_compiled_model = None
 
     semantic_attn_metadata = Mock()
     graph_attn_metadata = Mock()

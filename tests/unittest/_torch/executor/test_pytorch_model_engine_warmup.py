@@ -57,11 +57,13 @@ from tensorrt_llm.mapping import Mapping
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("model_kind", ["default", "m3", "m3_vl", "gdn", "mamba"])
 @pytest.mark.parametrize("compile_enabled,piecewise", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("compile_only_piecewise_graphs", [False, True])
 def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch: pytest.MonkeyPatch,
     model_kind: str,
     compile_enabled: bool,
     piecewise: bool,
+    compile_only_piecewise_graphs: bool,
 ) -> None:
     """Exercise the real constructor's routing gate without loading weights or CUDA."""
     from tensorrt_llm._torch.models.modeling_minimaxm3 import (
@@ -91,7 +93,11 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     eager = torch.nn.Linear(4, 4)
     model.model = eager
     compile_config = SimpleNamespace(
-        enable_fullgraph=True, enable_inductor=False, enable_userbuffers=False, max_num_streams=1
+        enable_fullgraph=True,
+        compile_only_piecewise_graphs=compile_only_piecewise_graphs,
+        enable_inductor=False,
+        enable_userbuffers=False,
+        max_num_streams=1,
     )
     llm_args = SimpleNamespace(
         encode_only=False,
@@ -166,7 +172,11 @@ def test_pcg_fx_fallback_policy_is_model_specific(
             checkpoint_loader=Mock(),
         )
 
-    expected_prefill_only = compile_enabled and piecewise and model_kind in ("m3", "m3_vl")
+    expected_prefill_only = (
+        compile_enabled
+        and piecewise
+        and (compile_only_piecewise_graphs or model_kind in ("m3", "m3_vl"))
+    )
     assert engine._torch_compile_prefill_only is expected_prefill_only
     if not compile_enabled:
         compile_model.assert_not_called()
@@ -269,14 +279,16 @@ def test_prefill_compile_preserves_partial_weight_reload(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("prefill_only", [False, True])
 @pytest.mark.parametrize("eligible", [False, True])
+@pytest.mark.parametrize("bypass", [False, True])
 @pytest.mark.parametrize("raises", [False, True])
 def test_prefill_compile_scopes_whole_model_forward(
     monkeypatch: pytest.MonkeyPatch,
     prefill_only: bool,
     eligible: bool,
+    bypass: bool,
     raises: bool,
 ) -> None:
-    """Keep compile state active through model epilogues and restore it on exit."""
+    """Scope compile dispatch by phase independently of the model wrapper."""
     observed = []
 
     def forward(**kwargs: object) -> str:
@@ -288,7 +300,13 @@ def test_prefill_compile_scopes_whole_model_forward(
         observed.append(is_torch_compiling())
         return "done"
 
-    model = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}), forward=forward)
+    eager_model = torch.nn.Identity()
+    eager_model.model_config = SimpleNamespace(extra_attrs={})
+    eager_model.forward = forward
+    compiled_model = torch.nn.Identity()
+    compiled_model.forward = forward
+    prefill_compiled_model = _PrefillCompiledModel(eager_model, compiled_model)
+    model = prefill_compiled_model if prefill_only else eager_model
     engine = SimpleNamespace(
         _model_caller=ModelCaller(model, prefill_compile_only=prefill_only),
         _eager_workspace_reclaimer=None,
@@ -298,7 +316,10 @@ def test_prefill_compile_scopes_whole_model_forward(
         model_call_module, "get_per_request_prefill_cuda_graph_flag", lambda: eligible
     )
     monkeypatch.setattr(model_call_module, "is_trace_enabled", lambda name: False)
-    with torch_compiling(True):
+    bypass_scope = (
+        prefill_compiled_model.bypass() if prefill_only and bypass else contextlib.nullcontext()
+    )
+    with torch_compiling(True), bypass_scope:
         if raises:
             with pytest.raises(RuntimeError, match="epilogue failure"):
                 PyTorchModelEngine.model_forward(engine, is_dummy=False, attn_metadata=Mock())
