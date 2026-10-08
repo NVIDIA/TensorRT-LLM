@@ -104,6 +104,9 @@ class _FakeSession:
 
 
 class _FakeTask:
+    # Matches SendTaskBase: these fakes never count an unowned write in flight.
+    has_unowned_writes_in_flight = False
+
     def __init__(
         self,
         status: TaskStatus,

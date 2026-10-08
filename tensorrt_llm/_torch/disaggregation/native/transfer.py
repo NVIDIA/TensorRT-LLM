@@ -23,7 +23,7 @@ import threading
 import time
 import weakref
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
@@ -91,8 +91,19 @@ if TYPE_CHECKING:
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-# Number of worker threads for KV transfer queues (default: 1)
-KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+_KV_TRANSFER_NUM_THREADS_ENV = "TRTLLM_KV_TRANSFER_NUM_THREADS"
+
+
+def _kv_transfer_num_threads_from_env() -> int:
+    """Read the Sender worker-thread count from the environment (default: 4).
+
+    ``Sender`` rejects values below 1 when it is constructed.
+    """
+    return int(os.environ.get(_KV_TRANSFER_NUM_THREADS_ENV, "4"))
+
+
+# Number of Sender worker threads; each one owns a send queue.
+KV_TRANSFER_NUM_THREADS = _kv_transfer_num_threads_from_env()
 
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
@@ -683,12 +694,18 @@ class SendTaskBase(_LogicalTask):
         self.status = TaskStatus.INIT
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
+        # Leaf lock: guards the transfer counters and the status transitions made
+        # by fail(), complete() and try_begin_unowned_write().
         self.lock = threading.Lock()
         self._params = params
         self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_lock = threading.Lock()
         self._physical_operations: dict[int, _PhysicalOperation] = {}
+        # "Unowned" writes are those made outside ownership mode, which tracks
+        # its writes in _physical_operations instead. This counts the unowned
+        # writes still reading this task's source.
+        self._unowned_writes_in_flight = 0
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Bind session outcome and deadline before exposing the task to workers.
@@ -702,14 +719,21 @@ class SendTaskBase(_LogicalTask):
 
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
-        self._exception = exc
-        self.status = TaskStatus.ERROR
-        self._event.set()
+        with self.lock:
+            self._exception = exc
+            self.status = TaskStatus.ERROR
+            self._event.set()
 
     def complete(self) -> None:
+        """Mark the task delivered, unless a failure already ended it."""
+        # The logical arbiter keeps whichever outcome committed first. Calling it
+        # outside self.lock keeps that lock a leaf.
         self._logical_outcomes.complete(self._logical_index)
-        self.status = TaskStatus.TRANSFERRED
-        self._event.set()
+        with self.lock:
+            if self.status == TaskStatus.ERROR:
+                return
+            self.status = TaskStatus.TRANSFERRED
+            self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -718,6 +742,40 @@ class SendTaskBase(_LogicalTask):
     @property
     def is_done(self) -> bool:
         return self._event.is_set()
+
+    def try_begin_unowned_write(self) -> bool:
+        """Admit and count one unowned write, unless the task has already ended.
+
+        Moves INIT to TRANSFERRING. Returns False, counting nothing, if the task
+        already failed or completed. Pair a True result with ``end_unowned_write()``.
+        """
+        with self.lock:
+            if self._event.is_set():
+                return False
+            if self.status == TaskStatus.INIT:
+                self.status = TaskStatus.TRANSFERRING
+            self._unowned_writes_in_flight += 1
+            return True
+
+    def begin_unowned_write(self) -> None:
+        """Count one unowned write without checking or changing the task status.
+
+        Pair it with ``end_unowned_write()``. Aux writes use this because they run
+        even after the aux task has ended.
+        """
+        with self.lock:
+            self._unowned_writes_in_flight += 1
+
+    def end_unowned_write(self) -> None:
+        """Stop counting an unowned write once its backend call has returned."""
+        with self.lock:
+            self._unowned_writes_in_flight -= 1
+
+    @property
+    def has_unowned_writes_in_flight(self) -> bool:
+        """Whether a counted unowned write has not yet returned."""
+        with self.lock:
+            return self._unowned_writes_in_flight > 0
 
     def begin_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
@@ -911,6 +969,17 @@ class _SessionQuiescence:
     endpoint: Optional[str]
 
 
+@dataclass
+class _SharedDealer:
+    """A DEALER shared by the Sender's listener and caller threads.
+
+    ZMQ sockets are not thread-safe; ``lock`` serializes every use of ``messenger``.
+    """
+
+    messenger: ZMQMessenger
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
@@ -926,6 +995,11 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
+        num_threads = KV_TRANSFER_NUM_THREADS
+        if num_threads < 1:
+            raise ValueError(
+                f"{_KV_TRANSFER_NUM_THREADS_ENV} must be at least 1, got {num_threads}"
+            )
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
@@ -936,8 +1010,12 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
-        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
+        # Shared DEALERs for the listener and caller threads; see
+        # _send_on_shared_dealer for their locking.
+        self._shared_dealers: dict[str, _SharedDealer] = {}
+        self._shared_dealers_lock = threading.Lock()
+        # Worker threads send only on their own DEALERs (_get_or_connect_thread_dealer).
+        self._thread_local = threading.local()
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
@@ -957,7 +1035,7 @@ class Sender(SenderBase):
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
         )
-        self._num_threads = KV_TRANSFER_NUM_THREADS
+        self._num_threads = num_threads
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
         ]
@@ -1123,11 +1201,16 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
+    def _worker_index(self, unique_rid: int, peer_rank: int) -> int:
+        """Return the index of the worker that handles one (request, peer) stream.
+
+        Each stream is handled by one worker, so the stream's reports leave on one
+        socket in queue order (e.g. IN_DOUBT before any later FAILED).
+        """
+        return hash((unique_rid, peer_rank)) % self._num_threads
+
     def _enqueue(self, write_meta: WriteMeta):
-        # Route by (unique_rid, peer_rank) so that:
-        # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
-        # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        thread_idx = self._worker_index(write_meta.unique_rid, write_meta.peer_rank)
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -1143,14 +1226,6 @@ class Sender(SenderBase):
         if endpoint not in dealers:
             dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return dealers[endpoint]
-
-    def _get_result_dealer(
-        self, endpoint: Optional[str], *, legacy_shared: bool = False
-    ) -> ZMQMessenger:
-        """Keep legacy early-failure routing outside the ownership bridge."""
-        if legacy_shared and not self._enforce_physical_ownership:
-            return self._get_or_connect_dealer(endpoint)
-        return self._get_or_connect_thread_dealer(endpoint)
 
     def _submit_transfer(
         self,
@@ -1276,14 +1351,14 @@ class Sender(SenderBase):
         initial_report: list[bytes],
         send_slot_id: Optional[int] = None,
     ) -> None:
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        thread_idx = self._worker_index(write_meta.unique_rid, write_meta.peer_rank)
         key = (write_meta.task, write_meta.peer_rank)
         if key in self._pending_settlements[thread_idx]:
             return
         pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
         self._pending_settlements[thread_idx][key] = pending
         try:
-            self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(initial_report)
         except Exception as error:
             logger.warning(f"Failed to report ambiguous transfer; retaining evidence: {error}")
             pending.report_error_logged = True
@@ -1295,7 +1370,7 @@ class Sender(SenderBase):
         for key, pending in list(pending_transfers.items()):
             meta = pending.write_meta
             try:
-                dealer = self._get_result_dealer(meta.peer_endpoint)
+                dealer = self._get_or_connect_thread_dealer(meta.peer_endpoint)
                 if pending.initial_report is not None:
                     dealer.send(pending.initial_report)
                     pending.initial_report = None
@@ -1395,31 +1470,43 @@ class Sender(SenderBase):
         timer = task._perf_timer
         if timer:
             timer.record_push_end(write_meta.peer_rank)
-        # Hold session.lock to serialize the INIT→TRANSFERRING transition with
-        # cancel(): prevents cancel_request() from freeing KV pages while a
-        # worker is about to write into them.
+        # Hold session.lock to serialize admission with cancel(): this prevents
+        # cancel_request() from freeing KV pages while a worker is about to write
+        # into them. Outside ownership mode, try_begin_unowned_write() moves the
+        # slice from INIT to TRANSFERRING here; in ownership mode,
+        # _begin_task_operation() already did so when it admitted this write.
         with session.lock:
             status = session.status
-            if status in (SessionStatus.ERROR, SessionStatus.CANCELLED):
-                should_abort = True
-            else:
-                if not owned:
-                    task.status = TaskStatus.TRANSFERRING
-                should_abort = False
+            session_ended = status in (SessionStatus.ERROR, SessionStatus.CANCELLED)
+            # The slice may have ended since the session check, usually because another
+            # peer's write of it failed. try_begin_unowned_write() is atomic with
+            # fail(), so an ended slice is never reopened.
+            slice_ended = False
+            if not session_ended and not owned:
+                slice_ended = not task.try_begin_unowned_write()
 
-        if should_abort:
-            logger.warning(
-                f"_deliver_kv_to_agent: session {write_meta.unique_rid} already "
-                f"in {status.value} state; sending FAILED to receiver"
-            )
-            # Task may have been enqueued after cancel() already iterated kv_tasks,
-            # so its future was never set by cancel(). Set it here as a fallback.
-            if owned:
-                task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-            task.fail(
-                RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
-            )
-            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+        if session_ended or slice_ended:
+            if session_ended:
+                logger.warning(
+                    f"_deliver_kv_to_agent: session {write_meta.unique_rid} already "
+                    f"in {status.value} state; sending FAILED to receiver"
+                )
+                # Task may have been enqueued after cancel() already iterated kv_tasks,
+                # so its future was never set by cancel(). Set it here as a fallback.
+                if owned:
+                    task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                task.fail(
+                    RuntimeError(
+                        f"session {write_meta.unique_rid} {status.value}, transfer aborted"
+                    )
+                )
+            else:
+                # Keep the slice's existing outcome on the task.
+                logger.warning(
+                    f"_deliver_kv_to_agent: slice {write_meta.slice_id} of session "
+                    f"{write_meta.unique_rid} already ended; sending FAILED to receiver"
+                )
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1430,78 +1517,85 @@ class Sender(SenderBase):
             )
             return
 
-        from .bounce import build_send_request, encode_result_tail
+        # Outside ownership mode, the write counted above keeps
+        # TxSession.resources_drained() False, so its source pages are not freed,
+        # until the backend call returns. Release it on every path.
+        try:
+            from .bounce import build_send_request, encode_result_tail
 
-        agent_result = AgentResult.SUCCESS
-        send_slot_id = None
-        submitted_and_completed = False
-        if write_meta.src_ptrs.size > 0:
-            try:
-                request, send_slot_id = build_send_request(
-                    self._bounce,
-                    write_meta,
-                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
-                )
-            except Exception as e:
-                # Don't let a gather fault escape: without a result the receiver would hang and its
-                # region leak. Tell the receiver it failed and fail the local task instead.
-                logger.error(
-                    f"_deliver_kv_to_agent: failed to build the KV send request for "
-                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
-                )
-                if owned:
-                    task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-                task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
-                    _make_kv_result_msg(
-                        self._instance_rank,
-                        write_meta.unique_rid,
-                        write_meta.receiver_slice_id,
-                        True,  # is_last_slice — ensures receiver resolves its task future
-                        AgentResult.FAILED,
+            agent_result = AgentResult.SUCCESS
+            send_slot_id = None
+            submitted_and_completed = False
+            if write_meta.src_ptrs.size > 0:
+                try:
+                    request, send_slot_id = build_send_request(
+                        self._bounce,
+                        write_meta,
+                        lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
                     )
-                )
-                return
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            transfer_finished = False
-            try:
-                transfer_finished, last_status = self._submit_transfer(
-                    task, write_meta.peer_rank, request
-                )
-                if transfer_finished:
-                    submitted_and_completed = True
-                    del request
-                if not transfer_finished:
-                    agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
-                    agent_name = getattr(self._agent, "name", "<?>")
-                    detail = (
-                        f"KV transfer agent failed: "
-                        f"unique_rid={write_meta.unique_rid} "
-                        f"slice={write_meta.slice_id} "
-                        f"peer_rank={write_meta.peer_rank} "
-                        f"peer_endpoint={write_meta.peer_endpoint} "
-                        f"op={getattr(request, 'op', '?')} "
-                        f"remote={getattr(request, 'remote_name', '?')} "
-                        f"src_size={int(write_meta.src_ptrs.size)} "
-                        f"dst_size={int(write_meta.dst_ptrs.size)} "
-                        f"nixl_status={last_status} agent={agent_name}"
+                except Exception as e:
+                    # Don't let a gather fault escape: without a result the receiver would hang and its
+                    # region leak. Tell the receiver it failed and fail the local task instead.
+                    logger.error(
+                        f"_deliver_kv_to_agent: failed to build the KV send request for "
+                        f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                     )
-                    logger.error(detail)
-                    error = RuntimeError(detail)
+                    if owned:
+                        task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                    task.fail(RuntimeError(f"build_send_request failed: {e}"))
+                    self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                        _make_kv_result_msg(
+                            self._instance_rank,
+                            write_meta.unique_rid,
+                            write_meta.receiver_slice_id,
+                            True,  # is_last_slice — ensures receiver resolves its task future
+                            AgentResult.FAILED,
+                        )
+                    )
+                    return
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                transfer_finished = False
+                try:
+                    transfer_finished, last_status = self._submit_transfer(
+                        task, write_meta.peer_rank, request
+                    )
+                    if transfer_finished:
+                        submitted_and_completed = True
+                        del request
+                    if not transfer_finished:
+                        agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
+                        agent_name = getattr(self._agent, "name", "<?>")
+                        detail = (
+                            f"KV transfer agent failed: "
+                            f"unique_rid={write_meta.unique_rid} "
+                            f"slice={write_meta.slice_id} "
+                            f"peer_rank={write_meta.peer_rank} "
+                            f"peer_endpoint={write_meta.peer_endpoint} "
+                            f"op={getattr(request, 'op', '?')} "
+                            f"remote={getattr(request, 'remote_name', '?')} "
+                            f"src_size={int(write_meta.src_ptrs.size)} "
+                            f"dst_size={int(write_meta.dst_ptrs.size)} "
+                            f"nixl_status={last_status} agent={agent_name}"
+                        )
+                        logger.error(detail)
+                        error = RuntimeError(detail)
+                        task.fail(error)
+                except _TransferNotSubmittedError as error:
+                    # Backend admission failed, so local resources are safe to retire.
+                    transfer_finished = True
+                    agent_result = AgentResult.FAILED
                     task.fail(error)
-            except _TransferNotSubmittedError as error:
-                # Backend admission failed, so local resources are safe to retire.
-                transfer_finished = True
-                agent_result = AgentResult.FAILED
-                task.fail(error)
-            finally:
-                if send_slot_id is not None and (not owned or transfer_finished):
-                    self._bounce.release_send(send_slot_id)
-        elif owned:
-            task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-        if timer:
-            timer.record_transfer_end(write_meta.peer_rank)
+                finally:
+                    if send_slot_id is not None and (not owned or transfer_finished):
+                        self._bounce.release_send(send_slot_id)
+            elif owned:
+                task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+            if timer:
+                timer.record_transfer_end(write_meta.peer_rank)
+        finally:
+            if not owned:
+                task.end_unowned_write()
 
         # Report every chunk so failures reach the receiver immediately.
         tail = (
@@ -1534,7 +1628,7 @@ class Sender(SenderBase):
         if agent_result == AgentResult.IN_DOUBT:
             self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
             return
-        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
         with task.lock:
             task.transferred_count += 1
@@ -1588,48 +1682,56 @@ class Sender(SenderBase):
         if timer:
             timer.record_push_end(write_meta.peer_rank)
 
-        agent_result = AgentResult.SUCCESS
-        if write_meta.src_ptrs.size > 0:
-            try:
-                request = Sender._make_agent_request(write_meta, device_id=self._device_id)
-            except Exception as error:
-                logger.error(
-                    "_deliver_aux_to_agent: failed to build the auxiliary send "
-                    f"request for {write_meta.unique_rid}: {error}"
-                )
-                if owned:
-                    aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-                aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
-                # An admitted operation normally makes this worker the only
-                # eligible claimant. Keep the claim at the send boundary so
-                # duplicate dispatch cannot publish contradictory evidence.
-                if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
-                    self._get_result_dealer(write_meta.peer_endpoint).send(
-                        _make_aux_result_msg(
-                            self._instance_rank,
-                            write_meta.unique_rid,
-                            AgentResult.FAILED,
-                        )
+        # Outside ownership mode, count this write so TxSession.resources_drained()
+        # stays False, and the aux slot is not freed, until the backend call returns.
+        if not owned:
+            aux_task.begin_unowned_write()
+        try:
+            agent_result = AgentResult.SUCCESS
+            if write_meta.src_ptrs.size > 0:
+                try:
+                    request = Sender._make_agent_request(write_meta, device_id=self._device_id)
+                except Exception as error:
+                    logger.error(
+                        "_deliver_aux_to_agent: failed to build the auxiliary send "
+                        f"request for {write_meta.unique_rid}: {error}"
                     )
-                return
-            if timer:
-                timer.record_transfer_start(write_meta.peer_rank)
-            try:
-                transfer_finished, last_status = self._submit_transfer(
-                    aux_task, write_meta.peer_rank, request
-                )
-                if transfer_finished:
-                    del request
-                if not transfer_finished:
-                    agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
-                    session.set_exception(f"aux transfer agent request failed: {last_status}")
-            except _TransferNotSubmittedError as error:
-                agent_result = AgentResult.FAILED
-                aux_task.fail(error)
-            if timer:
-                timer.record_transfer_end(write_meta.peer_rank)
-        elif owned:
-            aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                    if owned:
+                        aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+                    aux_task.fail(RuntimeError(f"build aux transfer request failed: {error}"))
+                    # An admitted operation normally makes this worker the only
+                    # eligible claimant. Keep the claim at the send boundary so
+                    # duplicate dispatch cannot publish contradictory evidence.
+                    if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
+                        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
+                            _make_aux_result_msg(
+                                self._instance_rank,
+                                write_meta.unique_rid,
+                                AgentResult.FAILED,
+                            )
+                        )
+                    return
+                if timer:
+                    timer.record_transfer_start(write_meta.peer_rank)
+                try:
+                    transfer_finished, last_status = self._submit_transfer(
+                        aux_task, write_meta.peer_rank, request
+                    )
+                    if transfer_finished:
+                        del request
+                    if not transfer_finished:
+                        agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
+                        session.set_exception(f"aux transfer agent request failed: {last_status}")
+                except _TransferNotSubmittedError as error:
+                    agent_result = AgentResult.FAILED
+                    aux_task.fail(error)
+                if timer:
+                    timer.record_transfer_end(write_meta.peer_rank)
+            elif owned:
+                aux_task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
+        finally:
+            if not owned:
+                aux_task.end_unowned_write()
 
         # An admitted operation normally makes this worker the only eligible
         # claimant. Keep the claim at the send boundary so future cleanup-path
@@ -1641,7 +1743,7 @@ class Sender(SenderBase):
                     _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, agent_result),
                 )
                 return
-            self._get_result_dealer(write_meta.peer_endpoint).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_aux_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -2013,7 +2115,7 @@ class Sender(SenderBase):
                 return
             marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
             self._pending_session_quiescence[key] = marker
-            self._send_task_queues[hash(key) % self._num_threads].put(marker)
+            self._send_task_queues[self._worker_index(unique_rid, instance_rank)].put(marker)
 
     def _send_session_quiesced(self, marker: _SessionQuiescence) -> bool:
         """Acknowledge a fenced, drained session; return False to retry later.
@@ -2031,7 +2133,7 @@ class Sender(SenderBase):
             with session.lock:
                 if not session.has_failed() or not session.resources_drained():
                     return False
-        thread_idx = hash(key) % self._num_threads
+        thread_idx = self._worker_index(marker.unique_rid, marker.peer_rank)
         if any(
             pending.write_meta.unique_rid == marker.unique_rid
             and pending.write_meta.peer_rank == marker.peer_rank
@@ -2206,20 +2308,35 @@ class Sender(SenderBase):
         if defer_to_worker or self._enforce_physical_ownership:
             # Listener-side rejection must share the worker's ordered stream;
             # it cannot overtake an ambiguous write's pending IN_DOUBT report.
-            thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
+            thread_idx = self._worker_index(info.unique_rid, info.instance_rank)
             for message in messages:
                 self._send_task_queues[thread_idx].put((endpoint, message))
             return
-        dealer = self._get_or_connect_dealer(endpoint)
-        for message in messages:
-            dealer.send(message)
+        # Outside ownership mode, an immediate listener rejection goes out on the
+        # shared DEALER and is not ordered with the worker's reports.
+        self._send_on_shared_dealer(endpoint, messages)
 
-    def _get_or_connect_dealer(self, endpoint: Optional[str]):
+    def _send_on_shared_dealer(
+        self, endpoint: Optional[str], messages: Iterable[list[bytes]]
+    ) -> None:
+        """Send ``messages`` in order on the shared DEALER for ``endpoint``.
+
+        The listener and caller threads share these sockets. The lookup and
+        first-use connect run under ``_shared_dealers_lock``, so each endpoint gets
+        exactly one socket. The sends run under that dealer's own lock, so one
+        call's messages are never interleaved with another thread's, and a send
+        blocked toward one peer does not stall sends to other peers.
+        """
         if endpoint is None:
             raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        with self._shared_dealers_lock:
+            dealer = self._shared_dealers.get(endpoint)
+            if dealer is None:
+                dealer = _SharedDealer(ZMQMessenger(mode="DEALER", endpoint=endpoint))
+                self._shared_dealers[endpoint] = dealer
+        with dealer.lock:
+            for message in messages:
+                dealer.messenger.send(message)
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -2260,8 +2377,9 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                self._send_on_shared_dealer(
+                    peer_ri.self_endpoint,
+                    [[MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]],
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
@@ -2299,12 +2417,15 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
-            try:
-                dealer.stop()
-            except Exception as e:
-                logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
+        with self._shared_dealers_lock:
+            for dealer in self._shared_dealers.values():
+                # Let an in-progress send finish before its socket is closed.
+                with dealer.lock:
+                    try:
+                        dealer.messenger.stop()
+                    except Exception as e:
+                        logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
+            self._shared_dealers.clear()
         self._shutdown = True
 
     def __del__(self):
@@ -2556,12 +2677,19 @@ class TxSession(TxSessionBase):
         return self.aux_task is not None and self.aux_task.status == TaskStatus.ERROR
 
     def resources_drained(self) -> bool:
+        tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
         if not getattr(self, "_enforce_physical_ownership", False):
-            return not any(task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks)
+            # A task can already be ERROR while another peer's write of the same
+            # slice, or an aux write, still reads its source, so status alone does
+            # not prove the session drained.
+            no_kv_task_transferring = not any(
+                task.status == TaskStatus.TRANSFERRING for task in self.kv_tasks
+            )
+            no_write_in_flight = not any(task.has_unowned_writes_in_flight for task in tasks)
+            return no_kv_task_transferring and no_write_in_flight
         retirement = getattr(self, "_retirement", None)
         if retirement is not None and not retirement.can_retire():
             return False
-        tasks = self.kv_tasks + ([self.aux_task] if self.aux_task is not None else [])
         return all(task.resources_drained for task in tasks)
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
