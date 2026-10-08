@@ -42,6 +42,8 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..attention.backends.sparse.params import \
+    get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
@@ -557,6 +559,20 @@ def get_mla_context_workspace_kv_len_cap(
     if override is None:
         return worst_case
     return min(max(int(override), max_seq_len), worst_case)
+
+
+def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
+                                             workspace_memory: int) -> int:
+    """Bytes to carve out of the KV cache budget for the Indexer MQA-logits tile.
+
+    The profiling forward does not reach the largest logits tile the runtime can
+    allocate (fresh-prefill dummies attend only their own tokens), so reserve the
+    full reachable tile, clamped to the budget. Returns 0 if either input is
+    non-positive.
+    """
+    if kv_cache_memory <= 0 or workspace_memory <= 0:
+        return 0
+    return min(workspace_memory, kv_cache_memory)
 
 
 def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
@@ -1746,6 +1762,21 @@ class KvCacheCreator:
         # user-provided configuration.
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
+
+        if getattr(self._sparse_attention_config, "algorithm",
+                   None) == "deepseek_v4":
+            workspace_memory = get_indexer_mqa_logits_workspace_bytes(
+                self._max_num_tokens, self._max_seq_len)
+            budget_before = kv_cache_max_memory
+            workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
+                budget_before, workspace_memory)
+            if workspace_reserve > 0:
+                kv_cache_max_memory = int(budget_before - workspace_reserve)
+                logger.info(
+                    f"Reserving {workspace_reserve / (GB):.2f} GiB for the DeepSeek-V4 Indexer MQA "
+                    f"logits workspace (workspace cap {workspace_memory / (GB):.2f} GiB): KV cache "
+                    f"budget {budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
+                )
 
         # Reserve headroom for attention workspace the selected backend declares and the profiling forward
         # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill

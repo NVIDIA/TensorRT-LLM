@@ -413,6 +413,8 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+        # Token shape of the last autotuner warmup that ran a forward pass.
+        self._completed_autotuner_warmup_num_tokens: Optional[int] = None
         self.encoder_batch_size = (llm_args.encoder_max_batch_size
                                    if llm_args.encoder_max_batch_size
                                    is not None else self.batch_size)
@@ -2280,11 +2282,6 @@ class PyTorchModelEngine(ModelEngine):
         enable_flashinfer_mxfp8_autotuner = bool(flashinfer_mxfp8_methods)
         enable_native_mxfp8_autotuner = bool(native_mxfp8_methods)
 
-        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
-        logger.info(
-            f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
-            f"native MXFP8={enable_native_mxfp8_autotuner}, "
-            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -2292,6 +2289,23 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
+
+        # The warmup runs again after the KV cache is rebuilt; when the token
+        # shape is unchanged and no MXFP8 tuning is pending, the profiling
+        # cache already holds every tactic this pass would tune.
+        if (self._completed_autotuner_warmup_num_tokens == curr_max_num_tokens
+                and not enable_flashinfer_mxfp8_autotuner
+                and not enable_native_mxfp8_autotuner):
+            logger.info(
+                "Skipping duplicate autotuner warmup for already completed "
+                f"num_tokens={curr_max_num_tokens}")
+            return
+
+        AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
+        logger.info(
+            f"Running autotuner warmup (TRT-LLM={enable_trtllm_autotuner}, "
+            f"native MXFP8={enable_native_mxfp8_autotuner}, "
+            f"FlashInfer MXFP8={enable_flashinfer_mxfp8_autotuner})...")
 
         warmup_configs = [(curr_max_num_tokens, 0)]
         if self.guided_decoder is None and not self.mapping.has_pp():
@@ -2387,6 +2401,8 @@ class PyTorchModelEngine(ModelEngine):
         # profiler, reducing memory available for activations during inference.
         clear_memory_buffers()
         torch.cuda.empty_cache()
+        if ran_native_forward:
+            self._completed_autotuner_warmup_num_tokens = curr_max_num_tokens
 
     def _run_mamba_hybrid_warmup(self,
                                  resource_manager: ResourceManager) -> None:

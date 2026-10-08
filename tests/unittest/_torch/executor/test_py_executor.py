@@ -2324,6 +2324,45 @@ def test_pad_dummy_gen_keeps_default_token_nums():
     assert stub.active_requests[-1].state == _STATE_GENERATION_IN_PROGRESS
 
 
+def _make_cleanup_stub(active_requests):
+    stub = Mock()
+    stub.active_requests = list(active_requests)
+    return stub
+
+
+def test_attention_dp_dummy_cleanup_removes_dummy_that_is_not_last():
+    dummy = Mock(is_attention_dp_dummy=True, py_request_id=17)
+    real_request = Mock(is_attention_dp_dummy=False, py_request_id=18)
+    stub = _make_cleanup_stub([dummy, real_request])
+
+    PyExecutor._terminate_attention_dp_dummy_requests(stub)
+
+    assert stub.active_requests == [real_request]
+    assert dummy.state == LlmRequestState.GENERATION_COMPLETE
+    stub.inflight_req_ids.erase.assert_called_once_with(17)
+    stub._terminate_request.assert_called_once_with(dummy)
+
+
+def test_attention_dp_dummy_cleanup_preserves_real_requests():
+    real_request = Mock(is_attention_dp_dummy=False, py_request_id=19)
+    stub = _make_cleanup_stub([real_request])
+
+    PyExecutor._terminate_attention_dp_dummy_requests(stub)
+
+    assert stub.active_requests == [real_request]
+    stub.inflight_req_ids.erase.assert_not_called()
+    stub._terminate_request.assert_not_called()
+
+
+def test_update_request_states_uses_common_dummy_cleanup():
+    stub = Mock()
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states_tp(stub, scheduled_requests)
+
+    stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
+
+
 def test_overlap_adp_preserves_legacy_role_without_forward_intent_collective():
     stub = _StubADPExecutor(
         max_num_tokens=4096,
