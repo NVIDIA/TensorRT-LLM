@@ -37,6 +37,7 @@ def multimodal_processor(monkeypatch) -> Mock:
     # The GPU worker runs in a separate process unless this is set.
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
     processor = Mock(spec=BaseMultimodalInputProcessor)
     processor.frontend_torch_threads = _MAX_THREADS
     return processor
@@ -52,6 +53,18 @@ def test_caps_multimodal_processor_threads(monkeypatch, multimodal_processor):
     assert initializer is not None
     initializer()
     assert observed == [_MAX_THREADS]
+
+
+def test_keeps_explicit_mkl_thread_count(monkeypatch, multimodal_processor):
+    monkeypatch.setenv("MKL_NUM_THREADS", "32")
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 32)
+    observed = []
+    monkeypatch.setattr(torch, "set_num_threads", observed.append)
+
+    initializer = _multimodal_processor_torch_initializer(_generator(), multimodal_processor)
+
+    assert initializer is None
+    assert observed == []
 
 
 @pytest.mark.parametrize(

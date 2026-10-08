@@ -584,7 +584,8 @@ def _multimodal_processor_torch_initializer(
     use intra-op parallelism later in this process and resizes PyTorch's
     process-wide auxiliary thread pools, so the cap is skipped when the GPU
     worker may run in the frontend process. It is also skipped when
-    ``OMP_NUM_THREADS`` is set, to respect an explicit user choice.
+    ``OMP_NUM_THREADS`` or ``MKL_NUM_THREADS`` is set, to respect an explicit
+    user choice.
 
     Args:
         generator: The serving generator; its ``args`` tell whether the GPU
@@ -598,7 +599,9 @@ def _multimodal_processor_torch_initializer(
     if not isinstance(input_processor, BaseMultimodalInputProcessor):
         return None
     max_threads = input_processor.frontend_torch_threads
-    if max_threads is None or "OMP_NUM_THREADS" in os.environ:
+    if max_threads is None or any(
+            name in os.environ
+            for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")):
         return None
 
     # GenerationExecutor.create() may run the GPU worker in this process in
