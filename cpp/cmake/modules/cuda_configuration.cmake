@@ -85,6 +85,10 @@ Functions
   ``CMAKE_CUDA_ARCHITECTURES_FAMILIES``
     List of family architectures (e.g., ``100f``, ``120f``).
 
+  ``CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS``
+    Architectures TensorRT-LLM provides optimized kernels for, i.e. the values
+    ``CMAKE_CUDA_ARCHITECTURES`` may select from.
+
   ``CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES``
     Boolean indicating if family targets are supported.
 
@@ -482,6 +486,9 @@ function(setup_cuda_architectures)
       PARENT_SCOPE)
   set(CMAKE_CUDA_ARCHITECTURES_FAMILIES
       ${CMAKE_CUDA_ARCHITECTURES_FAMILIES}
+      PARENT_SCOPE)
+  set(CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS
+      ${ARCHITECTURES_WITH_KERNELS}
       PARENT_SCOPE)
 endfunction()
 
