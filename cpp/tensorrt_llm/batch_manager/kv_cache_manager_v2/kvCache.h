@@ -27,6 +27,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -37,6 +38,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // Forward declarations.
+class Batch;
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
@@ -152,6 +154,56 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+// Independent host metadata for one request's layer group and beam. Events retain copy readiness,
+// not storage ownership: use the indices only while the request is active and its version matches.
+class PageStorageSnapshot
+{
+public:
+    uint64_t version() const noexcept
+    {
+        return mVersion;
+    }
+
+    std::optional<int> row() const noexcept
+    {
+        return mRow;
+    }
+
+    std::vector<int> const& basePageIndices() const noexcept
+    {
+        return mBasePageIndices;
+    }
+
+    // A missing level accompanies BAD_PAGE_INDEX. Valid indices address slots in the indicated level.
+    std::vector<std::optional<CacheLevel>> const& cacheLevels() const noexcept
+    {
+        return mCacheLevels;
+    }
+
+    // Contiguous complete sparse history on host; stops at the first missing or GPU mapping.
+    int eligibleHistoryBlocks() const noexcept
+    {
+        return mEligibleHistoryBlocks;
+    }
+
+    std::vector<CachedCudaEvent> const& readyEvents() const noexcept
+    {
+        return mReadyEvents;
+    }
+
+    // Queue copy-completion dependencies without blocking the CPU or publishing device metadata.
+    void waitReady(CudaStream stream) const;
+
+private:
+    friend class KvCache;
+    uint64_t mVersion = 0;
+    std::optional<int> mRow;
+    std::vector<int> mBasePageIndices;
+    std::vector<std::optional<CacheLevel>> mCacheLevels;
+    int mEligibleHistoryBlocks = 0;
+    std::vector<CachedCudaEvent> mReadyEvents;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -188,8 +240,20 @@ public:
 
     // Resume: check utilization and lock active pages at their required storage levels.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
+    // isDecoding defaults to the current phase. A cache starts in prefill and cannot return to it
+    // after decode admission. Set true when admitting a suspended request directly to decode.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt);
+    bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
+
+    // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
+    // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
+    // with an unchanged watermark. Returns false on host OOM.
+    bool enterDecode();
+
+    bool isDecoding() const noexcept
+    {
+        return mIsDecoding;
+    }
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
     void suspend();
@@ -214,6 +278,33 @@ public:
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);
 
+    //! Internal explicit demotion of complete, locked sparse history. Takes the manager's exclusive lock.
+    //! Duplicate pages and pages already in host history are ignored. Does not advance history length.
+    //! Caller must ensure every owner has finished the execution phase that requires these pages on GPU.
+    void offloadSparsePages(std::vector<SharedPtr<Page>> const& pages);
+
+    // CPU-side invalidation for page indices, levels, readiness, eligibility and row/buffer bindings.
+    // Several changes leave one pending refresh. Acknowledging an older version never clears it.
+    uint64_t pageStorageVersion() const;
+    bool pageStorageDirty() const;
+    // Acknowledge only after refreshing every group/beam from snapshots of this same version.
+    bool acknowledgePageStorage(uint64_t version);
+
+    // Associate a consumer's stable row with this request; nullopt detaches it. Every bind
+    // requires a refresh, including reuse of the same row number by a new consumer. Close detaches it.
+    // Batch members must use Batch::add/remove instead of rebinding directly.
+    void bindPageStorageRow(std::optional<int> row);
+    std::optional<int> pageStorageRow() const;
+
+    // Copies raw indices (no expansion or BAD-to-zero conversion) and readiness under the API lock.
+    // Eligibility is zero for prefill, inactive requests and non-sparse layer groups.
+    PageStorageSnapshot getPageStorageSnapshot(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
+
+    // Call after submitting reads on another stream, before mutating/suspending/closing this cache.
+    // Joins those reads into the request stream so its normal unlock/commit fences protect storage.
+    // Snapshot acquisition, read submission and this call belong to the request's owning thread.
+    void recordPageStorageRead(CudaStream stream);
+
     // ---- Committing tokens -------------------------------------------------
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
@@ -234,7 +325,7 @@ public:
     // Get base page indices (slot_id) for beamIdx × layerGroupId.
     // Returns a non-owning Span into the page-index buffer (owned by this KvCache, or by the
     // caller when set via setBasePageIndexBuf). The span is valid until the next resize(),
-    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume().
+    // setBasePageIndexBuf() or close(); its contents are also rewritten by suspend()/resume() and offload.
     Span<int const> getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx = kDefaultBeamIndex) const;
 
     // Get aggregated (slot-level) page indices for one layer group + beam.
@@ -339,7 +430,7 @@ public:
     // Plan dropping SWA blocks needed only by the next conversation turn.
     //
     // The plan covers committed pages in each SWA life cycle's current attention
-    // window. Full-attention and attention-sink blocks are excluded because
+    // window. Sparse history, full-attention, and attention-sink blocks are excluded because
     // later turns may still need them. An SSM life cycle contributes its final block. Must be
     // called after stopCommitting(). Returns nullptr without creating a plan if
     // any required SWA page is unavailable. Mirrors Python's
@@ -464,22 +555,35 @@ public:
 
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
+    // Caller holds the manager's exclusive API lock, including when updating another owner's table.
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
 
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
     friend class KvCacheIntrospection;
+    friend class UniqPageLock;
+    friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
+
+    void onPageStorageChanged() noexcept;
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
-    // Keep cold sparse history (and immutable reuse sources) in host memory.
-    // Writable pages require GPU storage; GPU history stays there until explicitly offloaded.
+    // Release active locks and scratch slots without recording a scheduler suspension.
+    void _deactivate();
+
+    // Prefill and writable pages require GPU storage. Decode keeps cold sparse history on host.
     CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
+
+    // Offload GPU pages in the supplied complete-history range and retry deferred history.
+    // Pages stay on GPU until they belong to every live owner's complete decode history.
+    // The candidate watermark is visible only under the exclusive API lock until offload succeeds.
+    void _offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength);
+    void _publishHistoryLength(int historyLength);
 
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
@@ -539,7 +643,6 @@ private:
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
-    bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
     bool _shouldRecordManagerStats() const;
     bool _shouldRecordRequestStats() const;
@@ -638,6 +741,9 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    bool mIsDecoding = false;
+    // Retry by scanning current blocks; deferred work does not retain pages or other requests.
+    bool mHasDeferredSparseOffload = false;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 
@@ -647,6 +753,10 @@ private:
     using LifeCyclePageIndexBuffers = TypedVec<LifeCycleId, PageIndexBuf>;
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
+    Batch* mPageStorageBatch = nullptr; // Non-owning; both destructors detach membership.
+    uint64_t mPageStorageVersion = 0;
+    bool mPageStorageDirty = true;
+    std::optional<int> mPageStorageRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
 
@@ -668,6 +778,7 @@ private:
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
+    bool mHasResumed = false; // Successful admission, independent of completed deferred copies.
 
     PendingStats mPendingStats;
 

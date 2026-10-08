@@ -50,9 +50,10 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager, get_global_dwdp_manager
+from .engine.runners.decoder.runner import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .hang_diagnostics import monitor_executor_initialization
-from .model_engine import PyTorchModelEngine, uses_full_generation_page_table
+from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
