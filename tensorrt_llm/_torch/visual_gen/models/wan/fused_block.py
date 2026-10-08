@@ -13,6 +13,9 @@ from tensorrt_llm._utils import get_sm_version
 
 from ...modules.wan_fused_fp8 import ops as fused_ops
 
+# Attention writes FP8 for to_out, skipping the quant; "0" disables.
+_FP8_ATTN_OUT = os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN_OUT", "1") == "1"
+
 
 def _static_fp8(linear) -> bool:
     weight = getattr(linear, "weight", None)
@@ -67,21 +70,31 @@ def _quant(x2d, linear):
     )[0]
 
 
+def _attn_args(attn, freqs_cos, freqs_sin):
+    return (
+        attn.norm_q.weight,
+        attn.norm_k.weight,
+        freqs_cos,
+        freqs_sin,
+        attn.local_num_attention_heads,
+        float(attn.eps),
+        bool(attn.interleave),
+    )
+
+
+def _fused_attn_mode(attn):
+    """sp_mode of attn, or "unsupported" when fused attention is off."""
+    if os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") != "1":
+        return "unsupported", None
+    return fused_ops.sp_mode(attn)
+
+
 def _self_attention(attn, qkv, freqs_cos, freqs_sin, timestep):
-    mode, pg = fused_ops.sp_mode(attn)
-    if os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") == "1" and mode != "unsupported":
-        args = (
-            attn.norm_q.weight,
-            attn.norm_k.weight,
-            freqs_cos,
-            freqs_sin,
-            attn.local_num_attention_heads,
-            float(attn.eps),
-            bool(attn.interleave),
-        )
-        if mode == "ulysses":
-            return fused_ops.ulysses_self_attention(qkv, *args, pg)
-        return torch.ops.wanfused.fp8_self_attention(qkv, *args)
+    mode, pg = _fused_attn_mode(attn)
+    if mode == "ulysses":
+        return fused_ops.ulysses_self_attention(qkv, *_attn_args(attn, freqs_cos, freqs_sin), pg)
+    if mode == "none":
+        return torch.ops.wanfused.fp8_self_attention(qkv, *_attn_args(attn, freqs_cos, freqs_sin))
     attn.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
     q, k, v = qkv.split([attn.local_q_dim, attn.local_kv_dim, attn.local_kv_dim], dim=-1)
     return attn._attn_impl(q, k, v, timestep=timestep)
@@ -105,8 +118,14 @@ def forward(block, x, encoder_hidden_states, temb, freqs_cos, freqs_sin, timeste
         x2d, None, None, None, 2, scale_msa, shift_msa, seq, eps, _inv_scale(attn1.qkv_proj)
     )
     qkv = _gemm(x8, attn1.qkv_proj, epilogue=1).view(batch, seq, -1)
-    attn_out = _self_attention(attn1, qkv, freqs_cos, freqs_sin, timestep)
-    y1 = _gemm(_quant(attn_out.reshape(tokens, dim), attn1.to_out[0]), attn1.to_out[0])
+    if _FP8_ATTN_OUT and _fused_attn_mode(attn1)[0] == "none":
+        attn_out8 = torch.ops.wanfused.fp8_self_attention_fp8_out(
+            qkv, *_attn_args(attn1, freqs_cos, freqs_sin), attn1.to_out[0].input_scale
+        )
+        y1 = _gemm(attn_out8.reshape(tokens, dim), attn1.to_out[0])
+    else:
+        attn_out = _self_attention(attn1, qkv, freqs_cos, freqs_sin, timestep)
+        y1 = _gemm(_quant(attn_out.reshape(tokens, dim), attn1.to_out[0]), attn1.to_out[0])
 
     # Out-proj bias + gated residual + LayerNorm2 + FP8 quant.
     xa, xa8 = rlq(

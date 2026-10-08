@@ -115,3 +115,26 @@ def test_fp8_self_attention_matches_reference():
     ref = _reference_attention(qkv, norm_q_w, norm_k_w, cos, sin, eps)
     assert out.shape == (batch, seq, DIM)
     assert _cosine(out, ref) > 0.99
+
+
+def test_fp8_self_attention_fp8_out_matches_bf16_out_then_quant():
+    torch.manual_seed(0)
+    batch, seq, eps = 2, 1024, 1e-6
+    qkv = torch.randn(batch, seq, 3 * DIM, device="cuda").to(torch.bfloat16)
+    norm_q_w = (torch.rand(DIM, device="cuda") + 0.5).to(torch.bfloat16)
+    norm_k_w = (torch.rand(DIM, device="cuda") + 0.5).to(torch.bfloat16)
+    angle = torch.rand(seq, HEAD_DIM // 2, device="cuda") * 2 * math.pi
+    cos = torch.repeat_interleave(angle.cos(), 2, dim=-1)
+    sin = torch.repeat_interleave(angle.sin(), 2, dim=-1)
+    args = (qkv, norm_q_w, norm_k_w, cos, sin, HEADS, eps, True)
+    out16 = torch.ops.wanfused.fp8_self_attention(*args)
+    out_scale = (out16.float().abs().amax() / 448.0).reshape(1)
+    ref8 = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        out16.reshape(batch * seq, DIM), out_scale
+    )[0].view(batch, seq, DIM)
+    out8 = torch.ops.wanfused.fp8_self_attention_fp8_out(*args, out_scale)
+    assert out8.dtype == torch.float8_e4m3fn and out8.shape == ref8.shape
+    # One rounding instead of two: codes differ by at most one step.
+    steps = (out8.view(torch.uint8).int() - ref8.view(torch.uint8).int()).abs()
+    assert steps.max().item() <= 1
+    assert (steps == 0).float().mean().item() > 0.95

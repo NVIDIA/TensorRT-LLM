@@ -47,7 +47,7 @@ def _norm_rope_quant(
     return q8, k8, v8
 
 
-def _fmha(q8, k8, v8, scale_v, batch, seq, bufs):
+def _fmha(q8, k8, v8, scale_v, batch, seq, bufs, out=None):
     heads = q8.shape[-2]
     tokens = batch * seq
     q, k, v = (t.reshape(tokens, heads, HEAD_DIM).contiguous() for t in (q8, k8, v8))
@@ -63,7 +63,7 @@ def _fmha(q8, k8, v8, scale_v, batch, seq, bufs):
         seq,
         True,
         True,
-        None,
+        out,
     )
     return out.view(batch, seq, heads * HEAD_DIM)
 
@@ -140,18 +140,8 @@ def _(x, y, ybias, gate, mode, w, b, seq_per_batch, eps, inv_scale):
     return [x_out, q]
 
 
-@torch.library.custom_op("wanfused::fp8_self_attention", mutates_args=())
-def fp8_self_attention(
-    qkv: torch.Tensor,
-    norm_q_w: torch.Tensor,
-    norm_k_w: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    num_heads: int,
-    eps: float,
-    interleave: bool,
-) -> torch.Tensor:
-    """Packed QKV [B, S, 3*H*D] to attention output [B, S, H*D]."""
+def _prep_qkv(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave):
+    """V scale, then normed/RoPE'd FP8 Q/K/V for one GPU."""
     batch, seq, _ = qkv.shape
     bufs = shape_buffers(batch, seq, qkv.device)
     qkv2d = qkv.reshape(batch * seq, -1).contiguous()
@@ -169,6 +159,23 @@ def fp8_self_attention(
         bufs,
         (batch * seq, num_heads, HEAD_DIM),
     )
+    return q8, k8, v8, bufs
+
+
+@torch.library.custom_op("wanfused::fp8_self_attention", mutates_args=())
+def fp8_self_attention(
+    qkv: torch.Tensor,
+    norm_q_w: torch.Tensor,
+    norm_k_w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    interleave: bool,
+) -> torch.Tensor:
+    """Packed QKV [B, S, 3*H*D] to attention output [B, S, H*D]."""
+    batch, seq, _ = qkv.shape
+    q8, k8, v8, bufs = _prep_qkv(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave)
     return _fmha(q8, k8, v8, bufs["scale_v"], batch, seq, bufs)
 
 
@@ -176,6 +183,33 @@ def fp8_self_attention(
 def _(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave):
     batch, seq, _ = qkv.shape
     return qkv.new_empty(batch, seq, num_heads * HEAD_DIM)
+
+
+@torch.library.custom_op("wanfused::fp8_self_attention_fp8_out", mutates_args=())
+def fp8_self_attention_fp8_out(
+    qkv: torch.Tensor,
+    norm_q_w: torch.Tensor,
+    norm_k_w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    interleave: bool,
+    out_scale: torch.Tensor,
+) -> torch.Tensor:
+    """As fp8_self_attention, but FP8 output quantized by out_scale."""
+    batch, seq, _ = qkv.shape
+    q8, k8, v8, bufs = _prep_qkv(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave)
+    # Unit-scale cubin applies scale_v / out_scale, rounding once to FP8.
+    scale_o = (bufs["scale_v"] / out_scale.float().reshape(1)).contiguous()
+    out = torch.empty(batch * seq, num_heads, HEAD_DIM, device=qkv.device, dtype=FP8)
+    return _fmha(q8, k8, v8, scale_o, batch, seq, bufs, out)
+
+
+@fp8_self_attention_fp8_out.register_fake
+def _(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, interleave, out_scale):
+    batch, seq, _ = qkv.shape
+    return qkv.new_empty(batch, seq, num_heads * HEAD_DIM, dtype=FP8)
 
 
 @torch.library.custom_op("wanfused::v_amax", mutates_args=())
