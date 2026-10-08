@@ -80,7 +80,7 @@ def _self_attention(attn, qkv, freqs_cos, freqs_sin, timestep):
             bool(attn.interleave),
         )
         if mode == "ulysses":
-            return fused_ops.fp8_self_attention_ulysses(qkv, *args, pg)
+            return fused_ops.ulysses_self_attention(qkv, *args, pg)
         return torch.ops.wanfused.fp8_self_attention(qkv, *args)
     attn.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
     q, k, v = qkv.split([attn.local_q_dim, attn.local_kv_dim, attn.local_kv_dim], dim=-1)

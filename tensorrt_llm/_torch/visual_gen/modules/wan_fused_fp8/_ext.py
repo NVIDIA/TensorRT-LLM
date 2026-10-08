@@ -46,6 +46,19 @@ def prep():
 
 
 @functools.cache
+def peer():
+    """Copy-engine copies and stream flags for the Ulysses overlap."""
+    return load(
+        name="wan_fused_peer_copy_ext",
+        sources=[str(_CSRC / "peer_copy.cpp")],
+        extra_cflags=["-O2", "-std=c++17"],
+        extra_ldflags=["-lcuda"],
+        with_cuda=True,
+        build_directory=_build_dir("peer"),
+    )
+
+
+@functools.cache
 def fmha():
     """Binding over TllmGenFmhaRunner; needs a TensorRT-LLM source build."""
     cpp = _TRTLLM_ROOT / "cpp"
