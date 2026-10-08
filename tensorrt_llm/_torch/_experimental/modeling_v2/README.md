@@ -186,12 +186,14 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is certified: 19 entries on sm_103, and 34 on sm_100 (B200 /
+**The catalog is certified: 19 entries on sm_103, and 46 on sm_100 (B200 /
 GB200): the 30 Kimi K3 entries (the MNNVL ones, `attention/k3_drafter_attn` and
-`attention/k3_drafter_attn_qknorm` among them), where their first caller runs,
-and `cublas_mm`, `flashinfer_rmsnorm`, `allgather` and
-`attention/fused_qk_norm_rope`. The targets construct but have never
-executed.**
+`attention/k3_drafter_attn_qknorm` among them) and the 7 entries of Kimi K3's
+generic path, where their first caller runs; `cublas_mm`, `flashinfer_rmsnorm`,
+`allgather` and `attention/fused_qk_norm_rope`; and the Kimi K3 cells of five
+more entries that also hold sm_103 receipts (`thop_attention`, the three MLA
+cache / RoPE ops and the MXFP4 MoE runner). The targets construct but have
+never executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where
