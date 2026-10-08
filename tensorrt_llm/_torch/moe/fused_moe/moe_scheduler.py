@@ -69,6 +69,16 @@ if TYPE_CHECKING:
     from .configurable_moe import ConfigurableMoE
 
 
+def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
+    """Join a pending ``input_ready_event`` before the first read of ``x``.
+
+    Returns ``None`` so callers can clear their handle in one statement.
+    """
+    if event is not None:
+        event.wait()
+    return None
+
+
 class MoEScheduler(ABC):
     """Forward-execution strategy for ConfigurableMoE.
 
@@ -92,6 +102,7 @@ class MoEScheduler(ABC):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor: ...
 
 
@@ -133,7 +144,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
+        """``input_ready_event``: ``x`` is written on another stream. The join
+        is deferred to the first kernel that reads ``x`` so routing overlaps it.
+        """
         moe = self.moe
 
         # ========== Step 1: Handle padding ==========
@@ -179,6 +194,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             all_rank_num_tokens_padded = [all_rank_max_num_tokens] * len(all_rank_num_tokens)
             local_n = x.shape[0]
             if local_n < all_rank_max_num_tokens:
+                input_ready_event = _wait_input_ready(input_ready_event)
                 pad = all_rank_max_num_tokens - local_n
                 x = torch.cat([x, x.new_zeros((pad, x.shape[1]))], dim=0)
                 router_logits = torch.cat(
@@ -200,8 +216,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 do_finalize,
                 input_ids,
                 lora_params=lora_params,
+                input_ready_event=input_ready_event,
             )
         else:
+            input_ready_event = _wait_input_ready(input_ready_event)
             outputs = self._forward_multiple_chunks(
                 x,
                 router_logits,
@@ -317,6 +335,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         do_finalize: bool = True,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -336,6 +355,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             workspace=workspace,
             input_ids=input_ids,
             lora_params=lora_params,
+            input_ready_event=input_ready_event,
         )
 
     def _forward_chunk_impl(
@@ -352,6 +372,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
         row_offset: Optional[int] = 0,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -374,6 +395,25 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
+
+        # Async input quantization (backends providing quantize_input_async,
+        # currently CuteDSL NVFP4): quantize x on the MoE aux stream now so it
+        # overlaps routing (top-k) and the backend's moe_sort on the main
+        # stream -- at decode batch 8 these three latency-bound kernels
+        # otherwise serialize to ~25 us per layer. Only when nothing modifies
+        # x before quantization (no apply_router_weight_on_input) and no comm
+        # strategy decides the quantize/dispatch order.
+        async_quant = None
+        x_ready_event = None
+        if (
+            moe.comm is None
+            and not moe.apply_router_weight_on_input
+            and not isinstance(x, Fp4QuantizedTensor)
+            and hasattr(moe.backend, "quantize_input_async")
+        ):
+            # The quantization stream joins input_ready_event itself.
+            async_quant = moe.backend.quantize_input_async(x, input_ready_event)
+            input_ready_event = None
 
         # ========== Step 2: Apply routing ==========
         # External dispatch (Step 5) sends per-token expert/scale payloads, so
@@ -398,6 +438,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 and not moe._using_load_balancer()
                 and not moe.apply_router_weight_on_input
             ):
+                # A fused route+quant reads x.
+                input_ready_event = _wait_input_ready(input_ready_event)
                 fused_result = moe.backend.try_fused_route_quant(x, router_logits)
             else:
                 fused_result = None
@@ -443,6 +485,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             # apply_router_weight_on_input: fuse top-k weight onto x
             if moe.apply_router_weight_on_input:
+                input_ready_event = _wait_input_ready(input_ready_event)
                 assert x.dtype != torch.float8_e4m3fn, (
                     "Current workaround for apply_router_weight_on_input does not support fp8 input"
                 )
@@ -518,6 +561,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 should_update_eplb_after_dispatch = True
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
+        input_ready_event = _wait_input_ready(input_ready_event)
         use_deep_ep_direct_metadata = False
         if moe.comm is not None:
             # Debug: optional dummy AllReduce to break load-balancing artifacts
@@ -573,8 +617,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 if not uses_internal_dispatch_quantization:
                     x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
-            # No comm: just quantize
-            if not used_fused_route_quant:
+            # No comm: just quantize (or pick up the async result forked above)
+            if async_quant is not None:
+                x, x_sf, x_ready_event = async_quant
+            elif not used_fused_route_quant:
                 x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
 
         # ========== Step 6: MoE computation ==========
@@ -590,6 +636,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            x_ready_event=x_ready_event,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -839,6 +886,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
         use_deep_ep_direct_metadata: bool = False,
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -852,6 +900,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             token_final_scales=token_final_scales,
             x=x,
             x_sf=x_sf,
+            x_ready_event=x_ready_event,
             output_dtype=output_dtype,
             do_finalize=do_finalize,
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
@@ -945,6 +994,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         use_dp_padding: Optional[bool],
         input_ids: Optional[torch.Tensor],
         lora_params: Optional[Dict] = None,
+        input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -955,6 +1005,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         kernel for the cross-rank barrier.
         """
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
+        _wait_input_ready(input_ready_event)
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert
         # MoE LoRA is supported only on the CUTLASS backend. Reject rather than
@@ -1018,15 +1069,24 @@ class FusedCommMoEScheduler(MoEScheduler):
         provided, e.g. dummy / single-rank forwards).
         """
         moe = self.moe
-        had_meta = all_rank_num_tokens is not None
+        # A single count is local (non-DP) metadata, not one entry per EP rank:
+        # indexing it with moe_ep_rank > 0 would raise.
+        had_meta = all_rank_num_tokens is not None and len(all_rank_num_tokens) > 1
         if had_meta:
             # Force plain Python int: downstream torch.Tensor.split and range()
             # reject torch 0-d tensor / numpy scalar elements, and the public
             # ``Optional[List[int]]`` type hint is not runtime-enforced.
             real_all_rank_num_tokens = [int(v) for v in all_rank_num_tokens]
+            if len(real_all_rank_num_tokens) != moe.mapping.moe_ep_size:
+                raise ValueError(
+                    "Fused-comm MoE token metadata must contain one count per EP rank; "
+                    f"got {len(real_all_rank_num_tokens)} counts for EP size "
+                    f"{moe.mapping.moe_ep_size}."
+                )
             ep_rank = moe.mapping.moe_ep_rank
         else:
-            real_all_rank_num_tokens = [int(x.shape[0])]
+            real_local = int(all_rank_num_tokens[0]) if all_rank_num_tokens else int(x.shape[0])
+            real_all_rank_num_tokens = [real_local]
             ep_rank = 0
         real_local = real_all_rank_num_tokens[ep_rank]
         assert real_local <= x.shape[0], (

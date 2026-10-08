@@ -277,6 +277,11 @@ def prepare_sparse_attn_outputs(
             return False
         if num_contexts == 0 and num_generations == 0:
             return False
+        if get_sm_version() == 107:
+            # is_sm_100f() is true on Rubin, but its quantized-attention output
+            # is not numerically compatible with this FMHA epilogue; keep the
+            # standard O-LoRA projection path there.
+            return False
         if self.mapping.has_cp_helix() or not is_sm_100f():
             return False
         if not getattr(self.mapping, "enable_attention_dp", False):

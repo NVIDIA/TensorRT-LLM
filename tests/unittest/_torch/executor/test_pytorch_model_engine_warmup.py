@@ -348,6 +348,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
         llm_args=SimpleNamespace(enable_autotuner=True),
+        _completed_autotuner_warmup_num_tokens=None,
         _torch_compile_enabled=compile_enabled,
         _torch_compile_prefill_only=prefill_only,
         _torch_compile_backend=None,
@@ -437,6 +438,63 @@ def test_compiled_mxfp8_warmup_backend_selection(
     assert flashinfer_gemm.call_count == expected_flashinfer_calls
     assert native_gemm.call_count == (engine._forward_warmup.call_count - expected_flashinfer_calls)
     assert os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND") == backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("completed_num_tokens", [16, 8, None])
+def test_autotuner_warmup_skips_only_completed_token_shape(
+    monkeypatch: pytest.MonkeyPatch, completed_num_tokens: int | None
+) -> None:
+    """A repeated warmup with an already tuned token shape must not re-run tuning."""
+    engine = SimpleNamespace(
+        llm_args=SimpleNamespace(enable_autotuner=True),
+        _completed_autotuner_warmup_num_tokens=completed_num_tokens,
+        _torch_compile_enabled=False,
+        _torch_compile_prefill_only=False,
+        _warmup_timer=_WarmupTimer(rank=0),
+        cuda_graph_runner=SimpleNamespace(enabled=False),
+        model=SimpleNamespace(modules=lambda: []),
+        mapping=SimpleNamespace(tp_size=1, has_pp=lambda: False),
+        dist=object(),
+        kv_cache_manager_key="kv_cache",
+        max_num_tokens=16,
+        batch_size=16,
+        max_seq_len=2,
+        original_max_draft_len=0,
+        max_total_draft_tokens=0,
+        guided_decoder=None,
+        no_cuda_graph=lambda: contextlib.nullcontext(),
+        _create_warmup_request=Mock(return_value=object()),
+        _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
+        _should_run_warmup_batch=Mock(return_value=True),
+        _release_megamoe_profiling_scratch=Mock(),
+        is_spec_decode=False,
+        spec_config=None,
+        max_draft_len=0,
+        _forward_warmup=Mock(),
+    )
+    cache = SimpleNamespace(get_num_available_tokens=lambda **kwargs: 16)
+    resources = SimpleNamespace(
+        get_resource_manager=lambda key: cache if key == "kv_cache" else None
+    )
+    tuner = Mock(profiling_cache={})
+    get_tuner = Mock(return_value=tuner)
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(model_engine_module.AutoTuner, "get", get_tuner)
+    monkeypatch.setattr(model_engine_module, "autotune", lambda **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_engine_module, "clear_memory_buffers", lambda: None)
+
+    PyTorchModelEngine._run_autotuner_warmup(engine, resources)
+
+    if completed_num_tokens == 16:
+        get_tuner.assert_not_called()
+        engine._create_warmup_request.assert_not_called()
+        engine._forward_warmup.assert_not_called()
+    else:
+        assert engine._forward_warmup.call_count == 2
+    assert engine._completed_autotuner_warmup_num_tokens == 16
 
 
 @pytest.mark.parametrize("config_cls", [DraftTargetDecodingConfig, PARDDecodingConfig])
@@ -1230,6 +1288,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
+                _completed_autotuner_warmup_num_tokens=None,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
                 model=SimpleNamespace(
@@ -1348,6 +1407,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
+                _completed_autotuner_warmup_num_tokens=None,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
                 model=SimpleNamespace(
@@ -1451,6 +1511,7 @@ class TestWarmupCleanup(unittest.TestCase):
             engine = SimpleNamespace(
                 _warmup_timer=_WarmupTimer(rank=0),
                 llm_args=SimpleNamespace(enable_autotuner=True),
+                _completed_autotuner_warmup_num_tokens=None,
                 cuda_graph_runner=SimpleNamespace(enabled=True),
                 _torch_compile_enabled=False,
                 model=SimpleNamespace(

@@ -167,12 +167,23 @@ _varlen_pure_cache = {}
 # single-seq cu_seqlens.
 _varlen_single_seqlen_cache = {}
 
-# id(tensor) -> cute_wrapper. The wrappers themselves are stateless views
-# over the tensor's storage, so they remain valid as long as the tensor's
-# data pointer / shape / strides don't change. Callers that reuse the same
-# tensor objects across iterations (typical benchmark pattern) hit the
-# cache; per-call fresh tensors (the executor runtime pattern) rebuild.
-_input_wrap_cache = {}
+# ===== Caching rule for this module (read before adding a cache) =====
+#
+# A cute wrapper built by ``from_dlpack`` holds a STRONG reference to the
+# torch tensor it was built from. So a module-level dict that stores a
+# wrapper keeps that tensor -- and its GPU storage -- alive for the life of
+# the process. id()-keyed weakref pruning cannot help: the cache entry is
+# itself what keeps the key object alive, so the finalizer never runs.
+#
+# Therefore:
+#   * Never put a wrapper over a per-call activation in a module-level dict
+#     (see the note in _launch_k4_persistent).
+#   * Never put a wrapper over LRU-managed scratch in a module-level dict
+#     either -- it defeats the eviction. Store it next to the buffers whose
+#     lifetime it must share (see ``cute_wrappers`` in _get_buffers).
+#   * A wrapper over a private COPY the module intends to own forever is
+#     fine (see _get_dt_bias_ct, which clones on purpose so the cached value
+#     never aliases the keyed object).
 
 
 def _prune_on_gc(cache, key, *keyobjs):
@@ -188,26 +199,6 @@ def _prune_on_gc(cache, key, *keyobjs):
     """
     for o in keyobjs:
         weakref.finalize(o, cache.pop, key, None)
-
-
-def _ct_cached(t, etype):
-    """`_ct(t, etype)` with id(t)-based cache. Returns the same cute wrapper
-    for repeated calls with the same tensor object, avoiding per-call
-    `from_dlpack` overhead (~5-10us each).
-
-    ONLY use for tensors with process-long lifetime (module params, the
-    module-level scratch from ``_get_buffers``): the cached wrapper pins the
-    tensor's storage, so the weakref pruning never fires for the keyed
-    object and a per-call activation would be pinned forever (~100MB/call
-    leak in the executor runtime). Per-call tensors must use plain ``_ct``.
-    """
-    key = (id(t), etype)
-    w = _input_wrap_cache.get(key)
-    if w is None:
-        w = _ct(t, etype)
-        _input_wrap_cache[key] = w
-        _prune_on_gc(_input_wrap_cache, key, t)
-    return w
 
 
 # Cache for dt_bias `.float().contiguous().view(H, K)` + cute wrapper.
@@ -481,6 +472,21 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
         kg_ct = _wrap(KG_flat, bf16)
         o_ct = _wrap(O_token, bf16)
         gk_ct = _wrap(gk_flat, fp32)
+
+        # K123 consumes the un-flattened [B, T, H, *] views of the same
+        # scratch (K4 consumes the token-flat ones above), so it needs its
+        # own wrappers. They MUST be built here and stored in the cache
+        # entry: a wrapper holds a strong reference to its torch tensor, so
+        # parking these in a module-level dict makes the whole buffer set
+        # immortal and the LRU below frees nothing. See the caching rule
+        # above _prune_on_gc.
+        k123_ks_ct = _ct(k_scaled, bf16)
+        k123_kg_ct = _ct(kg, bf16)
+        k123_qs_ct = _ct(q_scaled, bf16)
+        k123_beta_activated_ct = _ct(beta_activated, bf16)
+        k123_gk_ct = _ct(gk_last_exp, fp32)
+        k123_aqk_ct = _ct(A_qk, bf16)
+        k123_akk_ct = _ct(A_kk, bf16)
         cu_eqlen_ct = from_dlpack(cu_eqlen, assumed_align=4).mark_layout_dynamic()
         cu_eqlen_ct.element_type = cutlass.Int32
         co_eqlen_ct = from_dlpack(co_eqlen, assumed_align=4).mark_layout_dynamic()
@@ -507,12 +513,21 @@ def _get_buffers(dev, dtype_k, B, T, H, K_dim, V_dim, NT, N_seqs, BT, varlen=Fal
             co_eqlen_ct=co_eqlen_ct,
             akk_in_view=akk_in_view,
             akk_out_view=akk_out_view,
+            k123_ks_ct=k123_ks_ct,
+            k123_kg_ct=k123_kg_ct,
+            k123_qs_ct=k123_qs_ct,
+            k123_beta_activated_ct=k123_beta_activated_ct,
+            k123_gk_ct=k123_gk_ct,
+            k123_aqk_ct=k123_aqk_ct,
+            k123_akk_ct=k123_akk_ct,
             # Filled lazily on first launch — saves cache_key tuple build +
             # outer dict lookup on subsequent calls.
             _k123_fns={},
             _akk_inv_fn=None,
         )
 
+        # Eviction is only real because nothing outside this tuple holds a
+        # reference to the buffers or their wrappers.
         return _lru_put(
             _buf_cache,
             key,
@@ -575,7 +590,7 @@ def _launch_k4_persistent(
     gk_ct = cute_wrappers["gk_ct"]
 
     # v is a per-call activation — wrap fresh every call (never cache; see
-    # _ct_cached docstring).
+    # the caching rule above _prune_on_gc).
     v_view = v_beta.reshape(-1, H, V_dim) if v_beta.dim() == 4 else v_beta
     v_ct = from_dlpack(v_view, assumed_align=16).mark_layout_dynamic()
     v_ct.element_type = bf16
@@ -761,8 +776,7 @@ def _launch_fused_k123_inv(
     # Inputs are guaranteed contiguous by upstream linear projections.
     # A_log is fp32 model param; .float() is no-op when dtype already matches.
     # q/k/g/beta/cu/ci are per-call activations: plain _ct, never cached
-    # (see _ct_cached docstring). The _get_buffers scratch below is
-    # module-persistent, so caching its wrappers is safe and worthwhile.
+    # (see the caching rule above _prune_on_gc).
     q_ct = _ct(q, cutlass.BFloat16)
     k_ct = _ct(k, cutlass.BFloat16)
     g_ct = _ct(g, cutlass.BFloat16)
@@ -774,14 +788,31 @@ def _launch_fused_k123_inv(
     else:
         raise ValueError(f"Kimi K3 KDA prefill beta must be float32 or bfloat16, got {beta.dtype}")
     beta_ct = _ct(beta, beta_etype)
-    beta_activated_ct = _ct_cached(beta_activated, cutlass.BFloat16)
 
-    ks_ct = _ct_cached(k_scaled, cutlass.BFloat16)
-    kg_ct = _ct_cached(kg, cutlass.BFloat16)
-    qs_ct = _ct_cached(q_scaled, cutlass.BFloat16)
-    gk_ct = _ct_cached(gk_last_exp, cutlass.Float32)
-    aqk_ct = _ct_cached(A_qk, cutlass.BFloat16)
-    akk_ct = _ct_cached(A_kk_inv, cutlass.BFloat16)
+    # Scratch wrappers come from the buffer-cache entry that owns the scratch
+    # itself, so wrapper and buffer die together and evicting the entry
+    # actually returns the memory it holds (~1 GiB at K3 sizes). Caching them
+    # in a module-level id()-keyed dict instead pinned one full buffer set per
+    # distinct prefill token count. CONTRACT: cute_wrappers must be the dict
+    # returned by the same _get_buffers call that produced k_scaled..A_kk_inv
+    # -- _chunk_kda_fwd unpacks both from one return value. Direct low-level
+    # callers may omit it and pay ~10us per tensor to rebuild.
+    if cute_wrappers is not None:
+        beta_activated_ct = cute_wrappers["k123_beta_activated_ct"]
+        ks_ct = cute_wrappers["k123_ks_ct"]
+        kg_ct = cute_wrappers["k123_kg_ct"]
+        qs_ct = cute_wrappers["k123_qs_ct"]
+        gk_ct = cute_wrappers["k123_gk_ct"]
+        aqk_ct = cute_wrappers["k123_aqk_ct"]
+        akk_ct = cute_wrappers["k123_akk_ct"]
+    else:
+        beta_activated_ct = _ct(beta_activated, cutlass.BFloat16)
+        ks_ct = _ct(k_scaled, cutlass.BFloat16)
+        kg_ct = _ct(kg, cutlass.BFloat16)
+        qs_ct = _ct(q_scaled, cutlass.BFloat16)
+        gk_ct = _ct(gk_last_exp, cutlass.Float32)
+        aqk_ct = _ct(A_qk, cutlass.BFloat16)
+        akk_ct = _ct(A_kk_inv, cutlass.BFloat16)
 
     if is_varlen:
         cu_ct = _ct(cu_seqlens, _cute_int_type(cu_seqlens.dtype))
@@ -867,9 +898,7 @@ def _launch_fused_k123_inv(
     else:
         akk_beta_etype = cutlass.BFloat16
     akk_beta_ct = (
-        _ct_cached(beta_for_akk, akk_beta_etype)
-        if use_beta_sigmoid_in_kernel
-        else _ct(beta_for_akk, akk_beta_etype)
+        beta_activated_ct if use_beta_sigmoid_in_kernel else _ct(beta_for_akk, akk_beta_etype)
     )
 
     # B/NT/T_val remain runtime args of akk_inv_host. Eqlen T is still part of

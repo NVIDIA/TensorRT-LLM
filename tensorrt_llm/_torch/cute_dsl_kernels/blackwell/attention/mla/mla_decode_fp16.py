@@ -1508,7 +1508,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                           if self.is_var_split_kv else split_kv)
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]],
                                      self.mma_qk_tiler[1])
-        k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
+        # A request without KV has no K tiles; keep the divisor nonzero.
+        k_tile_per_cta = max(cute.ceil_div(k_tile_total, local_split_kv), 1)
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
         # Alloc shared memory
@@ -3717,9 +3718,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 (H, split_kv, S, B),
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
+            # Bytes first: cosize * width in bits overflows Int32 past 2**26 elements.
             acc_lse_iter = cute.recast_ptr(
-                workspace.iterator +
-                cute.cosize(acc_o_layout) * acc_dtype.width // 8,
+                workspace.iterator + cute.cosize(acc_o_layout) *
+                (acc_dtype.width // 8),
                 dtype=acc_dtype,
             )
             acc_lse = cute.make_tensor(acc_lse_iter, acc_lse_layout)

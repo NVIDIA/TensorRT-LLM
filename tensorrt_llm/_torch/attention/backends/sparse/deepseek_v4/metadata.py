@@ -165,6 +165,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self.compress_ratio_set
         }
 
+        # Device scalar batch size for the shape-static compressed_mask graph.
+        self.batch_size_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (1,),
+            dtype=torch.int,
+            cache_name="batch_size_cuda",
+            capture_graph=capture_graph,
+        )
+
         # compressed_mask_cuda: per-token bool mask for postprocess scatter.
         # Precomputed from new_comp_kv_lens to skip padded generation slots.
         self.compressed_mask_cuda = {
@@ -755,12 +764,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         cached_tokens_cuda = self.cached_token_lens_cuda[:num_requests]
         self.prepare_compressed_kv_metadata(kv_lens_cuda, cached_tokens_cuda, ctx_output_sizes)
 
+        self.batch_size_cuda.fill_(num_requests)
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
             self.cu_new_comp_kv_cuda,
             self.compressed_mask_cuda,
-            num_requests,
-            self.num_total_compressed_tokens,
+            self.batch_size_cuda,
             self._compress_ratios_sorted,
         )
 
@@ -851,12 +860,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
         self.prepare_compressed_kv_metadata(kv_lens, cached_tokens, ctx_output_sizes)
 
+        self.batch_size_cuda.fill_(batch_size)
         self._compute_compressed_mask(
             self.new_comp_kv_lens_cuda,
             self.cu_new_comp_kv_cuda,
             self.compressed_mask_cuda,
-            batch_size,
-            self.num_total_compressed_tokens,
+            self.batch_size_cuda,
             self._compress_ratios_sorted,
         )
 
@@ -971,29 +980,40 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         new_comp_kv_lens_bufs: Dict[int, torch.Tensor],
         cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_mask_bufs: Dict[int, torch.Tensor],
-        batch_size: int,
-        num_total_compressed_tokens: Dict[int, int],
+        batch_size: torch.Tensor,
         compress_ratios: list,
     ):
         """Compute per-token compressed_mask on device (graph-safe, no .item()).
 
-        For each token in [0, total_tokens), determine which sequence it
-        belongs to via searchsorted on cu_new_comp_kv, then compare its
-        within-sequence offset against the actual new_comp_kv_len.
+        For each token slot, determine which sequence it belongs to via
+        searchsorted on cu_new_comp_kv, then compare its within-sequence offset
+        against the actual new_comp_kv_len.
         Context tokens (offset < actual) are always True.
         Generation tokens whose offset >= actual new_comp are padding → False.
+
+        Every shape is a buffer capacity and ``batch_size`` is a [1] int32
+        device tensor, so one compiled graph serves every batch composition.
+        Python-int sizes are 0/1-specialized by dynamo, which recompiled this
+        function for each (batch_size, per-ratio total_tokens) combination.
+        Entries past ``num_total_compressed_tokens[ratio]`` are written but
+        never read.
         """
         device = new_comp_kv_lens_bufs[compress_ratios[0]].device
+        last_seq = (batch_size - 1).clamp(min=0)
         for compress_ratio in compress_ratios:
-            total_tokens = num_total_compressed_tokens[compress_ratio]
-            new_comp = new_comp_kv_lens_bufs[compress_ratio][:batch_size]
-            cu = cu_new_comp_kv_bufs[compress_ratio][: batch_size + 1]
+            new_comp = new_comp_kv_lens_bufs[compress_ratio]
+            cu = cu_new_comp_kv_bufs[compress_ratio]
+            mask = compressed_mask_bufs[compress_ratio]
 
-            token_idx = torch.arange(total_tokens, dtype=torch.int32, device=device)
-            seq_idx = torch.searchsorted(cu[1:], token_idx, right=True)
-            seq_idx = seq_idx.clamp_(max=batch_size - 1)
+            # Stale entries past batch_size would break searchsorted's ordering.
+            req_idx = torch.arange(new_comp.shape[0], dtype=torch.int32, device=device)
+            cu_valid = torch.where(req_idx < batch_size, cu[1:], torch.iinfo(torch.int32).max)
+
+            token_idx = torch.arange(mask.shape[0], dtype=torch.int32, device=device)
+            seq_idx = torch.searchsorted(cu_valid, token_idx, right=True)
+            seq_idx = torch.minimum(seq_idx, last_seq.to(seq_idx.dtype))
             offset_in_seq = token_idx - cu[seq_idx]
-            compressed_mask_bufs[compress_ratio][:total_tokens] = offset_in_seq < new_comp[seq_idx]
+            mask.copy_(offset_in_seq < new_comp[seq_idx])
 
     @staticmethod
     def _compute_ctx_compressed_position_ids(

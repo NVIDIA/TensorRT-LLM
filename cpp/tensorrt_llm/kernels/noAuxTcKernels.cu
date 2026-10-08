@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdlib>
 
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
@@ -46,8 +47,55 @@ static __device__ inline float sigmoid_accurate(float x)
     return 0.5f * tanhf(0.5f * x) + 0.5f;
 }
 
+// Warp-wide max of a 32-bit unsigned value: one redux.sync on SM100+, shuffle tree elsewhere.
+static __device__ __forceinline__ uint32_t warpMaxU32(cg::thread_block_tile<WARP_SIZE> const& warp, uint32_t v)
+{
+    if constexpr (reduce_topk::kTLLM_GEN_HAS_FAST_REDUX)
+    {
+        uint32_t r;
+        asm("redux.sync.max.u32 %0, %1, 0xffffffff;\n" : "=r"(r) : "r"(v));
+        return r;
+    }
+    else
+    {
+        return cg::reduce(warp, v, cg::greater<uint32_t>{});
+    }
+}
+
+// One arg-max round over the warp's key slots (keys as produced by TopKRedType<float>::makeCmpVal:
+// high word = order-preserving value bits, low 16 bits = 65535 - expert index, so "larger key" means
+// "larger value, then smaller index" — the same total order the iterated reduceTopK used). The winner
+// is removed from the slot that held it (slot := 0, below every real key). Two 32-bit warp maxima
+// replace the previous 64-bit shuffle reduction.
+template <int N>
+static __device__ __forceinline__ uint64_t warpArgMaxRound(
+    cg::thread_block_tile<WARP_SIZE> const& warp, uint64_t (&slot)[N])
+{
+    uint64_t best = slot[0];
+#pragma unroll
+    for (int ii = 1; ii < N; ++ii)
+    {
+        best = slot[ii] > best ? slot[ii] : best;
+    }
+    uint32_t const bestHi = static_cast<uint32_t>(best >> 32);
+    uint32_t const hi = warpMaxU32(warp, bestHi);
+    uint32_t const lo = warpMaxU32(warp, bestHi == hi ? static_cast<uint32_t>(best & 0xFFFFu) : 0u);
+    uint64_t const winner = (static_cast<uint64_t>(hi) << 32) | lo;
+#pragma unroll
+    for (int ii = 0; ii < N; ++ii)
+    {
+        slot[ii] = slot[ii] == winner ? uint64_t{0} : slot[ii];
+    }
+    return winner;
+}
+
+// SmallBatch selects the ungrouped implementation: true = two-level parallel top-k (all warps, redux.sync)
+// that minimizes per-CTA latency for decode batches; false = the original single-warp iterated
+// reduceTopK, which issues fewer instructions and wins once thousands of CTAs saturate the GPU
+// (prefill). Both produce bit-identical results; invokeNoAuxTc picks by token count.
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
-    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups>
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups,
+    bool SmallBatch = true>
 __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* topkValues, IdxT* topkIndices,
     BiasT* routingBias, int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
     int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor, int64_t tokenIdx)
@@ -137,8 +185,9 @@ __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* 
             }
         }
     }
-    else
+    else if constexpr (!SmallBatch)
     {
+        // Original ungrouped implementation (throughput regime): warp 0 runs the iterated reduceTopK.
         for (int e = threadIdx.x; e < numExperts; e += blockDim.x)
         {
             auto scoreIdx = tokenIdx * static_cast<int64_t>(numExperts) + e;
@@ -180,10 +229,135 @@ __device__ __forceinline__ void deepseek_v3_topk_block(InputT* scores, OutputT* 
             }
         }
     }
+    else
+    {
+        // Ungrouped (n_group == 1, e.g. Kimi K3: 896 experts / top-16): two-level parallel top-k.
+        //
+        // The previous implementation had warp 0 alone run Sort<MaxNumExperts/32> per lane followed by
+        // `topk` serial 64-bit shuffle reductions while the other warps idled, and its phase 1 issued
+        // the per-thread global loads one dependent iteration at a time -- ~6.8 us per CTA for the
+        // 1024-expert tier on B200; with one CTA per token that latency is fully exposed at small
+        // decode batches. Here:
+        //   phase 1: every thread prefetches all its scores/bias (one round of load latency), then
+        //            writes the sigmoid and the packed (value, index) key of reduce_topk (a strict total
+        //            order: higher value first, then lower index);
+        //   phase 2: each 128-expert batch is handled by one warp: `topk` arg-max rounds, each two
+        //            32-bit redux.sync maxima (value word, then index word) instead of a 64-bit shuffle
+        //            tree -- all warps work in parallel;
+        //   phase 3: warp 0 runs the same rounds over the NumBatches*topk candidates.
+        // Every round removes exactly the maximum key under the same total order the old iterated
+        // reduceTopK used, so the selected experts and their order are identical (bit-exact).
+        using RedType = reduce_topk::TopKRedType<float>;
+        using KeyT = typename RedType::TypeCmp;
+        static_assert(std::is_same_v<KeyT, uint64_t>, "float keys are 64-bit");
+        static constexpr int ChunksPerBatch = 4;
+        static constexpr int BatchSize = ChunksPerBatch * WARP_SIZE; // 128 experts per batch
+        static_assert(MaxNumExperts % BatchSize == 0, "MaxNumExperts must be a multiple of 128");
+        static_assert(BatchSize >= MaxNumTopExperts, "a batch must hold at least topk experts");
+        static constexpr int NumBatches = MaxNumExperts / BatchSize;
+        static constexpr int MaxCandPerLane = (NumBatches * MaxNumTopExperts + WARP_SIZE - 1) / WARP_SIZE;
+        // All launchers use blockDim >= 128 (128/256 threads, 448 in the K3 fused kernel).
+        static constexpr int MinBlockDim = 128;
+        static constexpr int MaxItersPhase1 = MaxNumExperts / MinBlockDim;
+        __shared__ KeyT __attribute((aligned(128))) smemKey[MaxNumExperts];
+        __shared__ KeyT __attribute((aligned(128))) smemCand[NumBatches * MaxNumTopExperts];
+
+        int32_t const numWarps = blockDim.x / WARP_SIZE;
+
+        // Phase 1: prefetch, then sigmoid + bias packed into a sortable key. Padding experts get -inf
+        // (never selected unless numExperts < topk, matching the previous behaviour).
+        float scoreArr[MaxItersPhase1];
+        float biasArr[MaxItersPhase1];
+#pragma unroll
+        for (int ii = 0; ii < MaxItersPhase1; ++ii)
+        {
+            int const e = threadIdx.x + ii * blockDim.x;
+            if (e < numExperts)
+            {
+                scoreArr[ii] = static_cast<float>(scores[tokenIdx * static_cast<int64_t>(numExperts) + e]);
+                biasArr[ii] = static_cast<float>(routingBias[e]);
+            }
+        }
+#pragma unroll
+        for (int ii = 0; ii < MaxItersPhase1; ++ii)
+        {
+            int const e = threadIdx.x + ii * blockDim.x;
+            if (e < MaxNumExperts)
+            {
+                float scoreBias = invalidScoreFloat;
+                float scoreSigmoid = 0.F;
+                if (e < numExperts)
+                {
+                    scoreSigmoid = sigmoid_accurate(scoreArr[ii]);
+                    scoreBias = scoreSigmoid + biasArr[ii];
+                }
+                smemScoreSigmoid[e] = scoreSigmoid;
+                smemKey[e] = RedType::makeCmpVal(scoreBias, e);
+            }
+        }
+        __syncthreads();
+
+        // Phase 2: per-batch top-k candidates (one warp per batch, warps loop over batches).
+        for (int b = warpIdx; b < NumBatches; b += numWarps)
+        {
+            KeyT slot[ChunksPerBatch];
+#pragma unroll
+            for (int ii = 0; ii < ChunksPerBatch; ++ii)
+            {
+                slot[ii] = smemKey[b * BatchSize + ii * WARP_SIZE + laneIdx];
+            }
+            for (int kk = 0; kk < topk; ++kk)
+            {
+                KeyT const winner = warpArgMaxRound(warp, slot);
+                if (laneIdx == kk)
+                {
+                    smemCand[b * topk + kk] = winner;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Phase 3 + finalize (warp 0): top-k over the NumBatches * topk candidates; lane kk keeps the
+        // kk-th largest expert, then the normalization is the same arithmetic as before.
+        if (warpIdx == 0)
+        {
+            int32_t const numCand = NumBatches * static_cast<int32_t>(topk);
+            KeyT slot[MaxCandPerLane];
+#pragma unroll
+            for (int ii = 0; ii < MaxCandPerLane; ++ii)
+            {
+                int const c = ii * WARP_SIZE + laneIdx;
+                slot[ii] = c < numCand ? smemCand[c] : KeyT{0};
+            }
+            KeyT myOut = 0;
+            for (int kk = 0; kk < topk; ++kk)
+            {
+                KeyT const winner = warpArgMaxRound(warp, slot);
+                myOut = laneIdx == kk ? winner : myOut;
+            }
+
+            int32_t expertIdx = MaxNumExperts - 1;
+            float scoreNorm = 0.F;
+            if (laneIdx < topk)
+            {
+                float unusedScore;
+                RedType::unpack(unusedScore, expertIdx, myOut);
+                scoreNorm = smemScoreSigmoid[expertIdx];
+            }
+            auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
+            auto finalScore = static_cast<OutputT>(scoreNorm * routedScalingFactor / (redNorm + 1e-20));
+            if (laneIdx < topk)
+            {
+                topkValues[laneIdx] = static_cast<OutputT>(finalScore);
+                topkIndices[laneIdx] = expertIdx;
+            }
+        }
+    }
 }
 
 template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
-    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups>
+    int MaxNumTopExperts = DefaultMaxNumTopExperts, int MaxNumTopGroups = DefaultMaxNumTopGroups,
+    bool SmallBatch = true>
 __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, BiasT* routingBias,
     int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
     int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
@@ -198,8 +372,8 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
             return;
         }
     }
-    deepseek_v3_topk_block<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups, MaxNumTopExperts, MaxNumTopGroups>(
-        scores, topkValues, topkIndices, routingBias, numTokens, numGroup, topkGroup, topk, numExperts,
+    deepseek_v3_topk_block<InputT, BiasT, OutputT, IdxT, MaxNumExperts, UseGroups, MaxNumTopExperts, MaxNumTopGroups,
+        SmallBatch>(scores, topkValues, topkIndices, routingBias, numTokens, numGroup, topkGroup, topk, numExperts,
         numExpertsPerGroup, routedScalingFactor, blockIdx.x);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
@@ -308,28 +482,48 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
         }
         else if (is_single_group)
         {
+            // Small batches (decode) use the latency-optimized two-level top-k; large batches keep the
+            // original single-warp implementation (fewer instructions once the GPU is saturated).
+            // Measured on B200 (148 SMs), 896 experts / top-16, kernel-only old -> new: 8 tok 6.84 -> 5.12 us,
+            // 128 tok 8.23 -> 5.70, 192-256 tok -3 %, 384 tok +9 %, 512 tok 10.9 -> 12.3, 8192 tok 94 -> 109.
+            // The break is where CTAs start sharing SMs, so the default crossover is 256 tokens.
+            // TLLM_NOAUX_TC_SMALL_BATCH_MAX_TOKENS overrides it (0 = always the original path).
+            static int const smallBatchMaxTokens = []
+            {
+                char const* env = std::getenv("TLLM_NOAUX_TC_SMALL_BATCH_MAX_TOKENS");
+                return env != nullptr ? std::atoi(env) : 256;
+            }();
+            bool const smallBatch = num_tokens <= smallBatchMaxTokens;
             if (num_experts <= 128)
             {
-                kernel_instance
-                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false, MaxSupportedTopExperts>;
+                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
+                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 128, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
                 num_threads = 128;
             }
             else if (num_experts <= 256)
             {
-                kernel_instance
-                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false, MaxSupportedTopExperts>;
+                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
+                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 256, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
                 num_threads = 256;
             }
             else if (num_experts <= 512)
             {
-                kernel_instance
-                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false, MaxSupportedTopExperts>;
+                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
+                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 512, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
                 num_threads = 256;
             }
             else
             {
-                kernel_instance
-                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false, MaxSupportedTopExperts>;
+                kernel_instance = smallBatch ? &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false,
+                                      MaxSupportedTopExperts, DefaultMaxNumTopGroups, true>
+                                             : &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, 1024, false,
+                                                 MaxSupportedTopExperts, DefaultMaxNumTopGroups, false>;
                 num_threads = 256;
             }
         }

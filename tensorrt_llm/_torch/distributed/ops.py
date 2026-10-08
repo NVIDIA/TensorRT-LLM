@@ -768,6 +768,7 @@ class MNNVLAllReduce(nn.Module):
         threading.Lock] = threading.Lock()
 
     SUPPORTED_FUSION_OPS: frozenset[AllReduceFusionOp] = frozenset({
+        AllReduceFusionOp.RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
         AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -967,7 +968,11 @@ class MNNVLAllReduce(nn.Module):
             all_reduce_params.scale,  # scale
             int(fusion_op),
         )
-        return tuple(outputs) if is_fusion else outputs[0]
+        # RMS_NORM returns norm_out alone; match AllReduce.forward's
+        # "unwrap a single-element result" contract so callers see a tensor.
+        if is_fusion and len(outputs) > 1:
+            return tuple(outputs)
+        return outputs[0]
 
 
 class AllReduce(nn.Module):

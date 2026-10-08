@@ -55,6 +55,10 @@ from .quantization import (BF16CuteDslFusedMoEMethod, MoEWeightLoadingMode,
                            NVFP4CuteDslFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
+# Kill switch for CuteDslFusedMoE.quantize_input_async (fork the NVFP4 input
+# quantization onto the MoE aux stream so it overlaps top-k + moe_sort).
+ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
+
 # These runners are defined inside cute_dsl_custom_ops' ``if
 # IS_CUTLASS_DSL_AVAILABLE:`` block, which has no else-branch, so importing them
 # unconditionally would break every importer of this file -- and create_moe
@@ -342,7 +346,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                  scaling_vector_size: int = 16,
                  use_direct_expert_metadata: bool = False,
                  use_locality_domain: bool = False,
-                 workload_identity: Optional[Tuple] = None):
+                 workload_identity: Optional[Tuple] = None,
+                 prime_inner_tactics: bool = False):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -357,7 +362,14 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         assert output_dtype == torch.bfloat16
         self.output_dtype = output_dtype
         self.scaling_vector_size = scaling_vector_size
+        # Extra terms that distinguish two otherwise identically-shaped
+        # workloads (locality-domain topology, activation type, ...). Cache key
+        # only -- it must not imply anything about ``forward_impl``'s signature.
         self.workload_identity = workload_identity
+        # Locality domain only: ``forward_impl`` nests its own AutoTuner calls
+        # and accepts ``overlap_moe_output_memset``. Single-op backends must
+        # leave this off.
+        self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
         identity = (
@@ -443,7 +455,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
+            if self.prime_inner_tactics:
                 # Inner FC tuning cannot run from inside the CUDA graph used to
                 # profile an outer tile. Prime every tile's FC1/FC2 cache for
                 # this optimization profile before outer profiling starts.
@@ -558,7 +570,8 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
                  local_expert_offset: int,
                  enable_alltoall: bool = False,
                  output_dtype: torch.dtype = torch.bfloat16,
-                 workload_identity: Optional[Tuple] = None):
+                 workload_identity: Optional[Tuple] = None,
+                 prime_inner_tactics: bool = False):
         super().__init__()
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -567,7 +580,10 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.enable_alltoall = enable_alltoall
         self.output_dtype = output_dtype
+        # See CuteDslFusedMoENvfp4Runner: cache key only, and locality-domain
+        # only.
         self.workload_identity = workload_identity
+        self.prime_inner_tactics = prime_inner_tactics
 
     def unique_id(self):
         identity = (
@@ -622,7 +638,7 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
                 tactic: Optional[int],
                 do_preparation: bool = False) -> torch.Tensor:
         if do_preparation:
-            if self.workload_identity is not None:
+            if self.prime_inner_tactics:
                 # See the NVFP4 runner: nested FC tuning must complete before
                 # the outer tile is profiled under CUDA graph capture.
                 for tile_size in self._tile_sizes():
@@ -837,13 +853,9 @@ class CuteDslFusedMoE(MoEImplBase):
                     MoERejectReason.DEP_MISSING,
                     "NVFP4 CuteDSL MoE on SM107 requires Rubin support in CuTe DSL"
                 )
-            # Keep SiTU enablement scoped to the Blackwell path. Rubin
-            # integration needs separate end-to-end validation.
-            if p.activation == "SiTu" and sm_version == 107:
-                return _reject(
-                    MoERejectReason.ACTIVATION_UNSUPPORTED,
-                    "CuteDSL SiTU is enabled only on SM100/SM103; "
-                    "SM107 integration is not enabled")
+            # SiTU is served on SM107 too: the Rubin act-fusion kernel carries
+            # the same trace-time SiTU epilogue as the Blackwell one, and Kimi
+            # K3 NVFP4 on CUTEDSL is what the Rubin K3 deployments run.
             # process_weights_after_loading() unswizzles the FC1 block scales,
             # which asserts 128-row tiles; without this gate an unaligned shard
             # dies mid weight load with a bare swizzle error.
@@ -919,6 +931,10 @@ class CuteDslFusedMoE(MoEImplBase):
             key: torch.cuda.Event()
             for key in [EventType.Main, EventType.MoeOutputMemset]
         }
+        # Async input quantization (see quantize_input_async /
+        # _join_pending_x_ready).
+        self._x_quant_event = torch.cuda.Event()
+        self._pending_x_ready_event: Optional[torch.cuda.Event] = None
 
         self._weights_created = False
 
@@ -1055,6 +1071,54 @@ class CuteDslFusedMoE(MoEImplBase):
             x_sf = x_sf.view(x_row, scale_cols)
         return x, x_sf
 
+    def quantize_input_async(
+        self,
+        x: torch.Tensor,
+        input_ready_event: Optional[torch.cuda.Event] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[torch.cuda.Event]]:
+        """Quantize ``x`` on the MoE aux stream so it overlaps top-k and ``moe_sort``.
+
+        At small decode batches the three per-layer prologue kernels (top-k,
+        input quantization, routing/permutation) are all latency-bound and
+        serialize on the main stream (~25 us/layer for 8 tokens on GB300).
+        Quantization only depends on ``x``, so the scheduler forks it here
+        before routing; the consumer joins via the returned event right before
+        the first kernel that reads ``x``/``x_sf`` (``run_moe_nvfp4_impl``,
+        after ``moe_sort``). Falls back to the synchronous ``quantize_input``
+        (event ``None``) when disabled, not NVFP4, already quantized, or no aux
+        stream is available. The stream running the quantization joins
+        ``input_ready_event`` (``x`` written on another stream).
+        """
+        if (not ASYNC_INPUT_QUANT or not self.has_nvfp4
+                or isinstance(x, Fp4QuantizedTensor)
+                or not self._has_moe_output_memset_aux_stream()):
+            if input_ready_event is not None:
+                input_ready_event.wait()
+            x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
+            return x_q, x_sf, None
+        main_stream = torch.cuda.current_stream()
+        aux_stream = self.aux_stream_dict[AuxStreamType.MoeOutputMemset]
+        self.event_dict[EventType.Main].record()
+        x.record_stream(aux_stream)
+        with torch.cuda.stream(aux_stream):
+            self.event_dict[EventType.Main].wait()
+            if input_ready_event is not None:
+                input_ready_event.wait()
+            x_q, x_sf = self.quantize_input(x, post_quant_comm=False)
+            self._x_quant_event.record()
+        x_q.record_stream(main_stream)
+        if x_sf is not None:
+            x_sf.record_stream(main_stream)
+        return x_q, x_sf, self._x_quant_event
+
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the async input quantization (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
+
     def run_moe_nvfp4(
         self,
         x: torch.Tensor,
@@ -1067,6 +1131,7 @@ class CuteDslFusedMoE(MoEImplBase):
         recv_expert_count: Optional[torch.Tensor] = None,
         deep_ep_expert_capacity: Optional[int] = None,
         use_deep_ep_direct_metadata: bool = False,
+        x_ready_event: Optional[torch.cuda.Event] = None,
     ) -> torch.Tensor:
         """NVFP4 MoE computation.
 
@@ -1079,6 +1144,10 @@ class CuteDslFusedMoE(MoEImplBase):
             weight_view: Bundled weight tensors. Must not be None.
             use_deep_ep_direct_metadata: Use adapter-free, count-native DeepEP
                 metadata. The scheduler sets this only for the supported path.
+            x_ready_event: Set when ``x``/``x_sf`` come from
+                ``quantize_input_async``; joined inside ``run_moe_nvfp4_impl``
+                right before the FC1 gather GEMM (the locality-domain path and
+                empty micro-batches join here).
         """
         assert self.has_nvfp4
         assert weight_view is not None
@@ -1120,6 +1189,16 @@ class CuteDslFusedMoE(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0),
                                          self.hidden_size)
             assert moe_output.dtype == output_dtype
+
+        # The async input quantization forked onto the aux stream must be
+        # joined on every path (CUDA graph capture rejects unjoined work).
+        # Only the single-tensor impl overlaps it with moe_sort.
+        if use_locality_domain or token_selected_experts.size(0) == 0:
+            if x_ready_event is not None:
+                x_ready_event.wait()
+            self._pending_x_ready_event = None
+        else:
+            self._pending_x_ready_event = x_ready_event
 
         # Empty micro-batches are valid at the backend boundary. Avoid
         # entering autotuning because its synthetic grouped-GEMM inputs
@@ -1167,6 +1246,7 @@ class CuteDslFusedMoE(MoEImplBase):
             workload_identity=workload_identity,
             use_direct_expert_metadata=use_direct_expert_metadata,
             use_locality_domain=use_locality_domain,
+            prime_inner_tactics=use_locality_domain,
         )
 
         if use_direct_expert_metadata:
@@ -1322,6 +1402,10 @@ class CuteDslFusedMoE(MoEImplBase):
             gather_act_kwargs["situ_beta"] = self.act_alpha
             gather_act_kwargs["situ_linear_beta"] = self.act_beta
 
+        # Join the async input quantization (quantize_input_async): x/x_sf were
+        # produced on the aux stream and are first read here, after moe_sort
+        # ran on the main stream in parallel with the quantization.
+        self._join_pending_x_ready()
         x, x_sf = gather_act_op(**gather_act_kwargs)
 
         if self.use_fused_finalize:
@@ -1476,6 +1560,7 @@ class CuteDslFusedMoE(MoEImplBase):
             enable_alltoall=enable_alltoall,
             output_dtype=output_dtype,
             workload_identity=workload_identity,
+            prime_inner_tactics=use_locality_domain,
         )
 
         inputs = [x, token_selected_experts, token_final_scales, moe_output]
@@ -2012,6 +2097,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 recv_expert_count=plan.recv_expert_count,
                 deep_ep_expert_capacity=plan.deep_ep_expert_capacity,
                 use_deep_ep_direct_metadata=plan.use_deep_ep_direct_metadata,
+                x_ready_event=ctx.x_ready_event,
             )
         elif self.has_deepseek_fp8_block_scales:
             result = self.run_moe_fp8_block_scales(

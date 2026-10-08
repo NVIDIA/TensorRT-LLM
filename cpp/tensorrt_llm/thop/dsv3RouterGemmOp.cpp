@@ -19,6 +19,9 @@
 #include "tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/cublasScaledMM.h"
+#include <c10/cuda/CUDAGuard.h>
+#include <cstdint>
+#include <tuple>
 
 namespace th = torch;
 namespace tl = tensorrt_llm;
@@ -31,7 +34,24 @@ namespace torch_ext
 
 namespace
 {
-template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim>
+// kUseMma selects the tensor-core kernel (invokeRouterGemmMma) instead of the scalar one.
+template <int kNumTokens, int kNumExperts, int kHiddenDim, bool kUseMma>
+void invokeRouterGemmForTokens(
+    float* output, __nv_bfloat16 const* input, __nv_bfloat16 const* weights, cudaStream_t stream)
+{
+    if constexpr (kUseMma)
+    {
+        tk::dsv3MinLatencyKernels::invokeRouterGemmMma<kNumTokens, kNumExperts, kHiddenDim>(
+            output, input, weights, stream);
+    }
+    else
+    {
+        tk::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, kNumTokens, kNumExperts, kHiddenDim>(
+            output, input, weights, stream);
+    }
+}
+
+template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim, bool kUseMma = false>
 struct LoopUnroller
 {
     static void unroll(
@@ -39,26 +59,25 @@ struct LoopUnroller
     {
         if (num_tokens == kBegin)
         {
-            tk::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, kBegin, kNumExperts, kHiddenDim>(
-                output, input, weights, stream);
+            invokeRouterGemmForTokens<kBegin, kNumExperts, kHiddenDim, kUseMma>(output, input, weights, stream);
         }
         else
         {
-            LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim>::unroll(num_tokens, output, input, weights, stream);
+            LoopUnroller<kBegin + 1, kEnd, kNumExperts, kHiddenDim, kUseMma>::unroll(
+                num_tokens, output, input, weights, stream);
         }
     }
 };
 
-template <int kEnd, int kNumExperts, int kHiddenDim>
-struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim>
+template <int kEnd, int kNumExperts, int kHiddenDim, bool kUseMma>
+struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim, kUseMma>
 {
     static void unroll(
         int num_tokens, float* output, __nv_bfloat16 const* input, __nv_bfloat16 const* weights, cudaStream_t stream)
     {
         if (num_tokens == kEnd)
         {
-            tk::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, kEnd, kNumExperts, kHiddenDim>(
-                output, input, weights, stream);
+            invokeRouterGemmForTokens<kEnd, kNumExperts, kHiddenDim, kUseMma>(output, input, weights, stream);
         }
         else
         {
@@ -66,7 +85,61 @@ struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim>
         }
     }
 };
+
+template <int kNumTokens = 1>
+void invokeRouterLatentForTokens(int numTokens, float* logits, __nv_bfloat16* projection, __nv_bfloat16 const* input,
+    __nv_bfloat16 const* gateWeight, __nv_bfloat16 const* downWeight, cudaStream_t stream)
+{
+    if (numTokens == kNumTokens)
+    {
+        tk::dsv3MinLatencyKernels::invokeRouterLatentGemmMma<kNumTokens>(
+            logits, projection, input, gateWeight, downWeight, stream);
+    }
+    else if constexpr (kNumTokens < 16)
+    {
+        invokeRouterLatentForTokens<kNumTokens + 1>(
+            numTokens, logits, projection, input, gateWeight, downWeight, stream);
+    }
+    else
+    {
+        TORCH_CHECK(false, "router + latent GEMM requires 1 <= M <= 16");
+    }
+}
 } // namespace
+
+std::tuple<th::Tensor, th::Tensor> dsv3_router_latent_gemm_op(
+    th::Tensor const& input, th::Tensor const& gateWeight, th::Tensor const& downWeight)
+{
+    constexpr int kHiddenDim = 7168;
+    constexpr int kNumExperts = 896;
+    constexpr int kLatentDim = 3584;
+    constexpr int kLoadAlignment = 16;
+    for (auto const& tensor : {input, gateWeight, downWeight})
+    {
+        TORCH_CHECK(tensor.is_cuda() && tensor.device() == input.device(), "inputs must be on the same CUDA device");
+        TORCH_CHECK(tensor.dim() == 2 && tensor.scalar_type() == th::kBFloat16, "inputs must be 2-D BF16 tensors");
+        TORCH_CHECK(tensor.is_contiguous() && tensor.stride(0) == kHiddenDim && tensor.stride(1) == 1,
+            "inputs must have contiguous [N,7168] row-major storage");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % kLoadAlignment == 0,
+            "inputs must have 16-byte-aligned storage");
+    }
+    TORCH_CHECK(input.size(0) >= 1 && input.size(0) <= 16 && input.size(1) == kHiddenDim,
+        "input must have shape [M,7168], 1 <= M <= 16");
+    TORCH_CHECK(gateWeight.size(0) == kNumExperts && gateWeight.size(1) == kHiddenDim,
+        "gate weight must have shape [896,7168]");
+    TORCH_CHECK(downWeight.size(0) == kLatentDim && downWeight.size(1) == kHiddenDim,
+        "down weight must have shape [3584,7168]");
+
+    c10::cuda::CUDAGuard const deviceGuard(input.device());
+    auto logits = th::empty({input.size(0), kNumExperts}, input.options().dtype(th::kFloat32));
+    auto projection = th::empty({input.size(0), kLatentDim}, input.options());
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    invokeRouterLatentForTokens(static_cast<int>(input.size(0)), static_cast<float*>(logits.mutable_data_ptr()),
+        static_cast<__nv_bfloat16*>(projection.mutable_data_ptr()), static_cast<__nv_bfloat16 const*>(input.data_ptr()),
+        static_cast<__nv_bfloat16 const*>(gateWeight.data_ptr()),
+        static_cast<__nv_bfloat16 const*>(downWeight.data_ptr()), stream);
+    return {logits, projection};
+}
 
 th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b, std::optional<at::Tensor> const& bias,
     std::optional<c10::ScalarType> const& out_dtype)
@@ -77,7 +150,8 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const data_type = mat_a.scalar_type();
     constexpr int kNumExperts = 256;
-    constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2
+    constexpr int kNumExpertsKimiK3 = 896;
+    constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2 / Kimi K3
     constexpr int kHiddenDim6144 = 6144; // GLM-5
     constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
@@ -86,11 +160,18 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool const shape_ok
-        = (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && mat_b.sizes()[0] == hidden_dim
-            && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+    bool const base_ok = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim
+        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
+    bool const shape_ok = base_ok && num_experts == kNumExperts;
 
-    if (shape_ok && hidden_dim == kHiddenDim7168)
+    if (base_ok && num_experts == kNumExpertsKimiK3 && hidden_dim == kHiddenDim7168)
+    {
+        // Kimi K3: tensor-core kernel; the cuBLAS fallback below costs ~7.4 us at M=8 on B200 (split-K + reduce).
+        LoopUnroller<1, 16, kNumExpertsKimiK3, kHiddenDim7168, /*kUseMma=*/true>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    }
+    else if (shape_ok && hidden_dim == kHiddenDim7168)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
@@ -123,9 +204,13 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("dsv3_router_gemm_op(Tensor mat_a, Tensor mat_b, Tensor? bias, ScalarType? out_dtype) -> (Tensor out)");
+    m.def(
+        "dsv3_router_latent_gemm_op(Tensor input, Tensor gate_weight, Tensor down_weight) -> (Tensor logits, Tensor "
+        "projection)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("dsv3_router_gemm_op", &tensorrt_llm::torch_ext::dsv3_router_gemm_op);
+    m.impl("dsv3_router_latent_gemm_op", &tensorrt_llm::torch_ext::dsv3_router_latent_gemm_op);
 }

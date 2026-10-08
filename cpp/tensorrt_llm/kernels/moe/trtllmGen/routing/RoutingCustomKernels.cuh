@@ -840,8 +840,13 @@ void launchCoopBlockKernel(Data const& data, uint32_t numThreadsHist, void* stre
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// launchDynBlockKernel launches min(max(tokens*32, MaxExperts), 1024) threads, i.e. 1024 for the
+// 1024-expert tier now reachable from the post-topK path. Without a bound the 1024-expert
+// instantiation compiled to 89 regs/thread -> 89*1024 > 64K -> cudaLaunchKernelEx "too many
+// resources requested for launch". The <=576-expert tiers already use <=62 regs, so the bound only
+// affects the large tiers.
 template <typename KernelParams>
-__global__ void routingIndicesDynBlockKernel(KernelParams params)
+__global__ void __launch_bounds__(1024) routingIndicesDynBlockKernel(KernelParams params)
 {
     using OutputT = typename KernelParams::OutputT;
     using InputT = typename KernelParams::InputT;
@@ -1734,6 +1739,20 @@ void launchClusterKernelBlockDim1024(Data const& data, void* stream)
 #if defined(TRTLLM_ROUTING_CUSTOM_ENTRY)
 void launchClusterKernel(Data const& data, void* stream)
 {
+    // Post-topK (mPtrScores == nullptr) only permutes: the cluster kernel is thread-per-expanded-index
+    // there, so the 512-thread variant is not bound by the warp-per-token limit below (capacity
+    // NumBlocksPerCluster * 512 = 4096 tokens). Measured on B200 (896 experts/top-16, E=1024 tier),
+    // same GPU: 512 threads (2 experts/thread) 4.3/4.6/4.8/5.1/5.4/6.1 us at 17/32/64/224/512/1024
+    // tokens vs 256 threads (4 experts/thread) 5.2/5.7/6.2 us at 16/32/64 and 1024 threads
+    // (1 expert/thread) ~5.9 us at 224-512. At 4096 tokens the 512-thread variant degrades to ~9.8 us
+    // (16 expanded indices per thread), so beyond 1024 tokens keep the 1024-thread launch.
+    static constexpr int PostTopKClusterBlockDim512MaxNumTokens = 1024;
+    if (data.mPtrScores == nullptr && data.mNumTokens <= PostTopKClusterBlockDim512MaxNumTokens)
+    {
+        launchClusterKernelBlockDim512(data, stream);
+        return;
+    }
+
     // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
     // Use them only where the requested token count fits; otherwise keep the original 1024-thread launch.
     if (data.mNumTokens <= MaxNumTokensClusterScores256)
