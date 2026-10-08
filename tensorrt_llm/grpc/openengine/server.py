@@ -11,6 +11,7 @@ import signal
 import socket
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -31,6 +32,7 @@ from tensorrt_llm.serve._frontend_processes import (
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .kv_events import KvEventsUnavailableError, events_config
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -108,6 +110,7 @@ class OpenEngineServer:
     ) -> None:
         self.host = host
         self.port = port
+        self._llm = llm
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
@@ -148,6 +151,13 @@ class OpenEngineServer:
 
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
+        if events_config(self._llm) is not None:
+            capacity = await asyncio.to_thread(self._llm._executor.get_kv_cache_capacity)
+            if not capacity.get("kvEventsEnabled", False):
+                raise KvEventsUnavailableError(
+                    "KV events are configured but the loaded engine has no streaming publisher; "
+                    "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
+                )
         await self._server.start()
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
@@ -184,6 +194,7 @@ def launch_server(
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
+    enable_load_metrics: bool = False,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -193,6 +204,7 @@ def launch_server(
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         report_failure: Records a child exit before startup readiness.
+        enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
     """
 
     async def serve() -> None:
@@ -282,6 +294,14 @@ def launch_server(
                 fail(f"OpenEngine supervision failed: {error}")
 
         try:
+            llm_args["_enable_routing_load"] = enable_load_metrics
+            # A new incarnation fences every node's metadata after a restart.
+            # The executor starts node discovery only when streaming is enabled.
+            llm_args["_openengine_discovery"] = {
+                "engine_id": str(uuid.uuid4()),
+                "host": host,
+                "port": port,
+            }
             llm = PyTorchLLM(**llm_args)
             if stop_event.is_set():
                 if failure is not None:
