@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -411,6 +412,93 @@ class TestFingerprint:
         server = resources(tokenizer, processor=SimpleNamespace(chat_template="PROCESSOR:{{ x }}"))
         router = RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
         assert not fingerprints_match(compute_fingerprint(router), compute_fingerprint(server))
+
+    def _worker_resources(self, tokenizer, **overrides) -> RenderResources:
+        """Resources built the way a worker builds them, not copied from the router's."""
+        server = SimpleNamespace(
+            tokenizer=tokenizer,
+            model_config=SimpleNamespace(model_type="render-test-model"),
+            processor=None,
+            chat_template=None,
+            allow_request_chat_template=False,
+            generator=SimpleNamespace(
+                args=SimpleNamespace(reasoning_parser=None),
+                input_processor=DefaultInputProcessor(None, None, tokenizer),
+            ),
+        )
+        for name, value in overrides.items():
+            setattr(server, name, value)
+        return RenderResources.from_server(server)
+
+    def test_a_router_matches_an_independently_built_worker_for_plain_text(self, tokenizer) -> None:
+        # The router has only a tokenizer; the worker has the engine's DefaultInputProcessor.
+        # Both are the same plain-text tokenization.
+        router = RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
+        worker = self._worker_resources(tokenizer)
+
+        assert fingerprints_match(compute_fingerprint(router), compute_fingerprint(worker))
+
+    def test_a_worker_with_its_own_input_processor_does_not_match_a_router(self, tokenizer) -> None:
+        class OwnInputProcessor:
+            pass
+
+        router = RenderResources.from_tokenizer(tokenizer, model_type="render-test-model")
+        worker = dataclasses.replace(
+            self._worker_resources(tokenizer), input_processor=OwnInputProcessor()
+        )
+
+        assert not fingerprints_match(compute_fingerprint(router), compute_fingerprint(worker))
+
+    def test_equal_vocabularies_with_a_different_normalizer_do_not_match(self, tokenizer) -> None:
+        from tokenizers import normalizers
+
+        other = make_tokenizer()
+        other.backend_tokenizer.normalizer = normalizers.Lowercase()
+        assert other.get_vocab() == tokenizer.get_vocab()
+        assert type(other) is type(tokenizer)
+
+        assert not fingerprints_match(
+            compute_fingerprint(resources(tokenizer)), compute_fingerprint(resources(other))
+        )
+
+    def test_equal_vocabularies_with_a_different_pre_tokenizer_do_not_match(
+        self, tokenizer
+    ) -> None:
+        from tokenizers import pre_tokenizers
+
+        other = make_tokenizer()
+        other.backend_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
+        assert other.get_vocab() == tokenizer.get_vocab()
+
+        assert not fingerprints_match(
+            compute_fingerprint(resources(tokenizer)), compute_fingerprint(resources(other))
+        )
+
+    def test_a_tokenizer_whose_encoding_cannot_be_identified_is_never_trusted(self) -> None:
+        class OpaqueTokenizer:
+            def get_vocab(self):
+                return {"a": 0, "b": 1}
+
+        fingerprint = compute_fingerprint(resources(OpaqueTokenizer()))
+
+        assert fingerprint["compared"]["tokenizer"]["complete"] is False
+        # Even identical digests on both sides are not enough.
+        assert not fingerprints_match(fingerprint, fingerprint)
+
+    def test_an_extension_revision_changes_the_digest(self, tokenizer) -> None:
+        class NewRevision(SimpleExtension):
+            render_version = 2
+
+        old = compute_fingerprint(resources(tokenizer, extension=SimpleExtension()))
+        new = compute_fingerprint(resources(tokenizer, extension=NewRevision()))
+
+        assert not fingerprints_match(old, new)
+
+    def test_harmony_has_an_explicit_encoding_identity(self, tokenizer) -> None:
+        fingerprint = compute_fingerprint(resources(tokenizer, use_harmony=True))
+
+        assert fingerprint["compared"]["harmony"]["encoding"] == "HARMONY_GPT_OSS"
+        assert "version" in fingerprint["compared"]["harmony"]
 
 
 class SimpleExtension(ServingExtension):

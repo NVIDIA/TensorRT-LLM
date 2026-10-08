@@ -56,6 +56,10 @@ class ServingExtension:
     match the generic serving path.
     """
 
+    # Part of the rendering fingerprint: bump it when a revision of the extension changes
+    # the prompt it renders, so prepared requests from the older revision are refused.
+    render_version: int = 1
+
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
     ) -> Optional[List[int]]:

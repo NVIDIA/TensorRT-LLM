@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 if TYPE_CHECKING:
     from .resources import RenderResources
 
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 
 
 def _sha256(value: Any) -> Optional[str]:
@@ -42,8 +42,46 @@ def _sha256(value: Any) -> Optional[str]:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _encoding_digest(inner: Any) -> Optional[Dict[str, Any]]:
+    """Digest of everything that turns text into ids, or ``None`` if it cannot be established.
+
+    A vocabulary alone does not identify the transformation: the merges, normalizer,
+    pre-tokenizer, post-processor and added-token matching rules also decide the ids.
+    A fast (Rust) tokenizer serializes all of them; a tiktoken-based tokenizer is
+    identified by its split pattern, mergeable ranks and special tokens.
+    """
+    backend = getattr(inner, "backend_tokenizer", None)
+    to_str = getattr(backend, "to_str", None)
+    if callable(to_str):
+        try:
+            return {"kind": "tokenizers", "sha256": _sha256_bytes(to_str().encode("utf-8"))}
+        except Exception:  # noqa: BLE001 - fall through to the other identities
+            pass
+    for name in ("model", "tokenizer", "encoding", "_encoding", "tiktoken_model"):
+        encoding = getattr(inner, name, None)
+        ranks = getattr(encoding, "_mergeable_ranks", None)
+        if isinstance(ranks, dict) and ranks:
+            specials = getattr(encoding, "_special_tokens", None) or {}
+            return {
+                "kind": "tiktoken",
+                "pattern_sha256": _sha256(getattr(encoding, "_pat_str", None)),
+                "ranks_sha256": _sha256(sorted((bytes(k).hex(), v) for k, v in ranks.items())),
+                "special_tokens_sha256": _sha256(sorted(specials.items())),
+            }
+    return None
+
+
 def _tokenizer_digest(tokenizer: Any) -> Dict[str, Any]:
-    """Identity of a tokenizer independent of where its files live."""
+    """Identity of a tokenizer independent of where its files live.
+
+    ``complete`` says whether the whole encoding configuration could be identified.
+    Ids rendered under an incomplete identity are never trusted by
+    :func:`fingerprints_match`, even when both sides report the same digest.
+    """
     inner = getattr(tokenizer, "tokenizer", tokenizer)
     info: Dict[str, Any] = {"class": f"{type(inner).__module__}.{type(inner).__qualname__}"}
     get_vocab = getattr(inner, "get_vocab", None)
@@ -53,14 +91,42 @@ def _tokenizer_digest(tokenizer: Any) -> Dict[str, Any]:
             info["vocab_size"] = len(vocab)
             info["vocab_sha256"] = _sha256(sorted(vocab.items()))
         except (TypeError, ValueError):
-            # A tokenizer without a usable vocabulary is identified by its class.
             pass
     special = getattr(inner, "special_tokens_map", None)
     info["special_tokens_sha256"] = _sha256(special if isinstance(special, dict) else None)
     added = getattr(inner, "added_tokens_decoder", None)
     if isinstance(added, dict) and added:
-        info["added_tokens_sha256"] = _sha256(sorted((int(k), str(v)) for k, v in added.items()))
+        # The matching rules (lstrip/rstrip/normalized/special) are part of the identity.
+        info["added_tokens_sha256"] = _sha256(
+            sorted(
+                (int(k), repr(v), getattr(v, "__dict__", None) and str(v.__dict__))
+                for k, v in added.items()
+            )
+        )
+    init_kwargs = getattr(inner, "init_kwargs", None)
+    if isinstance(init_kwargs, dict):
+        info["init_kwargs_sha256"] = _sha256(
+            {
+                k: v
+                for k, v in init_kwargs.items()
+                if isinstance(v, (str, int, float, bool, type(None)))
+            }
+        )
+    encoding = _encoding_digest(inner)
+    info["encoding"] = encoding
+    info["complete"] = encoding is not None
     return info
+
+
+def _harmony_identity() -> Dict[str, Any]:
+    """Harmony renders with its own encoding, so its implementation is the identity."""
+    try:
+        from importlib.metadata import version
+
+        package = version("openai-harmony")
+    except Exception:  # noqa: BLE001
+        package = None
+    return {"encoding": "HARMONY_GPT_OSS", "package": "openai-harmony", "version": package}
 
 
 def _template_sources(res: "RenderResources") -> Dict[str, Optional[str]]:
@@ -76,16 +142,24 @@ def _template_sources(res: "RenderResources") -> Dict[str, Optional[str]]:
 def compute_fingerprint(res: "RenderResources") -> Dict[str, Any]:
     """Fingerprint of the rendering configuration held by ``res``."""
     input_processor = res.input_processor
+    # "No input processor" (a router that only has a tokenizer) and the engine's
+    # DefaultInputProcessor are the same plain-text tokenization, so they share one identity.
     input_processor_kind = (
-        "default" if input_processor is None else type(input_processor).__qualname__
+        "default"
+        if input_processor is None or type(input_processor).__qualname__ == "DefaultInputProcessor"
+        else type(input_processor).__qualname__
     )
     compared: Dict[str, Any] = {
         "version": FINGERPRINT_VERSION,
         "model_type": res.model_type,
         "extension": type(res.extension).__qualname__,
+        # Bumped by an extension whose rendering output changes between revisions.
+        "extension_render_version": getattr(res.extension, "render_version", 1),
         "use_harmony": bool(res.use_harmony),
     }
-    if not res.use_harmony:
+    if res.use_harmony:
+        compared["harmony"] = _harmony_identity()
+    else:
         # Harmony renders with its own encoding, independent of the chat
         # template, the tokenizer files and the input processor.
         compared.update(
@@ -111,5 +185,16 @@ def fingerprints_match(local: Optional[Dict[str, Any]], remote: Optional[Dict[st
     """
     if not local or not remote:
         return False
+    if not (_identity_complete(local) and _identity_complete(remote)):
+        # A tokenizer whose whole encoding configuration could not be identified is never
+        # trusted, even when both sides happen to report the same digest.
+        return False
     digest = local.get("digest")
     return digest is not None and digest == remote.get("digest")
+
+
+def _identity_complete(fingerprint: Dict[str, Any]) -> bool:
+    compared = fingerprint.get("compared") or {}
+    if compared.get("use_harmony"):
+        return True
+    return bool((compared.get("tokenizer") or {}).get("complete"))
