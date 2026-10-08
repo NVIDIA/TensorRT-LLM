@@ -302,10 +302,9 @@ copies everything before and after that piece unchanged. A compressed buffer
 records the piece as `quantized_range_start` and `quantized_range_elements`.
 
 - `skip_rope_quantization: false` (default): the piece is the whole vector. DeepSeek-V4
-  target CSA uses single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
+  compressed rows use single NVFP4 for NoPE and, by default, 2FP4 for the trailing 64 RoPE
   values. Set `nvfp4_residual_dim: 0` for single NVFP4 throughout; the default
-  `64` matches DeepSeek-V4's native residual width. Other widths are rejected.
-  Other models ignore this residual option and continue to use single NVFP4.
+  `64` selects 2FP4 for the 64 RoPE values. Other widths are rejected.
 - `skip_rope_quantization: true`: the piece is the NoPE part of the K vector, so the
   RoPE numbers are copied unchanged into the cold page, right after that buffer's
   scales. The codec finds the RoPE part in the model config: the last
@@ -327,11 +326,10 @@ with trailing RoPE; separate key and value buffers are assumed to be
 partial-rotary GQA with leading RoPE. Adding a `model_type` alone is not enough
 for interleaved rotated dimensions or an MLA cache that also exposes a value
 buffer; implement an explicit placement rule and test it before adding that
-model to the allowlist. RoPE widths come from rotary-width fields or partial
+model to the supported-model list. RoPE widths come from rotary-width fields or partial
 rotary factors, never from theta or `rotary_emb_base`.
 
-Draft-model cold pages ignore both RoPE options and quantize whole vectors with
-single NVFP4 because the codec holds only the target model's config.
+Draft-model cold pages ignore both RoPE options and use single NVFP4.
 
 ### 4. Add method-specific kernels
 

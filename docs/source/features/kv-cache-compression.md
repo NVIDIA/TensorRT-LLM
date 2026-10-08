@@ -213,14 +213,14 @@ In some models, part of each K vector carries positional information (RoPE).
 When NVFP4 cold-page compression is enabled, `skip_rope_quantization` controls
 how that part is stored:
 
-- `false` (default): quantize RoPE as well. DeepSeek-V4 target CSA uses single
+- `false` (default): quantize RoPE as well. DeepSeek-V4 compressed rows use single
   NVFP4 for NoPE and two FP4 components (2FP4) for RoPE by default; other models
   use single NVFP4.
 - `true`: copy the supported target RoPE part unchanged at the hot-cache
   precision, such as FP8 or BF16. The remaining values use NVFP4.
 
-For DeepSeek-V4 target CSA, `nvfp4_residual_dim` defaults to `64`, matching
-the native residual width. Set it to `0` with `skip_rope_quantization: false`
+For DeepSeek-V4, `nvfp4_residual_dim` defaults to `64`, using 2FP4 for its
+64 RoPE values. Set it to `0` with `skip_rope_quantization: false`
 for single NVFP4 throughout the row. Only `0` and `64` are supported. Setting
 `skip_rope_quantization` to `true` preserves RoPE regardless of the residual
 option. See the [DeepSeek-V4 example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4)
@@ -229,9 +229,8 @@ for the three formats and limited accuracy results.
 Preserving RoPE increases cold-cache storage relative to single NVFP4. These
 formats are exploratory; validate accuracy on your model and workload. Skipping
 RoPE is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series;
-other models ignore that option with a warning. The residual option affects only
-DeepSeek-V4 target CSA. Separate draft caches ignore both options and use single
-NVFP4. To extend model support, follow the physical-layout requirements in the
+2FP4 is available only for DeepSeek-V4. To add model support, follow the layout
+requirements in the
 [development guide](../developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
 
 ```yaml
@@ -286,7 +285,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; target NoPE uses NVFP4 and target RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,

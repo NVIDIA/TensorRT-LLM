@@ -61,7 +61,7 @@ Attention-visible GPU layout.
 | Key-only MLA Attention KV | Supported; the latent Attention key is encoded as NVFP4 |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly |
 | DSA and other auxiliary buffers | Skipped by quantization and preserved losslessly |
-| DeepSeek-V4 CSA cache | Supported; target NoPE uses NVFP4 and target RoPE defaults to 2FP4, or is preserved in its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly |
+| DeepSeek-V4 CSA cache | Supported; NoPE uses NVFP4 and RoPE defaults to 2FP4, or is preserved in its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly |
 
 The current implementation requires the PyTorch backend, native C++
@@ -296,17 +296,15 @@ reusable prefixes when measuring cache-capacity and hit-rate benefits.
 DeepSeek-V4 keeps its compressed sparse attention (CSA) cache as one entry per
 four tokens, each entry a 512-element row: 448 elements without positional
 encoding (NoPE) and 64 with it (RoPE), plus an indexer cache. NVFP4 cold-page
-compression is disabled by default. When explicitly enabled, target NoPE uses
-NVFP4 and target RoPE defaults to two FP4 components (2FP4), following native
-DeepSeek-V4's main-plus-residual approach. The second component encodes the first component's
-residual, and their reconstructed values are added before restoring the active
-KV dtype. Other models and draft cold pages continue to use single NVFP4.
+compression is disabled by default. When enabled, NoPE uses NVFP4 and RoPE
+defaults to two FP4 components (2FP4), matching DeepSeek-V4's native KV-cache
+approach. The second component stores the first component's quantization error.
+Their values are added before restoring the active KV dtype.
 
 `skip_rope_quantization` defaults to `false`. Set it to `true` to preserve RoPE
 in its original precision, which retains DeepSeek-V4's previous cold-page
 behavior. Alternatively, set `nvfp4_residual_dim: 0` to use single NVFP4 for
-RoPE. This second option defaults to `64`, matching native DeepSeek-V4's residual
-width, and affects only target cold pages. Only `0` and `64` are supported;
+RoPE. `nvfp4_residual_dim` defaults to `64` for 2FP4. Only `0` and `64` are supported;
 intermediate widths are rejected. Inference without cold-page compression is unchanged.
 
 | `skip_rope_quantization` | `nvfp4_residual_dim` | DeepSeek-V4 target RoPE in cold pages |
@@ -325,7 +323,7 @@ Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300.
 The recipe below uses `skip_rope_quantization: true` to match those serving runs.
 The initial [IFBench accuracy check](#ifbench-accuracy-check) below includes
 the default cold-page 2FP4 format and original-precision RoPE; the native
-active-KV 2FP4 reference is reported separately. These are limited numerical
+active-KV 2FP4 reference is reported separately. These are limited accuracy
 checks, not comprehensive accuracy or offload/onboard validation. This is an
 optional feature for exploration; users should validate accuracy on their own
 models and workloads before deployment.
@@ -379,15 +377,15 @@ Each format has four complete 300-prompt runs. Only complete, audited runs are
 included; partial or failed attempts are excluded.
 
 No noticeable IFBench accuracy drop was observed for the default cold-page
-2FP4 format in this initial method-level numerical check: its average score
+2FP4 format in this initial quantization accuracy check: its average score
 was 75.31%, versus 75.06% for FP8, an observed difference of +0.25 percentage
-points. Batched sampling does not provide deterministic per-prompt seed pairs;
+points. Sampling varies between runs;
 higher observed scores do not establish an accuracy improvement.
 This optional feature and its example recipe are provided for exploration and
 have not undergone comprehensive accuracy validation; users should validate
 accuracy on their own models and workloads before deployment.
 
-An earlier native active-KV reference (requested seeds 0–3) used the same original
+An earlier native active-KV reference (seeds 0–3) used the same original
 checkpoint and 300-prompt recipe, with native NVFP4 storage and 2FP4 RoPE enabled. Its average
 score was **74.96 ± 1.43%**, compared with **75.19 ± 2.11%** for FP8, an observed
 difference of **−0.23 percentage points**. This reference uses the native active-KV
@@ -447,8 +445,7 @@ entry. By default all values are quantized: DeepSeek-V4 target RoPE uses the
 becomes NVFP4. Original precision means the hot-cache dtype, such as FP8 or BF16;
 it does not change that dtype. This is an option to explore; measure the accuracy effect on your
 own model and workload. It is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
-and the Qwen3.5 series; other models ignore it with a warning. Draft cold pages
-ignore both RoPE options and quantize whole vectors with single NVFP4. For extending model support, see
+and the Qwen3.5 series. To add model support, see
 the [development guide](../../docs/source/developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
 
 ```yaml
