@@ -73,6 +73,8 @@ class PeerRegistrar:
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
+        if self._ri.draft_cache is not None:
+            self._ri.draft_cache.validate_peer(peer_ri.draft_cache)
         if not self._check_peer_compatible(peer_ri):
             raise ValueError(
                 f"PeerRegistrar.register: peer {peer_name} (rank={peer_rank}) is incompatible with local rank."

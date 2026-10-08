@@ -20,6 +20,7 @@ import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.resource.draft_cache import DraftCacheInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -48,6 +49,7 @@ class RankInfo:
     attention: Optional[AttentionInfo] = None
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
+    draft_cache: Optional[DraftCacheInfo] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -60,6 +62,8 @@ class RankInfo:
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
+        if self.draft_cache is None:
+            data.pop("draft_cache")
         return msgpack.packb(data)
 
     @classmethod
@@ -123,4 +127,6 @@ class RankInfo:
             unpacked["page_table"] = KVCachePageTable.from_dict(unpacked["page_table"])
         if unpacked.get("aux_meta") is not None:
             unpacked["aux_meta"] = AuxBufferMeta.from_dict(unpacked["aux_meta"])
+        if unpacked.get("draft_cache") is not None:
+            unpacked["draft_cache"] = DraftCacheInfo(**unpacked["draft_cache"])
         return cls(**unpacked)

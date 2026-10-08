@@ -241,11 +241,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        draft_kv_cache_manager: Optional[KVCacheManager] = None,
     ):
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
+        self._draft_kv_cache_manager = draft_kv_cache_manager
+        self._draft_reuse_adapter = (
+            create_cache_reuse_adapter(draft_kv_cache_manager)
+            if draft_kv_cache_manager is not None
+            else None
+        )
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
         if self.kv_transfer_timeout_ms is None:
@@ -287,6 +294,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._transfer_worker = TransferWorker(
             TransferWorkerConfig(
                 kv_cache_manager=kv_cache_manager,
+                draft_kv_cache_manager=draft_kv_cache_manager,
                 device_id=self._device_id,
                 instance_name=self._instance_name,
                 # Context-only requests are released after KV transfer completes, so many batches
@@ -345,6 +353,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        if draft_kv_cache_manager is not None:
+            draft_kv_cache_manager._draft_context_lengths = {}
         try:
             self._enable_pipelined_transfer = self._resolve_pipelined_transfer(
                 cache_transceiver_config
@@ -536,6 +546,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
         layer_groups = self._page_table.layer_groups
+        draft_adapter = getattr(self, "_draft_reuse_adapter", None)
+        draft_info = self._transfer_worker.draft_cache_info if draft_adapter is not None else None
         prompt_blocks = (req.prompt_len + tpb - 1) // tpb
 
         is_gen_only = req.is_generation_only_request
@@ -549,7 +561,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         groups = []
         kinds = [lg.kind for lg in layer_groups]
         for idx, lg in enumerate(layer_groups):
-            if lg.kind == CacheKind.STATE:
+            if draft_info is not None and idx >= draft_info.first_layer_group:
+                ordinals = draft_adapter.get_block_ordinals(
+                    req, idx - draft_info.first_layer_group, lg
+                )
+                # Always receive the full draft prefix: target reuse does not
+                # establish that this independently allocated pool contains it.
+                group = self._positional_window(ordinals, prompt_blocks, 0)
+                if not is_gen_only:
+                    populated = self._draft_kv_cache_manager._draft_context_lengths.get(
+                        req.py_request_id, 0
+                    )
+                    required = min(req.prompt_len, req.py_last_context_chunk[1])
+                    if populated < required:
+                        logger.warning(
+                            f"Draft context for request {req.py_request_id} covers {populated} "
+                            f"tokens; transfer requires {required}. Omitting draft pages."
+                        )
+                        group.fill(-1)
+            elif lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
                 group = np.array([slot], dtype=np.int64) if slot is not None else empty
             else:
@@ -943,6 +973,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.context_phase_params.first_gen_tokens = first_gen_tokens
             req.context_phase_params.draft_tokens = draft_tokens
 
+    def _restore_draft_context(self, session, req: LlmRequest) -> None:
+        manager = getattr(self, "_draft_kv_cache_manager", None)
+        if manager is not None and session.has_draft_cache_transfer():
+            if not session.kv_write_verified():
+                raise RuntimeError("Draft context transfer did not cover every destination page.")
+            manager._draft_context_lengths[req.py_request_id] = req.prompt_len
+
     def _get_or_create_send_session(self, req: LlmRequest) -> Optional[TxSessionBase]:
         self._ever_had_send_session = True
         rid = get_unique_rid(req)
@@ -1129,6 +1166,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
+                self._restore_draft_context(session, req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -1333,6 +1371,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # distinguish the two cases and set the appropriate state.
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
+                if (
+                    getattr(self, "_draft_kv_cache_manager", None) is not None
+                    and session.has_draft_cache_transfer()
+                    and not session.kv_write_verified()
+                ):
+                    failed.append(rid)
+                    continue
                 req = self._recv_reqs[rid]
                 if session.transfer_end_time is not None:
                     req.set_kv_cache_transfer_end(session.transfer_end_time)
@@ -1395,6 +1440,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)
+            self._restore_draft_context(session, req)
             self._close_session_or_raise(session, rid, "completed")
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             del self._recv_reqs[rid]
