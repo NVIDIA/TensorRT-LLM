@@ -60,12 +60,13 @@ from .config_utils import (is_hybrid_linear, is_mla,
                            validate_kimi_kda_state_dtype)
 
 _KV_CACHE_MAP = {
+    "int8": QuantAlgo.INT8.value,
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto"
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto")
+_VALID_KV_CACHE_DTYPES = ("int8", "fp8", "fp8_ds_mla", "nvfp4", "auto")
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -330,6 +331,8 @@ def initialize_dummy_weights(
         ".inv_input_scale",
         ".kv_scales",
         ".inv_kv_scales",
+        ".kv_cache_scaling_factor",
+        ".inv_kv_cache_scaling_factor",
         ".alpha",
         ".scalar_alpha",
     )

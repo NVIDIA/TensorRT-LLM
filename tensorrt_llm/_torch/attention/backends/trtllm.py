@@ -56,6 +56,28 @@ from .utils import log_attention_failure_context
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
 
+def _validate_int8_kv_scale_values(orig_quant: torch.Tensor,
+                                   quant_orig: torch.Tensor) -> None:
+    """Validate positive finite reciprocal float32 scales, including graph replay.
+
+    Both inputs must be scalar tensors on the current CUDA device. Eager calls
+    raise ValueError before attention runs. Captured calls record a device-side
+    assertion so replay checks the live buffers without host synchronization.
+    """
+    scales = torch.stack((orig_quant.reshape(()), quant_orig.reshape(())))
+    error = "INT8 KV cache requires finite, positive, reciprocal KV scales."
+    if not torch.cuda.is_current_stream_capturing():
+        scale, inverse = scales.tolist()
+        if not (math.isfinite(scale) and math.isfinite(inverse) and scale > 0
+                and inverse > 0
+                and math.isclose(scale * inverse, 1.0, rel_tol=1e-5)):
+            raise ValueError(error)
+        return
+    valid = (torch.isfinite(scales).all() & (scales > 0).all()
+             & ((scales[0] * scales[1] - 1.0).abs() <= 1e-5))
+    torch._assert_async(valid, error)
+
+
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
                                        *,
@@ -1741,6 +1763,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = int(self.quant_config.layer_quant_mode)
+        self.has_int8_kv_cache = self.quant_config.layer_quant_mode.has_int8_kv_cache(
+        )
+        if (self.has_int8_kv_cache
+                and self.quant_config.layer_quant_mode.has_any_quant(
+                    exclude_kv_cache=True)):
+            raise ValueError(
+                "INT8 KV cache currently requires unquantized FP16/BF16 projections."
+            )
+        if self.has_int8_kv_cache and (self.is_mla_enable
+                                       or self.sparse_params is not None):
+            raise ValueError(
+                "INT8 KV cache does not support MLA or sparse attention.")
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
@@ -2072,6 +2106,34 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
+        if self.has_int8_kv_cache:
+            if q.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "INT8 KV cache requires FP16 or BF16 attention inputs.")
+            if metadata.kv_cache_params is None or not metadata.kv_cache_params.use_cache:
+                raise ValueError("INT8 KV cache requires an active KV cache.")
+            # Decode-only steps have no context prefixes to inspect. Tensor and
+            # cache guards remain per-call: backend callers may replace them.
+            cached_context = metadata.num_contexts > 0 and any(
+                n > 0 for n in metadata.kv_cache_params.
+                num_cached_tokens_per_seq[:metadata.num_contexts])
+            if metadata.is_cross or metadata.enable_helix:
+                raise ValueError(
+                    "INT8 KV cache does not support cross-attention or context parallelism."
+                )
+            if metadata.use_paged_context_fmha or cached_context:
+                raise ValueError(
+                    "INT8 KV cache does not support paged context attention or cached prefill."
+                )
+            for scale in (forward_args.kv_scale_orig_quant,
+                          forward_args.kv_scale_quant_orig):
+                if (scale is None or scale.dtype != torch.float32
+                        or scale.device != q.device or scale.numel() != 1):
+                    raise ValueError(
+                        "INT8 KV cache requires scalar float32 KV scales "
+                        "on the attention input device.")
+            _validate_int8_kv_scale_values(forward_args.kv_scale_orig_quant,
+                                           forward_args.kv_scale_quant_orig)
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
