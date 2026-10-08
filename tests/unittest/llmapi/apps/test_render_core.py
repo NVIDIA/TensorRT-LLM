@@ -494,11 +494,88 @@ class TestFingerprint:
 
         assert not fingerprints_match(old, new)
 
+    def test_the_same_checkpoint_at_two_locations_has_one_fingerprint(self, tmp_path) -> None:
+        # The standalone renderer and the worker typically see the same files at different
+        # mount points; the identity is the content, not where it was loaded from.
+        from transformers import AutoTokenizer
+
+        first, second = tmp_path / "mount_a" / "model", tmp_path / "mount_b" / "model"
+        make_tokenizer().save_pretrained(first)
+        make_tokenizer().save_pretrained(second)
+        a, b = AutoTokenizer.from_pretrained(first), AutoTokenizer.from_pretrained(second)
+        # The loading provenance really does differ.
+        assert a.init_kwargs["name_or_path"] != b.init_kwargs["name_or_path"]
+
+        assert fingerprints_match(
+            compute_fingerprint(resources(a)), compute_fingerprint(resources(b))
+        )
+
+    def test_serving_requests_does_not_change_the_fingerprint(self, tmp_path) -> None:
+        # Transformers enables truncation on the live backend while encoding a request and
+        # does not restore it, and the backend's serialization includes it. A fingerprint
+        # computed after the first truncated request must equal one computed before it.
+        from transformers import AutoTokenizer
+
+        make_tokenizer().save_pretrained(tmp_path)
+        served = AutoTokenizer.from_pretrained(tmp_path)
+        fresh = AutoTokenizer.from_pretrained(tmp_path)
+        before = compute_fingerprint(resources(served))
+
+        served.encode("hello world this is a test", truncation=True, max_length=3)
+
+        assert served.backend_tokenizer.truncation is not None  # the request state is set
+        assert fingerprints_match(before, compute_fingerprint(resources(served)))
+        assert fingerprints_match(
+            compute_fingerprint(resources(fresh)), compute_fingerprint(resources(served))
+        )
+        # Canonicalizing never touches the live tokenizer other requests are using.
+        assert served.backend_tokenizer.truncation["max_length"] == 3
+
     def test_harmony_has_an_explicit_encoding_identity(self, tokenizer) -> None:
         fingerprint = compute_fingerprint(resources(tokenizer, use_harmony=True))
 
         assert fingerprint["compared"]["harmony"]["encoding"] == "HARMONY_GPT_OSS"
         assert "version" in fingerprint["compared"]["harmony"]
+
+
+class TestPreparationContext:
+    PREFILLED_OPEN = (
+        "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
+        "{% if add_generation_prompt %}<assistant><think>{% endif %}"
+    )
+    PREFILLED_CLOSED = PREFILLED_OPEN.replace("<think>", "</think>")
+
+    def _context(self, template, **overrides):
+        res = resources(make_tokenizer(chat_template=template), **overrides)
+        return render_chat(chat_request(), res).context
+
+    def test_the_mode_is_recorded_for_every_parser_that_reads_it_off_the_prompt(self) -> None:
+        # No reasoning parser is configured on this renderer: the context must not depend on
+        # a setting that the compatibility check ignores.
+        context = self._context(self.PREFILLED_OPEN)
+
+        assert context["resolved_thinking"]["poolside_v1"] is True
+        assert context["resolved_thinking"]["laguna"] is True  # an alias of the same parser
+
+    def test_a_prompt_that_closes_thinking_is_recorded_as_off(self) -> None:
+        assert self._context(self.PREFILLED_CLOSED)["resolved_thinking"]["poolside_v1"] is False
+
+    def test_a_prompt_that_prefills_nothing_records_nothing(self, tokenizer) -> None:
+        assert render_chat(chat_request(), resources(tokenizer)).context["resolved_thinking"] == {}
+
+    def test_no_generation_prompt_records_nothing(self) -> None:
+        res = resources(make_tokenizer(chat_template=self.PREFILLED_OPEN))
+
+        context = render_chat(chat_request(add_generation_prompt=False), res).context
+
+        assert context["resolved_thinking"] == {}
+
+    def test_only_a_context_without_decisions_is_trivial(self) -> None:
+        from tensorrt_llm.serve.render import PreparedContext
+
+        assert PreparedContext().is_trivial()
+        assert not PreparedContext(prompt_tokens_excluded_from_usage=3).is_trivial()
+        assert not PreparedContext(resolved_thinking={"poolside_v1": True}).is_trivial()
 
 
 class SimpleExtension(ServingExtension):

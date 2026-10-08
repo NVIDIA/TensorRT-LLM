@@ -33,6 +33,7 @@ from tensorrt_llm.serve.chat_tokenization import (
 )
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
 from tensorrt_llm.serve.render import (
+    PreparedContext,
     RenderResources,
     UnsupportedRenderError,
     fingerprints_match,
@@ -361,14 +362,26 @@ class BlockHashMixin:
             # estimate and let the worker render the request itself.
             logger.debug(f"Router could not render the request ({error}); routing on an estimate.")
             return self._tokenize_chat_legacy(request, set_prompt_token_ids=False)
-        if rendered.tokens_trusted and self._may_write_back_token_ids(request.model):
+        # A forwarded request is an ordinary chat request carrying prompt_token_ids, so the
+        # worker cannot see the rendered text and decides nothing from it: usage adjustments
+        # (kimi_k3) and reasoning modes read off the prompt are lost. Ids whose serving
+        # semantics cannot be preserved that way are not forwarded; the worker renders them.
+        context = PreparedContext.model_validate(rendered.context)
+        reason = rendered.untrusted_reason
+        if not context.is_trivial():
+            reason = "serving decisions derived from the rendered prompt cannot be forwarded"
+        if (
+            rendered.tokens_trusted
+            and context.is_trivial()
+            and self._may_write_back_token_ids(request.model)
+        ):
             request.prompt_token_ids = rendered.token_ids
         else:
             self._render_fallbacks = getattr(self, "_render_fallbacks", 0) + 1
             if self._render_fallbacks == 1:
                 logger.warning(
                     "Router rendered prompt ids are not forwarded to workers: "
-                    f"{rendered.untrusted_reason or 'worker rendering fingerprint missing or different'}. "
+                    f"{reason or 'worker rendering fingerprint missing or different'}. "
                     "Workers render the prompt themselves; routing is based on the router's ids."
                 )
         return rendered.token_ids

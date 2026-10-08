@@ -74,9 +74,16 @@ class PreparedContext(BaseModel):
     # Rendered prompt tokens that are not reported as prompt usage (kimi_k3: the
     # generation channel opener). Zero when a server-level chat template applies.
     prompt_tokens_excluded_from_usage: int = Field(default=0, ge=0)
-    # Reasoning mode read off the rendered prompt by parsers that take it from there
-    # (a template that prefills ``<think>`` or ``</think>``); ``None`` when not applicable.
-    resolved_thinking: Optional[bool] = None
+    # Reasoning mode read off the rendered prompt (a template that prefills ``<think>`` or
+    # ``</think>``), per reasoning parser that takes its mode from there. It is recorded for
+    # every such parser, not only the one the renderer was configured with: the renderer's
+    # parser setting is not part of the compatibility check, so the worker picks the entry
+    # for its own parser. A parser absent from the mapping resolved nothing (``None``).
+    resolved_thinking: Dict[str, bool] = Field(default_factory=dict)
+
+    def is_trivial(self) -> bool:
+        """Whether the worker would decide the same things without this context."""
+        return self.prompt_tokens_excluded_from_usage == 0 and not self.resolved_thinking
 
 
 class GenerateRequest(BaseModel):

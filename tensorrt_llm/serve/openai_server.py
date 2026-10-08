@@ -2218,8 +2218,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         postproc_args.reasoning_parser, rendered_prompt)
                 if thinking is None and render_context is not None:
                     # Prepared request: the renderer read the mode off the
-                    # prompt it rendered.
-                    thinking = render_context["resolved_thinking"]
+                    # prompt it rendered, for every parser that does this.
+                    thinking = render_context["resolved_thinking"].get(
+                        postproc_args.reasoning_parser.lower())
                 if thinking is None and request.disaggregated_params is not None:
                     # Generation worker: it never rendered, so use the mode the
                     # context worker resolved and relayed.

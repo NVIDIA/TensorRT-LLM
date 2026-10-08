@@ -652,16 +652,21 @@ class TestGenerateThroughTheRealChatRoute:
         postproc_args = server._create_chat_response.call_args.args[1].postproc_args
         assert postproc_args.num_prompt_tokens_offset == 3
 
-    def test_the_thinking_mode_read_off_the_rendered_prompt_reaches_the_worker(self) -> None:
+    def test_the_thinking_mode_reaches_a_worker_even_when_the_renderer_has_no_parser(
+        self,
+    ) -> None:
         # The template prefills "<think>"; a parser that takes its mode from the prompt must
-        # see it as open even though the worker never renders the prompt.
+        # see it as open even though the worker never renders the prompt. The renderer is
+        # configured WITHOUT a reasoning parser (the standalone CLI's default; the parser is
+        # not part of the compatibility check), and the worker runs poolside_v1.
         thinking_tokenizer = make_tokenizer(
             chat_template=(
                 "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
                 "{% if add_generation_prompt %}<assistant><think>{% endif %}"
             )
         )
-        render_resources = resources(thinking_tokenizer, reasoning_parser="poolside_v1")
+        render_resources = resources(thinking_tokenizer)
+        assert render_resources.reasoning_parser is None
         app, server, captured = _real_chat_worker(
             thinking_tokenizer, reasoning_parser="poolside_v1"
         )
@@ -674,10 +679,29 @@ class TestGenerateThroughTheRealChatRoute:
 
         response = TestClient(app).post("/generate", json=prepared)
 
-        assert prepared["context"]["resolved_thinking"] is True
+        # Recorded for every parser that reads its mode off the prompt.
+        assert prepared["context"]["resolved_thinking"]["poolside_v1"] is True
         assert response.status_code == 200, response.text
         postproc_args = server._create_chat_response.call_args.args[1].postproc_args
         assert postproc_args.chat_template_kwargs["thinking"] is True
+
+    def test_a_prompt_that_prefills_nothing_leaves_the_mode_unresolved(self, tokenizer) -> None:
+        # Legitimately unresolved: no marker ends the prompt, so there is nothing to carry
+        # and the worker behaves as it does for a normally rendered request.
+        app, server, captured = _real_chat_worker(tokenizer, reasoning_parser="poolside_v1")
+        server._render_fingerprint = resources(tokenizer).fingerprint()
+        prepared = (
+            TestClient(build_render_app(resources(tokenizer)))
+            .post("/v1/chat/completions/render", json={**CHAT_BODY, "max_tokens": 4})
+            .json()
+        )
+
+        response = TestClient(app).post("/generate", json=prepared)
+
+        assert prepared["context"]["resolved_thinking"] == {}
+        assert response.status_code == 200, response.text
+        postproc_args = server._create_chat_response.call_args.args[1].postproc_args
+        assert "thinking" not in (postproc_args.chat_template_kwargs or {})
 
     def test_a_client_cannot_set_the_prepared_context_on_the_normal_route(self, tokenizer) -> None:
         # The context is a private attribute set only by /generate; a field of the same

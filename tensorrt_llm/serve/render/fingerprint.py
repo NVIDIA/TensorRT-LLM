@@ -46,6 +46,20 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# Tokenizer init options that change the ids a text encodes to (an allowlist: the rest of
+# ``init_kwargs`` is loading provenance such as paths).
+_ENCODING_INIT_KWARGS = (
+    "add_prefix_space",
+    "add_bos_token",
+    "add_eos_token",
+    "legacy",
+    "split_special_tokens",
+    "do_lower_case",
+    "strip_accents",
+    "tokenize_chinese_chars",
+)
+
+
 def _encoding_digest(inner: Any) -> Optional[Dict[str, Any]]:
     """Digest of everything that turns text into ids, or ``None`` if it cannot be established.
 
@@ -58,7 +72,15 @@ def _encoding_digest(inner: Any) -> Optional[Dict[str, Any]]:
     to_str = getattr(backend, "to_str", None)
     if callable(to_str):
         try:
-            return {"kind": "tokenizers", "sha256": _sha256_bytes(to_str().encode("utf-8"))}
+            serialized = json.loads(to_str())
+            # Truncation and padding are request-time state: Transformers enables them on
+            # the live backend while encoding a request and does not restore them, and the
+            # serialization includes them. They belong to the request, not to the identity,
+            # so a fingerprint must not depend on which requests the process has served.
+            # (Canonicalized on the parsed copy; the live tokenizer is never touched.)
+            serialized["truncation"] = None
+            serialized["padding"] = None
+            return {"kind": "tokenizers", "sha256": _sha256(serialized)}
         except Exception:  # noqa: BLE001 - fall through to the other identities
             pass
     for name in ("model", "tokenizer", "encoding", "_encoding", "tiktoken_model"):
@@ -105,11 +127,15 @@ def _tokenizer_digest(tokenizer: Any) -> Dict[str, Any]:
         )
     init_kwargs = getattr(inner, "init_kwargs", None)
     if isinstance(init_kwargs, dict):
+        # Only options that change how text is split into ids. ``init_kwargs`` also holds
+        # loading provenance (``name_or_path``, resolved file paths), which differs for the
+        # same checkpoint mounted at two locations and must not be part of the identity.
         info["init_kwargs_sha256"] = _sha256(
             {
-                k: v
-                for k, v in init_kwargs.items()
-                if isinstance(v, (str, int, float, bool, type(None)))
+                k: init_kwargs[k]
+                for k in _ENCODING_INIT_KWARGS
+                if isinstance(init_kwargs.get(k), (str, int, float, bool, type(None)))
+                and k in init_kwargs
             }
         )
     encoding = _encoding_digest(inner)
