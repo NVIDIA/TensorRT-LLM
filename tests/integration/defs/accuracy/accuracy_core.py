@@ -27,6 +27,7 @@ import yaml
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
+from tensorrt_llm.evaluate.interface import Evaluator
 from tensorrt_llm.llmapi import (GuidedDecodingParams, SamplingParams,
                                  SchedulingParams)
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -370,13 +371,33 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER),
             threshold=entry.get("threshold"))
 
+    def create_evaluator(
+            self,
+            num_samples: int,
+            extra_evaluator_kwargs: Optional[dict] = None) -> Evaluator:
+        """Build the task evaluator, e.g. before the LLM starts.
+
+        Creating it up front loads the dataset and evaluation harness while
+        the GPUs are still idle; pass the result to `evaluate` as
+        `prepared_evaluator`.
+        """
+        assert self.EVALUATOR_CLS is not None
+
+        evaluator_kwargs = {}
+        if self.EVALUATOR_KWARGS is not None:
+            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
+        if extra_evaluator_kwargs is not None:
+            evaluator_kwargs.update(extra_evaluator_kwargs)
+        return self.EVALUATOR_CLS(num_samples=num_samples, **evaluator_kwargs)
+
     def evaluate(self,
                  llm: PyTorchLLM,
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
-                 is_integration_test: bool = False):
+                 is_integration_test: bool = False,
+                 prepared_evaluator: Optional[Evaluator] = None):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
@@ -419,19 +440,14 @@ class AccuracyTask:
             if sampling_params.truncate_prompt_tokens is None:
                 sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
-        evaluator_kwargs = {}
-        if self.EVALUATOR_KWARGS is not None:
-            evaluator_kwargs.update(self.EVALUATOR_KWARGS)
-        if extra_evaluator_kwargs is not None:
-            evaluator_kwargs.update(extra_evaluator_kwargs)
-        evaluator = self.EVALUATOR_CLS(
-            num_samples=hypothesis_testing_params.num_samples,
-            **evaluator_kwargs)
+        if prepared_evaluator is None:
+            prepared_evaluator = self.create_evaluator(
+                hypothesis_testing_params.num_samples, extra_evaluator_kwargs)
         evaluate_kwargs = {}
         if hasattr(self, 'EVALUATE_KWARGS'):
             evaluate_kwargs.update(self.EVALUATE_KWARGS)
-        score = evaluator.evaluate(llm, sampling_params, streaming,
-                                   **evaluate_kwargs)
+        score = prepared_evaluator.evaluate(llm, sampling_params, streaming,
+                                            **evaluate_kwargs)
 
         logger.info(
             f"Hypothesis testing report:\n{hypothesis_testing_params.report(score)}"
