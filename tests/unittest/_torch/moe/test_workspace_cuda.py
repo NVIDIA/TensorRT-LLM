@@ -41,7 +41,9 @@ class CutlassWorkload:
     def forward(
         self, tokens: int, scope: CutlassWorkspaceReclaimer | None, *, warmup: bool = False
     ) -> list[torch.Tensor]:
-        with scope.forward(warmup=warmup) if scope is not None else nullcontext():
+        with (
+            scope.forward(warmup=warmup, num_tokens=tokens) if scope is not None else nullcontext()
+        ):
             return [
                 ops.fused_moe(
                     self.x[:n],
@@ -97,11 +99,32 @@ def test_cutlass_fifty_growth_reclaim_cycles(
             retained = memory()["allocated"]
             if step == 0:
                 peak = retained
-                assert peak > baseline, "Real kernel sizing must grow beyond the warmup floor"
+                assert peak > baseline, "Real kernel sizing must grow beyond the initial allocation"
             elif step < 3:
                 assert retained == peak, "Count complete forwards, not the three layer calls"
             else:
-                assert retained == baseline, "Third underfilled forward must reclaim to its floor"
+                assert retained <= baseline, "Third underfilled forward must release excess backing"
+                assert retained < peak
+
+
+def test_cutlass_reclaims_maximum_shape_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    workload = CutlassWorkload()
+    monkeypatch.setattr(ops.MoERunner, "runner_dict", {})
+    references = {n: [x.cpu() for x in workload.forward(n, None)] for n in (16, 8, 4)}
+    monkeypatch.setattr(ops.MoERunner, "runner_dict", {})
+    scope = CutlassWorkspaceReclaimer()
+    workload.forward(1024, scope, warmup=True)
+    peak = memory()["allocated"]
+    for step, n in enumerate((16, 8, 4)):
+        outputs = workload.forward(n, scope)
+        for output, expected in zip(outputs, references[n]):
+            torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+        del outputs, output
+        retained = memory()["allocated"]
+        if step < 2:
+            assert retained == peak
+        else:
+            assert retained < peak, "Normal maximum-shape warmup must not pin eager scratch"
 
 
 def test_cutlass_graph_replay_after_eager_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -173,7 +196,11 @@ def memory_sequence(workload: CutlassWorkload, enabled: bool) -> dict[str, objec
         assert peak > baseline, "The workload must actually grow native scratch"
         for label in ("short1", "short2"):
             assert phases[label]["allocated"] == peak
-        assert phases["short3"]["allocated"] == (baseline if enabled else peak)
+        if enabled:
+            assert phases["short3"]["allocated"] <= baseline
+            assert phases["short3"]["allocated"] < peak
+        else:
+            assert phases["short3"]["allocated"] == peak
         subsequent = torch.empty(64 * 1024 * 1024, dtype=torch.int8, device="cuda")
         subsequent.fill_(1)
         phases["synthetic_later_buffer"] = snapshot()
@@ -216,7 +243,7 @@ def benchmark(output: Path, runs: int, cycles: int) -> None:
                 for enabled in (False, True) if run % 2 == 0 else (True, False):
                     ops.MoERunner.runner_dict = {}
                     scope = CutlassWorkspaceReclaimer() if enabled else None
-                    workload.forward(32, scope, warmup=True)
+                    workload.forward(16 if name == "none" else 32, scope, warmup=True)
                     torch.cuda.synchronize()
                     torch.cuda.reset_peak_memory_stats()
                     start_memory = memory()

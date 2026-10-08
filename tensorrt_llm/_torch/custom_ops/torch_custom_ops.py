@@ -383,7 +383,7 @@ def fused_moe(
             gated_slot_lora_ranks, gated_slot_lora_weight_ptrs, token_to_slot
         ]
     run_moe_args.append(swiglu_clamp_after_silu)
-    register_cutlass_workspace(moe_runner.fused_moe_runner)
+    register_cutlass_workspace(moe_runner.fused_moe_runner, input.device)
     try:
         output = run_moe(*run_moe_args)
     except RuntimeError as e:

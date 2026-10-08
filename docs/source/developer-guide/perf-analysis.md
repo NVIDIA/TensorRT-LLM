@@ -22,8 +22,14 @@ initial spike's allocation requirement or necessarily reduce allocator-reserved
 memory. Set `TRTLLM_RECLAIM_WORKSPACE=0` before starting the process to disable
 this behavior if it causes performance regression. This setting also controls eager CUTLASS MoE runner workspace reclamation.
 CUTLASS uses its native workspace sizing to accumulate the maximum demand across
-all layers and chunks in a model forward. After three underfilled forwards, it
-releases excess capacity without going below the completed warmup baseline.
+all layers and chunks in a model forward. After three successful forwards using at most half the retained capacity, it
+replaces the backing with the largest actual requirement in that window. Unlike
+the attention policy, maximum-shape warmup is not a permanent minimum for this
+pure scratch buffer; it can shrink after warmup even without a serving spike.
+Previously observed demand is reserved at the next model-forward entry so model
+intermediates do not consume and fragment the released burst-sized block first.
+This reduces active allocations; allocator-reserved and device memory can remain
+unchanged even when the released capacity is successfully reused.
 Runners/streams first encountered after warmup are not reclaimed. Captured
 workspace, cross-engine sharing, and use outside the tracked forward opt out;
 speculative, CP, encoder-decoder, compiled, breakable-graph and multi-stream
