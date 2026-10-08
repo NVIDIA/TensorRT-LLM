@@ -380,6 +380,6 @@ def _logic_all(rank, world_size, backend):
 @pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
 def test_kv_cache_attention_under_ulysses(backend):
     """A rollout through rotations, the clean pass in four page-unaligned causal blocks
-    cut after the all-to-all, a padded single-frame first chunk, and two refusals: a
-    cache built for the full head count, and a per-rank seq_len."""
+    cut after the all-to-all, a padded single-frame first chunk, a refused cache built
+    for the full head count, and the model's path through the Attention module."""
     run_distributed(functools.partial(_logic_all, backend=backend))
