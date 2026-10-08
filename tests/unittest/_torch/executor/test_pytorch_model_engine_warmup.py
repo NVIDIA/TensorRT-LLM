@@ -127,6 +127,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
     for name in (
+        "_configure_autotuner_nvmmh",
         "_configure_deep_gemm_pdl",
         "create_input_processor",
         "setup_mm_encoder_attn_metadata",
