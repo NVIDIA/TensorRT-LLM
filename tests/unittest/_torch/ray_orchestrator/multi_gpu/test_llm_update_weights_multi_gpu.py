@@ -1135,9 +1135,8 @@ def test_llm_update_weights_nemotron_h():
 
     Requires mamba-ssm and causal-conv1d to be importable: without them HF
     falls back to the naive Python selective_scan path, which OOMs on
-    Nemotron-H and produces unmatched logits. The Ray CI stage used to install
-    both next to ray, and will again once upstream ships wheels for this base
-    image's torch -- see the TODO in jenkins/scripts/slurm_install.sh."""
+    Nemotron-H and produces unmatched logits. Ray CI builds both against the
+    installed torch with jenkins/scripts/install_mamba.sh."""
     try:
         import causal_conv1d  # noqa: F401
         import mamba_ssm  # noqa: F401
@@ -1145,11 +1144,12 @@ def test_llm_update_weights_nemotron_h():
         # Fail loudly here rather than let the naive fallback OOM further in,
         # which is a much harder failure to read.
         pytest.fail(
-            f"{e.name} is not installed, so the mamba fast path is unavailable. "
-            "The Ray CI stage stopped installing mamba-ssm and causal-conv1d "
-            "because upstream has no wheel for this base image's torch; "
-            "see the TODO in jenkins/scripts/slurm_install.sh."
+            f"The mamba fast path is unavailable: {e}. "
+            "Build and install the extensions against the current torch with "
+            "bash jenkins/scripts/install_mamba.sh."
         )
+    from transformers.models.nemotron_h import modeling_nemotron_h
+
     model_dir = str(llm_models_root() / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
     num_hidden_layers = 7
     # NemotronHConfig derives num_hidden_layers from ``layers_block_type``
@@ -1159,6 +1159,9 @@ def test_llm_update_weights_nemotron_h():
     layers_block_type = AutoConfig.from_pretrained(model_dir).layers_block_type[:num_hidden_layers]
     hf_model = RefHFModelWithIPCHandles(
         model_dir, num_hidden_layers=num_hidden_layers, layers_block_type=layers_block_type
+    )
+    assert modeling_nemotron_h.is_fast_path_available, (
+        "HF Nemotron-H did not enable the Mamba fast path despite the installed extensions."
     )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     # Nemotron-H's Mamba state dominates the cache budget; 0.25 of free memory

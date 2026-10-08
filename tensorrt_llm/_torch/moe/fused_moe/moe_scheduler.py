@@ -601,6 +601,29 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 7: EPLB - Start CPU stage ==========
         moe._load_balancer_start_set_cpu_stage(is_last_call)
 
+        # ========== Step 7b: Model-owned finalize, before the combine ==========
+        # ``do_finalize=False`` means the backend hands back the unfinalized
+        # ``(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)``
+        # triple. A registered ``unfinalized_combine_fn`` ALWAYS runs on it,
+        # with or without a comm strategy, so the forward's return type is a
+        # function of static config alone: call sites unpack either a triple
+        # or a dense tensor, and ``trtllm::moe_custom_op`` fixes the return
+        # type at trace time. Under a comm strategy the finalize must run here
+        # anyway -- no combine can carry the triple -- and the combine then
+        # reduces already-finalized partials, which is correct only because
+        # the finalize is computed from one ``(token, expert)`` row at a time.
+        # That is the contract a model accepts by registering the hook, and
+        # ``validate_backend`` rejected every configuration it cannot hold
+        # under at construction. A comm strategy with no registered hook is
+        # the one combination left to refuse at runtime, inside the helper.
+        if not do_finalize and (moe.unfinalized_combine_fn is not None or moe.comm is not None):
+            final_hidden_states = self._finalize_before_combine(
+                final_hidden_states,
+                token_selected_slots=token_selected_slots,
+                token_final_scales=token_final_scales,
+                output_dtype=output_dtype,
+            )
+
         # ========== Step 8: Communication combine ==========
         if moe.comm is not None:
             if moe.enable_dummy_allreduce:
@@ -619,6 +642,81 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe._load_balancer_done_set_cpu_stage(is_last_call)
 
         return final_hidden_states
+
+    def _finalize_before_combine(
+        self,
+        unfinalized: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
+        *,
+        token_selected_slots: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        output_dtype: Optional[torch.dtype],
+    ) -> torch.Tensor:
+        """Run the model's own finalize on the dispatched rows.
+
+        Turns the backend's unfinalized triple into the dense per-dispatched-row
+        tensor ``Communication.combine`` is typed for. The row count is the
+        dispatched one (``ep_size * max_tokens_per_rank``), taken from the routing
+        weights. The index map may flatten token and top-k dimensions, while a
+        quantized layout is free to reinterpret ``x``'s leading dimension.
+
+        ``token_selected_slots`` and ``token_final_scales`` must be the
+        POST-dispatch copies: under attention DP this rank holds rows for
+        tokens it does not own, and only the dispatched copies cover them.
+        """
+        moe = self.moe
+        finalize_fn = moe.unfinalized_combine_fn
+        if finalize_fn is None:
+            # Reached only with an active comm strategy: the registered-hook
+            # combinations were validated at construction, so this is the one
+            # refusal that stays at runtime (``do_finalize`` is a forward
+            # argument, not config).
+            raise NotImplementedError(
+                f"{type(moe.backend).__name__} was asked for do_finalize=False while "
+                f"{type(moe.comm).__name__} is active, but the model registered no "
+                "ConfigurableMoE.unfinalized_combine_fn. An unfinalized expert output "
+                "cannot cross a communication combine: every strategy takes a dense "
+                "per-token tensor. Either finalize in the backend (do_finalize=True) "
+                "or register a finalize the scheduler can run before the combine."
+            )
+        if not isinstance(unfinalized, (list, tuple)) or len(unfinalized) != 3:
+            raise NotImplementedError(
+                f"unfinalized_combine_fn is registered but {type(moe.backend).__name__} "
+                f"returned {type(unfinalized).__name__} for do_finalize=False instead of "
+                "the (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) triple."
+            )
+        if token_final_scales is None:
+            raise NotImplementedError(
+                "unfinalized_combine_fn needs the dispatched routing weights, but "
+                "token_final_scales is None (apply_router_weight_on_input folds them "
+                "into the activations). The two are not combinable."
+            )
+        gemm2_output, _expert_weights, expanded_idx_to_permuted_idx = unfinalized
+        num_tokens = token_final_scales.shape[0]
+        assert expanded_idx_to_permuted_idx.numel() == token_final_scales.numel(), (
+            f"dispatched routing weights cover {token_final_scales.numel()} token-expert "
+            f"slots but the index map covers {expanded_idx_to_permuted_idx.numel()}"
+        )
+        combined = finalize_fn(
+            gemm2_output=gemm2_output,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            # A per-expert transform needs to know which expert (slot) each
+            # row came from; the index map alone cannot answer that.
+            token_selected_slots=token_selected_slots,
+            routing_weights=token_final_scales,
+            num_tokens=num_tokens,
+        )
+        # ``gemm2_output`` is hidden-padded for some kernels and the backend
+        # only slices it on its own finalize path, so the hook must hand back
+        # exactly the layer's hidden size for the combine to reduce.
+        assert combined.shape == (num_tokens, moe.hidden_size), (
+            f"unfinalized_combine_fn returned {tuple(combined.shape)}, expected "
+            f"({num_tokens}, {moe.hidden_size}); gemm2_output is hidden-padded "
+            "and the hook owns the slice."
+        )
+        # Cast BEFORE the combine, not after: the one-sided workspace's combine
+        # region is sized from (hidden_size, act_dtype), so handing it a wider
+        # payload than the model output dtype would overrun that region.
+        return combined if output_dtype is None else combined.to(output_dtype)
 
     def _forward_multiple_chunks(
         self,
@@ -797,6 +895,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        do_finalize: bool,
     ) -> Tuple[Optional[torch.Tensor], bool]:
         """Decide the NVLinkOneSided combine payload buffer for this forward.
 
@@ -806,6 +905,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
         """
         moe = self.moe
         if not isinstance(moe.comm, NVLinkOneSided):
+            return None, False
+
+        if not do_finalize:
+            # The backend returns the unfinalized triple and writes nothing
+            # into the combine payload buffer, so the payload is NOT in the
+            # workspace however capable the backend is. Claiming otherwise
+            # makes moe_a2a_combine read an unwritten workspace region and
+            # reduce garbage silently, because the flag -- not the tensor
+            # argument -- is what combine() believes. The finalize that runs
+            # before the combine produces a fresh tensor, which has to be
+            # staged like any other caller-owned payload.
             return None, False
 
         if not moe.backend.supports_moe_output_in_alltoall_workspace():
@@ -860,6 +970,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             comm_plan=self._build_comm_plan(
                 all_rank_num_tokens,
                 output_dtype,
+                do_finalize,
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             ),
         )
@@ -868,6 +979,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        do_finalize: bool,
         use_deep_ep_direct_metadata: bool = False,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
@@ -880,7 +992,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # arrive unswizzled. Backends use this to skip a re-swizzle.
         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
         moe_output, payload_in_workspace = self._plan_onesided_workspace(
-            all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            all_rank_num_tokens=all_rank_num_tokens,
+            output_dtype=output_dtype,
+            do_finalize=do_finalize,
         )
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
