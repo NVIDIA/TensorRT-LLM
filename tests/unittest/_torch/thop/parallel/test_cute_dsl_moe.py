@@ -2566,6 +2566,7 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         num_local_experts=1,
         local_expert_offset=0,
         workload_identity=("locality_domain",),
+        prime_inner_tactics=True,
     )
     inputs = [torch.empty(0) for _ in range(num_inputs)]
 
@@ -2577,6 +2578,156 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         assert args == tuple(inputs)
         assert kwargs["enable_alltoall"] is False
         assert kwargs["overlap_moe_output_memset"] is False
+
+
+@pytest.mark.parametrize(
+    "module_name,runner_name,num_inputs,output_idx",
+    [
+        ("fused_moe_cute_dsl", "CuteDslFusedMoENvfp4Runner", 5, 4),
+        ("fused_moe_cute_dsl", "CuteDslFusedMoEBF16Runner", 4, 3),
+        # The subclass production instantiates for CUTEDSL_FC12. It overrides
+        # _tile_sizes, so a green result on the parent is not evidence about it.
+        ("fused_moe_cute_dsl_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+    ],
+)
+def test_workload_identity_alone_does_not_prime_inner_tactics(
+    monkeypatch,
+    module_name: str,
+    runner_name: str,
+    num_inputs: int,
+    output_idx: int,
+):
+    """workload_identity is a cache key, not a "forward_impl nests tuning" flag.
+
+    Non-locality-domain backends (e.g. CuteDslFc12FusedMoE, which keys the outer
+    tactic on the activation epilogue) pass a workload_identity, but their
+    ``run_moe_*_impl`` has no ``overlap_moe_output_memset`` parameter; priming
+    them raises TypeError during autotuner warmup.
+    """
+    import importlib
+
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl
+
+    monkeypatch.setattr(fused_moe_cute_dsl, "get_sm_version", lambda: 107)
+    preparation_calls = []
+
+    def forward_impl(*args, enable_alltoall=False, tile_size=128):
+        # Mirrors the single-op signature: no ``overlap_moe_output_memset``,
+        # so any priming call is a TypeError.
+        preparation_calls.append((args, tile_size))
+        return args[output_idx]
+
+    module = importlib.import_module(f"tensorrt_llm._torch.moe.fused_moe.{module_name}")
+    runner_cls = getattr(module, runner_name)
+    runner = runner_cls(
+        forward_impl,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        local_expert_offset=0,
+        workload_identity=(int(ActivationType.SiTu), 1.0, 0.5),
+    )
+    assert runner.prime_inner_tactics is False
+    inputs = [torch.empty(0) for _ in range(num_inputs)]
+
+    result = runner(inputs, tactic=-1, do_preparation=True)
+
+    assert result is inputs[output_idx]
+    assert preparation_calls == []
+
+
+def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
+    """Drive the real FC12 runner through do_preparation, on CPU.
+
+    The runner is built through ``CuteDslFc12FusedMoE.run_moe_nvfp4`` so the
+    workload_identity and the forward_impl are production's. Priming the
+    fused impl would raise ``TypeError: ... unexpected keyword argument
+    'overlap_moe_output_memset'`` at kwarg binding, before any CUDA work.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.moe.fused_moe import fused_moe_cute_dsl_fc12 as fc12
+
+    captured = {}
+
+    class _SpyRunner(fc12.CuteDslFc12FusedMoENvfp4Runner):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            captured["runner"] = self
+            super().__init__(**kwargs)
+
+        def forward(self, inputs, tactic, do_preparation=False):
+            if do_preparation:
+                return super().forward(inputs, tactic=tactic, do_preparation=True)
+            # The steady-state launch needs a GPU and is not on trial.
+            return inputs[4]
+
+    monkeypatch.setattr(fc12, "CuteDslFc12FusedMoENvfp4Runner", _SpyRunner)
+    monkeypatch.setattr(
+        fc12.AutoTuner,
+        "get",
+        staticmethod(
+            lambda: SimpleNamespace(choose_one=lambda op, runners, cfg, inputs: (runners[0], 128))
+        ),
+    )
+
+    num_tokens, hidden = 4, 16
+    impl_calls = []
+    backend = SimpleNamespace(
+        has_nvfp4=True,
+        num_slots=8,
+        hidden_size=hidden,
+        use_fused_finalize=True,
+        activation_type=ActivationType.SiTu,
+        act_alpha=4.0,
+        act_beta=25.0,
+    )
+    for name in ("_situ_betas", "_epilogue_identity"):
+        setattr(backend, name, getattr(fc12.CuteDslFc12FusedMoE, name).__get__(backend))
+    # Bound, like production's ``self.run_moe_nvfp4_impl``.
+    real_impl = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl.__get__(backend)
+
+    def tracking_impl(*args, **kwargs):
+        impl_calls.append(kwargs)
+        return real_impl(*args, **kwargs)
+
+    backend.run_moe_nvfp4_impl = tracking_impl
+    weight_view = SimpleNamespace(expert_size_per_partition=8, slot_start=0)
+
+    inputs = dict(
+        x=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
+        token_selected_experts=torch.zeros(num_tokens, 2, dtype=torch.int32),
+        token_final_scales=torch.ones(num_tokens, 2),
+        x_sf=torch.empty(0),
+        moe_output=torch.empty(num_tokens, hidden, dtype=torch.bfloat16),
+        weight_view=weight_view,
+    )
+    out = fc12.CuteDslFc12FusedMoE.run_moe_nvfp4(backend, **inputs)
+    assert out.shape == (num_tokens, hidden)
+
+    # Positive control: the activation-keyed identity is non-None.
+    assert captured["workload_identity"] == (int(ActivationType.SiTu), 4.0, 25.0)
+
+    runner = captured["runner"]
+    assert runner.prime_inner_tactics is False
+    ordered = [
+        inputs[k]
+        for k in (
+            "x",
+            "token_selected_experts",
+            "token_final_scales",
+            "x_sf",
+            "moe_output",
+            "weight_view",
+        )
+    ]
+    assert runner(ordered, tactic=-1, do_preparation=True) is ordered[4]
+    assert impl_calls == [], f"warmup priming reached the fused impl with {impl_calls}"
+    # And the reason it must not: the impl cannot take that kwarg.
+    assert (
+        "overlap_moe_output_memset"
+        not in inspect.signature(fc12.CuteDslFc12FusedMoE.run_moe_nvfp4_impl).parameters
+    )
 
 
 def _cute_dsl_eligibility(**deployment_kwargs):

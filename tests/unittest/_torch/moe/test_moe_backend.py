@@ -71,6 +71,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import (
     CuteDslFusedMoENvfp4Runner,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
+from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import (
+    CuteDslFc12FusedMoE,
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_marlin import MarlinFusedMoE
@@ -3377,8 +3381,8 @@ def test_nvfp4_fc1_row_alignment_gate(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [CutlassFusedMoE, CuteDslFusedMoE],
-    ids=["cutlass", "cutedsl"],
+    [CutlassFusedMoE, CuteDslFusedMoE, CuteDslFc12FusedMoE],
+    ids=["cutlass", "cutedsl", "cutedsl_fc12"],
 )
 def test_situ_survives_resolution_not_just_construction(backend_cls):
     """A SiTU layer must be admitted by the *resolver*, not only build.
@@ -3397,6 +3401,45 @@ def test_situ_survives_resolution_not_just_construction(backend_cls):
     )
     rejection = _reject_unsupported_activation(backend_cls, problem)
     assert rejection is None, f"{backend_cls.__name__} refuses SiTU at resolution: {rejection}"
+
+
+def test_cutedsl_fc12_refuses_relu2_at_resolution():
+    """Relu2 is not gated; the fused FC12 epilogue would compile it as SwiGLU."""
+    rejection = _reject_unsupported_activation(CuteDslFc12FusedMoE, _nvfp4_problem(2048, "Relu2"))
+    assert rejection is not None
+    assert rejection.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+
+
+def test_cutedsl_fc12_outer_runner_unique_id_includes_epilogue():
+    """The outer AutoTuner key must not share a tile tactic across epilogues."""
+
+    def _forward(*args, **kwargs):
+        raise AssertionError("not launched")
+
+    def _runner(identity):
+        return CuteDslFc12FusedMoENvfp4Runner(
+            forward_impl=_forward,
+            num_experts=8,
+            top_k=2,
+            num_local_experts=8,
+            local_expert_offset=0,
+            enable_finalize_fusion=True,
+            enable_alltoall=False,
+            workload_identity=identity,
+        )
+
+    swiglu = _runner((int(ActivationType.Swiglu), -1.0, -1.0))
+    situ = _runner((int(ActivationType.SiTu), 4.0, 25.0))
+    assert swiglu.unique_id() != situ.unique_id()
+
+    # A non-None workload_identity is a cache key only. It must not open the
+    # locality-domain inner-tactic priming branch, which calls forward_impl with
+    # overlap_moe_output_memset -- a kwarg the fused single-op impl does not
+    # take. _forward raises if reached; no GPU needed, the failure is at kwarg
+    # binding.
+    assert situ.prime_inner_tactics is False
+    inputs = [torch.empty(0) for _ in range(5)]
+    assert situ(inputs, tactic=-1, do_preparation=True) is inputs[4]
 
 
 def test_unresolvable_layer_error_carries_rejection_details():
