@@ -12,13 +12,22 @@ from __future__ import annotations
 from agent_flow.workflows.agent_team.prompts import DEFAULT_PROMPTS, PromptBundle
 
 from . import coder_extra, plan_drafter_extra, plan_reviewer_extra, qa_extra, reviewer_extra
-from ._common import CONTAINER_BOOTSTRAP, TEST_COMMAND_CACHE
+from ._common import (
+    CONTAINER_BOOTSTRAP,
+    MODEL_EXPRESS_DISABLED,
+    MODEL_EXPRESS_EXISTING_MODEL,
+    TEST_COMMAND_CACHE,
+)
+
+_ROLES = ("plan_drafter", "plan_reviewer", "coder", "reviewer", "qa")
 
 
 def build_modeling_bringup_prompts(
     *,
     include_slurm_environment: bool = False,
     replan_on_qa: bool = False,
+    include_model_express: bool = True,
+    model_express_existing_model: bool = False,
 ) -> PromptBundle:
     """Build modeling-bringup prompts for one validated ``task.yaml``.
 
@@ -30,7 +39,16 @@ def build_modeling_bringup_prompts(
     matrix) is appended only when ``replan_on_qa`` is set — it is designed
     around the post-QA replan sub-cycle, so without ``--replan-on-qa`` the
     agents run on the base flat-plan prompts.
+
+    The ModelExpress (MX) qualification step is part of every role's
+    `SYSTEM_PROMPT_EXTENSION`, so it is on by default. A task can turn it off
+    (`include_model_express=False`) or make it the whole task for a model that
+    already exists in TensorRT-LLM (`model_express_existing_model=True`). The
+    matching override is appended after every other block so that it wins.
     """
+    if model_express_existing_model and not include_model_express:
+        raise ValueError("model_express_existing_model requires include_model_express=True")
+
     prompts = DEFAULT_PROMPTS.with_extensions(
         plan_drafter=plan_drafter_extra.SYSTEM_PROMPT_EXTENSION,
         plan_reviewer=plan_reviewer_extra.SYSTEM_PROMPT_EXTENSION,
@@ -46,17 +64,20 @@ def build_modeling_bringup_prompts(
             reviewer=reviewer_extra.STAGE_GOAL_EXTENSION,
             qa=qa_extra.STAGE_GOAL_EXTENSION,
         )
-    if not include_slurm_environment:
-        return prompts
-
-    build_phase_slurm = "\n".join([CONTAINER_BOOTSTRAP, TEST_COMMAND_CACHE])
-    return prompts.with_extensions(
-        plan_drafter=CONTAINER_BOOTSTRAP,
-        plan_reviewer=CONTAINER_BOOTSTRAP,
-        coder=build_phase_slurm,
-        reviewer=build_phase_slurm,
-        qa=build_phase_slurm,
-    )
+    if include_slurm_environment:
+        build_phase_slurm = "\n".join([CONTAINER_BOOTSTRAP, TEST_COMMAND_CACHE])
+        prompts = prompts.with_extensions(
+            plan_drafter=CONTAINER_BOOTSTRAP,
+            plan_reviewer=CONTAINER_BOOTSTRAP,
+            coder=build_phase_slurm,
+            reviewer=build_phase_slurm,
+            qa=build_phase_slurm,
+        )
+    if not include_model_express:
+        prompts = prompts.with_extensions(**dict.fromkeys(_ROLES, MODEL_EXPRESS_DISABLED))
+    elif model_express_existing_model:
+        prompts = prompts.with_extensions(**dict.fromkeys(_ROLES, MODEL_EXPRESS_EXISTING_MODEL))
+    return prompts
 
 
 MODELING_BRINGUP_PROMPTS: PromptBundle = build_modeling_bringup_prompts()
