@@ -527,10 +527,10 @@ def test_mxfp8_alpha_cache_rejects_first_init_during_capture():
     getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
     reason="The test requires SM107 and SM107 CuTe DSL support.",
 )
-@pytest.mark.parametrize("m", [1, 128])
+@pytest.mark.parametrize("m", [1, 32, 128, 192, 256])
 def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
     """Validate production decode shapes, including CUDA Graph replay."""
-    num_heads, head_dim, nope_dim, k = 16, 512, 448, 1536
+    num_heads, head_dim, nope_dim, k = 128, 512, 448, 1536
     n = num_heads * head_dim
     eps = 1e-6
     torch.random.manual_seed(17)
@@ -547,8 +547,17 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
                                                                    k=k)
 
     position_ids = torch.arange(m, dtype=torch.int32, device="cuda")
-    cu_q_seqlens = torch.tensor([0, m], dtype=torch.int32, device="cuda")
-    kv_cache_lengths = torch.tensor([m], dtype=torch.int32, device="cuda")
+    batch_size = min(m, 32)
+    tokens_per_sequence = torch.full((batch_size, ),
+                                     m // batch_size,
+                                     dtype=torch.int32,
+                                     device="cuda")
+    tokens_per_sequence[:m % batch_size] += 1
+    cu_q_seqlens = torch.cat([
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        tokens_per_sequence.cumsum(0, dtype=torch.int32),
+    ])
+    kv_cache_lengths = tokens_per_sequence.clone()
     quant_scale_qkv = torch.ones(1, dtype=torch.float32, device="cuda")
 
     rope_dim = head_dim - nope_dim
@@ -574,8 +583,48 @@ def test_cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant(m):
             eps,
         )
 
+    # Exercise the eager fallback first, then profile every registered tactic.
     run_fusion()
     torch.cuda.synchronize()
+    custom_op = "trtllm::cute_dsl_dsv4_qb_gemm_fused_rmsnorm_rope_quant"
+    with autotune():
+        run_fusion()
+    torch.cuda.synchronize()
+    tuner = AutoTuner.get()
+    assert tuner.stats.tuned_op_profiled_configs.get(custom_op, 0) >= 4
+    assert not tuner.stats.failed_profiling_count.get(custom_op, set())
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner
+
+    runner = CuteDSLDsv4QbGemmFusedRmsnormRopeQuantRunner()
+    profile_inputs = [
+        a_fp8.new_empty((8192, k)),
+        b_fp8,
+        a_sf,
+        b_sf,
+        cos_sin_cache,
+        cu_q_seqlens,
+        kv_cache_lengths,
+        position_ids.new_empty(8192),
+        quant_scale_qkv,
+    ]
+    small_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(runner.tuning_config,
+                                                    profile_inputs)
+    }
+    assert small_profile_ms == {32, 128, 192, 256}
+
+    profile_inputs[0] = a_fp8.new_empty((16384, k))
+    profile_inputs[7] = position_ids.new_empty(16384)
+    large_profile_ms = {
+        profile.get_opt_shapes()[0][0]
+        for profile in tuner._optimization_profiles(
+            runner.large_m_tuning_config, profile_inputs)
+    }
+    assert large_profile_ms == {32, 128, 192, 256, 16384}
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = run_fusion()
