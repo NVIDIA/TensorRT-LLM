@@ -110,6 +110,8 @@ set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
     nvfp4ColdPageKernelsTest.cpp
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMemBacking.cpp
+    ${PROJECT_SOURCE_DIR}/tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.cpp
     # ~HostMem reports a failed cleanup through the poison latch, so this target
     # needs the latch itself: NO_TLLM_LINKAGE means nothing else supplies it.
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.cpp
@@ -123,5 +125,7 @@ add_gtest(nvfp4ColdPageKernelsTest "${NVFP4_COLD_PAGE_KERNEL_TEST_SRC}"
 target_include_directories(
   nvfp4ColdPageKernelsTest
   PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
+# numa: the backing places pages with mbind and the topology detector reads the
+# node layout through libnuma.
 target_link_libraries(nvfp4ColdPageKernelsTest PRIVATE CUDA::cudart
-                                                       CUDA::cuda_driver)
+                                                       CUDA::cuda_driver numa)

@@ -15,6 +15,7 @@ l0_gb200_multi_gpus:
       backend: pytorch
   tests:
   - unittest/_torch/moe/multi_gpu/test_moe_a2a_workspace.py TIMEOUT (10)
+  - unittest/kv_cache_manager_v2_tests/test_host_numa_placement.py ISOLATION
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
   # ---- curated pre-merge smoke set: diversify moe_backend across CUTLASS/TRTLLM/CUTEDSL ----

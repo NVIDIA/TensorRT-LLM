@@ -150,13 +150,19 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
     # already-patched tree from a failure. Require a reverse dry-run to succeed.
     # --force keeps this check in reverse mode instead of automatically
     # switching direction for an unapplied patch.
+    #
+    # The script must contain no ';': it is one list element here and one
+    # argument to bash -c, and CMake would split it on that character into
+    # separate arguments, leaving bash to run only the part before the first
+    # one. Hence '|| true &&' to discard the forward exit status, and '&& false'
+    # to fail the step.
     list(
       APPEND
       FETCH_ARGS
       PATCH_COMMAND
       bash
       -c
-      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1; patch -p1 --reverse --force --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2; false)"
+      "patch -p1 --forward --batch -r - -i '${_patch_file}' >/dev/null 2>&1 || true && patch -p1 --reverse --force --dry-run -i '${_patch_file}' >/dev/null 2>&1 || (echo 'Patch state for ${DEP_NAME} is inconsistent. Remove ${CMAKE_BINARY_DIR}/_deps/${DEP_NAME}-src and reconfigure.' >&2 && false)"
     )
   endif()
 
