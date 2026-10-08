@@ -5,6 +5,7 @@ import asyncio
 import base64
 import tempfile
 from collections import defaultdict
+from dataclasses import fields, is_dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
@@ -14,7 +15,7 @@ from urllib.parse import urlparse
 import numpy as np
 import soundfile
 import torch
-from PIL import Image
+from PIL import Image, ImageMode
 from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
 from transformers.utils import logging
@@ -45,6 +46,107 @@ from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
+
+
+class MultimodalDataTooLargeError(ValueError):
+    """A request's materialized multimodal inputs exceed its CPU limit."""
+
+
+def _is_shared_cpu_tensor_handle(value: dict) -> bool:
+    """Whether value is a CPU handle from `SharedTensorContainer.dump_to_dict`."""
+    return ("method_key" in value and "storage_size" in value
+            and "storage_dtype" in value)
+
+
+def _cpu_storage_bytes(
+        value: Any,
+        seen_storages: Optional[set[tuple[Any, ...]]] = None) -> int:
+    """Count unique CPU tensor, array, and image storage reachable from value."""
+    if seen_storages is None:
+        seen_storages = set()
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            return 0
+        storage = value.untyped_storage()
+        key = ("cpu", storage.data_ptr(), storage.nbytes())
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return storage.nbytes()
+
+    if isinstance(value, np.ndarray):
+        owner = value
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        data_ptr = owner.__array_interface__["data"][0]
+        key = ("cpu", data_ptr, owner.nbytes)
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return owner.nbytes
+
+    if isinstance(value, Image.Image):
+        mode = ImageMode.getmode(value.mode)
+        size_bytes = (value.width * value.height * len(mode.bands) *
+                      np.dtype(mode.typestr).itemsize)
+        key = ("pil", id(value), size_bytes)
+        if key in seen_storages:
+            return 0
+        seen_storages.add(key)
+        return size_bytes
+
+    if isinstance(value, BaseModalityData):
+        return _cpu_storage_bytes(vars(value), seen_storages)
+    if isinstance(value, dict):
+        if _is_shared_cpu_tensor_handle(value):
+            dtype = getattr(
+                torch,
+                str(value["storage_dtype"]).removeprefix("torch."),
+                None,
+            )
+            if isinstance(dtype, torch.dtype):
+                size_bytes = int(value["storage_size"]) * dtype.itemsize
+                key = ("shared_cpu", value.get("storage_handle"), size_bytes)
+                if key in seen_storages:
+                    return 0
+                seen_storages.add(key)
+                return size_bytes
+        return sum(
+            _cpu_storage_bytes(item, seen_storages) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_cpu_storage_bytes(item, seen_storages) for item in value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return sum(
+            _cpu_storage_bytes(getattr(value, field.name), seen_storages)
+            for field in fields(value))
+    return 0
+
+
+def _release_shared_cpu_tensors(value: Any) -> None:
+    """Free the shared memory behind CPU tensor handles reachable from value.
+
+    Exporting a CPU tensor as a handle (`MultimodalParams.to_handle`) keeps its
+    shared-memory segment alive until a consumer rebuilds the tensor. A request
+    dropped before any worker consumes its handles must rebuild them here, or
+    the segments stay in /dev/shm until the process exits. CUDA handles are
+    left alone.
+    """
+    if isinstance(value, dict):
+        if not _is_shared_cpu_tensor_handle(value):
+            for item in value.values():
+                _release_shared_cpu_tensors(item)
+            return
+        from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+        try:
+            # The rebuild takes over the reference added by the export, so
+            # dropping the rebuilt view frees the segment.
+            SharedTensorContainer.from_dict(value).get_local_view()
+        except (KeyError, RuntimeError, ValueError) as e:
+            logger.warning(f"Failed to release a shared CPU tensor: {e}")
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _release_shared_cpu_tensors(item)
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -375,6 +477,7 @@ class MultimodalDataTracker:
         model_type: str,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        initial_cpu_bytes: int = 0,
     ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
@@ -394,6 +497,9 @@ class MultimodalDataTracker:
         # Per-request override merged with the server default at media-load
         # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
+        if initial_cpu_bytes < 0:
+            raise ValueError("initial_cpu_bytes must be non-negative")
+        self._initial_cpu_bytes = initial_cpu_bytes
 
     @property
     def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
@@ -426,7 +532,12 @@ class MultimodalDataTracker:
                 out[modality].append(result)
             return dict(out)
 
-        # _data and _embeddings also gathered concurrently
+        max_bytes = self._multimodal_server_config.max_cpu_bytes_per_request
+        if max_bytes is not None:
+            return await self._retrieve_with_byte_limit(max_bytes)
+
+        # _data and _embeddings also gathered concurrently. Preserve this
+        # zero-overhead path when frontend byte admission is not configured.
         data_result, embed_result = await asyncio.gather(
             _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
@@ -451,6 +562,52 @@ class MultimodalDataTracker:
                         item.close()
             pending.clear()
         return None, None
+
+    async def _retrieve_with_byte_limit(
+        self, max_bytes: int
+    ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:
+        """Collect completed items until their unique CPU storage hits the limit."""
+        pairs = [(False, modality, item)
+                 for modality, items in self._data.items() for item in items]
+        pairs.extend((True, modality, item)
+                     for modality, items in self._embeddings.items()
+                     for item in items)
+        if not pairs:
+            return None, None
+
+        async def _indexed_result(index: int,
+                                  item: Coroutine) -> tuple[int, Any]:
+            return index, await item
+
+        tasks = [
+            asyncio.create_task(_indexed_result(index, item))
+            for index, (_, _, item) in enumerate(pairs)
+        ]
+        results: list[Any] = [None] * len(tasks)
+        seen_storages: set[tuple[Any, ...]] = set()
+        resident_bytes = self._initial_cpu_bytes
+        try:
+            for completed in asyncio.as_completed(tasks):
+                index, result = await completed
+                resident_bytes += _cpu_storage_bytes(result, seen_storages)
+                if resident_bytes > max_bytes:
+                    raise MultimodalDataTooLargeError(
+                        "Multimodal inputs require at least "
+                        f"{resident_bytes} CPU bytes, exceeding the per-request "
+                        f"limit of {max_bytes} bytes")
+                results[index] = result
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        data_result: dict[str, list] = defaultdict(list)
+        embed_result: dict[str, list] = defaultdict(list)
+        for (is_embedding, modality, _), result in zip(pairs, results):
+            (embed_result
+             if is_embedding else data_result)[modality].append(result)
+        return (dict(data_result) or None, dict(embed_result) or None)
 
     def retrieve_all_sync(
         self

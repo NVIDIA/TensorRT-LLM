@@ -63,7 +63,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (MultimodalConfig, TorchLlmArgs,
+                                          _parse_binary_byte_string)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -1265,6 +1266,29 @@ def launch_visual_gen_server(
                   "\"num_frames\": 16}}' to enable audio extraction from "
                   "video files.",
                   status="prototype")
+@stability_option(
+    "--max_multimodal_cpu_bytes",
+    type=str,
+    default=None,
+    help=("Maximum CPU working set for concurrently preprocessing multimodal "
+          "requests in each serving frontend process. Each request with media "
+          "reserves --max_multimodal_cpu_bytes_per_request, so "
+          "max_multimodal_cpu_bytes // max_multimodal_cpu_bytes_per_request "
+          "of them run at a time and the rest wait. If "
+          "--max_multimodal_cpu_bytes_per_request is not set, it defaults to "
+          "this value and only one runs at a time. Accepts byte values such "
+          "as '8GiB'. Disabled by default."),
+    status="prototype")
+@stability_option(
+    "--max_multimodal_cpu_bytes_per_request",
+    type=str,
+    default=None,
+    help=("Maximum CPU storage for one multimodal request: its raw HTTP body "
+          "plus decoded media and processed multimodal tensors. Chat, "
+          "Messages, and Responses request bodies above this size are "
+          "rejected with HTTP 413. Accepts byte values such as '1GiB'. "
+          "Defaults to the total multimodal CPU limit when that limit is set."),
+    status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
                   default=None,
@@ -1387,6 +1411,8 @@ def serve(
     enable_attention_dp: bool,
     disagg_cluster_uri: Optional[str],
     media_io_kwargs: Optional[str],
+    max_multimodal_cpu_bytes: Optional[str],
+    max_multimodal_cpu_bytes_per_request: Optional[str],
     agent_percentage: float,
     agent_types: Optional[str],
     video_pruning_rate: Optional[float],
@@ -1586,7 +1612,11 @@ def serve(
                 raise ValueError(f"Invalid JSON for media_io_kwargs: {e}")
 
         multimodal_server_config = MultimodalServerConfig(
-            media_io_kwargs=parsed_media_io_kwargs)
+            media_io_kwargs=parsed_media_io_kwargs,
+            max_cpu_bytes=_parse_binary_byte_string(max_multimodal_cpu_bytes),
+            max_cpu_bytes_per_request=_parse_binary_byte_string(
+                max_multimodal_cpu_bytes_per_request),
+        )
 
         if grpc:
             effective_num_serve_frontends = llm_args.get(
@@ -1615,6 +1645,10 @@ def serve(
                 server_role,
                 "disagg_cluster_config":
                 disagg_cluster_config,
+                "max_multimodal_cpu_bytes":
+                max_multimodal_cpu_bytes,
+                "max_multimodal_cpu_bytes_per_request":
+                max_multimodal_cpu_bytes_per_request,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
