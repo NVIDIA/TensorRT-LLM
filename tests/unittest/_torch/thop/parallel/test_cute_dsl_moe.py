@@ -2324,9 +2324,6 @@ def test_bf16_gather_grouped_gemm_swiglu_rubin(
             valid_mask[i] = True
     c_ref_valid = c_ref[:num_valid_permuted_tokens][valid_mask]
 
-    # Even-tile padding for Rubin cluster sync
-    kernel_nnet = ((num_non_exiting_tiles + 1) // 2) * 2
-
     # Test all valid autotuner candidate tactics via direct runner call
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         Sm107ContiguousGatherGroupedGemmSwigluFusionRunner,
@@ -2342,7 +2339,7 @@ def test_bf16_gather_grouped_gemm_swiglu_rubin(
         tile_idx_to_group_idx,
         tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx,
-        kernel_nnet,
+        num_non_exiting_tiles,
     ]
     tactics = runner.get_valid_tactics(inputs, None)
     assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
@@ -4191,8 +4188,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -4233,7 +4229,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_backend(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -4241,8 +4237,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                 moe_backend="CUTEDSL",
                 locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
             )
-            backend = create_moe_backend(
-                moe_cls=CuteDslFusedMoE,
+            moe = create_moe(
                 routing_method=routing_method,
                 num_experts=num_experts,
                 hidden_size=hidden_size,
@@ -4250,9 +4245,11 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                 dtype=dtype,
                 reduce_results=True,
                 model_config=model_config,
-                init_load_balancer=False,
+                allow_backend_degradation=False,
             )
-            backend.load_weights([weights])
+            backend = moe.backend
+            moe.create_weights()
+            moe.load_weights([weights])
             source_storage_ptrs = {}
             if enable_locality_domains and top_k == 2:
                 source_storage_ptrs = {
@@ -4261,12 +4258,13 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
                     "fc1_weight_block": backend.quant_scales.fc1_weight_block.untyped_storage().data_ptr(),
                     "fc2_weight_block": backend.quant_scales.fc2_weight_block.untyped_storage().data_ptr(),
                 }
-            backend.post_load_weights()
-            backend.cuda()
-            return backend, source_storage_ptrs
+            moe.post_load_weights()
+            moe.cuda()
+            return moe, source_storage_ptrs
 
-        base_backend, _ = create_backend(False)
-        locality_domain_backend, source_storage_ptrs = create_backend(True)
+        base_moe, _ = create_module(False)
+        locality_domain_moe, source_storage_ptrs = create_module(True)
+        locality_domain_backend = locality_domain_moe.backend
 
         if top_k == 2:
             assert locality_domain_backend._locality_domain_runtime is not None
@@ -4286,10 +4284,8 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
             assert locality_domain_backend.quant_scales.fc2_weight_block.numel() == 0
 
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
-            )
+            base_output = base_moe.forward(input_tensor, router_logits)
+            locality_domain_output = locality_domain_moe.forward(input_tensor, router_logits)
 
         torch.cuda.synchronize()
         torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
@@ -4299,7 +4295,7 @@ def test_moe_module_locality_domain_correctness_rubin(num_tokens: int, top_k: in
     get_sm_version() != 107,
     reason="This test is only supported on Rubin (SM 107) GPUs",
 )
-def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
+def test_moe_module_bf16_locality_domain_lifecycle_and_forward_rubin():
     _skip_if_no_locality_domain()
 
     from _torch.moe.quantize_utils import get_test_quant_params
@@ -4308,8 +4304,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
     from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
-    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
-    from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
     from tensorrt_llm._utils import mpi_rank
     from tensorrt_llm.mapping import Mapping
 
@@ -4351,7 +4346,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         pretrained_config.intermediate_size = intermediate_size
         pretrained_config.torch_dtype = dtype
 
-        def create_backend(enable_locality_domains: bool):
+        def create_module(enable_locality_domains: bool, post_load: bool = True):
             model_config = ModelConfig(
                 pretrained_config=pretrained_config,
                 quant_config=quant_config,
@@ -4359,8 +4354,7 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 moe_backend="CUTEDSL",
                 locality_domain_policy=LocalityDomainPolicy(enabled=enable_locality_domains),
             )
-            backend = create_moe_backend(
-                moe_cls=CuteDslFusedMoE,
+            moe = create_moe(
                 routing_method=routing_method,
                 num_experts=num_experts,
                 hidden_size=hidden_size,
@@ -4368,9 +4362,11 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                 dtype=dtype,
                 reduce_results=True,
                 model_config=model_config,
-                init_load_balancer=False,
+                allow_backend_degradation=False,
             )
-            backend.load_weights([weights])
+            backend = moe.backend
+            moe.create_weights()
+            moe.load_weights([weights])
             full_w3_w1 = None
             full_w2 = None
             source_storage_ptrs = ()
@@ -4381,12 +4377,14 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
                     backend.w3_w1_weight.untyped_storage().data_ptr(),
                     backend.w2_weight.untyped_storage().data_ptr(),
                 )
-            backend.post_load_weights()
-            backend.cuda()
-            return backend, full_w3_w1, full_w2, source_storage_ptrs
+            if post_load:
+                moe.post_load_weights()
+            moe.cuda()
+            return moe, full_w3_w1, full_w2, source_storage_ptrs
 
-        base_backend, _, _, _ = create_backend(False)
-        locality_domain_backend, full_w3_w1, full_w2, source_storage_ptrs = create_backend(True)
+        base_moe, _, _, _ = create_module(False)
+        locality_domain_moe, full_w3_w1, full_w2, source_storage_ptrs = create_module(True)
+        locality_domain_backend = locality_domain_moe.backend
 
         assert locality_domain_backend._locality_domain_runtime is not None
         assert locality_domain_backend._locality_domain_weight_shards is not None
@@ -4401,17 +4399,24 @@ def test_moe_module_bf16_locality_domain_lifecycle_and_forward_chunk_rubin():
         assert locality_domain_backend.w3_w1_weight.numel() == 0
         assert locality_domain_backend.w2_weight.numel() == 0
 
-        # Keep the production-shape lifecycle and public forward_chunk
-        # integration here. Broad accuracy, autotune, capture, and outer-tile
-        # replay are covered by the unified backend matrix.
+        # The split is a one-time transform: a repeated post-load keeps the shards.
+        locality_domain_moe.post_load_weights()
+        assert locality_domain_backend._locality_domain_weight_shards is shards
+
+        # Keep the production-shape lifecycle and public ConfigurableMoE
+        # forward integration here. Broad accuracy, autotune, capture, and
+        # outer-tile replay are covered by the unified backend matrix.
         with torch.inference_mode():
-            base_output = base_backend.forward_chunk(input_tensor, router_logits)
-            locality_domain_output = locality_domain_backend.forward_chunk(
-                input_tensor, router_logits
-            )
+            base_output = base_moe.forward(input_tensor, router_logits)
+            locality_domain_output = locality_domain_moe.forward(input_tensor, router_logits)
 
         torch.cuda.synchronize()
         torch.testing.assert_close(base_output, locality_domain_output, rtol=1e-2, atol=0.15)
+
+        # A staged load skips transform_weights and only refreshes derived state.
+        staged_moe, _, _, _ = create_module(True, post_load=False)
+        with pytest.raises(NotImplementedError, match="staged loads"):
+            staged_moe.cache_derived_state()
 
 
 @pytest.mark.skipif(
@@ -4497,9 +4502,6 @@ def test_bf16_grouped_gemm_finalize_rubin(
             scale = token_final_scales[token_idx, topk_idx].item()
             c_ref[token_idx] += (c_permuted[i] * scale).to(torch.bfloat16)
 
-    # Even-tile padding for Rubin cluster sync
-    kernel_nnet = ((num_non_exiting_tiles + 1) // 2) * 2
-
     # Test all valid autotuner candidate tactics via direct runner call
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
         Sm107ContiguousGroupedGemmFinalizeFusionRunner,
@@ -4536,7 +4538,7 @@ def test_bf16_grouped_gemm_finalize_rubin(
             tile_idx_to_group_idx,
             tile_idx_to_mn_limit,
             permuted_idx_to_expanded_idx,
-            kernel_nnet,
+            num_non_exiting_tiles,
             token_final_scales,
         ]
         with torch.inference_mode():
