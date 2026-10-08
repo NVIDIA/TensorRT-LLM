@@ -204,7 +204,7 @@ enable_attention_dp: true
 EOF
 ```
 
-2. Evaluate accuracy on the [MMLU](https://people.eecs.berkeley.edu/~hendrycks/data.tar) dataset:
+2. Evaluate accuracy on the [MMLU](https://huggingface.co/datasets/cais/mmlu/resolve/main/data.tar) dataset:
 ```bash
 trtllm-eval --model  <YOUR_MODEL_DIR> \
   --tp_size 8 \
