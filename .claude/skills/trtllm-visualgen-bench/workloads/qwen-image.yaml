@@ -1,0 +1,15 @@
+# Qwen/Qwen-Image  ·  QwenImagePipeline  ·  t2i
+# guidance_scale · max_sequence_length: pipeline defaults.
+backend: openai-images
+
+common_params:
+  width: 1328
+  height: 1328
+  num_inference_steps: 50
+  guidance_scale: 4.0
+  max_sequence_length: 1024
+  seed: 42
+
+# Prompt verbatim from qwen_image.py's `parse_args` -- this model's own.
+requests:
+  - prompt: "A serene mountain lake at sunrise, watercolor style, highly detailed"

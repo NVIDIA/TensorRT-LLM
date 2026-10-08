@@ -1,0 +1,215 @@
+# Pending pool — suspected (unconfirmed) perf-regression fixes.
+#
+# Every entry here had an NVBug-titled fix commit whose PR description
+# did NOT explicitly establish a perf regression, but whose diff/title
+# plausibly repairs one. This is the standing to-classify worklist:
+# future deep-dives resolve each entry through its nvbug ID (bug
+# history was deliberately not read at scan time).
+#
+# Do NOT cite these as precedents. Promote to a case in references/
+# (and remove from here) once the perf nature is confirmed; drop the
+# entry if refuted.
+#
+# Generated from the 2026-07-10 scan (origin/main fd9166c0a7,
+# window since 2026-01-10); verdicts by PR-description classification.
+
+pending:
+  - nvbug: "5816267"
+    commit: "635cbf01ba2e"
+    pr: 10876
+    date: "2026-01-21"
+    title: "[https://nvbugs/5816267][fix] Remove weight tensor holder to release memory earlier (#10876)"
+    pattern_hint: "memory-footprint"
+    why_suspected: "Human description is only 'Fix issue #10759'; the 3-line diff just deletes a `memo` holder in the fallback-init path so weights are freed earlier. Only plausible motive is reducing peak memory during load, which could restore lost KV/batch capacity — but it could equally be an OOM-crash fix, so not confirmable."
+
+  - nvbug: "5322131"
+    commit: "1dc49b266e54"
+    pr: 8279
+    date: "2026-01-22"
+    title: "[https://nvbugs/5322131][feat] Multi-LoRA serving with CUDA Graph (#8279)"
+    pattern_hint: "fast-path-fallback"
+    why_suspected: "Explicitly perf-motivated (nvbug-tracked, benchmark table in PR body) and repairs a known perf feature (CUDA Graph unusable with LoRA), but it is a [feat] PR closing a long-standing perf gap rather than fixing a regression from a previously faster state."
+
+  - nvbug: "5829097"
+    commit: "9fcc93ea7bbe"
+    pr: 10918
+    date: "2026-01-24"
+    title: "[https://nvbugs/5829097][fix] Re-init TRTLLM sampler to use sample stream in multi-stream cases. (#10918)"
+    pattern_hint: "overlap-broken (multi-stream sampling not actually on sample stream)"
+    why_suspected: "Human description is empty; the diff repairs the PP multi-stream sampling overlap feature (TRTLLM sampler store/algorithms were initialized on the default stream, so re-initializing them on the sample stream is what actually enables the async multi-stream sampling optimization); CodeRabbit notes 'Multi-stream sampling optimization ... for improved performance throughput'"
+
+  - nvbug: "5811697"
+    commit: "2b3bb2e9b0a0"
+    pr: 10716
+    date: "2026-01-25"
+    title: "[https://nvbugs/5811697][fix] Fix buffer reuse. (#10716)"
+    pattern_hint: "memory-footprint (buffer reuse path never taken)"
+    why_suspected: "Human description empty; diff shows the buffer-reuse fast path was silently skipped whenever reserve_buffer=False, so a fitting cached buffer was never reused and a new one was allocated each time (memory footprint growth / allocation overhead), plus empty_cache on >=1GB frees to curb fragmentation; CodeRabbit-only wording mentions 'improving memory efficiency and reducing fragmentation' — but the nvbug could equally be an OOM-crash (functional)"
+
+  - nvbug: "5820874"
+    commit: "eae480b7131c"
+    pr: 11259
+    date: "2026-02-05"
+    title: "[https://nvbugs/5820874][fix] Adjust deepgemm tuning buckets to cover larger num_tokens's scope (#11259)"
+    pattern_hint: "autotuner-bucket-miss / slow-kernel-selected"
+    why_suspected: "Human description is empty (CodeRabbit-only), but the fix reworks autotuner tuning buckets for DeepGemm SwapAB (tune_max_num_tokens clamped to [4096,8192]) and the changed files are perf-sanity test assets (test_perf_sanity.py, l0_dgx_b200_perf_sanity.yml, deepseek_r1_fp8_blackwell.yaml); the only plausible motive of widening tuning-bucket coverage is speed, and the NVBug is almost certainly a perf-sanity failure"
+
+  - nvbug: "5863392"
+    commit: "18e611da7730"
+    pr: 11247
+    date: "2026-02-06"
+    title: "[https://nvbugs/5863392][fix] fix partial reuse disabled for disagg (#11247)"
+    pattern_hint: "fast-path-fallback (perf feature silently disabled)"
+    why_suspected: "PR description is empty, but the title states a pure perf feature (partial KV cache block reuse) was disabled under disaggregated serving and this PR re-enables it; partial reuse has no correctness benefit, so restoring it is a perf fix, touching kvCacheManager/cacheFormatter/cacheTransceiver paths"
+
+  - nvbug: "5911143"
+    commit: "3fd5fafb58d2"
+    pr: 11573
+    date: "2026-02-26"
+    title: "[https://nvbugs/5911143][fix] add async worker to MTP/Eagle3 sampler,… (#11573)"
+    pattern_hint: "sync-introduced/host-overhead (blocking D2H in sampler, non-pinned transfers)"
+    why_suspected: "PR description is empty, but the change adds an async worker to the MTP/Eagle3 sampler (overlapping device-to-host transfers, a pure perf mechanism), standardizes pinned-memory allocation across the codebase, and gates pinning on confidential compute (pinned staging under CC is a transfer-speed concern); the only plausible motive of these changes is host-overhead/sync reduction"
+
+  - nvbug: "5823212"
+    commit: "85dc52acae7c"
+    pr: 11743
+    date: "2026-03-02"
+    title: "[https://nvbugs/5823212][fix] Warmup maybe_compiled_cat in forward_context_with_chunked_prefill (#11743)"
+    pattern_hint: "host-overhead-introduced (runtime torch.compile stall in hot path)"
+    why_suspected: "The diff moves torch.compile compilation of maybe_compiled_cat out of the hot chunked-prefill MLA context path into an explicit cached warmup, with an in-code comment that dynamic=True 'results in significantly degraded performance' — the only plausible motive is eliminating a runtime-compile perf stall; no functional symptom is described"
+
+  - nvbug: "5973199"
+    commit: "5cc0ccd1d1fa"
+    pr: 12156
+    date: "2026-03-12"
+    title: "[https://nvbugs/5973199][fix] support attn-dp TRTLLM-Gen NVFP4 MoE fu… (#12156)"
+    pattern_hint: "fusion-broken/fast-path-fallback"
+    why_suspected: "The fix removes a config check that blocked the MoE fusion transform under mapping_config and adds the all-to-all path so the cudagraph-compatible fused MoE kernel is used; the only plausible motive for restoring a fusion + CUDA-graph fast path is performance, though the PR never explicitly states a perf regression"
+
+  - nvbug: "5964329"
+    commit: "2dfc3d134e8e"
+    pr: 12360
+    date: "2026-03-19"
+    title: "[https://nvbugs/5964329][fix] fix PARD accuracy issue (#12360)"
+    pattern_hint: "spec-decode-acceptance-drop"
+    why_suspected: "PR is framed as an accuracy fix, but it explicitly cites a significant acceptance-rate drop for PARD at batch size > 1; acceptance rate is the throughput lever of speculative decoding, so the fix plausibly restores spec-decode speedup even though no throughput/latency metric is quoted"
+
+  - nvbug: "5963423"
+    commit: "9194e9e9f896"
+    pr: 12099
+    date: "2026-03-23"
+    title: "[https://nvbugs/5963423][fix] Fix kv token estimation when ADP is on. (#12099)"
+    pattern_hint: "memory-footprint (KV token estimation over-reserved under ADP, shrinking usable KV capacity)"
+    why_suspected: "Human-written description is empty; only the CodeRabbit summary calls it a 'Performance Improvement'. The diff divides warmup dummy-request block count by tp_size under ADP, i.e. the estimator previously over-reserved warmup blocks tp_size-fold, shrinking the estimated free KV tokens per rank — a KV-capacity (achievable batch/KV) issue rather than a functional crash."
+
+  - nvbug: "6015329"
+    commit: "9cc758419adb"
+    pr: 12516
+    date: "2026-03-26"
+    title: "[https://nvbugs/6015329][fix] Use model-level warmup cache key for visual gen pipelines (#12516)"
+    pattern_hint: "fast-path-fallback (warmup cache key too strict, spurious recompile)"
+    why_suspected: "The stated bug is a false 'not warmed up' warning with only 'potentially unnecessary recompilation' as perf impact — the perf cost is plausible (recompilation stall on cache-key mismatch) but the description does not clearly state a measured perf regression, so it does not meet the strict confirmed bar."
+
+  - nvbug: "6017720"
+    commit: "90c1a5f29f2c"
+    pr: 13470
+    date: "2026-05-09"
+    title: "[https://nvbugs/6017720][fix] Fix moe backend mismatch on Blackwell in perf test. (#13470)"
+    pattern_hint: "slow-kernel-selected (wrong MoE backend in perf test config)"
+    why_suspected: "Human-written description is empty; but the title says the fix targets a MoE backend mismatch in a perf test and the change edits tests/integration/defs/perf/pytorch_model_config.py to pin the intended MoE backend per GPU arch — the only plausible motive is restoring expected perf-test throughput after wrong backend selection."
+
+  - nvbug: "6160248"
+    commit: "609557c1459d"
+    pr: 14038
+    date: "2026-05-13"
+    title: "[https://nvbugs/6160248][fix] AutoDeploy: fixed broken pattern matching of fuse_rope_into_trtllm_attention transform (#14038)"
+    pattern_hint: "fusion-broken (pattern match silently fails, fused op never emitted)"
+    why_suspected: "The fix repairs a broken fusion transform (a perf feature): after commit 6cd23bccdf changed the emitted node pattern, pattern matching failed silently and the fused QKV op was never produced. The PR text never states a measured perf metric or explicitly frames the bug as a slowdown (the nvbug also had a waived test), so it cannot be confirmed, but restoring a silently-disabled fusion is a classic perf-regression repair."
+
+  - nvbug: "6221841"
+    commit: "8c830c90f3fb"
+    pr: 14624
+    date: "2026-05-29"
+    title: "[https://nvbugs/6221841][fix] Detect via the raw config_dict whether the user actually set a top-level rope_th (#14624)"
+    pattern_hint: "fast-path-fallback (spec-decode acceptance collapsed by wrong rope_theta)"
+    why_suspected: "The PR does not explicitly call the bug a perf problem, but acceptance_length is a throughput driver: the rope_theta merge bug made draft predictions worthless (acceptance 1.0), silently destroying the speculative-decoding speedup while output stayed functional; the fix restores the fast path."
+
+  - nvbug: "5940460"
+    commit: "e58e7587c650"
+    pr: 14697
+    date: "2026-06-02"
+    title: "[https://nvbugs/5940460][fix] Harden FP8 quant fusion matching after PyTorch 26.02 update (#14697)"
+    pattern_hint: "fusion-broken, dep-bump"
+    why_suspected: "PyTorch 26.02 dep bump changed traced graph shape so FP8 AR+Residual+RMSNorm quant fusion patterns stopped matching; PR text frames it as waived unit tests, but the repaired artifact is a fusion (a perf feature), and it explicitly preserves 'the intended fusion coverage' — silent fusion non-match is a perf regression even though no metric is quoted."
+
+  - nvbug: "6221483"
+    commit: "900d06907135"
+    pr: 14714
+    date: "2026-06-08"
+    title: "[https://nvbugs/6221483][fix] AutoDeploy: Fix Eagle metadata host syncs (#14714)"
+    pattern_hint: "sync-introduced"
+    why_suspected: "Human summary mixes a correctness change (blocking D2H mirroring for pinned-buffer safety) with explicit host-sync avoidance in the perf-critical Eagle drafting path; CodeRabbit notes 'improving performance' but the human text never states the bug is a perf regression, so cannot confirm."
+
+  - nvbug: "6281014"
+    commit: "f45172615d84"
+    pr: 15331
+    date: "2026-06-15"
+    title: "[https://nvbugs/6281014][fix] fix the repeated cute.compile and simpilify the test (#15331)"
+    pattern_hint: "repeated-jit-compile-host-overhead"
+    why_suspected: "Enabling CUDA-graph padding so cute.compile is not re-triggered per unmatched batch shape eliminates repeated JIT compilation overhead at runtime; the only plausible motive is speed (test wall-time/host overhead), though the PR never states an explicit perf regression."
+
+  - nvbug: "6270671"
+    commit: "071c287d131b"
+    pr: 15312
+    date: "2026-06-17"
+    title: "[https://nvbugs/6270671][fix] Enable multi-block mode for XQA HMMA spec-dec (#15312)"
+    pattern_hint: "fast-path-fallback (multi-block disabled on HMMA spec-dec)"
+    why_suspected: "Multi-block mode is a pure decode-latency optimization; the fix replaces a hardcoded multiBlock=1 with the multi-block count computation already used on the FP8/GMMA path, so the only plausible motive is restoring speculative-decoding attention speed on the BF16/HMMA path. CodeRabbit's 'Performance' bullet supports this but the human text never states the perf symptom."
+
+  - nvbug: "6062416"
+    commit: "8e6a089d5f4b"
+    pr: 15596
+    date: "2026-06-26"
+    title: "[https://nvbugs/6062416][fix] Cache NCCL window allocation failures by size (#15596)"
+    pattern_hint: "fast-path-fallback"
+    why_suspected: "Description never states a measured perf regression, but the fix's motive is to keep the NCCL symmetric-memory fast path available for smaller allocations (size-aware failure cache, pooled-buffer reuse) instead of blanket-disabling it — a perf-feature repair; the correctness parts (sticky CUDA error clearing) are secondary"
+
+  - nvbug: "6344107"
+    commit: "b48661b1907c"
+    pr: 15655
+    date: "2026-07-06"
+    title: "[https://nvbugs/6344107][fix] Enable disagg partial reuse store for PP>1 (#15655)"
+    pattern_hint: "fast-path-fallback (kv-reuse disabled for PP>1)"
+    why_suspected: "Repairs KV-cache block reuse (a throughput/TTFT perf feature) that was disabled for PP>1, but the PR frames the bug as incorrect cache-reuse reporting in a functional test rather than a measured perf regression"
+
+  - nvbug: "6384622"
+    commit: "ceae332fe6f2"
+    pr: 15879
+    date: "2026-07-06"
+    title: "[https://nvbugs/6384622][fix] increase free_mem_frac for failed perf test (#15879)"
+    pattern_hint: "memory-footprint / kv-capacity tuning for perf-sanity test"
+    why_suspected: "Title explicitly targets a failed perf test, but the human description is empty and the change is test-config tuning (more KV memory); the failure could equally have been an OOM/stability failure rather than a measured perf-bar miss (CodeRabbit says it 'may improve stability')"
+
+  - nvbug: "6299530"
+    commit: "02715db02f33"
+    pr: 15594
+    date: "2026-07-06"
+    title: "[https://nvbugs/6299530][fix] Capture Qwen3.5 GDN for piecewise CUDA … (#15594)"
+    pattern_hint: "cuda-graph-capture-broken"
+    why_suspected: "The fix exists solely to make piecewise CUDA graph (a launch-overhead perf feature) work for GDN models; the PR never states whether the original bug manifested as a crash or as lost CUDA-graph speedup, so it cannot be confirmed as a perf regression"
+
+  - nvbug: "6321874"
+    commit: "4d1cb8f79210"
+    pr: 15866
+    date: "2026-07-07"
+    title: "[https://nvbugs/6321874][fix] Filter `.lock` from `os.listdir(...)` in the test's rank-file count; skip the… (#15866)"
+    pattern_hint: "slow-kernel-selected (autotuner tie-break corrupted by fake 0.0 timing)"
+    why_suspected: "Corrupted autotuner tactic comparison can cause suboptimal kernel/tactic selection across ranks (a perf-affecting mechanism), but the PR presents it purely as a failing unit-test fix with no stated perf symptom"
+
+  - nvbug: "6070875"
+    commit: "cf9963f19550"
+    pr: 12470
+    date: "2026-04-19"
+    title: "[None][feat] Support sparse mqa/gqa attention (#12470)"
+    pattern_hint: "host-work-on-hot-path (FmhaAutoTuner kernel selection re-run per attention call)"
+    why_suspected: "Inverted from the usual pending entry: the REGRESSION is fully established and the FIX is not. The bug is a +31.76% inference-time (gpu_time) regression, reproduced on rerun, on phi_4_multimodal_instruct-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:128,128 on B200, 1.2.0 -> 1.3.0rc11, and, per the NVBug, an nsys comparison establishes the mechanism: GPU kernel times identical between good and bad commits, the whole loss is host-side — every mixed prefill+gen forward step adds +15.5 ms of CPU (22 ms -> 38 ms) because the new FmhaAutoTuner kernel-selection logic runs per attention call (64x per step at 32 layers), while pure-generation iterations are unaffected since CUDA-graph replay bypasses the autotuner. Culprit is 88bbb4de67f8, PR #12612 '[None][feat] Trtllm-gen FMHA JIT support'. The obvious fix is to memoize FmhaAutoTuner::selectKernel(). PR #12470 is credited with the fix, but it is a sparse MQA/GQA feature PR: its diff is sparse-attention flag/parameter renaming plus a new sparse test, it contains no selectKernel memoization (and none exists at HEAD), and it touches a sparse code path this dense bf16 workload never enters. The only conceivable carrier is the opaque libTrtLlmGen.a / libTrtLlmGenFmhaLib.a and trtllm-gen export refresh bundled in the same PR, which cannot be read. So the fix ATTRIBUTION is unconfirmed and the fix MECHANISM is unestablishable; do not cite #12470 as a host-overhead fix. To resolve: diff the trtllm-gen autotuner sources/libs across cf9963f19550."

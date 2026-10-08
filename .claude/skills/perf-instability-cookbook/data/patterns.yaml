@@ -1,0 +1,271 @@
+# Instability-pattern registry — transferable failure modes as first-class
+# entries. A pattern is the recurring WAY perf became unstable; cases are
+# its concrete instances. Match symptom signals → pattern → instance cases.
+#
+# Hybrid-registry contract (same as perf-regression-cookbook — keep by hand):
+#   - every id listed in a case's frontmatter `patterns:` must exist here;
+#   - every `instances:` entry here must resolve to an existing case file
+#     whose frontmatter lists this pattern back.
+# A pattern MAY have `instances: []` when its only known sightings are
+# unconfirmed entries in data/pending.yaml (named in notes) — promote them
+# to cases before adding them here.
+#
+# Provenance: a pattern's full commit/NVBug set is the union of its
+# instance cases' `commits:`/`nvbugs:` frontmatter (plus any pending
+# entries named in notes).
+#
+# Fields: id (stable, prefix `pattern-`), name (one-liner), instability_class /
+# signals (canonical terms from tags.yaml — the top-down hook), modules
+# (which `references/<module>/` dirs the instances live in today — descriptive,
+# not a constraint; ordered most-instances-first), instances (case ids),
+# notes (triage hint / scope caveat, optional).
+#
+# Patterns are the CROSS-MODULE axis. references/ is indexed by module (where
+# the fix landed); a pattern is the recurring mechanism, and a `modules:` list
+# with several entries is the useful case, not a filing error — it says this
+# failure mode has already recurred in code that has nothing else in common.
+
+patterns:
+  - id: pattern-jit-on-hot-path
+    name: JIT / compile / capture cost lands in served or measured iterations
+    instability_class: [warmup-gap]
+    signals: [first-iter-spike, midrun-stall, startup-time-increase]
+    modules: [jit-and-warmup]
+    instances:
+      - case-fmha-cubin-drop-align-kernel-selection
+      - case-mamba-hybrid-warmup-gap
+      - case-deepgemm-paged-mqa-logits-prewarm
+      - case-visual-gen-i2v-warmup
+      - case-visual-gen-warmup-shapes-configurable
+      - case-flashinfer-sampling-jit-on-served-path
+    notes: >
+      Three failure shapes: warmup entirely missing for a mode; a warmup grid
+      too sparse so a runtime shape misses it; and — the one easiest to miss —
+      a warmup that exists only as a SIDE EFFECT of another feature's warmup,
+      so a config flag that disables that feature silently removes the coverage
+      (`case-flashinfer-sampling-jit-on-served-path`: with
+      `cuda_graph_config: null` the advanced-sampling capture pass never runs,
+      so nothing builds the flashinfer sampling kernels until a request is
+      served). The warmup shape / mode grid must cover what the runtime can
+      legitimately request, and each warmup must be requested explicitly.
+      Triage: check for startup nvtx spans that reappear inside iter 0..N of
+      served traffic; grep the log for "recompile" / "not warmed up" /
+      "ninja: Entering" / hang-detector marks near iter 3, and check whether a
+      JIT/compile frame appears in the stack of whichever rank the hang
+      detector blamed — peers blocked in a collective are victims, not the
+      cause.
+
+  - id: pattern-warmup-coverage-hole
+    name: Warmup covered "typical" shapes but a live request lands on an uncovered shape/mode
+    instability_class: [warmup-gap]
+    signals: [first-iter-spike, midrun-stall]
+    modules: [jit-and-warmup]
+    instances:
+      - case-deepgemm-paged-mqa-logits-prewarm
+    notes: >
+      The kernel/backend has a warmup step, but the grid enumerates only the
+      obvious shapes — a narrow / non-multiple / atypical shape (e.g. seqlen
+      8193-9316, cudagraph batch bucket 160) misses coverage and triggers
+      JIT on the served path. Triage: dump the actually-warmed shape set
+      (log / metadata) and compare against runtime shapes drawn from live
+      traffic; densify only the buckets a real request can hit.
+
+  - id: pattern-warmup-path-mismatch
+    name: Warmup ran, but a served path invalidates the compiled graph
+    instability_class: [warmup-path-mismatch]
+    signals: [first-iter-spike, midrun-stall]
+    modules: [jit-and-warmup]
+    instances:
+      - case-visual-gen-i2v-warmup
+    notes: >
+      Warmup exercised path A (image=None / no-cache-kv / T2V), but a live
+      request goes down path B (image=…/cached-kv/I2V). torch.compile /
+      dynamo sees different shapes or a different sub-graph and recompiles.
+      Triage: enumerate the served paths the model exposes; a warmup must
+      touch every path that changes the compiled graph shape.
+
+  # RETIRED 2026-08-12 — pattern-warmup-sizing-tradeoff had exactly one instance
+  # (case-warmup-token-cap-protect-autotuner), removed because its bug 5805494 is
+  # a functional bug: an int32 overflow / IMA at the 16384-token warmup shape,
+  # i.e. a crash, with no metric varying. The tradeoff itself is real and still
+  # documented — the OTHER end of it, the revert that removed the cap after it
+  # cost >10 % disagg throughput, is a live performance-bug case in the
+  # regression cookbook
+  # (`references/jit-and-warmup/warmup-token-cap-revert.md`, nvbug 6185713).
+  # Read that before re-introducing any global warmup cap: compare the cap
+  # against the `max_num_tokens` / `max_batch_size` live traffic requests, and
+  # prefer per-op protective clamps over one global cap. Re-add here only with a
+  # performance bug on the cap side.
+
+  # RETIRED 2026-08-12 — pattern-warmup-cache-key-too-strict had exactly one
+  # instance (case-visual-gen-warmup-cache-key), removed because it was filed
+  # as a functional bug: the observable was a spurious "not warmed up" WARNING
+  # on an image-only FLUX pipeline whose cache-key included `num_frames`, with
+  # the recompile only ever "potential" — no measured metric moved. The
+  # mechanism is worth knowing (a cache-key must contain only axes the compiled
+  # artifact actually depends on; let each model override it), but a false
+  # warning is not a perf-instability precedent.
+
+  - id: pattern-cold-start-worker-imbalance
+    name: First N requests skewed to a single worker until a shared prefix is cached everywhere
+    instability_class: [cold-start-imbalance]
+    signals: [first-iter-spike, rep-to-rep-variance]
+    modules: [jit-and-warmup]
+    instances:
+      - case-kv-aware-adp-cold-start
+    notes: >
+      A KV-aware / affinity-scoring router will pin all requests carrying a
+      shared system prompt to the first rank that caches it. Cold ranks stay
+      cold; a later traffic spike pays the full re-prefill cost. Fix:
+      round-robin the first few relaxed requests before affinity scoring
+      kicks in.
+
+  - id: pattern-opportunistic-collective-fallback
+    name: A fast collective silently falls back on a corner case (autotuner miss, OOM, in-graph registration)
+    instability_class: [opportunistic-collective-fallback]
+    signals: [eager-fallback-in-log, rep-to-rep-variance, autotuner-cache-miss-during-capture, cross-rank-hang]
+    modules: [communication]
+    instances:
+      - case-nccl-symmetric-graceful-fallback
+      - case-nccl-symmetric-preallocation-for-autotuning
+    notes: >
+      NCCL_SYMMETRIC-style opportunistic fast paths must handle three corner
+      cases: (a) autotuner cache miss inside a CUDA-graph capture region,
+      (b) OOM during buffer registration or symmetric-pool growth,
+      (c) library-version mismatch at load. Each corner case can either fall
+      back silently to plain NCCL (correct, slower) or hang. Triage: grep
+      for symmetric fallback logs, watch for allocator regression across
+      multi-turn rounds (pool never releases), and verify preallocation
+      timing relative to graph capture.
+      Only (a) and (b) have *instability* instances here. Corner cases (b)-as-hang
+      and (c) were filed as nvbugs 5930934 (a crash bug) and 5923949 / 5803120
+      (functional bugs) — a deterministic hang and a load-time segfault, no
+      varying metric — so those two cases were removed on 2026-08-12. The
+      corner cases are still real; they are just not *perf-instability*
+      precedents. Do not re-add them without a performance bug.
+
+  - id: pattern-platform-conditional-disable
+    name: A NCCL / kernel path must be disabled on a specific platform's known bug
+    instability_class: [platform-conditional-disable]
+    signals: [rep-to-rep-variance, cross-rank-hang, segfault-on-load]
+    modules: [communication]
+    instances:
+      - case-nccl-symmetric-off-on-gb10-spark
+    notes: >
+      A platform-specific NCCL / hardware combination hits a library bug
+      that a workload-wide disable would over-solve. Prefer a targeted
+      per-platform gate (grep the compute-capability / device-name string
+      the case names) so other platforms keep the fast path.
+
+  - id: pattern-gc-driven-collective-destruction
+    name: __del__ / atexit on a communicator runs a collective; non-deterministic GC across ranks hangs
+    instability_class: [gc-driven-collective-destruction]
+    signals: [cross-rank-hang, rep-to-rep-variance]
+    modules: [moe]
+    instances:
+      - case-moe-deepep-gc-hang
+    notes: >
+      Any collective resource whose destructor runs a barrier/allreduce/
+      alltoall MUST have an explicit release path — GC timing differs across
+      ranks by design. Triage: grep the codebase for `__del__` implementations
+      that call any collective op; add explicit `destroy()` + context-manager
+      support.
+      Distinguish from `pattern-gc-pause-on-decode-path`: there the harm is a
+      host-side PAUSE in the decode loop (single rank, no collective involved);
+      here it is a collective fired from a finalizer, which hangs peers.
+
+  - id: pattern-gc-pause-on-decode-path
+    name: Host-side GC / finalizer pause lands in the decode loop because its tuning knob is absent or defaulted off
+    instability_class: [gc-pause-on-decode-path]
+    signals: [midrun-stall, rep-to-rep-variance]
+    modules: [scheduler-and-executor]
+    instances:
+      - case-autodeploy-gc-gen0-threshold-unforwarded
+    notes: >
+      A long-lived server holding an enormous Python object graph (FX graph +
+      CUDA-graph wrappers + SSM/mamba caches + MoE state) pays sub-second gen-2
+      collections that stall decode. TRT-LLM tunes this via
+      `garbage_collection_gen0_threshold` (default 20000) applied by
+      `customized_gc_thresholds` around the executor loop — but the knob is
+      `Optional[int] = None` and its None branch is a silent no-op, so any
+      executor construction path that forgets to forward it runs at CPython's
+      default 700 (~28x more frequent) with no warning. Triage: check
+      `gc.get_threshold()` inside the executor process before profiling
+      anything, look for decode gaps with the device idle and the host in
+      `gc.collect` (`py-spy dump` during a stall), and grep every `PyExecutor(`
+      construction site for the field. The general form is broader than GC: a
+      perf tuning knob that defaults to "off" cannot report its own absence —
+      prefer a required parameter, a shared construction helper, or a startup
+      log line stating the effective value.
+
+  # RETIRED 2026-08-12 — pattern-active-vs-max-batch-stride had exactly one
+  # instance (case-beam-search-logprobs-nondeterminism, PR #15125), removed as
+  # an *output*-nondeterminism defect rather than a perf instability: a kernel
+  # deriving `nMaxBatchSize` from a sliced `outputIdsPtr` reads the wrong slot,
+  # so the returned `log_probs` are simply wrong, varying with batch drain
+  # order. No perf metric varies anywhere in it. The mechanism is a real and
+  # nasty class — look for `getDimension<0>()` on tensors that are ever sliced,
+  # and pin every kernel-launch extent to the *allocation* dimension — but it
+  # is a correctness precedent, not a perf-instability one.
+
+  - id: pattern-metric-with-hidden-rng
+    name: A perf metric depends on an RNG (spec-decode acceptance rate) with no way to pin it
+    instability_class: [metric-with-hidden-rng]
+    signals: [acceptance-length-drift, rep-to-rep-variance, perf-ci-bar-flake]
+    modules: [measurement-and-test]
+    instances:
+      - case-force-num-accepted-tokens-in-spec-perf-test
+      - case-fractional-synthetic-acceptance-rates
+      - case-ignore-eos-with-spec-decoding
+    notes: >
+      Perf tests that report acceptance-rate-driven throughput on a real
+      draft model will produce a different number each rep — accepted-tokens
+      is an RNG draw. The mitigation is a *test-side* deterministic override
+      (`TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`, synthetic fractional AR
+      support). Perf CI without this knob is noise-dominated.
+      `case-ignore-eos-with-spec-decoding` adds the inverse failure and is the
+      one to check FIRST, because it needs no new knob to reproduce: a
+      harness flag applied to REMOVE variance from one metric can inject it
+      into another. `--ignore-eos` makes plain-decode throughput comparable by
+      forcing every request to `osl` tokens; with spec decoding on, generation
+      past the natural EOS is text the model has no distribution for, so the
+      draft model's agreement — and therefore acceptance length — is arbitrary.
+      So enumerate the randomness sources a metric depends on INCLUDING the
+      ones the harness adds, and when a "make it deterministic" flag is applied
+      suite-wide, ask per case which quantity is actually being measured. The
+      durable half of that fix is recording the flag in the perf DB's match
+      keys, so runs measured with and without it can never be compared.
+
+  - id: pattern-cross-node-log-flush-race
+    name: Benchmark client returns while gen-worker log is still flushing across NFS
+    instability_class: [cross-node-log-flush-race]
+    signals: [test-parser-missing-line, perf-ci-bar-flake]
+    modules: [measurement-and-test]
+    instances:
+      - case-gen-only-prev-device-step-time-race
+      - case-gen-only-log-flush-sentinel
+    notes: >
+      A perf-sanity parser reads a log written on a different node
+      immediately after the benchmark client returns; NFS/Lustre flush lag
+      causes the parser to see a truncated tail. Two rounds on the SAME log,
+      and the second is the important one: retry-until-EOF-stable
+      (`case-gen-only-prev-device-step-time-race`, PR #15108) is
+      **known-insufficient** when the writer is an `srun`-owned aggregate fd —
+      a pause in arriving lines is not evidence of EOF, so the poll can latch
+      onto a mid-flush prefix and silently average a PARTIAL run of iterations.
+      That converted a loud failure (parser returns None, gate raises) into a
+      quiet metric bias, which is worse. Prefer the writer's own end-of-write
+      signal (`case-gen-only-log-flush-sentinel`, PR #16717: a `.done` sentinel
+      touched after the `srun` is reaped). Only fall back to reader-side polling
+      when the writer genuinely cannot signal — and then check row counts, not
+      values, because a mean over a prefix looks plausible.
+
+  # RETIRED 2026-08-12 — pattern-process-lifetime-cache-binds-env had exactly
+  # one instance (case-single-process-mode-env-cache), and all four nvbugs
+  # behind it (5680911, 5698292, 5710045, 5758449) are functional bugs: the
+  # observable was unit tests silently no-op'ing, with no perf metric anywhere
+  # in the defect. A pattern with zero instances is a match surface that routes
+  # to nothing, so it is retired rather than left empty. The underlying trap
+  # (`os.environ` read inside a `@cache`-decorated body binds the first
+  # caller's env) is real and worth knowing — it just is not a perf-instability
+  # precedent. Re-add only with a performance bug behind it.

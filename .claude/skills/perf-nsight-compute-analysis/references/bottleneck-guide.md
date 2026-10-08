@@ -27,6 +27,7 @@ Root-cause analysis and optimization strategies for each bottleneck type identif
 | <40 | >60 | **Memory-bound** | MemoryWorkloadAnalysis |
 | <40 | <40 | **Latency-bound** | LaunchStats + Occupancy |
 | 40-60 | 40-60 | **Balanced** | Profile deeper with detailed sections |
+| >60 | >60 | **Near hardware limits** | ComputeWorkloadAnalysis + MemoryWorkloadAnalysis |
 
 Additional signals:
 - Duration <10us with many launches: **Launch-overhead bound** (use nsys first)

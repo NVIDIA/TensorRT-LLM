@@ -1,0 +1,188 @@
+# Module registry — the primary index of both cookbooks.
+#
+# `module:` in a case's frontmatter MUST be one of these ids, and MUST equal
+# the case file's parent directory name: references/<module>/<slug>.md.
+#
+# This file is IDENTICAL in perf-regression-cookbook and
+# perf-instability-cookbook. Both use all 18 ids, so "show me everything
+# that ever went wrong in the KV-cache manager" is one query across both
+# corpora. A module with no cases in one cookbook is still a valid id there.
+#
+# WHICH MODULE DOES A CASE GO IN?
+#   Use the module the FIX landed in, not the one that showed the symptom.
+#   A missing FMHA warmup grid is fixed by editing the warmup enumeration
+#   -> jit-and-warmup. A slow FMHA dispatcher is fixed in the dispatcher
+#   -> attention-fmha. Both are "an attention problem" to the reporter; only
+#   one of them is a place a future fix would be written.
+#   The mechanism axis is not lost: `family:` keeps the coarse how-it-broke
+#   label, `regression_class:` / `instability_class:` the precise one, and
+#   `patterns:` the cross-module recurrences.
+#
+# CROSS-CUTTING QUERIES
+#   `module:` is single-valued, so it cannot answer "every case that touched
+#   attention code". `subsystems:` (1–3 terms, multi-valued) can:
+#     grep -l 'attention-kernel' references/*/*.md
+#   The `subsystems:` key on each module below lists the terms actually
+#   observed on that module's cases — a hint for filing, not a constraint.
+#
+# `summary_ids:` maps onto the coarser module ids used by the NVBug/PR corpus
+# summary these cookbooks were mined from. The mapping is many-to-one in both
+# directions and is provenance only — nothing validates against it.
+#   - That summary's single `jit_warmup_inference` bucket is split here into
+#     jit-and-warmup (compile/JIT cost landing at runtime) and
+#     cuda-graph-and-compile (capture coverage, graph gating, torch.compile),
+#     because the fixes live in different code and recur independently.
+#   - Its `gpu_kernel` ("generic kernels") and `unknown` buckets are not
+#     modules: every case in them resolved to a real code owner here.
+
+modules:
+  - id: attention-fmha
+    display: Attention & FMHA
+    what: >
+      Attention kernels and their dispatch: FMHA / trtllm-gen attention, MLA,
+      DSA sparse attention and its indexer, and the host-side code that picks
+      a kernel or lays out its inputs.
+    summary_ids: [attention_fmha]
+    subsystems: [attention-kernel, fmha-kernel, mla-attention, dsa-attention]
+
+  - id: kernel-fusion
+    display: Kernel fusion
+    what: >
+      Fusion patterns and the passes/graph shapes that must match for them to
+      fire — fused ops in model definitions, epilogue/bias fusion, and the
+      gating that silently unfuses them.
+    summary_ids: [kernel_fusion]
+    subsystems: [model-definition, gemm-kernel, attention-kernel]
+
+  - id: jit-and-warmup
+    display: JIT & warmup
+    what: >
+      Warmup enumeration and JIT/compile caches — which shapes, dtypes, modes
+      and ranks get compiled before serving starts. A defect here shows up as
+      compile or autotune cost landing on a live request.
+    summary_ids: [jit_warmup_inference]
+    subsystems: [runtime-python, model-engine, autotuner, attention-kernel]
+
+  - id: cuda-graph-and-compile
+    display: CUDA graph & compile
+    what: >
+      CUDA-graph capture and replay coverage, batch-size buckets, the gates
+      that fall back to eager, piecewise graphs, and torch.compile regions.
+    summary_ids: [jit_warmup_inference]
+    subsystems: [cuda-graph, runtime-python]
+
+  - id: moe
+    display: MoE
+    what: >
+      Mixture-of-experts: routing, grouped/router GEMMs, expert dispatch and
+      combine, the all-to-all backends (DeepEP, MNNVL a2a) and their gating.
+    summary_ids: [moe]
+    subsystems: [moe, gemm-kernel, communication]
+
+  - id: gemm-and-quantization
+    display: GEMM & quantization
+    what: >
+      Dense GEMM paths and quantized linear layers — FP8/FP4 quantize and
+      dequantize, scale handling, DeepGEMM/CUTLASS wrappers.
+    summary_ids: [gemm_quantization]
+    subsystems: [gemm-kernel, runtime-python]
+
+  - id: autotuner
+    display: Autotuner
+    what: >
+      The tactic/tunable-runner machinery: what gets tuned, cache keys, when
+      tuning runs, and how a tuned choice is dispatched at runtime.
+    summary_ids: [autotuner]
+    subsystems: [autotuner]
+
+  - id: communication
+    display: Communication
+    what: >
+      Collectives and their strategy selection — AllReduce/AllGather kernels,
+      NCCL (incl. symmetric memory), MNNVL, user buffers, and the fallback
+      paths when a fast transport is unavailable.
+    summary_ids: [communication]
+    subsystems: [communication, runtime-cpp]
+
+  - id: kv-cache-manager
+    display: KV-cache manager
+    what: >
+      Block pool and reuse accounting: capacity/size estimation, token
+      budgets, per-layer and per-dtype cache sizing, recurrent/SSM state.
+    summary_ids: [kv_cache_manager]
+    subsystems: [kv-cache, runtime-cpp]
+
+  - id: kv-cache-transceiver
+    display: KV-cache transceiver
+    what: >
+      Moving cache between context and generation instances — the transceiver
+      itself, NIXL/UCX transfer, and the negotiation/quorum around it.
+    summary_ids: [kv_cache_transfer]
+    subsystems: [kv-cache, communication, disagg-serve]
+
+  - id: disagg-orchestrator
+    display: Disagg orchestrator
+    what: >
+      The disaggregated-serving front end: request routing between ctx and
+      gen servers, admission/throttling, and the orchestrator process itself.
+    summary_ids: [disagg]
+    subsystems: [disagg-serve, scheduler-executor, serve-endpoint]
+
+  - id: scheduler-and-executor
+    display: Scheduler & executor
+    what: >
+      The PyExecutor loop: admission and batching decisions, overlap
+      scheduling, per-request bookkeeping, and the model-engine step.
+    summary_ids: [scheduler]
+    subsystems: [scheduler-executor, model-engine, runtime-python]
+
+  - id: sampler
+    display: Sampler
+    what: >
+      Token selection and its host handoff — TorchSampler, beam search,
+      logprobs, stop-word handling, and the D2H copies they imply.
+    summary_ids: [sampler]
+    subsystems: [sampler]
+
+  - id: spec-decode
+    display: Speculative decoding
+    what: >
+      Draft/target speculation — MTP, EAGLE, draft models, acceptance
+      accounting and the token-to-request bookkeeping around it.
+    summary_ids: [speculative_decoding]
+    subsystems: [spec-decode]
+
+  - id: tokenization
+    display: Tokenization & detokenization
+    what: >
+      Input processing and detokenization on the request path, including
+      per-model tokenizer fast/slow paths.
+    summary_ids: [tokenization]
+    subsystems: [tokenizer]
+
+  - id: model-definition
+    display: Model definition
+    what: >
+      Per-model Python modeling code — layer wiring, weight loading and
+      restore, backend/dtype gates inside a model, vision towers.
+    summary_ids: []
+    subsystems: [model-definition]
+
+  - id: runtime-and-serving
+    display: Runtime & serving
+    what: >
+      Everything between the request and the model that is not the scheduler:
+      trtllm-serve endpoints and media I/O, LLM-API plumbing, buffer pools,
+      custom-op dispatch, device/platform capability detection.
+    summary_ids: []
+    subsystems: [runtime-python, serve-endpoint, runtime-cpp]
+
+  - id: measurement-and-test
+    display: Measurement & test
+    what: >
+      The measurement apparatus, not the product: perf-sanity/perf test
+      configs, the benchmark driver and its parsers, unit-test infra, and
+      container/dependency conditions that only affect a measured run. A case
+      lands here when the number moved but the product did not.
+    summary_ids: [measurement-test, infra-chore]
+    subsystems: [perf-test-config, perf-test-harness, unit-test-infra]

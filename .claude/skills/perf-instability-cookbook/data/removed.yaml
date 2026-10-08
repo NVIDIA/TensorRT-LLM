@@ -1,0 +1,273 @@
+# Refuted / withdrawn cases — the "do not re-add" registry.
+#
+# WHY THIS FILE EXISTS, and why these entries are NOT in pending.yaml:
+# pending.yaml is a promote-or-drop worklist for cases whose nature is
+# *unconfirmed* ("promote once confirmed; drop if refuted"). The entries below
+# were confirmed and REFUTED — they had full case files and were removed on
+# evidence. Filing a refuted case as "pending" invites the next sweep to
+# re-promote it. A bare `git rm` is the other failure mode: the next sweep
+# re-encounters the same PR, sees a warmup/collective/determinism diff, and
+# re-derives the case to reach the same no.
+#
+# READ THIS FIRST IF YOU ARE SIZING THIS COOKBOOK'S RELIABILITY:
+# 13 of the original 26 cases are listed here. That is not a sloppy first
+# draft — it is what a commit-catalog sweep does. Selecting PRs by the paths
+# they touch (warmup, collectives, determinism) selects for mechanisms that
+# COULD destabilize a metric; roughly half of them turn out to have no varying
+# metric anywhere in the underlying bug. Four distinct decoys recur, and all
+# four look "flaky": a spurious warning, a segfault/hang, a wrong output, and a
+# deterministic first-use compile cost. None is a perf instability.
+#
+# `file:` PATHS ARE AS-OF REMOVAL AND ARE NOT MAINTAINED. On 2026-08-13
+# `references/` was reorganized from four mechanism families
+# (warmup-and-jit, communication-negotiation, runtime-determinism,
+# measurement-determinism) into module directories, so most paths below name a
+# directory that no longer exists. That is deliberate: the field records where
+# the case WAS when it was removed, which is what makes it findable in
+# `git log`. Grep this file by nvbug id / PR number, never by path.
+# Fields: id, file (path as it was), removed_on, reason (not-a-perf-bug |
+# not-instability | moved-to-regression-cookbook), nvbugs, severity (verified
+# against each bug record — the discriminator), evidence, mechanism_kept_at,
+# readd_if.
+#
+# Severities were re-verified per id against NVBugs on 2026-08-12 rather than
+# copied from the removing commit's notes. That check caught a bad citation
+# already in the tree — see case-general-warmup-memory-pool below — so
+# re-verify rather than trust this column if you are acting on it.
+
+removed:
+  # ---- Not perf bugs at all (7 cases) --------------------------------------
+
+  - id: case-warmup-more-accurate-launch-params
+    file: references/warmup-and-jit/warmup-more-accurate-launch-params.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5955765"]
+    severity: functional
+    evidence: reported as a functional defect, not a varying metric.
+    mechanism_kept_at: warmup-and-jit/index.md
+    readd_if: a performance bug shows warmup launch-param inaccuracy moving a
+      metric run to run.
+
+  - id: case-trtllmgen-fmha-densify-grid
+    file: references/warmup-and-jit/trtllmgen-fmha-densify-grid.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6248837"]
+    severity: functional
+    evidence: >
+      L0 post-merge accuracy test failure
+      (accuracy/test_llm_api_pytorch.py). NOTE the name was reused: a NEW
+      regression case `case-trtllmgen-fmha-densify-grid` now exists in the
+      regression cookbook, built on DIFFERENT bug ids (6293823 + 6315845,
+      PR #15305, failed #15279 + #15472). Same slug, different provenance —
+      do not treat that case's existence as evidence this removal was undone.
+    mechanism_kept_at: perf-regression-cookbook
+      references/kernel-and-fusion/trtllmgen-fmha-densify-grid.md
+    readd_if: never on 6248837.
+
+  - id: case-mla-cached-kv-maybe-compiled-cat-warmup
+    file: references/warmup-and-jit/mla-cached-kv-maybe-compiled-cat-warmup.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6191524"]
+    severity: functional
+    evidence: functional defect. Note its sibling
+      case-mla-chunked-prefill-maybe-compiled-cat-warmup (bug 5823212) was
+      MOVED to the regression cookbook rather than removed — same code path,
+      different bug, opposite outcome. Check the bug id, not the file name.
+    mechanism_kept_at: perf-regression-cookbook
+      references/kernel-and-fusion/mla-chunked-prefill-maybe-compiled-cat-warmup.md
+    readd_if: never on 6191524.
+
+  - id: case-general-warmup-memory-pool
+    file: references/warmup-and-jit/general-warmup-memory-pool.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5820734"]
+    commits: ["2ee7dbae9d36"]
+    success_prs: [10340]
+    severity: functional
+    evidence: >
+      5820734 is an L0 post-merge accuracy failure
+      (accuracy/test_llm_api_pytorch.py, main + release/1.2). CITATION
+      CORRECTION: the removing pass cited nvbug 6108808 in
+      warmup-and-jit/index.md, but 6108808 is an unrelated, non-TensorRT-LLM
+      bug. The removal conclusion stands on 5820734; the id was wrong and was
+      corrected in the index on 2026-08-12.
+      Treat this as the standing warning about severity-audit passes: an id
+      typed from memory can point at a real bug in another product and still
+      read as evidence.
+    mechanism_kept_at: warmup-and-jit/index.md ("warmup coverage hole" bullet)
+    readd_if: a performance bug shows the memory-pool warmup gap varying a
+      metric.
+
+  - id: case-warmup-token-cap-protect-autotuner
+    file: references/warmup-and-jit/warmup-token-cap-protect-autotuner.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5805494"]
+    commits: ["8a11da8bff90"]
+    success_prs: [13758]
+    severity: functional
+    evidence: >
+      An illegal memory access (IMA) running the R1-0528 FP8 model on GB200
+      with the TRTLLM MoE backend: an int32 overflow at the 16384-token warmup
+      shape, i.e. a crash, with no metric varying. The OTHER end of the same
+      tradeoff IS a live case: the revert that removed the cap after it cost
+      >10% disagg throughput is
+      perf-regression-cookbook/.../warmup-token-cap-revert.md (nvbug 6185713,
+      a performance bug). Note also that the real fix has since landed
+      upstream — PR #15887 removed the overflow at source — so the tradeoff
+      this pair documented no longer exists on main.
+    mechanism_kept_at: data/patterns.yaml RETIRED block for
+      pattern-warmup-sizing-tradeoff, plus warmup-and-jit/index.md
+    readd_if: a performance bug is filed on the cap side.
+
+  - id: case-nccl-library-load-stability
+    file: references/communication-negotiation/nccl-library-load-stability.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5923949", "5803120"]
+    commits: ["b79f4c7700e1"]
+    success_prs: [12015]
+    severity: functional (both ids)
+    evidence: >
+      5923949 is a DeepSeek R1 NVFP4 segfault with
+      `enable_attention_dp: false`, and 5803120 a GitHub installation issue
+      (#10548). Deterministic failures with no varying metric.
+    mechanism_kept_at: data/patterns.yaml (the NCCL-negotiation pattern notes)
+    readd_if: a performance bug shows library-load negotiation varying a
+      metric.
+
+  - id: case-single-process-mode-env-cache
+    file: references/measurement-determinism/single-process-mode-env-cache.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5680911", "5698292", "5710045"]
+    commits: ["27feb0c6c267"]
+    success_prs: [10730]
+    severity: functional (all ids, incl. 5758449 named in prose)
+    evidence: >
+      All are L0 pre-merge unit-test failures in
+      unittest/_torch/speculative/*; the observable was tests silently
+      no-op'ing, with no perf metric anywhere. The removing pass named a fourth
+      id, 5758449 — also functional, also a speculative unit test — which
+      was in the case prose but not its `nvbugs:` frontmatter.
+    mechanism_kept_at: data/patterns.yaml RETIRED block for
+      pattern-process-lifetime-cache-binds-env, plus
+      measurement-determinism/index.md. The trap (os.environ read inside a
+      @cache-decorated body binds the first caller's env) is real and worth
+      knowing.
+    readd_if: a performance bug is filed behind it.
+
+  # ---- Not an instability, no bug needed to see it (3 cases) ---------------
+
+  - id: case-nccl-symmetric-fallback-long-context
+    file: references/communication-negotiation/nccl-symmetric-fallback-long-context.md
+    removed_on: 2026-08-12
+    reason: not-instability
+    nvbugs: ["5930934"]
+    commits: ["cb231c5b0851"]
+    success_prs: [11870]
+    severity: crash
+    evidence: >
+      A hang at 128k ISL with nvidia/DeepSeek-V3.1-NVFP4 — not a varying
+      metric. (communication-negotiation/index.md attributes this
+      correctly to 5930934 and the sibling segfault to 5923949 / 5803120;
+      verified 2026-08-12.)
+    mechanism_kept_at: data/patterns.yaml (symmetric-memory fallback notes)
+    readd_if: a performance bug shows the long-context symmetric fallback
+      varying a metric.
+
+  - id: case-visual-gen-warmup-cache-key
+    file: references/warmup-and-jit/visual-gen-warmup-cache-key.md
+    removed_on: 2026-08-12
+    reason: not-instability
+    nvbugs: ["6015329"]
+    commits: ["9cc758419adb"]
+    success_prs: [12516]
+    severity: functional
+    evidence: >
+      The observable was a spurious "not warmed up" WARNING on an image-only
+      FLUX pipeline whose cache key included num_frames; the recompile was only
+      ever *potential* and no measured metric moved. A false warning is not a
+      perf-instability precedent.
+    mechanism_kept_at: data/patterns.yaml RETIRED block for
+      pattern-warmup-cache-key-too-strict — the mechanism (a cache key must
+      contain only axes the compiled artifact actually depends on) is worth
+      knowing.
+    readd_if: a measured recompile, not a warning, is demonstrated.
+
+  - id: case-beam-search-logprobs-nondeterminism
+    file: references/runtime-determinism/beam-search-logprobs-nondeterminism.md
+    removed_on: 2026-08-12
+    reason: not-instability
+    nvbugs: []
+    commits: ["130ae826d025"]
+    success_prs: [15125]
+    severity: n/a — no bug id; judged on the PR
+    evidence: >
+      An *output*-correctness defect: a kernel derived nMaxBatchSize from an
+      outputIdsPtr sliced to the ACTIVE batch, so it read the wrong slot and
+      returned wrong log_probs, varying with batch drain order. No perf metric
+      varies anywhere in it — and it had been filed under
+      pattern-metric-with-hidden-rng despite containing no RNG, which is how a
+      "varies run to run" phrase alone can smuggle a correctness bug into a
+      perf cookbook. Excluded on the same rule as pending.yaml's
+      #14841 / #14509 / #14652.
+    mechanism_kept_at: >
+      data/patterns.yaml RETIRED block for pattern-active-vs-max-batch-stride —
+      a real and nasty class: look for getDimension<0>() on tensors that are
+      ever sliced, and pin every kernel-launch extent to the ALLOCATION
+      dimension.
+    readd_if: never as instability; it is a correctness precedent.
+
+  # ---- Moved to the regression cookbook (3 cases) --------------------------
+  # These were not refuted — they were in the wrong cookbook. The shared error
+  # was treating "presents as a spike in a trace" as instability. A cost paid
+  # once per process moves the MEAN, not the spread.
+
+  - id: case-warmup-token-cap-revert
+    file: references/warmup-and-jit/warmup-token-cap-revert.md
+    removed_on: 2026-08-12
+    reason: moved-to-regression-cookbook
+    nvbugs: ["6185713"]
+    severity: performance
+    evidence: a >10% disagg output-token-throughput drop (88.51 -> 75.61) that
+      stayed down — a step function in the mean.
+    mechanism_kept_at: perf-regression-cookbook
+      references/kernel-and-fusion/warmup-token-cap-revert.md
+    readd_if: never — it lives in the regression cookbook.
+
+  - id: case-trtllmgen-fmha-jit-warmup
+    file: references/warmup-and-jit/trtllmgen-fmha-jit-warmup.md
+    removed_on: 2026-08-12
+    reason: moved-to-regression-cookbook
+    nvbugs: ["6185446"]
+    severity: performance
+    evidence: a JIT stall that fires on every cold start is deterministic; it
+      merely presents as variance.
+    mechanism_kept_at: perf-regression-cookbook
+      references/kernel-and-fusion/trtllmgen-fmha-jit-warmup.md
+    readd_if: never — it lives in the regression cookbook.
+
+  - id: case-mla-chunked-prefill-maybe-compiled-cat-warmup
+    file: references/warmup-and-jit/mla-chunked-prefill-maybe-compiled-cat-warmup.md
+    removed_on: 2026-08-12
+    reason: moved-to-regression-cookbook
+    nvbugs: ["5823212"]
+    commits: ["85dc52acae7c", "6c542e98216d"]
+    success_prs: [11743, 11744]
+    severity: performance
+    evidence: >
+      A bisected release/1.2 regression on the DeepSeek R1/V3 models, +9-27%
+      gpu_time across five GPU types. The clearest example of the
+      first-use-recompile trap: a torch.compile paid once per process on a
+      branch (chunked prefill) the warmup never enters. Also carries a
+      branch-pair provenance hazard: the fix is #11743 on main and #11744 on
+      release/1.2, and it was #11744 that closed the bug — so bug->PR and
+      PR->bug lookups return different numbers.
+    mechanism_kept_at: perf-regression-cookbook
+      references/kernel-and-fusion/mla-chunked-prefill-maybe-compiled-cat-warmup.md
+    readd_if: never — it lives in the regression cookbook.
