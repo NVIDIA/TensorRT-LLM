@@ -136,6 +136,26 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
     return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
 
 
+def uses_full_generation_page_table(
+    disable_overlap_scheduler: bool,
+    spec_config: DecodingBaseConfig | None,
+    attn_metadata,
+) -> bool:
+    """Return whether overlap decode needs every reserved generation page.
+
+    ``attn_metadata`` may be an ``AttentionMetadata`` instance or its class:
+    only the presence of the correction hook is read, so the executor creator
+    can evaluate this before any metadata exists.
+    """
+    # FlashInfer metadata owns the optional device-side KV-length correction used with this
+    # wider page table.
+    return (
+        not disable_overlap_scheduler
+        and getattr(spec_config, "_use_shared_kv_cache", False)
+        and hasattr(attn_metadata, "apply_spec_decode_kv_lens_offsets")
+    )
+
+
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
     is_multimodal_decode_compatible: Callable[[LlmRequest], bool] | None = None,
@@ -2679,12 +2699,8 @@ class DecoderRunner(ScheduledModelRunner):
         self, spec_config: DecodingBaseConfig | None, attn_metadata: AttentionMetadata
     ) -> bool:
         """Return whether overlap decode needs every reserved generation page."""
-        # FlashInfer metadata owns the optional device-side KV-length correction used with this
-        # wider page table.
-        return (
-            not self._config.disable_overlap_scheduler
-            and getattr(spec_config, "_use_shared_kv_cache", False)
-            and hasattr(attn_metadata, "apply_spec_decode_kv_lens_offsets")
+        return uses_full_generation_page_table(
+            self._config.disable_overlap_scheduler, spec_config, attn_metadata
         )
 
     def _preprocess_inputs(
