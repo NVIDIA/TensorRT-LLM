@@ -1217,7 +1217,6 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
                                         if path)
     env.pop("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", None)
     env["TRTLLM_NIXL_NUM_THREADS"] = "1"
-    worker_env = {"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY": "1"}
     run_disaggregated_test(
         disaggregated_example_root,
         "mamba_bs1_concurrency2",
@@ -1226,8 +1225,6 @@ def test_disaggregated_mamba_bs1_concurrency2(disaggregated_example_root,
         model_path=model_path,
         cwd=llm_venv.get_working_directory(),
         post_client_test=_verify_mamba_bs1_concurrency2,
-        ctx_env=worker_env,
-        gen_env=worker_env,
         share_gpu=True,
         server_start_timeout=600,
     )
