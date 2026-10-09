@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -17,11 +17,76 @@ add_gtest(cudaProfilerUtilsTest cudaProfilerUtilsTest.cpp)
 add_gtest(cudaUtilsTest cudaUtilsTest.cpp)
 add_gtest(attentionWorkspaceTest attentionWorkspaceTest.cpp)
 add_gtest(memoryUtilsTest memoryUtilsTest.cu)
-add_gtest(optionalRefTest optionalRefTest.cpp)
-add_gtest(quantizationTest quantizationTest.cpp)
-add_gtest(stlUtilsTest stlUtilsTest.cpp)
-add_gtest(stringUtilsTest stringUtilsTest.cpp)
-add_gtest(timestampUtilsTest timestampUtilsTest.cpp)
-add_gtest(tllmExceptionTest tllmExceptionTest.cpp)
+add_tllm_gtest(
+  optionalRefTest
+  OWNER
+  common
+  SOURCES
+  optionalRefTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
+  quantizationTest
+  OWNER
+  common
+  SOURCES
+  quantizationTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
+  stlUtilsTest
+  OWNER
+  common
+  SOURCES
+  stlUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
+  stringUtilsTest
+  OWNER
+  common
+  SOURCES
+  stringUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_error
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
+  timestampUtilsTest
+  OWNER
+  common
+  SOURCES
+  timestampUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  Threads::Threads
+  LABELS
+  "unit;common;host")
+add_tllm_gtest(
+  tllmExceptionTest
+  OWNER
+  common
+  SOURCES
+  tllmExceptionTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  LABELS
+  "unit;common;host")
 add_gtest(cudaDriverWrapperTest cudaDriverWrapperTest.cpp)
-add_gtest(loggerTest loggerTest.cpp)
+add_tllm_gtest(
+  loggerTest
+  OWNER
+  common
+  SOURCES
+  loggerTest.cpp
+  LINK_LIBRARIES
+  tllm::common_logging
+  Threads::Threads
+  LABELS
+  "unit;common;host")
