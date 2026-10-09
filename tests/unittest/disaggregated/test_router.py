@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import copy
+import os
 import random
 import threading
 from pathlib import Path
@@ -14,6 +15,7 @@ import aiohttp
 import msgpack
 import numpy as np
 import pytest
+from utils.llm_data import llm_datasets_root
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
@@ -2594,8 +2596,13 @@ def _message(role: str, content: str) -> dict[str, str]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_harmony", [False, True])
 async def test_kv_cache_aware_router_routes_responses_turns(
-        servers, use_harmony):
+        servers, use_harmony, monkeypatch):
     """A later turn of a Responses conversation follows its cached prefix."""
+    if use_harmony:
+        # Load the Harmony vocab from the datasets root instead of downloading it.
+        cache_dir = os.path.join(llm_datasets_root(), "tiktoken_vocab")
+        monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", cache_dir)
+        monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", cache_dir)
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=4,
