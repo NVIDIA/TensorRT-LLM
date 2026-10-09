@@ -470,7 +470,7 @@ Main APIs / references:
 
 - `communication/base.py`: `Communication`, `is_platform_supported`,
   `is_workload_feasible`, `supports_post_quant_dispatch`, `prepare_dispatch`,
-  `dispatch`, `combine`.
+  `dispatch`, `combine`, `checkpoint_blocked_reason`.
 - `communication/communication_factory.py`: strategy selection.
 - Existing strategies: `nvlink_one_sided.py`, `nvlink_two_sided.py`, `deep_ep.py`,
   `allgather_reducescatter.py`.
@@ -483,6 +483,9 @@ Checklist:
   before dispatch.
 - `dispatch()` and `combine()` maintain enough internal state for the pair to be
   correct.
+- `checkpoint_blocked_reason()` returns `None` by default, meaning the strategy
+  can be checkpointed. Override it when a configuration blocks checkpointing;
+  `PyExecutor.__init__` uses it to reject `sleep_config` before the engine serves.
 - EPLB statistics gathered by the communication strategy are fed back to the
   load balancer through the forward-execution path.
 - Add/update `test_moe_comm.py` or module-level tests when changing strategy
