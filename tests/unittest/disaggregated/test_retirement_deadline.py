@@ -13,7 +13,6 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
-from tensorrt_llm._torch.disaggregation.native.bounce import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -350,7 +349,6 @@ def _receiver(watchdog: RetirementWatchdog) -> transfer_mod.Receiver:
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     return receiver
 
 
@@ -501,7 +499,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     if final_piece == "receive_kv":
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -526,7 +523,6 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
             task = session.send_aux()
         sender = session._sender
         sender._instance_rank = sender._device_id = 0
-        sender._bounce = NoBounceTransport()
         sender._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
         )
@@ -612,7 +608,6 @@ def test_finished_nonfinal_piece_does_not_complete_session(direction: str, block
         _submit_piece(session, session.kv_tasks[0])
     else:
         receiver = _receiver(watchdog)
-        receiver._bounce = NoBounceTransport()
         receiver._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
         )
@@ -687,7 +682,6 @@ def test_expired_second_receive_preserves_existing_claims(need_aux: bool) -> Non
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -727,7 +721,6 @@ def _settled_rx_session(
 ) -> tuple[transfer_mod.RxSession, transfer_mod.KVRecvTask, Mock]:
     """Settle real KV and AUX result handlers before the executor closes the session."""
     receiver = _receiver(watchdog)
-    receiver._bounce = NoBounceTransport()
     receiver._registrar = SimpleNamespace(
         self_rank_info=SimpleNamespace(instance_name="receiver", instance_rank=0)
     )
@@ -917,9 +910,9 @@ def test_receive_reserves_kv_and_aux_atomically_against_cancellation(
     assert published == {7}
     assert session.status is SessionStatus.CANCELLED
     assert not session.resources_drained()
-    task.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
     assert not session.resources_drained()
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert session.close()
     watchdog.stop()
 
@@ -1013,7 +1006,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     worker._receiver = receiver
     worker._agent = Mock()
     worker._registered_mem = [object()]
-    worker._bounce = Mock()
     if trigger == "cancel":
         session.cancel_local()
     elif trigger == "failure":
@@ -1029,8 +1021,8 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
     clock.return_value = 20.0 if trigger == "timeout" else 15.0
     watchdog.progress()
     assert watchdog.fatal is not None
-    task.record_writer_result(7, False, wait_for_local_completion=False)
-    session._aux_physical_owner.record_writer_result(7, False, wait_for_local_completion=False)
+    task.record_writer_result(7, False)
+    session._aux_physical_owner.record_writer_result(7, False)
     assert not session.resources_drained()
     assert not session.close()
     assert receiver._sessions[4] is session
@@ -1038,7 +1030,6 @@ def test_receiver_deadline_retains_kv_aux_and_registration(trigger: str) -> None
         worker.shutdown()
     worker._agent.deregister_memory.assert_not_called()
     worker._agent.shutdown.assert_not_called()
-    worker._bounce.close.assert_not_called()
     assert len(worker._registered_mem) == 1
     with pytest.raises(RuntimeError, match="admission is closed"):
         _rx_session(receiver)
@@ -1169,7 +1160,7 @@ def test_receiver_timeout_during_blocking_wait_cannot_report_delivery() -> None:
         """Inject late backend evidence at the external wait boundary."""
         assert timeout == 5.0
         clock.return_value = 15.0
-        task.record_writer_result(7, True, wait_for_local_completion=False)
+        task.record_writer_result(7, True)
         task.complete()
         return True
 

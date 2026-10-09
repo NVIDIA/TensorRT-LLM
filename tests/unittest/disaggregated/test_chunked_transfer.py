@@ -325,7 +325,6 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
     """The receiver resolves the task using its own slice id."""
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 1
-    session._receiver._bounce.is_bounced.return_value = False
 
     session.process_kv_agent_result(
         peer_rank=0,

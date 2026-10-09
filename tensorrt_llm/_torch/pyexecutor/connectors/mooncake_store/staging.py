@@ -24,9 +24,9 @@ A slot holds the page's regions concatenated in region order, which is the same
 payload a registered pool would produce, so a pool written by one path is
 readable by the other.
 
-Copies go through `cudaMemcpyAsync` rather than the batched Triton kernel in
-`disaggregation/native/bounce/gather_scatter.py`, since one side here is host
-memory and the copy engines move that over the host link by DMA.
+Copies go through `cudaMemcpyAsync` rather than a batched device gather kernel,
+since one side here is host memory and the copy engines move that over the host
+link by DMA.
 """
 
 from typing import List, Optional, Sequence, Tuple

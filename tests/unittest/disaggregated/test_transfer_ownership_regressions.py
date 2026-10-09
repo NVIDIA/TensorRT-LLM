@@ -30,7 +30,6 @@ import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
-from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -54,123 +53,6 @@ def _sole_piece(block_ids_per_layer_groups=None, *, tokens=0, is_last=True) -> C
         token_range=TokenRange(start=0, end=tokens),
         is_last=is_last,
     )
-
-
-class _BounceProbe:
-    """No-bounce probe that records physical-owner cleanup decisions."""
-
-    def __init__(self) -> None:
-        self.failed_writers: list[tuple[tuple[int, int], int]] = []
-        self.orphaned: list[tuple[int, int]] = []
-
-    def record_failure(self, rid_slice: tuple[int, int], peer_rank: int) -> None:
-        self.failed_writers.append((rid_slice, peer_rank))
-
-    def reserve(self, _receiver_req, _num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
-        return False
-
-    def release_idle_reservation(self, _rid_slice: tuple[int, int]) -> None:
-        return
-
-    def orphan_reservation(self, rid_slice: tuple[int, int]) -> None:
-        self.orphaned.append(rid_slice)
-
-    def abort_publication(
-        self,
-        _rid_slice: tuple[int, int],
-        _published_writers: set[int],
-    ) -> None:
-        return
-
-    def is_bounced(self, _rid_slice: tuple[int, int]) -> bool:
-        return False
-
-
-class _LateReservationBounce(_BounceProbe):
-    """Track a reservation created after cancellation already ran cleanup."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.active_reservations: set[tuple[int, int]] = set()
-
-    def release_idle_reservation(self, rid_slice: tuple[int, int]) -> None:
-        self.active_reservations.discard(rid_slice)
-
-
-class _PartialFanInBounce(_BounceProbe):
-    """CPU model of one bounced fan-in reservation."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.context: TransferContext | None = None
-        self.release_count = 0
-        self.scatter_count = 0
-
-    def reserve(self, receiver_req, num_writers: int, *, extra_bytes: int = 0) -> bool:
-        del extra_bytes
-        self.context = TransferContext(
-            rid_slice=(receiver_req.unique_rid, receiver_req.slice_id),
-            slot_id=0,
-            base_addr=0x1000,
-            per_writer_bytes=0x100,
-            num_writers=num_writers,
-        )
-        return True
-
-    def writer_base(self, rid_slice: tuple[int, int], writer_index: int) -> int | None:
-        if self.context is None or self.context.rid_slice != rid_slice:
-            return None
-        return self.context.writer_base(writer_index)
-
-    def is_bounced(self, rid_slice: tuple[int, int]) -> bool:
-        return self.context is not None and self.context.rid_slice == rid_slice
-
-    def _advance(self) -> None:
-        if self.context is None:
-            return
-        if self.context.ready_to_scatter():
-            self.scatter_count += 1
-            self.context.begin_scatter()
-            self.context.finish_scatter(True)
-        if not self.context.ready_to_settle():
-            return
-        settlement = self.context.settle()
-        self.context = None
-        assert settlement is not None
-        self.release_count += 1
-        if settlement.on_done is not None:
-            settlement.on_done(settlement.success)
-
-    def abort_publication(
-        self,
-        rid_slice: tuple[int, int],
-        published_writers: set[int],
-    ) -> None:
-        assert self.context is not None and self.context.rid_slice == rid_slice
-        self.context.abort_publication(published_writers)
-        self._advance()
-
-    def record_result(
-        self,
-        rid_slice: tuple[int, int],
-        peer_rank: int,
-        dst_ptrs=None,
-        sizes=None,
-        src_base=None,
-        on_done=None,
-    ) -> None:
-        assert self.context is not None and self.context.rid_slice == rid_slice
-        if on_done is not None:
-            self.context.on_done = on_done
-        self.context.record_writer_result(
-            peer_rank,
-            succeeded=True,
-            src_base=src_base,
-            dst_ptrs=dst_ptrs,
-            sizes=sizes,
-        )
-        self._advance()
 
 
 def _start_checked_thread(
@@ -240,7 +122,6 @@ class _ReceiverProbe:
     """Minimal receiver that publishes one destination to two writers."""
 
     def __init__(self) -> None:
-        self._bounce = _BounceProbe()
         self._enforce_physical_ownership = True
         self._session: RxSession | None = None
         self.clear_count = 0
@@ -295,7 +176,6 @@ def _make_owned_receiver() -> Receiver:
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = _BounceProbe()
     return receiver
 
 
@@ -384,7 +264,6 @@ def test_pre_cancelled_rx_session_never_publishes_destination(
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {rid: True}
-    receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver.dispatch_task = Mock()
@@ -413,7 +292,6 @@ def test_remote_cancel_resolves_strong_owned_session() -> None:
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
-    receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver.send_cancel_to_senders = Mock(return_value=None)
@@ -585,13 +463,11 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
-    receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver_req = SimpleNamespace(
         unique_rid=rid,
         slice_id=0,
-        bounce_dst_base=None,
         to_bytes=Mock(return_value=b"receiver-request"),
     )
     receiver._build_recv_req_info = Mock(return_value=receiver_req)
@@ -601,19 +477,12 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
     }
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(side_effect=lambda _peer, dp_rank: overlaps[dp_rank]),
-        self_extractor=SimpleNamespace(page_table=None),
-        self_rank_info=SimpleNamespace(
-            cp_size=1,
-            instance_name="gen",
-            instance_rank=0,
-        ),
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={rank: f"tcp://sender-{rank}" for rank in range(4)},
-            page_table=None,
             dp_size=2,
-            cp_size=1,
         )
     )
     receiver._request_sender_data = Mock()
@@ -663,18 +532,16 @@ def test_gen_first_no_retry_adp_count_seal_waits_for_one_writer_group() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("writer_settles_before_failure", [False, True])
-def test_partial_bounced_publication_waits_for_queued_writer_success(
+def test_partial_publication_waits_for_queued_writer_success(
     monkeypatch: pytest.MonkeyPatch,
     writer_settles_before_failure: bool,
 ) -> None:
     rid = 86
     queued_endpoints: list[str] = []
-    bounce = _PartialFanInBounce()
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
-    receiver._bounce = bounce
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     # This fixture delivers one result inline from the publication callback.
@@ -686,25 +553,17 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
         unique_rid=rid,
         slice_id=0,
         mamba_state_index=None,
-        bounce_dst_base=None,
-        to_bytes=Mock(side_effect=[b"writer-0", b"writer-1"]),
+        to_bytes=Mock(return_value=b"receiver-request"),
     )
     receiver._build_recv_req_info = Mock(return_value=receiver_req)
-    overlap = SimpleNamespace(
-        ranks=[0, 1],
-        duplicate_head_factor=1,
-        overlap_pp_size=1,
-    )
+    overlap = SimpleNamespace(ranks=[0, 1])
     receiver._registrar = SimpleNamespace(
         get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
-        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0, cp_size=1),
+        self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0),
     )
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0", 1: "tcp://sender-1"},
-            page_table=None,
-            cp_size=1,
             dp_size=1,
         )
     )
@@ -719,9 +578,6 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
                 receiver_slice_id=0,
                 is_last_slice=True,
                 status=AgentResult.SUCCESS,
-                dst_ptrs=np.array([0x2000], dtype=np.int64),
-                sizes=np.array([0x100], dtype=np.int64),
-                src_base=0x1000,
             )
 
     receiver._request_sender_data = request_sender_data
@@ -745,8 +601,6 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
 
     assert queued_endpoints == ["tcp://sender-0"]
     if not writer_settles_before_failure:
-        assert bounce.context is not None
-        assert bounce.release_count == 0
         assert not session.resources_drained()
 
         # Only writer 0's REQUEST_DATA was successfully queued. The destination
@@ -756,18 +610,12 @@ def test_partial_bounced_publication_waits_for_queued_writer_success(
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.SUCCESS,
-            dst_ptrs=np.array([0x2000], dtype=np.int64),
-            sizes=np.array([0x100], dtype=np.int64),
-            src_base=0x1000,
         )
 
     assert session.status == SessionStatus.ERROR
     assert not session.resources_drained()
     session.process_aux_agent_result(0, AgentResult.FAILED)
     assert session.resources_drained()
-    assert bounce.context is None
-    assert bounce.scatter_count == 0
-    assert bounce.release_count == 1
     assert session.close() is True
     assert rid not in receiver._sessions
 
@@ -854,7 +702,6 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     receiver._sessions_lock = threading.Lock()
     receiver._sessions = {}
     receiver._pre_cancelled_rids = {}
-    receiver._bounce = _BounceProbe()
     receiver._enforce_physical_ownership = True
     receiver._shutdown = False
     receiver._dealers = {}
@@ -863,23 +710,16 @@ def test_cancel_after_publication_cannot_overtake_request_data(
             unique_rid=rid,
             slice_id=0,
             mamba_state_index=None,
-            bounce_dst_base=None,
             to_bytes=Mock(return_value=b"receiver-request"),
         )
     )
     overlap = SimpleNamespace(ranks=[0])
-    receiver._registrar = SimpleNamespace(
-        get_peer_overlap=Mock(return_value=overlap),
-        self_extractor=SimpleNamespace(page_table=None),
-        self_rank_info=SimpleNamespace(cp_size=1),
-    )
+    receiver._registrar = SimpleNamespace(get_peer_overlap=Mock(return_value=overlap))
     receiver._get_sender_info = Mock(
         return_value=SimpleNamespace(
             sender_endpoints={0: "tcp://sender-0"},
-            page_table=None,
             tp_size=1,
             pp_size=1,
-            cp_size=1,
             dp_size=1,
             attention=None,
         )
@@ -963,24 +803,18 @@ def test_cancel_after_publication_cannot_overtake_request_data(
 
 
 @pytest.mark.cpu_only
-def test_cancel_before_dispatch_releases_late_idle_reservation() -> None:
+def test_cancel_before_dispatch_closes_unpublished_task() -> None:
     rid = 81
     receiver = _ReceiverProbe()
-    bounce = _LateReservationBounce()
-    receiver._bounce = bounce
     session = _make_rx_session(receiver, rid)
     task = session.prepare_receive(_sole_piece())
     assert task is not None
 
     assert session.cancel_local()
 
-    bounce.active_reservations.add((rid, task.slice_id))
     with pytest.raises(RuntimeError, match="became terminal before publication"):
         session.dispatch_prepared_receive(task)
 
-    assert bounce.active_reservations == set(), (
-        "cancel-before-dispatch left a reservation allocated after cancellation cleanup"
-    )
     assert session.status == SessionStatus.CANCELLED
     assert task.resources_drained
 
@@ -1734,7 +1568,6 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender = _make_owned_sender()
     sender._device_id = 0
     sender._agent = Mock()
-    sender._bounce = Mock()
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
     task = transfer_mod.KVSendTask(
@@ -1778,7 +1611,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True)
     dealer.send.assert_called_once()
     instance_rank, result_rid, result_slice, is_last, status_code, _ = (
-        transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])
+        transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])
     )
     assert (instance_rank, result_rid, result_slice, is_last) == (
         sender._instance_rank,
@@ -1836,7 +1669,7 @@ def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> Non
     results = [sender._send_task_queues[0].get_nowait() for _ in peers]
     assert sender._send_task_queues[0].empty()
     assert {endpoint for endpoint, _ in results} == {"receiver"}
-    assert {transfer_mod._KV_RESULT_PREFIX.unpack(message[1])[2] for _, message in results} == {
+    assert {transfer_mod._KV_RESULT_FRAME.unpack(message[1])[2] for _, message in results} == {
         1,
         2,
     }
@@ -1882,7 +1715,6 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     peer_rank = 2
     sender = _make_owned_sender()
     sender._device_id = 0
-    sender._bounce = Mock()
     wait = Mock(return_value=False)
     detail = "ERROR"
     if failure_mode == "wait_exception":
@@ -1947,7 +1779,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
 
     if meta_type == transfer_mod.WriteMetaType.KV:
         sender._deliver_kv_to_agent(write_meta)
-        status_code = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])[4]
+        status_code = transfer_mod._KV_RESULT_FRAME.unpack(dealer.send.call_args.args[0][1])[4]
         assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.IN_DOUBT
     else:
         sender._deliver_aux_to_agent(write_meta)

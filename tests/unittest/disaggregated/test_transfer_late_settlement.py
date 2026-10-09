@@ -67,7 +67,6 @@ def _sender() -> transfer_mod.Sender:
     sender._device_id = 0
     sender._num_threads = 1
     sender._pending_settlements = [{}]
-    sender._bounce = Mock()
     return sender
 
 
@@ -159,14 +158,14 @@ def test_only_explicit_settlement_closes_ambiguous_writer(count_only: bool) -> N
     owner.seal_writer_cohort(2, None if count_only else {7, 8})
     owner.finish_publication()
     assert owner.record_writer_in_doubt(7)
-    assert owner.record_writer_result(7, False, wait_for_local_completion=False) == (False, False)
+    assert owner.record_writer_result(7, False) == (False, False)
     assert not owner.all_writers_reported
     assert not owner.resources_drained
     assert owner.record_writer_settlement(7)
     assert not owner.resources_drained
     assert not owner.record_writer_settlement(7)
     assert not owner.record_writer_in_doubt(7)
-    owner.record_writer_result(8, False, wait_for_local_completion=False)
+    owner.record_writer_result(8, False)
     assert owner.resources_drained
 
 
@@ -186,7 +185,7 @@ def test_settlement_does_not_clear_contradictory_evidence() -> None:
     owner = _owner({7})
     owner.record_writer_in_doubt(7)
     with pytest.raises(RuntimeError, match="success while in doubt"):
-        owner.record_writer_result(7, True, wait_for_local_completion=True)
+        owner.record_writer_result(7, True)
     assert owner.record_writer_settlement(7)
     assert not owner.resources_drained
 
@@ -198,19 +197,16 @@ def test_abort_publication_cannot_exclude_ambiguous_writer() -> None:
     with pytest.raises(RuntimeError, match="unpublished writer"):
         owner.abort_publication({8})
     assert owner.record_writer_settlement(7)
-    owner.record_writer_result(8, False, wait_for_local_completion=False)
+    owner.record_writer_result(8, False)
     assert not owner.resources_drained
 
 
 @pytest.mark.cpu_only
-def test_settlement_does_not_clear_local_completion_or_publication() -> None:
+def test_settlement_does_not_clear_publication() -> None:
     owner = _owner({7})
-    owner._local_completion_pending = True
     owner._publication_pending = True
     owner.record_writer_in_doubt(7)
     owner.record_writer_settlement(7)
-    assert not owner.resources_drained
-    owner.finish_local_completion()
     assert not owner.resources_drained
     owner.finish_publication()
     assert owner.resources_drained
@@ -292,7 +288,7 @@ def test_sender_late_done_reports_physical_failure_only(
         assert task._transfer_count == 1
         session._claim_aux_terminal_result.assert_called_once_with(7)
     else:
-        decoded = [transfer_mod._KV_RESULT_PREFIX.unpack(message[1]) for message in messages]
+        decoded = [transfer_mod._KV_RESULT_FRAME.unpack(message[1]) for message in messages]
         assert [transfer_mod._AGENT_RESULT_BY_CODE[item[4]] for item in decoded] == [
             transfer_mod.AgentResult.IN_DOUBT,
             transfer_mod.AgentResult.FAILED_QUIESCED,
@@ -311,8 +307,6 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
-    receiver._bounce.is_bounced.return_value = False
     session = transfer_mod.RxSession(request_id=401, params=_params(), receiver=receiver)
     task = session.prepare_receive(_chunk())
     assert task is not None
@@ -341,12 +335,11 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
     assert session.status is SessionStatus.ERROR
     assert session.exception is error
     assert receiver._ownership_poisoned is not None
-    receiver._bounce.record_failure.assert_called_once_with((401, 0), 7)
     assert session.close()
 
 
 @pytest.mark.cpu_only
-def test_settlement_retries_in_order_without_releasing_twice() -> None:
+def test_settlement_retries_in_order() -> None:
     sender = _sender()
     task = transfer_mod.KVSendTask(_chunk(), _params(), slice_id=0)
     status = Mock(is_completed=Mock(return_value=True))
@@ -371,21 +364,19 @@ def test_settlement_retries_in_order_without_releasing_twice() -> None:
     dealer = Mock()
     dealer.send.side_effect = [RuntimeError("initial send"), None, RuntimeError("late send"), None]
     sender._get_result_dealer = Mock(return_value=dealer)
-    sender._retain_in_doubt_transfer(meta, initial, send_slot_id=12)
+    sender._retain_in_doubt_transfer(meta, initial)
     status.is_completed.assert_not_called()
     sender._poll_in_doubt_transfers(0)
     assert task.resources_drained
     assert sender._pending_settlements[0]
-    sender._bounce.release_send.assert_called_once_with(12)
     with pytest.raises(RuntimeError, match="settlement reports are pending"):
         sender.shutdown()
     sender._poll_in_doubt_transfers(0)
     assert not sender._pending_settlements[0]
-    sender._bounce.release_send.assert_called_once_with(12)
     status.is_completed.assert_called_once()
     assert task.transferred_count == 1
     codes = [
-        transfer_mod._KV_RESULT_PREFIX.unpack(call.args[0][1])[4]
+        transfer_mod._KV_RESULT_FRAME.unpack(call.args[0][1])[4]
         for call in dealer.send.call_args_list
     ]
     assert codes == [2, 2, 3, 3]
@@ -418,7 +409,6 @@ def test_committed_session_outcome_survives_late_settlement(
         receiver._enforce_physical_ownership = True
         receiver._ownership_poisoned = None
         receiver._get_ownership_admission_lock.return_value = threading.Lock()
-        receiver._bounce.is_bounced.return_value = False
         session = transfer_mod.RxSession(request_id=401, params=_params(), receiver=receiver)
         task = session.prepare_receive(_chunk())
         assert task is not None
@@ -522,3 +512,32 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     assert status.is_completed.call_count == 2
     assert task.status is transfer_mod.TaskStatus.ERROR
     sender._shutdown = True
+
+
+@pytest.mark.cpu_only
+def test_kv_result_frame_roundtrip() -> None:
+    """The KV_AGENT_RESULT binary frame must round-trip exactly."""
+    for rank, rid, sl, last, status, size in [
+        (7, 6925227277844486, 42, True, transfer_mod.AgentResult.SUCCESS, 4096),
+        (0, 1, 0, False, transfer_mod.AgentResult.FAILED, 0),
+        (31, 2**62, 9999, True, transfer_mod.AgentResult.SUCCESS, 2**40),
+    ]:
+        packed = transfer_mod._KV_RESULT_FRAME.pack(
+            rank, rid, sl, last, transfer_mod._AGENT_RESULT_CODE[status], size
+        )
+        r, i, s, last_out, c, sz = transfer_mod._KV_RESULT_FRAME.unpack(packed)
+        assert (r, i, s, last_out, sz) == (rank, rid, sl, last, size)
+        assert transfer_mod._AGENT_RESULT_BY_CODE[c] is status
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("result_name", ["SUCCESS", "FAILED"])
+def test_make_kv_result_msg_uses_binary_frame(result_name: str) -> None:
+    """Every KV result (success and failure) uses the binary frame so the receiver can decode it."""
+    result = getattr(transfer_mod.AgentResult, result_name)
+    msg = transfer_mod._make_kv_result_msg(3, 12345, 7, True, result, transfer_size=8192)
+    assert msg[0] == transfer_mod.MessageType.KV_AGENT_RESULT
+    assert len(msg) == 2  # type + frame
+    r, rid, sl, last, code, size = transfer_mod._KV_RESULT_FRAME.unpack(msg[1])
+    assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
+    assert transfer_mod._AGENT_RESULT_BY_CODE[code] is result

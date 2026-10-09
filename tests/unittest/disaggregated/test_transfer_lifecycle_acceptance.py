@@ -28,7 +28,6 @@ import pytest
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base import Cancelled, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
-from tensorrt_llm._torch.disaggregation.native.bounce.impl import NoBounceTransport
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm._torch.disaggregation.native.transfer import AgentResult, KVRecvTask, RxSession
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_mod
@@ -133,7 +132,6 @@ class _ReceiveCase:
         self.cleanup_count = 0
         self.receiver = SimpleNamespace(
             _enforce_physical_ownership=ownership,
-            _bounce=NoBounceTransport(),
             _registrar=SimpleNamespace(
                 self_rank_info=SimpleNamespace(instance_name="gen", instance_rank=0)
             ),

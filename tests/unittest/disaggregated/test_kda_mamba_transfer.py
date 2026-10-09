@@ -55,10 +55,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -230,15 +227,6 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
         assert sorted(ll.global_layer_id for ll in mlg.local_layers) == [
             i for i, m in enumerate(_KDA_MASK) if m
         ]
-
-        # Matched-parallelism payload: receiver_payload_bytes must equal
-        # NUM_KDA_LAYERS * (conv + ssm) for matched TP.
-        payload = mamba_receiver_payload_bytes(
-            sender_page_table=pt,
-            receiver_page_table=pt,
-            dst_slot=1,
-        )
-        assert payload == NUM_KDA_LAYERS * (CONV_SLOT_BYTES + SSM_SLOT_BYTES)
     finally:
         mgr.shutdown()
 

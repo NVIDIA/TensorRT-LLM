@@ -403,7 +403,6 @@ def _receive_session(
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     receiver._dealers = {}
     receiver._messenger = Mock()
     receiver._registrar = SimpleNamespace(
@@ -456,23 +455,16 @@ def test_adp_candidate_acks_do_not_replace_selected_writer_or_aux_evidence(
     assert session.close()
 
 
-@pytest.mark.parametrize("unsettled", ["backend", "local_cuda"])
-def test_session_ack_cannot_bypass_existing_unsettled_access(unsettled: str) -> None:
+def test_session_ack_cannot_bypass_existing_unsettled_access() -> None:
     owner = transfer_mod._ReceiveOperationOwner()
     owner.begin_publication()
     owner.seal_writer_cohort(1, published_writers={7, 8})
     owner.finish_publication()
-    if unsettled == "backend":
-        owner.record_writer_in_doubt(7)
-    else:
-        owner.record_writer_result(7, True, wait_for_local_completion=True)
+    owner.record_writer_in_doubt(7)
     owner.record_session_quiesced(7)
     owner.record_session_quiesced(8)
     assert not owner.resources_drained
-    if unsettled == "backend":
-        owner.record_writer_settlement(7)
-    else:
-        owner.finish_local_completion()
+    owner.record_writer_settlement(7)
     assert owner.resources_drained
 
 
