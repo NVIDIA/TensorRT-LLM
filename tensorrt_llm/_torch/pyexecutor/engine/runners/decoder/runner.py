@@ -11,7 +11,7 @@ import math
 import os
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -45,7 +45,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     BaseMambaCacheManager,
     MambaHybridCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
+    get_draft_token_length,
+    get_request_tokens_per_gen_step,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
@@ -70,6 +74,7 @@ from tensorrt_llm._torch.speculative import (
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from tensorrt_llm._torch.speculative.ragged_helpers import ragged_gather_index_lists
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
 from tensorrt_llm._torch.utils import (
@@ -401,6 +406,14 @@ class DecoderRunner(ScheduledModelRunner):
         self.previous_batch_indices_cuda = torch.empty(
             (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
         )
+        self.ragged_verify_lens_cuda = torch.empty(
+            (self._config.max_batch_size + 1,), dtype=torch.int, device="cuda"
+        )
+        self.ragged_qo_indptr_cuda = torch.empty(
+            (self._config.max_batch_size + 2,), dtype=torch.int, device="cuda"
+        )
+        self._pinned_host_cache = {}
+        self._pinned_host_active = {}
         self.input_ids_cuda = torch.empty(
             (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
         )
@@ -428,6 +441,37 @@ class DecoderRunner(ScheduledModelRunner):
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
+        spec_config = self._config.spec_config
+        self._dspark_confidence_enabled = bool(
+            spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
+        )
+        self._dspark_trims_submitted_tokens = self._dspark_confidence_enabled
+        self._dspark_device_windows = bool(
+            self._dspark_trims_submitted_tokens
+            and getattr(spec_config, "enable_fused_confidence_scheduler", False)
+        )
+        self._dspark_sps_cost_table = None
+        self._dspark_exact_candidate_cells = ()
+        self._dspark_exact_identity_words = (0,) * 8
+        table_path = getattr(spec_config, "confidence_sps_table_path", None)
+        if self._dspark_confidence_enabled and table_path:
+            from tensorrt_llm._torch.speculative.dspark_planner import load_runtime_sps_cost_table
+
+            self._dspark_sps_cost_table, _ = load_runtime_sps_cost_table(
+                table_path,
+                graph_batch_sizes=self._config.cuda_graph_batch_sizes,
+                max_draft_len=int(spec_config.max_draft_len),
+                live_engine_fingerprint_path=getattr(
+                    spec_config, "confidence_sps_live_fingerprint_path", None
+                ),
+            )
+            self._dspark_exact_candidate_cells = self._dspark_sps_cost_table.candidate_cells()
+            self._dspark_exact_identity_words = (
+                self._dspark_sps_cost_table.collective_identity_words
+            )
+        self.previous_request_ids = []
+        self.previous_verify_lens = [] if self._dspark_trims_submitted_tokens else None
+        self.has_previous_device_draft = False
         self._eager_workspace_reclaimer: EagerWorkspaceReclaimer | None = None
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
@@ -691,6 +735,8 @@ class DecoderRunner(ScheduledModelRunner):
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
+        self.cuda_graph_runner.secondary_padding_dummy_requests = {}
+        self.cuda_graph_runner.ragged_zero_real_high_rows = 0
 
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
@@ -791,6 +837,8 @@ class DecoderRunner(ScheduledModelRunner):
                 finally:
                     self.cuda_graph_runner.is_warmup_only = False
                 self.cuda_graph_runner.padding_dummy_requests = {}
+                self.cuda_graph_runner.secondary_padding_dummy_requests = {}
+                self.cuda_graph_runner.ragged_zero_real_high_rows = 0
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
@@ -806,6 +854,7 @@ class DecoderRunner(ScheduledModelRunner):
         # creates; build it when every forward above was skipped.
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
+            self._warmup_dspark_ragged_compressor_metadata()
             with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
                 self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
@@ -1852,7 +1901,9 @@ class DecoderRunner(ScheduledModelRunner):
             mapping[graph_bs] = draft_len
         return mapping
 
-    def _get_graphs_to_capture(self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
+    def _get_graphs_to_capture(
+        self, cuda_graph_batch_sizes: list[int]
+    ) -> list[tuple[int, int] | tuple[int, int, int]]:
         """Determine which (batch_size, draft_len) graphs to capture.
 
         Returns:
@@ -1889,6 +1940,33 @@ class DecoderRunner(ScheduledModelRunner):
             logger.info(
                 f"Dynamic draft length enabled for one-model path. "
                 f"Capturing {len(graphs)} graphs: {graphs}"
+            )
+            return graphs
+
+        if self._dspark_confidence_enabled:
+            max_draft_len = int(self._config.spec_config.max_draft_len)
+            native_graphs = [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
+            if not self._dspark_trims_submitted_tokens:
+                return native_graphs
+            from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostTable
+
+            exact_table = self._dspark_sps_cost_table
+            if not isinstance(exact_table, ExactSpsCostTable):
+                raise RuntimeError(
+                    "DSpark confidence graph capture requires an authenticated exact SPS table"
+                )
+            ragged_graphs = [
+                (bs, max_draft_len, verifier_budget)
+                for bs in cuda_graph_batch_sizes
+                for verifier_budget in exact_table.production_candidate_budgets(bs)
+            ]
+            # Full K keeps the ordinary native graph. Compact layouts have
+            # distinct keys; they cannot alias its uniform attention layout.
+            graphs = native_graphs + ragged_graphs
+            logger.info(
+                f"DSpark ragged verification: capturing {len(graphs)} graphs "
+                f"({len(native_graphs)} native static-K{max_draft_len} graphs + "
+                f"{len(ragged_graphs)} exact measured (G,V) cells)."
             )
             return graphs
 
@@ -2030,7 +2108,9 @@ class DecoderRunner(ScheduledModelRunner):
             pinned_tier = sample_type or SampleType.FULL
             self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
-                for bs, draft_len in graphs_to_capture:
+                for entry in graphs_to_capture:
+                    bs, draft_len = entry[:2]
+                    verify_bucket = entry[2] if len(entry) == 3 else None
                     if bs > self._config.max_batch_size:
                         continue
 
@@ -2043,6 +2123,8 @@ class DecoderRunner(ScheduledModelRunner):
                             force_non_greedy=force_non_greedy,
                         )
                         with self._release_batch_context(warmup_request, resource_manager) as batch:
+                            if batch is not None and verify_bucket is not None:
+                                self._set_warmup_ragged_windows(batch, verify_bucket, draft_len)
                             if batch is None:
                                 # No KV cache space for this batch size. During KV
                                 # cache estimation this makes the profiling peak
@@ -2079,6 +2161,7 @@ class DecoderRunner(ScheduledModelRunner):
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                self.cuda_graph_runner.agreed_ragged_bucket = None
 
         if self._lora.cuda_graph_manager is None:
             lora_graph_cases = [False]
@@ -2986,6 +3069,660 @@ class DecoderRunner(ScheduledModelRunner):
             num_cached_tokens_per_seq
         ) - sum(counts)
 
+    @torch.inference_mode()
+    def _warmup_dspark_ragged_compressor_metadata(self) -> None:
+        """Compile DSv4 ragged metadata for a non-CUDA-graph batch size.
+
+        Whole-model CUDA-graph warmup exercises only configured graph batch
+        sizes. The first mixed attention-DP iteration can contain an
+        intermediate number of generation requests, which otherwise triggers
+        a long ``torch.compile`` specialization immediately before a TP
+        collective. Ranks without generation work reach the collective first
+        and can trip the executor hang detector while their peers compile.
+
+        One non-bucket probe forces the dynamic specialization during engine
+        warmup, before the hang detector starts. It uses the metadata's real
+        persistent buffers so the tensor shape and stride guards match serving.
+        Those buffers are created under inference mode, so all probe and
+        cleanup mutations must run under the same mode.
+        """
+        if not self._dspark_confidence_enabled or not self._dspark_trims_submitted_tokens:
+            return
+
+        metadata = getattr(self, "attn_metadata", None)
+        required_attributes = (
+            "_compute_compressed_mask",
+            "_compute_gen_compressed_position_ids",
+            "_compress_ratios_sorted",
+            "compressed_mask_cuda",
+            "compressed_position_ids_cuda",
+            "cu_new_comp_kv_cuda",
+            "max_draft_tokens",
+            "new_comp_kv_lens_cuda",
+            "past_kv_lens_cuda",
+        )
+        missing_attributes = [
+            name for name in required_attributes if metadata is None or not hasattr(metadata, name)
+        ]
+        if missing_attributes:
+            raise RuntimeError(
+                "DSpark ragged metadata warmup requires the DSv4 compressor "
+                "contract; missing " + ", ".join(missing_attributes)
+            )
+
+        graph_batch_sizes = {int(batch_size) for batch_size in self._config.cuda_graph_batch_sizes}
+        num_generations = next(
+            (
+                candidate
+                for candidate in range(int(self._config.max_batch_size) - 1, 0, -1)
+                if candidate not in graph_batch_sizes
+            ),
+            None,
+        )
+        if num_generations is None:
+            return
+
+        compress_ratios = [int(ratio) for ratio in metadata._compress_ratios_sorted]
+        tokens_per_generation = 1 + int(metadata.max_draft_tokens)
+        total_compressed_tokens = {}
+        gen_output_offsets = {ratio: 0 for ratio in compress_ratios}
+        prepared_ratios = []
+        try:
+            for ratio in compress_ratios:
+                compressed_tokens_per_generation = (tokens_per_generation + ratio - 1) // ratio
+                total_tokens = num_generations * compressed_tokens_per_generation
+                past_kv_lens = metadata.past_kv_lens_cuda[ratio]
+                cu_new_comp = metadata.cu_new_comp_kv_cuda[ratio]
+                new_comp = metadata.new_comp_kv_lens_cuda[ratio]
+                compressed_positions = metadata.compressed_position_ids_cuda[ratio]
+                compressed_mask = metadata.compressed_mask_cuda[ratio]
+                if (
+                    past_kv_lens.numel() < num_generations
+                    or cu_new_comp.numel() < num_generations + 1
+                    or new_comp.numel() < num_generations
+                    or compressed_positions.numel() < total_tokens
+                    or compressed_mask.numel() < total_tokens
+                ):
+                    raise RuntimeError(
+                        "DSpark ragged compressor metadata buffers cannot "
+                        f"hold the compile probe with {num_generations} "
+                        "generation requests and compression ratio "
+                        f"{ratio}"
+                    )
+
+                total_compressed_tokens[ratio] = total_tokens
+                prepared_ratios.append(ratio)
+                past_kv_lens[:num_generations].zero_()
+                new_comp[:num_generations].fill_(compressed_tokens_per_generation)
+                cu_new_comp[: num_generations + 1].copy_(
+                    torch.arange(
+                        num_generations + 1, dtype=cu_new_comp.dtype, device=cu_new_comp.device
+                    )
+                )
+                cu_new_comp[: num_generations + 1].mul_(compressed_tokens_per_generation)
+
+            logger.info(
+                "DSpark ragged metadata warmup: compiling one non-graph "
+                f"shape with {num_generations} generation requests"
+            )
+            metadata._compute_gen_compressed_position_ids(
+                metadata.past_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_position_ids_cuda,
+                0,
+                num_generations,
+                tokens_per_generation,
+                compress_ratios,
+                gen_output_offsets,
+            )
+            metadata._compute_compressed_mask(
+                metadata.new_comp_kv_lens_cuda,
+                metadata.cu_new_comp_kv_cuda,
+                metadata.compressed_mask_cuda,
+                num_generations,
+                total_compressed_tokens,
+                compress_ratios,
+            )
+            torch.cuda.synchronize()
+        finally:
+            for ratio in prepared_ratios:
+                total_tokens = total_compressed_tokens[ratio]
+                metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.new_comp_kv_lens_cuda[ratio][:num_generations].zero_()
+                metadata.cu_new_comp_kv_cuda[ratio][: num_generations + 1].zero_()
+                metadata.compressed_position_ids_cuda[ratio][:total_tokens].zero_()
+                metadata.compressed_mask_cuda[ratio][:total_tokens].zero_()
+            torch.cuda.synchronize()
+        logger.info("DSpark ragged metadata warmup complete")
+
+    def _set_warmup_ragged_windows(self, batch, verify_bucket: int, draft_len: int) -> None:
+        """Give a capture batch per-request windows summing to ``verify_bucket``.
+
+        The warmup batch must hit the bucket total exactly, or the graph is
+        keyed under a total no runtime batch produces and every ragged step
+        silently falls back to eager. Any split with the right sum captures
+        the right shape (the raggedness lives in the contents of qo_indptr).
+        """
+        requests = batch.generation_requests
+        if not requests:
+            return
+        from tensorrt_llm._torch.speculative.ragged_helpers import RaggedVerifyLayout
+
+        lens = torch.ones(len(requests), dtype=torch.int32)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            lens, graph_num_tokens=int(verify_bucket), total_verify_tokens=len(requests)
+        )
+        filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
+        for request, tokens in zip(requests, filled.verify_lens.tolist()):
+            request.py_verify_len = int(tokens) - 1
+        # Publish to the runner too: the graph key carries this value, and the
+        # runtime fit never runs during capture.
+        self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)
+
+    def ragged_verify_token_buckets(self, padded_bs: int) -> List[int]:
+        """Measured compact ``V`` cells captured for one exact ``G``."""
+        if self._config.spec_config is None:
+            return []
+        from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostTable
+
+        exact_table = getattr(self, "_dspark_sps_cost_table", None)
+        if not isinstance(exact_table, ExactSpsCostTable):
+            raise RuntimeError(
+                "DSpark ragged verification requires an authenticated exact SPS table"
+            )
+        return list(exact_table.production_candidate_budgets(int(padded_bs)))
+
+    def _get_spec_worker(self):
+        """Return the one-model speculative worker when it is initialized."""
+        return getattr(self.model, "spec_worker", None)
+
+    def fit_ragged_verify_lens(
+        self,
+        generation_requests,
+        verify_lens: List[int],
+        exact_shape: Tuple[int, int, int],
+        peer_stats: Optional[List[List[int]]] = None,
+        exact_zero_real: bool = False,
+    ) -> Optional[int]:
+        """Validate and publish a globally selected exact ``(G,V)`` shape.
+
+        ``peer_stats`` is every attention-DP rank's ``[num_requests,
+        total_tokens, all_can_graph]``, including this rank's: the bucket must
+        be sized from the cross-rank maximum or ranks pick different shapes,
+        and ``all_can_graph`` is the group's answer to whether that maximum
+        will be taken at all.
+
+        ``exact_shape`` is the agreed ``(G,V,pad_tokens)`` from the exact SPS
+        selector. Changing V here would execute a different measured cell from
+        the one the policy priced, so this method only validates the split.
+
+        ``exact_zero_real`` means this rank contributes no logical requests
+        but carries the one scheduler-owned attention-DP dummy. The dummy is
+        mapped onto the high row when ``V % G != 0``; CUDA padding supplies
+        the remaining low/high rows without publishing output or KV ownership
+        for a real request.
+        """
+        runner = self.cuda_graph_runner
+        # Cleared on entry so every early return leaves no stale value: a
+        # bucket carried over from a previous step would key into the wrong
+        # graph. The padded row count follows the same rule.
+        runner.agreed_ragged_bucket = None
+        runner.ragged_zero_real_high_rows = 0
+        self._dspark_last_padded_bs = None
+        if not runner.enabled or not verify_lens:
+            return None
+        if len(verify_lens) != len(generation_requests):
+            # A partially windowed batch would go ragged in the token layout
+            # while the spec metadata stayed uniform; refuse instead.
+            logger.debug(
+                f"DSpark ragged: got {len(verify_lens)} verify lengths for "
+                f"{len(generation_requests)} generation requests; falling back "
+                f"to uniform scheduling"
+            )
+            return None
+        max_verify_len = 1 + int(self._config.spec_config.max_draft_len)
+        token_lens = [1 + int(v) for v in verify_lens]
+
+        from tensorrt_llm._torch.speculative.ragged_helpers import resolve_ragged_pad_split
+
+        # Resolve rows first, then tokens: the bucket grid depends on the
+        # widest rank's row count. `all_can_graph` (third peer-stat element;
+        # absent means single-rank) says whether _get_padded_batch will take
+        # the cross-rank row maximum at all -- only when EVERY rank can graph.
+        all_can_graph = bool(peer_stats[0][2]) if peer_stats and len(peer_stats[0]) > 2 else True
+        if not all_can_graph:
+            # No rank will replay a graph this step, and _get_padded_batch
+            # pads differently than this fit assumes on such steps, so the
+            # budget would go to rows that never appear. Decline (conservative:
+            # an eager ragged step would still save compute).
+            logger.debug(
+                "DSpark ragged: some rank cannot run a CUDA graph this step, "
+                "so no captured bucket applies; falling back to uniform"
+            )
+            return None
+        widest_rows = (
+            max([int(s[0]) for s in peer_stats], default=len(token_lens))
+            if peer_stats
+            else len(token_lens)
+        )
+        padded_bs = int(exact_shape[0])
+        expected_padded_bs = runner._round_up_batch_size(widest_rows)
+        if padded_bs != expected_padded_bs:
+            logger.warning(
+                "DSpark exact ragged shape disagrees with graph ladder: "
+                f"selected G={padded_bs}, expected G={expected_padded_bs}"
+            )
+            return None
+        if padded_bs == 0:
+            return None
+        # The fit assumes the batch will actually be padded to `padded_bs`;
+        # padding may decline, and then the fitted total lands in no captured
+        # bucket. Decline to go ragged rather than fit against rows that will
+        # not exist (`will_pad_to` mirrors only the SIZE guards; the group's
+        # graph answer is `all_can_graph` above).
+        if not runner.will_pad_to(padded_bs, len(token_lens)):
+            logger.debug(
+                f"DSpark ragged: padding to {padded_bs} rows is not available "
+                f"for {len(token_lens)} requests, so the bucket grid derived "
+                f"from it would not be realised; falling back to uniform"
+            )
+            return None
+        buckets = self.ragged_verify_token_buckets(padded_bs)
+        if not buckets:
+            return None
+        bucket = int(exact_shape[1])
+        if bucket not in buckets:
+            logger.warning(f"DSpark exact V={bucket} was not captured for G={padded_bs}")
+            return None
+
+        full_bucket = int(padded_bs) * int(max_verify_len)
+        if bucket == full_bucket:
+            # A full verifier budget has no ragged work reduction. Preserve
+            # the native static-K path and its ordinary multi-G tail handling.
+            return None
+
+        if exact_zero_real:
+            if (
+                len(generation_requests) != 1
+                or not generation_requests[0].is_attention_dp_dummy
+                or len(verify_lens) != 1
+            ):
+                raise RuntimeError(
+                    "DSpark zero-real exact fit lost its single scheduled "
+                    "attention-DP dummy invariant"
+                )
+            quotient, remainder = divmod(int(bucket), int(padded_bs))
+            if quotient < 1 or quotient + int(remainder > 0) > max_verify_len:
+                raise RuntimeError(
+                    "DSpark zero-real exact bucket has no bounded low/high "
+                    f"row split: G={padded_bs}, V={bucket}, "
+                    f"max_tokens={max_verify_len}"
+                )
+            expected_scheduled_window = quotient - 1 + int(remainder > 0)
+            if int(verify_lens[0]) != expected_scheduled_window:
+                raise RuntimeError(
+                    "DSpark zero-real scheduled dummy window differs from "
+                    f"the exact quotient/remainder split: got={verify_lens[0]}, "
+                    f"expected={expected_scheduled_window}"
+                )
+            if remainder > 1:
+                draft_len = int(self._config.spec_config.max_draft_len)
+                if draft_len not in runner.secondary_padding_dummy_requests:
+                    raise RuntimeError(
+                        "DSpark secondary padding dummy disappeared after "
+                        "the all-rank exact-cell agreement"
+                    )
+            self._dspark_last_padded_bs = int(padded_bs)
+            self._dspark_last_num_real = 0
+            runner.agreed_ragged_bucket = int(bucket)
+            runner.ragged_pad_verify_len = int(quotient) - 1
+            runner.ragged_zero_real_high_rows = int(remainder)
+            generation_requests[0].py_verify_len = expected_scheduled_window
+            return int(bucket)
+
+        # Pad rows are appended later as a *single shared dummy object*, so
+        # they all carry the same window and their contribution must be
+        # decided here, not left to the fill. They take the minimum (one
+        # token) so real requests get the slack, growing only when the real
+        # rows cannot absorb the bucket.
+        n_real = len(token_lens)
+        n_pad = padded_bs - n_real
+        floor_tokens = sum(token_lens)
+        fixed_pad_len = int(exact_shape[2])
+        split = resolve_ragged_pad_split(
+            bucket=int(bucket),
+            num_real_requests=n_real,
+            total_real_tokens=floor_tokens,
+            padded_bs=int(padded_bs),
+            max_verify_len=max_verify_len,
+            fixed_pad_len=fixed_pad_len,
+        )
+        if split is None:
+            logger.warning(
+                f"DSpark ragged: bucket {bucket} admits no pad-row window "
+                f"for {n_real} real requests and {n_pad} pad rows; falling "
+                f"back to uniform scheduling"
+            )
+            return None
+        pad_len = split.pad_len
+        real_target = split.real_target
+        if real_target != sum(token_lens):
+            logger.warning(
+                "DSpark exact layout changed between policy and fit: "
+                f"real tokens={sum(token_lens)}, target={real_target}, "
+                f"G={padded_bs}, V={bucket}, pad={pad_len}"
+            )
+            return None
+        # The exact selector already returned a bounded split whose real rows
+        # sum to the measured cell; repacking it cannot change a value.
+        published = token_lens
+
+        # Published only now, past the last way this fit can fail: a stale
+        # published bucket on a fallback step is the state behind the ragged
+        # IMA. The row count and pad window feed the fresh-confidence device
+        # prologue; `ragged_pad_verify_len` is also stamped on the shared dummy
+        # by _get_padded_batch.
+        self._dspark_last_padded_bs = int(padded_bs)
+        self._dspark_last_num_real = int(n_real)
+        runner.agreed_ragged_bucket = int(bucket)
+        runner.ragged_pad_verify_len = pad_len - 1
+
+        for request, tokens in zip(generation_requests, published):
+            request.py_verify_len = int(tokens) - 1
+        return int(bucket)
+
+    def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
+        """Re-rank this step's verify windows on device, with fresh confidence.
+
+        Runs after ``_prepare_inputs`` and before the graph replay, all device
+        ops on the current stream -- stream order makes every write visible to
+        the replayed graph, and nothing here reads device data back to the
+        host. The host has already agreed ``(padded_bs, bucket)`` and staged a
+        SHAPE SPLIT of the (lagged) budget through the normal fit; this
+        prologue re-distributes the same real/pad token totals by the verified
+        block's OWN confidence (ranking lag zero) and overwrites the layout's
+        content: verify lens, qo_indptr, the per-token row maps, the packed
+        input/position/draft tokens, and the per-request kv-length delta from
+        the shape split to the true windows.
+
+        Returns True when applied; False when a precondition fails (the step
+        then runs the shape split as-is, which is a valid window assignment).
+        """
+        from tensorrt_llm._torch.speculative.dspark_device_select import (
+            gather_packed_draft_tokens,
+            select_windows_device,
+        )
+
+        runner = self.cuda_graph_runner
+        budget = self._dspark_device_budget
+        self._dspark_device_budget = None
+        if budget is None or runner.agreed_ragged_bucket is None:
+            return False
+        if not getattr(self, "_dspark_prev_covers_batch", False):
+            # The input gathers below address new_tokens_device by
+            # previous_batch_indices in batch order; a request without a
+            # previous device tensor breaks that addressing.
+            return False
+        worker = self._get_spec_worker()
+        planner = worker.verify_planner
+        if planner is None or worker.staged_confidence_buffer() is None:
+            return False
+        if worker.batch_slot_view(1) is None:
+            return False
+        spec_metadata = inputs.get("spec_metadata")
+        attn_metadata = inputs.get("attn_metadata")
+        if spec_metadata is None or attn_metadata is None:
+            return False
+        if self._config.use_mrope:
+            # Host-selected ragged windows build the complete three-axis
+            # MRoPE positions correctly.  The device prologue currently owns
+            # only the scalar position buffer, so decline fresh reranking
+            # rather than leave the 3-D positions on the stale shape split.
+            return False
+        apply_device_layout = getattr(attn_metadata, "apply_device_ragged_layout", None)
+        if not callable(apply_device_layout):
+            # Device-selected row ownership is an attention-backend
+            # capability.  Decline before mutating any shared buffers when a
+            # backend only supports the ordinary host-selected ragged layout.
+            return False
+        if int(attn_metadata.num_contexts) != 0:
+            return False
+
+        bucket = int(runner.agreed_ragged_bucket)
+        padded_bs = int(self._dspark_last_padded_bs)
+        n_real = int(self._dspark_last_num_real)
+        pad_len_tok = int(runner.ragged_pad_verify_len) + 1
+        real_tokens = bucket - (padded_bs - n_real) * pad_len_tok
+        cfg = planner.cfg
+        # The scheduler cannot grant more than the real rows can absorb under
+        # the published split; the fill tops up any shortfall.
+        budget = max(0, min(int(budget), real_tokens - n_real * (cfg.min_verify_len + 1)))
+
+        # Snapshot the shape split BEFORE overwriting: past_seen per row is
+        # the staged position at each row's first token, and the kv delta
+        # needs the split the host baked into kv_lens_cuda.
+        lens_buf = self.ragged_verify_lens_cuda
+        qo_buf = self.ragged_qo_indptr_cuda
+        split_lens = lens_buf[:padded_bs].clone()
+        split_qo = qo_buf[: padded_bs + 1].to(torch.long)
+        past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
+
+        expected_stamp = worker.verified_draft_seq_cuda()
+        stamps = worker.confidence_stamp_buffer() if expected_stamp is not None else None
+        result = select_windows_device(
+            confidence_logits=worker.staged_confidence_buffer(),
+            slot_idx=worker.batch_slot_view(padded_bs),
+            num_real=n_real,
+            budget=budget,
+            graph_num_tokens=bucket,
+            cfg=cfg,
+            apply_calibration=planner.apply_calibration,
+            stamp=stamps,
+            expected_stamp=expected_stamp,
+            pad_len=pad_len_tok,
+        )
+
+        lens_buf[:padded_bs].copy_(result.verify_lens)
+        qo_buf[: padded_bs + 1].copy_(result.qo_indptr)
+        # The host stages kv_lens as num_cached + seq_lens_kv, and BOTH terms
+        # bake the per-request token window (num_cached = past + tokens;
+        # seq_lens_kv = tokens), so kv_lens = past + 2*S -- the window counts
+        # TWICE. Moving to the true windows therefore needs 2*(w - S), not
+        # (w - S): the single-delta variant left every re-ranked request's
+        # kv_len off by (w - S), which shifted the indexer K-cache slot
+        # mapping (slot_mapping_fp8) and silently wrote K entries into the
+        # wrong cache slots. Established empirically by an A/B tensor diff
+        # against a full host restage with the same windows.
+        window_delta = result.verify_lens - split_lens
+        attn_metadata.kv_lens_cuda[:padded_bs] += 2 * window_delta
+        # The graph adds previous_kv_lens_offsets (staged as new_tokens_lens -
+        # shape_lens, per request) to kv_lens during replay; host-with-w
+        # stages new_tokens_lens - w there, so the offsets move by -(w - S).
+        # Combined: (past + 2S) + 2(w-S) + (new - S) - (w-S) = past + w + new,
+        # exactly the host-with-w in-graph sum.
+        self.previous_kv_lens_offsets_cuda[:padded_bs] -= window_delta.to(
+            self.previous_kv_lens_offsets_cuda.dtype
+        )
+
+        req_idx = result.req_idx
+        spec_metadata.remap_expanded_sampling_params(req_idx, bucket)
+        device = req_idx.device
+        flat = torch.arange(bucket, device=device)
+        offset = flat - result.qo_indptr.to(torch.long)[req_idx]
+        prev_slots = self.previous_batch_indices_cuda[:n_real].to(torch.long)
+        slots_tok = prev_slots[req_idx.clamp(max=n_real - 1)]
+
+        new_tokens_device = new_tensors_device.new_tokens
+        new_tokens_lens_device = new_tensors_device.new_tokens_lens
+        next_draft_tokens_device = new_tensors_device.next_draft_tokens
+
+        self.input_ids_cuda[:bucket] = (
+            new_tokens_device.transpose(0, 1)[slots_tok, offset]
+            .flatten()
+            .to(self.input_ids_cuda.dtype)
+        )
+        self.position_ids_cuda[:bucket] = past_seen[req_idx] + offset.to(past_seen.dtype)
+        # Overlap corrections gather by each token's OWNER; rebuild both the
+        # index and the per-token offset it feeds (mirrors the host staging at
+        # the previous_pos_indices block).
+        self.previous_pos_indices_cuda[:real_tokens] = slots_tok[:real_tokens].to(
+            self.previous_pos_indices_cuda.dtype
+        )
+        self.previous_pos_id_offsets_cuda[:real_tokens].copy_(
+            new_tokens_lens_device[slots_tok[:real_tokens]]
+        )
+        # Draft tokens pack compactly, omitting each request's bonus/anchor.
+        # Build the draft-only row owners at the statically known real-draft
+        # size.  The previous scheme parked anchors at ``real_draft``; at a
+        # full K / full batch that index is exactly one past the allocation.
+        real_draft = real_tokens - n_real
+        if real_draft > 0:
+            self.draft_tokens_cuda[:real_draft].copy_(
+                gather_packed_draft_tokens(
+                    next_draft_tokens=next_draft_tokens_device,
+                    batch_slots=prev_slots,
+                    verify_lens=result.verify_lens,
+                    qo_indptr=result.qo_indptr,
+                    num_real=n_real,
+                    total_draft_tokens=real_draft,
+                ).to(self.draft_tokens_cuda.dtype)
+            )
+
+        apply_device_layout(result.verify_lens, req_idx, result.kv_correction)
+        return True
+
+    @staticmethod
+    def _ragged_token_lens(generation_requests) -> Optional[List[int]]:
+        """Each generation request's token window, or None if the batch is uniform.
+
+        ``py_verify_len`` counts drafted positions; the token window adds the
+        bonus position. None unless *every* request carries a window --
+        partially windowed batches are silent token misattribution.
+        """
+        verify_lens = [getattr(request, "py_verify_len", None) for request in generation_requests]
+        if not verify_lens or any(v is None for v in verify_lens):
+            return None
+        return [1 + int(v) for v in verify_lens]
+
+    def _publish_gen_token_layout(
+        self, attn_metadata, generation_requests, *, runtime_draft_len: int
+    ) -> None:
+        """Hand the attention metadata this step's gen-token layout, before it
+        prepares.
+
+        Split out of :meth:`_attach_ragged_verify_layout` for ordering:
+        ``attn_metadata.prepare()`` is the only consumer of
+        ``ragged_verify_lens`` and runs well before the spec metadata is
+        assembled. The uniform stride is published here too, because
+        ``max_draft_tokens`` is a static buffer-sizing ceiling that does not
+        move when a shorter tier is chosen. It cannot live in
+        ``update_spec_dec_param`` either: that runs against the base metadata,
+        and ``prepare()`` runs against the per-key CUDA-graph copy.
+        """
+        if attn_metadata is None:
+            return
+        if hasattr(attn_metadata, "runtime_tokens_per_gen_step"):
+            attn_metadata.runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                runtime_draft_len
+            )
+        if hasattr(attn_metadata, "ragged_verify_lens"):
+            attn_metadata.ragged_verify_lens = (
+                self._ragged_token_lens(generation_requests)
+                if self._dspark_trims_submitted_tokens
+                else None
+            )
+        if hasattr(attn_metadata, "device_windows_mode"):
+            # Tells the attention prepare that the host window VALUES are a
+            # shape split (bounds only); the true windows land on device
+            # through apply_device_ragged_layout after prepare.
+            attn_metadata.device_windows_mode = (
+                self._dspark_trims_submitted_tokens and self._dspark_device_windows
+            )
+
+    def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
+        """A persistent pinned staging buffer holding ``values``.
+
+        Async H2D sources must outlive the queued copy -- PyTorch does not
+        extend the lifetime of an async source, so a temporary tensor can be
+        reclaimed while the DMA still reads it. Buffers are keyed by name and
+        grown monotonically. Two slots support the token and draft gathers
+        issued under the same key in one preparation pass. The executor calls
+        :meth:`wait_for_input_copy` before the next pass mutates host input, so
+        no additional per-slot event or synchronization is needed.
+        """
+        values = list(values)
+        slot = 1 - self._pinned_host_active.get(key, 1)
+        bufs = self._pinned_host_cache.setdefault(key, [None, None])
+        buf = bufs[slot]
+        if buf is None or buf.numel() < len(values) or buf.dtype != dtype:
+            buf = torch.empty(max(len(values), 1), dtype=dtype, pin_memory=prefer_pinned())
+            bufs[slot] = buf
+        self._pinned_host_active[key] = slot
+        view = buf[: len(values)]
+        if values:
+            view.copy_(torch.tensor(values, dtype=dtype))
+        return view
+
+    def _attach_ragged_verify_layout(
+        self, spec_metadata, attn_metadata, generation_requests
+    ) -> None:
+        """Publish this step's per-request verify windows to both metadatas.
+
+        Only the DSpark confidence scheduler sets ``py_verify_len``; every
+        other path leaves the fields None. Acceptance needs the windows to
+        slice correctly; the DSA indexer needs them to expand kv_lens/block
+        tables per query token.
+        """
+        if not self._dspark_trims_submitted_tokens:
+            spec_metadata.verify_lens = None
+            spec_metadata.qo_indptr = None
+            spec_metadata.total_verify_tokens = None
+            if attn_metadata is not None and hasattr(attn_metadata, "ragged_verify_lens"):
+                attn_metadata.ragged_verify_lens = None
+            return
+
+        token_lens = self._ragged_token_lens(generation_requests)
+        if token_lens is None:
+            spec_metadata.verify_lens = None
+            spec_metadata.qo_indptr = None
+            spec_metadata.total_verify_tokens = None
+            if attn_metadata is not None and hasattr(attn_metadata, "ragged_verify_lens"):
+                attn_metadata.ragged_verify_lens = None
+            return
+
+        from tensorrt_llm._torch.speculative.ragged_helpers import build_qo_indptr
+
+        n = len(token_lens)
+        # Persistent buffers: a captured graph baked in the address it saw at
+        # capture time, so a fresh tensor would be invisible to every replay.
+        lens_view = self.ragged_verify_lens_cuda[:n]
+        lens_view.copy_(
+            self._pinned_host("ragged_verify_lens", token_lens, torch.int32), non_blocking=True
+        )
+        indptr_view = self.ragged_qo_indptr_cuda[: n + 1]
+        indptr_view.copy_(build_qo_indptr(lens_view), non_blocking=True)
+        spec_metadata.verify_lens = lens_view
+        spec_metadata.qo_indptr = indptr_view
+        spec_metadata.total_verify_tokens = sum(token_lens)
+        if attn_metadata is not None and hasattr(attn_metadata, "ragged_verify_lens"):
+            attn_metadata.ragged_verify_lens = token_lens
+
+    def _ragged_gather_indices(
+        self, slots: List[int], counts: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Row/column index pair for gathering a ragged block out of a
+        [num_slots, max_width] device tensor.
+
+        ``slots[i]`` contributes ``counts[i]`` entries taken from columns
+        ``0..counts[i]-1``, concatenated in batch order. This replaces the
+        ``tensor[slots, :width]`` strided gather used when every request
+        verifies the same number of positions.
+        """
+        rows, cols = ragged_gather_index_lists(slots, counts)
+        rows_dev = self._pinned_host("gather_rows", rows, torch.long).to("cuda", non_blocking=True)
+        cols_dev = self._pinned_host("gather_cols", cols, torch.long).to("cuda", non_blocking=True)
+        return (rows_dev, cols_dev)
+
     def _can_use_steady_gen_fast_prepare(
         self,
         scheduled_requests: ScheduledRequests,
@@ -3506,6 +4243,9 @@ class DecoderRunner(ScheduledModelRunner):
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
         previous_pos_indices = []
+        previous_batch_token_start = None
+        previous_batch_tokens_per_request = [] if self._dspark_trims_submitted_tokens else None
+        extend_tokens_emitted = 0
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
@@ -3525,6 +4265,11 @@ class DecoderRunner(ScheduledModelRunner):
                 or request.is_dummy
                 or request.py_batch_idx is None
             ):
+                num_draft_tokens = get_draft_token_length(request)
+                if self._dspark_trims_submitted_tokens:
+                    num_draft_tokens = (
+                        get_request_tokens_per_gen_step(request, 1 + num_draft_tokens) - 1
+                    )
                 # get token ids, including input token ids and draft token ids. For these dummy requests,
                 # no need to copy the token ids.
                 if not (request.is_attention_dp_dummy or request.is_cuda_graph_dummy):
@@ -3532,10 +4277,12 @@ class DecoderRunner(ScheduledModelRunner):
                         input_ids.append(request.get_tokens(0)[request.context_current_position])
                     else:
                         input_ids.append(request.get_last_tokens(0))
-                    input_ids.extend(request.py_draft_tokens)
-                    draft_tokens.extend(request.py_draft_tokens)
+                    submitted_draft_tokens = request.py_draft_tokens
+                    if self._dspark_trims_submitted_tokens:
+                        submitted_draft_tokens = submitted_draft_tokens[:num_draft_tokens]
+                    input_ids.extend(submitted_draft_tokens)
+                    draft_tokens.extend(submitted_draft_tokens)
                 # get other ids and lengths
-                num_draft_tokens = get_draft_token_length(request)
                 past_seen_token_num = (
                     request.context_current_position
                     if is_promoted_context
@@ -3564,6 +4311,9 @@ class DecoderRunner(ScheduledModelRunner):
                 num_cached_tokens_per_seq.append(
                     past_seen_token_num - request.py_num_compressed_tokens
                 )
+                if self._dspark_trims_submitted_tokens:
+                    request.cached_tokens = past_seen_token_num
+                extend_tokens_emitted += 1 + num_draft_tokens
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
                     # On a helix gen worker the request's token list is the
@@ -3587,30 +4337,36 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_batch_idx = request.py_batch_idx
                 request.py_batch_idx = request.py_seq_slot
 
-                sequence_lengths.append(runtime_tokens_per_gen_step)
+                request_tokens_per_step = runtime_tokens_per_gen_step
+                if self._dspark_trims_submitted_tokens:
+                    request_tokens_per_step = get_request_tokens_per_gen_step(
+                        request, runtime_tokens_per_gen_step
+                    )
+                sequence_lengths.append(request_tokens_per_step)
                 num_accepted_draft_tokens.append(request.py_num_accepted_draft_tokens)
                 past_seen_token_num = request.max_beam_num_tokens - 1
 
-                draft_lens.append(runtime_draft_token_buffer_width)
+                draft_lens.append(request_tokens_per_step - 1)
                 gather_ids.extend(
-                    list(range(len(position_ids), len(position_ids) + runtime_tokens_per_gen_step))
+                    list(range(len(position_ids), len(position_ids) + request_tokens_per_step))
                 )
                 position_ids.extend(
-                    list(
-                        range(
-                            past_seen_token_num, past_seen_token_num + runtime_tokens_per_gen_step
-                        )
-                    )
+                    list(range(past_seen_token_num, past_seen_token_num + request_tokens_per_step))
                 )
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
-                previous_pos_indices.extend([previous_batch_idx] * runtime_tokens_per_gen_step)
+                previous_pos_indices.extend([previous_batch_idx] * request_tokens_per_step)
+                if previous_batch_token_start is None:
+                    previous_batch_token_start = extend_tokens_emitted
+                if previous_batch_tokens_per_request is not None:
+                    previous_batch_tokens_per_request.append(request_tokens_per_step)
+                extend_tokens_emitted += request_tokens_per_step
 
                 num_cached_tokens_per_seq.append(
-                    past_seen_token_num
-                    + runtime_tokens_per_gen_step
-                    - request.py_num_compressed_tokens
+                    past_seen_token_num + request_tokens_per_step - request.py_num_compressed_tokens
                 )
+                if self._dspark_trims_submitted_tokens:
+                    request.cached_tokens = past_seen_token_num + request_tokens_per_step
                 if _has_cp_helix:
                     # In-flight predecessor: mirror the non-helix convention
                     # above -- positions are packed from the stale base (the
@@ -3619,7 +4375,7 @@ class DecoderRunner(ScheduledModelRunner):
                     # in recompute_helix_spec_buffers overrides them). The
                     # base is reconstructed GLOBALLY (see the no-previous
                     # branch: the token list is rank-local under helix).
-                    group = runtime_tokens_per_gen_step
+                    group = request_tokens_per_step
                     base = _helix_pack_extend(request, group)
                     local_full = _helix_local_len_host(base + group)
                     helix_owned_new_tokens.append(0)
@@ -3629,7 +4385,7 @@ class DecoderRunner(ScheduledModelRunner):
                     and spec_config.spec_dec_mode.extend_ctx(self._config.attention_backend)
                     and spec_config.is_linear_tree
                 ):
-                    prompt_lengths.append(runtime_tokens_per_gen_step)
+                    prompt_lengths.append(request_tokens_per_step)
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
@@ -3878,6 +4634,9 @@ class DecoderRunner(ScheduledModelRunner):
             mrope_delta_read_seq_slots.clear()
 
         previous_batch_len = len(previous_batch_indices)
+        self._dspark_prev_covers_batch = previous_batch_len > 0 and previous_batch_len == len(
+            extend_requests
+        ) - len(extend_dummy_requests)
 
         def previous_seq_slots_device():
             previous_batch_indices_host = torch.tensor(
@@ -3917,18 +4676,43 @@ class DecoderRunner(ScheduledModelRunner):
 
             if previous_batch_len > 0:
                 previous_slots = previous_seq_slots_device()
+                is_ragged_gen = previous_batch_tokens_per_request is not None and any(
+                    tokens != runtime_tokens_per_gen_step
+                    for tokens in previous_batch_tokens_per_request
+                )
                 # previous input ids
-                previous_batch_tokens = previous_batch_len * runtime_tokens_per_gen_step
-                new_tokens = new_tokens_device.transpose(0, 1)[
-                    previous_slots, :runtime_tokens_per_gen_step
-                ].flatten()
+                previous_batch_tokens = len(previous_pos_indices)
+                if is_ragged_gen:
+                    token_rows, token_cols = self._ragged_gather_indices(
+                        previous_batch_indices, previous_batch_tokens_per_request
+                    )
+                    new_tokens = new_tokens_device.transpose(0, 1)[token_rows, token_cols].flatten()
+                else:
+                    new_tokens = new_tokens_device.transpose(0, 1)[
+                        previous_slots, :runtime_tokens_per_gen_step
+                    ].flatten()
                 self.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].copy_(
                     new_tokens, non_blocking=True
                 )
 
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * runtime_draft_token_buffer_width
-                if runtime_draft_token_buffer_width > 0:
+                if is_ragged_gen:
+                    previous_batch_draft_tokens = previous_batch_tokens - previous_batch_len
+                    if previous_batch_draft_tokens > 0:
+                        draft_rows, draft_cols = self._ragged_gather_indices(
+                            previous_batch_indices,
+                            [tokens - 1 for tokens in previous_batch_tokens_per_request],
+                        )
+                        self.draft_tokens_cuda[
+                            num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
+                        ].copy_(
+                            next_draft_tokens_device[draft_rows, draft_cols].flatten(),
+                            non_blocking=True,
+                        )
+                elif runtime_draft_token_buffer_width > 0:
+                    previous_batch_draft_tokens = (
+                        previous_batch_len * runtime_draft_token_buffer_width
+                    )
                     self.draft_tokens_cuda[
                         num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
                     ].copy_(
@@ -3938,7 +4722,18 @@ class DecoderRunner(ScheduledModelRunner):
                         non_blocking=True,
                     )
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
+                if is_ragged_gen:
+                    tokens_per_previous_request = torch.tensor(
+                        previous_batch_tokens_per_request,
+                        dtype=torch.long,
+                        pin_memory=prefer_pinned(),
+                    ).to(new_tokens_lens_device.device, non_blocking=True)
+                    previous_kv_len_offsets = (
+                        new_tokens_lens_device[previous_slots] - tokens_per_previous_request
+                    ).clamp_(min=-(runtime_draft_len + 1), max=runtime_draft_len + 1)
+                else:
+                    kv_len_offsets_device = new_tokens_lens_device - runtime_tokens_per_gen_step
+                    previous_kv_len_offsets = kv_len_offsets_device[previous_slots]
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
@@ -3967,10 +4762,14 @@ class DecoderRunner(ScheduledModelRunner):
                 #       Already set to '0' during initialization.
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
-                self.previous_pos_id_offsets_cuda[
-                    (num_extend_reqeust_wo_dummy - previous_batch_len)
-                    * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
+                pos_offsets_start = (
+                    previous_batch_token_start
+                    if is_ragged_gen
+                    else (num_extend_reqeust_wo_dummy - previous_batch_len)
                     * runtime_tokens_per_gen_step
+                )
+                self.previous_pos_id_offsets_cuda[
+                    pos_offsets_start : pos_offsets_start + previous_batch_tokens
                 ].copy_(
                     new_tokens_lens_device[self.previous_pos_indices_cuda[0:previous_batch_tokens]],
                     non_blocking=True,
@@ -3978,7 +4777,7 @@ class DecoderRunner(ScheduledModelRunner):
 
                 self.previous_kv_lens_offsets_cuda[
                     num_extend_reqeust_wo_dummy - previous_batch_len : num_extend_reqeust_wo_dummy
-                ].copy_(kv_len_offsets_device[previous_slots], non_blocking=True)
+                ].copy_(previous_kv_len_offsets, non_blocking=True)
 
         elif new_tokens_device is not None:
             seq_slots_device = previous_seq_slots_device()
@@ -4067,7 +4866,21 @@ class DecoderRunner(ScheduledModelRunner):
                 helix_owned_new_tokens=(helix_owned_new_tokens if helix_spec_active else None),
             )
 
-        if not attn_metadata.is_cuda_graph:
+        if self._dspark_trims_submitted_tokens:
+            self._publish_gen_token_layout(
+                attn_metadata,
+                scheduled_requests.generation_requests,
+                runtime_draft_len=runtime_draft_len,
+            )
+        refresh_seq_lens = not attn_metadata.is_cuda_graph
+        if (
+            not refresh_seq_lens
+            and getattr(attn_metadata, "is_ragged_verify", False)
+            and attn_metadata.seq_lens is not None
+            and len(sequence_lengths) == attn_metadata.seq_lens.shape[0]
+        ):
+            refresh_seq_lens = True
+        if refresh_seq_lens:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
             attn_metadata.seq_lens = torch.tensor(
@@ -4244,6 +5057,10 @@ class DecoderRunner(ScheduledModelRunner):
             ]
             if context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
+            if self._dspark_trims_submitted_tokens:
+                self._attach_ragged_verify_layout(
+                    spec_metadata, attn_metadata, scheduled_requests.generation_requests
+                )
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
             spec_metadata.prepare()
@@ -4288,6 +5105,13 @@ class DecoderRunner(ScheduledModelRunner):
             )
 
         if not is_dummy:
+            self.previous_request_ids = all_gen_request_ids
+            if self._dspark_trims_submitted_tokens:
+                self.previous_verify_lens = [
+                    getattr(request, "py_verify_len", None)
+                    for request in scheduled_requests.generation_requests
+                ]
+            self.has_previous_device_draft = next_draft_tokens_device is not None
             # Record the steady-state generation cache when this pass handled
             # purely non-dummy generation requests that all carried a previous
             # overlap-scheduler tensor (previous_batch_len == _n_gen implies
@@ -4606,6 +5430,13 @@ class DecoderRunner(ScheduledModelRunner):
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 
+            if (
+                can_run_graph
+                and not is_dummy
+                and getattr(self, "_dspark_device_budget", None) is not None
+            ):
+                self._apply_device_window_prologue(inputs, new_tensors_device)
+
             breakable_runner = self.breakable_cuda_graph_runner
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
@@ -4826,6 +5657,16 @@ class DecoderRunner(ScheduledModelRunner):
 
                 logits_processors = getattr(request, "py_logits_post_processors", None)
                 if logits_processors:
+                    if (
+                        not is_context_request
+                        and getattr(request, "py_verify_len", None) is not None
+                    ):
+                        raise RuntimeError(
+                            "per-request logits post-processors are not supported with DSpark "
+                            "ragged verification: the processor interface assumes one uniform "
+                            "row stride and would modify another request's packed logits after "
+                            "a short verify window"
+                        )
                     token_ids = (
                         [request.get_tokens(0)]
                         if is_context_request

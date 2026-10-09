@@ -816,6 +816,61 @@ class PyTorchModelEngine(ModelEngine):
         return self._runner.cuda_graph_runner
 
     @property
+    def _dspark_confidence_enabled(self) -> bool:
+        return isinstance(
+            self._runner,
+            DecoderRunner) and self._runner._dspark_confidence_enabled
+
+    @property
+    def _dspark_trims_submitted_tokens(self) -> bool:
+        return isinstance(
+            self._runner,
+            DecoderRunner) and self._runner._dspark_trims_submitted_tokens
+
+    @property
+    def _dspark_sps_cost_table(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return self._runner._dspark_sps_cost_table
+
+    @property
+    def _dspark_exact_candidate_cells(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner._dspark_exact_candidate_cells
+
+    @property
+    def _dspark_exact_identity_words(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return (0, ) * 8
+        return self._runner._dspark_exact_identity_words
+
+    @property
+    def _dspark_device_budget(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return getattr(self._runner, "_dspark_device_budget", None)
+
+    @_dspark_device_budget.setter
+    def _dspark_device_budget(self, value) -> None:
+        if isinstance(self._runner, DecoderRunner):
+            self._runner._dspark_device_budget = value
+
+    def ragged_verify_token_buckets(self, batch_size: int):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner.ragged_verify_token_buckets(batch_size)
+
+    def fit_ragged_verify_lens(self, *args, **kwargs):
+        assert isinstance(self._runner, DecoderRunner)
+        return self._runner.fit_ragged_verify_lens(*args, **kwargs)
+
+    def _get_spec_worker(self):
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner._get_spec_worker()
+        return None
+
+    @property
     def metrics(self) -> dict[str, float]:
         """Return model-engine warmup time metrics."""
         return self._metrics
