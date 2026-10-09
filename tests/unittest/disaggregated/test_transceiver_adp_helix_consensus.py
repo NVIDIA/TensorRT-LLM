@@ -166,10 +166,51 @@ def test_adp_gen_consensus_outcome_retires_cancellation_only_when_every_cp_rank_
     assert run(local_drained=True, local_cancelled=[]) == ([9], [], [], set())
 
 
-def test_kv_size_rank_factor_scales_by_helix_cp_under_adp() -> None:
-    """kv_cache_size scales local shard bytes by cp_size under attention-DP, tp*cp otherwise."""
+def test_kv_size_rank_factor_is_the_tp_scale() -> None:
+    """The constant factor covers TP only; helix CP is scaled per request."""
     factor = KvCacheTransceiverV2._kv_size_rank_factor_for
-    assert factor(_mapping(tp_size=2, cp_size=1, enable_attention_dp=True)) == 1
-    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=True)) == 2
-    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=False)) == 4
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=True)) == 1
+    assert factor(_mapping(tp_size=2, cp_size=2, enable_attention_dp=False)) == 2
     assert factor(_mapping(tp_size=1, cp_size=1, enable_attention_dp=False)) == 1
+
+
+_TPB = 32
+_BLOCK_BYTES = 100
+
+
+@pytest.mark.parametrize(
+    "enable_attention_dp,tp_size,cp_size,total_len,local_len,expected_blocks",
+    [
+        # One-block prompt: CP rank 0 owns the only block; reported as one block, not two.
+        (True, 2, 2, 20, 20, 1),
+        # The empty CP rank has no bytes and reports 0.
+        (True, 2, 2, 20, 0, 0),
+        # Two blocks: one per CP rank.
+        (True, 2, 2, 64, 32, 2),
+        # Three blocks: CP rank 0 holds blocks 0 and 2 (the partial one), CP rank 1 block 1.
+        (True, 2, 2, 80, 48, 3),
+        (True, 2, 2, 80, 32, 3),
+        # Without attention-DP the TP shards scale on top: 3 blocks x tp 2.
+        (False, 2, 2, 80, 48, 6),
+        # No helix: the local prompt is the whole prompt; only the TP scale applies.
+        (False, 2, 1, 80, 80, 6),
+    ],
+)
+def test_helix_kv_cache_size_counts_round_robin_blocks(
+    enable_attention_dp: bool,
+    tp_size: int,
+    cp_size: int,
+    total_len: int,
+    local_len: int,
+    expected_blocks: int,
+) -> None:
+    """kv_cache_size is the request total, not one CP rank's share times cp_size."""
+    mapping = _mapping(tp_size=tp_size, cp_size=cp_size, enable_attention_dp=enable_attention_dp)
+    tc = object.__new__(KvCacheTransceiverV2)
+    tc._mapping = mapping
+    tc._kv_size_rank_factor = KvCacheTransceiverV2._kv_size_rank_factor_for(mapping)
+    tc._reuse_adapter = SimpleNamespace(tokens_per_block=_TPB)
+    req = SimpleNamespace(prompt_len=local_len, total_input_len_cp=total_len)
+    local_bytes = (local_len + _TPB - 1) // _TPB * _BLOCK_BYTES
+
+    assert tc._request_kv_bytes(req, local_bytes) == expected_blocks * _BLOCK_BYTES

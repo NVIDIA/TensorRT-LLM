@@ -388,16 +388,34 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @staticmethod
     def _kv_size_rank_factor_for(mapping) -> int:
-        """Scale from this rank's KV shard bytes to the request total (metric only).
+        """TP part of the scale from this rank's KV shard bytes to the request total.
 
-        _chunk_num_bytes() is the local shard: TP shards and helix CP ranks each hold a
-        disjoint part of the request, so multiply by tp_size * cp_size. Under attention
-        DP the TP dimension is not sharded, but helix CP still is.
+        TP shards are equal, so they scale by tp_size; under attention DP the TP dimension
+        is not sharded. Helix CP shares are unequal and are scaled per request instead
+        (see _request_kv_bytes).
         """
-        shards = (
-            mapping.cp_size if mapping.enable_attention_dp else mapping.tp_size * mapping.cp_size
-        )
-        return max(1, shards)
+        return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+
+    def _request_kv_bytes(self, req: LlmRequest, local_bytes: int) -> int:
+        """Request-total KV bytes from this rank's share (metric only, no collective).
+
+        Helix deals prompt blocks round-robin over the CP ranks, so this rank holds
+        ceil(prompt_len / tpb) of the ceil(total_input_len_cp / tpb) blocks (prompt_len
+        is the rank-local slice) and the shares differ by up to one block. Scaling the
+        per-block bytes by the global block count gives the exact total. A CP rank that
+        owns no block reports 0; responses come from CP rank 0, which owns block 0.
+        """
+        if local_bytes == 0:
+            return 0
+        total = local_bytes * self._kv_size_rank_factor
+        if self._mapping.cp_size == 1:
+            return total
+        tpb = self._reuse_adapter.tokens_per_block
+        local_blocks = (req.prompt_len + tpb - 1) // tpb
+        global_blocks = (req.total_input_len_cp + tpb - 1) // tpb
+        if local_blocks == 0:
+            return total
+        return total * global_blocks // local_blocks
 
     def _init_sync_policy(self):
         m = self._mapping
@@ -1157,7 +1175,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(
-                    self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+                    self._request_kv_bytes(req, self._chunk_num_bytes(extent.local))
                 )
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
@@ -1221,7 +1239,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         extent = self._create_cache_extent(req)
         chunk_bytes = self._chunk_num_bytes(extent.local)
-        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, chunk_bytes)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
