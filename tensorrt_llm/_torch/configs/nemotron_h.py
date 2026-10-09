@@ -135,7 +135,11 @@ class NemotronHConfig(PretrainedConfig):
         mamba_head_dim: int = 64,
         mamba_hidden_act: str = "silu",
         mamba_proj_bias: bool = False,
-        mamba_ssm_cache_dtype: str = "float32",
+        # Unset unless the checkpoint declares it: dense Nemotron-H checkpoints
+        # do not, and kv_cache_config.mamba_ssm_cache_dtype="auto" must then
+        # resolve to the checkpoint dtype rather than an implicit fp32 state
+        # cache (twice the recurrent-state memory).
+        mamba_ssm_cache_dtype=None,
         n_groups: int = 8,
         conv_kernel: int = 4,
         expand: int = 2,
