@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 import os
 import pickle  # nosec B403
@@ -200,6 +201,27 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                                    **fast_kwargs)
 
 
+def _hf_remote_code_guard(trust_remote_code: bool):
+    """Return the remote-code lock, or a no-op when nothing can be written.
+
+    A tokenizer load reaches remote code even when the tokenizer class itself is
+    built in: ``AutoTokenizer.from_pretrained`` resolves that class through
+    ``AutoConfig.from_pretrained``, so a checkpoint whose config.json carries an
+    ``auto_map`` publishes its .py files into ``HF_MODULES_CACHE`` from here too,
+    not only from the model-config and input-processor paths.
+    ``hf_remote_code_lock`` documents why racing that publish breaks the import,
+    and asks every caller to share the one lock instead of defining its own.
+
+    The import is deferred to call time because a module-scope one would cycle:
+    ``_torch.model_config`` imports ``llmapi.llm_args``, which imports this
+    package back.
+    """
+    if not trust_remote_code:
+        return contextlib.nullcontext()
+    from tensorrt_llm._torch.model_config import hf_remote_code_lock
+    return hf_remote_code_lock()
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
 
@@ -296,8 +318,9 @@ class TransformersTokenizer(TokenizerBase):
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         try:
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                      **kwargs)
+            with _hf_remote_code_guard(kwargs.get('trust_remote_code', False)):
+                tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_dir, **kwargs)
         except Exception as e:
             # Three transformers 5.x regressions for model_types not
             # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads

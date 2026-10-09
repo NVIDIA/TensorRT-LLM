@@ -435,9 +435,20 @@ class CacheCost:
     """Affine KV cache budget: ``bytes = slope * tokens + intercept``.
 
     The legacy proportional case is just ``intercept = 0``.
+
+    ``bytes_per_request`` is an optional estimate of the slope-funded
+    per-request spend (``get_cache_bytes_per_request``): the worst-case bytes
+    one request pins beyond what the intercept already reserves. It refines
+    how the target/draft budget split weighs the two managers.
+    ``quota_per_request`` is the optional allocator quota one request makes
+    the manager insist on (``get_cache_quota_per_request``), which floors and
+    caps the draft share. Neither is part of the affine cost model, so
+    arithmetic (``__add__``) drops them.
     """
     slope: int
     intercept: int = 0
+    bytes_per_request: Optional[int] = None
+    quota_per_request: Optional[int] = None
 
     @classmethod
     def from_raw(cls, raw) -> "CacheCost":
@@ -456,10 +467,14 @@ class CacheCost:
                          intercept=self.intercept + other.intercept)
 
     def __str__(self) -> str:
-        if self.intercept == 0:
-            return f"{self.slope} bytes/token"
-        else:
-            return f"{self.slope} bytes/token + {self.intercept} bytes fixed cost"
+        text = f"{self.slope} bytes/token"
+        if self.intercept != 0:
+            text += f" + {self.intercept} bytes fixed cost"
+        if self.bytes_per_request is not None:
+            text += f", {self.bytes_per_request} bytes/request"
+        if self.quota_per_request is not None:
+            text += f", {self.quota_per_request} quota bytes/request"
+        return text
 
     def tokens_for_budget(self, budget: int) -> int:
         """Memory budget -> max tokens. Clamps a negative result to 0."""
@@ -983,6 +998,7 @@ class KvCacheCreator:
                                 *,
                                 is_draft: bool = False,
                                 mapping=None,
+                                include_request_cost: bool = False,
                                 **extra_kwargs) -> CacheCost:
         kv_cache_config = (kv_cache_config if kv_cache_config is not None else
                            self._kv_cache_config)
@@ -996,7 +1012,7 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
-        return CacheCost.from_raw(
+        cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
                 mapping if mapping is not None else self._mapping,
@@ -1008,6 +1024,73 @@ class KvCacheCreator:
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
                 **extra_kwargs))
+        if include_request_cost:
+            if cost.bytes_per_request is None:
+                bytes_per_request = self._per_manager_request_estimate(
+                    manager_cls,
+                    "get_cache_bytes_per_request",
+                    model_config,
+                    kv_cache_config,
+                    mapping=mapping,
+                    is_draft=is_draft,
+                    # Zero is a valid weight: a manager whose entire retention
+                    # is intercept-funded spends nothing per request from the
+                    # slope budget.
+                    allow_zero=True,
+                    **extra_kwargs)
+                if bytes_per_request is not None:
+                    cost = dataclasses.replace(
+                        cost, bytes_per_request=bytes_per_request)
+            if cost.quota_per_request is None:
+                quota_per_request = self._per_manager_request_estimate(
+                    manager_cls,
+                    "get_cache_quota_per_request",
+                    model_config,
+                    kv_cache_config,
+                    mapping=mapping,
+                    is_draft=is_draft,
+                    **extra_kwargs)
+                if quota_per_request is not None:
+                    cost = dataclasses.replace(
+                        cost, quota_per_request=quota_per_request)
+        return cost
+
+    def _per_manager_request_estimate(self,
+                                      manager_cls,
+                                      method_name: str,
+                                      model_config,
+                                      kv_cache_config: KvCacheConfig,
+                                      *,
+                                      mapping=None,
+                                      is_draft: bool = False,
+                                      allow_zero: bool = False,
+                                      **extra_kwargs) -> Optional[int]:
+        """Per-request byte estimate from a manager classmethod, or None.
+
+        None when the manager class does not model per-request spend (only
+        ``KVCacheManagerV2`` and subclasses do) or declines (see the manager
+        method's docstring for when).
+        """
+        estimate_method = getattr(manager_cls, method_name, None)
+        if estimate_method is None:
+            return None
+        estimate = estimate_method(
+            model_config,
+            mapping if mapping is not None else self._mapping,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=self._max_seq_len,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            kv_cache_config=kv_cache_config,
+            spec_config=self._speculative_config,
+            is_draft=is_draft,
+            **extra_kwargs)
+        # Mocked manager classes in tests return non-int sentinels; treat
+        # anything but a usable int as "no estimate".
+        if isinstance(estimate, int) and (estimate > 0 or
+                                          (allow_zero and estimate == 0)):
+            return estimate
+        return None
 
     def _get_one_model_draft_layer_mask(self) -> List[bool]:
         """Return the same draft-only mask used by runtime construction."""
@@ -1051,6 +1134,7 @@ class KvCacheCreator:
         kv_cache_config: KvCacheConfig,
         *,
         use_separate_draft_kv_cache: bool,
+        include_request_cost: bool = False,
     ) -> Optional[CacheCost]:
         """Return the draft manager's standalone cache cost, if it has one.
 
@@ -1067,18 +1151,24 @@ class KvCacheCreator:
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
-            return CacheCost(slope=cost.slope * helix_cp_scale,
-                             intercept=cost.intercept)
+            # Rescale only the slope: every other cost component (e.g. the
+            # fixed intercept) is per-request rank-local bytes and stays
+            # unscaled. dataclasses.replace keeps any component the rescale
+            # does not touch, where rebuilding the CacheCost from named
+            # fields would silently drop it.
+            return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
         if self._draft_model_engine is not None:
             draft_model_config = self._draft_model_engine.model.model_config
             draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
                 self._draft_model_engine, kv_cache_config)
             return scaled(
-                self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                             draft_model_config,
-                                             kv_cache_config,
-                                             mapping=draft_mapping))
+                self._per_manager_cache_cost(
+                    draft_kv_cache_manager_cls,
+                    draft_model_config,
+                    kv_cache_config,
+                    mapping=draft_mapping,
+                    include_request_cost=include_request_cost))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -1105,11 +1195,13 @@ class KvCacheCreator:
             if self._speculative_config.spec_dec_mode.is_external_drafter():
                 # External drafter: layers start from 0, normal PP distribution
                 return scaled(
-                    self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                 effective_draft_config,
-                                                 draft_kv_cache_config,
-                                                 mapping=draft_mapping,
-                                                 is_draft=True))
+                    self._per_manager_cache_cost(
+                        draft_kv_cache_manager_cls,
+                        effective_draft_config,
+                        draft_kv_cache_config,
+                        mapping=draft_mapping,
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
             elif self._mapping.is_last_pp_rank():
                 # EAGLE3/MTP: draft layers only on last PP rank
                 return scaled(
@@ -1119,7 +1211,8 @@ class KvCacheCreator:
                         draft_kv_cache_config,
                         mapping=draft_mapping,
                         num_layers=self._get_num_draft_layers(),
-                        is_draft=True))
+                        is_draft=True,
+                        include_request_cost=include_request_cost))
         return None
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -2109,8 +2202,16 @@ class KvCacheCreator:
     def _get_target_and_draft_cache_costs(
         self,
         kv_cache_config: Optional[KvCacheConfig] = None,
+        *,
+        include_request_cost: bool = False,
     ) -> Optional[tuple[CacheCost, CacheCost]]:
-        """Per-manager KV cache costs for target and draft layers."""
+        """Per-manager KV cache costs for target and draft layers.
+
+        ``include_request_cost`` additionally attaches the optional per-request
+        estimates (``CacheCost.bytes_per_request`` and
+        ``CacheCost.quota_per_request``) to each cost. Only the GPU budget
+        split uses them; default callers keep the plain affine costs.
+        """
         target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
                                   else self._kv_cache_config)
         use_separate_draft_kv_cache = (
@@ -2119,12 +2220,14 @@ class KvCacheCreator:
             self._kv_cache_manager_cls,
             self._model_engine.model.model_config,
             target_kv_cache_config,
-            use_separate_draft_kv_cache=use_separate_draft_kv_cache)
+            use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost)
         # Estimate the draft component directly so its independently modelled
         # affine intercept is preserved exactly.
         draft_kv = self._get_draft_cache_cost(
             target_kv_cache_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache,
+            include_request_cost=include_request_cost,
         )
         if draft_kv is None:
             return None
@@ -2140,7 +2243,32 @@ class KvCacheCreator:
         target_kv: CacheCost,
         draft_kv: CacheCost,
     ) -> Optional[tuple[int, int]]:
-        """Split *total_budget* into (target_budget, draft_budget) byte shares."""
+        """Split *total_budget* into (target_budget, draft_budget) byte shares.
+
+        Both managers' affine intercepts are reserved first; the remaining
+        (slope) budget is weighed by slope-funded per-request spend
+        (``CacheCost.bytes_per_request``, which excludes the retention the
+        intercept already pays) when both managers report it, and by per-token
+        cost otherwise. The per-token weighting hands both pools the same token
+        capacity, which under-budgets the draft pool whenever the target bounds
+        retention with windows the intercept does not carry while every draft
+        mirror is reserved at the request's full context length: the draft pool
+        then caps concurrency while the target pool sits mostly idle. Weighting
+        by the uncovered per-request spend sizes both pools for the same
+        worst-case request count instead.
+
+        Under per-request weighting the draft share is additionally capped at
+        ``max_batch_size`` full-length mirrors — the pool can never hold more
+        than the scheduler admits, so any excess share stays with the target —
+        using the per-mirror allocator quota (``CacheCost.quota_per_request``:
+        resume-utilization headroom and allocation granularity included) when
+        the manager reports it. That quota also floors the draft share: the
+        allocator raises any smaller quota at construction regardless of the
+        split, so assigning less would silently overcommit the target's share.
+        A floor that does not fit in the budget remaining after both
+        intercepts makes the split infeasible (``None``), like an unfundable
+        fixed cost; flooring anyway would push the target below its intercept.
+        """
         intercept_total = target_kv.intercept + draft_kv.intercept
         slope_budget = total_budget - intercept_total
         slope_total = target_kv.slope + draft_kv.slope
@@ -2156,8 +2284,48 @@ class KvCacheCreator:
                 f"the fixed cache cost {intercept_total}; cannot split "
                 f"between target and draft with a per-token cache cost.")
             return None
-        draft_slope_share = (slope_budget * draft_kv.slope //
-                             slope_total if slope_total > 0 else 0)
+        per_request_weighted = (target_kv.bytes_per_request is not None
+                                and draft_kv.bytes_per_request is not None
+                                and target_kv.bytes_per_request +
+                                draft_kv.bytes_per_request > 0)
+        if per_request_weighted:
+            target_weight = target_kv.bytes_per_request
+            draft_weight = draft_kv.bytes_per_request
+        else:
+            target_weight = target_kv.slope
+            draft_weight = draft_kv.slope
+        weight_total = target_weight + draft_weight
+        draft_slope_share = (slope_budget * draft_weight //
+                             weight_total if weight_total > 0 else 0)
+        if per_request_weighted and self._max_batch_size > 0:
+            # Cap in allocator-quota units when known: the usable-bytes
+            # estimate under-reserves by the resume-utilization headroom and
+            # the allocation granularity the runtime rounds each pool to.
+            draft_bytes_per_mirror = (draft_kv.quota_per_request
+                                      if draft_kv.quota_per_request is not None
+                                      else draft_kv.bytes_per_request)
+            max_useful_draft_bytes = (self._max_batch_size *
+                                      draft_bytes_per_mirror)
+            draft_slope_share = min(draft_slope_share, max_useful_draft_bytes)
+        if draft_kv.quota_per_request is not None:
+            if draft_kv.quota_per_request > slope_budget:
+                # The allocator will raise the draft quota to this one-request
+                # floor at construction regardless of the split, so a budget
+                # that cannot fund it alongside both intercepts is infeasible,
+                # exactly like an unfundable fixed cost. Flooring anyway would
+                # silently push the target below its intercept.
+                logger.warning(
+                    f"KV cache budget {total_budget} cannot fund the draft "
+                    f"manager's minimum allocator quota "
+                    f"({draft_kv.quota_per_request} bytes for one max-length "
+                    f"request) beyond the fixed cache cost {intercept_total}; "
+                    f"cannot split between target and draft.")
+                return None
+            # The allocator raises any smaller quota to this one-request floor
+            # at construction regardless of the split, so assigning less would
+            # silently overcommit the target's share.
+            draft_slope_share = max(draft_slope_share,
+                                    draft_kv.quota_per_request)
         draft_budget = draft_kv.intercept + draft_slope_share
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
@@ -2202,7 +2370,7 @@ class KvCacheCreator:
             return target_kv_cache_config, draft_kv_cache_config
 
         cache_costs = self._get_target_and_draft_cache_costs(
-            target_kv_cache_config)
+            target_kv_cache_config, include_request_cost=True)
         if cache_costs is None:
             return target_kv_cache_config, draft_kv_cache_config
         target_kv, draft_kv = cache_costs
@@ -2211,7 +2379,10 @@ class KvCacheCreator:
         # state; it does not consume host offload memory. When splitting a
         # non-GPU budget (e.g. host_cache_size), drop the intercept so the split
         # stays proportional to the per-token (slope) cost instead of being
-        # spuriously starved by a GPU-only fixed cost.
+        # spuriously starved by a GPU-only fixed cost. The per-request
+        # estimates are dropped with it: only the GPU pool caps live
+        # concurrency and only its allocator enforces quota floors, so offload
+        # tiers keep the per-token proportional split.
         if budget_attr != "max_gpu_total_bytes":
             target_kv = CacheCost(slope=target_kv.slope)
             draft_kv = CacheCost(slope=draft_kv.slope)
@@ -4137,8 +4308,14 @@ def instantiate_sampler(
         return get_spec_decoder(sampler_args, engine.spec_config)
 
     if mm_encoder_only:
-        # NOTE: handle model outputs specially for mm encoder executor/engine
-        return EarlyStopWithMMResult()
+        # NOTE: handle model outputs specially for mm encoder executor/engine.
+        # Only export results on ranks whose responses reach the frontend
+        # (see PyExecutor._enqueue_responses): rank 0, plus the attention-DP
+        # ranks gathered into it. A CUDA IPC handle exported on any other rank
+        # is never opened, so PyTorch would never release its allocation.
+        returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
+                                                  and 0 in mapping.tp_group)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

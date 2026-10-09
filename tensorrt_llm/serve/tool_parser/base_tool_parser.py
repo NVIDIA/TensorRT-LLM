@@ -72,7 +72,9 @@ class BaseToolParser(ABC):
     # on the named-choice path instead of passing raw text through.
     extracts_forced_tool_calls: bool = False
     # True when parse_streaming_increment plus finish deliver exactly the calls
-    # detect_and_parse finds, however the text is split into increments.
+    # detect_and_parse finds, however the text is split into increments. A
+    # serving path may then take the streamed calls as final instead of
+    # re-parsing the whole text at the end of the stream.
     streaming_matches_whole_parse: bool = False
 
     def __init__(self):

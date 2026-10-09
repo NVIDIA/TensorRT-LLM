@@ -681,6 +681,43 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
 
+    def test_hyphenated_function_name(self):
+        """Test that function names containing hyphens are parsed."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="get-weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string"
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        tool_call = ('<|tool_call_begin|>functions.get-weather:0'
+                     '<|tool_call_argument_begin|>{"location":"Tokyo"}'
+                     '<|tool_call_end|>')
+
+        result = KimiK2ToolParser().detect_and_parse(
+            '<|tool_calls_section_begin|>' + tool_call +
+            '<|tool_calls_section_end|>', tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "Tokyo"}
+
+        parser = KimiK2ToolParser()
+        parser.parse_streaming_increment('<|tool_calls_section_begin|>', tools)
+        result = parser.parse_streaming_increment(tool_call, tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get-weather"
+
 
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
@@ -1899,6 +1936,22 @@ def test_deepseek_streaming_preserves_withheld_text(
     assert streamed == expected, f"Expected {expected!r}, got {streamed!r}"
     assert parser_cls().detect_and_parse(expected,
                                          sample_tools).normal_text == expected
+
+
+@pytest.mark.parametrize(
+    "parser_cls",
+    [DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser])
+def test_deepseek_streaming_keeps_markdown_fences(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """Content without tool-call markup is streamed verbatim."""
+    text = "Here is the code:\n```python\nprint(1)\n```\nDone."
+
+    streamed = parser_cls().parse_streaming_increment(text,
+                                                      sample_tools).normal_text
+
+    assert streamed == text, f"Expected {text!r}, got {streamed!r}"
+    assert parser_cls().detect_and_parse(text, sample_tools).normal_text == text
 
 
 @pytest.mark.parametrize(
@@ -5736,13 +5789,15 @@ MANGLED_NAMES = [
     ("my_exec_command", "my_exec_command"),
 ]
 
-# Prose and code that mention a declared tool; never repaired into a call to it.
+# Prose and code in the name position, mostly mentioning a declared tool; none
+# is a call.
 PROSE_NAMES = [
     "ops_check - re-querying for current status. Since my last report",
     "exec_command depended on the tools. Let me use the correct approach",
     "exec_sudo_command onCompleteCommand=\"export SKILLS_DIR=/x\"",
     "collaboration.immediately_agent(\"target\" => \"/root/builder\")",
     "exec_command(cmd=\"cat /workspace/kernel.cu\"",
+    "exec command",
 ]
 
 
@@ -6006,13 +6061,14 @@ class TestGlmStreamingMatchesWholeParse:
         assert calls == [(delivered, dict(cmd="ls -la /workspace"))]
 
     @pytest.mark.parametrize("prose", PROSE_NAMES)
-    def test_prose_is_never_repaired_into_a_call(self, parser_cls, prose):
-        text = _glm_call(parser_cls, prose, ("cmd", "ls"))
+    @pytest.mark.parametrize("pairs", [[("cmd", "ls")], []],
+                             ids=["with arguments", "without arguments"])
+    def test_a_prose_name_is_released_as_text(self, parser_cls, prose, pairs):
+        text = _glm_call(parser_cls, prose, *pairs)
 
-        _, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+        normal, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
 
-        declared = {tool.function.name for tool in AGENT_TOOLS}
-        assert not {name for name, _ in calls} & declared
+        assert (normal, calls) == (text, [])
 
     def test_a_bare_name_is_typed_by_its_qualified_declaration(
             self, parser_cls):
@@ -6030,9 +6086,13 @@ class TestGlmStreamingMatchesWholeParse:
                           dict(cmd="8000", max_output_tokens=8000))]
 
     def test_a_long_separator_run_streams_in_linear_time(self, parser_cls):
-        """A long run of literal backslash-n separators, two per increment."""
+        """A long run of literal backslash-n separators, two per increment.
+
+        A linear parse takes a fraction of a second; one that rescans the
+        buffer on every increment takes tens of seconds, well past the bound.
+        """
         text = _glm_raw_call(parser_cls, "f",
-                             _glm_pairs(("code", "ls")) + "\\n" * 20000)
+                             _glm_pairs(("code", "ls")) + "\\n" * 40000)
         chunks = [text[i:i + 2] for i in range(0, len(text), 2)]
         start = time.monotonic()
 

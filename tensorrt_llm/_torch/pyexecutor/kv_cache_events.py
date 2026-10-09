@@ -39,11 +39,13 @@ import zmq
 
 from tensorrt_llm.llmapi.llm_args import KVEventsConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEvent, KVCacheEventDiff
+from tensorrt_llm.runtime import kv_cache_manager_v2 as kv_cache_manager_v2_runtime
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEvent
 
 # Subscribers decode block hashes as 64-bit ints, so a bytes value would fail the
 # decode for the entire batch.
 ExternalBlockHash = int
+EventTokenId = int | str
 
 
 class EventBatch(
@@ -68,12 +70,24 @@ class KVCacheWireEvent(
     """Base class for KV cache event wire messages."""
 
 
+class MultimodalKey(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+    tag="mm_key",
+):
+    """One continuous multimodal segment within a stored block."""
+
+    hash: str
+    start_offset: int
+
+
 class BlockStored(KVCacheWireEvent):
     """A sequence of full KV cache blocks was stored."""
 
     block_hashes: list[ExternalBlockHash]
     parent_block_hash: ExternalBlockHash | None
-    token_ids: list[int]
+    token_ids: list[EventTokenId]
     block_size: int
     lora_id: int | None
     medium: str | None
@@ -83,6 +97,8 @@ class BlockStored(KVCacheWireEvent):
     kv_cache_spec_kind: str | None = None
     kv_cache_spec_sliding_window: int | None = None
     locality: str | None = None
+    # Aligned one-for-one with block_hashes when multimodal decoding is enabled.
+    mm_keys: list[list[MultimodalKey]] | None = None
 
 
 class BlockRemoved(KVCacheWireEvent):
@@ -406,24 +422,12 @@ def validate_streaming_support(
     Split out of ``KVCacheManagerV2.__init__`` so the preconditions are testable
     without building a manager, which needs a GPU.
 
-    Streaming is currently unsupported, so this always raises; ``config``,
-    ``ranks_per_host`` and ``data_parallel_size`` are retained for the caller's
-    signature and are consumed again once a native event sink exists.
     """
-    del config, ranks_per_host, data_parallel_size
     if pp_size > 1:
         raise ValueError("Streaming KV events do not support pipeline parallelism")
     if cp_size > 1:
         raise ValueError("Streaming KV events do not support context parallelism")
-    # StreamingKVCacheEventManager is a duck-typed Python event sink. It cannot satisfy the
-    # nanobind constructor's nb::cast<std::shared_ptr<kv::EventManager>>, and the C++ radix
-    # tree calls its sink natively rather than through Python, so there is no live path that
-    # can produce streaming events. Fail with an actionable message pointing at the buffered
-    # alternative instead of an opaque TypeError from the cast.
-    raise ValueError(
-        "Streaming KV events (kv_cache_config.kv_events_config) are not supported. Use the "
-        "buffered path via kv_cache_config.event_buffer_max_size instead."
-    )
+    validate_endpoint_ranges(config, ranks_per_host, data_parallel_size)
 
 
 def validate_endpoint_ranges(
@@ -494,19 +498,67 @@ def create_event_publisher(config: KVEventsConfig, data_parallel_rank: int) -> E
     raise ValueError(f"Unsupported KV event publisher: {config.publisher!r}")
 
 
+class _StreamingEventSource:
+    """Own the native sink and translate its semantic DTOs to wire structs."""
+
+    def __init__(
+        self,
+        *,
+        block_size: int,
+        max_entries: int,
+        mm_token_id_offset: int | None,
+    ) -> None:
+        if mm_token_id_offset is not None and mm_token_id_offset < 0:
+            raise ValueError("mm_token_id_offset must be non-negative")
+        self._block_size = block_size
+        self._include_mm_keys = mm_token_id_offset is not None
+        self._event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
+            max_entries=max_entries,
+            mm_token_id_offset=mm_token_id_offset,
+        )
+
+    @property
+    def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
+        return self._event_sink
+
+    def set_target_life_cycle(self, life_cycle_id: int) -> None:
+        self._event_sink.set_target_life_cycle(life_cycle_id)
+
+    def drain_events(self) -> list[BlockStored | BlockRemoved | AllBlocksCleared]:
+        result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
+        for event in self._event_sink.drain_iteration_events():
+            if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
+                result.append(
+                    BlockStored(
+                        block_hashes=list(event.block_hashes),
+                        parent_block_hash=event.parent_block_hash,
+                        token_ids=list(event.token_ids),
+                        block_size=self._block_size,
+                        lora_id=event.lora_id,
+                        medium="GPU",
+                        lora_name=None,
+                        mm_keys=(
+                            [
+                                [
+                                    MultimodalKey(hash=bytes(key[0]).hex(), start_offset=key[1])
+                                    for key in block_keys
+                                ]
+                                for block_keys in event.mm_keys
+                            ]
+                            if self._include_mm_keys
+                            else None
+                        ),
+                    )
+                )
+            elif isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockRemovedData):
+                result.append(BlockRemoved(block_hashes=list(event.block_hashes), medium="GPU"))
+            else:
+                raise TypeError(f"Unsupported native streaming KV event: {type(event)!r}")
+        return result
+
+
 class StreamingKVCacheEventManager:
-    """Event-sink hook interface for out-of-band KV cache event publishing.
-
-    The interface is duck typed rather than derived from ``KVCacheEventManager``: a sink
-    fully replaces event production (reusing the radix block hashes) and shares none of
-    the base manager's state.
-
-    No implementation is currently wired up. The C++ radix tree invokes its sink natively
-    rather than through Python, so a Python object cannot receive these callbacks; the
-    signatures below record the contract a native sink must satisfy. Constructing this
-    class raises -- ``validate_streaming_support`` rejects the configuration earlier, so
-    reaching here means that check was bypassed.
-    """
+    """Publish iteration batches captured by the native streaming event sink."""
 
     def __init__(
         self,
@@ -516,49 +568,104 @@ class StreamingKVCacheEventManager:
         block_size: int,
         max_window_size: int,
         max_entries: int = 50_000,
+        mm_token_id_offset: int | None = None,
     ) -> None:
-        raise NotImplementedError(
-            "Streaming KV events are not supported. Use the buffered path via "
-            "kv_cache_config.event_buffer_max_size instead."
+        self._rank = data_parallel_rank
+        self._publisher = create_event_publisher(config, data_parallel_rank)
+        self._max_window_size = max_window_size
+        self._event_source = _StreamingEventSource(
+            block_size=block_size,
+            max_entries=max_entries,
+            mm_token_id_offset=mm_token_id_offset,
         )
+        self._closed = False
+        self.enqueued_batches = 0
+        self.enqueued_events = 0
+        self.dropped_batches = 0
 
-    def needs_token_digest_context(self) -> bool:
-        # Streaming events do not emit multimodal keys.
-        return False
+    @property
+    def stored_blocks(self) -> int:
+        return self.event_sink.stats.stored_blocks
+
+    @property
+    def removed_blocks(self) -> int:
+        return self.event_sink.stats.removed_blocks
+
+    @property
+    def partial_blocks_suppressed(self) -> int:
+        return self.event_sink.stats.partial_blocks_suppressed
+
+    @property
+    def non_target_life_cycles_ignored(self) -> int:
+        return self.event_sink.stats.non_target_life_cycles_ignored
+
+    @property
+    def dropped_events(self) -> int:
+        return self.event_sink.stats.dropped_events
 
     def start(self) -> None:
         """Bind the publisher's sockets and start its background thread."""
+        self._publisher.start()
 
     def set_layer_group_window_sizes(self, window_sizes: dict[int, int]) -> None:
-        """Select the attention life cycle whose blocks are published."""
+        target_ids = [
+            int(life_cycle_id)
+            for life_cycle_id, window_size in window_sizes.items()
+            if int(window_size) == self._max_window_size
+        ]
+        if not target_ids and window_sizes:
+            largest_window = max(window_sizes.values())
+            target_ids = [
+                int(life_cycle_id)
+                for life_cycle_id, window_size in window_sizes.items()
+                if window_size == largest_window
+            ]
+        if not target_ids:
+            raise ValueError("Streaming KV events require an attention KV cache life cycle")
+        target_life_cycle_id = min(target_ids)
+        self._event_source.set_target_life_cycle(target_life_cycle_id)
+        logger.info(
+            "Streaming KV event fast path selected "
+            f"lifecycle_id={target_life_cycle_id} "
+            f"window_size={self._max_window_size}"
+        )
 
     def add_created_event(
         self,
         num_blocks_per_cache_level: Any,
         layer_group_ids: Any = None,
-    ) -> None: ...
-
-    def add_stored_event(self, *args: Any, **kwargs: Any) -> None: ...
-
-    def add_stored_block_event_from_block(self, block: Any) -> None: ...
-
-    def add_stored_life_cycle_event_from_block(self, block: Any, life_cycle_id: int) -> None: ...
-
-    def add_removed_event(self, block_hashes: Any) -> None: ...
-
-    def add_removed_life_cycle_event(self, block_hash: bytes, life_cycle_id: int) -> None: ...
-
-    def add_updated_event(
-        self,
-        block_hash: Any,
-        *,
-        cache_level: KVCacheEventDiff | None = None,
-        priority: KVCacheEventDiff | None = None,
-        layer_group_id: int | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Accept the common manager notification; streaming publishes no creation event."""
+        return
 
     def flush_iteration_events(self) -> None:
-        """Publish the events accumulated during this iteration."""
+        if self._closed:
+            return
+        events = self._event_source.drain_events()
+        if not events:
+            return
+        batch = KVEventBatch(
+            ts=time.time(),
+            events=events,
+            data_parallel_rank=self._rank,
+        )
+        try:
+            if self._publisher.publish(batch):
+                self.enqueued_batches += 1
+                self.enqueued_events += len(events)
+            else:
+                self.dropped_batches += 1
+        except Exception:
+            self.dropped_batches += 1
+            logger.error(
+                f"Dropping streaming KV event iteration batch on rank={self._rank}\n"
+                f"{traceback.format_exc()}"
+            )
+
+    @property
+    def event_sink(self) -> kv_cache_manager_v2_runtime.StreamingEventSink:
+        """Return the native sink installed in KVCacheManager."""
+        return self._event_source.event_sink
 
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]:
         # Streaming publishing pushes events out-of-band, so the pull API has
@@ -567,4 +674,20 @@ class StreamingKVCacheEventManager:
         return []
 
     def shutdown(self) -> None:
-        """Flush pending events and stop the publisher."""
+        if self._closed:
+            return
+        self.flush_iteration_events()
+        self._closed = True
+        self._publisher.shutdown()
+        stats = self.event_sink.stats
+        logger.info(
+            "Streaming KV event fast path "
+            f"rank={self._rank} "
+            f"stored_blocks={stats.stored_blocks} "
+            f"removed_blocks={stats.removed_blocks} "
+            f"partial_blocks_suppressed={stats.partial_blocks_suppressed} "
+            f"non_target_life_cycles_ignored={stats.non_target_life_cycles_ignored} "
+            f"dropped_events={stats.dropped_events} "
+            f"enqueued_batches={self.enqueued_batches} "
+            f"dropped_batches={self.dropped_batches}"
+        )
