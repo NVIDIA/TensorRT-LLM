@@ -30,7 +30,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //
 // Memory is:
 //   - Anonymous private mmap
-//   - Advised according to TLLM_KV_CACHE_MANAGER_V2_THP
+//   - Advised MADV_NOHUGEPAGE, or MADV_HUGEPAGE when TLLM_KV_CACHE_MANAGER_V2_THP=1
 //   - Optionally prefaulted in parallel before CUDA registration
 //   - Registered to CUDA as page-locked (CU_MEMHOSTREGISTER_DEVICEMAP)
 //

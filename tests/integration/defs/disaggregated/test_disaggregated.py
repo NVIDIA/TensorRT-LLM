@@ -2915,11 +2915,19 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Four context workers and a TP4 Eagle3 generation worker warm up on one
+    # node at once. On B200 the per-worker autotuner warmup alone takes ~130s
+    # and the TP4 generation worker is still autotuning at the 300s default
+    # (nvbugs/6888251: 4/5 workers registered at the deadline), so use the
+    # 1200s budget the other Blackwell disagg tests use; a real hang still
+    # fails at 1200s.
+    server_start_timeout = 1200 if get_sm_version() in (100, 103) else 300
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=server_start_timeout)
 
 
 @pytest.mark.timeout(12600)
