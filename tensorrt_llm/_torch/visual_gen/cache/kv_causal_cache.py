@@ -458,14 +458,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
                     f"KVCacheManagerV2 could not back {self._pool_pages} pages for the rollout"
                 )
         except Exception:
-            self._release(kv_cache)
+            self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
 
         total_pages = num_pages + num_private
         # V2 owns and may rewrite that buffer: copy it.
         pages = np.array(kv_cache.get_base_page_indices(0), dtype=np.int64)[:total_pages]
         if pages.size != total_pages or pages.min() < 0:
-            self._release(kv_cache)
+            self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise RuntimeError(f"expected {total_pages} backed pages, got {pages}")
         # Logical order is ours to choose. Ascending keeps consecutive page ids
         # consecutive after rotation whenever V2 handed out a contiguous range, which
@@ -481,7 +481,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         page_bytes = buf[0].numel() * buf.element_size()
         for layer, layer_buf in enumerate(buffers):
             if layer_buf is None or layer_buf.data_ptr() != buf.data_ptr() + layer * page_bytes:
-                self._release(kv_cache)
+                self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
                 raise RuntimeError("K/V pool layout changed: layers are not page-interleaved")
         self._buffers = buffers
         self._kv_cache = kv_cache
@@ -502,7 +502,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             # forget the half-built state, so the caller can retry.
             self._kv_cache = None
             self._buffers = []
-            self._release(kv_cache)
+            self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
 
     def _lay_out(
@@ -559,18 +559,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def close(self) -> None:
         if self._kv_cache is None:
             return
-        kv_cache, self._kv_cache = self._kv_cache, None
+        self._kv_cache = None
         # Device state outlives the sequence so that forwards captured in a CUDA
         # graph before close() stay valid after the next open().
         self._block_offsets_size = None
-        self._release(kv_cache)
-
-    def _release(self, kv_cache) -> None:
-        self.kv_cache_map.pop(_ROLLOUT_REQUEST_ID, None)
-        kv_cache.discard_pending_stats()
-        kv_cache.close()
-        self.impl.clear_stats_excluded(_ROLLOUT_REQUEST_ID)
-        self.index_mapper.remove_sequence(_ROLLOUT_REQUEST_ID)
+        self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
 
     def shutdown(self) -> None:
         self.close()
