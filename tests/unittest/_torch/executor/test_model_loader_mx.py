@@ -439,8 +439,11 @@ def _tiny_phi3_model(
     rope_scaling: dict[str, object] | None = None,
     tie_word_embeddings: bool = False,
 ) -> nn.Module:
-    # Defaults mirror the Phi-4 checkpoint structure: GQA attention, bias-free
-    # fused QKV and gate-up projections, default RoPE, and untied embeddings.
+    """Build a tiny deterministic `Phi3ForCausalLM` for the staged-lifecycle tests.
+
+    Defaults mirror the Phi-4 checkpoint structure: GQA attention, bias-free
+    fused QKV and gate-up projections, default RoPE, and untied embeddings.
+    """
     phi3_config = Phi3Config(
         architectures=["Phi3ForCausalLM"],
         attention_bias=False,
@@ -486,6 +489,11 @@ def _tiny_phi3_model(
 
 
 def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    """Return the runtime config a qualified BF16 dense tiny model realizes at TP1.
+
+    Keyword arguments override individual fields, for example the TP sizes of a
+    TP2 rank or a dimension that a negative test expects the registry to reject.
+    """
     values = {
         "dtype": "bfloat16",
         "quant_algorithm": "none",
@@ -566,6 +574,7 @@ def _mistral_layout_state(model: nn.Module) -> dict[str, object]:
 
 
 def _phi3_layout_state(model: nn.Module) -> dict[str, object]:
+    """Return the Phi3 layout and derived state that a staged receiver must reproduce."""
     layer = model.model.layers[0]
     return {
         "attention_type": type(layer.self_attn).__name__,
@@ -797,6 +806,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
 
 
 def _repository_text(relative_path: str) -> str:
+    """Read a text file given its path relative to the repository root."""
     return (Path(__file__).parents[4] / relative_path).read_text(encoding="utf-8")
 
 
@@ -852,6 +862,12 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
 
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
+    """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
+
+    The `_MX_CASES` rows must follow the shared naming scheme, and
+    `l0_model_express.yml` must list each row in the block whose GPU count
+    matches the row's two TP groups.
+    """
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
@@ -877,6 +893,12 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
 
 @pytest.mark.cpu_only
 def test_documentation_prose_matches_qualified_profile_registry() -> None:
+    """The ModelExpress doc names exactly the families, cases, and overrides in the registry.
+
+    Checks the text-only family list, the fused-RoPE family list, the
+    limitations list, and the case IDs and `TRTLLM_MX_*_MODEL` variables named
+    in the "Qualification Test" section.
+    """
     profiles = ModelLoader._post_transform_profile_registry().profiles
     families = {profile.architecture.removesuffix("ForCausalLM") for profile in profiles}
     fused_rope_families = {
@@ -1584,6 +1606,7 @@ def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
 
 
 def test_phi3_dense_profile_qualifies_full_staged_lifecycle() -> None:
+    """A TP1 Phi3 staged receiver matches the full post-load producer and qualifies."""
     case = PostTransformQualificationCase(
         profile_id="phi3-for-causal-lm-bf16-target-v1",
         model_factory=_tiny_phi3_model,
@@ -1632,6 +1655,7 @@ def test_phi3_dense_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
 ) -> None:
+    """Each TP2 rank's Phi3 staged receiver matches its full post-load producer."""
     monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
     monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
     case = PostTransformQualificationCase(
@@ -1669,7 +1693,7 @@ def test_phi3_dense_profile_qualifies_tp2_rank_lifecycle(
 
 
 def test_phi3_dense_profile_rejects_unregistered_subclass_root() -> None:
-    # An otherwise identical subclass must not inherit the exact-root profile.
+    """An otherwise identical subclass must not inherit the exact-root profile."""
     decision = ModelLoader._qualify_post_transform_profile(
         _tiny_phi3_model(model_class=_UnqualifiedPhi3ForCausalLM),
         speculative_mode=None,
@@ -1681,8 +1705,11 @@ def test_phi3_dense_profile_rejects_unregistered_subclass_root() -> None:
 
 
 def test_phi3_dense_profile_realizes_configured_window_as_full_attention() -> None:
-    # Phi-3 4k checkpoints configure `sliding_window`, but the Phi3 root runs
-    # full attention, so their realized runtime matches the qualified profile.
+    """A configured `sliding_window` still realizes full attention and qualifies.
+
+    Phi-3 4k checkpoints configure `sliding_window`, but the Phi3 root runs full
+    attention, so their realized runtime matches the qualified profile.
+    """
     model = _tiny_phi3_model(sliding_window=8)
 
     decision = ModelLoader._qualify_post_transform_profile(
@@ -1723,6 +1750,7 @@ def test_phi3_dense_profile_rejects_longrope_and_tied_embedding_variants(
     variant: dict[str, object],
     expected_dimension: str,
 ) -> None:
+    """LongRoPE and tied-embedding Phi3 variants fall outside the profile's constraints."""
     model = _tiny_phi3_model(**variant)
 
     decision = ModelLoader._qualify_post_transform_profile(
@@ -1737,8 +1765,11 @@ def test_phi3_dense_profile_rejects_longrope_and_tied_embedding_variants(
 
 
 def test_phi3_source_identity_binds_runtime_max_seq_len() -> None:
-    # Phi3Attention records the runtime `max_seq_len` in the pretrained config,
-    # which SourceIdentity hashes, so a donor and a receiver must agree on it.
+    """Phi3 donors and receivers with different `max_seq_len` values do not share.
+
+    `Phi3Attention` records the runtime `max_seq_len` in the pretrained config,
+    which `SourceIdentity` hashes, so a donor and a receiver must agree on it.
+    """
     identities = []
     for max_seq_len in (16, 32):
         model = _tiny_phi3_model(max_seq_len=max_seq_len)
@@ -1760,7 +1791,11 @@ def test_phi3_source_identity_binds_runtime_max_seq_len() -> None:
 
 @pytest.mark.cpu_only
 def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
-    # Phi4MM builds a nested Phi3ForCausalLM language model under its own root.
+    """The Phi4MM root does not qualify through its nested Phi3 language model.
+
+    Phi4MM builds a nested `Phi3ForCausalLM` language model under its own root,
+    and qualification matches the outer root class.
+    """
     phi4mm_root = get_registered_model_class("Phi4MMForCausalLM")
     assert phi4mm_root is not None
 
@@ -1895,6 +1930,7 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
+    """Each dense profile rejects runtime variants outside its qualified constraints."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -1975,6 +2011,7 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
     realized_overrides: dict[str, object],
     expected_dimension: str,
 ) -> None:
+    """Each dense profile rejects a realized RoPE fusion or window it was not qualified for."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -2059,6 +2096,7 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
+    """Dense profiles still qualify when only MoE-specific runtime dimensions differ."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,

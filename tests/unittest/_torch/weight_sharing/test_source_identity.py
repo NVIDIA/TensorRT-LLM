@@ -86,6 +86,7 @@ def test_from_model_config_requires_one_artifact_source() -> None:
     ],
 )
 def test_from_model_config_binds_transform_abi(transform_abi_id: str) -> None:
+    """Each published transform-layout ABI is bound into the generated identity."""
     identity = SourceIdentity.from_model_config(
         FakeModelConfig(),
         artifact_identity=make_artifact_identity(),
@@ -393,6 +394,7 @@ def test_phi3_transform_abi_shares_only_with_the_same_abi(
     should_share: bool,
     policy: IdentityCheckPolicy,
 ) -> None:
+    """A Phi3-ABI receiver shares only with a same-ABI donor, under either policy."""
     local = identity_from(
         FakeModelConfig(),
         transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
