@@ -494,6 +494,13 @@ class GuidedDecoder:
     def init_disagg_gen_requests(self) -> None:
         self._init_disagg_gen_requests(self.requests)
 
+    @property
+    def has_guided_requests(self) -> bool:
+        """Whether the current batch holds any grammar-constrained request."""
+        if self.requests is None:
+            return False
+        return next(self.requests.valid_requests(), None) is not None
+
 
 class CapturableGuidedDecoder(GuidedDecoder):
 
@@ -559,6 +566,10 @@ class CapturableGuidedDecoder(GuidedDecoder):
                             if runtime_draft_len is None else runtime_draft_len)
         self.requests = GuidedRequests.from_scheduled_requests(
             scheduled_requests, num_draft_tokens)
+        if not self.has_guided_requests:
+            # Each host function is a CUDA callback that must take the GIL;
+            # enqueue none when nothing in the batch is constrained.
+            return
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
@@ -588,6 +599,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute(self,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+        if not self.has_guided_requests:
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
@@ -602,23 +615,38 @@ class CapturableGuidedDecoder(GuidedDecoder):
         self._drain_host_functions()
         return failed_requests
 
+    # @hostfunc launches the callback when called, so the guard must precede it.
     @hostfunc
-    def rollback_rejected_tokens(self) -> None:
+    def _rollback_rejected_tokens_hostfunc(self) -> None:
         self._rollback_rejected_tokens(self.requests_hostfunc)
 
-    @hostfunc
-    def rollback_draft_tokens(self) -> None:
-        self._rollback_draft_tokens(self.requests_hostfunc)
+    def rollback_rejected_tokens(self) -> None:
+        if self.has_guided_requests:
+            self._rollback_rejected_tokens_hostfunc()
 
     @hostfunc
-    def init_disagg_gen_requests(self) -> None:
+    def _rollback_draft_tokens_hostfunc(self) -> None:
+        self._rollback_draft_tokens(self.requests_hostfunc)
+
+    def rollback_draft_tokens(self) -> None:
+        if self.has_guided_requests:
+            self._rollback_draft_tokens_hostfunc()
+
+    @hostfunc
+    def _init_disagg_gen_requests_hostfunc(self) -> None:
         self._init_disagg_gen_requests(self.requests_hostfunc)
+
+    def init_disagg_gen_requests(self) -> None:
+        if self.has_guided_requests:
+            self._init_disagg_gen_requests_hostfunc()
 
     @nvtx_range("GuidedDecoder.add_draft_batch")
     def add_draft_batch(self,
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
                         draft_step: int = 0) -> None:
+        if not self.has_guided_requests:
+            return
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
@@ -697,6 +725,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
             num_accepted_tokens: Int32 tensor of shape [batch_size], including
                 the bonus token in each verification count.
         """
+        if not self.has_guided_requests:
+            return
         self.add_accepted_batch(num_accepted_tokens)
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
@@ -711,6 +741,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
                             draft_step: int = 0) -> List[Tuple[int, str]]:
+        if not self.has_guided_requests:
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
