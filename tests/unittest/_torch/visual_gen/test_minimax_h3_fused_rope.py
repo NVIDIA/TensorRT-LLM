@@ -238,3 +238,26 @@ def test_fused_qk_norm_rope_rejects_invalid_inputs(invalid):
         assert weight_q.shape == (HEAD_DIM,) and not weight_q.is_contiguous()
     with pytest.raises(ValueError):
         apply_minimax_h3_qk_norm_rope_bf16(qkv, weight_q, weight_k, cos, sin, 1e-5, heads, head_dim)
+
+
+@requires_cuda
+@pytest.mark.parametrize("invalid", ["weight_shape", "columns", "strided"])
+def test_custom_op_validates_inputs_without_the_wrapper(invalid):
+    """Direct ``torch.ops.trtllm`` callers get the same ``ValueError`` as the wrapper."""
+    qkv, weight_q, weight_k, cos, sin = _packed_inputs(1, 7, 8, 96, torch.float32)
+    if invalid == "weight_shape":
+        weight_q = weight_q[:64]
+    elif invalid == "columns":
+        qkv = qkv[..., : 8 * HEAD_DIM]
+    elif invalid == "strided":
+        qkv = qkv.expand(2, -1, -1)
+    with pytest.raises(ValueError):
+        torch.ops.trtllm.minimax_h3_qk_norm_rope(
+            qkv, weight_q, weight_k, cos, sin, 1e-5, 8, HEAD_DIM
+        )
+    # The fake kernel validates too, so torch.compile reports the contract at trace time
+    # (Dynamo wraps the fake kernel's ValueError in its own error type).
+    with pytest.raises((ValueError, torch._dynamo.exc.TorchRuntimeError), match="H3|qkv"):
+        torch.compile(torch.ops.trtllm.minimax_h3_qk_norm_rope, fullgraph=True)(
+            qkv, weight_q, weight_k, cos, sin, 1e-5, 8, HEAD_DIM
+        )

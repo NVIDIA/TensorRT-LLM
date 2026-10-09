@@ -170,34 +170,6 @@ def launch_minimax_h3_qk_norm_rope(
         )
 
 
-@torch.library.custom_op("trtllm::minimax_h3_qk_norm_rope", mutates_args=(), device_types="cuda")
-def _minimax_h3_qk_norm_rope_op(
-    qkv: torch.Tensor,
-    weight_q: torch.Tensor,
-    weight_k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    eps: float,
-    num_heads: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Opaque custom op around the Triton launch (one node under torch.compile)."""
-    hd = num_heads * head_dim
-    batch, seq = qkv.shape[:2]
-    q = torch.empty((batch, seq, hd), dtype=qkv.dtype, device=qkv.device)
-    k = torch.empty((batch, seq, hd), dtype=qkv.dtype, device=qkv.device)
-    launch_minimax_h3_qk_norm_rope(
-        qkv, q, k, weight_q, weight_k, cos, sin, eps, num_heads, head_dim
-    )
-    return q, k
-
-
-@_minimax_h3_qk_norm_rope_op.register_fake
-def _(qkv, weight_q, weight_k, cos, sin, eps, num_heads, head_dim):
-    hd = num_heads * head_dim
-    return qkv.new_empty((*qkv.shape[:2], hd)), qkv.new_empty((*qkv.shape[:2], hd))
-
-
 def validate_minimax_h3_qk_norm_rope_inputs(
     qkv: torch.Tensor,
     weight_q: torch.Tensor,
@@ -207,7 +179,11 @@ def validate_minimax_h3_qk_norm_rope_inputs(
     num_heads: int,
     head_dim: int,
 ) -> None:
-    """Raise ``ValueError`` unless the inputs satisfy the kernel's contract."""
+    """Raise ``ValueError`` unless the tensors satisfy the kernel's contract.
+
+    Runs inside the custom op and its fake kernel. Autograd is rejected by the wrapper
+    because grad mode is already off by the time the op body runs.
+    """
     if qkv.ndim != 3:
         raise ValueError("H3 fused QK-norm RoPE expects packed qkv [batch, sequence, columns]")
     if not qkv.is_cuda or qkv.dtype != torch.bfloat16:
@@ -240,10 +216,40 @@ def validate_minimax_h3_qk_norm_rope_inputs(
     for table in (cos, sin):
         if table.device != qkv.device or table.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("H3 RoPE tables must be FP32 or BF16 on the qkv device")
-    if torch.is_grad_enabled() and any(
-        t.requires_grad for t in (qkv, weight_q, weight_k, cos, sin)
-    ):
-        raise ValueError("H3 fused QK-norm RoPE does not support autograd")
+
+
+@torch.library.custom_op("trtllm::minimax_h3_qk_norm_rope", mutates_args=(), device_types="cuda")
+def _minimax_h3_qk_norm_rope_op(
+    qkv: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float,
+    num_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opaque custom op around the Triton launch (one node under torch.compile).
+
+    Validates the tensor contract so direct ``torch.ops.trtllm`` callers get a ``ValueError``
+    instead of a kernel fault.
+    """
+    validate_minimax_h3_qk_norm_rope_inputs(qkv, weight_q, weight_k, cos, sin, num_heads, head_dim)
+    hd = num_heads * head_dim
+    batch, seq = qkv.shape[:2]
+    q = torch.empty((batch, seq, hd), dtype=qkv.dtype, device=qkv.device)
+    k = torch.empty((batch, seq, hd), dtype=qkv.dtype, device=qkv.device)
+    launch_minimax_h3_qk_norm_rope(
+        qkv, q, k, weight_q, weight_k, cos, sin, eps, num_heads, head_dim
+    )
+    return q, k
+
+
+@_minimax_h3_qk_norm_rope_op.register_fake
+def _(qkv, weight_q, weight_k, cos, sin, eps, num_heads, head_dim):
+    validate_minimax_h3_qk_norm_rope_inputs(qkv, weight_q, weight_k, cos, sin, num_heads, head_dim)
+    hd = num_heads * head_dim
+    return qkv.new_empty((*qkv.shape[:2], hd)), qkv.new_empty((*qkv.shape[:2], hd))
 
 
 def apply_minimax_h3_qk_norm_rope_bf16(
@@ -271,7 +277,10 @@ def apply_minimax_h3_qk_norm_rope_bf16(
         Contiguous BF16 ``q`` and ``k`` shaped ``[batch, sequence, heads * dim]``, computed in FP32
         and rounded once; not bit-identical to the eager module, which rounds at every step.
     """
-    validate_minimax_h3_qk_norm_rope_inputs(qkv, weight_q, weight_k, cos, sin, num_heads, head_dim)
+    if torch.is_grad_enabled() and any(
+        t.requires_grad for t in (qkv, weight_q, weight_k, cos, sin)
+    ):
+        raise ValueError("H3 fused QK-norm RoPE does not support autograd")
     return torch.ops.trtllm.minimax_h3_qk_norm_rope(
         qkv, weight_q, weight_k, cos, sin, float(eps), num_heads, head_dim
     )
