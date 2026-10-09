@@ -4898,15 +4898,24 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=0,
         ge=0,
         description=
-        "Capacity in MiB of the native-disagg KV-cache bounce buffer, which "
-        "coalesces a request's scattered per-block KV for a single multi-rail "
-        "NIXL write. The size doubles as the on/off switch: 0 (default) keeps "
-        "the per-block path, >0 enables bounce at that capacity. By default "
-        "two buffers of this size are allocated (one for send, one for recv); "
-        "with agent_bounce_buffer_enable a single shared buffer is allocated "
-        "instead and the size should be a power of two (256/512/1024). "
-        "Requires the Python (v2) transceiver (transceiver_runtime); the C++ "
-        "transceiver does not support bounce and ignores this field.")
+        "Capacity in MiB of the C++ transfer-agent KV-cache bounce buffer. "
+        "The size doubles as the on/off switch: 0 (default) sends KV "
+        "fragments directly with standard NIXL; >0 allocates one buffer of "
+        "this size, shared by send and receive, in the C++ NIXL agent (use a "
+        "power of two such as 256/512/1024; the usable capacity rounds down "
+        "to one). Eligible KV writes are gathered into it, written in chunks "
+        "and scattered on the receiver. By default only writes with many "
+        "small descriptors (>= 1024, <= 16 KiB average, i.e. head-mismatch "
+        "layouts) take that path; agent_bounce_params can relax the gate. "
+        "Enable it on both context and generation (a peer without it gets "
+        "standard NIXL); the size itself must match only when its usable "
+        "capacity is below max_chunk_size, since both sides must then clamp "
+        "to the same chunk cap, otherwise the pair falls back to standard "
+        "NIXL. Requires the Python (v2) transceiver "
+        "(transceiver_runtime) with the C++ NIXL agent built with bounce "
+        "support (libzmq); on a build without it a positive size fails "
+        "agent construction. The C++ transceiver and the pure-Python NIXL "
+        "agent ignore it with a warning.")
 
     enable_pipelined_transfer: bool = Field(
         default=False,
@@ -4914,27 +4923,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Transfer each completed prefill chunk's KV cache while later chunks "
         "compute. Requires Python NIXL, generation-first scheduling, chunked "
         "prefill, pipeline_parallel_size=1, context_parallel_size=1 on both "
-        "peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent "
-        "bounce selected by agent_bounce_buffer_enable is allowed) or "
-        "Mamba/hybrid cache, and block reuse disabled or set to all_reusable. "
-        "Invalid static settings fail at "
-        "startup; per-request constraints reject the request.")
+        "peers, beam_width=1, no Mamba/hybrid cache, and block reuse disabled "
+        "or set to all_reusable. Invalid static settings fail at startup; "
+        "per-request constraints reject the request.")
 
     agent_bounce_buffer_enable: bool = Field(
         default=False,
+        status="deprecated",
         description=
-        "Run the KV-cache bounce in the C++ transfer agent instead of the "
-        "Python transceiver, using one shared kv_cache_bounce_size_mb buffer "
-        "(use a power of two). Set this identically on context and "
-        "generation; kv_cache_bounce_size_mb matters only when its usable "
-        "capacity (rounded down to a power of two) is below max_chunk_size; "
-        "both sides must then clamp to the same chunk cap, otherwise the pair "
-        "falls back to standard NIXL. By default only writes with "
-        "many small descriptors (>= 1024, <= 16 KiB average, i.e. "
-        "head-mismatch layouts) take the path; head-matched layouts (MLA, "
-        "symmetric TP) stay on standard NIXL unless agent_bounce_params "
-        "relaxes the gate. Requires the Python (v2) transceiver; see the "
-        "disaggregated-serving docs.")
+        "DEPRECATED: no-op kept so existing configs still parse; it will be "
+        "removed in a future release. kv_cache_bounce_size_mb > 0 alone "
+        "enables the C++ transfer-agent bounce buffer, and 0 disables it.")
 
     agent_bounce_params: Optional[Dict[str, str]] = Field(
         default=None,
@@ -4943,12 +4942,12 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid "
         "keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). "
         "Precedence: this dict > environment variable > built-in default. "
-        "Requires agent_bounce_buffer_enable. request_timeout_ms and the "
+        "Requires kv_cache_bounce_size_mb > 0. request_timeout_ms and the "
         "effective max_chunk_size (after the arena clamp) must match between "
         "context and generation. "
         "max_average_descriptor_size=0 stops outbound routing only (arena, "
         "handshake and inbound scatter stay active); set "
-        "agent_bounce_buffer_enable=False to turn the feature off.")
+        "kv_cache_bounce_size_mb=0 to turn the feature off.")
 
     @field_validator('agent_bounce_params', mode='before')
     @classmethod
@@ -4964,17 +4963,25 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     @model_validator(mode='after')
     def validate_bounce_config(self) -> 'CacheTransceiverConfig':
-        if self.agent_bounce_buffer_enable and self.kv_cache_bounce_size_mb == 0:
-            raise ValueError(
-                "agent_bounce_buffer_enable selects the C++ transfer-agent "
-                "bounce implementation, but kv_cache_bounce_size_mb is 0 "
-                "(bounce disabled); set a positive capacity.")
+        # Deprecated no-op. Only True is reported: it is the only value that
+        # ever changed behavior, and an unset False becomes indistinguishable
+        # from an explicit one once apply_model_defaults_to_llm_args
+        # re-validates a full model_dump(). That re-validation repeats the
+        # warning in the same process, so it is keyed to print once per
+        # process (still once per rank).
+        if self.agent_bounce_buffer_enable:
+            logger.warning_once(
+                "cache_transceiver_config.agent_bounce_buffer_enable is "
+                "deprecated and ignored: kv_cache_bounce_size_mb > 0 alone "
+                "enables the C++ transfer-agent bounce buffer. Remove the "
+                "field; it will be deleted in a future release.",
+                key="cache_transceiver_config.agent_bounce_buffer_enable")
         if self.agent_bounce_params:
-            if not self.agent_bounce_buffer_enable:
+            if self.kv_cache_bounce_size_mb == 0:
                 raise ValueError(
-                    "agent_bounce_params only applies to the C++ transfer-agent "
-                    "bounce implementation; set agent_bounce_buffer_enable=True "
-                    "or drop the params.")
+                    "agent_bounce_params tunes the C++ transfer-agent bounce "
+                    "buffer, but kv_cache_bounce_size_mb is 0 (bounce "
+                    "disabled); set a positive capacity or drop the params.")
             # Lazy: importing tensorrt_llm._torch at module scope is circular.
             from tensorrt_llm._torch.disaggregation.nixl.bounce_knobs import \
                 AGENT_BOUNCE_PARAM_KEYS

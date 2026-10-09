@@ -4499,10 +4499,8 @@ class TransferWorkerConfig:
     enforce_physical_ownership: bool = False
     # Internal activation gate: only the qualified containment policy supplies it.
     quiescence_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
-    # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
-    # fast path. Derived upstream from CacheTransceiverConfig: it equals
-    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
-    # case `bounce` above is off) and 0 otherwise.
+    # C++ transfer-agent bounce buffer size in MiB
+    # (CacheTransceiverConfig.kv_cache_bounce_size_mb); 0 disables it.
     agent_buffer_size_mb: int = 0
     # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
@@ -4616,11 +4614,10 @@ class TransferWorker:
             and not self._agent.bounce_enabled
         ):
             logger.warning(
-                f"TransferWorker: the C++ transfer-agent bounce was requested "
-                f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
-                f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
-                f"{self._agent.name} (init failed); standard per-descriptor NIXL "
-                "transfers are in use."
+                "TransferWorker: the transfer-agent bounce buffer was requested "
+                f"(kv_cache_bounce_size_mb={self._config.agent_buffer_size_mb}) but is "
+                f"inactive on agent {self._agent.name} (init failed); standard "
+                "per-descriptor NIXL transfers are in use."
             )
         self._registered_mem: list = []
         try:

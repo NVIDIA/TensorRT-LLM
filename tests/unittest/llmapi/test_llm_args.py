@@ -3055,24 +3055,18 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
-        # agent_bounce_buffer_enable defaults to the Python implementation (False); enabling the
-        # C++ transfer-agent implementation with a zero capacity is a contradiction.
+        # The deprecated agent_bounce_buffer_enable defaults to False and no longer
+        # constrains the capacity: True with a zero capacity validates.
         assert config.agent_bounce_buffer_enable is False
         assert config.agent_bounce_params is None
         assert CacheTransceiverConfig(
-            kv_cache_bounce_size_mb=512,
-            agent_bounce_buffer_enable=True).agent_bounce_buffer_enable is True
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="kv_cache_bounce_size_mb is 0"):
-            CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+            agent_bounce_buffer_enable=True).kv_cache_bounce_size_mb == 0
 
         # Bounce is Python-transceiver-only: the pybind (C++ transceiver) config
         # carries no bounce fields at all. backend must be set: from_string(None)
         # is a pre-existing _to_pybind limit.
         pybind_config = CacheTransceiverConfig(
-            backend="NIXL",
-            kv_cache_bounce_size_mb=384,
-            agent_bounce_buffer_enable=True)._to_pybind()
+            backend="NIXL", kv_cache_bounce_size_mb=384)._to_pybind()
         assert not any("bounce" in attr for attr in dir(pybind_config))
 
         # Arbitrary arguments should be rejected
@@ -3085,7 +3079,6 @@ class TestStrictBaseModelArbitraryArgs:
         """agent_bounce_params coercion, key/consistency validation, pybind passthrough."""
         # Values are coerced to strings (YAML often yields ints/bools).
         config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                        agent_bounce_buffer_enable=True,
                                         agent_bounce_params={
                                             "max_chunk_size": 4096,
                                             "enable_eager_gather": False
@@ -3095,12 +3088,17 @@ class TestStrictBaseModelArbitraryArgs:
             "enable_eager_gather": "False"
         }
 
-        # Params without the C++ agent implementation are a contradiction: they
-        # would be silently ignored, so validation rejects them outright.
+        # Params with bounce disabled (capacity 0) are a contradiction: they
+        # would be silently ignored, so validation rejects them outright. The
+        # deprecated flag does not change that.
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
-                           match="agent_bounce_buffer_enable"):
+                           match="kv_cache_bounce_size_mb is 0"):
             CacheTransceiverConfig(
-                kv_cache_bounce_size_mb=512,
+                agent_bounce_params={"copy_stream_count": "2"})
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError,
+                           match="kv_cache_bounce_size_mb is 0"):
+            CacheTransceiverConfig(
+                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"copy_stream_count": "2"})
 
         # Unknown keys (here the env-var-style typo WITH the trailing _bytes) are
@@ -3109,7 +3107,6 @@ class TestStrictBaseModelArbitraryArgs:
                            match="max_chunk_size_bytes.*min_descriptor_count"):
             CacheTransceiverConfig(
                 kv_cache_bounce_size_mb=512,
-                agent_bounce_buffer_enable=True,
                 agent_bounce_params={"max_chunk_size_bytes": "4096"})
 
         # Non-dict input fails cleanly in the coercion validator, not with a bare
@@ -3117,8 +3114,41 @@ class TestStrictBaseModelArbitraryArgs:
         with pytest.raises(pydantic_core._pydantic_core.ValidationError,
                            match="must be a dict"):
             CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
-                                   agent_bounce_buffer_enable=True,
                                    agent_bounce_params="max_chunk_size=4096")
+
+    def test_cache_transceiver_config_agent_bounce_buffer_enable_is_deprecated_noop(
+            self, monkeypatch):
+        """agent_bounce_buffer_enable is a deprecated no-op that warns only when True."""
+        warnings_seen = []
+        monkeypatch.setattr(
+            llm_args_mod.logger, "warning_once",
+            lambda message, key: warnings_seen.append((message, key)))
+
+        field = CacheTransceiverConfig.model_fields[
+            "agent_bounce_buffer_enable"]
+        assert field.json_schema_extra["status"] == "deprecated"
+
+        # True only warns: the config is otherwise identical to the flag-less one.
+        config = CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                                        agent_bounce_buffer_enable=True)
+        assert len(warnings_seen) == 1
+        message, key = warnings_seen[0]
+        assert "deprecated" in message
+        assert key == "cache_transceiver_config.agent_bounce_buffer_enable"
+        assert config.model_dump(
+            exclude={"agent_bounce_buffer_enable"}) == CacheTransceiverConfig(
+                kv_cache_bounce_size_mb=512).model_dump(
+                    exclude={"agent_bounce_buffer_enable"})
+        CacheTransceiverConfig(agent_bounce_buffer_enable=True)
+
+        # Re-validating a full dump (as apply_model_defaults_to_llm_args does)
+        # and an explicit False stay silent.
+        warnings_seen.clear()
+        CacheTransceiverConfig(**CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=512).model_dump())
+        CacheTransceiverConfig(kv_cache_bounce_size_mb=512,
+                               agent_bounce_buffer_enable=False)
+        assert warnings_seen == []
 
     def test_agent_bounce_param_keys_match_cpp_env_knobs(self):
         """AGENT_BOUNCE_PARAM_KEYS must mirror kEnvKnobs in BounceConfig.h (parsed here)."""
