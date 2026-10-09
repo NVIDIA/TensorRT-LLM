@@ -53,9 +53,11 @@ l0_gb300_multi_gpus:
   # MuseSparkOpen decode-path fusions (random weights, no checkpoint): router
   # projection, sorted top-8 routing, attention norm+gate, attention->FFN
   # boundary (Triton and GB300 CTA-cluster kernels), pre-expert NVFP4 quant,
-  # router/quant overlap, and the fusion opt-out switches. The finalize+TP4
-  # all-reduce test file is deliberately NOT listed: it requires an external
-  # 4-rank MPI launch and every case skips under single-process pytest.
+  # router/quant overlap, the fusion opt-out switches, and the finalize module's
+  # single-process import and input-validation contracts. The finalize+all-reduce
+  # parity, stress and lifecycle files are deliberately NOT listed: they require
+  # an external 4- or 8-rank MPI launch and every case skips under single-process
+  # pytest.
   - unittest/_torch/modeling/test_musespark_open_router_projection.py
   - unittest/_torch/modeling/test_musespark_open_full_routing.py
   - unittest/_torch/modeling/test_musespark_open_norm_gate.py
@@ -64,6 +66,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modeling/test_musespark_open_pre_expert_quant.py
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
   - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_local.py
   # Opt-in layout/contract gates for the shared fused RMSNorm FP4 helper and
   # the FlashInfer MoE provider (from the same fusion stack).
   - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant_opt_in.py

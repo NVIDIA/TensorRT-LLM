@@ -179,3 +179,34 @@ def test_cluster_boundary_side_stream_and_gate_cache(
                     assert torch.isfinite(got).all()
                     error = (got.float() - want.float()).norm() / want.float().norm()
                     assert error < tolerance
+
+
+def test_cluster_boundary_does_not_import_the_finalize_module() -> None:
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.models import musespark_open_boundary
+
+    tree = ast.parse(inspect.getsource(musespark_open_boundary))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    assert not any("finalize_ar" in name for name in imported)
+
+
+def test_cluster_boundary_availability_ignores_finalize_fusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Disabling the finalize fusion must not disable the boundary kernel."""
+    from tensorrt_llm._torch.models import musespark_open_boundary, musespark_open_finalize_ar
+
+    monkeypatch.setattr(musespark_open_finalize_ar, "HAS_CUTEDSL", False)
+    musespark_open_boundary.cluster_boundary_available.cache_clear()
+    try:
+        assert musespark_open_boundary.cluster_boundary_available(torch.device("cuda", 0))
+    finally:
+        musespark_open_boundary.cluster_boundary_available.cache_clear()

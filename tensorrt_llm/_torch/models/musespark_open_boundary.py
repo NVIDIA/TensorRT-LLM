@@ -25,17 +25,37 @@ import functools
 
 import torch
 
-from .musespark_open_finalize_ar import HAS_CUTEDSL
-
-if HAS_CUTEDSL:
+# Availability of this kernel is independent of the finalize+all-reduce fusion.
+try:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
     import cutlass.utils as utils
-    from cutlass import Float32
+    from cutlass import Float32, Int32
+    from cutlass._mlir.dialects import llvm
     from cutlass.cute.runtime import make_ptr
+    from cutlass.cutlass_dsl import T, dsl_user_op
+except ImportError:
+    _HAS_CUTE_DSL = False
+else:
+    _HAS_CUTE_DSL = True
 
-    from .musespark_open_finalize_ar import _store_dsmem, _wait_cluster_tx, _warp_sum
+if _HAS_CUTE_DSL:
+
+    @dsl_user_op
+    def _float_bits(value, *, loc=None, ip=None):
+        """The int32 with the same bit pattern as an FP32 value."""
+        bits = llvm.inline_asm(
+            T.i32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+        return Int32(bits)
 
     class _ClusterBoundaryKernel:
         def __init__(
@@ -95,19 +115,19 @@ if HAS_CUTEDSL:
             tid = cute.arch.thread_idx()[0]
             lane, warp = tid % 32, tid // 32
             rank = cute.arch.block_idx()[0] % self.cluster
-            value = _warp_sum(value)
+            value = cute.arch.warp_reduction_sum(value)
             if cutlass.const_expr(self.cluster > 1):
                 if lane < self.cluster:
-                    _store_dsmem(
-                        partials.iterator + (phase * self.slots + rank * self.warps + warp) * 4,
+                    # Lane c sends this warp's partial to CTA c as one 16-byte
+                    # message that completes 16 bytes of that CTA's transaction.
+                    slot = partials.iterator + (phase * self.slots + rank * self.warps + warp) * 4
+                    cute.arch.store_async_dsmem(
+                        slot.align(16),
+                        (_float_bits(value), Int32(0), Int32(0), Int32(0)),
                         bars.iterator + phase,
                         lane,
-                        value,
-                        Float32(0),
-                        Float32(0),
-                        Float32(0),
                     )
-                _wait_cluster_tx(bars.iterator + phase)
+                cute.arch.mbarrier_wait(bars.iterator + phase, 0)
             else:
                 if lane == 0:
                     partials[(phase * self.slots + warp) * 4] = value
@@ -115,7 +135,7 @@ if HAS_CUTEDSL:
             total = Float32(0)
             for slot in range(lane, self.slots, 32):
                 total += partials[(phase * self.slots + slot) * 4]
-            return _warp_sum(total)
+            return cute.arch.warp_reduction_sum(total)
 
         @cute.kernel
         def kernel(
@@ -248,7 +268,7 @@ if HAS_CUTEDSL:
 def cluster_boundary_available(device: torch.device) -> bool:
     """The measured dispatch is restricted to GB300."""
     return (
-        HAS_CUTEDSL
+        _HAS_CUTE_DSL
         and device.type == "cuda"
         and torch.cuda.get_device_capability(device) == (10, 3)
     )
