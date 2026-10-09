@@ -213,7 +213,8 @@ def _run(
                     os.kill(child_pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            _cleanup_group(child_pid, grace, stop_signal or signal.SIGTERM)
+            # The payload gate stays closed if parent group setup fails.
+            _cleanup_group(child_pid, grace if group_ready else 0, stop_signal or signal.SIGTERM)
         finally:
             _signal_group(child_pid, signal.SIGKILL)
             try:

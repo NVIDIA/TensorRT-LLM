@@ -3,6 +3,7 @@
 
 """Exercise launcher supervision without importing TensorRT-LLM or initializing MPI."""
 
+import importlib.util
 import json
 import os
 import pty
@@ -13,6 +14,8 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -245,7 +248,7 @@ def _launcher_env(tmp_path: Path, mode: str) -> dict[str, str]:
             "PATH": f"{stub_bin}{os.pathsep}{env['PATH']}",
             "PMI_RANK": "0",
             "PMI_SIZE": "1",
-            "TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT": "1",
+            "TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT": "3",
             "TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR": f"ipc://{tmp_path / 'ipc'}",
             "LAUNCHER_TEST_ROOT": str(tmp_path),
             "LAUNCHER_TEST_MODE": mode,
@@ -346,7 +349,7 @@ def _run_launcher(
                 observer = threading.Thread(target=observe_server_exit, daemon=True)
                 stdout_reader.start()
                 observer.start()
-                process.wait(timeout=12)
+                process.wait(timeout=15)
                 stdout_reader.join(timeout=1)
                 observer.join(timeout=1)
                 assert not stdout_reader.is_alive(), "launcher descendants kept stdout open"
@@ -355,7 +358,7 @@ def _run_launcher(
                 stderr = "".join(stderr_lines)
                 assert server_observed.is_set(), stderr
             else:
-                stdout, stderr = process.communicate(timeout=12)
+                stdout, stderr = process.communicate(timeout=15)
             # Registration precedes go release, so these PIDs also identify
             # gated payloads that never run the stand-in to write a role record.
             for role, guard_pid, payload_pid in re.findall(
@@ -435,7 +438,7 @@ def test_launcher_deadline_covers_stop_helper_and_server(
     env["LAUNCHER_TEST_TASK_STATUS"] = str(task_status)
     result = _run_launcher(tmp_path, env)
     assert result.returncode == (task_status or 124), result.stderr
-    assert "MPI Comm shutdown exceeded 1s" in result.stderr
+    assert "MPI Comm shutdown exceeded 3s" in result.stderr
     assert "stop" in _process_records(tmp_path)
     _assert_exited(tmp_path)
 
@@ -536,7 +539,7 @@ def test_server_first_timeout_allows_slow_term_cleanup(
         env["LAUNCHER_TEST_CLEANUP_DELAY"] = "6"
     result = _run_launcher(tmp_path, env)
     assert result.returncode == 17, result.stderr
-    assert "Task exit after MPI Comm server failure exceeded 1s" in result.stderr
+    assert "Task exit after MPI Comm server failure exceeded 3s" in result.stderr
     assert (tmp_path / "task-term").exists(), result.stderr
     assert (tmp_path / "task-cleanup-completed").exists(), result.stderr
     assert set(_process_records(tmp_path)) == {"server", "task", "task_child"}
@@ -551,7 +554,7 @@ def test_server_first_timeout_kills_term_ignoring_descendants(
     env["TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS"] = "1"
     result = _run_launcher(tmp_path, env)
     assert result.returncode == (server_status or 1), result.stderr
-    assert "Task exit after MPI Comm server failure exceeded 1s" in result.stderr
+    assert "Task exit after MPI Comm server failure exceeded 3s" in result.stderr
     assert (tmp_path / "task-term").exists(), result.stderr
     assert set(_process_records(tmp_path)) == {"server", "task", "task_child"}
     _assert_exited(tmp_path)
@@ -607,6 +610,69 @@ def test_normal_task_exit_reclaims_descendant_and_preserves_status(
     assert result.returncode == task_status, result.stderr
     assert "task_child" in _process_records(tmp_path)
     assert {"guard_server", "guard_task", "guard_stop"} <= _owned_process_records(tmp_path).keys()
+
+
+@pytest.mark.parametrize("group_state", ["missing", "unconfirmed", "ready"])
+def test_guard_cleanup_grace_requires_confirmed_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_state: str
+) -> None:
+    spec = importlib.util.spec_from_file_location("process_guard", _PROCESS_GUARD)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    parent_pid, child_pid = 123, 456
+    startup_error = OSError("injected parent setpgid failure")
+    process_ops = Mock(spec_set=os)
+    process_ops.getppid.return_value = parent_pid
+    process_ops.pipe.return_value = (3, 4)
+    process_ops.fork.return_value = child_pid
+    process_ops.waitpid.return_value = (child_pid, 0)
+    process_ops.waitstatus_to_exitcode.return_value = 0
+    if group_state != "ready":
+        process_ops.setpgid.side_effect = startup_error
+    if group_state == "missing":
+        process_ops.killpg.side_effect = ProcessLookupError
+    # Never let simulated process identities reach the host's process APIs.
+    monkeypatch.setattr(guard, "os", process_ops)
+    monkeypatch.setattr(
+        guard,
+        "signal",
+        Mock(spec_set=signal, SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT, SIGKILL=signal.SIGKILL),
+    )
+    monkeypatch.setattr(guard, "_arm_parent_death_signal", lambda: None)
+    monkeypatch.setattr(guard, "_child_finished", lambda _: True)
+    # Unknown membership must retain grace only after successful group setup.
+    monkeypatch.setattr(guard, "_group_has_live_members", lambda _: True)
+    elapsed = 0.0
+
+    def advance_clock(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    monkeypatch.setattr(
+        guard, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance_clock)
+    )
+    ready_file = tmp_path / "guard-ready"
+    if group_state == "ready":
+        assert guard._run(parent_pid, 5, None, None, "task", ["unused"]) == 0
+        assert 5 <= elapsed < 5.1
+        process_ops.kill.assert_not_called()
+    else:
+        with pytest.raises(OSError) as error:
+            guard._run(parent_pid, 5, ready_file, tmp_path / "guard-go", "task", ["unused"])
+        assert error.value is startup_error
+        assert elapsed == 0, "Failed startup consumed the cleanup grace"
+        process_ops.kill.assert_called_once_with(child_pid, signal.SIGKILL)
+    assert not ready_file.exists()
+    process_ops.write.assert_not_called()
+    process_ops.close.assert_has_calls([call(3), call(4)])
+    process_ops.killpg.assert_any_call(child_pid, signal.SIGKILL)
+    process_ops.waitpid.assert_called_once_with(child_pid, 0)
+    reap_index = process_ops.mock_calls.index(call.waitpid(child_pid, 0))
+    assert all(
+        index < reap_index
+        for index, operation in enumerate(process_ops.mock_calls)
+        if operation[0] in ("kill", "killpg")
+    ), "Reaping must not release the child's identity before signaling finishes"
 
 
 def test_owner_death_before_guard_registration_release_does_not_start_workload(
@@ -689,6 +755,7 @@ def test_phase_completion_survives_a_whole_second_boundary(tmp_path: Path, phase
     }[phase]
     env = _launcher_env(tmp_path, mode)
     env["LAUNCHER_TEST_PHASE"] = phase
+    env["TLLM_LLMAPI_LAUNCH_STOP_TIMEOUT"] = "1"
     env["TLLM_LLMAPI_LAUNCH_TERM_GRACE_SECONDS"] = "1"
     bash_env = tmp_path / "phase-sleep.bash"
     bash_env.write_text(_PHASE_SLEEP)
