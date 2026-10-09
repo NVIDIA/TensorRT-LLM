@@ -916,6 +916,17 @@ class MultimodalScheduler(RequestScheduler):
     def can_schedule(self, requests: RequestList) -> bool:
         return self.scheduler.can_schedule(requests)
 
+    def set_async_transfer_manager(self, mgr) -> None:
+        """Forward the AsyncTransferManager to the wrapped scheduler.
+
+        PyExecutor feature-detects this method to wire in-flight disagg KV
+        sends into the KVCacheV2Scheduler deadlock detector; without the
+        passthrough, a wrapped V2 scheduler never receives it.
+        """
+        set_mgr = getattr(self.scheduler, "set_async_transfer_manager", None)
+        if set_mgr is not None:
+            set_mgr(mgr)
+
 
 class MultimodalEagerEncoderScheduler(MultimodalScheduler):
     """Eagerly schedule encoder work for already-active MM requests.
