@@ -176,7 +176,7 @@ A single sync inside `forward` collapses overlap, and per-iteration GPU work is 
 - `torch.tensor([...], device="cuda")` from a Python list (hidden H2D)
 - HF runtime branches (`if pixel_values is None: ...`) that change tensor shapes
 
-Three-arg **`torch.where(cond, x, y)`** is fine when **`cond`** is built only on-device (no scalar readback). **`fuse_input_embeds`:** kwargs **`text_token_indices` + `mm_token_indices`** together ⇒ skip internal `filter_*`. **`trtllm-serve`** usually supplies both via **`model_engine.py`** (CPU-side index build → `inputs` → `fuse_input_embeds(..., **kwargs)`). Pure-text batches have no MM `inputs`; bare unit tests / direct calls may omit indices ⇒ in-model `filter_*` runs.
+Three-arg **`torch.where(cond, x, y)`** is fine when **`cond`** is built only on-device (no scalar readback). **`fuse_input_embeds`:** kwargs **`text_token_indices` + `mm_token_indices`** together ⇒ skip internal `filter_*`. **`trtllm-serve`** usually supplies both via **`engine/runners/decoder/runner.py`**, using **`prepare_multimodal_indices`** from **`engine/runners/common.py`** (CPU-side index build → `inputs` → `fuse_input_embeds(..., **kwargs)`). Pure-text batches have no MM `inputs`; bare unit tests / direct calls may omit indices ⇒ in-model `filter_*` runs.
 
 **Patterns:**
 
