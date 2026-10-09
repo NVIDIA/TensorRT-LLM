@@ -226,11 +226,6 @@ CacheLevel KvCache::_lockLevel(Page const& page, BlockOrdinal ordinal) const
 void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength)
 {
     TLLM_CHECK_DEBUG(range.end <= BlockOrdinal{historyLength / mTokensPerBlock});
-    if (mHasDeferredSparseOffload)
-    {
-        range = {0, historyLength / mTokensPerBlock};
-    }
-    bool deferred = false;
     std::vector<SharedPtr<Page>> pages;
     for (auto const& [lcId, lc] : mManager->lifeCycles())
     {
@@ -248,36 +243,21 @@ void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int histo
                 if (page->cacheLevel == kSparseHistoryLevel)
                     continue;
                 auto const lock = page->holder.lock()->uniqLock.lock();
-                bool needsGpu = false;
                 for (auto const& owner : lock->owners())
                 {
-                    int const ownerHistory = owner.kvCache == this ? historyLength : owner.kvCache->historyLength();
-                    if ((owner.kvCache != this && !owner.kvCache->isDecoding())
-                        || owner.ordinal >= BlockOrdinal{ownerHistory / owner.kvCache->tokensPerBlock()})
-                    {
-                        needsGpu = true;
-                        break;
-                    }
-                }
-                if (needsGpu)
-                {
-                    deferred = true;
-                    continue;
+                    if (owner.kvCache != this && !owner.kvCache->isDecoding())
+                        throw LogicError("Cannot offload sparse history shared with a prefill request");
                 }
                 pages.push_back(std::move(page));
             }
         }
     }
-    // Preserve retry work if allocation or copy submission fails.
-    mHasDeferredSparseOffload = true;
-    if (!pages.empty())
-    {
-        int const oldHistoryLength = mHistoryLength;
-        auto restoreHistory = FuncGuard([&]() { mHistoryLength = oldHistoryLength; });
-        mHistoryLength = historyLength;
-        offloadSparsePages(pages);
-    }
-    mHasDeferredSparseOffload = deferred;
+    if (pages.empty())
+        return;
+    int const oldHistoryLength = mHistoryLength;
+    auto restoreHistory = FuncGuard([&]() { mHistoryLength = oldHistoryLength; });
+    mHistoryLength = historyLength;
+    offloadSparsePages(pages);
 }
 
 void KvCache::_publishHistoryLength(int historyLength)
@@ -293,7 +273,7 @@ bool KvCache::enterDecode()
     auto const apiLock = mManager->lockExclusive();
     if (!isActive())
         throw LogicError("Decode admission requires an active request");
-    if (mIsDecoding && !mHasDeferredSparseOffload)
+    if (mIsDecoding)
         return true;
     try
     {
@@ -303,11 +283,8 @@ bool KvCache::enterDecode()
     {
         return false;
     }
-    if (!mIsDecoding)
-    {
-        mIsDecoding = true;
-        onPageStorageChanged();
-    }
+    mIsDecoding = true;
+    onPageStorageChanged();
     return true;
 }
 
@@ -759,7 +736,6 @@ void KvCache::_deactivate()
         _freeScratchSlots();
     }
     mStatus = Status::SUSPENDED;
-    mHasDeferredSparseOffload = false;
     onPageStorageChanged();
 }
 
@@ -810,7 +786,6 @@ void KvCache::close()
         mPageStorageBatch->remove(*this);
     }
     mStatus = Status::CLOSED;
-    mHasDeferredSparseOffload = false;
     mPageStorageRow.reset();
     onPageStorageChanged();
     mManager->unregisterKvCache(this);
@@ -1604,7 +1579,7 @@ void KvCache::setHistoryLength(int hist)
 
 bool KvCache::_shortcutSetHistoryLength(int newHist)
 {
-    if (newHist == mHistoryLength && !mHasDeferredSparseOffload)
+    if (newHist == mHistoryLength)
         return true;
     // Check if stale range changes for any lifecycle.
     for (auto [lcId, lc] : mManager->lifeCycles())
@@ -2968,7 +2943,8 @@ PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex
     }
 
     auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lgId]);
-    int const completeSparseHistory = mIsDecoding && attn && attn->isSparse ? mHistoryLength / mTokensPerBlock : 0;
+    if (mIsDecoding && attn && attn->isSparse)
+        snapshot.mEligibleHistoryBlocks = mHistoryLength / mTokensPerBlock;
     snapshot.mReadyEvents.reserve(numBlocks);
     for (BlockOrdinal ord{0}; ord < mBlocks.size(); ++ord)
     {
@@ -2979,14 +2955,11 @@ PageStorageSnapshot KvCache::getPageStorageSnapshot(LayerGroupId lgId, BeamIndex
         }
         int const index = snapshot.mBasePageIndices[toSizeT(ord)];
         auto const& page = blockPageGetPage(pages.at(beamIdx).at(lgId));
-        // The scalar count exposes only the contiguous host prefix, stopping at any deferred GPU page.
-        if (ord.value() == snapshot.mEligibleHistoryBlocks && ord.value() < completeSparseHistory && page
-            && index != kBadPageIndex.value() && page->cacheLevel == kSparseHistoryLevel)
+        if (ord.value() < snapshot.mEligibleHistoryBlocks)
         {
-            TLLM_CHECK_WITH_INFO(page->status() == PageStatus::LOCKED && page->hasValidSlot()
-                    && index == slotIdToPageIndexValue(page->slotId()),
+            TLLM_CHECK_WITH_INFO(page && index != kBadPageIndex.value() && page->cacheLevel == kSparseHistoryLevel
+                    && page->hasValidSlot() && index == slotIdToPageIndexValue(page->slotId()),
                 "Eligible sparse history must have a locked host mapping");
-            ++snapshot.mEligibleHistoryBlocks;
         }
         if (index == kBadPageIndex.value())
             continue;
