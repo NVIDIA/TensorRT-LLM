@@ -94,7 +94,7 @@ Certified at `R` up to 8 and `T` 1 and 8 (no speculation; a DSpark verify step),
 pool: `KVCacheManager.get_buffers(layer)` of a `SELFKONLY` manager (one latent head of 576, `kv_factor` 1, 64 tokens
 per block), owned and sized by the manager. The addressing (`pool`, `row_stride`, `page_table`, `page_offset`,
 `seq_len`) is the attention metadata's view of one generation step: `k3_mla_decode_view(attn, metadata, M)`
-(`attention/backends/fmha/cute_dsl_mla.py`), computed per layer after `metadata.prepare()`.
+(`cute_dsl_kernels/k3_mla/decode_view.py`), computed per layer after `metadata.prepare()`.
 
 **What a call writes.** One 576-column row per token, at that token's position in its request (positions below 0
 skipped); nothing else (certified, above). The manager keeps every layer in one pool, interleaved by block: a layer's

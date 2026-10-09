@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
+from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
 
 MAX_SEQS, MAX_PAGES, POOL_PAGES = 16, 32, 40
 

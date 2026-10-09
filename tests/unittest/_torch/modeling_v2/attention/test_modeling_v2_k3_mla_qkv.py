@@ -30,9 +30,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.k3_mla_qkv 
     k3_mla_qkv,
     k3_mla_qkv_out,
 )
-from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.utils import create_attention
+from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
