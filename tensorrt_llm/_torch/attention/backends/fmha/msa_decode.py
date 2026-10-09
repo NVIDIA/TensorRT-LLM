@@ -41,12 +41,11 @@ if TYPE_CHECKING:
 
 
 def use_trtllm_gen_sparse_decode() -> bool:
-    """Select the opt-in Blackwell NVFP4 sparse decode experiment.
+    """Select the default Blackwell NVFP4 sparse decode path.
 
-    Set TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE=trtllm_gen to enable it.
-    Triton remains the default until matched task-level accuracy is validated.
+    Set TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE=triton to disable it.
     """
-    mode = os.environ.get("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "triton").lower()
+    mode = os.environ.get("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "trtllm_gen").lower()
     if mode not in ("triton", "trtllm_gen"):
         raise ValueError(f"Unknown MiniMax-M3 NVFP4 sparse decode mode: {mode!r}")
     return mode == "trtllm_gen"

@@ -38,6 +38,7 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.fmha.msa_decode import use_trtllm_gen_sparse_decode
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -2694,14 +2695,35 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mode,expected", [(None, True), ("trtllm_gen", True), ("TRTLLM_GEN", True), ("triton", False)]
+)
+def test_sparse_nvfp4_decode_default_and_opt_out(
+    monkeypatch, mode: str | None, expected: bool
+) -> None:
+    if mode is None:
+        monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", mode)
+    assert use_trtllm_gen_sparse_decode() is expected
+
+
+@pytest.mark.cpu_only
+def test_sparse_nvfp4_decode_rejects_invalid_mode(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "invalid")
+    with pytest.raises(ValueError, match="Unknown MiniMax-M3 NVFP4 sparse decode mode"):
+        use_trtllm_gen_sparse_decode()
+
+
+@pytest.mark.cpu_only
 def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
-    """Only opted-in pure decode uses the no-requantize handoff."""
+    """Eligible pure decode uses the no-requantize handoff by default."""
 
     class FakeMsa:
         pass
 
     monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3MsaSparseAttention", FakeMsa)
-    monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "trtllm_gen")
+    monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", raising=False)
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_dispatch_attention_over_live_tokens",
@@ -2764,8 +2786,8 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
     )
     assert incompatible_output.dtype == torch.bfloat16
     attention.o_proj.quant_method.supports_e4m3_input = True
-    monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE")
-    default_output = attention._forward_attention_core(
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "triton")
+    opt_out_output = attention._forward_attention_core(
         q,
         None,
         None,
@@ -2773,7 +2795,7 @@ def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
         None,
         SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
     )
-    assert default_output.dtype == torch.bfloat16
+    assert opt_out_output.dtype == torch.bfloat16
 
 
 @pytest.mark.cpu_only
