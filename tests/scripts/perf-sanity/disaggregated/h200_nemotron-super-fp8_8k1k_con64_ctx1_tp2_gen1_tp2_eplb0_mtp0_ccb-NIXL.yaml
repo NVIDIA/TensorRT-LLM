@@ -58,8 +58,8 @@ worker_config:
       enable_padding: true
       max_batch_size: 16
     kv_cache_config:
-      use_kv_cache_manager_v2: true
       enable_block_reuse: false
+      use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
@@ -82,8 +82,8 @@ worker_config:
       enable_padding: true
       max_batch_size: 16
     kv_cache_config:
-      use_kv_cache_manager_v2: true
       enable_block_reuse: false
+      use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
