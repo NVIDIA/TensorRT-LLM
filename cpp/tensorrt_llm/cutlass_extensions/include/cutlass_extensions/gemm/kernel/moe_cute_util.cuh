@@ -160,7 +160,13 @@ CUTE_DEVICE auto util_convert_type(cute::Tensor<Engine, Layout> const& tensor)
     cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<cutlass::Array<From_type, numel> const*>(tensor.data()));
-    return cute::make_tensor(cute::make_rmem_ptr<To_type>(&frag), tensor.layout());
+    auto converted = cute::make_tensor<To_type>(tensor.layout());
+    CUTLASS_PRAGMA_UNROLL
+    for (int element_idx = 0; element_idx < numel; ++element_idx)
+    {
+        converted.data()[element_idx] = frag[element_idx];
+    }
+    return converted;
 }
 
 template <typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
