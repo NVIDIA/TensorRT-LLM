@@ -89,24 +89,22 @@ class _CausalBlockLayout:
     the keys before the block's own tokens. Slots holding fixed or history tokens
     are copied at ``commit``; slots holding this forward's staged tokens (earlier
     blocks' tokens on a partial page, and the block's own) are written by every
-    ``write_staged``. All device tensors are persistent views into
-    the cache's packed buffers, rewritten in place by ``commit``, never
-    on the forward path; ``host`` holds numpy views of the same layout on the host
-    side of that upload.
+    ``write_staged``. All device tensors are persistent views into the cache's
+    packed buffers, rewritten in place on the device by ``commit``, never on the
+    forward path.
     """
 
     num_blocks: int
     block_size: int
     region_pages: int
-    regions: np.ndarray  # [num_blocks, region_pages] int64 layer-0 view indices, host
-    host: Dict[str, np.ndarray]  # host twins of rows, seq_len_*, own_slots, extra_*
+    regions: torch.Tensor  # [num_blocks, region_pages] int32 layer-0 view indices
+    host_regions: np.ndarray  # the same on the host, for host-addressed edits
     rows: torch.Tensor  # [num_blocks, row_len] int32 layer-0 view indices, 0-padded
     # The rows in the TRTLLM attention op's block-offset encoding, K plane then V
     # plane: ``row * kv_factor`` and ``+ kv_offset``. The op reads this tensor directly.
     block_offsets: torch.Tensor  # [1, num_blocks, 2, row_len] int32
     seq_len_q: torch.Tensor  # [num_blocks] int32, all block_size
     seq_len_kv: torch.Tensor  # [num_blocks] int32, cached + block_size
-    cached: List[int]  # host copy
     # Slot ids (``view_page * tokens_per_page + slot``) of the private slots holding
     # each staged token as one of its block's own tokens.
     own_slots: torch.Tensor  # [num_blocks*block_size] int64
@@ -117,6 +115,10 @@ class _CausalBlockLayout:
     # entries are a prefix and a captured forward replays them.
     extra_src: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 staged token index
     extra_dst: torch.Tensor  # [num_blocks*2*(tpb-1)] int64 slot id
+    # Fixed and history tokens copied into the private regions at commit: 3*(tpb-1)
+    # entries per block, (source pool row, destination pool row), -1 past the used ones.
+    piece_src: torch.Tensor  # [num_blocks*3*(tpb-1)] int64
+    piece_dst: torch.Tensor  # [num_blocks*3*(tpb-1)] int64
 
 
 @dataclass
@@ -124,26 +126,22 @@ class _GeometryState:
     """Device state a geometry's forwards read, allocated the first time that
     geometry is opened and kept at the same addresses for the life of the cache, so
     a CUDA graph captured over it stays valid when the geometry is opened again.
-    Every per-layout tensor is a view into one of two packed buffers with a host
-    twin, rewritten in place by ``commit``."""
+    Every per-layout tensor is a view into one of two packed buffers, rewritten in
+    place on the device by ``commit``."""
 
     layouts: Dict[int, _CausalBlockLayout]  # by causal block size
     packed_i32: torch.Tensor
     packed_i64: torch.Tensor
-    host_i32: np.ndarray
-    host_i64: np.ndarray
-    # Tail of the int64 buffer: the pieces copied at commit, as layer-0 pool rows.
+    # Every piece copied at commit, as layer-0 pool rows: the fixed tail's refill (one
+    # page of entries) first, then each layout's; one launch copies them all.
     piece_src: torch.Tensor
     piece_dst: torch.Tensor
-    host_piece_src: np.ndarray
-    host_piece_dst: np.ndarray
+    refill_src: torch.Tensor
+    refill_dst: torch.Tensor
     # [max_staged_tokens] int64 slot ids (view_page * tokens_per_page + slot) of the
     # staged tokens' logical positions, the shared pages later blocks and later
-    # commits read; and scratch to recompute them without allocating.
+    # commits read.
     staged_slots: torch.Tensor
-    logical: torch.Tensor
-    logical_page: torch.Tensor
-    view_page: torch.Tensor  # int32: gathers from the int32 table
 
 
 class CausalKVCacheManager(KVCacheManagerV2):
@@ -377,23 +375,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # that nothing is ever read back; and the private pages' view indices.
         self._host_table: Optional[np.ndarray] = None  # [num_pages] int64
         self._host_private: Optional[np.ndarray] = None  # [pool_pages] int64
-        self._piece_offsets: Optional[torch.Tensor] = None  # [layers * 2H] pool rows
         # Per-geometry state, and the open geometry's fields bound as attributes.
         self._states: Dict[Tuple[int, int, Tuple[int, ...]], _GeometryState] = {}
         self._layouts: Dict[int, _CausalBlockLayout] = {}
-        self._packed_i32: Optional[torch.Tensor] = None
-        self._packed_i64: Optional[torch.Tensor] = None
-        self._host_i32: Optional[np.ndarray] = None
-        self._host_i64: Optional[np.ndarray] = None
         self._piece_src: Optional[torch.Tensor] = None
         self._piece_dst: Optional[torch.Tensor] = None
-        self._host_piece_src: Optional[np.ndarray] = None
-        self._host_piece_dst: Optional[np.ndarray] = None
-        self._mirrors = (0, 0)  # live commit-time pieces whose sources are resident tokens
+        self._refill_src: Optional[torch.Tensor] = None
+        self._refill_dst: Optional[torch.Tensor] = None
         self._staged_slots: Optional[torch.Tensor] = None
-        self._logical: Optional[torch.Tensor] = None
-        self._logical_page: Optional[torch.Tensor] = None
-        self._view_page: Optional[torch.Tensor] = None
         self._block_offsets_size: Optional[int] = None
         self._kv_heads_local = 0
         self._rows_per_page = 0  # pool rows of head_dim per view page: 2 * H * tpb
@@ -537,13 +526,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if self._table is None:
             self._table = torch.zeros(self._pool_pages, dtype=torch.int32, device=device)
             self._host_private = np.zeros(self._pool_pages, dtype=np.int64)
-            # A piece's layer-0 slot row plus these offsets gives that slot's row in
-            # every layer, K and V, every head: + layer*rpp + (kv*H + head)*tpb.
-            layer_rows = np.arange(self._num_layers, dtype=np.int64)[:, None] * self._rows_per_page
-            kv_head = np.arange(2 * self._kv_heads_local, dtype=np.int64)[None, :] * tpb
-            self._piece_offsets = torch.from_numpy((layer_rows + kv_head).reshape(-1)).to(device)
         # Reopened: the device tensors a captured forward points at stay where they
-        # are and only their contents change (layout regions view _host_private).
+        # are and only their contents change.
         self._table[:num_pages].copy_(torch.from_numpy(scaled[:num_pages]))
         self._host_private[:num_private] = scaled[num_pages:]
         self._host_table = scaled[:num_pages].copy()
@@ -553,6 +537,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
             state = self._allocate_state(device, max_staged_tokens, sizes, num_private)
             self._states[key] = state
         self._bind_state(state)
+        for layout in self._layouts.values():
+            layout.regions.copy_(torch.from_numpy(layout.host_regions.astype(np.int32)))
         self._block_offsets_size = None
         self._refresh_device_state()
 
@@ -650,7 +636,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._fixed_tokens += pinned
             self._fixed_pages = self._fixed_tokens // self.tokens_per_page
         self._history_tokens += num_tokens - pinned
-        refill = None
+        drop_pages = 0
         excess = self._history_tokens - self.window_tokens
         if excess > 0:
             drop_pages = excess // self.tokens_per_page
@@ -660,11 +646,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 ring = self._table[self._fixed_pages : self.num_pages]
                 torch.ops.trtllm.rotate_rows_(ring, -drop_pages)  # dropped pages go to the tail
                 host_ring = self._host_table[self._fixed_pages :]
-                old_head = int(host_ring[0])
                 host_ring[:] = np.roll(host_ring, -drop_pages)
-                refill = (old_head, int(host_ring[0]))
                 self._history_tokens -= drop_pages * self.tokens_per_page
-        self._refresh_device_state(refill)
+        self._refresh_device_state(drop_pages)
 
     # ------------------------------------------------------------------ causal blocks
 
@@ -676,8 +660,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         num_private: int,
     ) -> _GeometryState:
         """Allocate a geometry's layouts as views into two packed buffers (int32 and
-        int64), each with a host twin, plus the pieces area and the staged-slot
-        scratch; once per geometry."""
+        int64), plus the pieces area and the staged slot ids; once per geometry."""
         tpb = self.tokens_per_page
         specs = []  # (size, n, region_pages, i32 fields, i64 fields)
         for size in sizes:
@@ -696,82 +679,63 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 "extra_dst": (n * self._start_entries,),
             }
             specs.append((size, n, region_pages, i32, i64))
-        # Fixed and history slots copied per block: the shared page's refill, then
-        # per block at most three partial pages.
+        # Pieces copied at commit: the fixed tail's refill (one page of entries), then
+        # per block at most three partial pages; contiguous, so one launch copies all.
         piece_capacity = tpb + sum(n * 3 * (tpb - 1) for _, n, _, _, _ in specs)
         numel_i32 = sum(int(np.prod(shape)) for *_, i32, _ in specs for shape in i32.values())
         numel_i64 = sum(int(np.prod(shape)) for *_, i64 in specs for shape in i64.values())
         numel_i64 += 2 * piece_capacity
         packed_i32 = torch.zeros(numel_i32, dtype=torch.int32, device=device)
         packed_i64 = torch.zeros(numel_i64, dtype=torch.int64, device=device)
-        host_i32 = np.zeros(numel_i32, dtype=np.int32)
-        host_i64 = np.zeros(numel_i64, dtype=np.int64)
         offsets = {"i32": 0, "i64": 0}
 
-        def take(kind: str, shape) -> Tuple[torch.Tensor, np.ndarray]:
-            dev, host = (packed_i32, host_i32) if kind == "i32" else (packed_i64, host_i64)
+        def take(kind: str, shape) -> torch.Tensor:
+            dev = packed_i32 if kind == "i32" else packed_i64
             numel, first = int(np.prod(shape)), offsets[kind]
             offsets[kind] += numel
-            return dev[first : first + numel].view(shape), host[first : first + numel].reshape(
-                shape
-            )
+            return dev[first : first + numel].view(shape)
 
+        piece_src = take("i64", (piece_capacity,))
+        piece_dst = take("i64", (piece_capacity,))
         layouts: Dict[int, _CausalBlockLayout] = {}
-        first_private = 0
+        first_private, first_piece = 0, tpb
         for size, n, region_pages, i32, i64 in specs:
-            fields, host = {}, {}
-            for kind, group in (("i32", i32), ("i64", i64)):
-                for name, shape in group.items():
-                    fields[name], host[name] = take(kind, shape)
-            host["seq_len_q"][:] = size
-            regions = self._host_private[first_private : first_private + n * region_pages]
+            fields = {name: take("i32", shape) for name, shape in i32.items()}
+            fields.update({name: take("i64", shape) for name, shape in i64.items()})
+            fields["seq_len_q"].fill_(size)
+            host_regions = self._host_private[first_private : first_private + n * region_pages]
             first_private += n * region_pages
+            pieces = n * 3 * (tpb - 1)
             layouts[size] = _CausalBlockLayout(
                 num_blocks=n,
                 block_size=size,
                 region_pages=region_pages,
-                regions=regions.reshape(n, region_pages),
-                host=host,
-                cached=[0] * n,
+                regions=torch.zeros(n, region_pages, dtype=torch.int32, device=device),
+                host_regions=host_regions.reshape(n, region_pages),
+                piece_src=piece_src[first_piece : first_piece + pieces],
+                piece_dst=piece_dst[first_piece : first_piece + pieces],
                 **fields,
             )
-        assert first_private == num_private
-        piece_src, host_piece_src = take("i64", (piece_capacity,))
-        piece_dst, host_piece_dst = take("i64", (piece_capacity,))
-        logical, logical_page, staged_slots = (
-            torch.empty(max_staged_tokens, dtype=torch.int64, device=device) for _ in range(3)
-        )
-        view_page = torch.empty(max_staged_tokens, dtype=torch.int32, device=device)
+            first_piece += pieces
+        assert first_private == num_private and first_piece == piece_capacity
         return _GeometryState(
             layouts=layouts,
             packed_i32=packed_i32,
             packed_i64=packed_i64,
-            host_i32=host_i32,
-            host_i64=host_i64,
             piece_src=piece_src,
             piece_dst=piece_dst,
-            host_piece_src=host_piece_src,
-            host_piece_dst=host_piece_dst,
-            staged_slots=staged_slots,
-            logical=logical,
-            logical_page=logical_page,
-            view_page=view_page,
+            refill_src=piece_src[:tpb],
+            refill_dst=piece_dst[:tpb],
+            staged_slots=torch.empty(max_staged_tokens, dtype=torch.int64, device=device),
         )
 
     def _bind_state(self, state: _GeometryState) -> None:
         """Make ``state`` the open geometry's: its tensors become the attributes the
         rest of the cache reads."""
         self._layouts = state.layouts
-        self._packed_i32, self._packed_i64 = state.packed_i32, state.packed_i64
-        self._host_i32, self._host_i64 = state.host_i32, state.host_i64
         self._piece_src, self._piece_dst = state.piece_src, state.piece_dst
-        self._host_piece_src, self._host_piece_dst = state.host_piece_src, state.host_piece_dst
+        self._refill_src, self._refill_dst = state.refill_src, state.refill_dst
         self._staged_slots = state.staged_slots
-        self._logical, self._logical_page, self._view_page = (
-            state.logical,
-            state.logical_page,
-            state.view_page,
-        )
 
     def _layout(self, causal_block_size: int) -> _CausalBlockLayout:
         self._require_open()
@@ -802,8 +766,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return layout.seq_len_q, layout.seq_len_kv
 
     def cached_tokens(self, causal_block_size: int) -> List[int]:
-        """Keys in each block's row before the block's own tokens (host ints)."""
-        return list(self._layout(causal_block_size).cached)
+        """Keys in each block's row before the block's own tokens (host ints, from the
+        host model of the layout)."""
+        blk = self._layout(causal_block_size)
+        return [self._host_block(blk, i)[0] for i in range(blk.num_blocks)]
 
     def page_table(self, causal_block_size: int) -> torch.Tensor:
         """``[num_blocks, row_len]`` int32 device table of layer-0 view indices.
@@ -841,80 +807,63 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ device state
 
-    def _refresh_device_state(self, refill: Optional[Tuple[int, int]] = None) -> None:
+    def _refresh_device_state(self, drop_pages: int = 0) -> None:
         """Rewrite every kernel-facing device tensor for the current table, fixed region
-        and ``past``. Runs on the host in ``open`` and ``commit``, never on the
-        forward path."""
-        # Staged token t lands at slot id view_page * tpb + slot, with view_page the
-        # table entry of its logical page and slot its offset in that page.
-        tpb = self.tokens_per_page
-        torch.arange(
-            self.staging_offset, self.staging_offset + self.max_staged_tokens, out=self._logical
+        and ``staging_offset``: one layout launch per block size (the first also writes
+        the staged slot ids and the fixed tail's refill), then one launch copying every
+        piece. Runs in ``open`` and ``commit``, never on the forward path. Nothing
+        crosses from the host but kernel arguments, so the host never waits for the
+        device here.
+
+        ``drop_pages`` is what the rotation before this call moved to the ring's tail;
+        the layout kernel reads the fixed tail from the moved page's old view."""
+        shared = True
+        for blk in self._layouts.values():
+            torch.ops.trtllm.causal_layout_(
+                self._table,
+                blk.regions,
+                blk.rows,
+                blk.block_offsets,
+                blk.seq_len_kv,
+                blk.own_slots,
+                blk.extra_src,
+                blk.extra_dst,
+                blk.piece_src,
+                blk.piece_dst,
+                self._staged_slots if shared else None,
+                self._refill_src if shared else None,
+                self._refill_dst if shared else None,
+                blk.block_size,
+                self.tokens_per_page,
+                self.staging_offset,
+                self._fixed_tokens,
+                self.window_tokens,
+                self.num_pages,
+                drop_pages,
+                self.kv_factor,
+                self._kv_offset,
+                self._rows_per_page,
+            )
+            shared = False
+        torch.ops.trtllm.copy_kv_slots_(
+            self._buffers[0],
+            self._piece_src,
+            self._piece_dst,
+            self._num_layers,
+            self._kv_heads_local,
+            self.tokens_per_page,
         )
-        torch.floor_divide(self._logical, tpb, out=self._logical_page)
-        torch.index_select(self._table, 0, self._logical_page, out=self._view_page)
-        torch.remainder(self._logical, tpb, out=self._staged_slots)
-        self._staged_slots.add_(self._view_page, alpha=tpb)
-        # Everything else is host arithmetic on the host table, uploaded at the end
-        # with one plain copy per packed buffer. The first copy blocks the host until
-        # the GPU has finished the forwards already queued, so the GPU then idles for
-        # the host's remaining commit work and the next launch: a few microseconds
-        # per chunk. Pinned buffers with asynchronous copies would hide that, at the
-        # cost of double-buffering them across commits.
-        # A rotation moves the page the fixed region's tail shares with the history;
-        # its first slots are copied into the page that now starts the history first,
-        # since the private regions' copies below read them from there.
-        num_refill = self._queue_refill(refill)
-        num_pieces = num_refill
-        for layout in self._layouts.values():
-            num_pieces = self._refresh_layout(layout, num_pieces)
-        self._packed_i32.copy_(torch.from_numpy(self._host_i32))
-        self._packed_i64.copy_(torch.from_numpy(self._host_i64))
-        if num_refill:
-            self._copy_pieces(0, num_refill)
-        if num_pieces > num_refill:
-            self._copy_pieces(num_refill, num_pieces)
-        self._mirrors = (num_refill, num_pieces)
 
-    def _queue_refill(self, refill: Optional[Tuple[int, int]]) -> int:
-        """Queue the fixed region's tail slots from the shared page's old copy to its
-        new one (view pages ``refill``) at the start of the pieces area; returns the count."""
-        tail = self._fixed_tokens % self.tokens_per_page
-        if refill is None or tail == 0:
-            return 0
-        old_page, new_page = refill
-        slot = np.arange(tail)
-        self._host_piece_src[:tail] = old_page * self._rows_per_page + slot
-        self._host_piece_dst[:tail] = new_page * self._rows_per_page + slot
-        return tail
+    # The host model of the layouts: the arithmetic the layout kernel performs, for
+    # host-addressed edits of committed tokens and for ``cached_tokens``.
 
-    def _refresh_layout(self, blk: _CausalBlockLayout, num_pieces: int) -> int:
-        """Rebuild one block size's host twins for the current state. Appends the fixed
-        and history slots its private regions need to the pieces area from index
-        ``num_pieces`` on; returns the new count.
-
-        Block ``i``'s row is every page it may see in full, then its private region:
-        first the visible slots of the pages it sees only partly, in logical order,
-        then its own tokens.
-        """
-        past, size = self.staging_offset, blk.block_size
-        blk.host["rows"].fill(0)
-        for i in range(blk.num_blocks):
-            spans = self._visible_spans(past + i * size)
-            runs = self._whole_page_runs(spans)
-            partial = self._partial_page_positions(spans, runs)
-            region = blk.regions[i]
-            self._fill_row(blk, i, runs, region)
-            blk.cached[i] = sum(b - a for a, b in runs) * self.tokens_per_page + partial.size
-            own = self._fill_own_slots(blk, i, region, first=partial.size)
-            # Fixed and history tokens are copied now, for every layer; the staged
-            # tokens of earlier blocks on partial pages are written by write_staged.
-            k = np.arange(partial.size)
-            static = partial < past
-            num_pieces = self._queue_pieces(partial[static], region, k[static], num_pieces)
-            self._fill_staged_pieces(blk, i, partial[~static] - past, region, k[~static], own[0])
-        blk.host["seq_len_kv"][:] = np.asarray(blk.cached, dtype=np.int32) + size
-        return num_pieces
+    def _host_block(self, blk: _CausalBlockLayout, i: int) -> Tuple[int, np.ndarray]:
+        """Block ``i``: ``(keys before its own tokens, visible positions on its partial
+        pages, ascending)``; the ``k``-th such position occupies region slot ``k``."""
+        spans = self._visible_spans(self.staging_offset + i * blk.block_size)
+        runs = self._whole_page_runs(spans)
+        partial = self._partial_page_positions(spans, runs)
+        return sum(b - a for a, b in runs) * self.tokens_per_page + partial.size, partial
 
     def _visible_spans(self, start: int) -> List[Tuple[int, int]]:
         """Logical positions a block starting at ``start`` sees before its own tokens:
@@ -948,75 +897,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """View page and slot of the ``k``-th slots of a private region."""
         return region[k // self.tokens_per_page], k % self.tokens_per_page
 
-    def _fill_row(
-        self, blk: _CausalBlockLayout, i: int, runs: List[Tuple[int, int]], region: np.ndarray
-    ) -> None:
-        """Block ``i``'s table row: its whole pages in logical order, then its region."""
-        whole = np.concatenate([self._host_table[a:b] for a, b in runs] or [np.zeros(0, np.int64)])
-        row = blk.host["rows"][i]
-        row[: whole.size] = whole
-        row[whole.size : whole.size + region.size] = region
-        offsets = blk.host["block_offsets"][0, i]
-        offsets[0] = row * self.kv_factor
-        offsets[1] = offsets[0] + self._kv_offset
-
-    def _fill_own_slots(
-        self, blk: _CausalBlockLayout, i: int, region: np.ndarray, first: int
-    ) -> np.ndarray:
-        """Slot ids of block ``i``'s own tokens: its region from slot ``first`` on."""
-        size = blk.block_size
-        page, slot = self._region_slot(region, first + np.arange(size))
-        own = blk.host["own_slots"][i * size : (i + 1) * size]
-        own[:] = page * self.tokens_per_page + slot
-        return own
-
-    def _queue_pieces(
-        self, positions: np.ndarray, region: np.ndarray, k: np.ndarray, num_pieces: int
-    ) -> int:
-        """Append copies of resident ``positions`` to region slots ``k`` (layer-0 pool
-        rows) to the pieces area; returns the new count."""
-        tpb, rpp = self.tokens_per_page, self._rows_per_page
-        page, slot = self._region_slot(region, k)
-        stop = num_pieces + positions.size
-        self._host_piece_src[num_pieces:stop] = (
-            self._host_table[positions // tpb] * rpp + positions % tpb
-        )
-        self._host_piece_dst[num_pieces:stop] = page * rpp + slot
-        return stop
-
-    def _fill_staged_pieces(
-        self,
-        blk: _CausalBlockLayout,
-        i: int,
-        tokens: np.ndarray,
-        region: np.ndarray,
-        k: np.ndarray,
-        own_first: int,
-    ) -> None:
-        """Block ``i``'s entries for the staged ``tokens`` on its partial pages, written
-        to region slots ``k`` by write_staged. Padded to a fixed count with a harmless
-        repeat of the block's own first token, also when that token is written by the
-        attention kernel itself (``own_tokens=False``): same value, same slot."""
-        per_block = self._start_entries
-        if tokens.size > per_block:
-            raise RuntimeError("more staged tokens on partial pages than two pages hold")
-        page, slot = self._region_slot(region, k)
-        entries = slice(i * per_block, (i + 1) * per_block)
-        src, dst = blk.host["extra_src"][entries], blk.host["extra_dst"][entries]
-        src[:] = i * blk.block_size
-        dst[:] = own_first
-        src[: tokens.size] = tokens
-        dst[: tokens.size] = page * self.tokens_per_page + slot
-
-    def _copy_pieces(self, first: int, stop: int) -> None:
-        """Copy pieces ``[first, stop)`` (layer-0 slot rows, uploaded) for every layer,
-        K and V, every head: one gather and one scatter over the whole pool."""
-        src = (self._piece_src[first:stop, None] + self._piece_offsets).view(-1)
-        dst = (self._piece_dst[first:stop, None] + self._piece_offsets).view(-1)
-        pool = self.kv_buffer(0)
-        pool_rows = pool.view(-1, pool.shape[-1])
-        pool_rows.index_copy_(0, dst, pool_rows.index_select(0, src))
-
     # ------------------------------------------------------------------ direct pool access
 
     def kv_buffer(self, layer_idx: int) -> torch.Tensor:
@@ -1048,9 +928,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 buf, page, count, k[t0:t1], v[t0:t1]
             ),
         )
-        pieces = self._mirror_pieces(start, k.shape[0])
-        if pieces.size:
-            src, dst = self._piece_rows(pieces, layer_idx, (0, 1))
+        home, copy = self._mirror_rows(start, k.shape[0])
+        if home.size:
+            src, dst = self._piece_rows(home, copy, layer_idx, (0, 1))
             pool_rows = self.kv_buffer(0).view(-1, buf.shape[-1])
             pool_rows.index_copy_(0, dst, pool_rows.index_select(0, src))
 
@@ -1068,36 +948,46 @@ class CausalKVCacheManager(KVCacheManagerV2):
             buf[page * vs : (page + count) * vs : vs, 1].zero_()
 
         self._for_each_page_run(start, num_tokens, slots, whole)
-        pieces = self._mirror_pieces(start, num_tokens)
-        if pieces.size:
-            _, dst = self._piece_rows(pieces, layer_idx, (1,))
+        home, copy = self._mirror_rows(start, num_tokens)
+        if home.size:
+            _, dst = self._piece_rows(home, copy, layer_idx, (1,))
             self.kv_buffer(0).view(-1, buf.shape[-1]).index_fill_(0, dst, 0)
 
-    def _mirror_pieces(self, start: int, num_tokens: int) -> np.ndarray:
-        """Indices of the live commit-time pieces whose source token lies in logical
-        ``[start, start + num_tokens)``: the private copies an edit of those tokens
-        must reach. The refill pieces are excluded; their sources are a page the
-        table no longer points at."""
-        lo, hi = self._mirrors
-        if lo == hi or num_tokens == 0:
-            return np.empty(0, dtype=np.int64)
+    def _mirror_rows(self, start: int, num_tokens: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Layer-0 pool rows ``(home, copy)`` of the private copies holding resident
+        tokens of logical ``[start, start + num_tokens)``: what an edit of those tokens
+        must reach besides their home slots. The last commit computed the same copies
+        on the device; the refill is not among them, its source page is gone from the
+        table."""
         tpb, rpp = self.tokens_per_page, self._rows_per_page
-        pos = np.arange(start, start + num_tokens)
-        home = self._host_table[pos // tpb] * rpp + pos % tpb
-        return lo + np.flatnonzero(np.isin(self._host_piece_src[lo:hi], home))
+        stop = min(start + num_tokens, self.staging_offset)
+        homes, copies = [], []
+        for blk in self._layouts.values():
+            for i in range(blk.num_blocks):
+                _, partial = self._host_block(blk, i)
+                k = np.flatnonzero((partial >= start) & (partial < stop))
+                if k.size == 0:
+                    continue
+                pos = partial[k]
+                page, slot = self._region_slot(blk.host_regions[i], k)
+                homes.append(self._host_table[pos // tpb] * rpp + pos % tpb)
+                copies.append(page * rpp + slot)
+        if not homes:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+        return np.concatenate(homes), np.concatenate(copies)
 
     def _piece_rows(
-        self, pieces: np.ndarray, layer_idx: int, planes: Sequence[int]
+        self, home: np.ndarray, copy: np.ndarray, layer_idx: int, planes: Sequence[int]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Device index tensors ``(src, dst)`` of the pool rows ``pieces`` occupy in
-        ``layer_idx`` for the given planes (0 = K, 1 = V), every head."""
+        """Device index tensors ``(src, dst)`` of the pool rows the layer-0 rows ``home``
+        and ``copy`` occupy in ``layer_idx`` for the given planes (0 = K, 1 = V), every head."""
         tpb, rpp, heads = self.tokens_per_page, self._rows_per_page, self._kv_heads_local
         offsets = np.array(
             [layer_idx * rpp + (plane * heads + h) * tpb for plane in planes for h in range(heads)],
             dtype=np.int64,
         )
-        src = (self._host_piece_src[pieces][:, None] + offsets).reshape(-1)
-        dst = (self._host_piece_dst[pieces][:, None] + offsets).reshape(-1)
+        src = (home[:, None] + offsets).reshape(-1)
+        dst = (copy[:, None] + offsets).reshape(-1)
         device = self._table.device
         return torch.from_numpy(src).to(device), torch.from_numpy(dst).to(device)
 

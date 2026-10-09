@@ -500,6 +500,57 @@ def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_st
     assert saw_stale or not expect_stale, "test geometry should hold stale tokens at some step"
 
 
+def host_model_rows(cache, size):
+    """Every block's row and key count as the host computes them from the host table:
+    whole pages of the fixed region and the window, then the private region, then zeros."""
+    blk = cache._layout(size)
+    rows, lengths = [], []
+    for i in range(blk.num_blocks):
+        spans = cache._visible_spans(cache.staging_offset + i * size)
+        runs = cache._whole_page_runs(spans)
+        cached, _ = cache._host_block(blk, i)
+        whole = [int(cache._host_table[p]) for a, b in runs for p in range(a, b)]
+        row = whole + blk.host_regions[i].tolist()
+        rows.append(row + [0] * (cache._table.numel() - len(row)))
+        lengths.append(cached + size)
+    return rows, lengths
+
+
+def test_device_layout_matches_the_host_model(cache):
+    """The layout kernel's rows, lengths and pieces agree with the host model across
+    commits, with and without eviction and with a fixed tail on a shared page."""
+    chunk = cache.test_geometry["max_staged_tokens"]
+    open_with_fixed(cache, 13)
+    for _ in range(5):
+        for size in (chunk, chunk // 4):
+            rows, lengths = host_model_rows(cache, size)
+            assert cache.page_table(size).tolist() == rows
+            assert cache.causal_block_lengths(size)[1].tolist() == lengths
+            offsets = cache.block_offsets(size)[0]
+            assert offsets[:, 0].tolist() == [[r * cache.kv_factor for r in row] for row in rows]
+            # The pieces: the host model names each resident token's home and the region
+            # slot its copy goes to. After a rotation the device reads the fixed tail
+            # from the moved page (the same launch refills the tail's new home from it),
+            # so translate that page to the new home before comparing.
+            rpp = cache._rows_per_page
+            blk = cache._layout(size)
+            device = {
+                (s, d) for s, d in zip(blk.piece_src.tolist(), blk.piece_dst.tolist()) if s >= 0
+            }
+            moved = {
+                s // rpp: d // rpp
+                for s, d in zip(cache._refill_src.tolist(), cache._refill_dst.tolist())
+                if s >= 0
+            }
+            device = {(moved.get(s // rpp, s // rpp) * rpp + s % rpp, d) for s, d in device}
+            home, copy = cache._mirror_rows(0, cache.staging_offset)
+            regions = set(blk.host_regions.reshape(-1).tolist())
+            host = {(h, c) for h, c in zip(home.tolist(), copy.tolist()) if c // rpp in regions}
+            assert device == host
+        cache.commit(cache.max_staged_tokens)
+    assert cache.history_tokens > cache.window_tokens  # eviction happened
+
+
 def test_block_rows_present_exactly_the_window(cache):
     chunk = cache.test_geometry["max_staged_tokens"]
     check_rows_present_exactly_the_window(cache, fixed=13, size=chunk // 4)
