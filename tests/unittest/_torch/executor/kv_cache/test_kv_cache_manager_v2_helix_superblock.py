@@ -229,6 +229,8 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
+        # No lender attached, so a resize has no one to tell.
+        _sharing=None,
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
