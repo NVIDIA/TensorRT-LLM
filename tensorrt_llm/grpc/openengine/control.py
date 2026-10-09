@@ -15,6 +15,7 @@ Event delivery is direct ZMQ; ``SubscribeKvEvents`` remains unimplemented.
 
 import asyncio
 import time
+import uuid
 from typing import Any, Optional
 
 import grpc
@@ -35,6 +36,7 @@ from .bindings import (
     server_pb2,
 )
 from .capabilities import supported_guides
+from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled
@@ -99,7 +101,13 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         model: str,
         inference: Any,
         kv_transfer_backend: str = "",
+        frontend: FrontendClient | None = None,
+        instance_id: str | None = None,
     ) -> None:
+        self._frontend = frontend
+        self._instance_id = (
+            instance_id if instance_id is not None else str(getattr(llm, "llm_id", "") or "")
+        )
         self._llm = llm
         self._model = model
         self._inference = inference
@@ -163,7 +171,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             engine_version=str(trtllm_version),
             # The same build serves either phase; the role is per request.
             engine_role=server_pb2.ENGINE_ROLE_UNSPECIFIED,
-            instance_id=str(getattr(self._llm, "llm_id", "") or ""),
+            instance_id=self._instance_id,
             supported_models=[self._model],
             schema_revision=SCHEMA_REVISION,
             minimum_client_revision=MINIMUM_CLIENT_REVISION,
@@ -343,7 +351,14 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 grpc.StatusCode.UNAVAILABLE,
                 "KV occupancy is enabled but no load snapshot is available",
             )
-        running_requests = self._inference.active_request_count()
+        if self._frontend is None:
+            running_requests = self._inference.active_request_count()
+        else:
+            try:
+                status = await self._frontend.request("status")
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            running_requests = status["count"]
         sample_time = snapshot.get("timestampUnixNanos", 0)
         if (
             self._load_reporting_enabled
@@ -357,7 +372,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 grpc.StatusCode.UNAVAILABLE,
                 "KV occupancy sample is stale while requests are active",
             )
-        load = server_pb2.LoadInfo(instance_id=str(getattr(self._llm, "llm_id", "") or ""))
+        load = server_pb2.LoadInfo(instance_id=self._instance_id)
         # An idle scheduler can wait without sampling. Active requests require
         # a recent scheduler sample before this observation is marked fresh.
         load.timestamp_unix_nanos = time.time_ns()
@@ -401,6 +416,12 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         ]
 
         model_ready = self._engine_is_healthy()
+        if self._frontend is not None:
+            try:
+                status = await self._frontend.request("status")
+                model_ready = model_ready and status["ready"]
+            except CoordinationError:
+                model_ready = False
         checks.append(
             lifecycle_pb2.HealthCheck(
                 name="model",
@@ -422,8 +443,11 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 )
             )
 
-        if request.include_inference_probe:
-            checks.append(await self._inference_probe(request.model or self._model))
+        if request.include_inference_probe and (self._frontend is None or model_ready):
+            try:
+                checks.append(await self._inference_probe(request.model or self._model))
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
         state = lifecycle_pb2.HEALTH_STATE_READY
         for check in checks:
@@ -455,16 +479,23 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         from tensorrt_llm.sampling_params import SamplingParams
 
         handle = None
+        reservation = None
         # Counted by GetLoad and reachable by Abort(all_requests): a probe
         # occupies a scheduler slot like any other request, and a router sizing
         # itself on running_requests must see it.
-        probe_id = f"__openengine_health_probe__{time.time_ns()}"
+        probe_id = f"__openengine_health_probe__{uuid.uuid4().hex}"
         try:
+            if self._frontend is not None:
+                reservation = await self._frontend.reserve(probe_id)
+                if reservation.aborted:
+                    raise RuntimeError("Health probe aborted before submission")
             handle = self._llm.generate_async(
                 [1],
                 sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
                 streaming=False,
             )
+            if reservation is not None:
+                reservation.bind(handle)
             self._inference.track_request(probe_id, handle)
             await asyncio.wait_for(handle.aresult(), timeout=_INFERENCE_PROBE_TIMEOUT_SECONDS)
             return lifecycle_pb2.HealthCheck(
@@ -493,6 +524,8 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             )
         finally:
             self._inference.untrack_request(probe_id, handle)
+            if reservation is not None:
+                await asyncio.shield(reservation.release())
 
     async def Abort(
         self,
@@ -500,6 +533,31 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         context: grpc.aio.ServicerContext,
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
+
+        if self._frontend is not None and target in ("request_id", "all_requests"):
+            fields = {"request_id": request.request_id} if target == "request_id" else {}
+            try:
+                outcome = await self._frontend.request("abort", **fields)
+            except InvalidRequestIdError as error:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+            except CoordinationError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            if outcome["failed"]:
+                await context.abort(
+                    grpc.StatusCode.INTERNAL, f"{outcome['failed']} request(s) could not be aborted"
+                )
+            return lifecycle_pb2.AbortResponse(
+                status=(
+                    lifecycle_pb2.ABORT_STATUS_ABORTED
+                    if outcome["aborted"]
+                    else lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
+                ),
+                message=(
+                    request.request_id
+                    if target == "request_id"
+                    else f"aborted {outcome['aborted']} request(s)"
+                ),
+            )
 
         if target == "request_id":
             # AbortStatus has no failure value, and reporting ALREADY_FINISHED

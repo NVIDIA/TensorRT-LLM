@@ -540,9 +540,14 @@ def _construct_harmony_messages(
             # User passes in a a tool call request and its output. We need
             # to add the tool call request to prev_outputs so that the
             # parse_response_input can find the tool call request when
-            # parsing the tool call output.
+            # parsing the tool call output. Depending on the pydantic version,
+            # the request union may hand the call over as a plain dict.
             if isinstance(input_msg, ResponseFunctionToolCall):
                 prev_outputs.append(input_msg)
+            elif isinstance(input_msg,
+                            dict) and input_msg.get("type") == "function_call":
+                prev_outputs.append(
+                    ResponseFunctionToolCall.model_validate(input_msg))
     return messages
 
 

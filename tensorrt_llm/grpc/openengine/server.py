@@ -8,7 +8,11 @@ import gc
 import ipaddress
 import os
 import signal
+import socket
+import tempfile
+import threading
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 import click
@@ -17,9 +21,17 @@ import uvloop
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._frontend_processes import (
+    FrontendStartupCancelled,
+    _init_multi_frontend_mode,
+    _signal_frontend_ready,
+    _spawn_attached_frontends,
+    _terminate_attached_frontends,
+)
 
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
+from .coordinator import CoordinationError, Coordinator, FrontendClient
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .servicer import OpenEngineInferenceServicer
 
@@ -89,17 +101,23 @@ class OpenEngineServer:
         port: int,
         llm: Any,
         model: str,
+        *,
+        frontend: FrontendClient | None = None,
+        instance_id: str | None = None,
         subagent_affinity_auth_key: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self._llm = llm
-        self._server = grpc.aio.server(options=_SERVER_OPTIONS)
+        options = list(_SERVER_OPTIONS)
+        options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
+        self._server = grpc.aio.server(options=options)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
             llm,
             model,
             kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
             subagent_affinity_auth_key=subagent_affinity_auth_key,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
@@ -107,7 +125,12 @@ class OpenEngineServer:
         # Abort and GetLoad see the same requests Generate is serving.
         openengine_pb2_grpc.add_ControlServicer_to_server(
             OpenEngineControlServicer(
-                llm, model, inference, kv_transfer_backend=kv_transfer_backend
+                llm,
+                model,
+                inference,
+                kv_transfer_backend=kv_transfer_backend,
+                frontend=frontend,
+                instance_id=instance_id,
             ),
             self._server,
         )
@@ -174,6 +197,7 @@ def launch_server(
     served_model_name: str | None = None,
     enable_load_metrics: bool = False,
     subagent_affinity_auth_key: str | None = None,
+    report_failure: Callable[[int, str, str], None] | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -184,6 +208,7 @@ def launch_server(
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
         subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
+        report_failure: Records a child exit before startup readiness.
     """
 
     async def serve() -> None:
@@ -197,22 +222,80 @@ def launch_server(
                 param_hint="backend",
             )
 
-        loop = asyncio.get_running_loop()
+        mode = _init_multi_frontend_mode(llm_args, enabled=True)
+        if mode.num_frontends > 1 and port == 0:
+            raise click.UsageError("Multiple OpenEngine frontends require a fixed --port")
+        if mode.is_launcher:
+            family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][0]
+            try:
+                with socket.create_server((host, port), family=family):
+                    pass
+            except OSError as error:
+                raise RuntimeError(f"Failed to bind {host}:{port}: {error}") from error
         stop_event = asyncio.Event()
-        server = None
-        llm = None
+        startup_cancelled = threading.Event()
+        server = llm = coordinator = frontend = monitor = None
+        directory = None
+        children = []
+        failure = None
+        parent_pid = os.getppid()
 
-        def signal_handler() -> None:
-            logger.info("Received shutdown signal")
+        def fail(reason: str) -> None:
+            nonlocal failure
+            if not stop_event.is_set():
+                failure = reason
+                logger.error(reason)
+            startup_cancelled.set()
             stop_event.set()
 
-        # Installed before the engine is built, not after. Loading a model takes
-        # minutes and spawns MPI workers; a SIGTERM in that window -- a rolling
-        # restart, a failed startup probe, an operator ^C -- would otherwise hit
-        # Python's default handler with no shutdown, orphaning workers that hold
-        # GPU memory.
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
+        def signal_handler(signum: int, frame: Any) -> None:
+            # A Python handler also observes signals while synchronous model
+            # initialization is running. Cleanup starts at its next safe boundary.
+            startup_cancelled.set()
+            stop_event.set()
+
+        previous_handlers = {
+            sig: signal.signal(sig, signal_handler) for sig in (signal.SIGTERM, signal.SIGINT)
+        }
+
+        def healthy() -> bool:
+            try:
+                return not stop_event.is_set() and bool(llm._check_health())
+            except (RuntimeError, ValueError, OSError):
+                return False
+
+        async def supervise() -> None:
+            group_was_ready = False
+            while not stop_event.is_set():
+                if mode.is_attached_frontend and os.getppid() != parent_pid:
+                    fail("OpenEngine launcher parent exited")
+                    return
+                if any(child.poll() is not None for child in children):
+                    fail("An OpenEngine frontend exited; stopping the serving group")
+                    return
+                if not healthy():
+                    fail("OpenEngine engine health check failed")
+                    return
+                if frontend is not None:
+                    try:
+                        status = await frontend.request("heartbeat", frontend=frontend.frontend_id)
+                    except CoordinationError:
+                        return
+                    if status["stopping"]:
+                        stop_event.set()
+                        return
+                    if group_was_ready and not status["ready"]:
+                        fail("OpenEngine frontend group became unavailable")
+                        return
+                    group_was_ready = status["ready"]
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        def monitor_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and (error := task.exception()) is not None:
+                fail(f"OpenEngine supervision failed: {error}")
 
         try:
             llm_args["_enable_routing_load"] = enable_load_metrics
@@ -224,30 +307,112 @@ def launch_server(
                 "port": port,
             }
             llm = PyTorchLLM(**llm_args)
+            if stop_event.is_set():
+                if failure is not None:
+                    raise RuntimeError(failure)
+                return
             logger.info("Model loaded successfully")
+            instance_id = str(llm.llm_id)
+            if mode.is_launcher:
+                directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
+                longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
+                socket_path = os.path.join(directory.name, longest_name)
+                if len(os.fsencode(socket_path)) >= 108:
+                    raise ValueError(
+                        f"OpenEngine private Unix socket path exceeds 107 bytes: {socket_path}. "
+                        "Set TMPDIR to a shorter directory."
+                    )
+                coordinator = Coordinator(
+                    directory.name, mode.num_frontends, instance_id, healthy, fail
+                )
+                await coordinator.start()
+                frontend = FrontendClient(directory.name, 0, fail)
+            elif mode.is_attached_frontend:
+                frontend = FrontendClient(
+                    os.environ.pop("TLLM_OPENENGINE_COORDINATOR"),
+                    int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"]),
+                    fail,
+                )
+                instance_id = os.environ.pop("TLLM_OPENENGINE_INSTANCE_ID")
+            if frontend is not None:
+                await frontend.start()
+            # Start supervision before waiting for children, so engine death or
+            # coordinator failure cannot leave startup waiting on a ready pipe.
+            monitor = asyncio.create_task(supervise())
+            monitor.add_done_callback(monitor_done)
+            if mode.is_launcher:
+                try:
+                    children = await asyncio.to_thread(
+                        _spawn_attached_frontends,
+                        llm,
+                        mode.num_frontends,
+                        extra_env={
+                            "TLLM_OPENENGINE_COORDINATOR": directory.name,
+                            "TLLM_OPENENGINE_INSTANCE_ID": instance_id,
+                        },
+                        cancelled=startup_cancelled,
+                        report_failure=report_failure,
+                    )
+                except FrontendStartupCancelled:
+                    # The spawn helper has already reaped its children. The
+                    # stop check below distinguishes SIGTERM from engine failure.
+                    pass
+            if stop_event.is_set():
+                if failure is not None:
+                    raise RuntimeError(failure)
+                return
             server = OpenEngineServer(
                 host=host,
                 port=port,
                 llm=llm,
                 model=model,
                 subagent_affinity_auth_key=subagent_affinity_auth_key,
+                frontend=frontend,
+                instance_id=instance_id,
             )
             _disable_gc_if_requested()
             await server.start()
+            if any(child.poll() is not None for child in children):
+                raise RuntimeError("An OpenEngine frontend exited during startup")
+            _signal_frontend_ready(mode)
+            if coordinator is not None:
+                coordinator.ready = True
             await stop_event.wait()
         finally:
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.remove_signal_handler(sig)
+            startup_cancelled.set()
+            if coordinator is not None:
+                coordinator.ready = False
+                coordinator.stopping = True
+            elif mode.is_attached_frontend and frontend is not None:
+                try:
+                    await frontend.request("withdraw", frontend=frontend.frontend_id)
+                except CoordinationError:
+                    pass
+            if monitor is not None:
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
             try:
                 if server is not None:
                     await server.stop()
             finally:
-                if llm is not None and hasattr(llm, "shutdown"):
-                    # Synchronous and potentially slow (it joins the MPI
-                    # session), so it runs off the event loop: blocking here
-                    # would freeze any generator still finalizing its abort and
-                    # make the process deaf to a second signal.
-                    await asyncio.to_thread(llm.shutdown)
+                try:
+                    if children:
+                        await asyncio.to_thread(_terminate_attached_frontends, children)
+                    if frontend is not None:
+                        await frontend.close()
+                    if coordinator is not None:
+                        await coordinator.close()
+                finally:
+                    try:
+                        if llm is not None:
+                            await asyncio.to_thread(llm.shutdown)
+                    finally:
+                        if directory is not None:
+                            directory.cleanup()
+                        for sig, previous in previous_handlers.items():
+                            signal.signal(sig, previous)
                 logger.info("LLM engine stopped")
+        if failure is not None:
+            raise RuntimeError(failure)
 
     uvloop.run(serve())

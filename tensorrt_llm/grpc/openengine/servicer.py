@@ -5,6 +5,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any
 
 import grpc
@@ -16,6 +17,13 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 
 from .affinity import validate_parent_affinity
 from .bindings import error_pb2, generation_pb2, openengine_pb2_grpc
+from .coordinator import (
+    CoordinationError,
+    DuplicateRequestError,
+    FrontendClient,
+    InvalidRequestIdError,
+    Reservation,
+)
 from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
@@ -44,7 +52,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         model: str,
         kv_transfer_backend: str = "",
         subagent_affinity_auth_key: str | None = None,
+        frontend: FrontendClient | None = None,
     ) -> None:
+        self._frontend = frontend
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
@@ -109,6 +119,39 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         self,
         request: generation_pb2.GenerateRequest,
         context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[generation_pb2.GenerateResponse]:
+        reservation = None
+        try:
+            if self._frontend is not None:
+                if not request.request_id:
+                    await context.abort(
+                        grpc.StatusCode.INVALID_ARGUMENT, "request_id must be non-empty"
+                    )
+                reservation = await self._frontend.reserve(request.request_id)
+            async with aclosing(self._generate(request, context, reservation)) as responses:
+                async for response in responses:
+                    yield response
+        except DuplicateRequestError as error:
+            await context.abort(grpc.StatusCode.ALREADY_EXISTS, str(error))
+        except InvalidRequestIdError as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except CoordinationError as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+        finally:
+            if reservation is not None:
+                try:
+                    await asyncio.shield(reservation.release())
+                except CoordinationError as error:
+                    # Cleanup still fails the serving group through FrontendClient.
+                    # Preserve cancellation or an already selected RPC error.
+                    if not context.cancelled() and context.code() in (None, grpc.StatusCode.OK):
+                        await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+
+    async def _generate(
+        self,
+        request: generation_pb2.GenerateRequest,
+        context: grpc.aio.ServicerContext,
+        reservation: Reservation | None = None,
     ) -> AsyncIterator[generation_pb2.GenerateResponse]:
         """Run a server-streaming OpenEngine generation request."""
         request_id = request.request_id
@@ -209,6 +252,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             tokenizer=self._llm.tokenizer,
         )
 
+        if reservation is not None and reservation.aborted:
+            await context.abort(grpc.StatusCode.CANCELLED, "Request aborted before submission")
+
         try:
             result_handle = self._llm.generate_async(
                 inputs=inputs,
@@ -240,6 +286,9 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
             return
 
+        if reservation is not None:
+            reservation.bind(result_handle)
+
         engine_terminal = False
         abort_requested = False
         registration = ActiveRequest(self._active_requests, request_id, result_handle)
@@ -269,6 +318,8 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             # stays in flight forever: GetLoad over-reports it and the id is
             # permanently unusable.
             registration.release()
+            if reservation is not None:
+                reservation.release()
 
         watchdog = StallWatchdog(
             asyncio.get_running_loop(), RESPONSE_STALL_TIMEOUT_SECONDS, on_stall

@@ -3,6 +3,7 @@
 
 """Unit tests for the OpenEngine Control service."""
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -224,6 +225,59 @@ async def test_get_load_reports_kv_snapshot_and_honors_per_rank_opt_in():
     assert list(aggregate.ranks) == []
     assert per_rank.ranks[0].data_parallel_rank == 0
     assert per_rank.ranks[0].used_kv_blocks == 7
+
+
+@pytest.mark.asyncio
+async def test_multiple_frontends_report_shared_identity_kv_sources_and_load():
+    """Each frontend must expose engine-wide KV state and coordinated request count."""
+    source = _runtime_source(0)
+    snapshot = {
+        "timestampUnixNanos": time.time_ns(),
+        "usedKvBlocks": 7,
+        "totalKvBlocks": 20,
+        "ranks": [{"rank": 0, "runningRequests": 0, "usedKvBlocks": 7, "totalKvBlocks": 20}],
+    }
+
+    async def status(operation):
+        assert operation == "status"
+        return {"count": 2}
+
+    frontends = []
+    for local_id in ("launcher", "attached"):
+        llm = _llm(
+            kv_cache_config=SimpleNamespace(tokens_per_block=32, kv_events_config=_kv_events()),
+            _kv_capacity={"maxNumBlocks": 20},
+            _kv_load=snapshot,
+            _openengine_discovery={"sources": [source]},
+        )
+        llm.llm_id = local_id
+        frontends.append(
+            OpenEngineControlServicer(
+                llm,
+                MODEL,
+                _inference(),
+                frontend=SimpleNamespace(request=status),
+                instance_id="shared-engine",
+            )
+        )
+
+    for frontend in frontends:
+        info = await frontend.GetServerInfo(
+            server_pb2.GetServerInfoRequest(), FakeServicerContext()
+        )
+        sources = await frontend.GetKvEventSources(
+            kv_pb2.GetKvEventSourcesRequest(), FakeServicerContext()
+        )
+        load = await frontend.GetLoad(
+            server_pb2.GetLoadRequest(include_per_rank=True), FakeServicerContext()
+        )
+        assert info.instance_id == load.instance_id == "shared-engine"
+        assert info.capacity.total_kv_blocks == load.total_kv_blocks == 20
+        assert [(item.data_parallel_rank, item.endpoint_addr.host) for item in sources.sources] == [
+            (0, "node-a")
+        ]
+        assert load.running_requests == load.ranks[0].running_requests == 2
+        assert load.used_kv_blocks == 7
 
 
 @pytest.mark.asyncio
@@ -673,9 +727,7 @@ async def test_server_info_disables_dp_rank_targeting_with_conversation_affinity
         enable_attention_dp=False,
         attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True),
     )
-    info = await without_adp.GetServerInfo(
-        server_pb2.GetServerInfoRequest(), FakeServicerContext()
-    )
+    info = await without_adp.GetServerInfo(server_pb2.GetServerInfoRequest(), FakeServicerContext())
     assert info.extra["trtllm_supports_subagent_affinity"] is False
 
 
