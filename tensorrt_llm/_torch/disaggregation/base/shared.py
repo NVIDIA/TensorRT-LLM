@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol, runtime_checkable
 
 __all__ = [
@@ -27,6 +28,9 @@ __all__ = [
     "Cancelled",
     "Outcome",
     "Attempt",
+    "CancelDisposition",
+    "CancellableAttempt",
+    "request_cancel",
     "SubmissionRejected",
     "Route",
     "Registration",
@@ -127,9 +131,9 @@ class Failed:
 
 @dataclass(frozen=True)
 class Cancelled:
-    """Logical cancellation without delivery, initiated outside this interface.
+    """Logical cancellation without delivery, independent of access completion.
 
-    There is no cancellation operation on this interface. Submitted work may
+    A cancellation request does not guarantee this outcome. Submitted work may
     continue accessing memory after cancellation is reported.
 
     Args:
@@ -155,6 +159,67 @@ class Attempt(Protocol):
             subsequent polls. No outcome proves physical quiescence.
         """
         ...
+
+
+class CancelDisposition(Enum):
+    """Acknowledgement of a cancellation request, not a delivery outcome.
+
+    REQUESTED means the provider recorded a best-effort request; work can still
+    complete normally. UNSUPPORTED means no effective cancellation request is
+    available. Neither disposition establishes logical cancellation or proves
+    that caller-memory access has ended.
+    """
+
+    REQUESTED = "requested"
+    UNSUPPORTED = "unsupported"
+
+
+@runtime_checkable
+class CancellableAttempt(Attempt, Protocol):
+    """Optional best-effort cancellation capability for a delivery.
+
+    Implementations must support repeated requests without starting duplicate
+    cancellation work. Requests may overlap completion and must preserve the
+    first terminal outcome. They cannot roll back already published content.
+    A request cannot start or restart caller-memory access or invalidate a
+    previously established quiescence guarantee.
+    """
+
+    def request_cancel(self) -> CancelDisposition:
+        """Request cancellation without waiting for work or memory access to end.
+
+        Suppress queued work where feasible and request SDK cancellation when
+        supported. SDK calls that can block must run outside this call. A
+        completed attempt keeps its outcome, including when completion races
+        this request. Unsupported cancellation is a disposition, not an error.
+
+        Returns:
+            REQUESTED if a best-effort request was recorded, or UNSUPPORTED if
+            no effective request is available. Repeated requests are harmless.
+        """
+        ...
+
+
+def request_cancel(attempt: Attempt) -> CancelDisposition:
+    """Request cancellation through the optional shared capability.
+
+    Callers may invoke this for any Attempt without checking provider support.
+    This function does not poll, wait, commit an outcome, or establish access
+    completion. Logical cancellation, fixed retirement deadlines, local-copy
+    completion and resource retention remain the caller's responsibility.
+    Provider exceptions propagate to the caller and do not establish either
+    cancellation or quiescence.
+
+    Args:
+        attempt: Submitted delivery, possibly already completed or cancelled.
+
+    Returns:
+        The provider's acknowledgement, or UNSUPPORTED for an Attempt without
+        the optional CancellableAttempt capability.
+    """
+    if isinstance(attempt, CancellableAttempt):
+        return attempt.request_cancel()
+    return CancelDisposition.UNSUPPORTED
 
 
 class SubmissionRejected(Exception):
