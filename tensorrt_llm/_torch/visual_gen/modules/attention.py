@@ -551,12 +551,18 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
+        # Under tensor parallelism the packed projection holds this rank's heads. A
+        # per-head norm weight ([head_dim]) is the same on every rank; a full-dim
+        # weight ([num_heads * head_dim]) would need this rank's slice of it.
+        if self.tp_size > 1 and self.norm_q.weight.numel() != self.head_dim:
+            raise NotImplementedError(
+                "fused_dit_qk_norm_rope under tensor parallelism needs per-head norm weights"
+            )
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
+            self.local_num_attention_heads,
+            self.local_num_key_value_heads,
+            self.local_num_key_value_heads,
             self.head_dim,
             self.eps,
             self.norm_q.weight,
@@ -657,6 +663,13 @@ class Attention(nn.Module):
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
+
+        ``seq_len`` is derived from ``q.shape[1]`` and overrides any caller value,
+        except with a ``kv_cache``: then the caller must pass it, as the number of
+        real tokens of this forward, because the rows may carry padding from the
+        sequence-parallel exchange and the backend writes this forward's K/V into
+        the cache. Only the caller knows where the real tokens end; a padding row
+        written as history would be attended by every later forward of the rollout.
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
@@ -686,17 +699,22 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        kwargs.update(
-            {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "seq_len_kv": seq_len_kv,
-            }
-        )
+        # With a K/V cache the caller states seq_len, the real token count of the
+        # whole sequence: the rows here may include padding for the sequence
+        # exchange, and under Ulysses they are one rank's shard.
+        if kwargs.get("kv_cache") is None:
+            kwargs["seq_len"] = seq_len
+        elif kwargs.get("seq_len") is None:
+            raise ValueError("with a K/V cache, pass seq_len: the real token count of the chunk")
+        kwargs.update({"batch_size": batch_size, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
+        if kwargs.get("kv_cache") is not None and not self.attn.support_kv_cache():
+            raise NotImplementedError(
+                f"{type(self.attn).__name__} does not support a K/V cache; use CUDNN or TRTLLM."
+            )
         out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]

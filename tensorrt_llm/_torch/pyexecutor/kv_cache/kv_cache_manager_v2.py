@@ -2014,12 +2014,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         if not kv_cache.resume(self._stream.cuda_stream):
             logger.warning("KVCacheManagerV2: could not reserve a guard page")
-            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
-            kv_cache.close()
-            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
-            # The dummy create marked this id stats-excluded; free_resources
-            # clears that on the normal teardown, so the bail-outs must too.
-            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
+            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Never committed, so the reuse tree can never hand this page to a
@@ -2027,12 +2022,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.stop_committing()
         if not kv_cache.resize(1 + self.num_extra_kv_tokens):
             logger.warning("KVCacheManagerV2: could not size the guard page")
-            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
-            kv_cache.close()
-            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
-            # The dummy create marked this id stats-excluded; free_resources
-            # clears that on the normal teardown, so the bail-outs must too.
-            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
+            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         unfillable_dtype = False
@@ -2057,12 +2047,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 else "no layer resolved it"
             )
             logger.warning(f"KVCacheManagerV2: guard page reserved but {reason}")
-            self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
-            kv_cache.close()
-            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
-            # The dummy create marked this id stats-excluded; free_resources
-            # clears that on the normal teardown, so the bail-outs must too.
-            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
+            self._remove_kv_cache(_GUARD_PAGE_REQUEST_ID)
             self._guard_page_fill = ""
             return
         # Warning, not info: this is the only proof a run has that the switch
@@ -5503,6 +5488,22 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
 
+    def _remove_kv_cache(self, request_id: int) -> None:
+        """Forget a sequence made by `_create_kv_cache`: drop it from the map,
+        close it, clear its stats exclusion and free its index slot. Calling
+        this again for the same id does nothing."""
+        kv_cache = self.kv_cache_map.pop(request_id, None)
+        if kv_cache is None:
+            self.impl.clear_stats_excluded(request_id)
+            return
+        kv_cache.discard_pending_stats()
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
+        else:
+            self.index_mapper.remove_sequence(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
@@ -5530,17 +5531,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
-        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
-        if kv_cache is None:
-            self.impl.clear_stats_excluded(request.py_request_id)
-            return
-        kv_cache.discard_pending_stats()
-        kv_cache.close()
-        self.impl.clear_stats_excluded(request.py_request_id)
-        if request.py_request_id in self._early_freed_index_requests:
-            self._early_freed_index_requests.discard(request.py_request_id)
-        else:
-            self.index_mapper.remove_sequence(request.py_request_id)
+        self._remove_kv_cache(request.py_request_id)
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
         """Page-index scale of this layer's KV buffer. Layers in one pool can
