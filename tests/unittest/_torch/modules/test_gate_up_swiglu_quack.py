@@ -18,13 +18,23 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 def _kernel_available_or_fail() -> bool:
-    """Skip on unsupported hardware; fail on SM100/SM103 if QuACK (a pinned dependency) is missing."""
+    """Skip on unsupported hardware; fail on SM100/SM103 if QuACK (a pinned dependency) is missing.
+
+    Skips, with the reason, when QuACK imports but its kernel does not build against the installed
+    CUTLASS DSL: the op then computes the unfused result, which these tests are not about.
+    """
     if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
         return False
-    if not fused.gate_up_swiglu_quack_available():
+    if fused._quack_gemm_act() is None:
         pytest.fail(
             "SM100-family GPU but QuACK gemm_act is unavailable; the pinned quack-kernels dependency is broken"
         )
+    if fused._kernel_state["ok"]:
+        x = torch.randn((16, 64), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((128, 64), device="cuda", dtype=torch.bfloat16)
+        fused.gate_up_swiglu_quack_bf16(x, weight)
+    if not fused._kernel_state["ok"]:
+        pytest.skip("QuACK gemm_act does not run against the installed CUTLASS DSL (see warning)")
     return True
 
 
@@ -319,3 +329,33 @@ def test_availability_falls_back_when_quack_does_not_import(monkeypatch):
         assert not mlp.fuse_bf16_gate_up_swiglu
     finally:
         fused._quack_gemm_act.cache_clear()
+
+
+@requires_kernel
+def test_op_falls_back_when_the_kernel_raises(monkeypatch):
+    """A kernel that raises when first built leaves correct results and disables itself."""
+    _kernel_available_or_fail()
+
+    def broken_gemm_act(*args, **kwargs):
+        raise ValueError(
+            "too many values to unpack (expected 3)"
+        )  # the CUTLASS DSL drift seen in CI
+
+    monkeypatch.setattr(fused, "_quack_gemm_act", lambda: broken_gemm_act)
+    monkeypatch.setitem(fused._kernel_state, "ok", True)
+    mlp = _make_mlp(hidden=64, intermediate=128)
+    x = torch.randn((9, 64), device="cuda", dtype=torch.bfloat16)
+    weight = mlp.gate_up_proj.weight
+    with torch.inference_mode():
+        assert mlp._can_fuse_gate_up_swiglu_bf16(x)
+        out = fused.gate_up_swiglu_quack_bf16(x, weight)
+        torch.testing.assert_close(out, fused._unfused_gate_up_swiglu(x, weight), rtol=0, atol=0)
+        assert not fused._kernel_state["ok"]
+        assert not fused.gate_up_swiglu_quack_available()
+        assert not mlp._can_fuse_gate_up_swiglu_bf16(x)  # later calls take the native unfused path
+        # The op stays callable (compiled graphs keep its node) and keeps computing the unfused result.
+        assert torch.equal(fused.gate_up_swiglu_quack_bf16(x, weight), out)
+        # GatedMLP now runs its native unfused path, the same as with the fusion switched off.
+        disabled_out = mlp(x)
+        monkeypatch.setattr(mlp, "fuse_bf16_gate_up_swiglu", False)
+        assert torch.equal(disabled_out, mlp(x))

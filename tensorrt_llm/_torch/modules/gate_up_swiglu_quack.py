@@ -28,9 +28,13 @@ exact shapes and would re-tune for every new token count.
 import functools
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
+
+# Cleared the first time the QuACK kernel raises; every later call takes the unfused path.
+_kernel_state = {"ok": True}
 
 
 @functools.lru_cache(maxsize=1)
@@ -54,12 +58,32 @@ def _quack_gemm_act():
 
 
 def gate_up_swiglu_quack_available() -> bool:
-    """True on SM100/SM103 GPUs with QuACK importable (the kernel is not validated on SM107)."""
+    """True on SM100/SM103 GPUs with QuACK importable and its kernel not yet failed.
+
+    The kernel is not validated on SM107. QuACK is JIT-compiled against the installed CUTLASS
+    DSL, so a release that imports can still fail when the kernel is first built; after that
+    ``gate_up_swiglu_quack_bf16`` computes the unfused result and this returns False.
+    """
     return (
-        torch.cuda.is_available()
+        _kernel_state["ok"]
+        and torch.cuda.is_available()
         and get_sm_version() in (100, 103)
         and _quack_gemm_act() is not None
     )
+
+
+def _disable_kernel(exc: BaseException) -> None:
+    if _kernel_state["ok"]:
+        _kernel_state["ok"] = False
+        logger.warning(
+            "QuACK gemm_act failed; GatedMLP uses the unfused SwiGLU path from now on. The "
+            f"pinned QuACK release and the installed CUTLASS DSL may not match: {exc!r}"
+        )
+
+
+def _unfused_gate_up_swiglu(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    gate, up = F.linear(x, weight).chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 def gate_up_swiglu_quack_shape_ok(hidden_size: int, intermediate_size: int) -> bool:
@@ -81,7 +105,8 @@ def gate_up_swiglu_quack_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
         weight: ``[2I, K]`` BF16 ``GatedMLP.gate_up_proj.weight`` (gate rows first).
 
     Returns:
-        Contiguous ``[M, I]`` BF16.
+        Contiguous ``[M, I]`` BF16. Computed without the kernel (gate/up GEMM, then SwiGLU)
+        when QuACK is unavailable or its kernel has failed once in this process.
     """
     if (
         x.dtype != torch.bfloat16
@@ -98,16 +123,20 @@ def gate_up_swiglu_quack_bf16(x: torch.Tensor, weight: torch.Tensor) -> torch.Te
             f"{weight.dtype}"
         )
     gemm_act = _quack_gemm_act()
-    if gemm_act is None:
-        raise RuntimeError("QuACK gemm_act is not available")
-    _, out = gemm_act(
-        x.contiguous(),
-        weight.t(),
-        activation="swiglu",
-        store_preact=False,
-        tuned=False,
-        concat_layout=("B",),
-    )
+    if gemm_act is None or not _kernel_state["ok"]:
+        return _unfused_gate_up_swiglu(x, weight)
+    try:
+        _, out = gemm_act(
+            x.contiguous(),
+            weight.t(),
+            activation="swiglu",
+            store_preact=False,
+            tuned=False,
+            concat_layout=("B",),
+        )
+    except Exception as exc:  # noqa: BLE001 - third-party JIT; any failure means "no kernel"
+        _disable_kernel(exc)
+        return _unfused_gate_up_swiglu(x, weight)
     return out
 
 

@@ -374,15 +374,17 @@ class GatedMLP(nn.Module):
         """Whether this call takes the opt-in BF16 gate/up GEMM + SwiGLU epilogue.
 
         One place decides, for forward and for the tests: the module opted in
-        and the kernel is available (resolved at construction); the projection
+        and the kernel is available (resolved at construction and re-checked
+        here, since a kernel that fails once is disabled for the process); the projection
         is the fused ``gate_up_proj`` with plain SwiGLU and no limit; ``x`` is
         a CUDA BF16 tensor of rank >= 2 outside grad mode, since the op has no
         backward; ``gate_up_proj`` is unquantized BF16 without bias, tensor
         parallelism or another GEMM provider; K and I are multiples of 8
         (16-byte TMA rows). Evaluated in forward, after the weights exist.
         """
-        if not self.fuse_bf16_gate_up_swiglu:
-            return False
+        if not self.fuse_bf16_gate_up_swiglu or not gate_up_swiglu_quack_available(
+        ):
+            return False  # the second check drops out once the kernel has failed in this process
         if self.split_gate_up:  # no fused projection to fuse into
             return False
         if not (self.activation == F.silu and self._is_plain_swiglu()):
