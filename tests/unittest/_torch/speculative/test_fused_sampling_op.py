@@ -490,6 +490,23 @@ def test_same_seed_and_offset_reproduce_the_same_tokens() -> None:
     assert torch.equal(first, second)
 
 
+def test_tiny_temperature_scales_logits_exactly() -> None:
+    """At T=1e-8 a 1e-6 logit gap is 100 nats: the larger token must always win."""
+    dev = "cuda"
+    rows, vocab = 256, 4096
+    logits = torch.full((rows, vocab), -1.0, device=dev)
+    logits[:, 0] = 0.0
+    logits[:, 1] = 1e-6
+    temps, top_ks, top_ps, min_ps = _params(rows, device=dev, temperature=1e-8)
+    seed, offset = _rng(rows, dev)
+
+    tokens, probs = fused.fused_sample_from_logits_with_probs(
+        logits, temps, top_ks, top_ps, min_ps, seed=seed, offset=offset
+    )
+    assert (probs[:, 1] > 0.999).all()
+    assert (tokens == 1).all()
+
+
 @pytest.mark.parametrize("with_probs", [False, True], ids=["tokens", "with_probs"])
 @pytest.mark.parametrize("rows", [4, 32])
 @pytest.mark.parametrize("vocab", [4096, 65536])

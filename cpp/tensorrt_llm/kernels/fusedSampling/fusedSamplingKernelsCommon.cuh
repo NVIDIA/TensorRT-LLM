@@ -49,7 +49,8 @@ constexpr int kHistCopies = 16;
 //! How many survivors the shared gather buffer holds (8 KB). Past this the descent falls
 //! back to re-reading the row, so the cap is a performance knob, never a correctness one.
 constexpr int kCandCap = 2048;
-//! Guards 1/T for a zero temperature. Matches decodingCommon.cu's EPSILON for float.
+//! Stands in for a zero temperature in 1/T. A positive temperature is used as given, however
+//! small, so that it scales the logits exactly as dividing by it would.
 constexpr float kTempEpsilon = 1e-6f;
 //! Rejection rounds a tokens-only row may spend before it settles for the argmax. Each
 //! round drops the rejected candidate and everything at or below its weight, so the
@@ -132,7 +133,7 @@ __device__ inline RowParams loadRowParams(FusedSamplingParams const& p, int row)
 {
     RowParams r;
     float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
-    r.tempInv = 1.0f / (temperature + kTempEpsilon);
+    r.tempInv = temperature > 0.0f ? 1.0f / temperature : 1.0f / kTempEpsilon;
 
     // min_p is a fraction of the row maximum, so a value above 1 keeps nothing: keptMass
     // would be 0 and the renormalized row would come back all-inf instead of raising.

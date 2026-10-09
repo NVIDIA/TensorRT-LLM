@@ -3346,6 +3346,32 @@ class TestRequestSeed:
         manager.observe([target])
         assert manager._offsets[0].item() == offset_before
 
+    def test_draft_batch_advances_unseeded_offsets(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        device = torch.device("cpu")
+
+        def request(request_id: int, is_draft: bool) -> LlmRequest:
+            return cast(
+                LlmRequest,
+                SimpleNamespace(
+                    py_seq_slot=0,
+                    py_request_id=request_id,
+                    py_is_draft=is_draft,
+                    sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+                ),
+            )
+
+        target = request(100, is_draft=False)
+        manager.observe([target])
+        before = manager.take_row_seeds([0], device=device)
+        manager.observe([request(200, is_draft=True)])
+        during = manager.take_row_seeds([0], device=device)
+        manager.observe([target])
+        after = manager.take_row_seeds([0], device=device)
+
+        assert before.seed.tolist() == during.seed.tolist() == after.seed.tolist() == [42]
+        assert before.offset.item() < during.offset.item() < after.offset.item()
+
     def test_multi_row_offsets_do_not_overlap(self):
         """Speculative decoding draws several rows per request per step.
 
