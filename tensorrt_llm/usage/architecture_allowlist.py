@@ -39,7 +39,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "Exaone4ForCausalLM",
         "Exaone4_5_ForConditionalGeneration",
         "ExaoneForCausalLM",
-        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Gemma3nForConditionalGeneration",

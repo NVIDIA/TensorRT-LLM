@@ -23,9 +23,9 @@ their test-file consumers. Ambiguous helpers and other non-test paths
 YAML-covered ancestor.
 
 Paths matched by `out_of_scope_rule.is_out_of_scope` (QA / dev test
-lists, `.test_durations`, `microbenchmarks/`, `tests/**/*.md`) are
-excluded from candidates so `OutOfScopeRule`'s noop claim is not
-overridden by a same-file narrow contribution.
+lists, `.test_durations`, and microbenchmarks) are excluded from candidates
+so `OutOfScopeRule`'s noop claim is not overridden by a testdef contribution.
+Documentation paths are likewise left to `DocsRule`.
 """
 
 from __future__ import annotations
@@ -47,6 +47,7 @@ from ._helpers import (
     stages_by_yaml_stem,
 )
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 from .out_of_scope_rule import is_out_of_scope
 
 # Changes touching at least this fraction of all blocks (top-level conftest,
@@ -469,7 +470,9 @@ class TestsDefRule(Rule):
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         candidates = [
-            f for f in pr.changed_files if f.startswith("tests/") and not is_out_of_scope(f)
+            f
+            for f in pr.changed_files
+            if f.startswith("tests/") and not is_out_of_scope(f) and not is_docs_path(f)
         ]
         if not candidates:
             return None
