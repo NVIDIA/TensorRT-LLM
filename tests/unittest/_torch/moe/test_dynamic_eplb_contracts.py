@@ -682,7 +682,7 @@ def test_launch_queue_setup_precedes_runtime_initialization():
     )
 
 
-def test_direct_inputs_are_not_retained_by_dtype_view_memo():
+def test_routed_megamoe_direct_inputs_and_full_grid_contract():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
     tree = ast.parse(source.read_text())
     launch = next(
@@ -705,9 +705,7 @@ def test_direct_inputs_are_not_retained_by_dtype_view_memo():
         assert isinstance(value.func, ast.Attribute)
         assert value.func.attr == "_memo_dtype_view"
 
-    reserved_sms = arguments["reserved_sms"]
-    assert isinstance(reserved_sms, ast.Name)
-    assert reserved_sms.id == "reserved_sms"
+    assert "reserved_sms" not in arguments
 
 
 def test_gpu_direct_tma_fails_closed_on_stale_scheduler_plan():
@@ -1015,7 +1013,6 @@ def _autotune_helpers(torch):
         "_is_pow2_in_range",
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
-        "_launch_cluster_configuration",
         "_expand_megamoe_ready_tactics",
         "enumerate_megamoe_candidate_tactics",
     }
@@ -1118,7 +1115,6 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
         in_kernel_fc2_reduce=False,
         combine_format="bf16",
         helper_expert_count=4,
-        reserved_sms=0,
     )
 
     production = get_runner(**kwargs, tactic_autotune=False)
@@ -1131,57 +1127,7 @@ def test_megamoe_runner_cache_reuses_only_production_runners():
     first_tuning = get_runner(**kwargs, tactic_autotune=True)
     second_tuning = get_runner(**kwargs, tactic_autotune=True)
     assert first_tuning is not second_tuning
-    different_reservation = get_runner(**{**kwargs, "reserved_sms": 8}, tactic_autotune=False)
-    assert different_reservation is not production
-    assert different_reservation.kwargs["reserved_sms"] == 8
-    assert len(created) == 4
-
-
-def test_megamoe_runner_launch_geometry_uses_reserved_sm_budget():
-    source = _TORCH_ROOT / "moe/custom_ops/cute_dsl_megamoe_custom_op.py"
-    tree = ast.parse(source.read_text())
-    methods = {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and node.name in {"_build_kernel_once", "_tactic_cache_key"}
-    }
-    for method_name in ("_build_kernel_once", "_tactic_cache_key"):
-        launch_call = next(
-            node
-            for node in ast.walk(methods[method_name])
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "_launch_cluster_configuration"
-        )
-        keywords = {keyword.arg: keyword.value for keyword in launch_call.keywords}
-        for keyword_name in ("reserved_sms", "max_sm_count"):
-            value = keywords[keyword_name]
-            assert isinstance(value, ast.Attribute)
-            assert isinstance(value.value, ast.Name)
-            assert value.value.id == "self"
-            assert value.attr == keyword_name
-
-
-def test_megamoe_persistent_grid_reserves_sms_for_copy_work():
-    helpers = _autotune_helpers(None)
-    max_clusters = {2: 72, 4: 32}
-    helpers["_max_active_clusters"] = lambda cluster_size, sm_version=None: max_clusters[
-        cluster_size
-    ]
-    launch_config = helpers["_launch_cluster_configuration"]
-
-    uniform = launch_config([2, 1, 1], None, 107, reserved_sms=8, max_sm_count=144)
-    mixed = launch_config([4, 1, 1], [2, 1, 1], 107, reserved_sms=8, max_sm_count=144)
-    rounded = launch_config([4, 1, 1], [2, 1, 1], 107, reserved_sms=9, max_sm_count=144)
-
-    assert uniform == (68, None, None, 136)
-    assert mixed == (34, 32, 4, 136)
-    assert rounded == (33, 32, 2, 132)
-    with pytest.raises(ValueError, match="reserved_sms"):
-        launch_config([2, 1, 1], None, 107, reserved_sms=144, max_sm_count=144)
-    with pytest.raises(TypeError, match="reserved_sms"):
-        launch_config([2, 1, 1], None, 107, reserved_sms=True, max_sm_count=144)
+    assert len(created) == 3
 
 
 def test_on_autotune_uses_distinct_tactics():
