@@ -276,15 +276,19 @@ def get_kv_cache_manager_cls(
                 Glm5NextCacheManager
             return Glm5NextCacheManager
 
-        # Kimi K3 (KDA + MLA hybrid): block reuse uses the unified C++ pool
+        # Kimi K3 (KDA + MLA hybrid) on KV cache manager V1, i.e. a
+        # text-only KimiLinearForCausalLM checkpoint or
+        # use_kv_cache_manager_v2=False (released K3 checkpoints,
+        # KimiK3ForConditionalGeneration, default to KVCacheManagerV2 and get
+        # MambaHybridCacheManagerV2): block reuse uses the unified C++ pool
         # (CppMambaHybridCacheManager) like the other hybrid linear models —
         # per-block KDA state snapshots every mamba_state_cache_interval
-        # tokens with FORCE_CHUNK context chunking. Without block reuse the
-        # Mixed manager (separate KV / recurrent-state pools) stays the
-        # default. SA speculative decoding is validated on the Mixed
-        # manager's SpeculativeState scratch path only; reuse + SA is
-        # unvalidated. Disaggregated serving (TRTLLM-14815) routes through
-        # the shared hybrid transceiver validation below: the Python NIXL
+        # tokens with FORCE_CHUNK context chunking. Without block reuse it
+        # uses the Mixed manager (separate KV / recurrent-state pools). SA
+        # speculative decoding is validated on the Mixed manager's
+        # SpeculativeState scratch path only; reuse + SA is unvalidated.
+        # Disaggregated serving (TRTLLM-14815) routes through the shared
+        # hybrid transceiver validation below: on V1 the Python NIXL
         # transceiver selects the Mixed manager, whose KDA recurrent/conv
         # states transfer as a STATE layer group with the KV blocks.
         # Helix x speculation bookkeeping (per-token verify groups on the

@@ -63,7 +63,7 @@ accuracy:
 worker_config:
   # K3 constraints applied to both sides (see examples/kimi_k3/disagg/README.md):
   # EP-only DEP16 with matched ctx/gen parallelism, no chunked prefill, no KV
-  # block reuse, tokens_per_block 64, NIXL with the Python V2 transceiver.
+  # block reuse, tokens_per_block 64, NIXL with the Python transceiver.
   gen:
     print_iter_log: true
     max_batch_size: 32
@@ -93,12 +93,8 @@ worker_config:
       backend: MEGAMOE_DEEPGEMM
     cache_transceiver_config:
       backend: NIXL
-      # PYTHON is mandatory: the C++ transceiver throws at construction for
-      # K3's MixedMambaHybridCacheManager.
+      # Only the Python transceiver can move the KDA state.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
-      # Shared C++ agent arena for chunked gather/write/scatter transfers.
-      kv_cache_bounce_size_mb: 1024
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -122,8 +118,7 @@ worker_config:
       backend: MEGAMOE_DEEPGEMM
     cache_transceiver_config:
       backend: NIXL
+      # Only the Python transceiver can move the KDA state.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
-      kv_cache_bounce_size_mb: 1024
     disable_overlap_scheduler: true
     trust_remote_code: true

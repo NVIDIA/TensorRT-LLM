@@ -1,10 +1,10 @@
 # Kimi K3 disaggregated serving (ctx/gen split)
 
 Configuration pair + deployment wiring for running Kimi K3 with separate
-context (prefill) and generation (decode) servers. Status: **validated
-end-to-end on hardware** (GB300 NVL72, 1 ctx + 1 gen, DEP16 both sides,
-GSM8K accuracy parity with aggregated serving) — see the caveats section
-for constraints.
+context (prefill) and generation (decode) servers. Status: validated
+end-to-end on GB300 NVL72 with the current configs (1 ctx + 1 gen, DEP16
+both sides, KVCacheManagerV2); GSM8K accuracy and throughput are on par
+with the previous transfer path. See the caveats section for constraints.
 
 ## Files
 
@@ -12,7 +12,7 @@ for constraints.
 |---|---|
 | `ctx_config.yaml` | Context-server extra LLM-API options (DEP16, overlap scheduler off, no spec decode) |
 | `gen_config.yaml` | Generation-server options WITH suffix-automaton (SA) speculative decoding (DEP16, eager) |
-| `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first (CUDA graphs ON by default: GSM8K 96.89, 765/2138 tok/s @c64/c256 vs aggregated 643/1972; null `cuda_graph_config` for token-parity debugging) |
+| `gen_config_no_sa.yaml` | Generation-server options WITHOUT spec decode — use this first (CUDA graphs ON by default: GSM8K 96.5, ~950/2043 output tok/s @c64/c256 on 8k/1k random prompts; null `cuda_graph_config` for token-parity debugging) |
 | `disagg_proxy_config.yaml` | `trtllm-serve disaggregated` proxy config (1 ctx + 1 gen) |
 | `benchmark_kimi_k3_dep16.yaml` | Config for the SLURM benchmark harness (`examples/disaggregated/slurm/benchmark/submit.py`) |
 
@@ -32,26 +32,28 @@ for constraints.
   replicated share ~113 GiB + experts/8), leaving no activation headroom
   on GB300 (288 GiB) and not fitting GB200 (186 GiB). Treat DEP8-ctx as
   ruled out on GB200 and an open (likely negative) question on GB300.
-- **`transceiver_runtime: PYTHON` is mandatory**: `auto` resolves to the
-  C++ transceiver, which throws at construction for K3's
-  `MixedMambaHybridCacheManager`.
+- **Python transceiver** (`backend: NIXL`, `transceiver_runtime: PYTHON`):
+  only it can move the KDA state. It is the default (and `auto` selects it
+  for K3 too); the configs set it explicitly.
 - `disable_overlap_scheduler: true` on the ctx server (disagg
   requirement) and on the gen server (SA runs eager; also keeps the
   SA-off smoke maximally comparable).
 - `enable_block_reuse: false`, `tokens_per_block: 64`, no chunked
   prefill, beam width 1 (model requirements).
-- `max_tokens_in_buffer: 8448` covers the target max ISL of 8192; raise
-  it together with `max_num_tokens`/`max_seq_len` for longer ISL.
-- **`kv_cache_bounce_size_mb: 1024` on both sides**: the V2 transceiver's default
-  pool-to-pool path cannot use inter-node cuda_ipc on MNNVL (the KV pool
-  is a plain, non-fabric allocation) and falls back to ~0.4 GB/s
-  host-staged tcp; the fabric-VMM bounce buffer restores cuda_ipc/MNNVL
-  eligibility (measured ~455 GB/s/GPU). Bounce engages automatically for payloads above `TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES` (default 2 MiB) — always true for K3's ~433 MiB per-request state.
-  The region must fit ONE request's full payload: fixed 433 MiB KDA
-  state + ~27 KB/token MLA latent (649 MiB at 8k ISL). A
-  512 MiB value makes every 8k transfer fall back to the per-fragment
-  tcp path (`[kv-bounce] in-place: transfer 649MiB exceeds the 512MiB
-  bounce region`).
+- **No bounce buffer**: leave `kv_cache_bounce_size_mb` unset. K3 runs on
+  KVCacheManagerV2, which keeps the MLA KV cache and the KDA state in its
+  pools. On GB300 NVL72 these pools are fabric memory, and standard NIXL
+  writes them pool to pool across nodes over MNNVL (cuda_ipc). With its
+  default gate a bounce buffer would stay unused: the gate only accepts
+  writes between mismatched head layouts, and K3's matched DEP16 layout
+  produces none.
+- **Optional, shorter KV transfer**: for latency-sensitive or short-ISL
+  serving, set `kv_cache_bounce_size_mb: 1024` and
+  `agent_bounce_params: {min_descriptor_count: "1", max_average_descriptor_size: "4MB"}`
+  on both servers to send K3's writes through the C++ transfer-agent
+  bounce buffer. On GB300 NVL72 this cut the per-request 8k KV transfer
+  about 4x (~40 ms to ~10 ms) for 1 GiB per GPU; end-to-end throughput
+  was unchanged.
 
 ## KDA state payload size
 
@@ -70,7 +72,7 @@ prerequisites for every worker shell (see caveats below for why):
 ```bash
 export UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc   # on clusters where verbs cannot
                                                 # initialize; a container-default
-                                                # UCX_TLS=tcp breaks V2 NIXL
+                                                # UCX_TLS=tcp breaks NIXL setup
 ```
 
 1. Start the context server (16-rank MPI world across its 4 nodes):
@@ -127,45 +129,46 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
 
 ## Current caveats (read before running)
 
-1. **V2 transceiver "MPI hang" — root-caused, environmental (RESOLVED
+1. **Python-transceiver "MPI hang" — root-caused, environmental (RESOLVED
    with the env pins).** A reported multi-node hang in
    `KvCacheTransceiverV2._exchange_rank_info` → `mpi_allgather` was a
    downstream symptom of `UCX_TLS=all` on nodes where `ud_verbs` cannot
    initialize: the broken transport wedges native NIXL/UCX agent init
    asymmetrically per rank, and the healthy ranks park forever in the
-   setup MPI collectives. Not an MPI/pmix or V2 code bug; with
-   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` V2 NIXL passes multi-node
-   with no code change.
-2. **SA ships eager here.** SA speculative decoding in disagg is
-   validated for accuracy (GSM8K parity with aggregated serving) with
-   CUDA graphs disabled, as configured in `gen_config.yaml`. SA with
-   CUDA graphs is functional (the MLA latent-cache append under CUDA
-   graphs handles spec-dec verification), but the disagg SA + graphs
-   perf points have not been re-measured yet, so `gen_config.yaml`
-   keeps graphs off. Start with `gen_config_no_sa.yaml` for the first
-   bring-up on a new cluster, then switch to `gen_config.yaml`.
+   setup MPI collectives. Not an MPI/pmix or transceiver code bug; with
+   `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` the Python transceiver passes
+   multi-node with no code change.
+2. **SA ships eager here.** SA speculative decoding in disagg was
+   validated for accuracy (GSM8K parity with aggregated serving) on the
+   earlier transfer path, with CUDA graphs disabled as configured in
+   `gen_config.yaml`. SA with CUDA graphs is functional (the MLA
+   latent-cache append under CUDA graphs handles spec-dec verification),
+   but the disagg SA + graphs perf points have not been re-measured yet,
+   so `gen_config.yaml` keeps graphs off. Start with
+   `gen_config_no_sa.yaml` for the first bring-up on a new cluster, then
+   switch to `gen_config.yaml`.
 3. **Matched-DP only.** Keep ctx and gen at identical DEP16 with
    attention-DP on both sides; heterogeneous parallelism passes peer
    validation but is not validated end-to-end (see constraints above).
 4. **Cluster environment** (NVL72 nodes): on clusters where verbs
    transports cannot initialize, pin
    `UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc` (`UCX_TLS=all` hangs setup,
-   see caveat 1) and never run V2 NIXL with a container-default
-   `UCX_TLS=tcp` (breaks V2 NIXL VRAM registration) — unset/override it.
-   No bounce env override is needed: the byte gate
-   (`TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES`, default 2 MiB) is always cleared
-   by K3 payloads (constraints section above).
+   see caveat 1) and never run the Python transceiver with a
+   container-default `UCX_TLS=tcp` (breaks NIXL VRAM registration) —
+   unset/override it. Keep `cuda_ipc` in any pin; UCX uses it for
+   transfers over MNNVL.
 5. **Transfer payload**: each request moves a fixed 433.4 MiB (~454.5 MB)
    KDA state blob ctx → gen in addition to the MLA latent KV
-   (~27 KB/token).
-   Within an NVL72 domain this is ~0.9 ms/request (measured; not a
-   bottleneck), but off-fabric paths would pay 11–23 ms — keep ctx and
-   gen inside one NVL72 domain.
-6. **Bounce-buffer sizing cliff (silent).** Size `kv_cache_bounce_size_mb`
-   to the largest single request's full KV payload (fixed KDA state plus
-   the per-token MLA latent; ≥1024 MB for 8k ISL). An undersized region
-   does not error — every transfer silently falls back to a much slower
-   host-staged TCP path.
+   (~27 KB/token). Keep ctx and gen inside one NVL72 domain so these
+   writes can go over MNNVL.
+6. **V1 cache manager.** `use_kv_cache_manager_v2: false`, or `"auto"` with
+   a text-only K3 checkpoint (`KimiLinearForCausalLM`, which declares no
+   preference), runs the V1 `MixedMambaHybridCacheManager`. Its MLA KV
+   pool still uses fabric memory where supported, but its KDA state is
+   plain PyTorch memory, so cross-node KDA writes cannot use cuda_ipc and
+   fall back to a much slower transport (host-staged TCP under the
+   caveat-4 pin). Use the released checkpoint with the default KV cache
+   manager.
 7. **SA caps gen-side batch size.** SA requires `max_batch_size` ≤ 8 on
    the generation server, which bounds per-instance concurrency at
    `8 × dp_size` (128 with DEP16). Plan instance counts accordingly.
@@ -179,5 +182,6 @@ python3 examples/disaggregated/slurm/benchmark/submit.py \
    job time limits accordingly. The disaggregated proxy does not serve
    `/v1/models` (404) — point readiness probes at a different endpoint.
 10. **`max_num_tokens` coupling.** The generation side must cover
-    `max_batch_size × (1 + max_draft_len)`; the context side needs
-    `max_tokens_in_buffer` ≥ max ISL (see constraints above).
+    `max_batch_size × (1 + max_draft_len)`; with chunked prefill disabled,
+    the context side must fit the whole prompt in `max_num_tokens` and
+    `max_seq_len`.
