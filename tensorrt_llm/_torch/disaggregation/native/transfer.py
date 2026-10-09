@@ -2763,32 +2763,21 @@ class KVRecvTask(_LogicalTask):
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
-        self._ownership_state_lock: Optional[threading.Lock] = None
 
+    # Callers hold RxSession.lock, which keeps complete()'s check-then-set atomic against fail().
+    # The only lock-free fail() is dispatch_task's pre-publication PeerIncompatibleError path.
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
-        if self._ownership_state_lock is None:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
-            return
-        with self._ownership_state_lock:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
+        self._exception = exc
+        self.status = TaskStatus.ERROR
+        self._event.set()
 
     def complete(self) -> None:
-        if self._ownership_state_lock is None:
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
-            return
-        with self._ownership_state_lock:
-            if self.status == TaskStatus.ERROR:
-                return
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
+        if self.status == TaskStatus.ERROR:
+            return  # a failure that already committed stands
+        self._logical_outcomes.complete(self._logical_index)
+        self.status = TaskStatus.TRANSFERRED
+        self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -2849,7 +2838,6 @@ class KVRecvTask(_LogicalTask):
     def begin_publication(self) -> None:
         if self._physical_owner is None:
             self._physical_owner = _ReceiveOperationOwner(self._retirement)
-            self._ownership_state_lock = threading.Lock()
         self._physical_owner.begin_publication()
 
     def _get_physical_owner(self) -> _ReceiveOperationOwner:
