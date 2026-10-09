@@ -173,9 +173,13 @@ def setup_kv_and_metadata(
         * scenario.kv_cache_tokens_per_block
         * scenario.batch
     )
+    # HELIX's V2 ledger measures global tokens; the kernels below consume
+    # rank-local lengths and need one generation slot on every rank.
+    cache_token_scale = mapping.cp_size if mapping.has_cp_helix() else 1
+    cache_seq_len = (ctx_len_per_gpu + 1) * cache_token_scale
     kv_cache_manager = KVCacheManagerV2(
         KvCacheConfig(
-            max_tokens=max_tokens,
+            max_tokens=max_tokens * cache_token_scale,
             enable_block_reuse=False,
         ),
         cache_type,
@@ -183,7 +187,7 @@ def setup_kv_and_metadata(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         tokens_per_block=scenario.kv_cache_tokens_per_block,
-        max_seq_len=ctx_len_per_gpu + 1,
+        max_seq_len=cache_seq_len,
         max_batch_size=scenario.batch,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
@@ -191,7 +195,7 @@ def setup_kv_and_metadata(
     # The attention test bypasses scheduling and uses rank-local dummy caches.
     # Reserve the context plus the generation token written by this test.
     requests = kv_cache_manager.add_dummy_requests(
-        list(range(scenario.batch)), [ctx_len_per_gpu + 1] * scenario.batch
+        list(range(scenario.batch)), [cache_seq_len] * scenario.batch
     )
     assert requests is not None
     for req in requests:
