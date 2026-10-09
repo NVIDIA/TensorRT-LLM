@@ -31,7 +31,8 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Dict, NoReturn, Optional, Sequence, Set
+from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
+                    Sequence, Set)
 
 import click
 import torch
@@ -49,7 +50,7 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      apply_config_overrides,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
-from tensorrt_llm.commands.mooncake import mooncake_donor, mooncake_master
+from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -61,7 +62,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (KvCacheConnectorConfig,
+                                          MultimodalConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -489,6 +491,39 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+@contextlib.contextmanager
+def _provision_kv_cache_pool(llm_args: dict,
+                             owns_engine: bool = True) -> Iterator[None]:
+    """Bring up the shared cache this server joins, for its lifetime.
+
+    A connector backed by a cluster-wide pool needs that pool reachable before
+    any rank opens a handle, and the LLM constructor spawns the ranks, so this
+    wraps the construction. A deployment that provisions the pool externally is
+    detected and left alone.
+
+    Only the process that owns the engine does this. An attached frontend
+    re-execs this command line but shares the launcher's executor, so it would
+    otherwise render a second client config over the first.
+    """
+    if not owns_engine:
+        yield
+        return
+
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import \
+        maybe_provision_pool
+
+    connector_config = llm_args.get("kv_connector_config")
+    if isinstance(connector_config, dict):
+        # A YAML section arrives unvalidated, and the pool has to be described
+        # before the LLM constructor would coerce it. The validated model is
+        # handed on so it is not parsed twice.
+        connector_config = KvCacheConnectorConfig(**connector_config)
+        llm_args["kv_connector_config"] = connector_config
+
+    with maybe_provision_pool(connector_config):
+        yield
+
+
 def launch_server(
         host: str,
         port: int,
@@ -570,50 +605,52 @@ def launch_server(
         # until uvicorn takes it over, so no one can steal the port in between.
         _publish_bound_address(report_addr, host, port)
 
-        if backend == 'pytorch':
-            llm_args.pop("build_config", None)
-            llm = PyTorchLLM(**llm_args)
-        else:
-            raise click.BadParameter(
-                f"{backend} is not a known backend, check help for available options.",
-                param_hint="backend")
+        with _provision_kv_cache_pool(
+                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+            if backend == 'pytorch':
+                llm_args.pop("build_config", None)
+                llm = PyTorchLLM(**llm_args)
+            else:
+                raise click.BadParameter(
+                    f"{backend} is not a known backend, check help for available options.",
+                    param_hint="backend")
 
-        # The finally below is the cleanup boundary for the attached
-        # frontends: it must cover everything from their spawn through
-        # server construction, middleware registration, and runtime, or a
-        # failure in between leaks the child processes.
-        frontend_children = []
-        try:
-            if multi_frontend.is_launcher:
-                frontend_children = _spawn_attached_frontends(
-                    llm,
-                    multi_frontend.num_frontends,
-                    report_failure=_report_observed_child_failure)
+            # The finally below is the cleanup boundary for the attached
+            # frontends: it must cover everything from their spawn through
+            # server construction, middleware registration, and runtime, or a
+            # failure in between leaks the child processes.
+            frontend_children = []
+            try:
+                if multi_frontend.is_launcher:
+                    frontend_children = _spawn_attached_frontends(
+                        llm,
+                        multi_frontend.num_frontends,
+                        report_failure=_report_observed_child_failure)
 
-            server = OpenAIServer(
-                generator=llm,
-                model=model,
-                tool_parser=tool_parser,
-                server_role=server_role,
-                metadata_server_cfg=metadata_server_cfg,
-                disagg_cluster_config=disagg_cluster_config,
-                multimodal_server_config=multimodal_server_config,
-                chat_template=chat_template,
-                allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=num_input_processor_workers,
-                media_load_workers=num_media_load_workers,
-                internal_disagg_auth_key=internal_disagg_auth_key)
-            _apply_fastapi_middlewares(server.app, middleware)
+                server = OpenAIServer(
+                    generator=llm,
+                    model=model,
+                    tool_parser=tool_parser,
+                    server_role=server_role,
+                    metadata_server_cfg=metadata_server_cfg,
+                    disagg_cluster_config=disagg_cluster_config,
+                    multimodal_server_config=multimodal_server_config,
+                    chat_template=chat_template,
+                    allow_request_chat_template=allow_request_chat_template,
+                    input_processor_workers=num_input_processor_workers,
+                    media_load_workers=num_media_load_workers,
+                    internal_disagg_auth_key=internal_disagg_auth_key)
+                _apply_fastapi_middlewares(server.app, middleware)
 
-            # Optionally disable GC (default: not disabled)
-            if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
-                gc.disable()
+                # Optionally disable GC (default: not disabled)
+                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                    gc.disable()
 
-            _signal_frontend_ready(multi_frontend)
-            uvloop.run(server(host, port, sockets=[s]))
-        finally:
-            if frontend_children:
-                _terminate_attached_frontends(frontend_children)
+                _signal_frontend_ready(multi_frontend)
+                uvloop.run(server(host, port, sockets=[s]))
+            finally:
+                if frontend_children:
+                    _terminate_attached_frontends(frontend_children)
 
 
 def launch_mm_encoder_server(
@@ -1493,12 +1530,18 @@ def serve(
                         "Restore the required gRPC runtime with `python -m pip "
                         "install \"grpcio>=1.67.1,<2\"`.") from error
 
-                launch_grpc_server(
-                    host,
-                    port,
-                    llm_args,
-                    served_model_name=served_model_name,
-                    report_failure=_report_observed_child_failure)
+                grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
+                                                                enabled=True)
+                with _provision_kv_cache_pool(
+                        llm_args,
+                        owns_engine=not grpc_multi_frontend.is_attached_frontend
+                ):
+                    launch_grpc_server(
+                        host,
+                        port,
+                        llm_args,
+                        served_model_name=served_model_name,
+                        report_failure=_report_observed_child_failure)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
@@ -2686,10 +2729,10 @@ main = DefaultGroup(
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
         "mm_embedding_serve": serve_encoder,
         "embeddings": serve_embedding,
-        # The parts of a Mooncake pool that cannot belong to a server, for
-        # deployments where a pool outlives or spans them.
+        # The part of a Mooncake pool that outlives and is shared by every
+        # server, and the report of what they collectively contributed to it.
         "mooncake_master": mooncake_master,
-        "mooncake_donor": mooncake_donor,
+        "mooncake_pool_report": mooncake_pool_report,
     })
 
 if __name__ == "__main__":
