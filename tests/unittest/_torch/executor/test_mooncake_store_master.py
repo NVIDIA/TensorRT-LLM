@@ -42,6 +42,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     resolve_master_address,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def free_port() -> int:
     with socket.socket() as probe:
@@ -571,6 +573,47 @@ def test_a_half_written_address_is_never_read(tmp_path):
     with master_module._published_address("10.0.0.7:50051", [str(target)]):
         assert not (tmp_path / "master.addr.partial").exists()
         assert target.read_text().strip() == "10.0.0.7:50051"
+
+
+@pytest.mark.parametrize("standalone", [False, True], ids=["provision_pool", "running_master"])
+def test_partial_publication_is_retracted_on_startup_failure(fake_master, tmp_path, standalone):
+    port = free_port()
+    fake_master.arm(listen_on=port)
+    run_dir = tmp_path / "run"
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    sentinel = occupied / "keep"
+    sentinel.write_text("unrelated")
+    pool = PoolSpec(launch_master=True, master_port=port, master_address_file=str(occupied))
+    context = (
+        master_module.running_master(pool, str(run_dir), address_file=str(occupied))
+        if standalone
+        else provision_pool(pool, run_dir=str(run_dir))
+    )
+
+    with pytest.raises(OSError):
+        with context:
+            pytest.fail("publishing over a directory should not have yielded")
+
+    assert not (run_dir / master_module.MASTER_ADDRESS_NAME).exists()
+    assert not (tmp_path / "occupied.partial").exists()
+    assert sentinel.read_text() == "unrelated"
+    assert fake_master.process.terminated
+
+
+def test_failed_publication_does_not_retract_unvisited_paths(tmp_path):
+    occupied = tmp_path / "occupied"
+    occupied.mkdir()
+    untouched = tmp_path / "another-master.addr"
+    untouched.write_text("another-master:50051\n")
+
+    with pytest.raises(OSError):
+        with master_module._published_address("127.0.0.1:50051", [str(occupied), str(untouched)]):
+            pytest.fail("publishing over a directory should not have yielded")
+
+    assert untouched.read_text() == "another-master:50051\n"
+    assert occupied.is_dir()
+    assert not (tmp_path / "occupied.partial").exists()
 
 
 # ---- saying why bringup is stuck ----
