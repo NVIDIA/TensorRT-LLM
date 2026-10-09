@@ -22,7 +22,11 @@ This file covers the code paths gated behind
   `BeamSearchHandler._prepare_beam_history._builder`
   (the synchronous `.cpu()` issued when the host-side predictor
   decided the step is non-terminal but the beam still finalizes),
-* the predictor-hit path that routes copies through the side stream.
+* the predictor-hit path that routes copies through the side stream,
+* the two stream-ordering contracts the path relies on: the side-stream
+  copier keeping its sources alive until it has read them, and the
+  fallback builder awaiting its own non-blocking copies before reading
+  them (handler-level tests, no LLM).
 
 The dummy model from `test_beam_search_util` produces deterministic
 outputs, so we can compare runs token-for-token without depending on
@@ -32,7 +36,7 @@ real model weights.
 import gc
 import os
 import pathlib as _pl
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any, Generator, Iterable
 
@@ -43,10 +47,21 @@ from test_beam_search_util import DummyConfigLoader, DummyWeightLoader
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTorch, TorchSampler
-from tensorrt_llm._torch.pyexecutor.sampler.beam_search import BeamSearchHandler
+from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
+    BEAM_SEARCH_PAD_TOKEN,
+    BeamSearchHandler,
+    BeamSearchStore,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import _SideStreamCopier
+from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi import KvCacheConfig
+
+# Long enough that host-side work issued after the sleep is enqueued
+# while the GPU is still inside it: ~0.5-1 s on current parts.
+_RACE_WINDOW_CYCLES = 1_000_000_000
 
 
 @pytest.fixture(scope="module")
@@ -153,18 +168,22 @@ def _run_with_env(
     predictor_override: Any = None,
     sampler_force_async_worker: bool = False,
     sampler_method_patches: dict[str, Any] | None = None,
+    handler_method_patches: dict[str, Any] | None = None,
 ) -> list[GenerationResult]:
     """Build a fresh LLM with the speculative flag configured, run beam search, tear down.
 
     Opt-in is via `TorchLlmArgs.enable_speculative_beam_history_d2h`.
     `predictor_override` patches
-    `BeamSearchHandler.predict_is_likely_finishing` and
-    `sampler_method_patches` patches arbitrary `TorchSampler` methods;
-    either forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
-    reach the sampler. `sampler_force_async_worker` enables the
-    AsyncWorkerMixin path.
+    `BeamSearchHandler.predict_is_likely_finishing`,
+    `sampler_method_patches` patches arbitrary `TorchSampler` methods and
+    `handler_method_patches` arbitrary `BeamSearchHandler` methods; any of
+    them forces `TLLM_WORKER_USE_SINGLE_PROCESS=1` so class-level patches
+    reach the sampler. The method patches are installed after a warmup
+    generate, so they only observe the measured run.
+    `sampler_force_async_worker` enables the AsyncWorkerMixin path.
     """
-    needs_single_process = predictor_override is not None or sampler_method_patches
+    method_patches = bool(sampler_method_patches) or bool(handler_method_patches)
+    needs_single_process = predictor_override is not None or method_patches
     if needs_single_process:
         # Class-level patches do not cross process boundaries; force the
         # sampler to run in-process so the patch is observed.
@@ -182,12 +201,14 @@ def _run_with_env(
     try:
         with llm:
             sampling_params = _make_sampling_params(fixed_params, stop_token_ids)
-            if sampler_method_patches:
+            if method_patches:
                 # Warmup before installing the hooks.
                 _generate(llm, input_prompts, sampling_params)
-            with monkeypatch.context() if sampler_method_patches else nullcontext() as p:
+            with monkeypatch.context() if method_patches else nullcontext() as p:
                 for name, replacement in (sampler_method_patches or {}).items():
                     p.setattr(TorchSampler, name, replacement)
+                for name, replacement in (handler_method_patches or {}).items():
+                    p.setattr(BeamSearchHandler, name, replacement)
                 # Run with the hooks installed.
                 return _generate(llm, input_prompts, sampling_params)
     finally:
@@ -291,6 +312,66 @@ def test_speculative_d2h_predictor_miss_fallback(
         "predictor patch was never invoked; the speculative path did not run "
         "(check that enable_speculative_beam_history_d2h is honored)"
     )
+    _assert_outputs_equal(out_on, out_off)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_speculative_d2h_fallback_builder_runs_only_on_finishing_step(
+    fixed_params: dict[str, Any],
+    input_prompts: list[list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback builder is invoked once per request, on the step that ends it.
+
+    With the predictor pinned to a miss, every step hands `update_requests` a
+    fallback builder whose invocation takes a blocking snapshot of the
+    request's rows. `update_requests` must only invoke it once the host-side
+    finish reasons show every beam finished; invoking it on every step would
+    stall each step on a snapshot that then produces nothing.
+
+    No stop token and `end_id=-1`, so every request runs to its length budget
+    and all its beams finish on the same step. Each request's builder must
+    therefore run exactly once, and that run must produce a history.
+    """
+    _always_miss, miss_state = _pinned_predictor(False)
+    speculative_builder_orig = BeamSearchHandler._speculative_builder
+    builder_results: list[bool] = []
+
+    def _counting_speculative_builder(self, request):  # type: ignore[no-untyped-def]
+        inner = speculative_builder_orig(self, request)
+
+        def _builder():  # type: ignore[no-untyped-def]
+            history = inner()
+            builder_results.append(history is not None)
+            return history
+
+        return _builder
+
+    with monkeypatch.context() as mp_off:
+        out_off = _run_with_env(
+            fixed_params, input_prompts, mp_off, speculative=False, stop_token_ids=None
+        )
+
+    with monkeypatch.context() as mp_on:
+        out_on = _run_with_env(
+            fixed_params,
+            input_prompts,
+            mp_on,
+            speculative=True,
+            stop_token_ids=None,
+            predictor_override=_always_miss,
+            handler_method_patches={"_speculative_builder": _counting_speculative_builder},
+        )
+
+    assert miss_state["calls"] > 0, (
+        "predictor patch was never invoked; the speculative path did not run "
+        "(check that enable_speculative_beam_history_d2h is honored)"
+    )
+    assert len(builder_results) == len(input_prompts), (
+        "the fallback builder must run exactly once per request, on its final "
+        f"step; it ran {len(builder_results)} times for {len(input_prompts)} requests"
+    )
+    assert all(builder_results), "every fallback builder invocation must finalize its request"
     _assert_outputs_equal(out_on, out_off)
 
 
@@ -509,6 +590,167 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
     )
     assert hook_state["sample_async_called"], "sample_async hook was never invoked"
     assert hook_state["update_requests_called"], "update_requests hook was never invoked"
+
+
+# ---------------------------------------------------------------------------
+# Stream-ordering contracts of the two D2H paths (handler-level, no LLM).
+#
+# Both tests open a deliberate race window with torch.cuda._sleep so that the
+# host-side work they issue afterwards runs while the GPU copies are still
+# pending. A correct implementation is unaffected by the window; a missing
+# ordering edge turns into a deterministic wrong read instead of a flake.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_side_stream_copier_keeps_sources_alive_until_copied() -> None:
+    """The copier must keep a staged source's memory out of reuse until it has read it.
+
+    `prepare_cba_group_host` stages advanced-indexing gathers and drops them
+    right after; by the time `commit` issues the copies, the only reference
+    is the copier's own. The caching allocator frees a block to its
+    allocating stream, so without `record_stream(side_stream)` the next
+    same-sized main-stream allocation gets the block back while the
+    side-stream copy may not have started, and the host receives whatever
+    the new owner wrote.
+
+    Park the side stream behind a sleep so the copy cannot have started when
+    a same-sized tensor is allocated and filled on the main stream.
+    """
+    numel = 4096
+    side_stream = torch.cuda.Stream()
+    copier = _SideStreamCopier(side_stream, torch.cuda.stream(side_stream))
+
+    # Start from an empty cache so the block `src` releases is the only free
+    # block of its size; an older same-sized block left by earlier tests
+    # would otherwise absorb the clobber and hide a missing record_stream.
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    base = torch.arange(numel, device="cuda", dtype=torch.int32)
+    index = torch.randperm(numel, device="cuda")
+    expected = base.cpu()[index.cpu()]
+
+    with torch.cuda.stream(side_stream):
+        torch.cuda._sleep(_RACE_WINDOW_CYCLES)
+
+    src = base[index]  # main-stream temporary, same shape as the clobber below
+    dst = copier.stage_copy_to_host(src)
+    event = copier.commit()
+    assert event is not None
+    del src
+
+    # Nothing is queued on the main stream, so this runs at once. Without the
+    # record_stream edge it lands in the block `src` just released.
+    clobber = torch.full((numel,), -1, device="cuda", dtype=torch.int32)
+    assert not event.query(), (
+        "the side-stream copy finished before the clobber was issued; the race "
+        "window was not open and the test proves nothing (raise _RACE_WINDOW_CYCLES)"
+    )
+
+    event.synchronize()
+    torch.testing.assert_close(dst, expected)
+    del clobber
+
+
+def _recording_non_blocking_copy(src: torch.Tensor) -> torch.Tensor:
+    """Stand-in for `AsyncWorkerMixin._copy_to_host` without the async worker.
+
+    Same non-blocking copy into pinned memory, but the destination is
+    zero-filled first so a read that outruns the copy observes zeros rather
+    than whatever the pinned block last held. Zero is `should_stop == False`,
+    so an unsynchronized builder deterministically returns no history.
+    """
+    dst = torch.zeros_like(src, device="cpu", pin_memory=True)
+    dst.copy_(src, non_blocking=True)
+    return dst
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_speculative_fallback_builder_awaits_its_copies() -> None:
+    """The fallback builder must await its own D2H copies before reading them.
+
+    It runs inside `update_requests`, after the step's sampler event has
+    already been awaited, and issues fresh non-blocking copies; no later
+    event covers them, so the builder has to synchronize itself before the
+    `.item()` reads in `_prepare_beam_history_cba`.
+
+    Set up one request whose beams have all finished, park the current stream
+    behind a sleep, then invoke the builder: it must still return the history
+    the device state describes.
+    """
+    num_beams = 3
+    num_generated = 4
+    pad = BEAM_SEARCH_PAD_TOKEN
+
+    sampling_params = SamplingParams(n=num_beams, best_of=num_beams, use_beam_search=True)
+    request = LlmRequest(
+        request_id=0,
+        seq_slot=0,
+        max_new_tokens=16,
+        input_tokens=[1, 2, 3],
+        end_id=-1,
+        sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.py_decoding_iter = num_generated
+    request.decoding_iter = num_generated
+    request.py_seq_slot = 0
+    prompt_len = request.py_prompt_len
+    # num_generated_tokens is derived from the request's token count; the last
+    # token of the step is not added yet, hence num_generated - 1.
+    request.set_generated_tokens([[0] * (num_generated - 1)] * num_beams)
+    total = prompt_len + num_generated
+
+    store = BeamSearchStore.create(
+        cache_indirection_shape=(1, num_beams, total),
+        max_num_sequences=1,
+        max_beam_width=num_beams,
+    )
+    cba = store.ensure_cba()
+    # Every beam finished, so should_stop is True for the slot.
+    store.first_finish_reasons.fill_(FinishReason.LENGTH.value)
+    # Identity ancestry: each beam keeps its own tokens.
+    store.cache_indirection.copy_(
+        torch.arange(num_beams, dtype=torch.int32).view(-1, 1).expand(-1, total).unsqueeze(0)
+    )
+    active_tokens = torch.tensor(
+        [[31, 32, 33, 34], [41, 42, 43, 44], [51, 52, 53, 54]], dtype=torch.int32
+    )
+    store.original_tokens.zero_()
+    store.original_tokens[0, :, prompt_len:] = active_tokens.cuda()
+    # Already in descending order, so the ranking leaves the beams in place.
+    store.cum_log_probs[0] = torch.tensor([7.0, 5.0, 3.0], device="cuda")
+    # Empty pool: every output beam comes from the live ones.
+    cba.cba_tokens.fill_(pad)
+    cba.cba_lengths.zero_()
+    cba.cba_cum_log_probs.zero_()
+    cba.cba_normed_scores.fill_(float("-inf"))
+
+    def _no_side_stream_copier() -> AbstractContextManager[_SideStreamCopier]:
+        raise AssertionError("the fallback builder must not use the side-stream copier")
+
+    handler = BeamSearchHandler(
+        store=store,
+        max_seq_len=total,
+        max_num_sequences=1,
+        use_speculative_d2h=True,
+        has_multi_token_stop_words=lambda _request: False,
+        copy_to_host=_recording_non_blocking_copy,
+        make_side_stream_copier=_no_side_stream_copier,
+    )
+    builder = handler._speculative_builder(request)
+
+    # Everything the builder enqueues now lands behind this sleep.
+    torch.cuda._sleep(_RACE_WINDOW_CYCLES)
+    history = builder()
+
+    assert history is not None, (
+        "the builder read should_stop before its D2H copy landed and dropped the history"
+    )
+    torch.testing.assert_close(history.tokens, active_tokens)
+    assert history.cum_logprobs is not None
+    torch.testing.assert_close(history.cum_logprobs, torch.tensor([7.0, 5.0, 3.0]))
 
 
 if __name__ == "__main__":
