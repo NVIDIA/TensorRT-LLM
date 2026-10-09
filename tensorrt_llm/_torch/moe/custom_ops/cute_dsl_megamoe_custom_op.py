@@ -2174,9 +2174,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         kernel_cache: dict = {}
         # Module-scope resolved (kernel descriptor, tactic) cache, same sharing.
         _kernel_descriptor_cache: dict = {}
-        # Cache kernel objects at class scope so transient runner instances share
-        # artifacts with identical constructor and tactic keys.
-        kernel_obj_cache: dict = {}
 
         def __init__(
             self,
