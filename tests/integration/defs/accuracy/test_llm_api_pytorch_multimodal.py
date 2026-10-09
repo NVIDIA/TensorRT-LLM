@@ -590,8 +590,6 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            # Preserve the long-output KDA-hybrid shape that previously stalled
-            # under V2; this migration still needs that regression qualified.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
