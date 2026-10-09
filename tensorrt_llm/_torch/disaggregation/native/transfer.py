@@ -2490,32 +2490,29 @@ class KVRecvTask(_LogicalTask):
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
-        self._ownership_state_lock: Optional[threading.Lock] = None
 
     def fail(self, exc: Exception) -> None:
+        """Mark the task ERROR.
+
+        Callers hold RxSession.lock, except dispatch_task's PeerIncompatibleError path, which
+        runs before publication.
+        """
         self._logical_outcomes.fail(exc)
-        if self._ownership_state_lock is None:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
-            return
-        with self._ownership_state_lock:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
+        self._exception = exc
+        self.status = TaskStatus.ERROR
+        self._event.set()
 
     def complete(self) -> None:
-        if self._ownership_state_lock is None:
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
+        """Mark the task TRANSFERRED unless it already failed.
+
+        Callers hold RxSession.lock, so this check-then-set is atomic against fail(). Status is
+        set before _event, so a thread woken by _event reads the status that complete() set.
+        """
+        if self.status == TaskStatus.ERROR:
             return
-        with self._ownership_state_lock:
-            if self.status == TaskStatus.ERROR:
-                return
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
+        self._logical_outcomes.complete(self._logical_index)
+        self.status = TaskStatus.TRANSFERRED
+        self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -2576,7 +2573,6 @@ class KVRecvTask(_LogicalTask):
     def begin_publication(self) -> None:
         if self._physical_owner is None:
             self._physical_owner = _ReceiveOperationOwner(self._retirement)
-            self._ownership_state_lock = threading.Lock()
         self._physical_owner.begin_publication()
 
     def _get_physical_owner(self) -> _ReceiveOperationOwner:
@@ -3504,15 +3500,14 @@ class RxSession(RxSessionBase):
                 # attestation of destination bytes actually submitted and
                 # completed for this chunk (0 unless the write completed).
                 task.verified_write_bytes += transfer_size
-                # The completing report: every expected writer succeeded. A concurrent failure that
-                # already failed the task stands. complete() sets status before _event, keeping
-                # wait_complete's status-first poll correct.
+                # Once every expected writer has reported success for the last slice, complete the
+                # task and log perf, unless the task has already failed.
                 if is_last_slice and all_succeeded and task.status != TaskStatus.ERROR:
-                    ri = self._receiver._registrar.self_rank_info
                     task.complete()
                     # Record completion before best-effort diagnostics.
                     if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
                         self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
+                    ri = self._receiver._registrar.self_rank_info
                     try:
                         if task._perf_timer is not None:
                             task._perf_timer.record_task_end(peer_rank)
