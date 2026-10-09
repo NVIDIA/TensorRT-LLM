@@ -295,18 +295,36 @@ TEST(BounceConfig, ParamsWithoutRequestTimeoutLeaveLeaseAlone)
     EXPECT_EQ(cfgDirect.quarantineMs, 654321);
 }
 
+namespace
+{
+// The inputs of bounceWantsSplitBatchSizeOne, defaulting to a case that forces split_batch_size=1.
+struct SplitInputs
+{
+    bool bounceRequested{true};
+    std::string backend{"UCX"};
+    bool useProgThread{true};
+    bool splitBatchSizeSet{false};
+    std::optional<std::string> numThreads{"8"};
+};
+
+bool wantsSplitBatchSizeOne(SplitInputs const& in)
+{
+    return b::bounceWantsSplitBatchSizeOne(
+        in.bounceRequested, in.backend, in.useProgThread, in.splitBatchSizeSet, in.numThreads);
+}
+} // namespace
+
 // split_batch_size=1 is forced only for bounce requested + UCX + progress thread + num_threads > 0,
 // and never over an explicit split_batch_size.
 TEST(BounceConfig, SplitBatchSizeDecision)
 {
-    std::optional<std::string> const eight{"8"};
-    EXPECT_TRUE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, eight));
-    EXPECT_TRUE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"1"}));
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(false, "UCX", true, false, eight));             // bounce off
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "LIBFABRIC", true, false, eight));        // not UCX
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", false, false, eight));             // no progress thread
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, true, eight));               // set explicitly
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::nullopt));       // num_threads absent
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"0"}));   // engine off
-    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"abc"})); // unparsable
+    EXPECT_TRUE(wantsSplitBatchSizeOne({}));
+    EXPECT_TRUE(wantsSplitBatchSizeOne({.numThreads = "1"}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.bounceRequested = false}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.backend = "LIBFABRIC"}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.useProgThread = false}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.splitBatchSizeSet = true}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.numThreads = std::nullopt}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.numThreads = "0"}));
+    EXPECT_FALSE(wantsSplitBatchSizeOne({.numThreads = "abc"}));
 }

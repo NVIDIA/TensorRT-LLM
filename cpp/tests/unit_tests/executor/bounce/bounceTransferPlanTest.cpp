@@ -16,14 +16,15 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceTransferPlan.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/HostWorkerPool.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -36,6 +37,9 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 namespace
 {
+// Every desc starts at a multiple of this offset within its chunk's bounce region.
+constexpr std::uint64_t kBounceAlignment = 32;
+
 // Build a TransferDescs from (addr,len,dev) tuples. Addresses are synthetic; the planner never
 // dereferences them, it only bins by length / device.
 kvc::TransferDescs makeDescs(std::vector<std::tuple<std::uintptr_t, std::size_t, std::uint32_t>> const& t)
@@ -52,7 +56,8 @@ kvc::TransferDescs makeDescs(std::vector<std::tuple<std::uintptr_t, std::size_t,
 
 TEST(BounceTransferPlan, EmptyYieldsNoChunks)
 {
-    auto plan = b::BounceTransferPlan::build(makeDescs({}), makeDescs({}), /*maxChunkSizeBytes=*/1024, /*maxDescs=*/64);
+    auto plan = b::BounceTransferPlan::build(
+        makeDescs({}), makeDescs({}), /*maxChunkSizeBytes=*/1024, /*maxDescsPerChunk=*/64);
     EXPECT_EQ(plan.numChunks(), 0u);
     EXPECT_EQ(plan.totalDescs(), 0u);
     EXPECT_EQ(plan.totalBytes(), 0u);
@@ -121,7 +126,7 @@ TEST(BounceTransferPlan, MaxDescsPerChunkBoundary)
 {
     // 3 tiny descs, maxDescs=2 -> first chunk holds 2, second holds 1.
     auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 8, 0}, {0x2000, 8, 0}, {0x3000, 8, 0}}),
-        makeDescs({{0x9000, 8, 0}, {0xA000, 8, 0}, {0xB000, 8, 0}}), 4096, /*maxDescs=*/2);
+        makeDescs({{0x9000, 8, 0}, {0xA000, 8, 0}, {0xB000, 8, 0}}), 4096, /*maxDescsPerChunk=*/2);
     ASSERT_EQ(plan.numChunks(), 2u);
     EXPECT_EQ(plan.chunks()[0].srcPtrs.size(), 2u);
     EXPECT_EQ(plan.chunks()[1].srcPtrs.size(), 1u);
@@ -250,37 +255,79 @@ TEST(BounceTransferPlan, ScatterRunsIrregularStrideBreaks)
 
 namespace
 {
-// A request large enough for the parallel planner. src AND dst are strided (no in-place merges, no
-// scatter-run growth) and neighbouring descs differ in size (no stride latch), so every plan desc and
-// every scatter piece maps 1:1 to one input desc. Every 997th desc is zero-length (skipped, counted).
-// `badIdx` (if < n) gets a dst length that does not match its src.
-std::pair<std::vector<kvc::MemoryDesc>, std::vector<kvc::MemoryDesc>> makeLargeRequest(
-    std::size_t n, std::size_t badIdx = std::numeric_limits<std::size_t>::max())
-{
-    std::vector<kvc::MemoryDesc> src;
-    std::vector<kvc::MemoryDesc> dst;
-    src.reserve(n);
-    dst.reserve(n);
-    for (std::size_t i = 0; i < n; ++i)
-    {
-        std::size_t const len = (i % 997 == 0) ? 0 : 64 + (i % 7) * 96; // 64..640 B
-        src.emplace_back(static_cast<std::uintptr_t>(0x10000000ULL + i * 1024), len, 0);
-        dst.emplace_back(static_cast<std::uintptr_t>(0x80000000ULL + i * 2048), i == badIdx ? len + 1 : len, 0);
-    }
-    return {std::move(src), std::move(dst)};
-}
+constexpr std::size_t kSequential = 1;
+constexpr std::size_t kFourSegments = 4;
+constexpr std::size_t kPoolWorkers = 4;
+
+// Chunk caps of the large-request plans: both the byte cap and the desc cap close chunks there.
+constexpr std::size_t kLargeRequestChunkBytes = 16384;
+constexpr std::size_t kLargeRequestDescsPerChunk = 40;
 
 kvc::TransferDescs vram(std::vector<kvc::MemoryDesc> descs)
 {
     return kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(descs)};
 }
 
-// Every chunk honours the planner invariants, the chunks' per-desc entries read in order are exactly
-// the request's non-empty descs (each once, with its src/dst/size), offsets are 32 B-aligned and
-// non-overlapping, and each chunk's scatter runs expand to exactly its descs.
-void expectPlanCoversRequest(b::BounceTransferPlan const& plan, std::vector<kvc::MemoryDesc> const& src,
-    std::vector<kvc::MemoryDesc> const& dst, std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk)
+struct DescPairs
 {
+    std::vector<kvc::MemoryDesc> src;
+    std::vector<kvc::MemoryDesc> dst;
+};
+
+// A request large enough for the parallel planner in which every plan desc and every scatter piece maps
+// 1:1 to one input desc: src and dst are strided, so nothing merges, and neighbouring descs differ in
+// size, so no strided scatter run forms.
+DescPairs makeLargeRequest(std::size_t n)
+{
+    constexpr std::size_t kEmptyDescPeriod = 997; // zero-length descs are skipped but still counted
+    constexpr std::size_t kDescSizeCount = 7;
+    constexpr std::size_t kSmallestDescBytes = 64;
+    constexpr std::size_t kDescBytesStep = 96;
+    constexpr std::size_t kLargestDescBytes = kSmallestDescBytes + (kDescSizeCount - 1) * kDescBytesStep;
+    constexpr std::uintptr_t kSrcBase = 0x10000000ULL;
+    constexpr std::uintptr_t kDstBase = 0x80000000ULL;
+    constexpr std::uintptr_t kSrcPitch = 1024;
+    constexpr std::uintptr_t kDstPitch = 2048;
+    static_assert(kSrcPitch > kLargestDescBytes && kDstPitch > kLargestDescBytes);
+
+    DescPairs request;
+    request.src.reserve(n);
+    request.dst.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        std::size_t const len
+            = (i % kEmptyDescPeriod == 0) ? 0 : kSmallestDescBytes + (i % kDescSizeCount) * kDescBytesStep;
+        request.src.emplace_back(kSrcBase + i * kSrcPitch, len, 0);
+        request.dst.emplace_back(kDstBase + i * kDstPitch, len, 0);
+    }
+    return request;
+}
+
+void mismatchDstLen(std::vector<kvc::MemoryDesc>& dst, std::size_t idx)
+{
+    dst[idx] = kvc::MemoryDesc{dst[idx].getAddr(), dst[idx].getLen() + 1, dst[idx].getDeviceId()};
+}
+
+b::BounceTransferPlan planLargeRequest(
+    DescPairs const& request, std::size_t segments, b::HostWorkerPool* pool = nullptr)
+{
+    return b::BounceTransferPlan::build(
+        vram(request.src), vram(request.dst), kLargeRequestChunkBytes, kLargeRequestDescsPerChunk, segments, pool);
+}
+
+auto throwsLenMismatchAt(std::size_t idx)
+{
+    return testing::Throws<std::exception>(
+        testing::Property(&std::exception::what, testing::HasSubstr("len mismatch at idx " + std::to_string(idx))));
+}
+
+// Every chunk honours the planner invariants, the chunks' per-desc entries read in order are exactly
+// the request's non-empty descs (each once, with its src/dst/size), offsets are aligned and
+// non-overlapping, and each chunk's scatter runs expand to exactly its descs.
+void expectPlanCoversRequest(b::BounceTransferPlan const& plan, DescPairs const& request)
+{
+    auto const& src = request.src;
+    auto const& dst = request.dst;
     std::size_t next = 0;
     std::uint64_t bytes = 0;
     auto skipEmpty = [&]
@@ -293,8 +340,8 @@ void expectPlanCoversRequest(b::BounceTransferPlan const& plan, std::vector<kvc:
     for (auto const& c : plan.chunks())
     {
         ASSERT_FALSE(c.srcPtrs.empty());
-        ASSERT_LE(c.srcPtrs.size(), maxDescsPerChunk);
-        ASSERT_LE(c.packedBytes, maxChunkSizeBytes);
+        ASSERT_LE(c.srcPtrs.size(), kLargeRequestDescsPerChunk);
+        ASSERT_LE(c.packedBytes, kLargeRequestChunkBytes);
         ASSERT_EQ(c.dstPtrs.size(), c.srcPtrs.size());
         ASSERT_EQ(c.sizes.size(), c.srcPtrs.size());
         ASSERT_EQ(c.bounceOffsets.size(), c.srcPtrs.size());
@@ -306,7 +353,7 @@ void expectPlanCoversRequest(b::BounceTransferPlan const& plan, std::vector<kvc:
             ASSERT_EQ(c.srcPtrs[k], src[next].getAddr()) << "desc " << next;
             ASSERT_EQ(c.dstPtrs[k], dst[next].getAddr()) << "desc " << next;
             ASSERT_EQ(c.sizes[k], src[next].getLen()) << "desc " << next;
-            ASSERT_EQ(c.bounceOffsets[k] % 32, 0u);
+            ASSERT_EQ(c.bounceOffsets[k] % kBounceAlignment, 0u);
             if (k == 0)
             {
                 ASSERT_EQ(c.bounceOffsets[k], 0u);
@@ -340,47 +387,75 @@ void expectPlanCoversRequest(b::BounceTransferPlan const& plan, std::vector<kvc:
     EXPECT_EQ(plan.totalDescs(), src.size());
 }
 
-std::string buildError(std::vector<kvc::MemoryDesc> const& src, std::vector<kvc::MemoryDesc> const& dst,
-    std::size_t buildSegments, b::HostWorkerPool* pool = nullptr)
-{
-    try
-    {
-        (void) b::BounceTransferPlan::build(vram(src), vram(dst), 16384, 40, buildSegments, pool);
-    }
-    catch (std::exception const& e)
-    {
-        return e.what();
-    }
-    return {};
-}
-
 // The two plans are identical chunk for chunk (same per-desc arrays, scatter runs and extents).
-void expectSamePlan(b::BounceTransferPlan const& a, b::BounceTransferPlan const& b2)
+void expectSamePlan(b::BounceTransferPlan const& expected, b::BounceTransferPlan const& actual)
 {
-    ASSERT_EQ(a.numChunks(), b2.numChunks());
-    EXPECT_EQ(a.totalBytes(), b2.totalBytes());
-    EXPECT_EQ(a.totalDescs(), b2.totalDescs());
-    for (std::size_t k = 0; k < a.numChunks(); ++k)
+    ASSERT_EQ(actual.numChunks(), expected.numChunks());
+    EXPECT_EQ(actual.totalBytes(), expected.totalBytes());
+    EXPECT_EQ(actual.totalDescs(), expected.totalDescs());
+    for (std::size_t k = 0; k < expected.numChunks(); ++k)
     {
-        auto const& x = a.chunks()[k];
-        auto const& y = b2.chunks()[k];
-        ASSERT_EQ(x.srcPtrs, y.srcPtrs) << "chunk " << k;
-        ASSERT_EQ(x.dstPtrs, y.dstPtrs) << "chunk " << k;
-        ASSERT_EQ(x.sizes, y.sizes) << "chunk " << k;
-        ASSERT_EQ(x.bounceOffsets, y.bounceOffsets) << "chunk " << k;
-        ASSERT_EQ(x.scatterRuns.size(), y.scatterRuns.size()) << "chunk " << k;
-        for (std::size_t r = 0; r < x.scatterRuns.size(); ++r)
+        auto const& want = expected.chunks()[k];
+        auto const& got = actual.chunks()[k];
+        ASSERT_EQ(got.srcPtrs, want.srcPtrs) << "chunk " << k;
+        ASSERT_EQ(got.dstPtrs, want.dstPtrs) << "chunk " << k;
+        ASSERT_EQ(got.sizes, want.sizes) << "chunk " << k;
+        ASSERT_EQ(got.bounceOffsets, want.bounceOffsets) << "chunk " << k;
+        ASSERT_EQ(got.scatterRuns.size(), want.scatterRuns.size()) << "chunk " << k;
+        for (std::size_t r = 0; r < want.scatterRuns.size(); ++r)
         {
-            auto const& u = x.scatterRuns[r];
-            auto const& v = y.scatterRuns[r];
+            auto const& u = want.scatterRuns[r];
+            auto const& v = got.scatterRuns[r];
             ASSERT_TRUE(u.bounceOffset == v.bounceOffset && u.dstAddr == v.dstAddr && u.dstStride == v.dstStride
                 && u.bounceStride == v.bounceStride && u.pieceSize == v.pieceSize && u.count == v.count)
                 << "chunk " << k << " run " << r;
         }
-        EXPECT_EQ(x.totalBytes, y.totalBytes);
-        EXPECT_EQ(x.packedBytes, y.packedBytes);
-        EXPECT_EQ(x.maxDescBytes, y.maxDescBytes);
+        EXPECT_EQ(got.totalBytes, want.totalBytes);
+        EXPECT_EQ(got.packedBytes, want.packedBytes);
+        EXPECT_EQ(got.maxDescBytes, want.maxDescBytes);
     }
+}
+
+// `count` back-to-back descs of `descBytes` each, the first at `base`.
+kvc::TransferDescs contiguousDescs(std::uintptr_t base, std::size_t count, std::size_t descBytes)
+{
+    std::vector<kvc::MemoryDesc> descs;
+    descs.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        descs.emplace_back(base + i * descBytes, descBytes, 0);
+    }
+    return vram(std::move(descs));
+}
+
+constexpr std::size_t kThrowingIndices = 16;
+constexpr std::size_t kFirstFailingIdx = 5;
+constexpr std::size_t kLaterFailingIdx = 11;
+
+std::string failureAt(std::size_t idx)
+{
+    return "index " + std::to_string(idx);
+}
+
+// parallelFor over kThrowingIndices indices, counting each run in `runs`; kFirstFailingIdx and
+// kLaterFailingIdx throw failureAt(index).
+void runThrowingIndices(b::HostWorkerPool& pool, std::vector<std::atomic<int>>& runs)
+{
+    pool.parallelFor(kThrowingIndices,
+        [&](std::size_t i)
+        {
+            runs[i].fetch_add(1);
+            if (i == kFirstFailingIdx || i == kLaterFailingIdx)
+            {
+                throw std::runtime_error(failureAt(i));
+            }
+        });
+}
+
+auto throwsFailureAt(std::size_t idx)
+{
+    return testing::Throws<std::runtime_error>(
+        testing::Property(&std::runtime_error::what, testing::StrEq(failureAt(idx))));
 }
 } // namespace
 
@@ -388,73 +463,89 @@ TEST(HostWorkerPool, BulkSegmentCount)
 {
     EXPECT_EQ(b::bulkSegmentCount(0), 1u);
     EXPECT_EQ(b::bulkSegmentCount(b::kBulkSegmentItems - 1), 1u);
-    EXPECT_EQ(b::bulkSegmentCount(b::kBulkSegmentItems), 2u); // the threshold itself already splits
+    EXPECT_EQ(b::bulkSegmentCount(b::kBulkSegmentItems), b::kMinBulkSegments);
     EXPECT_EQ(b::bulkSegmentCount(2 * b::kBulkSegmentItems), 2u);
     EXPECT_EQ(b::bulkSegmentCount(3 * b::kBulkSegmentItems + 1), 3u);
-    EXPECT_EQ(b::bulkSegmentCount(std::size_t{1} << 20), b::kMaxBulkSegments); // 1M descs: capped
+    EXPECT_EQ(b::bulkSegmentCount((b::kMaxBulkSegments + 1) * b::kBulkSegmentItems), b::kMaxBulkSegments);
 }
 
 TEST(HostWorkerPool, DefaultThreadCountIsBounded)
 {
     EXPECT_GE(b::HostWorkerPool::defaultThreadCount(), 1u);
-    EXPECT_LE(b::HostWorkerPool::defaultThreadCount(), 16u);
+    EXPECT_LE(b::HostWorkerPool::defaultThreadCount(), b::HostWorkerPool::kMaxDefaultWorkers);
 }
 
 TEST(HostWorkerPool, RunsEveryIndexOnce)
 {
+    constexpr std::size_t kIndices = 1000;
     for (std::size_t threads : {std::size_t{0}, std::size_t{1}, std::size_t{4}})
     {
         b::HostWorkerPool pool(threads);
         EXPECT_LE(pool.threadCount(), threads);
-        constexpr std::size_t kCount = 1000;
-        std::vector<std::atomic<int>> hits(kCount);
-        pool.parallelFor(kCount, [&](std::size_t i) { hits[i].fetch_add(1); });
-        for (std::size_t i = 0; i < kCount; ++i)
+        std::vector<std::atomic<int>> runs(kIndices);
+        pool.parallelFor(kIndices, [&](std::size_t i) { runs[i].fetch_add(1); });
+        for (std::size_t i = 0; i < kIndices; ++i)
         {
-            ASSERT_EQ(hits[i].load(), 1) << "threads=" << threads << " index " << i;
+            ASSERT_EQ(runs[i].load(), 1) << "threads=" << threads << " index " << i;
         }
-        pool.parallelFor(0, [](std::size_t) { FAIL() << "no index to run"; });
     }
 }
 
-TEST(HostWorkerPool, RethrowsLowestIndexError)
+TEST(HostWorkerPool, ZeroCountRunsNothing)
 {
-    b::HostWorkerPool pool(4);
-    std::atomic<int> ran{0};
-    try
+    for (std::size_t threads : {std::size_t{0}, std::size_t{1}, std::size_t{4}})
     {
-        pool.parallelFor(16,
-            [&](std::size_t i)
-            {
-                ran.fetch_add(1);
-                if (i == 11 || i == 5)
-                {
-                    throw std::runtime_error("index " + std::to_string(i));
-                }
-            });
-        FAIL() << "expected an exception";
+        b::HostWorkerPool pool(threads);
+        std::atomic<int> runs{0};
+        pool.parallelFor(/*count=*/0, [&](std::size_t) { runs.fetch_add(1); });
+        EXPECT_EQ(runs.load(), 0) << "threads=" << threads;
     }
-    catch (std::runtime_error const& e)
+}
+
+// Like a sequential loop, the error of the lowest failing index wins.
+TEST(HostWorkerPool, RethrowsLowestIndexErrorAfterEveryIndexRan)
+{
+    b::HostWorkerPool pool(kPoolWorkers);
+    ASSERT_GT(pool.threadCount(), 0u) << "needs workers to hand indices to";
+    std::vector<std::atomic<int>> runs(kThrowingIndices);
+
+    EXPECT_THAT([&] { runThrowingIndices(pool, runs); }, throwsFailureAt(kFirstFailingIdx));
+    for (std::size_t i = 0; i < kThrowingIndices; ++i)
     {
-        EXPECT_STREQ(e.what(), "index 5"); // the lowest failing index wins, like a sequential loop
+        EXPECT_EQ(runs[i].load(), 1) << "index " << i;
     }
-    EXPECT_EQ(ran.load(), 16);             // the other indices still ran
+}
+
+TEST(HostWorkerPool, WithoutWorkersStopsAtLowestIndexError)
+{
+    b::HostWorkerPool pool(/*threads=*/0);
+    std::vector<std::atomic<int>> runs(kThrowingIndices);
+
+    EXPECT_THAT([&] { runThrowingIndices(pool, runs); }, throwsFailureAt(kFirstFailingIdx));
+    for (std::size_t i = 0; i < kThrowingIndices; ++i)
+    {
+        EXPECT_EQ(runs[i].load(), i <= kFirstFailingIdx ? 1 : 0) << "index " << i;
+    }
 }
 
 TEST(HostWorkerPool, SharedByConcurrentCallers)
 {
-    b::HostWorkerPool pool(2); // fewer workers than callers: callers must still finish on their own
-    constexpr int kCallers = 6;
-    std::atomic<std::size_t> total{0};
+    constexpr std::size_t kWorkers = 2;
+    constexpr std::size_t kCallers = 6;
+    constexpr std::size_t kCallsPerCaller = 50;
+    constexpr std::size_t kIndicesPerCall = 8;
+    static_assert(kWorkers < kCallers, "some callers find no free worker and must run their indices themselves");
+    b::HostWorkerPool pool(kWorkers);
+    std::atomic<std::size_t> runs{0};
     std::vector<std::thread> callers;
-    for (int c = 0; c < kCallers; ++c)
+    for (std::size_t c = 0; c < kCallers; ++c)
     {
         callers.emplace_back(
             [&]
             {
-                for (int round = 0; round < 50; ++round)
+                for (std::size_t call = 0; call < kCallsPerCaller; ++call)
                 {
-                    pool.parallelFor(8, [&](std::size_t) { total.fetch_add(1); });
+                    pool.parallelFor(kIndicesPerCall, [&](std::size_t) { runs.fetch_add(1); });
                 }
             });
     }
@@ -462,92 +553,120 @@ TEST(HostWorkerPool, SharedByConcurrentCallers)
     {
         t.join();
     }
-    EXPECT_EQ(total.load(), std::size_t{kCallers} * 50 * 8);
+    EXPECT_EQ(runs.load(), kCallers * kCallsPerCaller * kIndicesPerCall);
 }
 
 TEST(BounceTransferPlan, ParallelBuildMatchesSequential)
 {
-    constexpr std::size_t kMaxChunk = 16384;
-    constexpr std::size_t kMaxDescs = 40; // both the byte and the desc cap close chunks here
     std::size_t const n = b::kBulkSegmentItems + 12345;
-    auto const [src, dst] = makeLargeRequest(n);
-    auto const seq = b::BounceTransferPlan::build(vram(src), vram(dst), kMaxChunk, kMaxDescs, /*buildSegments=*/1);
-    auto const par = b::BounceTransferPlan::build(vram(src), vram(dst), kMaxChunk, kMaxDescs, /*buildSegments=*/4);
-    auto const autoPlan = b::BounceTransferPlan::build(vram(src), vram(dst), kMaxChunk, kMaxDescs); // default
-    b::HostWorkerPool pool(4);
-    auto const parPool
-        = b::BounceTransferPlan::build(vram(src), vram(dst), kMaxChunk, kMaxDescs, /*buildSegments=*/4, &pool);
-    auto const autoPool = b::BounceTransferPlan::build(vram(src), vram(dst), kMaxChunk, kMaxDescs, 0, &pool);
+    std::size_t const autoSegments = b::bulkSegmentCount(n);
+    ASSERT_GT(autoSegments, kSequential);
+    auto const request = makeLargeRequest(n);
+    b::HostWorkerPool pool(kPoolWorkers);
+
     // The pool only changes who plans the segments, never the plan.
-    expectSamePlan(parPool, par);
-    expectSamePlan(autoPool, autoPlan);
-    for (auto const* plan : {&seq, &par, &autoPlan, &parPool})
+    expectSamePlan(/*expected=*/planLargeRequest(request, kFourSegments),
+        /*actual=*/planLargeRequest(request, kFourSegments, &pool));
+    expectSamePlan(/*expected=*/planLargeRequest(request, autoSegments),
+        /*actual=*/planLargeRequest(request, autoSegments, &pool));
+
+    auto const sequential = planLargeRequest(request, kSequential);
+    for (std::size_t segments : {kSequential, kFourSegments, autoSegments})
     {
-        expectPlanCoversRequest(*plan, src, dst, kMaxChunk, kMaxDescs);
-        EXPECT_EQ(plan->totalBytes(), seq.totalBytes());
-        EXPECT_EQ(plan->totalDescs(), seq.totalDescs());
-        // Each extra segment can add at most one partially filled chunk.
-        EXPECT_GE(plan->numChunks(), seq.numChunks());
-        EXPECT_LE(plan->numChunks(), seq.numChunks() + b::kMaxBulkSegments - 1);
+        auto const plan = planLargeRequest(request, segments);
+        expectPlanCoversRequest(plan, request);
+        EXPECT_EQ(plan.totalBytes(), sequential.totalBytes());
+        EXPECT_EQ(plan.totalDescs(), sequential.totalDescs());
+        // Each segment boundary can add at most one partially filled chunk.
+        EXPECT_GE(plan.numChunks(), sequential.numChunks()) << "segments=" << segments;
+        EXPECT_LE(plan.numChunks(), sequential.numChunks() + segments - 1) << "segments=" << segments;
     }
 }
 
 TEST(BounceTransferPlan, SegmentBoundaryStartsFreshChunk)
 {
-    // Eight contiguous 32 B descs: one merged 256 B desc sequentially; with 4 segments each segment
-    // merges its own pair and starts a fresh chunk, so the plan has 4 chunks of one 64 B desc each.
-    std::vector<std::tuple<std::uintptr_t, std::size_t, std::uint32_t>> s;
-    std::vector<std::tuple<std::uintptr_t, std::size_t, std::uint32_t>> d;
-    for (std::uintptr_t i = 0; i < 8; ++i)
+    constexpr std::size_t kDescs = 8;
+    constexpr std::uint32_t kDescBytes = kBounceAlignment; // so contiguous descs merge with no alignment gap
+    constexpr std::size_t kSegments = 4;
+    constexpr std::size_t kDescsPerSegment = kDescs / kSegments;
+    constexpr std::uint32_t kSegmentBytes = kDescsPerSegment * kDescBytes;
+    constexpr std::uintptr_t kSrcBase = 0x1000;
+    auto const src = contiguousDescs(kSrcBase, kDescs, kDescBytes);
+    auto const dst = contiguousDescs(/*base=*/0x9000, kDescs, kDescBytes);
+
+    auto const sequential
+        = b::BounceTransferPlan::build(src, dst, /*maxChunkSizeBytes=*/1024, /*maxDescsPerChunk=*/64, kSequential);
+    auto const segmented
+        = b::BounceTransferPlan::build(src, dst, /*maxChunkSizeBytes=*/1024, /*maxDescsPerChunk=*/64, kSegments);
+
+    ASSERT_EQ(sequential.numChunks(), 1u);
+    EXPECT_EQ(sequential.chunks()[0].sizes, (std::vector<std::uint32_t>{kDescs * kDescBytes}));
+    ASSERT_EQ(segmented.numChunks(), kSegments);
+    for (std::size_t k = 0; k < kSegments; ++k)
     {
-        s.emplace_back(0x1000 + i * 32, 32, 0);
-        d.emplace_back(0x9000 + i * 32, 32, 0);
+        auto const& chunk = segmented.chunks()[k];
+        EXPECT_EQ(chunk.srcPtrs, (std::vector<std::uint64_t>{kSrcBase + k * kSegmentBytes}));
+        EXPECT_EQ(chunk.sizes, (std::vector<std::uint32_t>{kSegmentBytes}));
+        EXPECT_EQ(chunk.bounceOffsets, (std::vector<std::uint64_t>{0}));
     }
-    auto const seq = b::BounceTransferPlan::build(makeDescs(s), makeDescs(d), 1024, 64, /*buildSegments=*/1);
-    auto const par = b::BounceTransferPlan::build(makeDescs(s), makeDescs(d), 1024, 64, /*buildSegments=*/4);
-    ASSERT_EQ(seq.numChunks(), 1u);
-    EXPECT_EQ(seq.chunks()[0].sizes, (std::vector<std::uint32_t>{256}));
-    ASSERT_EQ(par.numChunks(), 4u);
-    for (std::size_t k = 0; k < 4; ++k)
-    {
-        EXPECT_EQ(par.chunks()[k].srcPtrs, (std::vector<std::uint64_t>{0x1000 + k * 64}));
-        EXPECT_EQ(par.chunks()[k].sizes, (std::vector<std::uint32_t>{64}));
-        EXPECT_EQ(par.chunks()[k].bounceOffsets, (std::vector<std::uint64_t>{0}));
-    }
-    EXPECT_EQ(par.totalBytes(), seq.totalBytes());
-    EXPECT_EQ(par.totalDescs(), seq.totalDescs());
-    // More segments than descs is capped at one desc per segment.
-    auto const capped = b::BounceTransferPlan::build(makeDescs(s), makeDescs(d), 1024, 64, /*buildSegments=*/100);
-    EXPECT_EQ(capped.numChunks(), 8u);
-    EXPECT_EQ(capped.totalBytes(), 256u);
+    EXPECT_EQ(segmented.totalBytes(), sequential.totalBytes());
+    EXPECT_EQ(segmented.totalDescs(), sequential.totalDescs());
 }
 
-TEST(BounceTransferPlan, ParallelBuildErrorInLateSegmentThrows)
+TEST(BounceTransferPlan, MoreSegmentsThanDescsPlansOneDescPerSegment)
+{
+    constexpr std::size_t kDescs = 8;
+    constexpr std::size_t kDescBytes = kBounceAlignment;
+    constexpr std::size_t kSegments = 100;
+    static_assert(kSegments > kDescs);
+
+    auto const plan = b::BounceTransferPlan::build(contiguousDescs(/*base=*/0x1000, kDescs, kDescBytes),
+        contiguousDescs(/*base=*/0x9000, kDescs, kDescBytes), /*maxChunkSizeBytes=*/1024, /*maxDescsPerChunk=*/64,
+        kSegments);
+
+    ASSERT_EQ(plan.numChunks(), kDescs);
+    for (auto const& chunk : plan.chunks())
+    {
+        EXPECT_EQ(chunk.srcPtrs.size(), 1u);
+    }
+    EXPECT_EQ(plan.totalBytes(), kDescs * kDescBytes);
+}
+
+TEST(BounceTransferPlan, ParallelBuildReportsMismatchInLastSegment)
 {
     std::size_t const n = b::kBulkSegmentItems + 1000;
-    std::size_t const bad = n - 5; // in the last segment
-    auto const [src, dst] = makeLargeRequest(n, bad);
-    std::string const expect = "len mismatch at idx " + std::to_string(bad);
-    b::HostWorkerPool pool(4);
-    for (std::size_t segments : {std::size_t{1}, std::size_t{4}, std::size_t{0}})
-    {
-        auto const err = buildError(src, dst, segments);
-        EXPECT_NE(err.find(expect), std::string::npos) << "segments=" << segments << ": " << err;
-        auto const errPool = buildError(src, dst, segments, &pool);
-        EXPECT_NE(errPool.find(expect), std::string::npos) << "pool, segments=" << segments << ": " << errPool;
-    }
+    std::size_t const lastSegmentIdx = n - 5;
+    ASSERT_GE(lastSegmentIdx, b::segmentBegin(n, kFourSegments, /*segment=*/kFourSegments - 1));
+    auto request = makeLargeRequest(n);
+    mismatchDstLen(request.dst, lastSegmentIdx);
+    b::HostWorkerPool pool(kPoolWorkers);
 
-    // Two bad descs in different segments: the parallel build reports the lower index, like the
-    // sequential one (results are collected in segment order).
-    std::size_t const early = n / 4 + 7; // second segment of four
-    auto [src2, dst2] = makeLargeRequest(n, bad);
-    dst2[early] = kvc::MemoryDesc{dst2[early].getAddr(), dst2[early].getLen() + 1, 0};
-    std::string const expectEarly = "len mismatch at idx " + std::to_string(early);
-    for (std::size_t segments : {std::size_t{1}, std::size_t{4}})
+    for (std::size_t segments : {kSequential, kFourSegments, b::bulkSegmentCount(n)})
     {
-        auto const err = buildError(src2, dst2, segments);
-        EXPECT_NE(err.find(expectEarly), std::string::npos) << "segments=" << segments << ": " << err;
-        auto const errPool = buildError(src2, dst2, segments, &pool);
-        EXPECT_NE(errPool.find(expectEarly), std::string::npos) << "pool, segments=" << segments << ": " << errPool;
+        EXPECT_THAT([&] { (void) planLargeRequest(request, segments); }, throwsLenMismatchAt(lastSegmentIdx))
+            << "segments=" << segments;
+        EXPECT_THAT([&] { (void) planLargeRequest(request, segments, &pool); }, throwsLenMismatchAt(lastSegmentIdx))
+            << "pool, segments=" << segments;
+    }
+}
+
+TEST(BounceTransferPlan, ParallelBuildReportsLowestMismatchAcrossSegments)
+{
+    std::size_t const n = b::kBulkSegmentItems + 1000;
+    std::size_t const secondSegmentIdx = b::segmentBegin(n, kFourSegments, /*segment=*/1) + 7;
+    std::size_t const lastSegmentIdx = n - 5;
+    ASSERT_LT(secondSegmentIdx, b::segmentBegin(n, kFourSegments, /*segment=*/2));
+    ASSERT_GE(lastSegmentIdx, b::segmentBegin(n, kFourSegments, /*segment=*/kFourSegments - 1));
+    auto request = makeLargeRequest(n);
+    mismatchDstLen(request.dst, secondSegmentIdx);
+    mismatchDstLen(request.dst, lastSegmentIdx);
+    b::HostWorkerPool pool(kPoolWorkers);
+
+    for (std::size_t segments : {kSequential, kFourSegments})
+    {
+        EXPECT_THAT([&] { (void) planLargeRequest(request, segments); }, throwsLenMismatchAt(secondSegmentIdx))
+            << "segments=" << segments;
+        EXPECT_THAT([&] { (void) planLargeRequest(request, segments, &pool); }, throwsLenMismatchAt(secondSegmentIdx))
+            << "pool, segments=" << segments;
     }
 }
