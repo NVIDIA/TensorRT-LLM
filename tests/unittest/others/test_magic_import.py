@@ -776,35 +776,57 @@ def test_sys_path_check_ignores_paths_outside_the_project(sys_path_report, tmp_p
     assert sys_path_report(outside, "/usr/lib/python3", "") == []
 
 
-def test_sys_path_check_ignores_a_virtualenv_inside_the_project(sys_path_report, tree):
+def test_sys_path_check_ignores_the_environment_running_pytest(sys_path_report, tree, monkeypatch):
     """The launcher's bin directory and directories installed packages append to."""
-    venv = tree.project_root / ".venv"
-    venv.mkdir()
-    (venv / "pyvenv.cfg").write_text("")
-    launcher = venv / "bin"
-    package = venv / "lib" / "site-packages" / "dsl" / "base"
-    launcher.mkdir()
+    env = tree.project_root / "env"
+    launcher = env / "bin"
+    package = env / "lib" / "site-packages" / "dsl" / "base"
+    launcher.mkdir(parents=True)
     package.mkdir(parents=True)
     (package / "mi_helper.py").write_text("")
+    monkeypatch.setattr(sys, "prefix", str(env))
 
     assert sys_path_report(launcher, package) == []
 
 
-def test_sys_path_check_reports_a_venv_lookalike(sys_path_report, tree):
-    helpers = tree.project_root / ".venv" / "helpers"
-    helpers.mkdir(parents=True)
-    (helpers / "mi_helper.py").write_text("")
-
-    assert sys_path_report(helpers) == [os.path.join(".venv", "helpers")]
-
-
-def test_sys_path_check_ignores_an_entry_that_is_not_a_directory(
+def test_sys_path_check_still_reports_directories_outside_the_environment(
     sys_path_report, tree, monkeypatch
 ):
-    """An editable install registers a path-hook marker, not a directory."""
+    env = tree.project_root / "env"
+    env.mkdir()
+    helpers = tree.project_root / "tests" / "scripts" / "helpers"
+    helpers.mkdir(parents=True)
+    (helpers / "mi_helper.py").write_text("")
+    monkeypatch.setattr(sys, "prefix", str(env))
+
+    assert sys_path_report(helpers) == [os.path.join("tests", "scripts", "helpers")]
+
+
+def test_sys_path_check_does_not_exempt_the_project_root_as_an_environment(
+    sys_path_report, tree, monkeypatch
+):
+    """A prefix that is the project root would excuse every entry in it."""
+    helpers = tree.project_root / "bin"
+    helpers.mkdir()
+    (helpers / "mi_helper.py").write_text("")
+    monkeypatch.setattr(sys, "prefix", str(tree.project_root))
+
+    assert sys_path_report(helpers) == ["bin"]
+
+
+def test_sys_path_check_ignores_a_relative_marker_that_is_not_a_directory(
+    sys_path_report, tree, monkeypatch
+):
+    """An editable install registers a path-hook marker, not a path."""
     monkeypatch.chdir(tree.project_root)
 
     assert sys_path_report("__editable__.pkg-1.0.finder.__path_hook__") == []
+
+
+def test_sys_path_check_reports_an_absolute_path_that_no_longer_exists(sys_path_report, tree):
+    removed = tree.project_root / "tests" / "removed_helpers"
+
+    assert sys_path_report(removed) == [os.path.join("tests", "removed_helpers")]
 
 
 @pytest.mark.parametrize("ignored_tree", _NON_TEST_TREES)
