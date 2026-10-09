@@ -19,6 +19,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 
 pytestmark = pytest.mark.cpu_only
@@ -26,6 +27,7 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
     executor.kv_connector_manager.prefix_reservations_enabled = True
     executor.kv_connector_manager.defer_load_termination.return_value = False
@@ -159,18 +161,29 @@ def test_allocation_survives_until_the_completion_poll() -> None:
     executor._do_terminate_request.assert_not_called()
 
 
-def test_load_dispatch_marks_ownership_before_worker_launch(monkeypatch) -> None:
+@pytest.mark.parametrize("park_load", [False, True])
+def test_load_dispatch_marks_ownership_before_worker_launch(
+    monkeypatch: pytest.MonkeyPatch, park_load: bool
+) -> None:
     executor = _executor()
     connector = executor.kv_connector_manager
     calls = []
-    connector.take_scheduled_requests_pending_load.side_effect = lambda batch: calls.append("park")
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [_request()]
+
+    def park(scheduled: ScheduledRequests) -> None:
+        calls.append("park")
+        if park_load:
+            scheduled.reset_context_requests([])
+
+    connector.take_scheduled_requests_pending_load.side_effect = park
     connector.handle_metadata.side_effect = lambda: calls.append("metadata")
     connector.mark_prefix_loads_dispatched.side_effect = lambda: calls.append("own")
     connector.worker = Mock()
     connector.worker.start_load_kv.side_effect = lambda stream: calls.append("start")
     monkeypatch.setattr("torch.cuda.current_stream", lambda: None)
 
-    executor._kv_connector_start_batch(SimpleNamespace())
+    assert executor._kv_connector_start_batch(batch) == (not park_load, not park_load)
 
     assert calls == ["park", "metadata", "own", "start"]
 

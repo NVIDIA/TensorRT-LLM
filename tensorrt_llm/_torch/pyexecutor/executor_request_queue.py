@@ -257,6 +257,14 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def pending_cancellation_ids(self) -> set[int]:
+        """Inspect cancellation sentinels without consuming queued requests."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_canceled_request
+            }
+
     def enqueue_control_request(self,
                                 drain: bool = True,
                                 control_id: Optional[str] = None):

@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import cloudpickle
 import mpi4py
 import pytest
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
@@ -678,3 +679,47 @@ def test_nothing_is_said_where_nothing_changed(monkeypatch):
         scheduler=both(llm_args=None)).warn_flat_scheduler_under_swa(4096)
 
     assert warnings == []
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_adp_disjoint_requests(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    """A busy owner must finish without request callbacks on its idle peer."""
+
+    def test() -> None:
+
+        class AdapterMock(MagicMock):
+            supports_attention_dp = True
+
+        worker = AdapterMock()
+        scheduler = AdapterMock()
+        scheduler.get_num_new_matched_tokens.return_value = (4, False)
+        scheduler.request_finished_by_layer_group.return_value = True
+        manager = KvCacheConnectorManager(worker,
+                                          scheduler,
+                                          enable_attention_dp=True)
+        requests = []
+        # Different callback counts would deadlock the old per-request MPI
+        # broadcasts; intersecting all owners' completions would never release.
+        if mpi_rank() == 1:
+            for request_id in (10, 20, 30):
+                req = MagicMock(is_dummy_request=False,
+                                is_generation_only_request=False)
+                req.request_id = request_id
+                assert manager.query_num_new_matched_tokens(req,
+                                                            0) == (4, False)
+                manager.commit_new_matched_tokens(req, 4, False)
+                manager.update_state_after_alloc(req, [], [[request_id]])
+                assert manager.request_finished(req, [], [[request_id]])
+                requests.append(req)
+        worker.get_finished.return_value = ([
+            req.request_id for req in requests
+        ], [])
+        assert {req.request_id
+                for req in manager.get_finished()
+                } == {req.request_id
+                      for req in requests}
+        assert not manager.pending_async_requests.saving
+
+    run_across_mpi(mpi_pool_executor, test, 2)

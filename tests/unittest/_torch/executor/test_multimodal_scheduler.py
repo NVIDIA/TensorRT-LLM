@@ -606,12 +606,13 @@ def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
     assert "multimodal_embed_mask_cumsum" in mm_data
 
 
-def test_terminate_request_releases_partial_multimodal_encoder_state():
+def test_terminate_request_releases_partial_multimodal_encoder_state() -> None:
     request = make_mm_request(1, [4, 4])
     record_output(request.py_mm_encoder_state, 0)
     freed = []
 
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
     executor.resource_manager = SimpleNamespace(free_resources=freed.append)
     executor._prefetched_request_ids = {request.py_request_id}
     executor._disagg_coordinator = Mock()
