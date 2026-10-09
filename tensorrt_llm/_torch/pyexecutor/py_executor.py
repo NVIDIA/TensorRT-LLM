@@ -1484,9 +1484,14 @@ class PyExecutor:
         if getattr(self.llm_args, "sleep_config", None) is None:
             return
 
+        from tensorrt_llm._torch.moe.fused_moe.communication.base import \
+            CheckpointBlockable
+
         blockers = []
         for resource in self._mnnvl_checkpoint_resources(
                 list(ExecutorMemoryType)):
+            if not isinstance(resource, CheckpointBlockable):
+                continue
             reason = resource.checkpoint_blocked_reason()
             if reason is not None:
                 blockers.append(reason)
