@@ -19,8 +19,9 @@ import copy
 import importlib.util
 import json
 import runpy
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -306,37 +307,56 @@ def test_existing_configs(
     assert not failures, failures
 
 
-@pytest.mark.parametrize(
-    ("builder_format", "failed"), [("html", False), ("html", True), ("latex", False)]
-)
-def test_docs_publishes_only_after_successful_html_build(
-    tmp_path: Path,
-    schemas: dict[str, dict],
-    monkeypatch: pytest.MonkeyPatch,
-    builder_format: str,
-    failed: bool,
-) -> None:
+@pytest.fixture
+def docs_extension() -> ModuleType:
     spec = importlib.util.spec_from_file_location(
         "trtllm_schema_assets", _REPO_ROOT / "docs/source/_ext/trtllm_schema_assets.py"
     )
     assert spec is not None and spec.loader is not None
     extension = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(extension)
-    calls = []
-    monkeypatch.setattr(
-        extension.runpy,
-        "run_path",
-        lambda _path: {"write_schemas": lambda output_dir: calls.append(output_dir)},
-    )
+    return extension
+
+
+@pytest.mark.parametrize(
+    ("builder_format", "failed"), [("html", False), ("html", True), ("latex", False)]
+)
+def test_docs_publishes_only_after_successful_html_build(
+    tmp_path: Path,
+    docs_extension: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    builder_format: str,
+    failed: bool,
+) -> None:
+    monkeypatch.setitem(sys.modules, "tensorrt_llm", None)
+    monkeypatch.setitem(sys.modules, "tensorrt_llm.version", None)
     app = SimpleNamespace(
         builder=SimpleNamespace(format=builder_format),
         outdir=tmp_path,
     )
-    extension._write_schema_assets(app, RuntimeError("failed") if failed else None)
+    docs_extension._write_schema_assets(app, RuntimeError("failed") if failed else None)
+    output_dir = tmp_path / "_static/schemas"
     if builder_format == "html" and not failed:
-        assert calls == [tmp_path / "_static/schemas"]
+        expected = {
+            name: (_REPO_ROOT / "tensorrt_llm/schemas" / name).read_bytes()
+            for name in (
+                generator.SERVE_SCHEMA,
+                generator.DISAGG_SCHEMA,
+                generator.VISUAL_GEN_SCHEMA,
+            )
+        }
+        assert {path.name: path.read_bytes() for path in output_dir.iterdir()} == expected
     else:
-        assert not calls
+        assert not output_dir.exists()
+
+
+def test_docs_rejects_missing_snapshots(
+    tmp_path: Path, docs_extension: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(docs_extension, "_SCHEMA_DIR", tmp_path / "missing")
+    app = SimpleNamespace(builder=SimpleNamespace(format="html"), outdir=tmp_path)
+    with pytest.raises(FileNotFoundError, match=generator.SERVE_SCHEMA):
+        docs_extension._write_schema_assets(app, None)
 
 
 def test_generation_is_deterministic(tmp_path: Path, schemas: dict[str, dict]) -> None:
@@ -348,15 +368,23 @@ def test_checked_in_schemas_are_current() -> None:
     generator.write_schemas(_REPO_ROOT / "tensorrt_llm/schemas", check=True)
 
 
-@pytest.mark.parametrize("missing", [False, True])
-def test_check_detects_stale_files_without_writing(tmp_path: Path, missing: bool) -> None:
+@pytest.mark.parametrize("change", ["modified", "missing", "version"])
+def test_check_detects_stale_files_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
     paths = generator.write_schemas(tmp_path)
     generator.write_schemas(tmp_path, check=True)
-    if missing:
+    if change == "missing":
         paths[0].unlink()
-    else:
+    elif change == "modified":
         paths[0].write_text("{}\n", encoding="utf-8")
+    else:
+        from tensorrt_llm import version
+
+        monkeypatch.setattr(version, "__version__", version.__version__ + ".post1")
     before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
     with pytest.raises(ValueError, match="Missing or stale configuration schemas"):
         generator.write_schemas(tmp_path, check=True)
     assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+    generator.write_schemas(tmp_path)
+    generator.write_schemas(tmp_path, check=True)
