@@ -1469,7 +1469,8 @@ def serve(
                 allow_request_chat_template
                 if allow_request_chat_template else None,
                 "internal_request_auth_key":
-                internal_disagg_auth_key if grpc_protocol != "openengine" else None,
+                internal_disagg_auth_key
+                if grpc_protocol != "openengine" else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
