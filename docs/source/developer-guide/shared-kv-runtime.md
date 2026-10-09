@@ -28,7 +28,9 @@ blocks. Remapping, offload, compression, recurrent state, extra buffer roles and
 retry remain outside that shape. An unknown extra feature is rejected as well.
 These checks describe compatibility requirements; they neither enable runtime
 integration nor establish deployment qualification. Exact adapter qualification
-belongs to LC-MC-21 and runtime qualification to RI-09.
+belongs to LC-MC-15 for the native profile and LC-MC-17 for the separate
+Mooncake profile; runtime qualification belongs to RI-09. Mooncake remains
+unsupported until its RI-08D integration and profile qualification are complete.
 
 The assembly caller must obtain the cache dtype, writer/layout and feature facts
 from the actual engine configuration. A lender layout digest alone does not prove
@@ -115,9 +117,21 @@ race with cancellation, and the first terminal outcome stays unchanged.
 Cancellation cannot roll back already published content. Repeated calls must
 not start duplicate cancellation work.
 
-The runtime adapter commits its own logical cancellation independently and
-invokes the shared helper without waiting for SDK completion. Neither
-disposition resets retirement deadlines or permits early lease, registration,
-or staging release. Backend quiescence and local-copy completion still govern
-physical retirement. Store providers keep queue and per-row SDK details private
-behind this shared capability.
+`SharedStagingAdapter.cancel` first commits its logical cancellation under the
+lifecycle arbiter. It then invokes the shared helper once, outside that lock,
+without waiting for SDK completion. The first locally committed outcome wins;
+backend completion that the adapter has not observed cannot undo local
+cancellation. An already committed `Delivered` outcome remains unchanged.
+
+The watchdog timeout callback updates outcome metadata only. Owner-thread
+`progress` forwards cancellation for a latched `Failed` or `Cancelled` outcome.
+Repeated cancellation, progress and shutdown calls do not dispatch additional
+requests. `SharedLeaseOperation.cancel_disposition` records the acknowledgement;
+`cancel_error` records a provider exception or invalid acknowledgement. A failed
+request does not change the outcome or stop physical evidence collection.
+
+Neither disposition resets retirement deadlines or permits early lease,
+registration, or staging release. A request must not start caller-memory access
+or invalidate prior quiescence. Backend quiescence and local-copy completion
+still govern physical retirement. Store providers keep queue and per-row SDK
+details private behind this shared capability.

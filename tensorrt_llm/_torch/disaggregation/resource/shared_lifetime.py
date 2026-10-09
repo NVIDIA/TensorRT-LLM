@@ -20,6 +20,7 @@ from ...pyexecutor.kv_cache.sharing import Lease, PartsHold, RegionView, Staging
 from ..base.shared import (
     Attempt,
     CacheExtent,
+    CancelDisposition,
     Cancelled,
     Delivered,
     Failed,
@@ -30,6 +31,7 @@ from ..base.shared import (
     Registration,
     Route,
     SubmissionRejected,
+    request_cancel,
 )
 from ..lifecycle.retirement import RetirementDeadline
 from .shared import STAGING_EXTENT_NAMESPACE, SharedRuntimeProfile, build_extent, served_masks
@@ -71,6 +73,8 @@ class SharedLeaseOperation:
     Callers inspect ``outcome`` and ``released`` independently. A logical result
     never authorizes destination reuse. The adapter owns this object until it
     releases the lease; callers may drop their request and operation references.
+    ``cancel_disposition`` and ``cancel_error`` describe the one-shot cancellation
+    request, not logical cancellation or physical access completion.
     """
 
     retirement: RetirementDeadline
@@ -83,6 +87,9 @@ class SharedLeaseOperation:
     attempt: Attempt | None = None
     outcome: Outcome | None = None
     released: bool = False
+    cancel_disposition: CancelDisposition | None = None
+    cancel_error: str | None = None
+    _cancel_requested: bool = False
     _proof: Future[bool] | None = field(default=None, repr=False)
     _access_ended: bool = False
     _copy_complete: Callable[[], bool] | None = field(default=None, repr=False)
@@ -330,7 +337,11 @@ class SharedStagingAdapter:
                     operation.retirement.request_drain("delivery failed or cancelled")
 
     def cancel(self, operation: SharedLeaseOperation, *, by_peer: bool = False) -> None:
-        """Latch cancellation while retaining all outstanding physical resources.
+        """Latch cancellation, then request it without waiting for physical work.
+
+        The first locally committed outcome wins, even if an unobserved backend
+        outcome is already available. The provider call runs outside the arbiter
+        lock and cannot authorize release or extend retirement deadlines.
 
         Args:
             operation: Operation returned by this adapter.
@@ -341,6 +352,37 @@ class SharedStagingAdapter:
         """
         self._require_operation(operation)
         self._commit(operation, Cancelled(by_peer=by_peer))
+        self._request_cancel(operation)
+
+    def _request_cancel(self, operation: SharedLeaseOperation) -> None:
+        """Send one best-effort request for a failed or cancelled operation.
+
+        Provider failures remain diagnostic and cannot obstruct evidence
+        collection. Timeout callbacks leave this call to owner-thread progress.
+
+        Args:
+            operation: Retained binding whose logical outcome is already latched.
+        """
+        with operation.retirement.lock:
+            if (
+                operation.released
+                or operation._cancel_requested
+                or operation.attempt is None
+                or not isinstance(operation.outcome, (Failed, Cancelled))
+            ):
+                return
+            operation._cancel_requested = True
+            attempt = operation.attempt
+        try:
+            disposition = request_cancel(attempt)
+            if not isinstance(disposition, CancelDisposition):
+                raise TypeError("backend returned an invalid cancellation disposition")
+        except Exception as error:
+            # Provider exception types are unrestricted at this external boundary.
+            # A failed request must not block proof consumption or other operations.
+            operation.cancel_error = f"{type(error).__name__}: {error}"
+        else:
+            operation.cancel_disposition = disposition
 
     def retry_quiescence(self, operation: SharedLeaseOperation) -> None:
         """Start one background proof, including explicit retries after ambiguity.
@@ -399,6 +441,7 @@ class SharedStagingAdapter:
                 else:
                     if outcome is not None:
                         self._commit(operation, outcome)
+            self._request_cancel(operation)
             proof = operation._proof
             if proof is not None and proof.done():
                 operation._proof = None

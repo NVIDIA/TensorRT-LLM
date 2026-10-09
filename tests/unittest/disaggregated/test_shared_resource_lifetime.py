@@ -11,7 +11,7 @@ from __future__ import annotations
 import gc
 import threading
 import weakref
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 from unittest.mock import Mock
 
@@ -21,6 +21,7 @@ import pytest
 from tensorrt_llm._torch.disaggregation.base.shared import (
     Attempt,
     CacheExtent,
+    CancelDisposition,
     Cancelled,
     Delivered,
     Failed,
@@ -119,6 +120,35 @@ class _Attempt:
     def poll(self) -> Outcome | None:
         """Return the fixture's current logical answer."""
         return self.outcome
+
+
+class _CancellableAttempt(_Attempt):
+    """Record the adapter's request independently of outcome and access evidence."""
+
+    def __init__(self) -> None:
+        """Create a pending attempt with observable cancellation behavior."""
+        super().__init__()
+        self.cancel_calls = 0
+        self.cancel_threads: list[int] = []
+        self.on_cancel: Callable[[], None] | None = None
+        self.cancel_error: Exception | None = None
+
+    def request_cancel(self) -> CancelDisposition:
+        """Record a best-effort request without changing outcome or access.
+
+        Returns:
+            REQUESTED unless the test injects a provider exception.
+
+        Raises:
+            Exception: The injected provider error.
+        """
+        self.cancel_calls += 1
+        self.cancel_threads.append(threading.get_ident())
+        if self.on_cancel is not None:
+            self.on_cancel()
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return CancelDisposition.REQUESTED
 
 
 class _Backend:
@@ -423,6 +453,177 @@ def test_terminal_outcome_is_stable_during_late_completion(
     assert operation.outcome == terminal
     assert operation.released
     assert bound.lease.marks[0][0].tolist() == [False, False]
+
+
+def test_unsupported_cancellation_keeps_logical_outcome_and_physical_roots(bound: _Fixture) -> None:
+    """A provider without cancellation still supports local cancellation and drain."""
+    operation = bound.submit()
+    bound.adapter.cancel(operation, by_peer=True)
+    assert operation.outcome == Cancelled(True)
+    assert operation.cancel_disposition is CancelDisposition.UNSUPPORTED
+    assert operation.cancel_error is None
+    assert not bound.adapter.close()
+    assert operation.outcome == Cancelled(True)
+    assert not operation.released
+    assert bound.backend.registrations[0].calls == 0
+    bound.hold.release.assert_not_called()
+    bound.finish_proof()
+    assert bound.adapter.close()
+    assert operation.released
+
+
+def test_cancellation_commits_before_one_request_outside_arbiter_lock(bound: _Fixture) -> None:
+    """An acknowledgement cannot release blocked I/O or pending local copies."""
+    attempt = _CancellableAttempt()
+    bound.backend.attempt = attempt
+    operation = bound.submit()
+    assert bound.backend.entered.wait(1)
+
+    def observe_cancel() -> None:
+        """Check logical visibility and independent arbiter progress at dispatch."""
+        assert operation.outcome == Cancelled(False)
+        acquired: list[bool] = []
+
+        def check_lock() -> None:
+            """Observe that cancellation does not hold the watchdog's arbiter."""
+            acquired.append(operation.retirement.lock.acquire(blocking=False))
+            if acquired[-1]:
+                operation.retirement.lock.release()
+
+        worker = threading.Thread(target=check_lock)
+        worker.start()
+        worker.join(timeout=1)
+        assert acquired == [True]
+
+    attempt.on_cancel = observe_cancel
+    bound.adapter.cancel(operation)
+    bound.adapter.cancel(operation, by_peer=True)
+    bound.adapter.progress()
+    assert not bound.adapter.close()
+    assert not bound.adapter.close()
+    assert attempt.cancel_calls == 1
+    assert attempt.cancel_threads == [threading.get_ident()]
+    assert operation.cancel_disposition is CancelDisposition.REQUESTED
+    assert operation.cancel_error is None
+    assert not operation.released
+    assert bound.backend.registrations[0].calls == 0
+    bound.hold.release.assert_not_called()
+    bound.copy_done.return_value = False
+    bound.finish_proof()
+    bound.adapter.progress()
+    assert not operation.released
+    assert bound.lease.marks[0][0].tolist() == [False, False]
+    bound.copy_done.return_value = True
+    assert bound.adapter.close()
+    bound.adapter.cancel(operation)
+    assert attempt.cancel_calls == 1
+    assert bound.lease.release_count == 1
+
+
+@pytest.mark.parametrize("observed", [False, True], ids=["unobserved", "committed"])
+def test_first_local_outcome_wins_completion_cancellation_race(
+    bound: _Fixture, observed: bool
+) -> None:
+    """Backend success wins only after the adapter commits that logical outcome."""
+    attempt = _CancellableAttempt()
+    bound.backend.attempt = attempt
+    operation = bound.submit()
+    delivered = Delivered(frozenset(_NAMES))
+    attempt.outcome = delivered
+    if observed:
+        bound.adapter.progress()
+    bound.adapter.cancel(operation)
+    expected = delivered if observed else Cancelled(False)
+    assert operation.outcome == expected
+    assert attempt.cancel_calls == int(not observed)
+    assert attempt.outcome == delivered
+    bound.finish_proof()
+    bound.adapter.progress()
+    assert operation.released
+    assert operation.outcome == expected
+    assert bound.lease.marks[0][0].tolist() == [observed, observed]
+    assert bound.adapter.close()
+
+
+def test_cancellation_error_does_not_obstruct_other_operations_or_proof(bound: _Fixture) -> None:
+    """Provider cancellation errors remain diagnostic while all operations progress."""
+    attempt = _CancellableAttempt()
+    attempt.cancel_error = RuntimeError("cancel submission failed")
+    bound.backend.attempt = attempt
+    first = bound.submit()
+    assert bound.backend.entered.wait(1)
+    attempt.outcome = Failed("provider delivery failed")
+    bound.backend.attempt = _Attempt()
+    second_lease = _Lease()
+    second = bound.adapter.submit_fetch(
+        second_lease, bound.backend, bound.watchdog.create_owner(2, "receive", 5)
+    )
+    bound.backend.attempt.outcome = Delivered(frozenset(_NAMES))
+    bound.adapter.progress()
+    assert first.outcome == Failed("provider delivery failed")
+    assert first.cancel_error == "RuntimeError: cancel submission failed"
+    assert first.cancel_disposition is None
+    assert not first.released
+    assert second.outcome == Delivered(frozenset(_NAMES))
+    bound.operation = second
+    bound.finish_proof()
+    bound.adapter.progress()
+    assert first.released and second.released
+    assert bound.lease.release_count == second_lease.release_count == 1
+    assert attempt.cancel_calls == 1
+    assert bound.adapter.close()
+
+
+def test_timeout_forwards_cancellation_only_during_owner_progress(bound: _Fixture) -> None:
+    """Delayed request dispatch cannot extend the watchdog's fixed grace period."""
+    attempt = _CancellableAttempt()
+    bound.backend.attempt = attempt
+    operation = bound.submit()
+    assert bound.backend.entered.wait(1)
+    bound.clock.return_value = 15.0
+    worker = threading.Thread(target=bound.watchdog.progress)
+    worker.start()
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert operation.outcome == Failed("transfer timeout")
+    assert attempt.cancel_calls == 0
+    bound.clock.return_value = 18.0
+    bound.adapter.progress()
+    bound.adapter.cancel(operation)
+    assert attempt.cancel_threads == [threading.get_ident()]
+    assert operation.cancel_disposition is CancelDisposition.REQUESTED
+    assert operation.outcome == Failed("transfer timeout")
+    bound.clock.return_value = 19.999
+    bound.watchdog.progress()
+    assert bound.watchdog.fatal is None
+    bound.clock.return_value = 20.0
+    bound.watchdog.progress()
+    assert bound.watchdog.fatal is not None
+    assert bound.watchdog.fatal.started_at == 15.0
+    assert bound.watchdog.fatal.deadline == 20.0
+    bound.finish_proof()
+    bound.adapter.progress()
+    assert attempt.cancel_calls == 1
+    assert not operation.released
+    bound.hold.release.assert_not_called()
+
+
+def test_cancellation_preserves_already_observed_quiescence(bound: _Fixture) -> None:
+    """A conforming cancellation request cannot invalidate positive access evidence."""
+    attempt = _CancellableAttempt()
+    bound.backend.attempt = attempt
+    operation = bound.submit()
+    bound.finish_proof()
+    bound.adapter.progress()
+    assert operation.outcome is None
+    assert not operation.released
+    bound.adapter.cancel(operation)
+    bound.adapter.progress()
+    assert operation.released
+    assert operation.outcome == Cancelled(False)
+    assert operation.cancel_disposition is CancelDisposition.REQUESTED
+    assert bound.backend.wait_calls == 1
+    assert bound.adapter.close()
 
 
 def test_request_timeout_stays_failed_after_late_success(bound: _Fixture) -> None:
