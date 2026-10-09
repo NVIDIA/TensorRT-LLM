@@ -892,8 +892,11 @@ def test_mxfp8_linear_native_e4m3_fullgraph_compile():
 
 @pytest.mark.cpu_only
 def test_mxfp8_unit_scales_reuse_largest_buffer() -> None:
-    module = Mock(spec_set=["_mxfp8_unit_activation_scales"])
+    module = Mock(
+        spec_set=["_mxfp8_unit_activation_scales", "_mxfp8_retired_unit_activation_scales"]
+    )
     module._mxfp8_unit_activation_scales = None
+    module._mxfp8_retired_unit_activation_scales = []
     largest = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(257, 512))
     address = largest.data_ptr()
     capacity = module._mxfp8_unit_activation_scales.numel()
@@ -904,6 +907,48 @@ def test_mxfp8_unit_scales_reuse_largest_buffer() -> None:
         assert torch.all(scales == 127)
         assert module._mxfp8_unit_activation_scales.numel() == capacity
     larger = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(513, 512))
-    assert module._mxfp8_unit_activation_scales.numel() == larger.numel()
+    assert module._mxfp8_unit_activation_scales.numel() >= larger.numel()
+    assert module._mxfp8_retired_unit_activation_scales[0].data_ptr() == address
+    for rows in (1025, 2049, 4097):
+        MXFP8LinearMethod._unit_activation_scales(module, torch.empty(rows, 512))
+        retained = module._mxfp8_retired_unit_activation_scales
+        capacity = module._mxfp8_unit_activation_scales.numel()
+        assert sum(old.numel() for old in retained) < capacity
+        assert retained[0].data_ptr() == address
+        assert torch.all(largest == 127)
+    larger = module._mxfp8_unit_activation_scales
     smaller = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(1, 512))
     assert smaller.data_ptr() == larger.data_ptr()
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(), reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100"
+)
+def test_mxfp8_e4m3_graph_replay_after_scale_buffer_growth() -> None:
+    torch.manual_seed(23)
+    out_f, in_f = 256, 512
+    w = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    w_e4m3, scale = quant_bf16_to_mxfp8(w, 32)
+    qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    lin = Linear(
+        in_features=in_f, out_features=out_f, bias=False, dtype=torch.bfloat16, quant_config=qc
+    ).cuda()
+    lin.load_weights([{"weight": w_e4m3, "weight_scale_inv": scale}])
+    static_x = torch.randn(16, in_f, device="cuda").to(torch.float8_e4m3fn)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            lin(static_x)
+    torch.cuda.current_stream().wait_stream(stream)
+    old_address = lin._mxfp8_unit_activation_scales.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = lin(static_x)
+    for rows in (129, 1, 513, 16):
+        lin(torch.randn(rows, in_f, device="cuda").to(torch.float8_e4m3fn))
+        assert lin._mxfp8_retired_unit_activation_scales[0].data_ptr() == old_address
+        static_x.copy_(torch.randn_like(static_x, dtype=torch.float32).to(torch.float8_e4m3fn))
+        expected = lin(static_x)
+        graph.replay()
+        torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)

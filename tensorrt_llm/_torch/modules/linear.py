@@ -3523,7 +3523,8 @@ class MXFP8LinearMethod(LinearMethodBase):
                                 input: torch.Tensor) -> torch.Tensor:
         """Slice one high-water UE8M0 buffer representing exactly 1.0.
 
-        Warm up the largest row count before capturing smaller decode graphs.
+        Keep superseded allocations alive for previously captured graphs.
+        Geometric growth bounds all retained storage by twice the capacity.
         """
         m, k = input.shape
         if k % cls.BLOCK_SIZE:
@@ -3548,12 +3549,22 @@ class MXFP8LinearMethod(LinearMethodBase):
             # UE8M0 uses an exponent bias of 127, so byte 127 encodes 2^0.
             # Every entry is identical, making the linear and 128x4-swizzled
             # layouts byte-for-byte equivalent.
-            scale = torch.full(
-                [required_size],
+            capacity = required_size if scale is None else max(
+                required_size, 2 * scale.numel())
+            new_scale = torch.full(
+                [capacity],
                 127,
                 dtype=torch.uint8,
                 device=input.device,
             )
+            if scale is not None:
+                retired = getattr(module,
+                                  "_mxfp8_retired_unit_activation_scales", None)
+                if retired is None:
+                    retired = []
+                    module._mxfp8_retired_unit_activation_scales = retired
+                retired.append(scale)
+            scale = new_scale
             module._mxfp8_unit_activation_scales = scale
         return scale[:required_size]
 
