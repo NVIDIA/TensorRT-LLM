@@ -907,10 +907,16 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
             "cuda_graph_config": None,
+            # DEFAULT drops the per-test UCX pinning but still runs UCX, since
+            # launch_disaggregated_llm sets TRTLLM_USE_UCX_KVCACHE=1 for every
+            # backend but NIXL. Transport coverage is unchanged by this move.
+            # CPP is explicit: this test runs on UCX (see the DEFAULT note
+            # above), and DeepSeek's Python preference would otherwise be
+            # adopted verbatim and fail at creation on a non-NIXL backend.
             "cache_transceiver_config": {
-                "backend": "NIXL",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": "CPP",
             },
         }
         gen_server_config = {
@@ -929,9 +935,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "enable_chunked_prefill": False,
             "cuda_graph_config": cuda_graph_config,
             "cache_transceiver_config": {
-                "backend": "NIXL",
+                "backend": "DEFAULT",
                 "max_tokens_in_buffer": 8192,
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": "CPP",
             },
             "enable_attention_dp": enable_attention_dp,
         }
