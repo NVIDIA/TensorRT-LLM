@@ -1494,6 +1494,12 @@ class PyTorchModelEngine(ModelEngine):
         if la_provider and prefetcher.register("linear_attn", la_provider):
             logger.info(f"[JIT prefetch] GDN/KDA provider: "
                         f"{len(la_provider.shapes)} distinct layer shape(s)")
+        from ..attention.backends.sparse.dsa import kernels as dsa_kernels
+        if dsa_kernels.FUSED_DSA_DECODE_TEMPLATE:
+            from ..attention.backends.sparse.dsa.jit_prefetch import \
+                DsaDecodeMetadataProvider
+            prefetcher.register("dsa_decode_metadata",
+                                DsaDecodeMetadataProvider(self.batch_size))
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
