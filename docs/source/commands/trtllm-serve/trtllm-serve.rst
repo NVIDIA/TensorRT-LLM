@@ -511,17 +511,19 @@ relative to your YAML file):
 
    python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))'
 
-When changing configuration definitions, regenerate and commit the snapshots using
-a TensorRT-LLM build and dependencies matching the checkout:
+When changing configuration definitions or bumping the package version in
+``tensorrt_llm/version.py``, regenerate and commit the snapshots using a
+TensorRT-LLM build and dependencies matching the checkout. Each schema's ``$id``
+and ``title`` include the package version.
 
 .. code-block:: bash
 
    python3 scripts/generate_trtllm_serve_schemas.py
    python3 scripts/generate_trtllm_serve_schemas.py --check
 
-The CPU schema tests reject stale snapshots. Wheel builds package the checked-in
-files without importing configuration classes; HTML docs builds regenerate their
-published copies. ``--output-dir`` can be used to generate a separate local preview.
+The CPU schema tests reject stale snapshots. Wheel and HTML docs builds publish
+the checked-in files without importing configuration classes. ``--output-dir``
+can be used to generate a separate local preview.
 
 .. _syntax:
 

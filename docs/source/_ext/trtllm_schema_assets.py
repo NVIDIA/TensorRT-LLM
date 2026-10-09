@@ -16,20 +16,25 @@
 
 from __future__ import annotations
 
-import runpy
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sphinx.application import Sphinx
 
+_SCHEMA_DIR = Path(__file__).resolve().parents[3] / "tensorrt_llm/schemas"
+
 
 def _write_schema_assets(app: Sphinx, exception: Exception | None) -> None:
     if exception is not None or app.builder.format != "html":
         return
-    generator = Path(__file__).resolve().parents[3] / "scripts/generate_trtllm_serve_schemas.py"
-    write_schemas = runpy.run_path(str(generator))["write_schemas"]
-    write_schemas(Path(app.outdir) / "_static" / "schemas")
+    output_dir = Path(app.outdir) / "_static" / "schemas"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Publish the checked-in snapshots without requiring a TensorRT-LLM installation.
+    for kind in ("config", "disagg-config", "visual-gen-config"):
+        filename = f"trtllm-serve-{kind}.schema.json"
+        shutil.copyfile(_SCHEMA_DIR / filename, output_dir / filename)
 
 
 def setup(app: Sphinx) -> dict:

@@ -23,8 +23,10 @@ Python and C++ codebase with a PyTorch execution path.
   affected accepted/rejected values. Run
   `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
   Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
+  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
+  include the package version in their `$id` and `title`.
   `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
-  reject missing or stale snapshots. Wheels package these same files for offline use.
+  reject missing or stale snapshots. Wheels and HTML docs publish these same files.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
