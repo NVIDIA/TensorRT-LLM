@@ -986,13 +986,48 @@ class KVCacheV2Scheduler(RequestScheduler):
             return None
         return min(draft_match, target_match)
 
+    def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
+        """Create and resume an unpaired draft mirror as part of admitting *req*.
+
+        ``_suspend_request`` suspends both pools whenever a draft manager
+        exists, but only the joint pairing admits the draft pool through its
+        own calls. An unpaired mirror is therefore suspended by eviction -- or
+        simply born suspended, which a fresh ``_KVCache`` always is -- and
+        nothing here brings it up, so it reaches the draft manager's
+        ``prepare_resources`` still suspended. That method cannot defer: the
+        target has already been prepared and the request is already in the
+        scheduled batch, so it raises and takes the executor loop with it.
+        Admitting here turns a refusal into an ordinary allocation failure the
+        caller can roll back and retry.
+
+        Returns True when there is nothing to do: no draft pool at all, or a
+        joint one that admits itself.
+        """
+        draft_manager = self.draft_kv_cache_manager
+        if draft_manager is None or self._joint_draft_manager is not None:
+            return True
+        return draft_manager.admit_mirror(req)
+
     def _prepare_context_pair(self, req: LlmRequest) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
         from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
 
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
-            return self.kv_cache_manager.prepare_context(req)
+            if not self.kv_cache_manager.prepare_context(req):
+                return False
+            if self._admit_unpaired_draft(req):
+                return True
+            # Mirror the joint branch below: a non-first chunk reaches a
+            # refused admission with an ACTIVE target cache (prepare_context
+            # just resumed it), and leaving it active pins its pages while the
+            # request waits on the draft pool -- under pressure, the very
+            # requests whose completion would drain that pool can then no
+            # longer grow their own target KV. First chunks are rolled back
+            # (freed) by _try_schedule_context instead.
+            if not req.is_first_context_chunk:
+                self._suspend_request(req)
+            return False
 
         if not req.is_first_context_chunk:
             if self.kv_cache_manager.prepare_context(req) and draft_manager.prepare_context(req):
@@ -1382,12 +1417,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         means this request does not fit. Roll the target growth back and report
         a plain allocation failure, letting the caller run the same evict /
         recompute-pause / self-suspend ladder it uses for target-pool pressure.
+
+        An unpaired draft pool sizes itself in ``prepare_resources`` rather than
+        here, but its mirror still has to be admitted under this rollback: see
+        ``_admit_unpaired_draft``.
         """
         if not self.kv_cache_manager.try_allocate_generation(req):
             return False
 
         draft_manager = self._joint_draft_manager
-        if draft_manager is None or draft_manager.try_allocate_generation(req):
+        if draft_manager is None:
+            if self._admit_unpaired_draft(req):
+                return True
+        elif draft_manager.try_allocate_generation(req):
             return True
 
         self.kv_cache_manager.revert_allocate_generation(req)
