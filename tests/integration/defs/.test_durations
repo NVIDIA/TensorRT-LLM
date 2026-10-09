@@ -1654,7 +1654,6 @@
    "unittest/bindings": 25.817817073170733,
    "unittest/disaggregated": 182.90635623599704,
    "unittest/disaggregated/test_agent_multi_backends.py": 76.4412887966805,
-   "unittest/disaggregated/test_bounce.py": 23.687550505050506,
    "unittest/disaggregated/test_cache_transceiver_harness.py": 49.95386402753873,
    "unittest/disaggregated/test_cache_transceiver_harness_report.py": 20.371459203036054,
    "unittest/disaggregated/test_cache_transceiver_precheck_e2e.py": 106.20446303501944,
