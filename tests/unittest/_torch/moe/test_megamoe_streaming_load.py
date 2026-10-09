@@ -51,7 +51,7 @@ def _load_classes() -> tuple[type[MoEWeightLoadingMode], type[NVFP4MegaMoECuteDs
 class _StreamingMoEModule(nn.Module):
     """Minimal single-rank module for the quant-method load path."""
 
-    def __init__(self, weight_loading_mode: MoEWeightLoadingMode) -> None:
+    def __init__(self, weight_loading_mode: MoEWeightLoadingMode, helper_slots: int = 0) -> None:
         from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
         super().__init__()
@@ -61,6 +61,7 @@ class _StreamingMoEModule(nn.Module):
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
         self.expand_intermediate_size_per_partition = 2 * INTERMEDIATE_SIZE
         self.expert_size_per_partition = NUM_EXPERTS
+        self.helper_slots = int(helper_slots)
         self.initial_local_expert_ids = list(range(NUM_EXPERTS))
         self.tp_size = 1
         self.tp_rank = 0
@@ -72,9 +73,36 @@ class _StreamingMoEModule(nn.Module):
         # No EPLB in this test: need_load_shared_weights() must be False.
         self.layer_load_balancer = None
 
+    @property
+    def compute_slot_count(self) -> int:
+        return int(self.expert_size_per_partition) + self.helper_slots
+
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: list[torch.Tensor]) -> None:
         # Only forwards to the dynamic load balancer in production; no-op here.
         del weight_tensors
+
+
+class _SentinelAlphaMoEModule(_StreamingMoEModule):
+    def __init__(self, weight_loading_mode: MoEWeightLoadingMode, helper_slots: int) -> None:
+        super().__init__(weight_loading_mode, helper_slots)
+        self.alpha_sentinels: dict[str, torch.Tensor] = {}
+
+    def register_parameter(self, name, parameter):
+        if (
+            name in ("fc31_alpha", "fc2_alpha")
+            and parameter is not None
+            and tuple(parameter.shape) == (NUM_EXPERTS,)
+            and name not in self.alpha_sentinels
+        ):
+            base = 11 if name == "fc31_alpha" else 21
+            sentinel = torch.arange(
+                NUM_EXPERTS,
+                device=parameter.device,
+                dtype=parameter.dtype,
+            ).add_(base)
+            parameter.data.copy_(sentinel)
+            self.alpha_sentinels[name] = sentinel.clone()
+        super().register_parameter(name, parameter)
 
 
 def _w13_input_scale(expert_id: int) -> float:
@@ -176,6 +204,65 @@ def _expected_fc1_norm_const() -> torch.Tensor:
         dtype=torch.float32,
         device="cuda",
     )
+
+
+def test_helper_slots_widen_only_seven_kernel_planes() -> None:
+    mode_cls, method_cls = _load_classes()
+    helper_slots = 2
+    module = _SentinelAlphaMoEModule(mode_cls.VANILLA, helper_slots=helper_slots)
+    method = method_cls()
+    with torch.device("cuda"):
+        method.create_weights(module)
+
+    assert module.expert_size_per_partition == NUM_EXPERTS
+    for name in _STREAMED_PARAMS:
+        assert module.rebuild_tensor_metadata[name]["meta"].shape[0] == NUM_EXPERTS
+
+    compute_slots = NUM_EXPERTS + helper_slots
+    kernel_planes = (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+        "fc31_alpha",
+        "fc2_alpha",
+        "fc1_norm_const",
+    )
+    assert all(getattr(module, name).shape[0] == compute_slots for name in kernel_planes)
+
+    bundle = method.live_weight_plane_spec(module)
+    for plane in bundle.planes:
+        parameter = getattr(module, plane.name)
+        shape, stride, dtype_name, element_size, pointer_alignment = plane.storage_metadata(
+            compute_slots
+        )
+        assert tuple(parameter.shape) == shape
+        assert tuple(parameter.stride()) == stride
+        assert parameter.dtype == getattr(torch, dtype_name)
+        assert parameter.element_size() == element_size
+        assert parameter.data_ptr() % pointer_alignment == 0
+
+        kernel_shape, kernel_stride, kernel_dtype, kernel_element_size, _ = plane.kernel_metadata(
+            compute_slots
+        )
+        kernel_view = parameter.view(getattr(torch, kernel_dtype))
+        if plane.name in ("mega_fc1_weight", "mega_fc2_weight"):
+            kernel_view = kernel_view.transpose(1, 2)
+        assert tuple(kernel_view.shape) == kernel_shape
+        assert tuple(kernel_view.stride()) == kernel_stride
+        assert kernel_view.dtype == getattr(torch, kernel_dtype)
+        assert kernel_view.element_size() == kernel_element_size
+
+    for name, sentinel in module.alpha_sentinels.items():
+        actual = getattr(module, name)
+        assert torch.equal(actual[:NUM_EXPERTS], sentinel)
+        assert torch.equal(
+            actual[NUM_EXPERTS:],
+            torch.ones(helper_slots, dtype=actual.dtype, device=actual.device),
+        )
+    assert set(module.alpha_sentinels) == {"fc31_alpha", "fc2_alpha"}
+    assert module.quant_scales.fc1_global is module.fc31_alpha
+    assert module.quant_scales.fc2_global is module.fc2_alpha
 
 
 def test_initial_streaming_load_layer_atomic() -> None:

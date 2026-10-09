@@ -550,8 +550,12 @@ class MpiPoolSession(MpiSession):
             key: value
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM") or key in (
-                "FLASHINFER_WORKSPACE_BASE", "FLASHINFER_CUBIN_DIR",
-                "MASTER_ADDR", "MASTER_PORT")
+                "FLASHINFER_WORKSPACE_BASE",
+                "FLASHINFER_CUBIN_DIR",
+                "MASTER_ADDR",
+                "MASTER_PORT",
+                # MPI may use an environment snapshot from MPI_Init.
+                "CUDA_SCALE_LAUNCH_QUEUES")
         }
         workspace_managed = env.get(_FLASHINFER_WORKSPACE_MANAGED_ENV) == "1"
         env.update(self._env_overrides)

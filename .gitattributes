@@ -24,3 +24,4 @@ docs/source/blogs/media/tech_blog28_video_*.gif filter=lfs diff=lfs merge=lfs -t
 3rdparty/patches/*.patch -whitespace
 tensorrt_llm/grpc/openengine/proto/** text eol=lf
 tensorrt_llm/grpc/openengine/_generated/** linguist-generated=true
+tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe/*.patch -whitespace

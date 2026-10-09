@@ -1,0 +1,6 @@
+upstream: external-source://nvidia/cutedsl-megamoe
+locked_commit: 1f0d454617f76eb2644e51cb18dbca01be2b3259
+project: CuTe DSL MegaMoE
+original_authors: Bangyu Shen <bangyus@nvidia.com>; Aragorn Guan <aragorng@nvidia.com>; Hao Sheng <hsheng@nvidia.com>; Yuhan Li <alel@nvidia.com>; Yucheng Yan <yuchengy@nvidia.com>; XingFei Xi <xxi@nvidia.com>; Shawn Wang <shawnwan@nvidia.com>
+license: per-file SPDX declarations (BSD-3-Clause where declared)
+managed_by: 3rdparty/vendor_sources.lock.yaml

@@ -314,11 +314,10 @@ class TopkReduce:
                             value_pair, score_pair, (acc[i], acc[i + 1])
                         )
                     else:
-                        if cutlass.const_expr(topk_score is not None):
-                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(value_pair, score_pair)
-                        else:
-                            acc[i] = value_pair[0]
-                            acc[i + 1] = value_pair[1]
+                        # Include the +0 seed: direct assignment/multiply preserves -0.
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            value_pair, score_pair, (Float32(0.0), Float32(0.0))
+                        )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -411,13 +410,10 @@ class TopkReduce:
                             dequant_pair, score_pair, (acc[i], acc[i + 1])
                         )
                     else:
-                        if cutlass.const_expr(topk_score is not None):
-                            acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(
-                                dequant_pair, score_pair
-                            )
-                        else:
-                            acc[i] = dequant_pair[0]
-                            acc[i + 1] = dequant_pair[1]
+                        # Include the +0 seed: direct assignment/multiply preserves -0.
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            dequant_pair, score_pair, (Float32(0.0), Float32(0.0))
+                        )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
@@ -516,11 +512,11 @@ class TopkReduce:
                         acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
                             dequant_pair, score_pair, (acc[i], acc[i + 1])
                         )
-                    elif cutlass.const_expr(topk_score is not None):
-                        acc[i], acc[i + 1] = cute.arch.mul_packed_f32x2(dequant_pair, score_pair)
                     else:
-                        acc[i] = dequant_pair[0]
-                        acc[i + 1] = dequant_pair[1]
+                        # Include the +0 seed: direct assignment/multiply preserves -0.
+                        acc[i], acc[i + 1] = cute.arch.fma_packed_f32x2(
+                            dequant_pair, score_pair, (Float32(0.0), Float32(0.0))
+                        )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

@@ -1,0 +1,1058 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""EP-scoped live-weight storage for HALO-Q and hierarchical SAMI copies.
+
+Every layer owns its home-expert storage and maps one of two shared helper-slot
+banks directly after it in virtual address space. Layers alternate banks, while
+per-layer READY terminals and small planes remain independent. Allocation and
+binding are collective across the EP group; vendor imports stay lazy until the
+rebalance path is enabled.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+from torch.utils._python_dispatch import _disable_current_modes
+
+from tensorrt_llm.logger import logger
+
+__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena"]
+
+BUFFER_ALIGNMENT = 2 * 1024 * 1024
+
+#: The ``uint64[EP]`` terminal array is addressed by the SAMI copy kernel and
+#: wants its own page.
+TERMINAL_ALIGNMENT = 4096
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _plane_dtypes() -> Dict[str, torch.dtype]:
+    """Return the canonical kernel-plane dtypes.
+
+    Resolve optional Torch dtypes lazily so unsupported wheels fail only when
+    constructing an enabled rebalance arena.
+    """
+    fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp4 is None or fp8 is None:
+        raise RuntimeError(
+            "MoE rebalance live arena needs torch.float4_e2m1fn_x2 and "
+            "torch.float8_e4m3fn to type the NVFP4 weight planes; this torch "
+            f"({torch.__version__}) exposes float4_e2m1fn_x2="
+            f"{fp4 is not None}, float8_e4m3fn={fp8 is not None}."
+        )
+    return {
+        "uint8": torch.uint8,
+        "float4_e2m1fn_x2": fp4,
+        "float8_e4m3fn": fp8,
+        "float32": torch.float32,
+    }
+
+
+def _plane_view(
+    flat_u8: torch.Tensor,
+    plane: Any,
+    slots: int,
+    *,
+    kernel: bool,
+) -> torch.Tensor:
+    """Create a kernel or framework view from the canonical plane descriptor."""
+    metadata = plane.kernel_metadata(slots) if kernel else plane.storage_metadata(slots)
+    shape, stride, dtype_name, element_size, pointer_alignment = metadata
+    dtype = _plane_dtypes().get(dtype_name)
+    if dtype is None:
+        raise RuntimeError(f"unsupported live-plane dtype {dtype_name!r}")
+    typed = flat_u8.view(dtype)
+    if typed.element_size() != element_size:
+        raise RuntimeError(
+            f"{plane.name} descriptor element size {element_size} does not "
+            f"match torch dtype {dtype_name} ({typed.element_size()})"
+        )
+    if int(typed.data_ptr()) % pointer_alignment:
+        raise RuntimeError(f"{plane.name} pointer is not {pointer_alignment}-byte aligned")
+    return typed.as_strided(shape, stride)
+
+
+@dataclass
+class RebalanceLiveArena:
+    """Own a bound live arena and both views of its seven weight planes.
+
+    Kernel views preserve the allocator's bound identities. Framework aliases
+    back nn.Parameters without changing the allocation or plane offsets.
+    """
+
+    #: The allocator owns these bytes; the arena only retains and exposes it.
+    provider: Any
+    arena: Any
+    bound: Any
+    bundle: Any
+    plane_names: Tuple[str, ...]
+    local_plane_views: Tuple[torch.Tensor, ...]
+    tekit_alias_views: Tuple[torch.Tensor, ...]
+    home_experts: int
+    helper_slots: int
+    #: READY generation ``g`` currently published into this arena's helper
+    #: slots. 0 means "nothing published yet" -- the kernel ABI rejects it
+    #: (the gate requires g in [1, 2**63)), which is the intended fail-closed
+    #: state before the weight transport has run for this generation.
+    ready_generation_value: int = 0
+
+    @property
+    def slot_count(self) -> int:
+        return self.home_experts + self.helper_slots
+
+    def terminal_flags_tensor(self) -> torch.Tensor:
+        """This rank's ``uint64[EP]`` terminal view -- the contract's
+        ``hot_expert_weight_ready_flags``. Sources publish into the multicast
+        alias of the SAME bytes, so a publish by any EP rank becomes visible
+        here without any host-side copy."""
+        # Hierarchical arenas expose terminals through their base arena.
+        arena = getattr(self.arena, "base", self.arena)
+        return arena.terminals.local_view
+
+    def ready_generation(self) -> int:
+        return int(self.ready_generation_value)
+
+    def publish_ready_generation(self, generation: int) -> None:
+        """Record the generation the kernel must wait for. Called by the
+        weight transport AFTER it has issued the payload copies for ``g``;
+        the terminal cells themselves are written by the transport."""
+        if type(generation) is not int or not (1 <= generation < (1 << 63)):
+            raise ValueError(
+                f"READY generation must be an exact int in [1, 2**63); got {generation!r}"
+            )
+        self.ready_generation_value = generation
+
+    def assert_identity(self) -> None:
+        """Run the optional allocator identity guard.
+
+        The caller must also check framework parameter pointers: allocator checks
+        cannot detect replacement of a Parameter's storage.
+        """
+        # The allocator guard is optional; framework pointer checks remain mandatory.
+        guard = getattr(self.bound, "assert_identity", None)
+        if guard is not None:
+            guard()
+
+
+class _EpComm:
+    """Adapt the resolved torch EP ProcessGroup to SAMI's collectives.
+
+    Using the default distributed group could include ranks outside this arena
+    and deadlock its collective allocation or binding.
+    """
+
+    def __init__(self, process_group: Any) -> None:
+        if process_group is None:
+            raise ValueError("MoE rebalance requires an EP ProcessGroup")
+        self.process_group = process_group
+        self.rank = int(torch.distributed.get_rank(group=process_group))
+        self.world = int(torch.distributed.get_world_size(group=process_group))
+
+    def validate_geometry(self, *, expected_rank: int, expected_world: int) -> None:
+        expected = (int(expected_rank), int(expected_world))
+        actual = (self.rank, self.world)
+        if actual != expected:
+            raise ValueError(
+                "EP ProcessGroup rank/size differs from the model mapping: "
+                f"process_group={actual}, mapping={expected}."
+            )
+
+    def barrier(self) -> None:
+        with _disable_current_modes():
+            torch.distributed.barrier(group=self.process_group)
+
+    def bcast(self, payload: object, root: int) -> object:
+        if type(root) is not int or not 0 <= root < self.world:
+            raise ValueError(f"broadcast root must be in [0, {self.world}); got {root!r}")
+        values = [payload]
+        source_rank = torch.distributed.get_global_rank(self.process_group, root)
+        with _disable_current_modes():
+            torch.distributed.broadcast_object_list(
+                values, src=source_rank, group=self.process_group
+            )
+        return values[0]
+
+    def allgather(self, value: object) -> list:
+        values = [None] * self.world
+        with _disable_current_modes():
+            torch.distributed.all_gather_object(values, value, group=self.process_group)
+        return values
+
+
+class _RawPointer:
+    """Expose a CUDA address through __cuda_array_interface__.
+
+    Tensor views do not own this allocation; the provider retains its owners.
+    """
+
+    def __init__(self, pointer: int, nbytes: int) -> None:
+        self.__cuda_array_interface__ = {
+            "data": (int(pointer), False),
+            "shape": (int(nbytes),),
+            "typestr": "|u1",
+            "strides": None,
+            "version": 3,
+        }
+
+
+#: Planes whose whole [H + S] span is at most this many bytes (the fp32 scale
+#: planes) live in a per-layer record of a small shared page instead of in
+#: their own granularity-sized allocations.
+_RECORD_PLANE_BYTES = 64 * 1024
+_RECORD_PLANE_ALIGNMENT = 256
+
+
+_HELPER_BANK_COUNT = 2
+
+
+class _ViewSpec:
+    """Address and layout of a plane view SAMI only binds, never dereferences.
+
+    Peer and multicast views feed SAMI's bind-time pointer tables. A multicast
+    view's row 0 lies in a reserved but unmapped prefix, which a torch tensor
+    cannot wrap; only its helper rows are mapped and written by the copy.
+    """
+
+    __slots__ = ("_pointer", "shape", "_stride", "dtype", "_element_size", "device", "is_cuda")
+
+    def __init__(self, pointer: int, like: torch.Tensor) -> None:
+        self._pointer = int(pointer)
+        self.shape = tuple(like.shape)
+        self._stride = tuple(like.stride())
+        self.dtype = like.dtype
+        self._element_size = int(like.element_size())
+        self.device = like.device
+        self.is_cuda = True
+
+    def data_ptr(self) -> int:
+        return self._pointer
+
+    def stride(self) -> Tuple[int, ...]:
+        return self._stride
+
+    def element_size(self) -> int:
+        return self._element_size
+
+
+class _Vmm:
+    """CUDA VMM calls on FABRIC-exportable memory with explicit ownership."""
+
+    def __init__(self, device: int, group_sizes: Tuple[int, ...]) -> None:
+        from cuda.bindings import driver as cuda
+
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami._util import check_cuda
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami.fabric import (
+            FABRIC,
+            _allocation_properties,
+            _read_write_access,
+        )
+
+        self.cuda = cuda
+        self.check = check_cuda
+        self.fabric = FABRIC
+        self.device = int(device)
+        self.properties = _allocation_properties(self.device)
+        self._access = [_read_write_access(self.device)]
+        # Every chunk is multicast-bindable at every level, so align to the
+        # coarsest MINIMUM granularity rather than the 512 MiB recommendation.
+        values = [
+            BUFFER_ALIGNMENT,
+            int(
+                check_cuda(
+                    cuda.cuMemGetAllocationGranularity(
+                        self.properties,
+                        cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
+                    ),
+                    "cuMemGetAllocationGranularity(shared slots)",
+                )
+            ),
+        ]
+        for members in sorted(set(group_sizes)):
+            values.append(
+                int(
+                    check_cuda(
+                        cuda.cuMulticastGetGranularity(
+                            self.multicast_properties(members, BUFFER_ALIGNMENT),
+                            cuda.CUmulticastGranularity_flags.CU_MULTICAST_GRANULARITY_MINIMUM,
+                        ),
+                        "cuMulticastGetGranularity(shared slots)",
+                    )
+                )
+            )
+        self.granularity = math.lcm(*values)
+        self.local_allocation_handles: List[Any] = []
+        self.imported_allocation_handles: List[Any] = []
+        self.created_multicast_handles: List[Any] = []
+        self.imported_multicast_handles: List[Any] = []
+        self.mappings: List[Tuple[int, int]] = []
+        self.reservations: List[Tuple[int, int]] = []
+        self.multicast_binds: List[Tuple[Any, int, int]] = []
+        self.allocated_bytes = 0
+
+    def multicast_properties(self, members: int, nbytes: int) -> Any:
+        properties = self.cuda.CUmulticastObjectProp()
+        properties.numDevices = int(members)
+        properties.size = int(nbytes)
+        properties.handleTypes = int(self.fabric)
+        properties.flags = 0
+        return properties
+
+    def create(self, nbytes: int) -> Tuple[Any, bytes]:
+        handle = self.check(
+            self.cuda.cuMemCreate(nbytes, self.properties, 0), "cuMemCreate(shared slots)"
+        )
+        self.local_allocation_handles.append(handle)
+        self.allocated_bytes += nbytes
+        exported = self.check(
+            self.cuda.cuMemExportToShareableHandle(handle, self.fabric, 0),
+            "cuMemExportToShareableHandle(shared slots)",
+        )
+        shareable = bytes(exported.data)
+        if len(shareable) != 64:
+            raise RuntimeError(f"fabric handle has {len(shareable)} bytes; expected 64")
+        return handle, shareable
+
+    def import_(self, shareable: bytes) -> Any:
+        if not isinstance(shareable, bytes) or len(shareable) != 64:
+            raise RuntimeError("peer fabric handle must contain exactly 64 bytes")
+        handle = self.check(
+            self.cuda.cuMemImportFromShareableHandle(bytearray(shareable), self.fabric),
+            "cuMemImportFromShareableHandle(shared slots)",
+        )
+        self.imported_allocation_handles.append(handle)
+        return handle
+
+    def register_created_multicast(self, handle: Any) -> None:
+        self.created_multicast_handles.append(handle)
+
+    def import_multicast(self, shareable: bytes) -> Any:
+        if not isinstance(shareable, bytes) or len(shareable) != 64:
+            raise RuntimeError("multicast fabric handle must contain exactly 64 bytes")
+        handle = self.check(
+            self.cuda.cuMemImportFromShareableHandle(bytearray(shareable), self.fabric),
+            "cuMemImportFromShareableHandle(shared multicast)",
+        )
+        self.imported_multicast_handles.append(handle)
+        return handle
+
+    def reserve(self, nbytes: int) -> int:
+        address = int(
+            self.check(
+                self.cuda.cuMemAddressReserve(nbytes, self.granularity, 0, 0),
+                "cuMemAddressReserve(shared slots)",
+            )
+        )
+        self.reservations.append((address, int(nbytes)))
+        return address
+
+    def map(self, address: int, nbytes: int, handle: Any) -> None:
+        self.check(self.cuda.cuMemMap(address, nbytes, 0, handle, 0), "cuMemMap(shared slots)")
+        self.mappings.append((int(address), int(nbytes)))
+        self.check(
+            self.cuda.cuMemSetAccess(address, nbytes, self._access, 1),
+            "cuMemSetAccess(shared slots)",
+        )
+
+    def record_multicast_bind(self, handle: Any, offset: int, nbytes: int) -> None:
+        self.multicast_binds.append((handle, int(offset), int(nbytes)))
+
+    def unmap_all(self) -> None:
+        while self.mappings:
+            address, nbytes = self.mappings[-1]
+            self.check(self.cuda.cuMemUnmap(address, nbytes), "cuMemUnmap(shared slots)")
+            self.mappings.pop()
+
+    def unbind_all(self) -> None:
+        while self.multicast_binds:
+            handle, offset, nbytes = self.multicast_binds[-1]
+            self.check(
+                self.cuda.cuMulticastUnbind(handle, self.device, offset, nbytes),
+                "cuMulticastUnbind(shared slots)",
+            )
+            self.multicast_binds.pop()
+
+    def free_reservations(self) -> None:
+        while self.reservations:
+            address, nbytes = self.reservations[-1]
+            self.check(
+                self.cuda.cuMemAddressFree(address, nbytes),
+                "cuMemAddressFree(shared slots)",
+            )
+            self.reservations.pop()
+
+    def _release_handles(self, handles: List[Any], label: str) -> None:
+        while handles:
+            self.check(self.cuda.cuMemRelease(handles[-1]), label)
+            handles.pop()
+
+    def release_imported_handles(self) -> None:
+        self._release_handles(
+            self.imported_multicast_handles,
+            "cuMemRelease(imported shared multicast)",
+        )
+        self._release_handles(
+            self.imported_allocation_handles,
+            "cuMemRelease(imported shared allocation)",
+        )
+
+    def release_created_handles(self) -> None:
+        self._release_handles(
+            self.created_multicast_handles,
+            "cuMemRelease(created shared multicast)",
+        )
+        self._release_handles(
+            self.local_allocation_handles,
+            "cuMemRelease(local shared allocation)",
+        )
+
+    def zero(self, address: int, nbytes: int) -> None:
+        self.check(
+            self.cuda.cuMemsetD8(self.cuda.CUdeviceptr(address), 0, nbytes),
+            "cuMemsetD8(shared slots)",
+        )
+
+
+class _MulticastSpec:
+    """One aligned group's multicast pair: member binds and local mappings."""
+
+    def __init__(
+        self,
+        members: Tuple[int, ...],
+        nbytes: int,
+        binds: List[Tuple[int, Any, int]],
+        mappings: List[int],
+    ) -> None:
+        self.members = members
+        self.nbytes = nbytes
+        #: (multicast offset, member allocation handle, bytes) bound on every member.
+        self.binds = binds
+        #: Reserved addresses where this rank maps its selected object.
+        self.mappings = mappings
+        self.handles: List[Any] = []
+
+
+def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpec]) -> None:
+    """Collectively create, bind and map dual-creator multicast objects.
+
+    Follows MulticastTeamPair: the first two members each create one object,
+    every member binds its chunks to both, and the first member maps the second
+    member's object while every other member maps the first member's. Ranks
+    outside a group join only the collectives; specs are rank-ordered alike.
+    """
+    cuda, check = vmm.cuda, vmm.check
+    created: Dict[Tuple[int, int], Any] = {}
+    exported: Dict[Tuple[int, int], bytes] = {}
+    for index, spec in enumerate(specs):
+        for alias, creator in enumerate(spec.members[:2]):
+            if rank == creator:
+                handle = check(
+                    cuda.cuMulticastCreate(
+                        vmm.multicast_properties(len(spec.members), spec.nbytes)
+                    ),
+                    "cuMulticastCreate(shared slots)",
+                )
+                vmm.register_created_multicast(handle)
+                created[(index, alias)] = handle
+                exported[(index, alias)] = bytes(
+                    check(
+                        cuda.cuMemExportToShareableHandle(handle, vmm.fabric, 0),
+                        "cuMemExportToShareableHandle(shared multicast)",
+                    ).data
+                )
+    gathered = comm.allgather(exported)
+    joined = [(index, spec) for index, spec in enumerate(specs) if rank in spec.members]
+    for index, spec in joined:
+        for alias, creator in enumerate(spec.members[:2]):
+            handle = created.get((index, alias))
+            if handle is None:
+                handle = vmm.import_multicast(gathered[creator][(index, alias)])
+            spec.handles.append(handle)
+            check(
+                cuda.cuMulticastAddDevice(handle, vmm.device), "cuMulticastAddDevice(shared slots)"
+            )
+    comm.barrier()
+    for _, spec in joined:
+        for handle in spec.handles:
+            for offset, memory, nbytes in spec.binds:
+                check(
+                    cuda.cuMulticastBindMem_v2(handle, vmm.device, offset, memory, 0, nbytes, 0),
+                    "cuMulticastBindMem_v2(shared slots)",
+                )
+                vmm.record_multicast_bind(handle, offset, nbytes)
+    comm.barrier()
+    for _, spec in joined:
+        selected = spec.handles[1 if len(spec.handles) > 1 and rank == spec.members[0] else 0]
+        for address in spec.mappings:
+            vmm.map(address, spec.nbytes, selected)
+    comm.barrier()
+
+
+@dataclass
+class _HelperSet:
+    """One physical helper-slot set: a chunk per large plane, one multicast
+    object per hierarchy level, and that object's view base per plane."""
+
+    chunks: Dict[str, Any]
+    level_bases: Tuple[Dict[str, int], ...]
+    level_specs: Tuple[_MulticastSpec, ...]
+    zeroed: bool = False
+
+
+@dataclass
+class _RecordPage:
+    """Per-layer records of READY terminals and small planes, mapped on every
+    rank and bound to one multicast object per hierarchy level."""
+
+    uc_ptrs: Tuple[int, ...]
+    mc_ptrs: Tuple[int, ...]
+    level_specs: Tuple[_MulticastSpec, ...]
+
+
+class _SharedLayer:
+    """Anti-GC owner of one layer's home chunks and raw pointer holders."""
+
+    def __init__(self, pool: "_SharedSlotPool", helper_set: int) -> None:
+        self.pool = pool
+        self.helper_set = helper_set
+        self.home_handles: List[Any] = []
+        self.holders: List[_RawPointer] = []
+
+
+class _SharedSlotPool:
+    """Helper-slot sets shared by every MoE layer of one geometry.
+
+    Layer ``i`` maps helper set ``i % sets`` directly after its home rows, so
+    each plane is still one contiguous ``[H + S]`` kernel view. Only the home
+    rows are per layer. No extra synchronization guards reuse: layer ``i``'s
+    copy follows HALO-Q's all-rank exchange, which every rank enters only after
+    MAIN finished the previous layers' MegaMoE.
+
+    READY terminals stay per layer because one forward shares its generation
+    across layers. They and the fp32 planes live in per-layer records.
+    """
+
+    def __init__(
+        self,
+        *,
+        world: int,
+        rank: int,
+        home_count: int,
+        helper_count: int,
+        bundle: Any,
+        device: int,
+        comm: Any,
+        owner_registry: List["_SharedSlotPool"],
+    ) -> None:
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
+            hierarchy_group_sizes,
+        )
+
+        torch.cuda.set_device(device)
+        self.world = world
+        self.rank = rank
+        self.device = device
+        self.comm = comm
+        self._closed = False
+        self._closing = False
+        self._producers: Dict[int, Any] = {}
+        self.home_count = home_count
+        self.helper_count = helper_count
+        self.slots = home_count + helper_count
+        self.bundle = bundle
+        self.group_sizes = hierarchy_group_sizes(world)
+        self.groups = tuple(
+            tuple(range(rank // size * size, rank // size * size + size))
+            for size in self.group_sizes
+        )
+        self.vmm = _Vmm(device, self.group_sizes)
+        granularity = self.vmm.granularity
+
+        self.large = tuple(p for p in bundle.planes if p.nbytes * self.slots > _RECORD_PLANE_BYTES)
+        self.home_bytes = {
+            p.name: _align_up(home_count * p.nbytes, granularity) for p in self.large
+        }
+        self.helper_bytes = {
+            p.name: _align_up(helper_count * p.nbytes, granularity) for p in self.large
+        }
+        # One multicast object per set and level holds every large plane's chunk.
+        self.mc_offsets: Dict[str, int] = {}
+        cursor = 0
+        for plane in self.large:
+            self.mc_offsets[plane.name] = cursor
+            cursor += self.helper_bytes[plane.name]
+        self.set_bytes = cursor
+
+        # A record keeps its READY terminals on their own page.
+        cursor = _align_up(world * 8, TERMINAL_ALIGNMENT)
+        self.record_offsets: Dict[str, int] = {}
+        for plane in bundle.planes:
+            if plane.name not in self.home_bytes:
+                cursor = _align_up(cursor, _RECORD_PLANE_ALIGNMENT)
+                self.record_offsets[plane.name] = cursor
+                cursor += self.slots * plane.nbytes
+        self.record_stride = _align_up(cursor, TERMINAL_ALIGNMENT)
+        self.page_bytes = _align_up(self.record_stride, granularity)
+        self.records_per_page = self.page_bytes // self.record_stride
+        self.pages: List[_RecordPage] = []
+        self.layer_count = 0
+        self.sets: Tuple[_HelperSet, ...] = ()
+        self._construction_complete = False
+        self._owner_registry = owner_registry
+        self._owner_registry.append(self)
+        self.sets = self._create_sets(comm)
+        self._construction_complete = True
+
+    def register_producer(self, producer: Any) -> None:
+        if self._closed:
+            raise RuntimeError("cannot register a producer on a closed shared-slot pool")
+        self._producers.setdefault(id(producer), producer)
+
+    def _cleanup_manifest(self) -> tuple:
+        return (
+            1,
+            self._construction_complete,
+            self.world,
+            self.home_count,
+            self.helper_count,
+            self.bundle.hidden,
+            self.bundle.intermediate,
+            self.group_sizes,
+            self.layer_count,
+            len(self.pages),
+            len(self.sets),
+            tuple((plane.name, int(plane.nbytes)) for plane in self.bundle.planes),
+            tuple(
+                (
+                    type(producer).__qualname__,
+                    getattr(producer, "layer_idx", getattr(producer, "_layer_idx", None)),
+                )
+                for producer in self._producers.values()
+            ),
+        )
+
+    def _collective_phase(self, label: str, operation: Any) -> None:
+        error = None
+        try:
+            operation()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = self.comm.allgather(error)
+        if len(errors) != self.world:
+            raise RuntimeError(
+                f"shared-slot cleanup {label} returned {len(errors)} ranks; expected {self.world}"
+            )
+        failures = [f"rank {rank}: {item}" for rank, item in enumerate(errors) if item]
+        if failures:
+            raise RuntimeError(f"shared-slot cleanup {label} failed: {'; '.join(failures)}")
+
+    def _close_producers(self) -> None:
+        for producer in self._producers.values():
+            close = getattr(producer, "close", None)
+            if close is None:
+                raise TypeError(f"registered producer {type(producer).__qualname__} has no close")
+            if close() is False:
+                raise RuntimeError(
+                    f"registered producer {type(producer).__qualname__} did not close"
+                )
+
+    def _on_device(self, operation: Any) -> None:
+        with torch.cuda.device(self.device):
+            operation()
+
+    def close_collectively(self, local_safe: bool = True) -> bool:
+        if self._closed:
+            return True
+        if self._closing:
+            raise RuntimeError("shared-slot pool cleanup is already in progress")
+        preflight = self.comm.allgather(
+            {
+                "local_safe": bool(local_safe),
+                "manifest": self._cleanup_manifest(),
+            },
+        )
+        if len(preflight) != self.world:
+            raise RuntimeError(
+                f"shared-slot cleanup preflight returned {len(preflight)} ranks; "
+                f"expected {self.world}"
+            )
+        if not all(item["local_safe"] for item in preflight):
+            return False
+        manifests = [item["manifest"] for item in preflight]
+        expected = manifests[0]
+        if any(manifest != expected for manifest in manifests[1:]):
+            raise RuntimeError("shared-slot cleanup manifests differ across the EP communicator")
+        self._closing = True
+        try:
+            self._collective_phase(
+                "device synchronize",
+                lambda: self._on_device(lambda: torch.cuda.synchronize(self.device)),
+            )
+            self._collective_phase("producers", lambda: self._on_device(self._close_producers))
+            self._producers.clear()
+            self._collective_phase("unmap", lambda: self._on_device(self.vmm.unmap_all))
+            self._collective_phase("multicast unbind", lambda: self._on_device(self.vmm.unbind_all))
+            self._collective_phase(
+                "address free", lambda: self._on_device(self.vmm.free_reservations)
+            )
+            self._collective_phase(
+                "release imported handles",
+                lambda: self._on_device(self.vmm.release_imported_handles),
+            )
+            self._collective_phase(
+                "release created handles",
+                lambda: self._on_device(self.vmm.release_created_handles),
+            )
+            self._closed = True
+            if self in self._owner_registry:
+                self._owner_registry.remove(self)
+            self.sets = ()
+            self.pages.clear()
+            return True
+        finally:
+            self._closing = False
+
+    def _create_sets(self, comm: Any) -> Tuple[_HelperSet, ...]:
+        if not self.large:
+            return tuple(
+                _HelperSet({}, tuple({} for _ in self.groups), ())
+                for _ in range(_HELPER_BANK_COUNT)
+            )
+        sets, specs = [], []
+        for _ in range(_HELPER_BANK_COUNT):
+            chunks = {p.name: self.vmm.create(self.helper_bytes[p.name])[0] for p in self.large}
+            level_bases, level_specs = [], []
+            for members in self.groups:
+                bases: Dict[str, int] = {}
+                mappings: List[int] = []
+                for plane in self.large:
+                    # Row 0 of the view sits H rows before the plane's chunk.
+                    prefix = self.home_bytes[plane.name]
+                    address = self.vmm.reserve(prefix + self.set_bytes)
+                    mappings.append(address + prefix)
+                    bases[plane.name] = (
+                        address
+                        + prefix
+                        + self.mc_offsets[plane.name]
+                        - self.home_count * plane.nbytes
+                    )
+                spec = _MulticastSpec(
+                    members,
+                    self.set_bytes,
+                    [
+                        (self.mc_offsets[p.name], chunks[p.name], self.helper_bytes[p.name])
+                        for p in self.large
+                    ],
+                    mappings,
+                )
+                specs.append(spec)
+                level_specs.append(spec)
+                level_bases.append(bases)
+            sets.append(_HelperSet(chunks, tuple(level_bases), tuple(level_specs)))
+        _create_multicast(self.vmm, comm, self.rank, specs)
+        return tuple(sets)
+
+    def _create_page(self, comm: Any) -> _RecordPage:
+        handle, shareable = self.vmm.create(self.page_bytes)
+        local = self.vmm.reserve(self.page_bytes)
+        self.vmm.map(local, self.page_bytes, handle)
+        self.vmm.zero(local, self.page_bytes)
+        torch.cuda.synchronize(self.device)
+        shareables = comm.allgather(shareable)
+        if len(shareables) != self.world:
+            raise RuntimeError("shared-slot record exchange returned an incomplete EP")
+        uc_ptrs = []
+        for peer in range(self.world):
+            if peer == self.rank:
+                uc_ptrs.append(local)
+                continue
+            address = self.vmm.reserve(self.page_bytes)
+            self.vmm.map(address, self.page_bytes, self.vmm.import_(shareables[peer]))
+            uc_ptrs.append(address)
+        mc_ptrs = [self.vmm.reserve(self.page_bytes) for _ in self.groups]
+        specs = [
+            _MulticastSpec(members, self.page_bytes, [(0, handle, self.page_bytes)], [address])
+            for members, address in zip(self.groups, mc_ptrs)
+        ]
+        _create_multicast(self.vmm, comm, self.rank, specs)
+        return _RecordPage(tuple(uc_ptrs), tuple(mc_ptrs), tuple(specs))
+
+    def _flat(self, owner: _SharedLayer, pointer: int, nbytes: int) -> torch.Tensor:
+        holder = _RawPointer(pointer, nbytes)
+        owner.holders.append(holder)
+        return torch.as_tensor(holder, device=f"cuda:{self.device}")
+
+    def build_layer(self, comm: Any) -> Tuple[Any, Dict[str, torch.Tensor], _SharedLayer, int]:
+        """Collectively map one layer; returns its arena, framework views,
+        owner and own allocation bytes."""
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
+            HierarchicalLiveWeightArena,
+            LivePlaneView,
+            LiveTerminalView,
+            LiveWeightArena,
+        )
+
+        world, rank, slots = self.world, self.rank, self.slots
+        index = self.layer_count
+        if index % self.records_per_page == 0:
+            self.pages.append(self._create_page(comm))
+        page = self.pages[-1]
+        record = (index % self.records_per_page) * self.record_stride
+        helper_set = self.sets[index % len(self.sets)]
+        layer = _SharedLayer(self, index % len(self.sets))
+        self.layer_count += 1
+
+        homes = {p.name: self.vmm.create(self.home_bytes[p.name]) for p in self.large}
+        layer.home_handles = [homes[p.name][0] for p in self.large]
+        peer_handles = comm.allgather(tuple(homes[p.name][1] for p in self.large))
+        if len(peer_handles) != world:
+            raise RuntimeError("shared-slot home exchange returned an incomplete EP")
+
+        planes, group_views, group_owners = [], [], []
+        tekit_views: Dict[str, torch.Tensor] = {}
+        for plane in self.bundle.planes:
+            span = slots * plane.nbytes
+            if plane.name in self.home_bytes:
+                large_index = [p.name for p in self.large].index(plane.name)
+                home_bytes = self.home_bytes[plane.name]
+                helper_bytes = self.helper_bytes[plane.name]
+                # Home rows end where the helper chunk begins.
+                pad = home_bytes - self.home_count * plane.nbytes
+                address = self.vmm.reserve(home_bytes + helper_bytes)
+                self.vmm.map(address, home_bytes, homes[plane.name][0])
+                self.vmm.map(address + home_bytes, helper_bytes, helper_set.chunks[plane.name])
+                self.vmm.zero(address, home_bytes)
+                if not helper_set.zeroed:
+                    self.vmm.zero(address + home_bytes, helper_bytes)
+                uc_ptrs = []
+                for peer in range(world):
+                    if peer == rank:
+                        uc_ptrs.append(address + pad)
+                        continue
+                    # Peers expose only home rows; the reservation keeps the
+                    # view's helper tail clear of every other mapping.
+                    peer_address = self.vmm.reserve(home_bytes + helper_bytes)
+                    self.vmm.map(
+                        peer_address,
+                        home_bytes,
+                        self.vmm.import_(peer_handles[peer][large_index]),
+                    )
+                    uc_ptrs.append(peer_address + pad)
+                level_ptrs = tuple(bases[plane.name] for bases in helper_set.level_bases)
+                owners = helper_set.level_specs
+            else:
+                offset = record + self.record_offsets[plane.name]
+                uc_ptrs = [pointer + offset for pointer in page.uc_ptrs]
+                level_ptrs = tuple(pointer + offset for pointer in page.mc_ptrs)
+                owners = page.level_specs
+            flat = self._flat(layer, uc_ptrs[rank], span)
+            kernel_view = _plane_view(flat, plane, slots, kernel=True)
+            uc_views = tuple(
+                kernel_view if peer == rank else _ViewSpec(pointer, kernel_view)
+                for peer, pointer in enumerate(uc_ptrs)
+            )
+            level_views = tuple(_ViewSpec(pointer, kernel_view) for pointer in level_ptrs)
+            tekit_views[plane.name] = _plane_view(flat, plane, slots, kernel=False)
+            planes.append(
+                LivePlaneView(
+                    name=plane.name,
+                    uc_views=uc_views,
+                    mc_view=level_views[0],
+                    aliases_same_backing=True,
+                    backing_owner=layer,
+                )
+            )
+            group_views.append(level_views)
+            group_owners.append(tuple(owners))
+        helper_set.zeroed = True
+
+        terminals = LiveTerminalView(
+            local_view=self._flat(layer, page.uc_ptrs[rank] + record, world * 8).view(torch.uint64),
+            mc_view=self._flat(layer, page.mc_ptrs[0] + record, world * 8).view(torch.uint64),
+            aliases_same_backing=True,
+            backing_owner=layer,
+        )
+        arena = HierarchicalLiveWeightArena(
+            base=LiveWeightArena(planes=tuple(planes), terminals=terminals),
+            group_sizes=self.group_sizes,
+            group_mc_views=tuple(group_views),
+            group_mc_owners=tuple(group_owners),
+            aliases_same_backing=True,
+        )
+        return arena, tekit_views, layer, sum(self.home_bytes.values())
+
+
+class SharedSlotArenaProvider:
+    """Provide one layer's arena over the two shared helper-slot banks.
+
+    The broadcaster requests the arena again after Parameters are bound, so a
+    provider memoizes its first build and requires identical geometry.
+    """
+
+    def __init__(self, owner: Any) -> None:
+        # The model-level per-iteration manager owns both the geometry cache
+        # and creation order. No Mapping attribute or process-global registry
+        # participates in allocation lifetime.
+        self._owner = owner
+        pools = getattr(owner, "_rebalance_shared_slot_pools", None)
+        order = getattr(owner, "_rebalance_shared_slot_pool_order", None)
+        if not isinstance(pools, dict) or not isinstance(order, list):
+            raise TypeError("SharedSlotArenaProvider owner must expose model-local pool state")
+        self._pools = pools
+        self._pool_order = order
+        self.buffer_bytes = 0
+        self.group_sizes: Tuple[int, ...] = ()
+        self.pool: Optional[_SharedSlotPool] = None
+        self.layer: Optional[_SharedLayer] = None
+        self._built: Optional[Any] = None
+        self._signature: Optional[tuple] = None
+        self._tekit_views: Dict[str, torch.Tensor] = {}
+
+    def build_hierarchical_live_arena(
+        self,
+        *,
+        world: int,
+        rank: int,
+        home_count: int,
+        helper_count: int,
+        bundle: Any,
+        device: int,
+        comm: Any,
+    ) -> Any:
+        signature = (
+            int(world),
+            int(rank),
+            int(home_count),
+            int(helper_count),
+            int(device),
+            bundle,
+        )
+        if self._built is not None:
+            if self._signature != signature:
+                raise RuntimeError(
+                    "shared-slot arena provider is per-layer and single-geometry; "
+                    f"rebuilt with {signature} after {self._signature}"
+                )
+            if self.pool is not None and not self.pool._closed:
+                return self._built
+            self._built = None
+            self._tekit_views = {}
+            self.layer = None
+            self.pool = None
+            self.buffer_bytes = 0
+            self.group_sizes = ()
+        self._signature = signature
+        key = signature
+        pool = self._pools.get(key)
+        if pool is not None and pool._closed:
+            self._pools.pop(key)
+            pool = None
+        if pool is None:
+            pool = _SharedSlotPool(
+                world=int(world),
+                rank=int(rank),
+                home_count=int(home_count),
+                helper_count=int(helper_count),
+                bundle=bundle,
+                device=int(device),
+                comm=comm,
+                owner_registry=self._pool_order,
+            )
+            self._pools[key] = pool
+        self._built, self._tekit_views, self.layer, self.buffer_bytes = pool.build_layer(comm)
+        self.pool = pool
+        self.group_sizes = pool.group_sizes
+        return self._built
+
+    def register_producer(self, producer: Any) -> None:
+        if self.pool is None:
+            raise RuntimeError("build the shared-slot arena before registering its producer")
+        self.pool.register_producer(producer)
+
+    def tekit_alias(self, name: str) -> torch.Tensor:
+        """Return this rank's framework storage view for a weight plane."""
+        return self._tekit_views[name]
+
+
+def allocate_rebalance_arena(
+    *,
+    home_experts: int,
+    helper_slots: int,
+    bundle: Any,
+    ep_comm: Any,
+    mapping: Any,
+    provider: SharedSlotArenaProvider,
+    device: int,
+    layer_idx: Optional[int],
+) -> RebalanceLiveArena:
+    """Allocate and bind one layer's arena collectively across its EP group.
+
+    Every rank must call this with identical geometry and collective order.
+    """
+    world = int(mapping.moe_ep_size)
+    rank = int(mapping.moe_ep_rank)
+    if world < 2:
+        raise RuntimeError(f"MoE rebalance needs at least two EP ranks; got moe_ep_size={world}.")
+
+    if bundle is None or not getattr(bundle, "planes", None):
+        raise TypeError("rebalance arena requires a quant-method live-weight plane spec")
+    if not isinstance(ep_comm, _EpComm):
+        raise TypeError("rebalance arena requires its model-owned EP communicator")
+    ep_comm.validate_geometry(expected_rank=rank, expected_world=world)
+    if not isinstance(provider, SharedSlotArenaProvider):
+        raise TypeError("rebalance arena provider must be owned by the model load balancer")
+    arena = provider.build_hierarchical_live_arena(
+        world=world,
+        rank=rank,
+        home_count=int(home_experts),
+        helper_count=int(helper_slots),
+        bundle=bundle,
+        device=int(device),
+        comm=ep_comm,
+    )
+    # Initialize READY terminals explicitly before peers can observe them.
+    # This startup-only reset does not depend on allocator initialization details.
+    arena.base.terminals.local_view.zero_()
+    torch.cuda.synchronize()
+    ep_comm.barrier()
+    bound = arena.bind(
+        world=world,
+        rank=rank,
+        home_count=int(home_experts),
+        helper_count=int(helper_slots),
+        bundle=bundle,
+        device=int(device),
+    )
+    plane_names = tuple(plane.name for plane in bundle.planes)
+    # Retain the hierarchical arena and its bound base views.
+    live = RebalanceLiveArena(
+        provider=provider,
+        arena=arena,
+        bound=bound,
+        bundle=bundle,
+        plane_names=plane_names,
+        # The bound hierarchy exposes local plane views through its base arena.
+        local_plane_views=tuple(bound.base.local_plane_views),
+        tekit_alias_views=tuple(provider.tekit_alias(name) for name in plane_names),
+        home_experts=int(home_experts),
+        helper_slots=int(helper_slots),
+    )
+    pool = provider.pool
+    layer = provider.layer
+    assert pool is not None and layer is not None
+    logger.debug(
+        f"[MegaMoECuteDsl] layer={layer_idx} MoE rebalance SHARED-SLOT live arena: "
+        f"{provider.buffer_bytes} B of home rows for M={live.slot_count} slots "
+        f"(H={home_experts} + S={helper_slots}) on helper set "
+        f"{layer.helper_set}/{len(pool.sets)}; pool sets "
+        f"{len(pool.sets)} x {pool.set_bytes} B, record pages {len(pool.pages)} x "
+        f"{pool.page_bytes} B, granularity {pool.vmm.granularity} B, VMM total "
+        f"{pool.vmm.allocated_bytes} B after {pool.layer_count} layers; ep_size={world} "
+        f"ep_rank={rank} device={device}, group_sizes={provider.group_sizes}."
+    )
+    return live

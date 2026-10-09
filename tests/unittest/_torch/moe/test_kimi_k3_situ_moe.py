@@ -2451,6 +2451,25 @@ def test_mega_format_transform_is_slot_blockwise() -> None:
         )
 
     whole = _run(0, num_slots)
+    bundle = method._live_weight_bundle_layout(hidden, intermediate, expand_intermediate)
+    planes = {plane.name: plane for plane in bundle.planes}
+    for tensor, name in zip(
+        whole,
+        (
+            "mega_fc1_weight",
+            "mega_fc1_weight_sf",
+            "mega_fc2_weight",
+            "mega_fc2_weight_sf",
+        ),
+    ):
+        shape, stride, dtype_name, element_size, pointer_alignment = planes[name].storage_metadata(
+            num_slots
+        )
+        assert tuple(tensor.shape) == shape
+        assert tuple(tensor.stride()) == stride
+        assert tensor.dtype == getattr(torch, dtype_name)
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
 
     for chunk in (1, 3, 16):  # 16 > num_slots: the single-call degenerate case
         pieces = [_run(lo, min(lo + chunk, num_slots)) for lo in range(0, num_slots, chunk)]

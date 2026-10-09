@@ -33,7 +33,8 @@ import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, field_validator, model_validator)
+                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -1750,61 +1751,38 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                                  uses_spcompress=self.uses_spcompress)
 
 
-class MoeLoadBalancerConfig(StrictBaseModel):
-    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
-
-    This model holds configuration data (`num_slots`, etc.) as well as
-    runtime state (`_ep_rank`, `_ep_size`) which must be set via the
-    `setup()` method before use.
-    """
+class _MoeLoadBalancerConfigBase(StrictBaseModel):
+    """Common slot layout and expert-parallel runtime state for EPLB."""
 
     num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
-        default=None,
-        repr=False  # Exclude this large dict from model representation
-    )
-    layer_updates_per_iter: int = 0
     _ep_rank: Optional[int] = PrivateAttr(default=None)
     _ep_size: Optional[int] = PrivateAttr(default=None)
 
-    # --- Methods ---
-
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """Initializes the runtime state of the configuration.
-        This must be called before accessing properties like `num_local_slots`.
-        """
+        """Bind the process-local expert-parallel rank and size."""
         self._ep_rank = ep_rank
         self._ep_size = ep_size
-
-        # This assertion was in the original and is critical.
         if self.num_slots is None:
             raise ValueError("`num_slots` cannot be None when calling setup().")
-
         if self.num_slots % ep_size != 0:
             raise ValueError(
                 f"`num_slots` ({self.num_slots}) must be divisible by `ep_size` ({ep_size})."
             )
 
-    # --- Computed Properties ---
-    # These properties depend on the runtime state set by setup()
-
     @property
     def ep_rank(self) -> int:
-        """Public accessor for the private expert parallel rank."""
         if self._ep_rank is None:
             raise AttributeError("ep_rank is not set. Call setup() first.")
         return self._ep_rank
 
     @property
     def ep_size(self) -> int:
-        """Public accessor for the private expert parallel size."""
         if self._ep_size is None:
             raise AttributeError("ep_size is not set. Call setup() first.")
         return self._ep_size
 
     @property
     def num_local_slots(self) -> int:
-        """Calculates the number of slots local to this rank."""
         if self.num_slots is None or self._ep_size is None:
             raise ValueError(
                 "Cannot calculate `num_local_slots`. "
@@ -1813,7 +1791,6 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     @property
     def slot_start(self) -> int:
-        """Calculates the starting global slot index for this rank."""
         if self._ep_rank is None:
             raise ValueError(
                 "Cannot calculate `slot_start`. Call setup() first.")
@@ -1821,32 +1798,113 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     @property
     def slot_end(self) -> int:
-        """Calculates the ending global slot index (exclusive) for this rank."""
         return self.slot_start + self.num_local_slots
+
+
+class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure the standard asynchronous EPLB implementation."""
+
+    mode: Literal["standard"] = "standard"
+    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
+        default=None,
+        repr=False,
+    )
+    layer_updates_per_iter: int = 0
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """Retrieves the initial global assignments for a specific layer."""
         if self.initial_global_assignments is None:
             return None
-
         if layer_idx not in self.initial_global_assignments:
             raise KeyError(
                 f"layer_idx {layer_idx} not found in `initial_global_assignments`."
             )
-
         assignments = self.initial_global_assignments[layer_idx]
-
         if self.num_slots is None:
             raise ValueError(
                 "`num_slots` is not set, cannot verify assignment length.")
-
         if len(assignments) != self.num_slots:
             raise ValueError(
                 f"Assignment length ({len(assignments)}) for layer {layer_idx} "
                 f"does not match `num_slots` ({self.num_slots}).")
-
         return assignments
+
+
+class MoePerIterationLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure per-iteration EPLB with Halo-Q scheduling."""
+
+    mode: Literal["per_iteration"] = "per_iteration"
+    num_slots: PositiveInt
+    auxiliary_sms: int = Field(
+        default=8,
+        ge=8,
+        le=128,
+        description="SM budget shared serially by HALO-Q and in-switch copy.",
+    )
+
+    def validate_expert_capacity(self, num_experts: int) -> None:
+        """Validate that every EP rank has at least one helper slot."""
+        if self._ep_size is None:
+            raise ValueError("Call setup() before validating expert capacity.")
+        if num_experts <= 0:
+            raise ValueError("`num_experts` must be positive.")
+        if num_experts % self._ep_size != 0:
+            raise ValueError(
+                f"`num_experts` ({num_experts}) must be divisible by "
+                f"`ep_size` ({self._ep_size}) for per-iteration EPLB.")
+        if self.num_slots <= num_experts:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must exceed `num_experts` "
+                f"({num_experts}) for per-iteration EPLB.")
+
+
+MoeLoadBalancerConfigType = Annotated[
+    Union[MoeLoadBalancerConfig, MoePerIterationLoadBalancerConfig],
+    PydanticField(discriminator="mode"),
+]
+_MOE_LOAD_BALANCER_ADAPTER = TypeAdapter(MoeLoadBalancerConfigType)
+
+
+def _normalize_load_balancer_config(value: Any) -> Any:
+    """Preserve legacy standard-EPLB dictionaries that predate ``mode``."""
+    if isinstance(value, dict) and "mode" not in value:
+        return {"mode": "standard", **value}
+    return value
+
+
+def _parse_load_balancer_config(value: Any) -> MoeLoadBalancerConfigType:
+    return _MOE_LOAD_BALANCER_ADAPTER.validate_python(
+        _normalize_load_balancer_config(value))
+
+
+def _resolve_load_balancer_config(value: Any) -> Any:
+    """Resolve inline or YAML-backed EPLB input to its typed config."""
+    if value is None or isinstance(
+            value, (MoeLoadBalancerConfig, MoePerIterationLoadBalancerConfig)):
+        return value
+
+    if isinstance(value, str):
+        config_path = value
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"MoE load balancer config file not found: {config_path}")
+        try:
+            with open(config_path) as f:
+                value = yaml.safe_load(f)
+            return _parse_load_balancer_config(value)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load MoE load balancer config file: {config_path}"
+            ) from e
+
+    if isinstance(value, dict):
+        try:
+            return _parse_load_balancer_config(value)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load MoE load balancer config: {value}") from e
+
+    return value
 
 
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
@@ -1868,10 +1926,9 @@ class MoeConfig(StrictBaseModel):
         "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
 
-    load_balancer: Optional[Union[object, str]] = Field(
+    load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]] = Field(
         default=None,
-        description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
+        description="Configuration for standard or per-iteration EPLB.")
 
     disable_finalize_fusion: bool = Field(
         default=False,
@@ -1884,6 +1941,23 @@ class MoeConfig(StrictBaseModel):
         description=
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
+
+    @field_validator("load_balancer", mode="before")
+    @classmethod
+    def resolve_load_balancer_config(cls, value: Any) -> Any:
+        return _resolve_load_balancer_config(value)
+
+    @model_validator(mode="after")
+    def resolve_load_balancer_compatibility(self) -> "MoeConfig":
+        """Resolve the backend required by per-iteration EPLB."""
+        if getattr(self.load_balancer, "mode", None) != "per_iteration":
+            return self
+        if self.backend == "AUTO":
+            self.backend = "MEGAMOE_CUTEDSL"
+        elif self.backend != "MEGAMOE_CUTEDSL":
+            raise ValueError("per-iteration EPLB requires "
+                             "backend='MEGAMOE_CUTEDSL'")
+        return self
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
@@ -7132,69 +7206,25 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
-        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+        """Reject GMS when MoE load balancing owns extra device state.
 
-        The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
-        and ``finalize_model`` run AFTER the GMS RW pool is closed and
-        ``finalize_write`` has committed, so any CUDA allocations they
-        make land in non-GMS memory and are NOT part of the committed
-        layout that RO peers receive. The result is "wrong inference,
-        no error" on RO peers (broken MoE routing state). Failing at
-        config-validation time is strictly better than that silent
-        miscompute.
-
-        The fix for this gap (running the MoE finalize work INSIDE
-        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE
-        allocations are part of the committed layout) is tracked as
-        the (MoE, GMS) follow-up; see ``model_loader.py``'s
-        ``TODO(GMS-MOE-LB)`` comment.
-
-        Returns:
-            ``self`` (Pydantic ``model_validator`` contract).
-
-        Raises:
-            ValueError: When ``load_format == LoadFormat.GMS`` and
-                ``moe_config.load_balancer`` is set.
+        Load-balancer state is currently allocated after GMS commits its
+        shared layout, so read-only peers cannot safely restore that state.
         """
         if (self.load_format == LoadFormat.GMS and self.moe_config is not None
                 and self.moe_config.load_balancer is not None):
             raise ValueError(
                 "LoadFormat.GMS is incompatible with moe_config.load_balancer "
-                "in this PR. The MoE load balancer's "
-                "register_weight_slots_after_to_cuda and finalize_model run "
-                "after the GMS pool closes and finalize_write commits, so "
-                "their allocations land outside the committed layout. RO "
-                "peers would receive a broken MoE routing state. Either "
-                "disable moe_config.load_balancer or use LoadFormat.AUTO. "
-                "Tracked as the (MoE, GMS) follow-up at "
-                "tensorrt_llm/_torch/pyexecutor/model_loader.py "
-                "(see TODO(GMS-MOE-LB)).")
+                "because load-balancer device state is not included in the "
+                "committed GMS layout. Disable moe_config.load_balancer or "
+                "use LoadFormat.AUTO.")
         return self
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
-        if isinstance(self.moe_config.load_balancer, str):
-            if not os.path.exists(self.moe_config.load_balancer):
-                raise FileNotFoundError(
-                    f"MoE load balancer config file not found: {self.moe_config.load_balancer}"
-                )
-            try:
-                with open(self.moe_config.load_balancer) as f:
-                    moe_load_balancer_config = yaml.safe_load(f)
-                self.moe_config.load_balancer = MoeLoadBalancerConfig(
-                    **moe_load_balancer_config)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to load MoE load balancer config file: {self.moe_config.load_balancer}"
-                ) from e
-        elif isinstance(self.moe_config.load_balancer, dict):
-            try:
-                self.moe_config.load_balancer = MoeLoadBalancerConfig(
-                    **self.moe_config.load_balancer)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
-                ) from e
+        self.moe_config.load_balancer = _resolve_load_balancer_config(
+            self.moe_config.load_balancer)
+        self.moe_config.resolve_load_balancer_compatibility()
         return self
 
     @model_validator(mode='after')

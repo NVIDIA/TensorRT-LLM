@@ -18,6 +18,8 @@ from .impl_base import MoEImplBase
 from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
+from .per_iteration_eplb import (PerIterationMoeLayerLoadBalancer,
+                                 PerIterationMoeLoadBalancer)
 from .quantization import FusedMoEQuantScalesFP8
 # yapf: disable
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
@@ -66,6 +68,8 @@ __all__ = [
     "MoEImplBase",
     "MoEImplClass",
     "MoeLoadBalancer",
+    "PerIterationMoeLayerLoadBalancer",
+    "PerIterationMoeLoadBalancer",
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
     "DeepSeekV4MoeRoutingMethod",

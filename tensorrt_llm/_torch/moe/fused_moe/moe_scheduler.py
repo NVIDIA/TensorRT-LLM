@@ -1343,6 +1343,8 @@ class FusedCommMoEScheduler(MoEScheduler):
             )
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
+        uses_replica_plan = moe._load_balancer_uses_replica_plan()
+        replica_plan = None
         if moe.layer_load_balancer:
             moe._load_balancer_done_wait_gpu_stage(is_first_call)
             # ignore_allreduce=False: the fused kernel has no side channel
@@ -1354,7 +1356,13 @@ class FusedCommMoEScheduler(MoEScheduler):
                 is_last_call,
                 ignore_allreduce=False,
             )
-            token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            # Standard EPLB remaps here. Per-iteration EPLB must consume the
+            # final logical routes after calibration/replay below.
+            token_selected_slots = (
+                token_selected_experts
+                if uses_replica_plan
+                else moe._load_balancer_route(token_selected_experts, moe.use_dp)
+            )
         else:
             token_selected_slots = token_selected_experts
 
@@ -1365,42 +1373,51 @@ class FusedCommMoEScheduler(MoEScheduler):
             moe.num_slots, token_selected_slots
         )
 
-        # ----- quantize / prepare -----
-        if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
-            # MegaMoE can fuse BF16->MXFP8 quantization with the SymmBuffer
-            # topk copies, so keep the original activations and let run_moe
-            # prepare its workspace.
-            moe_input = x_chunk_real
-            x_sf = None
-        else:
-            # Delegate to ``backend.quantize_input`` so each fused-comm backend
-            # owns its own empty-tensor layout. Both MegaMoEDeepGemm and
-            # MegaMoECuteDsl short-circuit ``x.shape[0] == 0`` inside their
-            # quantize_input contracts.
-            moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
+        if uses_replica_plan:
+            token_selected_slots = moe._load_balancer_route(token_selected_slots, moe.use_dp)
+            replica_plan = moe._load_balancer_replica_plan()
 
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+        try:
+            # ----- quantize / prepare -----
+            if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
+                # MegaMoE can fuse BF16->MXFP8 quantization with SymmBuffer
+                # topk copies, so keep activations for run_moe preparation.
+                moe_input = x_chunk_real
+                x_sf = None
+            else:
+                # Each fused-comm backend owns its empty-tensor layout.
+                moe_input, x_sf = moe.backend.quantize_input(x_chunk_real)
 
-        # ----- MoE compute -----
-        # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
-        # ``num_experts`` template parameter (SymmBuffer / weights sized to
-        # num_slots in quantization.py).
-        # Fused-comm backends own the EP exchange, so there is no comm plan:
-        # nothing outside the fused kernel decided anything about this forward.
-        out = moe.backend.run_moe(
-            MoERunContext(
-                token_selected_experts=token_selected_slots,
-                token_final_scales=token_final_scales,
-                x=moe_input,
-                x_sf=x_sf,
-                output_dtype=output_dtype,
+            # Select one rank-identical adaptive bucket on every EP rank.
+            set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+            if set_adaptive is not None:
+                set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
+
+            # ----- MoE compute -----
+            # The manager owns the plan; the backend only consumes its
+            # geometry, READY terminals and late route dependency.
+            out = moe.backend.run_moe(
+                MoERunContext(
+                    token_selected_experts=token_selected_slots,
+                    token_final_scales=token_final_scales,
+                    x=moe_input,
+                    x_sf=x_sf,
+                    output_dtype=output_dtype,
+                    replica_plan=replica_plan,
+                )
             )
-        )
+        except BaseException as error:  # noqa: BLE001
+            if replica_plan is not None:
+                try:
+                    moe._load_balancer_finish_replica_plan(replica_plan)
+                except BaseException as cleanup_error:  # noqa: BLE001
+                    error.add_note(
+                        "Failed to release the per-iteration EPLB plan after "
+                        f"forward failure: {cleanup_error!r}"
+                    )
+            raise
+        else:
+            moe._load_balancer_finish_replica_plan(replica_plan)
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----
         # The external-comm path overlaps CPU stage with ``comm.combine``;

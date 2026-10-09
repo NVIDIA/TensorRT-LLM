@@ -71,7 +71,7 @@ from ..modules.engram import Engram, EngramConfig, EngramHashProvider
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
-from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import (
     DEFAULT_MOE_ACTIVATION,
@@ -1581,25 +1581,75 @@ class DeepseekV4MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
-        block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        gate_up_quant_config, down_quant_config = self._get_shared_expert_projection_quant_configs(
+            model_config, layer_idx
+        )
+        shared_model_config = model_config
+        if (
+            gate_up_quant_config == down_quant_config
+            and gate_up_quant_config is not model_config.quant_config
+        ):
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = gate_up_quant_config
 
+        quantized_block_sizes = [
+            quant_config.group_size
+            for quant_config in (gate_up_quant_config, down_quant_config)
+            if (
+                quant_config is not None
+                and quant_config.quant_algo is not None
+                and quant_config.group_size is not None
+            )
+        ]
+        block_size = max(quantized_block_sizes, default=1)
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size
         )
 
-        self.shared_experts = GatedMLP(
+        load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+        self._per_iteration_eplb_enabled = (
+            getattr(load_balancer_config, "mode", None) == "per_iteration"
+        )
+        self._per_iteration_eplb_auxiliary_sms = (
+            int(load_balancer_config.auxiliary_sms) if self._per_iteration_eplb_enabled else 0
+        )
+        rebalance_backend = getattr(self.experts, "backend", self.experts)
+        # The fused shared kernel is part of the opt-in per-iteration path. Ask
+        # the selected routed backend for the capability instead of naming a
+        # concrete implementation here.
+        use_fused_fc12 = (
+            self._per_iteration_eplb_enabled
+            and self._shared_fc12_backend_supported(rebalance_backend)
+            and get_sm_version() == 107
+            and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
+            and not model_config.use_cuda_graph
+        )
+
+        shared_mlp_cls = GatedMLP
+        if use_fused_fc12:
+            from ..modules.megamoe_shared_mlp import MegaMoESharedMLP
+
+            shared_mlp_cls = MegaMoESharedMLP
+
+        # Only fused FC12 accepts an SM budget; other shared MLP backends stay unrestricted.
+        shared_reserved_sms = (
+            self._per_iteration_eplb_auxiliary_sms
+            if use_fused_fc12 and self._per_iteration_eplb_enabled
+            else 0
+        )
+        shared_mlp_kwargs = {"fc12_reserved_sms": shared_reserved_sms} if use_fused_fc12 else {}
+
+        self.shared_experts = shared_mlp_cls(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
             swiglu_limit=swiglu_limit,
+            **shared_mlp_kwargs,
         )
 
         self.allreduce = None
@@ -1663,6 +1713,62 @@ class DeepseekV4MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        )
+
+    @staticmethod
+    def _get_shared_expert_projection_quant_configs(
+        model_config, layer_idx: int
+    ) -> tuple[Optional[QuantConfig], Optional[QuantConfig]]:
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        quant_config_dict = getattr(model_config, "quant_config_dict", None) or {}
+        global_quant_config = model_config.quant_config
+
+        gate_up_name = f"{base_name}.gate_up_proj"
+        gate_name = f"{base_name}.gate_proj"
+        up_name = f"{base_name}.up_proj"
+        down_name = f"{base_name}.down_proj"
+
+        # Match apply_layerwise_quant_config exactly for the actual fused
+        # gate_up Linear: the first gate_proj/gate_up_proj entry wins, while an
+        # up-only entry does not independently reconfigure a fused weight.
+        gate_up_quant_config = global_quant_config
+        for name, candidate in quant_config_dict.items():
+            if gate_name in name or gate_up_name in name:
+                gate_up_quant_config = candidate
+                break
+        down_quant_config = quant_config_dict.get(down_name, global_quant_config)
+
+        # apply_quant_config_exclude_modules runs after layerwise overrides and
+        # excludes the fused gate_up Linear when any fused constituent matches.
+        if global_quant_config is not None:
+            unquantized = QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo,
+            )
+            if any(
+                global_quant_config.is_module_excluded_from_quantization(name)
+                for name in (gate_up_name, gate_name, up_name)
+            ):
+                gate_up_quant_config = unquantized
+            if global_quant_config.is_module_excluded_from_quantization(down_name):
+                down_quant_config = unquantized
+        return gate_up_quant_config, down_quant_config
+
+    @staticmethod
+    def _shared_fc12_backend_supported(backend) -> bool:
+        capabilities = getattr(backend, "capabilities", None)
+        return bool(getattr(capabilities, "supports_per_iteration_eplb", False))
+
+    @staticmethod
+    def _shared_fc12_quantization_supported(
+        gate_up_quant_config: Optional[QuantConfig],
+        down_quant_config: Optional[QuantConfig],
+    ) -> bool:
+        return (
+            gate_up_quant_config is not None
+            and gate_up_quant_config == down_quant_config
+            and gate_up_quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            and gate_up_quant_config.group_size == 128
         )
 
     def compute_routed_output(
@@ -1731,13 +1837,48 @@ class DeepseekV4MoE(nn.Module):
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
 
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output,
-            _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-        )
+        # With helper slots enabled, the one-shot hook runs after MAIN has
+        # enqueued both HALO-Q and TMA copy on the shared high-priority stream.
+        # Shared experts then run on MAIN while helper weights are copied.
+        # Install identically across ranks and clear the hook on every exit.
+        _plan_gap_installed = False
+        if (
+            self._per_iteration_eplb_enabled
+            and self.shared_experts is not None
+            and not do_multi_stream()
+        ):
+            _shared_box = {}
+
+            def _plan_gap_shared():
+                # Shared-expert scaling must run at most once per forward.
+                if "out" not in _shared_box:
+                    _shared_box["out"] = _compute_shared_output()
+
+            _experts = getattr(self, "experts", None)
+            if _experts is not None and hasattr(_experts, "__dict__"):
+                setattr(_experts, "_rebalance_plan_gap_hook", _plan_gap_shared)
+                _plan_gap_installed = True
+
+        if _plan_gap_installed:
+            try:
+                routed_output = _compute_routed_output()
+            finally:
+                # Clear the hook even when the routed path exits early.
+                _e = getattr(self, "experts", None)
+                if _e is not None:
+                    setattr(_e, "_rebalance_plan_gap_hook", None)
+            # Compute shared experts here if the routed path skipped the hook.
+            if "out" not in _shared_box:
+                _shared_box["out"] = _compute_shared_output()
+            shared_output = _shared_box["out"]
+        else:
+            routed_output, shared_output = maybe_execute_in_parallel(
+                _compute_routed_output,
+                _compute_shared_output,
+                self.event_dict[EventType.Main],
+                self.event_dict[EventType.MoeShared],
+                self.aux_stream,
+            )
 
         if not do_finalize:
             return [shared_output, *routed_output]

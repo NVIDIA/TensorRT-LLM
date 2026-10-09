@@ -16,6 +16,7 @@
 
 import dataclasses
 import importlib
+import inspect
 import itertools
 import logging
 import os
@@ -86,6 +87,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     MoERejection,
     MoERejectReason,
+    MoEReplicaPlan,
     MoEResolutionReport,
     MoERunContext,
     MoEStaticCapability,
@@ -103,6 +105,10 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler import (
+    RebalanceSlotSchedulerGroup,
+    _LiveBankLeaseProvider,
+)
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     _reject_unsupported_activation,
     build_moe_deployment,
@@ -114,6 +120,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
+    NVFP4MegaMoECuteDslMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
     NVFP4TRTLLMGenFusedMoEMethod,
     UnquantizedFusedMoEMethod,
@@ -1512,20 +1519,219 @@ def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
     assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
+@pytest.mark.cpu_only
+def test_megamoe_quant_method_defines_canonical_live_plane_spec():
+    method = NVFP4MegaMoECuteDslMethod()
+    module = SimpleNamespace(
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+    )
+
+    spec = method.live_weight_plane_spec(module)
+
+    assert (spec.hidden, spec.intermediate, spec.expand_intermediate) == (7168, 3072, 6144)
+    assert tuple(plane.name for plane in spec.planes) == (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+        "fc31_alpha",
+        "fc2_alpha",
+        "fc1_norm_const",
+    )
+
+    # Exercise the storage-to-kernel dtype/view bridge on a small legal
+    # geometry; production metadata is covered by the independent goldens.
+    bridge = method._live_weight_bundle_layout(160, 80, 160)
+    for plane in bridge.planes:
+        shape, stride, dtype_name, element_size, pointer_alignment = plane.storage_metadata(3)
+        tensor = torch.empty(shape, dtype=getattr(torch, dtype_name))
+        assert tuple(tensor.stride()) == stride
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
+
+        kernel_shape, kernel_stride, _, kernel_element_size, _ = plane.kernel_metadata(3)
+        kernel_view = tensor
+        if plane.name in ("mega_fc1_weight", "mega_fc2_weight"):
+            kernel_view = kernel_view.transpose(1, 2)
+        assert tuple(kernel_view.shape) == kernel_shape
+        assert tuple(kernel_view.stride()) == kernel_stride
+        assert kernel_view.element_size() == kernel_element_size
+
+
+@pytest.mark.cpu_only
+def test_megamoe_live_plane_spec_rejects_expand_before_allocation():
+    method = NVFP4MegaMoECuteDslMethod()
+    module = SimpleNamespace(
+        hidden_size=160,
+        intermediate_size_per_partition=80,
+        expand_intermediate_size_per_partition=176,
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        method.live_weight_plane_spec(module)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_rejects_expand_before_provider_allocation():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._weights_created = False
+    moe.expert_size_per_partition = 4
+    moe._rebalance_slots_active = 1
+    moe._rebalance_home_experts = None
+    moe.layer_idx = 0
+    moe.hidden_size = 160
+    moe.intermediate_size_per_partition = 80
+    moe.expand_intermediate_size_per_partition = 176
+    moe.quant_method = NVFP4MegaMoECuteDslMethod()
+    moe.ep_size = 2
+    allocate_provider = MagicMock()
+    moe._alloc_symm_provider = allocate_provider
+    create_arena_provider = MagicMock()
+    moe.layer_load_balancer = SimpleNamespace(
+        manager=SimpleNamespace(create_arena_provider=create_arena_provider)
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        moe.create_weights()
+
+    allocate_provider.assert_not_called()
+    create_arena_provider.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_megamoe_live_plane_identity_guard_detects_parameter_replacement():
+    class Tensor:
+        def __init__(self, pointer):
+            self.shape = (2, 3)
+            self.dtype = "u8"
+            self.device = "cuda:0"
+            self.is_meta = False
+            self._pointer = pointer
+
+        def stride(self):
+            return (3, 1)
+
+        def data_ptr(self):
+            return self._pointer
+
+    arena_view = Tensor(17)
+    alias = Tensor(17)
+    plane = SimpleNamespace(name="weight")
+    bundle = SimpleNamespace(planes=(plane,))
+    arena = SimpleNamespace(
+        bundle=bundle,
+        local_plane_views=(arena_view,),
+        tekit_alias_views=(alias,),
+    )
+    module = SimpleNamespace(_rebalance_arena=arena, weight=Tensor(17))
+    method = NVFP4MegaMoECuteDslMethod()
+    method.live_weight_plane_spec = MagicMock(return_value=bundle)
+
+    method.assert_live_weight_aliases(module, arena)
+
+    module.weight = Tensor(23)
+    with pytest.raises(RuntimeError, match="changed storage"):
+        method.assert_live_weight_aliases(module, arena)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_compute_slots_do_not_widen_resident_expert_axis():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe._rebalance_home_experts = 8
+    moe._rebalance_slots_active = 3
+
+    assert moe.compute_slot_count == 11
+    assert moe.expert_size_per_partition == 8
+
+    # Catch the old representation (expert_size_per_partition == H + S)
+    # instead of silently adding S a second time.
+    moe.expert_size_per_partition = 11
+    with pytest.raises(RuntimeError, match="resident expert geometry changed"):
+        _ = moe.compute_slot_count
+
+
+@pytest.mark.cpu_only
+def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe._rebalance_home_experts = 8
+    moe._rebalance_slots_active = 3
+    moe._quantize_reserved_sms = 8
+    wait_for_routes = MagicMock()
+    ready_flags = torch.empty(8, dtype=torch.int64)
+    plan = MoEReplicaPlan(
+        resident_experts_per_rank=8,
+        compute_slots_per_rank=11,
+        ready_flags=ready_flags,
+        ready_generation=7,
+        reserved_sms=8,
+        _wait_for_routes=wait_for_routes,
+    )
+
+    compute_slots, helper_slots, actual_flags, generation, reserved_sms = (
+        moe._replica_plan_launch_args(plan)
+    )
+    assert (compute_slots, helper_slots, generation, reserved_sms) == (11, 3, 7, 8)
+    assert actual_flags is ready_flags
+    moe._wait_rebalance_routes(plan)
+    wait_for_routes.assert_called_once_with()
+
+    moe._wait_rebalance_routes()
+    wait_for_routes.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_megamoe_replica_plan_rejects_unallocated_geometry():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe._rebalance_home_experts = 8
+    moe._rebalance_slots_active = 3
+    moe._quantize_reserved_sms = 8
+    plan = MoEReplicaPlan(
+        resident_experts_per_rank=8,
+        compute_slots_per_rank=12,
+        ready_flags=torch.empty(8, dtype=torch.int64),
+        ready_generation=7,
+        reserved_sms=8,
+        _wait_for_routes=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="geometry does not match"):
+        moe._replica_plan_launch_args(plan)
+
+
+@pytest.mark.cpu_only
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     quant_method = SimpleNamespace(
         transform_weights=MagicMock(),
         cache_derived_state=MagicMock(),
+        assert_live_weight_aliases=MagicMock(),
     )
     moe.quant_method = quant_method
+    moe._rebalance_slots_active = 1
+    arena = MagicMock()
+    # ``unittest.mock`` blocks dynamically-created ``assert_*`` attributes.
+    arena.assert_identity = MagicMock()
+    moe._rebalance_arena = arena
+    moe.layer_load_balancer = SimpleNamespace(bind_backend=MagicMock())
 
     moe.post_load_weights()
     moe.transform_weights()
 
     quant_method.transform_weights.assert_called_once_with(moe)
     quant_method.cache_derived_state.assert_called_once_with(moe)
+    moe._rebalance_arena.assert_identity.assert_called_once_with()
+    quant_method.assert_live_weight_aliases.assert_called_once_with(moe, moe._rebalance_arena)
+    moe.layer_load_balancer.bind_backend.assert_called_once_with(moe)
     assert moe._weights_transformed is True
 
 
@@ -1568,6 +1774,119 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
         world_size=8,
         device_id=torch.device("cuda", 2),
     )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
+    monkeypatch,
+):
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import rebalance_slot_scheduler
+    from tensorrt_llm._torch.moe.fused_moe.per_iteration_eplb import PerIterationMoeLoadBalancer
+
+    config = SimpleNamespace(num_slots=24, auxiliary_sms=8)
+    manager = PerIterationMoeLoadBalancer(
+        ep_rank=0,
+        ep_size=4,
+        config=config,
+    )
+    layer = manager.add_layer(
+        expert_count=16,
+        top_k=2,
+        slot_count_per_rank=6,
+    )
+    arena = MagicMock(home_experts=4, helper_slots=2)
+    arena.assert_identity = MagicMock()
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.quant_method = SimpleNamespace(
+        cache_derived_state=MagicMock(),
+        assert_live_weight_aliases=MagicMock(),
+    )
+    moe._rebalance_slots_active = 2
+    moe._rebalance_arena = arena
+    moe.layer_load_balancer = layer
+    builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
+    monkeypatch.setattr(
+        rebalance_slot_scheduler,
+        "build_rebalance_slot_scheduler_group",
+        builder,
+    )
+
+    moe.cache_derived_state()
+    moe.cache_derived_state()
+
+    assert moe.quant_method.cache_derived_state.call_count == 2
+    assert arena.assert_identity.call_count == 2
+    assert moe.quant_method.assert_live_weight_aliases.call_count == 2
+    builder.assert_called_once_with(moe)
+
+
+@pytest.mark.cpu_only
+def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
+    trace = []
+    completion_event = object()
+    outputs = SimpleNamespace(physical_slot_ids=[3, 4])
+    part = (outputs, 2)
+    copy_stream = object()
+
+    group = RebalanceSlotSchedulerGroup.__new__(RebalanceSlotSchedulerGroup)
+    group._check_owner = MagicMock()
+    group._plan_part = part
+    group._generation = 1
+    group._finished_generation = 0
+    group._scheduled_generation = 1
+    group._route_wait_generation = 0
+    group._pending_release = None
+    group.plan_calls = 0
+    group._consumer_done = completion_event
+    group._consumer_done_handle = 17
+    group._execution_stream_handle = 23
+    group.copy_stream = copy_stream
+    group.scheduler_stream = copy_stream
+
+    def wait_for_routes():
+        trace.append("wait_routes")
+        group._route_wait_generation = group._generation
+
+    def record_event(event_handle, stream_handle):
+        assert (event_handle, stream_handle) == (17, 23)
+        trace.append("record_consumer_done")
+
+    broadcaster = SimpleNamespace(
+        release_generation_after=MagicMock(
+            side_effect=lambda generation, event: trace.append("release_generation")
+        ),
+        mark_collective_reuse_safe=MagicMock(
+            side_effect=lambda authority, generation: trace.append("prove_reuse")
+        ),
+    )
+    group.wait_for_routes = wait_for_routes
+    group._record_event = record_event
+    group.broadcaster = broadcaster
+
+    group.discard_plan(part)
+
+    assert group._plan_part is None
+    assert group.plan_calls == 1
+    assert group._finished_generation == 1
+    assert group._pending_release == (1, completion_event)
+    assert trace == ["wait_routes", "record_consumer_done", "release_generation"]
+
+    # The next schedule advances this counter before proving that generation 1
+    # can be reused. Exercise the real lease check to show cleanup left a valid
+    # transition rather than a permanently poisoned group.
+    group._scheduled_generation = 2
+    lease = _LiveBankLeaseProvider(group)
+    lease.prove(1)
+
+    assert lease.proved_generation == 1
+    assert trace[-1] == "prove_reuse"
+
+
+@pytest.mark.cpu_only
+def test_rebalance_scheduler_group_requires_ep_process_group():
+    parameters = inspect.signature(RebalanceSlotSchedulerGroup.__init__).parameters
+    assert "ep_process_group" in parameters
 
 
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
@@ -2118,29 +2437,32 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 10 for t in decode + prefill)
-    assert {t[-1] for t in decode} == {(1, 1)}
-    assert {t[-1] for t in prefill} == {(2, 4)}
+    assert all(len(t) == 11 for t in decode + prefill)
+    assert {t[-2] for t in decode} == {(1, 1)}
+    assert {t[-2] for t in prefill} == {(2, 4)}
+    assert {t[-1] for t in decode + prefill} == {"expert"}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
-    for num_tokens in (64, 4096, 16384):
-        megamoe_op.validate_megamoe_tactic(
-            megamoe_op.default_megamoe_tactic(num_tokens), sm_version=sm_version
-        )
+    default_tactics = [
+        megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
+    ]
+    assert all(len(tactic) == 11 for tactic in default_tactics)
+    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    for tactic in default_tactics:
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
         for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
             megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
-            assert (
-                megamoe_op._default_megamoe_tactic_for_problem(
-                    sm_version=sm_version,
-                    max_tokens_per_rank=bucket,
-                    num_tokens=bucket,
-                    apply_topk_in_fc1=False,
-                    in_kernel_fc2_reduce=False,
-                    combine_format="bf16",
-                )
-                == tactic
+            selected = megamoe_op._default_megamoe_tactic_for_problem(
+                sm_version=sm_version,
+                max_tokens_per_rank=bucket,
+                num_tokens=bucket,
+                apply_topk_in_fc1=False,
+                in_kernel_fc2_reduce=False,
+                combine_format="bf16",
             )
+            assert len(selected) == 11
+            assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
     with pytest.raises(ValueError, match=r"schedule_policy hint must be a positive int or None"):
@@ -2148,6 +2470,9 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
+    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
+    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
+    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.gpu

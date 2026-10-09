@@ -43,6 +43,7 @@ from tensorrt_llm._torch.weight_sharing import (
     SourceIdentityMismatchError,
     check_weight_sharing_compatibility,
 )
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerIterationLoadBalancerConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -115,6 +116,21 @@ def test_backend_mismatch_flags_global():
     result = a.matches(b)
     assert not result.matched
     assert "backend_fingerprint" in result.mismatched_fields
+
+
+def test_moe_load_balancer_config_controls_backend_identity():
+    base = identity_from(FakeModelConfig())
+    standard = identity_from(FakeModelConfig(moe_load_balancer=MoeLoadBalancerConfig(num_slots=64)))
+    per_iteration = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerIterationLoadBalancerConfig(num_slots=72))
+    )
+    same_per_iteration = identity_from(
+        FakeModelConfig(moe_load_balancer=MoePerIterationLoadBalancerConfig(num_slots=72))
+    )
+
+    assert not base.matches(standard).matched
+    assert not standard.matches(per_iteration).matched
+    assert per_iteration.matches(same_per_iteration).matched
 
 
 def test_model_layout_field_mismatch_flags_global_and_shard():

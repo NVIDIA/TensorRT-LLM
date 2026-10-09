@@ -15,9 +15,9 @@
 """Contracts for declaring, selecting, and executing MoE implementations."""
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -46,6 +46,9 @@ class MoEStaticCapability:
     # ``_supports_load_balancer()``, which TrtllmGenFusedMoEBase overrides to mean
     # "separated routing is used".
     supports_eplb: bool = False
+    # Whether the backend consumes a per-forward helper-slot plan whose live
+    # weights may be published concurrently with shared-expert computation.
+    supports_per_iteration_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.
@@ -278,6 +281,8 @@ class MoEDeployment:
     cluster_size: int = 1
     # True only when an EPLB load balancer is registered.
     eplb_enabled: bool = False
+    # Unified EPLB mode: disabled, standard, or per_iteration.
+    eplb_mode: str = "disabled"
     # True only for routed-expert LoRA targets.
     moe_lora_enabled: bool = False
     # False when ``moe_disable_finalize_fusion`` is set or any LoRA is
@@ -517,6 +522,7 @@ class MoEResolutionReport:
                 "use_dp": self.deployment.use_dp,
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
+                "eplb_mode": self.deployment.eplb_mode,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
                 "sm": self.deployment.env.sm,
                 "env_flags": dict(self.deployment.env.env_flags),
@@ -593,6 +599,48 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class MoEReplicaPlan:
+    """Per-forward physical replica layout produced by the EPLB layer.
+
+    The backend consumes these facts but does not own the planner, copy stream,
+    weight arena, or generation lifecycle.  The private wait callback preserves
+    the late dependency: independent input preparation remains overlapped until
+    the fused kernel is about to read the physical routes.
+    """
+
+    resident_experts_per_rank: int
+    compute_slots_per_rank: int
+    ready_flags: torch.Tensor
+    ready_generation: int
+    reserved_sms: int
+    _wait_for_routes: Callable[[], None] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        resident = int(self.resident_experts_per_rank)
+        compute = int(self.compute_slots_per_rank)
+        generation = int(self.ready_generation)
+        if resident <= 0 or compute <= resident:
+            raise ValueError(
+                "A replica plan requires compute slots M greater than resident "
+                f"experts H; got H={resident}, M={compute}."
+            )
+        if not 1 <= generation < (1 << 63):
+            raise ValueError(
+                f"A replica plan READY generation must be in [1, 2**63); got {generation}."
+            )
+        if int(self.reserved_sms) <= 0:
+            raise ValueError("A replica plan must reserve at least one auxiliary SM")
+
+    @property
+    def helper_slots_per_rank(self) -> int:
+        return int(self.compute_slots_per_rank) - int(self.resident_experts_per_rank)
+
+    def wait_for_routes(self) -> None:
+        """Order the first route consumer after the plan producer on device."""
+        self._wait_for_routes()
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -618,6 +666,8 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by per-iteration EPLB; None for standard EPLB and OFF.
+    replica_plan: Optional[MoEReplicaPlan] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

@@ -982,7 +982,11 @@ class PhaseInterleavedFc12MappingState:
         fc2_cursor: _PhaseFc12CursorState,
         num_fc1_intermediate_blocks: int,
         num_fc2_hidden_blocks: int,
+        dfc1_m_group: int = 1,
     ) -> None:
+        if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
+            raise ValueError("dfc1_m_group must be 1 or 16")
+        self.dfc1_m_group = dfc1_m_group
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
         self.mapping_cluster_shape_mn = mapping_cluster_shape_mn
@@ -995,6 +999,11 @@ class PhaseInterleavedFc12MappingState:
         self.fc2_cursor = fc2_cursor
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
+        self.fc2_claims_per_token_block = num_fc2_hidden_blocks
+        if fc2_cursor.blocks_per_token_block != self.fc2_claims_per_token_block:
+            raise ValueError(
+                "FC2 cursor blocks_per_token_block does not match the selected work-ID domain."
+            )
 
     @property
     def mapping_cluster_tile_m(self) -> int:
@@ -1045,6 +1054,7 @@ class PhaseInterleavedFc12MappingState:
             fc2_cursor=rebuild(self.fc2_cursor),
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=self.num_fc2_hidden_blocks,
+            dfc1_m_group=self.dfc1_m_group,
         )
         if value_index != len(values):
             raise ValueError(
@@ -1081,6 +1091,7 @@ def create_phase_interleaved_fc12_mapping_state(
     is_swap_ab: bool,
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
+    dfc1_m_group: int = 1,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
@@ -1088,6 +1099,7 @@ def create_phase_interleaved_fc12_mapping_state(
         intermediate_gateup_size + mapping_cluster_tile_n - 1
     ) // mapping_cluster_tile_n
     num_fc2_hidden_blocks = (hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
+    fc2_claims_per_token_block = num_fc2_hidden_blocks
     return PhaseInterleavedFc12MappingState(
         expert_count=expert_count,
         mapping_cta_tile_shape_mnk=mapping_cta_tile_shape_mnk,
@@ -1098,9 +1110,10 @@ def create_phase_interleaved_fc12_mapping_state(
         expert_token_sizes=expert_token_sizes,
         expert_token_prefix_sum=expert_token_prefix_sum,
         fc1_cursor=_make_phase_cursor(num_fc1_intermediate_blocks),
-        fc2_cursor=_make_phase_cursor(num_fc2_hidden_blocks),
+        fc2_cursor=_make_phase_cursor(fc2_claims_per_token_block),
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+        dfc1_m_group=dfc1_m_group,
     )
 
 
@@ -1183,6 +1196,29 @@ def _decode_phase_work_id(
     cluster_output_block_idx = local_work_id - cluster_token_block_idx * Int32(
         cursor.blocks_per_token_block
     )
+    if cutlass.const_expr(mapping_state.dfc1_m_group > 1):
+        if phase == Int32(BlockPhase.Linear2):
+            # Within each small M strip, visit its rows for a fixed N weight
+            # tile before advancing N. Only the per-expert rectangle is
+            # permuted: expert ranges, real row/ready indices, and task counts
+            # remain unchanged. A short final strip uses its actual row count
+            # and therefore adds neither padding work nor duplicate tiles.
+            strip_span = Int32(mapping_state.dfc1_m_group * cursor.blocks_per_token_block)
+            strip = local_work_id // strip_span
+            strip_m_begin = strip * Int32(mapping_state.dfc1_m_group)
+            strip_rows = cutlass.max(
+                Int32(1),
+                cutlass.min(
+                    Int32(mapping_state.dfc1_m_group),
+                    cursor.current_token_block_count - strip_m_begin,
+                ),
+            )
+            in_strip = local_work_id - strip * strip_span
+            cluster_output_block_idx = in_strip // strip_rows
+            cluster_token_block_idx = (
+                strip_m_begin + in_strip - cluster_output_block_idx * strip_rows
+            )
+
     cta_token_block_idx = (
         cluster_token_block_idx * Int32(mapping_state.mapping_cluster_shape_mn[0])
         + cta_id_in_mapping_cluster[0]
