@@ -321,12 +321,6 @@ The same two configuration blocks as for the other models enable it. The
 settings below were validated with DeepSeek-V4-Flash on one node (TP=4, EP=4,
 Attention DP) and with DeepSeek-V4-Pro in disaggregated serving on GB300.
 The recipe below uses `skip_rope_quantization: true` to match those serving runs.
-The initial [IFBench accuracy check](#ifbench-accuracy-check) below includes
-the default cold-page 2FP4 format and original-precision RoPE; the native
-active-KV 2FP4 reference is reported separately. These are limited accuracy
-checks, not comprehensive accuracy or offload/onboard validation. This is an
-optional feature for exploration; users should validate accuracy on their own
-models and workloads before deployment.
 
 ```yaml
 kv_cache_config:
@@ -351,46 +345,6 @@ DeepSeek-V4 specific requirements:
 * If `scale_checkpoint_path` supplies ModelOpt KV scales, only the per-layer
   K scale is applied to the CSA cache; the V scale is not used. Checkpoints
   without scale metadata use identity scales and need no calibration.
-
-### IFBench accuracy check
-
-DeepSeek-V4-Pro-0813 was evaluated on all 300 IFBench prompts with the original
-checkpoint, FP8 active KV cache, TP=8, EP=8, Attention DP, Max reasoning,
-temperature=1, top_p=1, and four requested seeds (4–7). The accuracy check applies
-one cold-codec NVFP4 quantize/dequantize round trip to each newly written CSA
-row and restores FP8 for Attention. It uses the cold codec's conversion rules
-and identity global scales; it does not use native NVFP4 active KV storage.
-HCA, sliding-window, indexer, and compressor state are unchanged.
-
-Results below are percentages, reported as mean ± sample standard deviation
-across complete 300-prompt runs. The average is the arithmetic mean of the four
-IFBench metrics.
-
-| Representation | Prompt strict | Instruction strict | Prompt loose | Instruction loose | Average |
-| --- | --- | --- | --- | --- | --- |
-| FP8 baseline | 71.33 ± 1.68 | 74.27 ± 1.22 | 76.00 ± 0.86 | 78.63 ± 0.56 | 75.06 ± 1.03 |
-| Cold NVFP4 NoPE / original FP8 RoPE | 73.25 ± 0.74 | 75.94 ± 1.02 | 78.50 ± 1.55 | 80.89 ± 1.78 | 77.15 ± 1.23 |
-| Cold NVFP4 NoPE / 2FP4 RoPE (default) | 71.50 ± 0.43 | 74.27 ± 0.61 | 76.42 ± 0.32 | 79.07 ± 0.34 | 75.31 ± 0.21 |
-| Cold single NVFP4 / all 512 elements | 71.75 ± 1.71 | 74.42 ± 1.36 | 77.08 ± 2.01 | 79.80 ± 1.78 | 75.76 ± 1.69 |
-
-Each format has four complete 300-prompt runs. Only complete, audited runs are
-included; partial or failed attempts are excluded.
-
-No noticeable IFBench accuracy drop was observed for the default cold-page
-2FP4 format in this initial quantization accuracy check: its average score
-was 75.31%, versus 75.06% for FP8, an observed difference of +0.25 percentage
-points. Sampling varies between runs;
-higher observed scores do not establish an accuracy improvement.
-This optional feature and its example recipe are provided for exploration and
-have not undergone comprehensive accuracy validation; users should validate
-accuracy on their own models and workloads before deployment.
-
-An earlier native active-KV reference (seeds 0–3) used the same original
-checkpoint and 300-prompt recipe, with native NVFP4 storage and 2FP4 RoPE enabled. Its average
-score was **74.96 ± 1.43%**, compared with **75.19 ± 2.11%** for FP8, an observed
-difference of **−0.23 percentage points**. This reference uses the native active-KV
-path and its global scales, not the cold-page codec, and must not be interpreted
-as accuracy validation of the cold-page 2FP4 format.
 
 ## Verify Activation
 
@@ -443,8 +397,7 @@ entry. By default all values are quantized: DeepSeek-V4 target RoPE uses the
 2FP4 format described above, while the remaining values use single NVFP4. With
 `skip_rope_quantization: true` the RoPE part is copied unchanged and the rest
 becomes NVFP4. Original precision means the hot-cache dtype, such as FP8 or BF16;
-it does not change that dtype. This is an option to explore; measure the accuracy effect on your
-own model and workload. It is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
+it does not change that dtype. RoPE preservation is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`),
 and the Qwen3.5 series. To add model support, see
 the [development guide](../../docs/source/developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
 

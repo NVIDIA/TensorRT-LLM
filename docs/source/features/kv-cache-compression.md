@@ -224,7 +224,7 @@ For DeepSeek-V4, `nvfp4_residual_dim` defaults to `64`, using 2FP4 for its
 for single NVFP4 throughout the row. Only `0` and `64` are supported. Setting
 `skip_rope_quantization` to `true` preserves RoPE regardless of the residual
 option. See the [DeepSeek-V4 example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4)
-for the three formats and limited accuracy results.
+for the three formats.
 
 Preserving RoPE increases cold-cache storage relative to single NVFP4. These
 formats are exploratory; validate accuracy on your model and workload. Skipping
