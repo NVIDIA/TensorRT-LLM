@@ -901,16 +901,18 @@ def test_nvfp4_grouped_gemm_blackwell(num_tokens: int, top_k: int, ep_size: int,
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -993,16 +995,18 @@ def test_nvfp4_grouped_gemm_finalize_blackwell(
     )
 
     max_num_permuted_tokens = permuted_idx_to_expanded_idx.size(0)
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 16 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
@@ -1103,16 +1107,18 @@ def test_nvfp4_grouped_gemm_swiglu_blackwell(
             tile_idx += 1
     tile_idx_to_group_idx = tile_idx_to_group_idx.cuda()
 
+    # Draw straight into bfloat16: an int32 staging buffer would double the
+    # footprint of `b`, which is already 32 GiB at ep_size=1.
     a = torch.randint(
-        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.int32, device="cuda"
-    ).to(torch.bfloat16)
+        -5, 5, (max_num_permuted_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
     b = torch.randint(
         -5,
         5,
         (num_local_experts, interm_size * 2, hidden_size),
-        dtype=torch.int32,
+        dtype=torch.bfloat16,
         device="cuda",
-    ).to(torch.bfloat16)
+    )
 
     a_global_sf = a.abs().max().float() / (448 * 6)
     b_global_sf = b.abs().amax(dim=(1, 2)).float() / (448 * 6)
