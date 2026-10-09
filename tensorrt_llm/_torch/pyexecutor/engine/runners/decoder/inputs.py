@@ -31,6 +31,7 @@ from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_token
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
+from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
@@ -56,7 +57,20 @@ from ..common import (
 )
 from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
-from .speculative import resolve_runtime_draft_len, set_spec_metadata_all_rank_num_tokens
+from .metadata import set_spec_metadata_all_rank_num_tokens
+
+
+def resolve_runtime_draft_len(
+    spec_config: DecodingBaseConfig | None, runtime_draft_len: int
+) -> int:
+    """Return the draft length a decoder step prepares and runs with.
+
+    For tree decoding it matches the total tree tokens, not the tree depth;
+    py_executor resets it every iteration.
+    """
+    if spec_config is not None and not spec_config.is_linear_tree:
+        return get_static_draft_len(spec_config)
+    return runtime_draft_len
 
 
 def uses_full_generation_page_table(

@@ -81,9 +81,18 @@ from ..interface import PreparedInputs, ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs
-from .inputs import DecoderInputBuffers, DecoderInputPreparer, ExtraInputsCollector
-from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
-from .speculative import get_spec_managers, resolve_runtime_draft_len, update_spec_metadata
+from .inputs import (
+    DecoderInputBuffers,
+    DecoderInputPreparer,
+    ExtraInputsCollector,
+    resolve_runtime_draft_len,
+)
+from .metadata import (
+    DecoderMetadata,
+    get_spec_managers,
+    resolve_mamba_metadata_cls,
+    update_spec_metadata,
+)
 from .warmup import WarmupAgreement
 
 
@@ -873,7 +882,7 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None:
             return
-        self._metadata.set_up_attn(
+        self._metadata.setup_attention(
             kv_cache_manager, self._get_draft_kv_cache_manager(resource_manager)
         )
 
@@ -1834,12 +1843,12 @@ class DecoderRunner(ScheduledModelRunner):
         scheduled_requests = self._get_attention_dp_execution_batch(scheduled_requests)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
-        attn_metadata = self._metadata.set_up_attn(kv_cache_manager, draft_kv_cache_manager)
+        attn_metadata = self._metadata.setup_attention(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
             spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
-            spec_metadata = self._metadata.set_up_spec(spec_resource_manager)
+            spec_metadata = self._metadata.setup_speculative(spec_resource_manager)
             assert spec_metadata is not None
             update_spec_metadata(
                 spec_metadata,

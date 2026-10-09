@@ -160,7 +160,7 @@ def setup_mm_encoder_attn_metadata(
     using the engine's encoder token budget (``encoder_max_num_tokens``, falling back to
     the LLM-side ``max_num_tokens``).
 
-    Mirrors ``_set_up_attn_metadata`` for the LLM backbone: encoders opt in by inheriting
+    Mirrors ``DecoderMetadata.setup_attention`` for the LLM backbone: encoders opt in by inheriting
     ``MultimodalEncoderMixin``, and the engine drives the construction so the sizes match
     the resolved encoder token budget rather than being hardcoded inside each encoder's
     ``__init__``. The optional per-segment capacity combines the encoder token budget with

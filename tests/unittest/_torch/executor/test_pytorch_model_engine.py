@@ -362,7 +362,7 @@ def _make_forward_only_engine(
     graph_attn_metadata = Mock()
     decoder._metadata = SimpleNamespace(
         attn_metadata=semantic_attn_metadata,
-        set_up_attn=Mock(return_value=semantic_attn_metadata))
+        setup_attention=Mock(return_value=semantic_attn_metadata))
     spec_dec_mode = Mock()
     spec_dec_mode.attention_need_spec_dec_mode.return_value = False
     spec_dec_mode.is_parallel_draft.return_value = False
@@ -372,7 +372,7 @@ def _make_forward_only_engine(
         is_spec_dec_dynamic_tree=False,
     )
     decoder._metadata.spec_metadata = spec_metadata
-    decoder._metadata.set_up_spec = Mock(return_value=spec_metadata)
+    decoder._metadata.setup_speculative = Mock(return_value=spec_metadata)
     prepared_inputs = {
         "prepared": True,
         "input_ids": torch.zeros(2, dtype=torch.int32),
@@ -1826,7 +1826,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             engine._metadata.attn_metadata = metadata
             return metadata
 
-        engine._metadata.set_up_attn = Mock(side_effect=build)
+        engine._metadata.setup_attention = Mock(side_effect=build)
         kv_cache_manager = Mock()
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = kv_cache_manager
@@ -1834,7 +1834,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._ensure_dsa_attn_metadata_for_warmup(resource_manager)
         engine._warmup_cute_dsl_radix_topk()
 
-        engine._metadata.set_up_attn.assert_called_once_with(
+        engine._metadata.setup_attention.assert_called_once_with(
             kv_cache_manager, None)
         metadata.warmup_cute_dsl_radix_topk.assert_called_once_with(3)
         metadata.warmup_selfsampling_topk.assert_called_once_with(
@@ -1851,12 +1851,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                            mapping=None,
                                            model=None,
                                            buffers=None)
-        engine._metadata.set_up_attn = Mock()
+        engine._metadata.setup_attention = Mock()
 
         engine._ensure_dsa_attn_metadata_for_warmup(Mock())
         engine._warmup_cute_dsl_radix_topk()
 
-        engine._metadata.set_up_attn.assert_not_called()
+        engine._metadata.setup_attention.assert_not_called()
 
     def test_breakable_rejects_multimodal_models(self) -> None:
         engine = object.__new__(PyTorchModelEngine)
