@@ -83,6 +83,18 @@ def get_ucx_tls():
     return "^ib,gdr_copy"
 
 
+def get_ucx_net_devices():
+    """Get UCX_NET_DEVICES for these single-node disaggregated tests.
+
+    Every worker runs on this host, so loopback is the only TCP device UCX
+    needs. With every netdev enabled, UCX protocol selection re-queries each
+    TCP interface (ethtool ioctls, slow on bonded NICs) for every new endpoint,
+    which pushed cold NIXL peer setup past kv_transfer_timeout_ms on B200
+    nodes (https://nvbugs/6836097).
+    """
+    return "lo"
+
+
 # Fatal patterns whose presence in worker/server logs after a stress run
 # indicates the cluster did not stay healthy and the test should be failed.
 # Only genuinely fatal conditions belong here — transient request-level errors
@@ -1041,6 +1053,7 @@ def run_disaggregated_test(example_dir,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_run_env = run_env.copy()
     if ctx_env:
         ctx_run_env.update(ctx_env)
@@ -1277,6 +1290,7 @@ def test_disaggregated_benchmark_gen_only_insufficient_kv(
     env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     env['TLLM_BENCHMARK_REQ_QUEUES_SIZE'] = '64'
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config("gen_only_insufficient_kv",
                                   disaggregated_example_root,
@@ -1451,6 +1465,7 @@ def test_disaggregated_overlap_transceiver_runtime_python(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
                            env=env,
@@ -1474,6 +1489,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_fabric_memory(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_POOL_USE_FABRIC_MEMORY"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
@@ -1505,6 +1521,7 @@ def test_disaggregated_overlap_transceiver_runtime_python_bounce(
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     # min_blocks=1 forces bounce on even for the short test prompt (the gate is internal, tuned via
     # env). No fabric-pool env is needed: the bounce arena is its own fabric memory.
     env["TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"] = "1"
@@ -1537,6 +1554,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         "TRTLLM_USE_NIXL_KVCACHE": "0",
         "TRTLLM_USE_UCX_KVCACHE": "1",
         "UCX_TLS": get_ucx_tls(),
+        "UCX_NET_DEVICES": get_ucx_net_devices(),
     }
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1580,6 +1598,7 @@ def test_disaggregated_kv_cache_time_output(disaggregated_test_root, llm_venv,
     env["TRTLLM_USE_NIXL_KVCACHE"] = "0"
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["TRTLLM_KVCACHE_TIME_OUTPUT_PATH"] = output_path
     run_disaggregated_test(disaggregated_example_root,
                            "perf_metrics",
@@ -1932,6 +1951,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     env["UCX_MM_ERROR_HANDLING"] = "y"
 
     # @skip_pre_hopper (SM >= 90), not @skip_no_hopper (SM == 90): placement is
@@ -2236,6 +2256,7 @@ def run_disaggregated_benchmark(example_dir,
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2504,6 +2525,7 @@ def run_disaggregated_aiperf(config_file,
     """
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -3700,6 +3722,7 @@ def run_disaggregated_mixed_stress(example_dir: str,
 
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     setup_start = time.monotonic()
@@ -3855,6 +3878,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
+    run_env["UCX_NET_DEVICES"] = get_ucx_net_devices()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
@@ -4005,6 +4029,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=env,
@@ -4148,6 +4173,7 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
 
     env = llm_venv._new_env.copy()
     env["UCX_TLS"] = get_ucx_tls()
+    env["UCX_NET_DEVICES"] = get_ucx_net_devices()
     e2el, ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
         config_file,
