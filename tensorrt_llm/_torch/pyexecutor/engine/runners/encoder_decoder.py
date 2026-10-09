@@ -764,7 +764,7 @@ class EncoderDecoderRunner(DecoderRunner):
                 return None
         requests = context_requests + generation_requests
 
-        max_seq_len_request = self._add_longest_dummy_request(
+        max_seq_len_request = self._dummy_requests.add_longest_dummy_request(
             resource_manager,
             requests,
             batch_size,
@@ -784,7 +784,7 @@ class EncoderDecoderRunner(DecoderRunner):
             request.py_batch_idx = None
         result.context_requests_last_chunk = requests[:num_mixed_contexts]
         result.generation_requests = requests[num_mixed_contexts:]
-        return self._finish_cuda_graph_warmup_request(
+        return self._dummy_requests.finish_cuda_graph_warmup_request(
             result, resource_manager, batch_size, draft_len
         )
 

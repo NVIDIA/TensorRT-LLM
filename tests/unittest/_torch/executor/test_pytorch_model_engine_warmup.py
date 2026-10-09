@@ -383,8 +383,10 @@ def test_compiled_mxfp8_warmup_backend_selection(
         is_draft_model=False,
         guided_decoder=None,
         no_cuda_graph=lambda: contextlib.nullcontext(),
-        _create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
-            num_gen_requests=num_gen_requests
+        _dummy_requests=SimpleNamespace(
+            create_warmup_request=lambda resources, num_tokens, num_gen_requests: Mock(
+                num_gen_requests=num_gen_requests
+            )
         ),
         _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
         _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
@@ -593,20 +595,23 @@ def test_warmup_builders_resynchronize_stale_draft_buffers(
         max_draft_loop_tokens=config.tokens_per_gen_step - 1,
     )
     runner.get_runtime_tokens_per_gen_step = config.get_runtime_tokens_per_gen_step
+    requests = runner._dummy_requests
+    requests._config = runner._config
+    requests.get_runtime_tokens_per_gen_step = runner.get_runtime_tokens_per_gen_step
     # Profiling a batch of two leaves K=2; every requested warmup shape below
     # differs from that value and must synchronize the requests.
     batch_size = 2
 
     if draft_len is None:
         expected_draft_len = runner._config.max_draft_len
-        warmup_request = runner._create_warmup_request(
+        warmup_request = requests.create_warmup_request(
             resource_manager,
             num_tokens=batch_size * config.tokens_per_gen_step,
             num_gen_requests=batch_size,
         )
     else:
         expected_draft_len = draft_len
-        warmup_request = runner._create_cuda_graph_warmup_request(
+        warmup_request = requests.create_cuda_graph_warmup_request(
             resource_manager, batch_size, draft_len, max_seq_len=16
         )
 
@@ -633,7 +638,9 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     forward_warmup = Mock(side_effect=RuntimeError("capture failure") if fails else None)
     with (
         patch.object(runner, "_get_graphs_to_capture", return_value=[(1, 0), (1, 2)]),
-        patch.object(runner, "_create_cuda_graph_warmup_request", side_effect=create_request),
+        patch.object(
+            runner._dummy_requests, "create_cuda_graph_warmup_request", side_effect=create_request
+        ),
         patch.object(
             runner,
             "_release_batch_context",
@@ -676,7 +683,7 @@ def test_warmup_phases_pass_configured_speculation_state(phase: str) -> None:
             )
         )
         stack.enter_context(
-            patch.object(runner, "_create_warmup_request", Mock(return_value=batch))
+            patch.object(runner._dummy_requests, "create_warmup_request", Mock(return_value=batch))
         )
         stack.enter_context(
             patch.object(
@@ -1264,7 +1271,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=object(),
                 guided_decoder=None,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
+                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
                 _release_batch_context=Mock(
                     side_effect=[
                         contextlib.nullcontext(object()),
@@ -1386,7 +1393,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=object(),
                 guided_decoder=None,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
+                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
                 _release_batch_context=Mock(
                     side_effect=[
                         contextlib.nullcontext(None),
@@ -1493,7 +1500,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 dist=dist,
                 guided_decoder=None,
                 no_cuda_graph=lambda: contextlib.nullcontext(),
-                _create_warmup_request=Mock(return_value=object()),
+                _dummy_requests=SimpleNamespace(create_warmup_request=Mock(return_value=object())),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
                 _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
                 _release_megamoe_profiling_scratch=Mock(),

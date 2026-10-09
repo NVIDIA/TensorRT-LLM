@@ -24,7 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -1749,23 +1749,25 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         spec_config=spec_config,
     )
     try:
-        runner = object.__new__(DecoderRunner)
-        runner.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-        runner._config = SimpleNamespace(
-            spec_config=spec_config,
-            max_draft_len=draft_len,
-            max_draft_loop_tokens=draft_len,
-            max_seq_len=manager.max_seq_len,
-            max_beam_width=1,
-            use_mrope=False,
-        )
-        runner.get_runtime_tokens_per_gen_step = lambda length: length + 1
-        runner._get_draft_kv_cache_manager = lambda _: None
-        runner.model = SimpleNamespace(
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace())
+        requests = DummyRequestFactory(
+            SimpleNamespace(
+                spec_config=spec_config,
+                max_draft_len=draft_len,
+                max_draft_loop_tokens=draft_len,
+                max_seq_len=manager.max_seq_len,
+                max_beam_width=1,
+                use_mrope=False,
+            ),
+            ResourceManagerType.KV_CACHE_MANAGER,
+            lambda length: length + 1,
+            None,
+            request_kwargs=lambda resource_manager, num_requests: {},
+            position_limit=lambda: None,
+            add_resources=lambda requests, resource_manager: True,
+            get_draft_kv_cache_manager=lambda _: None,
         )
         resources = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
-        batch = runner._create_cuda_graph_warmup_request(
+        batch = requests.create_cuda_graph_warmup_request(
             resources, batch_size=2, draft_len=draft_len
         )
         assert batch is not None

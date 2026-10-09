@@ -13,6 +13,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM
 from tensorrt_llm._torch.pyexecutor.engine.runners import encoder_decoder as encoder_decoder_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderPreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     CrossAttentionInputs,
@@ -323,6 +324,19 @@ def _dummy_request_runner(
     return runner
 
 
+def _dummy_requests(runner: DecoderRunner) -> DummyRequestFactory:
+    return DummyRequestFactory(
+        runner._config,
+        runner.kv_cache_manager_key,
+        lambda draft_len: draft_len + 1,
+        runner._dummy_request_tokens,
+        request_kwargs=runner._dummy_request_kwargs,
+        position_limit=runner._dummy_position_limit,
+        add_resources=runner._add_dummy_request_resources,
+        get_draft_kv_cache_manager=runner._get_draft_kv_cache_manager,
+    )
+
+
 def _dummy_request_resources() -> tuple[Mock, Mock]:
     kv_cache_manager = Mock(max_seq_len=64)
     kv_cache_manager.get_num_available_tokens.return_value = 40
@@ -352,7 +366,9 @@ def test_longest_dummy_request_applies_runner_limits(
     longest = object()
     kv_cache_manager.add_dummy_requests.return_value = [longest]
 
-    actual = runner._add_longest_dummy_request(resource_manager, [], 3, None, 0, None)
+    actual = _dummy_requests(runner).add_longest_dummy_request(
+        resource_manager, [], 3, None, 0, None
+    )
 
     assert actual is longest
     kv_cache_manager.add_dummy_requests.assert_called_once_with(
@@ -378,7 +394,8 @@ def test_longest_dummy_request_failure_frees_filler_requests() -> None:
     kv_cache_manager.add_dummy_requests.return_value = None
     fillers = [object(), object()]
 
-    assert runner._add_longest_dummy_request(resource_manager, fillers, 3, None, 0, None) is None
+    requests = _dummy_requests(runner)
+    assert requests.add_longest_dummy_request(resource_manager, fillers, 3, None, 0, None) is None
     assert kv_cache_manager.free_resources.call_args_list == [call(r) for r in fillers]
     assert draft_kv_cache_manager.free_resources.call_args_list == [call(r) for r in fillers]
 
@@ -398,13 +415,12 @@ def test_mixed_warmup_request_orders_context_generation_and_longest_rows() -> No
         longest_inputs.append(list(requests))
         return longest
 
-    with (
-        patch.object(runner, "_add_longest_dummy_request", side_effect=add_longest),
-        patch.object(
-            runner, "_finish_cuda_graph_warmup_request", side_effect=lambda result, *_: result
-        ) as finish,
-    ):
-        batch = runner._create_mixed_cuda_graph_warmup_request(resource_manager, 4, 0, [5, 7], 3)
+    finish = Mock(side_effect=lambda result, *_: result)
+    runner._dummy_requests = SimpleNamespace(
+        add_longest_dummy_request=Mock(side_effect=add_longest),
+        finish_cuda_graph_warmup_request=finish,
+    )
+    batch = runner._create_mixed_cuda_graph_warmup_request(resource_manager, 4, 0, [5, 7], 3)
 
     assert longest_inputs == [contexts + generations]
     assert batch.context_requests_last_chunk == contexts

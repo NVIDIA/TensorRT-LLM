@@ -67,7 +67,7 @@ from tensorrt_llm._torch.speculative import (
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
-from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
+from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import (
     get_per_request_prefill_cuda_graph_flag,
     helix_local_len,
@@ -91,7 +91,6 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
 from ...model_call import ModelCaller
@@ -110,6 +109,7 @@ from ..common import (
 )
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
+from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputBuffers
 from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
 from .speculative import (
@@ -205,13 +205,6 @@ def _make_single_token_context_graph_batch(
     return graph_batch, promoted_context_request_ids
 
 
-# Arbitrary non-greedy params used to force the advanced-sampling CUDA graph
-# warmup capture path.
-NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
-    temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
-)
-
-
 class ExtraInputsCollector:
     """Collect per-sequence model inputs beyond the decoder's own; none by default."""
 
@@ -294,6 +287,16 @@ class DecoderRunner(ScheduledModelRunner):
         self._buffers = DecoderInputBuffers()
         self._buffers.allocate(self._config, self.use_beam_search)
         self._metadata = DecoderMetadata(self._config, mapping, model, self._buffers)
+        self._dummy_requests = DummyRequestFactory(
+            self._config,
+            kv_cache_manager_key,
+            get_runtime_tokens_per_gen_step,
+            self._dummy_request_tokens,
+            request_kwargs=self._dummy_request_kwargs,
+            position_limit=self._dummy_position_limit,
+            add_resources=self._add_dummy_request_resources,
+            get_draft_kv_cache_manager=self._get_draft_kv_cache_manager,
+        )
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
@@ -1045,7 +1048,9 @@ class DecoderRunner(ScheduledModelRunner):
                 continue
             try:
                 with self._release_batch_context(
-                    self._create_warmup_request(resource_manager, num_tokens, num_gen_tokens),
+                    self._dummy_requests.create_warmup_request(
+                        resource_manager, num_tokens, num_gen_tokens
+                    ),
                     resource_manager,
                 ) as batch:
                     if not self._agreement.should_run_warmup_batch(
@@ -1154,7 +1159,7 @@ class DecoderRunner(ScheduledModelRunner):
             )
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
-            warmup_request = self._create_warmup_request(
+            warmup_request = self._dummy_requests.create_warmup_request(
                 resource_manager, num_tokens=num_tokens, num_gen_requests=num_gen_requests
             )
 
@@ -1317,7 +1322,7 @@ class DecoderRunner(ScheduledModelRunner):
             ran_forward = False
             with self.no_cuda_graph(), autotune_context:
                 for num_tokens, num_gen_requests in warmup_configs:
-                    warmup_request = self._create_warmup_request(
+                    warmup_request = self._dummy_requests.create_warmup_request(
                         resource_manager, num_tokens, num_gen_requests
                     )
                     with self._release_batch_context(warmup_request, resource_manager) as batch:
@@ -1526,7 +1531,7 @@ class DecoderRunner(ScheduledModelRunner):
                 )
                 with init_ctx:
                     try:
-                        warmup_request = self._create_warmup_request(
+                        warmup_request = self._dummy_requests.create_warmup_request(
                             resource_manager,
                             num_tokens_i,
                             num_gen_requests_i,
@@ -1824,7 +1829,7 @@ class DecoderRunner(ScheduledModelRunner):
                         continue
 
                     for max_seq_len in max_seq_len_list:
-                        warmup_request = self._create_cuda_graph_warmup_request(
+                        warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
                             draft_len,
@@ -1969,7 +1974,9 @@ class DecoderRunner(ScheduledModelRunner):
         runtime_draft_len = get_static_draft_len(self._config.spec_config)
         with capture_context, self.no_cuda_graph():
             for num_tokens in prefill_cuda_graph_num_tokens:
-                warmup_request = self._create_warmup_request(resource_manager, num_tokens, 0)
+                warmup_request = self._dummy_requests.create_warmup_request(
+                    resource_manager, num_tokens, 0
+                )
                 with self._release_batch_context(warmup_request, resource_manager) as batch:
                     self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                     if batch is None:
@@ -2019,7 +2026,7 @@ class DecoderRunner(ScheduledModelRunner):
         # those allocations can be reused during stable inference.
         with timing_metric("post_ctx_cuda_graph_capture_warmup_seconds", self._metrics):
             for num_tokens in prefill_cuda_graph_num_tokens:
-                warmup_request = self._create_warmup_request(
+                warmup_request = self._dummy_requests.create_warmup_request(
                     resource_manager, num_tokens, 0, least_requests=False
                 )
                 with self._release_batch_context(warmup_request, resource_manager) as batch:
@@ -2072,363 +2079,6 @@ class DecoderRunner(ScheduledModelRunner):
                         spec_resource_manager.free_resources(req)
                     if release_request_state is not None:
                         release_request_state(req.py_request_id)
-
-    @staticmethod
-    def _apply_chunk_alignment(
-        ctx_token_nums: list[int], alignment: int, aligned: bool
-    ) -> list[int] | None:
-        """Rewrite warmup context lengths onto one side of ``alignment``.
-
-        Returns lengths that are all multiples of ``alignment`` (``aligned``) or
-        that include at least one non-multiple, or None if that would leave the
-        batch empty. Only shrinks or drops sequences.
-        """
-        if aligned:
-            floored = [n - n % alignment for n in ctx_token_nums]
-            kept = [n for n in floored if n > 0]
-            return kept or None
-        if any(n % alignment != 0 for n in ctx_token_nums):
-            return list(ctx_token_nums)
-        # Every length is a multiple; one token off the last breaks it.
-        if ctx_token_nums[-1] <= 1:
-            return None
-        return ctx_token_nums[:-1] + [ctx_token_nums[-1] - 1]
-
-    def _create_warmup_request(
-        self,
-        resource_manager: ResourceManager,
-        num_tokens: int,
-        num_gen_requests: int,
-        least_requests: bool = True,
-        chunk_alignment: int | None = None,
-        chunk_aligned: bool = False,
-    ) -> ScheduledRequests | None:
-        """Creates a generic dummy ScheduledRequests object for warmup.
-
-        ``chunk_alignment``, when set, rewrites the context lengths onto one
-        side of it, so a kernel specializing on chunk alignment can be primed
-        for both variants instead of whichever one the split happens to hit.
-        Only shrinks or drops sequences, so the block estimate below stays a
-        safe over-estimate.
-        """
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
-
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-
-        available_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=num_tokens,
-            max_num_draft_tokens=self._config.max_total_draft_tokens,
-        )
-        available_blocks = kv_cache_manager.get_num_free_blocks()
-        if num_tokens > self._config.max_num_tokens or num_tokens > available_tokens:
-            return None
-
-        if num_gen_requests > self._config.max_batch_size:
-            return None
-        if (
-            num_gen_requests > 0
-            and getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
-        ):
-            # Generic warmup also requests decode/mixed shapes. Exercise their
-            # token and batch bounds as fresh context rows on an encoder-only
-            # cache; actual generation requests remain invalid. Packing many
-            # requests preserves N one-token rows for the max-batch shape.
-            num_gen_requests = 0
-            least_requests = False
-        num_gen_tokens = num_gen_requests * (1 + self._config.max_total_draft_tokens)
-        if num_gen_tokens > self._config.max_num_tokens:
-            return None
-
-        num_ctx_tokens = num_tokens - num_gen_tokens
-        num_ctx_requests = 0
-        ctx_requests = []
-        gen_requests = []
-
-        # Leave room for at least one decode token per request.
-        max_seq_len = self._config.max_seq_len - 1
-        if max_seq_len < 1:
-            return None
-        ctx_token_nums = []
-
-        max_context_requests = self._config.max_batch_size - num_gen_requests
-        if max_context_requests * max_seq_len < num_ctx_tokens:
-            return None
-
-        if num_ctx_tokens > 0:
-            if least_requests:
-                num_full_seqs, remainder = divmod(num_ctx_tokens, max_seq_len)
-                ctx_token_nums = [max_seq_len] * num_full_seqs
-                if remainder:
-                    ctx_token_nums.append(remainder)
-            else:
-                max_bs = min(num_ctx_tokens, max_context_requests)
-                # Keep every admitted request row while balancing lengths.
-                # This covers the largest batch without exceeding max_seq_len
-                # on uneven totals (five tokens in two rows become [3, 2]).
-                base_length, remainder = divmod(num_ctx_tokens, max_bs)
-                ctx_token_nums = [base_length + 1] * remainder + [base_length] * (
-                    max_bs - remainder
-                )
-            num_ctx_requests = len(ctx_token_nums)
-
-        if num_ctx_requests + num_gen_requests > self._config.max_batch_size:
-            return None  # Not enough batch size to fill the request
-
-        # Mirror add_dummy_requests' actual allocation: on top of the raw
-        # token count, every sequence gets num_extra_kv_tokens add_token
-        # calls, and generation dummies additionally reserve
-        # max_draft_loop_tokens for the draft loop.
-        # In one-engine spec modes that is (max_draft_len - 1) extra KV
-        # tokens plus max_draft_len draft-loop tokens per gen dummy, i.e.
-        # 2 * max_draft_len - 1 on top of the single prompt token.
-        # Under-counting these let warmup start an allocation that fails
-        # midway and, before the partial-allocation cleanup existed,
-        # permanently leaked most of the estimation-sized KV pool
-        # (TRTLLM-14903).
-        def blocks_for_seq(num_tokens: int) -> int:
-            return math.ceil(num_tokens / kv_cache_manager.tokens_per_block)
-
-        extra_ctx_tokens = getattr(kv_cache_manager, "num_extra_kv_tokens", 0) or 0
-        extra_gen_tokens = extra_ctx_tokens + self._config.max_draft_loop_tokens
-        blocks_to_use = sum(
-            blocks_for_seq(token_num + extra_ctx_tokens) for token_num in ctx_token_nums
-        )
-        blocks_to_use += (
-            num_gen_requests * self._config.max_beam_width * blocks_for_seq(1 + extra_gen_tokens)
-        )
-
-        if blocks_to_use > available_blocks and isinstance(kv_cache_manager, KVCacheManager):
-            return None
-
-        if num_ctx_tokens > 0:
-            if chunk_alignment:
-                adjusted = self._apply_chunk_alignment(
-                    ctx_token_nums, chunk_alignment, chunk_aligned
-                )
-                if adjusted is None:
-                    logger.debug(
-                        f"Warmup batch of {ctx_token_nums} cannot be made "
-                        f"{'aligned' if chunk_aligned else 'ragged'} modulo "
-                        f"{chunk_alignment}; that variant will compile on the "
-                        f"first request needing it."
-                    )
-                else:
-                    ctx_token_nums = adjusted
-                    num_ctx_requests = len(ctx_token_nums)
-
-            ctx_requests = kv_cache_manager.add_dummy_requests(
-                list(range(num_ctx_requests)),
-                token_nums=ctx_token_nums,
-                is_gen=False,
-                max_num_draft_tokens=self._config.max_total_draft_tokens,
-                kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-                use_mrope=self._config.use_mrope,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-            )
-
-            if ctx_requests is None:
-                return None
-
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(request_ids=list(range(num_ctx_requests)))
-
-        if num_gen_requests > 0:
-            gen_requests = kv_cache_manager.add_dummy_requests(
-                list(range(num_ctx_requests, num_ctx_requests + num_gen_requests)),
-                token_nums=[1] * num_gen_requests,
-                is_gen=True,
-                max_num_draft_tokens=self._config.max_total_draft_tokens,
-                kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-                use_mrope=self._config.use_mrope,
-                max_beam_width=self._config.max_beam_width,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-            )
-
-            if gen_requests is None:
-                for r in ctx_requests:
-                    kv_cache_manager.free_resources(r)
-                    if draft_kv_cache_manager is not None:
-                        draft_kv_cache_manager.free_resources(r)
-                return None
-
-            if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(
-                    request_ids=list(range(num_ctx_requests, num_ctx_requests + num_gen_requests))
-                )
-
-        result = ScheduledRequests()
-        result.reset_context_requests(ctx_requests)
-        result.generation_requests = gen_requests
-        static_draft_len = get_static_draft_len(self._config.spec_config)
-        resolve_draft_len(
-            self._config.spec_config,
-            result,
-            max_draft_len=self._config.max_draft_len,
-            static_draft_len=static_draft_len,
-            draft_len=static_draft_len,
-        )
-        return result
-
-    def _create_cuda_graph_warmup_request(
-        self,
-        resource_manager: ResourceManager,
-        batch_size: int,
-        draft_len: int,
-        max_seq_len: int = None,
-        force_non_greedy: bool = False,
-    ) -> ScheduledRequests | None:
-        """Creates a dummy ScheduledRequests tailored for CUDA graph capture."""
-        capture_sampling_params = NON_GREEDY_CAPTURE_SAMPLING_PARAMS if force_non_greedy else None
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        if getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None:
-            return None
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
-
-        available_blocks = kv_cache_manager.get_num_free_blocks() // self._config.max_beam_width
-        if available_blocks < batch_size:
-            return None
-
-        result = ScheduledRequests()
-        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(draft_len)
-        runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
-
-        # Add (batch_size - 1) dummy requests with the minimal sequence length.
-        num_fillers = batch_size - 1
-        requests = kv_cache_manager.add_dummy_requests(
-            list(range(num_fillers)),
-            token_nums=(
-                None
-                if self._dummy_request_tokens is None
-                else [self._dummy_request_tokens] * num_fillers
-            ),
-            is_gen=True,
-            max_num_draft_tokens=runtime_draft_token_buffer_width,
-            kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-            use_mrope=self._config.use_mrope,
-            max_beam_width=self._config.max_beam_width,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, num_fillers),
-        )
-        if requests is None:
-            return None
-
-        max_seq_len_request = self._add_longest_dummy_request(
-            resource_manager,
-            requests,
-            batch_size,
-            max_seq_len,
-            runtime_draft_token_buffer_width,
-            capture_sampling_params,
-        )
-        if max_seq_len_request is None:
-            return None
-
-        # Insert the longest request first to simulate padding for the CUDA
-        # graph.
-        requests.insert(0, max_seq_len_request)
-        result.generation_requests = requests
-        return self._finish_cuda_graph_warmup_request(
-            result, resource_manager, batch_size, draft_len
-        )
-
-    def _add_longest_dummy_request(
-        self,
-        resource_manager: ResourceManager,
-        requests: list[LlmRequest],
-        batch_size: int,
-        max_seq_len: int | None,
-        runtime_draft_token_buffer_width: int,
-        capture_sampling_params: SamplingParams | None,
-    ) -> LlmRequest | None:
-        """Add the dummy request with the longest sequence; free ``requests`` if it does not fit."""
-        kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-        draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
-
-        def free_warmup_requests() -> None:
-            for r in requests:
-                kv_cache_manager.free_resources(r)
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.free_resources(r)
-
-        # Add one dummy request with the maximum possible sequence length.
-        max_seq_len = min(
-            self._config.max_seq_len if max_seq_len is None else max_seq_len,
-            kv_cache_manager.max_seq_len,
-        )
-
-        # Use max_draft_loop_tokens for capacity estimation to account
-        # for the actual KV reservation per request.
-        _kv_draft = self._config.max_draft_loop_tokens
-        available_tokens = kv_cache_manager.get_num_available_tokens(
-            token_num_upper_bound=max_seq_len, batch_size=batch_size, max_num_draft_tokens=_kv_draft
-        )
-
-        # Also consider draft KV cache capacity when it exists
-        if draft_kv_cache_manager is not None:
-            draft_available_tokens = draft_kv_cache_manager.get_num_available_tokens(
-                batch_size=batch_size,
-                token_num_upper_bound=max_seq_len,
-                max_num_draft_tokens=_kv_draft,
-            )
-            available_tokens = min(available_tokens, draft_available_tokens)
-
-        token_num = max(
-            self._dummy_request_tokens or 1,
-            min(
-                available_tokens,
-                max_seq_len - 1 - get_num_extra_kv_tokens(self._config.spec_config) - _kv_draft,
-            ),
-        )
-        max_position_embeddings = self._dummy_position_limit()
-        if max_position_embeddings is not None:
-            token_num = min(token_num, max_position_embeddings - _kv_draft)
-
-        token_num = int(token_num)  # Ensure int for range() in add_dummy_requests
-
-        max_seq_len_request = kv_cache_manager.add_dummy_requests(
-            request_ids=[batch_size - 1],
-            token_nums=[token_num],
-            is_gen=True,
-            max_num_draft_tokens=runtime_draft_token_buffer_width,
-            kv_reserve_draft_tokens=self._config.max_draft_loop_tokens,
-            use_mrope=self._config.use_mrope,
-            max_beam_width=self._config.max_beam_width,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-            capture_sampling_params=capture_sampling_params,
-            **self._dummy_request_kwargs(resource_manager, 1),
-        )
-
-        if max_seq_len_request is None:
-            free_warmup_requests()
-            return None
-        return max_seq_len_request[0]
-
-    def _finish_cuda_graph_warmup_request(
-        self,
-        result: ScheduledRequests,
-        resource_manager: ResourceManager,
-        batch_size: int,
-        draft_len: int,
-    ) -> ScheduledRequests | None:
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        if spec_resource_manager is not None:
-            spec_resource_manager.add_dummy_requests(request_ids=list(range(batch_size)))
-        if not self._add_dummy_request_resources(result.all_requests(), resource_manager):
-            return None
-        resolve_draft_len(
-            self._config.spec_config,
-            result,
-            max_draft_len=self._config.max_draft_len,
-            static_draft_len=get_static_draft_len(self._config.spec_config),
-            draft_len=draft_len,
-        )
-        return result
 
     def _dummy_request_kwargs(
         self, resource_manager: ResourceManager, num_requests: int
