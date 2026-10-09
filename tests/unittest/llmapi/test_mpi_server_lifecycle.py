@@ -80,7 +80,7 @@ def test_failed_task_publishes_without_a_final_collective(monkeypatch):
         raise ValueError("injected failure")
 
     with pytest.raises(ValueError, match="injected failure"):
-        mpi.RemoteMpiCommSessionServer.task_wrapper(fail)
+        mpi.RemoteMpiCommSessionServer.task_wrapper((), fail)
     barrier.assert_called_once()
 
 
@@ -236,7 +236,7 @@ def test_next_batch_waits_for_every_previous_future():
 
     queue.on_poll = advance
     server.serve()
-    assert [call.args[2] for call in server.session.submit.call_args_list] == [0, 1]
+    assert [call.args[3] for call in server.session.submit.call_args_list] == [0, 1]
     assert queue.sent == [[1, 1]]
 
 
@@ -265,7 +265,7 @@ def test_stop_drains_preceding_async_batches():
     )
     server = _server(queue, [[_future(0), pending], [_future(1)] * 2, [_future(2)] * 2])
     server.serve()
-    assert [call.args[2] for call in server.session.submit.call_args_list] == [0, 1, 2]
+    assert [call.args[3] for call in server.session.submit.call_args_list] == [0, 1, 2]
     server._shutdown_session.assert_called_once()
     assert queue.closed
 

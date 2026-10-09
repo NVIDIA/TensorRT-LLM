@@ -19,6 +19,7 @@ from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.mpi_session import (_DEFAULT_IDENTITY_TIMEOUT,
                                              MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
+                                             RemoteMpiCommSessionServer,
                                              _identity_barrier_timeout,
                                              split_mpi_env)
 
@@ -207,11 +208,12 @@ def test_remote_mpi_submit_sync_response_after_empty_poll(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("task_type", [
     "submit", "submit_sync", "flashinfer_workspace",
-    "flashinfer_temporary_cleanup"
+    "flashinfer_temporary_cleanup", "task_kwargs", "client_sys_path"
 ])
 def test_remote_mpi_session(
     task_type: Literal["submit", "submit_sync", "flashinfer_workspace",
-                       "flashinfer_temporary_cleanup"],
+                       "flashinfer_temporary_cleanup", "task_kwargs",
+                       "client_sys_path"],
     tmp_path: Path,
 ) -> None:
     """Test RemoteMpiPoolSessionClient and RemoteMpiPoolSessionServer interaction"""
@@ -221,6 +223,8 @@ def test_remote_mpi_session(
     command = ["bash", test_file, task_type]
     print(' '.join(command))
     env = os.environ.copy()
+    if task_type == "client_sys_path":
+        env.pop("PYTHONPATH", None)
     if task_type == "flashinfer_workspace":
         env["HOME"] = str(tmp_path)
         env.pop("FLASHINFER_WORKSPACE_BASE", None)
@@ -269,6 +273,31 @@ def test_remote_mpi_session(
 
     if task_type == "flashinfer_temporary_cleanup":
         assert not list(tmp_path.glob("trtllm-flashinfer-rank-*"))
+
+
+@pytest.mark.cpu_only
+def test_remote_task_wrapper_preserves_paths_and_kwargs(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from tensorrt_llm.llmapi import mpi_session
+
+    existing = str(tmp_path / "existing")
+    additional = str(tmp_path / "additional")
+    monkeypatch.setattr(sys, "path", [existing])
+    monkeypatch.setattr(mpi_session, "mpi_barrier", lambda: None)
+    monkeypatch.setattr(mpi_session, "mpi_rank", lambda: 0)
+    monkeypatch.setattr(mpi_session, "mpi_world_size", lambda: 1)
+
+    result = RemoteMpiCommSessionServer.task_wrapper(
+        (existing, additional, additional, "relative", ""),
+        dict,
+        client_sys_path="task-owned value",
+        task="another task-owned value")
+
+    assert sys.path == [existing, additional]
+    assert result == {
+        "client_sys_path": "task-owned value",
+        "task": "another task-owned value"
+    }
 
 
 def task1():
