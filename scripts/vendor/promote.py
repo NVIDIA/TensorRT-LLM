@@ -437,6 +437,7 @@ def _make_plan(
             }
             assignments, evidence = metadata.resolve(gh, previous, reviewed, entry, Path(directory))
         record["attribution"] = evidence
+        record["attribution_scope"] = {"source": reviewed.source, "include": list(reviewed.include)}
     else:
         assignments = _map_commits(commits, prs, args.map_upstream, gh.upstream_repo) if prs else {}
     upstream_main = _sha(
@@ -455,6 +456,26 @@ def _make_plan(
                 "upstream_head": None,
                 "upstream_merge": None,
                 "unpaired_reason": args.unpaired_reason.strip(),
+                "refresh_policy": "retain",
+            }
+        )
+    outside_scope = [
+        item["sha"]
+        for item in commits
+        if item["sha"] in assignments and assignments[item["sha"]] is None
+    ]
+    if outside_scope:
+        groups.append(
+            {
+                "commits": outside_scope,
+                "upstream_pr": None,
+                "upstream_base": None,
+                "upstream_head": None,
+                "upstream_merge": None,
+                "unpaired_reason": (
+                    "No changes to files selected by the vendor lock source/include. "
+                    "No whole-commit upstream equivalence is claimed."
+                ),
                 "refresh_policy": "retain",
             }
         )
@@ -568,6 +589,11 @@ def _adopt_record(plan: Promotion, message: str) -> None:
     if any(existing.get(key) != plan.record[key] for key in stable_keys):
         raise ValueError("Existing promotion metadata does not describe this source update.")
     _validate_snapshot(existing, plan.record["upstream_repository"])
+    if "attribution_scope" in existing and existing["attribution_scope"] != {
+        "source": plan.reviewed.source,
+        "include": list(plan.reviewed.include),
+    }:
+        raise ValueError("Promotion attribution scope does not match the reviewed vendor lock.")
     if "changes" not in plan.record:
         # A verified operation identity can restore its entire durable snapshot.
         plan.record = existing
@@ -596,6 +622,12 @@ def _adopt_record(plan: Promotion, message: str) -> None:
 def _validate_snapshot(record: dict, upstream_repo: str) -> None:
     _sha(record["upstream_base"])
     _sha(record["upstream_observed_main"])
+    if "attribution_scope" in record:
+        scope = record["attribution_scope"]
+        if not isinstance(scope, dict) or set(scope) != {"source", "include"}:
+            raise ValueError("Invalid promotion attribution scope.")
+        vendor._validate_relative_path(scope["source"], "Attribution source")
+        vendor._validate_include(scope["include"], record["vendor"])
     commits = []
     if not isinstance(record["changes"], list) or not record["changes"]:
         raise ValueError("Promotion metadata must contain source changes.")
@@ -910,9 +942,10 @@ def _pr_body(plan: Promotion, message: str) -> str:
     unpaired = ""
     if any(group["upstream_pr"] is None for group in plan.record["changes"]):
         unpaired = (
-            "No paired upstream PR exists for this source update. Its provenance "
-            "explicitly records it as unpaired, with `refresh_policy: retain`. A future "
-            "refresh must carry it forward until an upstream pairing or equivalence "
+            "Some source commits have no paired upstream PR. Their provenance "
+            "records an explicit reason and `refresh_policy: retain`, including commits "
+            "outside the lock-selected scope when applicable. A future refresh must "
+            "retain these commits until an upstream pairing or equivalence "
             "is explicitly established.\n\n"
         )
     return (

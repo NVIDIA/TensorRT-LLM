@@ -186,6 +186,9 @@ only to verified lock-only promotions, not changes to these tools.
 Git/GitHub promotion commits are authoritative; SQLite is a disposable cache.
 After cache loss, stop the old process and relaunch with the same operator/config.
 Cold discovery backfills merged PRs; `--since` explicitly limits that history.
+For monitoring, use INFO poll summaries/30-second active-operation heartbeats
+and `bot.py status --workdir ...`. Check the last poll outcome and next deadline;
+the process lock and heartbeat alone do not establish successful reconciliation.
 
 ### Triggering CI
 

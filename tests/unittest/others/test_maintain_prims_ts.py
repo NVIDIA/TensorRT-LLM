@@ -494,6 +494,131 @@ def test_bot_attribution_survives_retry_and_squash_merge(world: World) -> None:
     assert completed.record == original.record
 
 
+def test_scoped_attribution_preserves_excluded_tail_during_promotion_and_recovery(
+    world: World,
+) -> None:
+    upstream = world.get(f"repos/{_UPSTREAM}/pulls/4829")
+    paired_head = world.reviewed
+    _write(world.source, "tests/test_kernel.py", "# downstream tests only\n")
+    world.reviewed = _commit(world.source, "excluded test changes")
+    assert (
+        m.vendor.main(
+            [
+                "--lock",
+                str(world.consumer / m._LOCK),
+                "pin",
+                _VENDOR,
+                "--commit",
+                world.reviewed,
+                "--repo",
+                str(world.source),
+            ]
+        )
+        == 0
+    )
+    _git(world.consumer, "add", "-A")
+    _git(world.consumer, "commit", "-q", "--amend", "-s", "-m", "include tests-only source commit")
+    world.merged = _git(world.consumer, "rev-parse", "HEAD")
+    world.main = world.merged
+    world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = upstream
+    args = world.args(publish=True, auto_merge=True)
+    plan = m._make_plan(args, world, auto_match=True)
+    assert plan.record["attribution_scope"] == {"source": "prims_ts", "include": ["**/*.py"]}
+    assert plan.record["attribution"][world.reviewed] == {
+        "method": "outside-vendor-scope",
+        "refresh_policy": "retain",
+    }
+    unpaired, paired = plan.record["changes"]
+    assert unpaired["commits"] == [world.reviewed]
+    assert unpaired["upstream_pr"] is None
+    assert unpaired["refresh_policy"] == "retain"
+    assert paired["commits"] == [world.first, paired_head]
+    assert paired["upstream_pr"] == f"https://github.com/{_UPSTREAM}/pull/4829"
+    m._validate_snapshot(plan.record, _UPSTREAM)
+    m._publish(args, world, plan)
+    saved = world.prs[99]["auto_merge"]
+    assert m._record_from_message(saved["commit_message"]) == plan.record
+    assert "outside the lock-selected scope" in world.prs[99]["body"]
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    assert not (args.worktree / "vendored/prims_ts/test_kernel.py").exists()
+    # Recovery must use the durable, lock-bound scope, not mutable PR metadata.
+    upstream["head"]["sha"] = "b" * 40
+    recovered = m._plan_identity(args, world)
+    assert m._recover_plan(args, world, recovered)
+    assert recovered.record == plan.record
+    m._publish(args, world, recovered)
+    assert len(world.prs) == 1
+
+
+def test_similarity_provenance_survives_publication_and_recovery(world: World) -> None:
+    original_head = world.reviewed
+    additions = [f"VALUE_{index} = {index}\n" for index in range(16)]
+    _write(world.source, "prims_ts/kernel.py", "VALUE = 3\n" + "".join(additions))
+    world.reviewed = _commit(world.source, "downstream source update")
+    _git(world.source, "checkout", "-q", "-b", "upstream-adapted", original_head)
+    _write(
+        world.source, "prims_ts/kernel.py", "VALUE = 3\n" + "".join(additions[:-1]) + "adapted\n"
+    )
+    upstream_head = _commit(world.source, "upstream equivalent with adaptation")
+    _git(world.source, "checkout", "-q", "main")
+    upstream = world.get(f"repos/{_UPSTREAM}/pulls/4829")
+    upstream["head"]["sha"] = upstream_head
+    world.overrides[f"repos/{_UPSTREAM}/pulls/4829"] = upstream
+    _write(world.consumer, "vendored/prims_ts/kernel.py", "VALUE = 3\n" + "".join(additions))
+    assert (
+        m.vendor.main(
+            [
+                "--lock",
+                str(world.consumer / m._LOCK),
+                "pin",
+                _VENDOR,
+                "--commit",
+                world.reviewed,
+                "--repo",
+                str(world.source),
+            ]
+        )
+        == 0
+    )
+    _git(world.consumer, "add", "-A")
+    _git(world.consumer, "commit", "-q", "--amend", "-s", "-m", "merged source update")
+    world.merged = _git(world.consumer, "rev-parse", "HEAD")
+    world.main = world.merged
+    args = world.args(publish=True, auto_merge=True)
+    plan = m._make_plan(args, world, auto_match=True)
+    evidence = plan.record["attribution"][world.reviewed]
+    assert evidence["method"] == "similar-edits"
+    assert evidence["similarity"] == 0.95
+    assert evidence["similarity_threshold"] == 0.9
+    assert evidence["refresh_policy"] == "retain-until-verified"
+    assert evidence["comparison"]["upstream_head"] == upstream_head
+    m._publish(args, world, plan)
+    saved = world.prs[99]["auto_merge"]
+    assert m._record_from_message(saved["commit_message"]) == plan.record
+    upstream["head"]["sha"] = "b" * 40
+    recovered = m._plan_identity(args, world)
+    assert m._recover_plan(args, world, recovered)
+    assert recovered.record == plan.record
+    m._publish(args, world, recovered)
+    assert len(world.prs) == 1
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"source": "different", "include": ["**/*.py"]},
+        {"source": "prims_ts", "include": ["*.py"]},
+        {"source": "prims_ts"},
+    ],
+)
+def test_recovery_rejects_mismatched_attribution_scope(world: World, scope: dict) -> None:
+    args = world.args()
+    record = m._make_plan(args, world).record
+    record["attribution_scope"] = scope
+    with pytest.raises(ValueError, match="attribution scope"):
+        m._adopt_record(m._plan_identity(args, world), m._record_text(record))
+
+
 def test_non_main_consumer_and_upstream_branches(world: World) -> None:
     world.base_branch = "release/next"
     world.upstream_branch = "develop"
@@ -852,7 +977,7 @@ def test_unpaired_promotion_publishes_and_resumes(world: World) -> None:
     m._publish(args, world, plan)
     m._publish(args, world, m._make_plan(args, world))
     assert len(world.prs) == 1
-    assert "No paired upstream PR" in world.prs[99]["body"]
+    assert "Some source commits have no paired upstream PR" in world.prs[99]["body"]
     assert not any(f"repos/{_UPSTREAM}/pulls/" in call[1] for call in world.calls)
     changed = copy.deepcopy(plan.record)
     changed["changes"][0]["refresh_policy"] = "drop"
