@@ -26,8 +26,6 @@ get_filename_component(TRTLLM_REPO_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
                        ABSOLUTE)
 set(TRTLLM_FMHA_PARAMS_GENERATOR
     "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
-# The schema classes live in the modules that own them; the generator parses all
-# of them and resolves a nested member by the class its annotation names.
 set(TRTLLM_FMHA_PARAMS_SCHEMAS
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/interface.py"
     "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
@@ -39,11 +37,8 @@ foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})
 endforeach()
 set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
-# Generate at configure time rather than as a build step: a configure-only tree,
-# which is how the clangd compile database is produced, still needs these
-# headers for attentionOp.h to parse. CONFIGURE_DEPENDS re-runs CMake when a
-# schema or the generator changes, so editing a schema and building is enough to
-# refresh them.
+# Generate during configuration so clangd can resolve the headers before a
+# build.
 set_property(
   DIRECTORY
   APPEND

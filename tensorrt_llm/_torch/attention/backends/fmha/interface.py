@@ -118,12 +118,7 @@ class StaticAttentionConfig:
         *,
         skip_correction_threshold: float = 0.0,
     ) -> StaticAttentionConfig:
-        """Capture the fixed runner-selection inputs from one attention call.
-
-        Sourced from the layer and the batch metadata rather than from the phase
-        carrier: everything here is fixed for the layer, so reading it off `attn` and
-        `meta` keeps the phase carrier free of a second copy.
-        """
+        """Capture the runner configuration from the layer and per-call parameters."""
         from tensorrt_llm._utils import torch_dtype_to_binding
         from tensorrt_llm.quantization.mode import QuantMode
 
@@ -207,11 +202,7 @@ class StaticAttentionConfig:
 
     @classmethod
     def from_legacy_arguments(cls, arguments: Mapping[str, Any]) -> StaticAttentionConfig:
-        """Build the config for the flat compatibility entry point.
-
-        That entry point has no layer object to read from, so the values come from its
-        own arguments; `from_params` covers every other caller.
-        """
+        """Build the config for the flat compatibility entry point."""
         from tensorrt_llm._utils import torch_dtype_to_binding
         from tensorrt_llm.quantization.mode import QuantMode
 
@@ -288,9 +279,6 @@ class FmhaParams:
     """
 
     fwd: AttentionForwardArgs = None
-    # Objects whose types have no native schema are Python-only.
-    # FMHA backends that need layer/metadata state the flat schema does not carry
-    # (e.g. the Triton custom-mask backend) read them from here.
     local_layer_idx: int = -1
     has_fp8_kv_cache: bool = False
     kv_pool: Optional[torch.Tensor] = None
@@ -319,8 +307,6 @@ class FmhaParams:
     # Total sequence rows (max_num_requests * beam_width). The generation workspace and
     # the multi-block counter are sized per sequence, not per request.
     max_num_sequences: int = 0
-    # Total number of sequences, i.e. max_num_requests * beam_width. The generation
-    # workspace and the multi-block counter are sized per sequence, not per request.
     beam_width: int = 1
     use_spec_decoding: bool = False
     is_spec_dec_tree: bool = True
@@ -375,15 +361,6 @@ class FmhaParams:
 
     is_cross: bool = False
 
-    # Fused kv_a_layernorm for the DSv4 sparse context path: when set, `latent_cache`
-    # is the raw kv_a_proj output and the context RoPE kernel norms it in place.
-
-    # Mechanical state consumed by handwritten C++ lowering hooks. Defaults
-    # remain Python-owned; the generated C++ holder is only value-initialized.
-    # NOTE: the KV-cache pool base pointers are deliberately absent. They are derived from
-    # host_kv_cache_pool_pointers plus a per-layer intra-pool byte offset, which depends on
-    # the resolved KV-cache element size, so they live in handwritten C++ lowering
-    # (FmhaParams::kv_cache_pool_pointers) rather than in this schema.
     multi_ctas_kv_counter: Optional[torch.Tensor] = None
 
     @classmethod

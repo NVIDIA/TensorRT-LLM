@@ -58,37 +58,32 @@ struct KvCachePoolPointers
 
 #define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type) cpp_type name{};
 
-/// An attention layer's fixed shape, handed to the op once at construction.
-/// Generated from StaticAttentionConfig.
+/// Attention configuration fixed at op construction.
 struct StaticAttentionConfig
 {
 #include "tensorrt_llm/thop/static_attention_config_fields.inc"
 };
 
-/// Sparse inputs an attention module hands to its backend. Generated from
-/// SparseBackendForwardArgs; see FmhaParams for how a schema class is written.
+/// Sparse inputs from the attention module to its backend.
 struct SparseBackendForwardArgs
 {
 #include "tensorrt_llm/thop/sparse_backend_forward_args_accessors.inc"
 #include "tensorrt_llm/thop/sparse_backend_forward_args_fields.inc"
 };
 
-/// Sparse inputs a backend hands to the attention op. Generated from
-/// SparseRuntimeParams.
+/// Sparse inputs from the backend to the attention op.
 struct SparseRuntimeParams
 {
 #include "tensorrt_llm/thop/sparse_runtime_params_accessors.inc"
 #include "tensorrt_llm/thop/sparse_runtime_params_fields.inc"
 };
 
-/// The arguments that vary per forward pass. Generated from AttentionForwardArgs and
-/// held by value in FmhaParams, so the native layout mirrors the Python one.
+/// Arguments that vary per forward pass.
 struct AttentionForwardArgs
 {
 #include "tensorrt_llm/thop/attention_forward_args_accessors.inc"
 #include "tensorrt_llm/thop/attention_forward_args_fields.inc"
 
-    // The attention entry point's dtype dispatch supplies T.
     template <typename T>
     T* getLatentCache() const
     {
@@ -114,8 +109,6 @@ struct AttentionForwardArgs
                                                    : nullptr;
     }
 
-    // Handwritten for the same reason as in FmhaParams: the native view of these
-    // buffers is not their dtype.
     void* getOutputSf() const
     {
         return output_sf.has_value() ? output_sf.value().data_ptr() : nullptr;
@@ -139,34 +132,20 @@ struct AttentionForwardArgs
     }
 };
 
-/// The unify attention parameter struct: every phased entry point and every enqueue path
-/// consumes it directly. Data members are generated from the Python schema
-/// (fmha/interface.py, via scripts/generate_fmha_params.py), which also states the offset
-/// contract in full. In short: device tensors arrive pre-sliced for the phase, while host
-/// tensors, KV-cache block offsets and FP4 scaling factors arrive whole-batch: a pointer
-/// accessor applies `seq_offset` / `token_offset` itself, so call sites never pass one.
-/// Fixed-dtype pointer accessors are generated. Runtime-dispatched types and semantic
-/// views stay handwritten so dtype dispatch, validation and offsets remain explicit.
-///
-/// A C++-only field, for state the op derives rather than receives, is declared below the
-/// generated block and filled during initialization; it stays invisible to Python. A field
-/// visible to both is declared in the Python schema instead, and the build regenerates the
-/// member and its binding.
 class AttentionOp;
 
+/// Parameters for phased attention, generated from fmha/interface.py.
+/// Device tensors are phase-local; host tensors, KV-cache block offsets and FP4
+/// scales remain whole-batch. Their accessors apply seq_offset / token_offset.
 struct FmhaParams
 {
 #include "tensorrt_llm/thop/fmha_params_fields.inc"
 #undef TRTLLM_FMHA_PARAM_FIELD
 
-    // ---- handwritten derived state (deliberately outside the generated schema) ----
-    // Both are filled by AttentionOp::prepare(): they are projections of the fields
-    // above plus the cache-layout arithmetic the op alone can do.
+    // Derived by AttentionOp::prepare().
     kernels::SparseAttentionParams sparse_params{};
     KvCachePoolPointers kv_cache_pool_pointers{};
 
-    /// Read straight off the inputs rather than mirrored into a field: a mirror can
-    /// disagree with the tensor it describes, and these are all cheap scalar queries.
     tensorrt_llm::DataType getType() const
     {
         return tensorrt_llm::runtime::TorchUtils::dataType(qkv_or_q.scalar_type());
@@ -194,8 +173,6 @@ struct FmhaParams
             && fwd.sparse_runtime_params.sparse_attn_offsets.value().numel() > 0;
     }
 
-    // Accessors for the members above. These mirror what the generator emitted while the
-    // fields were part of the schema; nothing assigns them, so they resolve to nullptr.
     template <typename T>
     T* getQkvBias() const
     {
@@ -282,9 +259,7 @@ struct FmhaParams
     std::int64_t vision_length = -1;
     std::int64_t vision_start = -1;
 
-    /// Build the MlaParams the MLA kernels take. Returned by value: the kernels hold a
-    /// pointer to it for the duration of the launch, so the caller owns the storage.
-    /// Defined out of line because they reach for AttentionOp, which is declared below.
+    /// Build MLA parameters; the caller retains them for the kernel launch.
     template <typename T>
     kernels::MlaParams<T> buildContextMlaParams(AttentionOp const& op) const;
 
@@ -295,19 +270,13 @@ struct FmhaParams
     template <typename T>
     void addFlashMlaGenerationParams(kernels::MlaParams<T>& mla) const;
 
-    /// The tail both builders share.
+    /// Fill shared MLA fields using the op's layer configuration.
     template <typename T>
-    /// Takes the op because the MLA dimensions, the head count and the position-embedding
-    /// type are layer configuration, which FmhaParams deliberately does not carry.
     void finalizeMlaParams(kernels::MlaParams<T>& mla, AttentionOp const& op) const;
 
-    // ---- generated accessors: fixed-dtype tensor views ----
 #include "tensorrt_llm/thop/fmha_params_accessors.inc"
-
-    // ---- generated forwarding: reaches through `fwd` so call sites stay flat ----
 #include "tensorrt_llm/thop/fmha_params_forwarding.inc"
 
-    // The attention entry point's dtype dispatch supplies T.
     template <typename T>
     T* getQkvOrQ() const
     {
@@ -350,9 +319,6 @@ struct FmhaParams
         return fwd.getRelativeAttentionBias<T>();
     }
 
-    // ---- hand-written accessors: the native view differs from the tensor's dtype ----
-    // These read the buffer as something the schema cannot name: an opaque pointer, or
-    // a float32 buffer consumed as pairs.
     void* getWorkspace() const
     {
         return workspace.data_ptr();

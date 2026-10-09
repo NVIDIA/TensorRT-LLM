@@ -15,17 +15,9 @@
 # limitations under the License.
 """Generate native FmhaParams declarations from the Python schema.
 
-The schema is parsed, never imported: it lives inside the tensorrt_llm package,
-whose import pulls in the very bindings this generator runs before. Parsing also
-means a field's annotation is read exactly as written, which is where optionality
-and the non-dtype types come from.
-
-Each field's C++ type comes from its annotation, and ``dtype`` supplies the
-element type the annotation cannot carry -- a tensor's dtype, or a set's.
-Supported named types, scalars, and tensors, including Optional forms, need no
-cpp_metadata: ordinary defaults and default_factory are independent of codegen. Unmarked
-tensors have no generated getter. Native schema classes are registered explicitly;
-their inclusion does not depend on any field carrying cpp_metadata.
+Parse the schema without importing tensorrt_llm, whose bindings do not exist yet.
+Annotations determine C++ types; cpp_metadata supplies tensor and set element
+dtypes for generated accessors. Unmarked tensors have no generated getter.
 """
 
 from __future__ import annotations
@@ -50,8 +42,6 @@ NATIVE_STRUCT_NAMES = (
     "SparseRuntimeParams",
 )
 
-# The schema classes are spread over the modules that own them, so every source
-# is parsed and a nested member is resolved by the class its annotation names.
 DEFAULT_MODULE_PATHS = (
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "fmha" / "interface.py",
     REPO_ROOT / "tensorrt_llm" / "_torch" / "attention" / "backends" / "interface.py",
