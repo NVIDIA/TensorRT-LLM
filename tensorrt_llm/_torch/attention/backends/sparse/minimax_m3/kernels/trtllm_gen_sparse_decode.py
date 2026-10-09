@@ -24,7 +24,7 @@ from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._utils import get_sm_version
 
 from .msa_utils import check_decode_span_shape
-from .trtllm_gen_dense_decode import _counter_size, _workspace
+from .trtllm_gen_dense_decode import _counter_buffer, _workspace
 
 _M3_PAGE_SIZE = 128
 _TRTLLM_GEN_PAGE_SIZE = 32
@@ -38,41 +38,6 @@ class _MiniMaxM3SparseKVCacheManager(Protocol):
     def get_kv_scale_subpage_pool(
         self, layer_idx: int, kv_layout: str
     ) -> tuple[torch.Tensor, int]: ...
-
-
-def _persistent_counter_buffer(
-    owner: object,
-    device: torch.device,
-    num_heads: int,
-    max_num_requests: int,
-) -> torch.Tensor:
-    """Return an initially zeroed, owner-local TRTLLM-Gen counter buffer.
-
-    TRTLLM-Gen returns every counter byte to zero before the attention kernel
-    completes. Keep the buffer address stable across calls and CUDA-graph
-    replays, matching the lifecycle of the generic TRTLLM-Gen backend. A first
-    allocation during graph capture is rejected so warmup remains responsible
-    for materializing graph-owned state.
-    """
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (device.type, device_index, num_heads, max_num_requests)
-    cache = getattr(owner, "_msa_trtllm_gen_sparse_counter_buffers", None)
-    if cache is None:
-        cache = {}
-        owner._msa_trtllm_gen_sparse_counter_buffers = cache
-    counters = cache.get(key)
-    if counters is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "TRTLLM-Gen sparse counters must be allocated before CUDA graph capture"
-            )
-        counters = torch.zeros(
-            _counter_size(num_heads, max_num_requests, device_index),
-            dtype=torch.uint8,
-            device=device,
-        )
-        cache[key] = counters
-    return counters
 
 
 @triton.autotune(
@@ -334,6 +299,7 @@ def minimax_m3_trtllm_gen_sparse_decode(
     sm_scale: float,
     output: torch.Tensor,
     decode_query_len: int,
+    max_num_requests: int,
     k_global_scale: torch.Tensor,
     v_global_scale: torch.Tensor,
     enable_pdl: bool = True,
@@ -391,7 +357,9 @@ def minimax_m3_trtllm_gen_sparse_decode(
     gqa_group = num_heads // num_kv_heads
     q_pseudo = q.to(torch.float8_e4m3fn).reshape(total_q, num_kv_heads, gqa_group, head_dim)
     q_pseudo = q_pseudo.flatten(0, 1)
-    pseudo_batch = int(q_pseudo.shape[0])
+    max_pseudo_requests = max_num_requests * decode_query_len * num_kv_heads
+    if int(q_pseudo.shape[0]) > max_pseudo_requests:
+        raise ValueError("Sparse decode batch exceeds max_num_requests")
     reserve = torch.cuda.is_current_stream_capturing()
     native_output = _get_native_output(output, reserve)
     native_output_pseudo = native_output.reshape(
@@ -441,8 +409,8 @@ def minimax_m3_trtllm_gen_sparse_decode(
         q_len_per_req=1,
         kv_cache_sf=(kv_scale_pool, kv_scale_pool),
         uses_shared_paged_kv_idx=False,
-        multi_ctas_kv_counter_buffer=_persistent_counter_buffer(
-            owner, q.device, gqa_group, pseudo_batch
+        multi_ctas_kv_counter_buffer=_counter_buffer(
+            q.device, gqa_group, max_pseudo_requests, reserve
         ),
     )
     if native_output.data_ptr() != output.data_ptr():

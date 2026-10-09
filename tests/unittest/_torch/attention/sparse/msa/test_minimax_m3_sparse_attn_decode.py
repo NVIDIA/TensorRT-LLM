@@ -14,10 +14,12 @@ import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.msa_decode import MsaDecodeFmha
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import run_msa_nvfp4_sparse_gqa
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
@@ -36,8 +38,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
     resolve_num_topk_chunks,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
+    _counter_buffer,
     _get_bmm_scales,
-    _persistent_counter_buffer,
     build_sparse_p32_table,
     minimax_m3_trtllm_gen_sparse_decode,
 )
@@ -1471,6 +1473,7 @@ def test_trtllm_gen_sparse_nvfp4_decode_matches_selected_page_reference():
         sm_scale=HEAD_DIM**-0.5,
         output=output,
         decode_query_len=case.decode_query_len,
+        max_num_requests=len(case.seq_lens),
         k_global_scale=case.scales["k_global_scale"],
         v_global_scale=case.scales["v_global_scale"],
     )
@@ -1486,12 +1489,11 @@ def test_trtllm_gen_sparse_nvfp4_decode_matches_selected_page_reference():
         sm_scale=HEAD_DIM**-0.5,
         output=output,
         decode_query_len=case.decode_query_len,
+        max_num_requests=len(case.seq_lens),
         k_global_scale=case.scales["k_global_scale"],
         v_global_scale=case.scales["v_global_scale"],
     )
     assert torch.equal(first, output)
-    counter = next(iter(owner._msa_trtllm_gen_sparse_counter_buffers.values()))
-    assert int(torch.count_nonzero(counter)) == 0
     expected = _reference_sparse_decode(
         case.q.to(torch.bfloat16),
         case.k_ref,
@@ -1517,34 +1519,12 @@ def test_trtllm_gen_sparse_bmm_scales_preserve_logical_output_scale():
     torch.testing.assert_close(bmm2[0], torch.tensor(0.5, device="cuda"))
 
 
-def test_trtllm_gen_sparse_counter_is_owner_local_and_not_recleared():
-    first_owner = SimpleNamespace()
-    second_owner = SimpleNamespace()
-
-    first = _persistent_counter_buffer(
-        first_owner,
-        torch.device("cuda"),
-        16,
-        256,
-    )
+def test_trtllm_gen_sparse_counter_is_shared_and_recleared() -> None:
+    first = _counter_buffer(torch.device("cuda"), 16, 256, False)
     first.fill_(7)
-    reused = _persistent_counter_buffer(
-        first_owner,
-        torch.device("cuda"),
-        16,
-        256,
-    )
-    separate = _persistent_counter_buffer(
-        second_owner,
-        torch.device("cuda"),
-        16,
-        256,
-    )
-
+    reused = _counter_buffer(torch.device("cuda"), 16, 256, False)
     assert reused.data_ptr() == first.data_ptr()
-    assert torch.equal(reused, torch.full_like(reused, 7))
-    assert separate.data_ptr() != first.data_ptr()
-    assert int(torch.count_nonzero(separate)) == 0
+    assert int(torch.count_nonzero(reused)) == 0
 
 
 @skip_not_sm100
@@ -1567,6 +1547,7 @@ def test_trtllm_gen_sparse_nvfp4_decode_writes_logical_e4m3_for_mxfp8_o_proj():
         sm_scale=HEAD_DIM**-0.5,
         output=output,
         decode_query_len=case.decode_query_len,
+        max_num_requests=len(case.seq_lens),
         k_global_scale=case.scales["k_global_scale"],
         v_global_scale=case.scales["v_global_scale"],
     )
@@ -1581,3 +1562,61 @@ def test_trtllm_gen_sparse_nvfp4_decode_writes_logical_e4m3_for_mxfp8_o_proj():
         decode_query_len=case.decode_query_len,
     )
     torch.testing.assert_close(output.float(), expected, rtol=0.3, atol=0.35)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_sparse_decode_preserves_bf16_dispatch(monkeypatch, dtype: torch.dtype) -> None:
+    monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", raising=False)
+    native = Mock()
+    triton_decode = Mock()
+    prefix = "tensorrt_llm._torch.attention.backends"
+    monkeypatch.setattr(
+        prefix
+        + ".sparse.minimax_m3.kernels.trtllm_gen_sparse_decode.minimax_m3_trtllm_gen_sparse_decode",
+        native,
+    )
+    monkeypatch.setattr(
+        prefix + ".sparse.minimax_m3.kernels.triton_sparse_decode.minimax_m3_sparse_attn_decode",
+        triton_decode,
+    )
+    monkeypatch.setattr(
+        prefix + ".sparse.minimax_m3.kernels.msa_utils.msa_paged_kv", lambda *_: (None, None)
+    )
+    monkeypatch.setattr(
+        prefix + ".fmha.msa_prefill._aligned_nvfp4_dequant_scales",
+        lambda *_: (torch.ones(1), torch.ones(1)),
+    )
+    manager = Mock(spec_set=["is_nvfp4_layer", "get_block_scale_buffers"])
+    manager.is_nvfp4_layer.return_value = True
+    manager.get_block_scale_buffers.return_value = torch.ones(1, 2)
+    attn = Mock(spec_set=["head_dim", "num_heads", "layer_idx", "q_scaling"])
+    attn.head_dim, attn.num_heads, attn.layer_idx, attn.q_scaling = 128, 16, 0, 1.0
+    meta = Mock(spec_set=["kv_cache_manager", "max_num_requests"])
+    meta.kv_cache_manager, meta.max_num_requests = manager, 32
+    fwd = Mock(spec_set=["kv_scale_quant_orig"])
+    fwd.kv_scale_quant_orig = torch.ones(3)
+    params = Mock(
+        spec_set=[
+            "attn",
+            "meta",
+            "fwd",
+            "num_tokens",
+            "token_offset",
+            "input_seq_length",
+            "query_input",
+            "output",
+        ]
+    )
+    params.attn, params.meta, params.fwd = attn, meta, fwd
+    params.num_tokens, params.token_offset, params.input_seq_length = 2, 0, 1
+    params.query_input = torch.empty(2, 16, 128)
+    params.output = torch.empty(2, 16, 128, dtype=dtype)
+    MsaDecodeFmha._run_sparse(None, params, torch.zeros(2, 1, 4), torch.zeros(2, 1), torch.ones(2))
+    if dtype == torch.bfloat16:
+        native.assert_not_called()
+        triton_decode.assert_called_once()
+    else:
+        triton_decode.assert_not_called()
+        native.assert_called_once()
+        assert native.call_args.kwargs["max_num_requests"] == 32

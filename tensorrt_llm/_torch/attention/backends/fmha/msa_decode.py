@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 
 def use_trtllm_gen_sparse_decode() -> bool:
-    """Select the default Blackwell NVFP4 sparse decode path.
+    """Enable Blackwell NVFP4 sparse decode for native E4M3 output.
 
     Set TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE=triton to disable it.
     """
@@ -203,7 +203,7 @@ class MsaDecodeFmha(PhasedFmha):
             if params.fwd.kv_scale_quant_orig is None:
                 raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
             k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
-            if use_trtllm_gen_sparse_decode():
+            if use_trtllm_gen_sparse_decode() and params.output.dtype == torch.float8_e4m3fn:
                 from ..sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
                     minimax_m3_trtllm_gen_sparse_decode,
                 )
@@ -219,6 +219,7 @@ class MsaDecodeFmha(PhasedFmha):
                     sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
                     output=params.output.view(num_tokens, attn.num_heads, head_dim),
                     decode_query_len=params.input_seq_length,
+                    max_num_requests=int(params.meta.max_num_requests),
                     k_global_scale=k_scale,
                     v_global_scale=v_scale,
                 )

@@ -3521,19 +3521,21 @@ class MXFP8LinearMethod(LinearMethodBase):
     @classmethod
     def _unit_activation_scales(cls, module: Linear,
                                 input: torch.Tensor) -> torch.Tensor:
-        """Return cached swizzled UE8M0 scales representing exactly 1.0."""
+        """Slice one high-water UE8M0 buffer representing exactly 1.0.
+
+        Warm up the largest row count before capturing smaller decode graphs.
+        """
         m, k = input.shape
         if k % cls.BLOCK_SIZE:
             raise ValueError(
                 f"E4M3 input width {k} must be divisible by MXFP8 block size "
                 f"{cls.BLOCK_SIZE}")
-        key = (m, k, input.device.type, input.device.index)
-        cache = getattr(module, "_mxfp8_unit_activation_scales", None)
-        if cache is None:
-            cache = {}
-            module._mxfp8_unit_activation_scales = cache
-        scale = cache.get(key)
-        if scale is None:
+        required_size = cls._swizzled_scale_size(m, k)
+        scale = getattr(module, "_mxfp8_unit_activation_scales", None)
+        if scale is not None and scale.device != input.device:
+            raise ValueError(
+                "MXFP8 unit activation scales cannot change device")
+        if scale is None or scale.numel() < required_size:
             # Dynamo cannot trace is_current_stream_capturing(), which returns
             # a Python bool.  During tracing the scale creation itself becomes
             # part of the graph; outside tracing, retain the eager CUDA-graph
@@ -3547,13 +3549,13 @@ class MXFP8LinearMethod(LinearMethodBase):
             # Every entry is identical, making the linear and 128x4-swizzled
             # layouts byte-for-byte equivalent.
             scale = torch.full(
-                [cls._swizzled_scale_size(m, k)],
+                [required_size],
                 127,
                 dtype=torch.uint8,
                 device=input.device,
             )
-            cache[key] = scale
-        return scale
+            module._mxfp8_unit_activation_scales = scale
+        return scale[:required_size]
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):

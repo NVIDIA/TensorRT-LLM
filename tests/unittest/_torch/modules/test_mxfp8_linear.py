@@ -860,7 +860,7 @@ def test_mxfp8_linear_native_e4m3_unit_scales_matches_reference():
     rel = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6)
     assert rel < 0.05, f"native E4M3 MXFP8 vs reference rel err {rel}"
 
-    unit_scales = next(iter(lin._mxfp8_unit_activation_scales.values()))
+    unit_scales = lin._mxfp8_unit_activation_scales
     assert unit_scales.numel() == 128 * 16
     assert torch.all(unit_scales == 127)
 
@@ -887,4 +887,23 @@ def test_mxfp8_linear_native_e4m3_fullgraph_compile():
     eager = lin(x_e4m3)
 
     torch.testing.assert_close(got, eager, rtol=0, atol=0)
-    assert len(lin._mxfp8_unit_activation_scales) == 1
+    assert lin._mxfp8_unit_activation_scales.numel() == 128 * 16
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_unit_scales_reuse_largest_buffer() -> None:
+    module = Mock(spec_set=["_mxfp8_unit_activation_scales"])
+    module._mxfp8_unit_activation_scales = None
+    largest = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(257, 512))
+    address = largest.data_ptr()
+    capacity = module._mxfp8_unit_activation_scales.numel()
+    for rows in (1, 16, 127, 128, 129, 256, 257):
+        scales = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(rows, 512))
+        assert scales.data_ptr() == address
+        assert scales.numel() == MXFP8LinearMethod._swizzled_scale_size(rows, 512)
+        assert torch.all(scales == 127)
+        assert module._mxfp8_unit_activation_scales.numel() == capacity
+    larger = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(513, 512))
+    assert module._mxfp8_unit_activation_scales.numel() == larger.numel()
+    smaller = MXFP8LinearMethod._unit_activation_scales(module, torch.empty(1, 512))
+    assert smaller.data_ptr() == larger.data_ptr()
