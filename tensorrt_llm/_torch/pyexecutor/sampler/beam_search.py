@@ -1609,6 +1609,9 @@ class BeamSearchHandler:
             )
             if cba_group is None:
                 return None
+            # The copies above are non-blocking into pinned memory and nothing
+            # else awaits them before the builder reads the host tensors.
+            torch.cuda.current_stream().synchronize()
             inner = _prepare_beam_history_cba(request, cba_group=cba_group)
             return inner() if inner is not None else None
 

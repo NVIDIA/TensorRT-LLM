@@ -613,6 +613,12 @@ class _SideStreamCopier:
         self._side_stream.wait_stream(torch.cuda.current_stream())
         with self._side_stream_ctx:
             for dst, src in self._tasks:
+                # The sources are typically temporaries of the main stream
+                # (advanced-indexing gathers) that the caller drops right
+                # after staging. Without this, the caching allocator may hand
+                # their memory to the next main-stream allocation before the
+                # side-stream copy has read it.
+                src.record_stream(self._side_stream)
                 dst.copy_(src, non_blocking=True)
         self._tasks.clear()
         event = torch.cuda.Event()

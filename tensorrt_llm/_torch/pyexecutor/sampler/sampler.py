@@ -1591,8 +1591,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # server the prompt tail instead of that beam's token. Append
                 # this step's tokens instead and let the generation side own
                 # finalization.
+                # The builder only produces a history when every beam has
+                # finished, which is exactly the all-beams-finished prefix test
+                # below; checking it here first keeps the builder (and, in
+                # speculative-D2H mode, its blocking fallback snapshot) off
+                # every step that does not end the request.
+                assert req.py_seq_slot is not None
+                request_finishing = bool(finished_beam_prefix_lengths) and (
+                    finished_beam_prefix_lengths[req.py_seq_slot] >= req.py_beam_width
+                )
                 if (
                     not req.is_context_only_request
+                    and request_finishing
                     and (beam_history := _maybe_build_beam_history(req_idx)) is not None
                 ):
                     finalize_beam(req, beam_history)
