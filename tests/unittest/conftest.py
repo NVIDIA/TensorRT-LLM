@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # # Force resource release after test
+import importlib.metadata
 import os
 import signal
 import sys
@@ -32,6 +33,7 @@ import pytest
 import torch
 import tqdm
 from mpi4py.futures import MPIPoolExecutor
+from packaging.version import Version
 from utils.cpp_paths import llm_root  # noqa: F401
 from utils.util import get_current_process_gpu_memory
 
@@ -111,6 +113,37 @@ def pytest_configure(config):
 # cached traceback pins the failed test's frame locals (e.g. multi-GiB CUDA
 # tensors) for the rest of the session, beyond the reach of gc.collect().
 _RERUNFAILURES_EXCINFOS_ATTR = "_rerun_condition_excinfos"
+_RERUNFAILURES_FIRST_CACHING_VERSION = Version("16.7")
+_RERUNFAILURES_CACHE_CHECKED = pytest.StashKey[bool]()
+
+
+def _warn_rerunfailures_cache_moved(config: pytest.Config) -> None:
+    if not config.pluginmanager.has_plugin("rerunfailures"):
+        return
+    version = Version(importlib.metadata.version("pytest-rerunfailures"))
+    if version < _RERUNFAILURES_FIRST_CACHING_VERSION:
+        return
+    warnings.warn(
+        f"pytest-rerunfailures {version} no longer keeps failed-phase "
+        f"ExceptionInfo in item.{_RERUNFAILURES_EXCINFOS_ATTR}, so "
+        "tests/unittest/conftest.py may no longer release failed tests' frame "
+        "locals (including CUDA tensors). Point _RERUNFAILURES_EXCINFOS_ATTR at "
+        "where this version caches them, or drop the cleanup if the plugin now "
+        "releases them itself.")
+
+
+# The attribute is private to the plugin, so a rename would silently disable the
+# cleanup in pytest_runtest_protocol; warn once when a failed item lacks it.
+# tryfirst makes this the outermost makereport wrapper, so the code after its
+# yield runs after the plugin has recorded the ExceptionInfo of the phase.
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if (report.failed and not hasattr(item, _RERUNFAILURES_EXCINFOS_ATTR)
+            and not item.config.stash.get(_RERUNFAILURES_CACHE_CHECKED, False)):
+        item.config.stash[_RERUNFAILURES_CACHE_CHECKED] = True
+        _warn_rerunfailures_cache_moved(item.config)
+    return report
 
 
 @pytest.hookimpl(wrapper=True)
