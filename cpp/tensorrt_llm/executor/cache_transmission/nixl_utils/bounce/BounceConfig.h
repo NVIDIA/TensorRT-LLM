@@ -130,6 +130,22 @@ namespace tensorrt_llm::executor::kv_cache::bounce
     return parsed * mult;
 }
 
+/// Whether the NIXL agent sets the UCX backend parameter split_batch_size=1: bounce requested + UCX +
+/// num_threads > 0 + progress thread, unless split_batch_size was set explicitly. Bounce's one-descriptor
+/// chunk posts would otherwise run on the shared UCX worker, which the progress thread arms; arming
+/// inserts a host callback into the copy stream, which serializes the queued chunk copies.
+/// `numThreads` is the resolved num_threads backend parameter, if any.
+[[nodiscard]] inline bool bounceWantsSplitBatchSizeOne(bool bounceRequested, std::string const& backend,
+    bool useProgThread, bool splitBatchSizeSet, std::optional<std::string> const& numThreads)
+{
+    if (!bounceRequested || backend != "UCX" || !useProgThread || splitBatchSizeSet || !numThreads.has_value())
+    {
+        return false;
+    }
+    auto const threads = parseU64Value(*numThreads);
+    return threads.has_value() && *threads > 0;
+}
+
 /// POD config for the bounce v2 pipeline. There is no `enabled` field: the on/off switch is
 /// CacheTransceiverConfig's agent_bounce_buffer_enable + kv_cache_bounce_size_mb (which the Python
 /// frontend folds into the agent's arena size in MiB: 0 = off, >0 = arena size), and at runtime

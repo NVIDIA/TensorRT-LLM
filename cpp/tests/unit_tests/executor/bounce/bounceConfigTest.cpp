@@ -294,3 +294,19 @@ TEST(BounceConfig, ParamsWithoutRequestTimeoutLeaveLeaseAlone)
     EXPECT_EQ(cfgDirect.receiverFlowTimeoutMs, 123456);
     EXPECT_EQ(cfgDirect.quarantineMs, 654321);
 }
+
+// split_batch_size=1 is forced only for bounce requested + UCX + progress thread + num_threads > 0,
+// and never over an explicit split_batch_size.
+TEST(BounceConfig, SplitBatchSizeDecision)
+{
+    std::optional<std::string> const eight{"8"};
+    EXPECT_TRUE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, eight));
+    EXPECT_TRUE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"1"}));
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(false, "UCX", true, false, eight));             // bounce off
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "LIBFABRIC", true, false, eight));        // not UCX
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", false, false, eight));             // no progress thread
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, true, eight));               // set explicitly
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::nullopt));       // num_threads absent
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"0"}));   // engine off
+    EXPECT_FALSE(b::bounceWantsSplitBatchSizeOne(true, "UCX", true, false, std::string{"abc"})); // unparsable
+}

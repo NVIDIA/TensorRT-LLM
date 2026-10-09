@@ -24,8 +24,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <future>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
@@ -238,4 +243,176 @@ TEST(BounceTransport, SenderArenaBackpressureParksCredits)
     // 32 x 4KiB = 128KiB in ~8 chunks of 16KiB: double the sender's usable arena, so at least half
     // the granted credits must park and retry.
     runTransfer("btPark", /*nDescs=*/32, /*descBytes=*/4096, small, big, /*seed=*/11);
+}
+
+// Mixed descriptor sizes in one request, so both gather/scatter plan paths run on each side: chunks
+// whose descs are all <= 64 KiB (the bulk "no split" path) and chunks with a larger one — a 64 KiB+1
+// desc, a 300 KiB desc, and a contiguous run of 2 KiB descs that the planner merges into one 96 KiB
+// desc — which are split into 64 KiB copy pieces. Odd sizes (1 B, 31 B) exercise the 32 B alignment.
+TEST(BounceTransport, MixedSizeDescsAreByteExact)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig cfg;
+    cfg.maxChunkSizeBytes = 512 * 1024;
+    cfg.maxInflightChunksPerRequest = 4;
+    cfg.scatterWorkerCount = 2;
+    cfg.arenaAllocationGranularityBytes = 4096;
+    cfg.arenaSizeBytes = 8ULL << 20;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+    auto A = bounce_test::makeNode("btMixedA", cfg, maxDescs);
+    auto B = bounce_test::makeNode("btMixedB", cfg, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*A, *B);
+
+    std::vector<std::uint32_t> sizes;
+    std::vector<bool> contiguous;
+    auto add = [&](std::uint32_t len, bool contiguousWithPrev = false)
+    {
+        sizes.push_back(len);
+        contiguous.push_back(contiguousWithPrev);
+    };
+    for (int g = 0; g < 10; ++g) // ~680 KiB of descs <= 64 KiB: fills a whole chunk on the no-split path
+    {
+        add(1);
+        add(31);
+        add(4096);
+        add(64 * 1024);
+    }
+    add(64 * 1024 + 1);
+    add(300 * 1024);
+    for (int i = 0; i < 48; ++i) // contiguous in src and dst: merged into one 96 KiB plan desc
+    {
+        add(2048, /*contiguousWithPrev=*/i > 0);
+    }
+    add(1);
+    add(31);
+    add(4096);
+    auto bufs = bounce_test::makeXferBufsSized(sizes, contiguous, /*seed=*/51);
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, B->name);
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "transfer hung";
+    EXPECT_EQ(fut.get().state, kvc::TransferState::kSUCCESS);
+    EXPECT_TRUE(bounce_test::verifyXferBufs(bufs)) << "byte mismatch";
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    bounce_test::freeXferBufs(bufs);
+}
+
+// Several multi-chunk requests submitted at once from different threads to one receiver, with more
+// chunks allowed in flight (4 per request x 4 requests) than the sender has exec contexts (8): GRANTs
+// race the submits, and exec contexts are reused across requests. Every request must land byte-exact.
+TEST(BounceTransport, ConcurrentMultiChunkSubmitsShareExecContexts)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig cfg;
+    cfg.maxChunkSizeBytes = 4096;
+    cfg.maxInflightChunksPerRequest = 4;
+    cfg.scatterWorkerCount = 2;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.arenaSizeBytes = 1ULL << 20;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+    auto A = bounce_test::makeNode("btConcMultiA", cfg, maxDescs); // exec pool: maxInflight + 4 = 8 contexts
+    auto B = bounce_test::makeNode("btConcMultiB", cfg, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*A, *B);
+
+    constexpr int kRequests = 4;
+    std::vector<bounce_test::XferBufs> bufs;
+    for (int r = 0; r < kRequests; ++r)
+    {
+        // 40 x 700 B -> 11 chunks of <= 4 KiB each.
+        bufs.push_back(bounce_test::makeXferBufs(/*nDescs=*/40, /*descBytes=*/700, /*seed=*/60 + r));
+    }
+    std::vector<std::shared_future<b::BounceResult>> futs(kRequests);
+    std::vector<std::thread> submitters;
+    for (int r = 0; r < kRequests; ++r)
+    {
+        submitters.emplace_back([&, r] { futs[r] = A->tx->submit(bufs[r].srcDescs, bufs[r].dstDescs, B->name); });
+    }
+    for (auto& t : submitters)
+    {
+        t.join();
+    }
+    for (int r = 0; r < kRequests; ++r)
+    {
+        ASSERT_EQ(futs[r].wait_for(std::chrono::seconds(30)), std::future_status::ready) << "request " << r << " hung";
+        EXPECT_EQ(futs[r].get().state, kvc::TransferState::kSUCCESS) << "request " << r;
+        EXPECT_TRUE(bounce_test::verifyXferBufs(bufs[r])) << "byte mismatch, request " << r;
+    }
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    for (auto& x : bufs)
+    {
+        bounce_test::freeXferBufs(x);
+    }
+}
+
+// Many tiny requests at once keep the control queues full (WANTs on the receiver; GRANTs and ACKs on
+// the sender) while the shared arena and exec contexts are recycled across requests. Every request must
+// still complete byte-exact.
+TEST(BounceTransport, ManyTinyConcurrentRequestsAllComplete)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig cfg;
+    cfg.maxChunkSizeBytes = 4096;
+    cfg.maxInflightChunksPerRequest = 2;
+    cfg.scatterWorkerCount = 2;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.arenaSizeBytes = 1ULL << 20;
+    std::size_t const maxDescs = std::max<std::size_t>(1024ULL, cfg.maxChunkSizeBytes / 256ULL);
+    auto A = bounce_test::makeNode("btTinyA", cfg, maxDescs);
+    auto B = bounce_test::makeNode("btTinyB", cfg, maxDescs);
+    if (!A || !B)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable";
+    }
+    bounce_test::wirePair(*A, *B);
+
+    constexpr int kRequests = 200;
+    std::vector<bounce_test::XferBufs> bufs;
+    bufs.reserve(kRequests);
+    for (int r = 0; r < kRequests; ++r)
+    {
+        bufs.push_back(
+            bounce_test::makeXferBufs(/*nDescs=*/2, /*descBytes=*/100, /*seed=*/static_cast<std::uint32_t>(r)));
+    }
+    std::vector<std::shared_future<b::BounceResult>> futs;
+    futs.reserve(kRequests);
+    for (int r = 0; r < kRequests; ++r)
+    {
+        futs.push_back(A->tx->submit(bufs[r].srcDescs, bufs[r].dstDescs, B->name));
+    }
+    int ok = 0;
+    for (int r = 0; r < kRequests; ++r)
+    {
+        ASSERT_EQ(futs[r].wait_for(std::chrono::seconds(60)), std::future_status::ready) << "request " << r << " hung";
+        if (futs[r].get().state == kvc::TransferState::kSUCCESS && bounce_test::verifyXferBufs(bufs[r]))
+        {
+            ++ok;
+        }
+    }
+    EXPECT_EQ(ok, kRequests);
+
+    A->tx->shutdown();
+    B->tx->shutdown();
+    for (auto& x : bufs)
+    {
+        bounce_test::freeXferBufs(x);
+    }
 }

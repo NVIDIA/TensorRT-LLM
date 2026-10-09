@@ -219,6 +219,27 @@ void BounceContext::sendGrants(std::vector<Grant> const& grants)
     }
 }
 
+HostWorkerPool* BounceContext::cpuPool() noexcept
+{
+    std::lock_guard<std::mutex> lk(mCpuPoolMu);
+    if (mCpuPool == nullptr && !mCpuPoolFailed)
+    {
+        try
+        {
+            mCpuPool = std::make_unique<HostWorkerPool>(HostWorkerPool::defaultThreadCount());
+            TLLM_LOG_DEBUG("BounceTransport(%s): host worker pool started with %zu threads", selfName.c_str(),
+                mCpuPool->threadCount());
+        }
+        catch (std::exception const& e)
+        {
+            mCpuPoolFailed = true;
+            TLLM_LOG_WARNING("BounceTransport(%s): host worker pool unavailable (%s) -> bulk passes run sequentially",
+                selfName.c_str(), e.what());
+        }
+    }
+    return mCpuPool.get();
+}
+
 // ============================================================================
 // BounceReceiver — [R] role
 // ============================================================================
@@ -700,6 +721,7 @@ void BounceReceiver::scatterWorkerLoop()
                 // overflow (no launch -> NACK, the sender fails immediately; never a false ACK).
                 std::size_t const maxEntries = maxPlanEntries(ctx);
                 std::uint64_t rawPieces = 0;
+                std::uint32_t maxPieceBytes = 0;
                 for (std::uint32_t i = 0; i < n; ++i)
                 {
                     auto const& e = job.entries[i];
@@ -710,6 +732,7 @@ void BounceReceiver::scatterWorkerLoop()
                     srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
                         && span <= job.regionBytes - e.bounceOffset;
                     rawPieces += std::max<std::uint32_t>(e.count, 1);
+                    maxPieceBytes = std::max(maxPieceBytes, e.pieceSize);
                 }
                 // Reject an oversized run list BEFORE the exact-count pass below: that pass iterates
                 // once per PIECE, so a hostile/corrupt DATA (per-run count near 2^32 passes the span
@@ -724,9 +747,13 @@ void BounceReceiver::scatterWorkerLoop()
                         static_cast<unsigned long long>(job.rid), job.chunkIdx);
                     srcInBounds = false;
                 }
-                std::size_t nTotal = 0;
+                // No piece above the split size (the common small-desc KV layout): every piece is exactly
+                // one plan entry, so skip the per-piece split budgeting (same entries, several times the
+                // CPU cost per chunk). rawPieces <= maxEntries was enforced just above.
+                bool const noSplit = srcInBounds && maxPieceBytes <= kCopySplitBytes;
+                std::size_t nTotal = noSplit ? static_cast<std::size_t>(rawPieces) : 0;
                 std::uint64_t seen = 0;
-                for (std::uint32_t i = 0; i < n && srcInBounds; ++i)
+                for (std::uint32_t i = 0; i < n && srcInBounds && !noSplit; ++i)
                 {
                     auto const& e = job.entries[i];
                     for (std::uint32_t p = 0; p < e.count; ++p)
@@ -746,10 +773,19 @@ void BounceReceiver::scatterWorkerLoop()
                         auto const& e = job.entries[i];
                         for (std::uint32_t p = 0; p < e.count; ++p)
                         {
+                            auto const src
+                                = regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride;
+                            auto const dst = e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride;
+                            if (noSplit)
+                            {
+                                bufs.srcs[idx] = src;
+                                bufs.dsts[idx] = dst;
+                                bufs.sizes[idx] = e.pieceSize;
+                                ++idx;
+                                continue;
+                            }
                             ++seen;
-                            appendSplitInto(bufs, idx,
-                                regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride,
-                                e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride, e.pieceSize,
+                            appendSplitInto(bufs, idx, src, dst, e.pieceSize,
                                 splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                         }
                     }
@@ -838,8 +874,12 @@ std::shared_future<BounceResult> BounceSender::submit(
     try
     {
         BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
+        // Only a request large enough to be split takes the pool (and creates it on first use); without a
+        // pool the same segments are planned on this thread.
+        std::size_t const segments = bulkSegmentCount(srcDescs.getDescs().size());
         plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkSizeBytes,
-            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL));
+            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkSizeBytes / 256ULL), segments,
+            segments > 1 ? mCtx.cpuPool() : nullptr);
     }
     catch (std::exception const& e)
     {
@@ -1095,8 +1135,12 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // the total before the first write), then fill the pinned buffer DIRECTLY — one write pass
         // instead of building std::vectors and memcpy'ing them in.
         std::size_t const maxEntries = maxPlanEntries(ctx);
-        std::size_t nTotal = 0;
-        for (std::uint32_t i = 0; i < nDesc; ++i)
+        // No desc above the split size (the common small-desc KV layout): every desc is exactly one plan
+        // entry, so the arrays are written in one bulk pass. The per-entry split budgeting below emits the
+        // identical entries at several times the CPU cost, on the IO thread, once per chunk.
+        bool const noSplit = chunk.maxDescBytes <= kCopySplitBytes && nDesc <= maxEntries;
+        std::size_t nTotal = noSplit ? nDesc : 0;
+        for (std::uint32_t i = 0; !noSplit && i < nDesc; ++i)
         {
             nTotal += piecesFor(chunk.sizes[i], splitBudget(nTotal, nDesc - 1 - i, maxEntries));
         }
@@ -1118,11 +1162,23 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             break;
         }
         auto const bufs = planBufs(ctx, nTotal);
-        std::size_t idx = 0;
-        for (std::uint32_t i = 0; i < nDesc; ++i)
+        if (noSplit)
         {
-            appendSplitInto(bufs, idx, chunk.srcPtrs[i], regionBase + chunk.bounceOffsets[i], chunk.sizes[i],
-                splitBudget(idx, nDesc - 1 - i, maxEntries));
+            std::memcpy(bufs.srcs, chunk.srcPtrs.data(), nDesc * sizeof(std::uint64_t));
+            for (std::uint32_t i = 0; i < nDesc; ++i)
+            {
+                bufs.dsts[i] = regionBase + chunk.bounceOffsets[i];
+            }
+            std::memcpy(bufs.sizes, chunk.sizes.data(), nDesc * sizeof(std::uint32_t));
+        }
+        else
+        {
+            std::size_t idx = 0;
+            for (std::uint32_t i = 0; i < nDesc; ++i)
+            {
+                appendSplitInto(bufs, idx, chunk.srcPtrs[i], regionBase + chunk.bounceOffsets[i], chunk.sizes[i],
+                    splitBudget(idx, nDesc - 1 - i, maxEntries));
+            }
         }
         // gather into the region (cfg.useZeroCopyArguments selects the H2D-vs-zero-copy plan-argument path)
         cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);

@@ -24,6 +24,7 @@
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ControlChannel.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/CreditScheduler.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ExecPool.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/HostWorkerPool.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <algorithm>
@@ -159,6 +160,13 @@ public:
     /// the sender's releaseLocal/reclaim can free arena bytes that re-grant a waiting remote flow).
     void sendGrants(std::vector<Grant> const& grants);
 
+    /// Host worker pool for the bulk CPU passes on the submit path (admission shape scan, plan build).
+    /// Created on first use — an agent that never sees a request of kBulkSegmentItems descriptors starts
+    /// no threads — and joined when the context is destroyed (after the transport's threads). Returns
+    /// nullptr (warned once) if the pool cannot be created; callers then run those passes sequentially.
+    /// Never throws. Thread-safe.
+    [[nodiscard]] HostWorkerPool* cpuPool() noexcept;
+
     std::string selfName;
     BounceConfig cfg;
     int deviceId{};
@@ -168,6 +176,11 @@ public:
     ExecPool* exec{};          // gather/scatter exec contexts (streams/scratch), borrowed per kernel
     CreditScheduler scheduler; // shared region allocator; internally synchronized
     std::atomic<bool> stop{false};
+
+private:
+    std::mutex mCpuPoolMu;
+    std::unique_ptr<HostWorkerPool> mCpuPool; // guarded by mCpuPoolMu; never replaced once created
+    bool mCpuPoolFailed{false};               // creation failed once: stay sequential, do not retry
 };
 
 /// Receiver role ([R]): WANT -> grant regions, DATA -> scatter into the caller's KV, then ACK. Owns
@@ -520,6 +533,13 @@ public:
         TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
     {
         return mSender.submit(srcDescs, dstDescs, peer);
+    }
+
+    /// The transport's host worker pool (see BounceContext::cpuPool), shared with the agent's admission
+    /// scan; nullptr if it could not be created. Never throws. Thread-safe.
+    [[nodiscard]] HostWorkerPool* cpuPool() noexcept
+    {
+        return mCtx.cpuPool();
     }
 
     /// This side's EFFECTIVE per-chunk cap: cfg.maxChunkSizeBytes AFTER the constructor's clamp to

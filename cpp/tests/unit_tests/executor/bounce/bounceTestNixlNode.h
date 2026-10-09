@@ -62,13 +62,48 @@ struct XferBufs
     void* src{nullptr};
     void* dst{nullptr};
     std::uint32_t nDescs{};
-    std::uint32_t descBytes{};
+    std::uint32_t descBytes{};        // every desc's length, unless `sizes` is set
+    std::vector<std::uint32_t> sizes; // per-desc lengths (makeXferBufsSized); empty = uniform descBytes
     std::uint32_t seed{};
     std::vector<std::uint64_t> off;
     std::uint64_t total{};
     kvc::TransferDescs srcDescs{kvc::MemoryType::kVRAM, {}};
     kvc::TransferDescs dstDescs{kvc::MemoryType::kVRAM, {}};
+
+    [[nodiscard]] std::uint32_t len(std::size_t i) const
+    {
+        return sizes.empty() ? descBytes : sizes[i];
+    }
 };
+
+// Allocate src/dst of x.total bytes, seed the src pattern and build both desc lists from x.off and the
+// per-desc lengths. src and dst share the layout, so a desc contiguous with its predecessor in src is
+// contiguous in dst too.
+inline void allocXferBufs(XferBufs& x)
+{
+    EXPECT_EQ(cudaMalloc(&x.src, x.total), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&x.dst, x.total), cudaSuccess);
+    std::vector<unsigned char> h(x.total, 0);
+    for (std::uint32_t i = 0; i < x.nDescs; ++i)
+    {
+        for (std::uint32_t j = 0; j < x.len(i); ++j)
+        {
+            h[x.off[i] + j] = patSeed(x.seed, i, j);
+        }
+    }
+    EXPECT_EQ(cudaMemcpy(x.src, h.data(), x.total, cudaMemcpyHostToDevice), cudaSuccess);
+    EXPECT_EQ(cudaMemset(x.dst, 0, x.total), cudaSuccess);
+    auto a2 = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uintptr_t>(static_cast<char*>(p) + o); };
+    std::vector<kvc::MemoryDesc> sd;
+    std::vector<kvc::MemoryDesc> dd;
+    for (std::uint32_t i = 0; i < x.nDescs; ++i)
+    {
+        sd.emplace_back(a2(x.src, x.off[i]), x.len(i), 0);
+        dd.emplace_back(a2(x.dst, x.off[i]), x.len(i), 0);
+    }
+    x.srcDescs = kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(sd)};
+    x.dstDescs = kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(dd)};
+}
 
 inline XferBufs makeXferBufs(std::uint32_t nDescs, std::uint32_t descBytes, std::uint32_t seed)
 {
@@ -84,28 +119,29 @@ inline XferBufs makeXferBufs(std::uint32_t nDescs, std::uint32_t descBytes, std:
         cur = alignUp(cur + descBytes, 256);
     }
     x.total = cur;
-    EXPECT_EQ(cudaMalloc(&x.src, x.total), cudaSuccess);
-    EXPECT_EQ(cudaMalloc(&x.dst, x.total), cudaSuccess);
-    std::vector<unsigned char> h(x.total, 0);
-    for (std::uint32_t i = 0; i < nDescs; ++i)
+    allocXferBufs(x);
+    return x;
+}
+
+// Like makeXferBufs, with a length per desc. contiguousWithPrev[i] (if given) places desc i right after
+// desc i-1 — in src and dst alike, so the planner may merge the two; otherwise a gap separates them.
+inline XferBufs makeXferBufsSized(
+    std::vector<std::uint32_t> sizes, std::vector<bool> const& contiguousWithPrev, std::uint32_t seed)
+{
+    XferBufs x;
+    x.nDescs = static_cast<std::uint32_t>(sizes.size());
+    x.sizes = std::move(sizes);
+    x.seed = seed;
+    x.off.resize(x.nDescs);
+    std::uint64_t end = 0;
+    for (std::uint32_t i = 0; i < x.nDescs; ++i)
     {
-        for (std::uint32_t j = 0; j < descBytes; ++j)
-        {
-            h[x.off[i] + j] = patSeed(seed, i, j);
-        }
+        bool const contiguous = i > 0 && i < contiguousWithPrev.size() && contiguousWithPrev[i];
+        x.off[i] = contiguous ? end : alignUp(end + 64, 256);
+        end = x.off[i] + x.sizes[i];
     }
-    EXPECT_EQ(cudaMemcpy(x.src, h.data(), x.total, cudaMemcpyHostToDevice), cudaSuccess);
-    EXPECT_EQ(cudaMemset(x.dst, 0, x.total), cudaSuccess);
-    auto a2 = [](void* p, std::uint64_t o) { return reinterpret_cast<std::uintptr_t>(static_cast<char*>(p) + o); };
-    std::vector<kvc::MemoryDesc> sd;
-    std::vector<kvc::MemoryDesc> dd;
-    for (std::uint32_t i = 0; i < nDescs; ++i)
-    {
-        sd.emplace_back(a2(x.src, x.off[i]), descBytes, 0);
-        dd.emplace_back(a2(x.dst, x.off[i]), descBytes, 0);
-    }
-    x.srcDescs = kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(sd)};
-    x.dstDescs = kvc::TransferDescs{kvc::MemoryType::kVRAM, std::move(dd)};
+    x.total = alignUp(end, 256);
+    allocXferBufs(x);
     return x;
 }
 
@@ -118,7 +154,7 @@ inline bool verifyXferBufs(XferBufs const& x)
     }
     for (std::uint32_t i = 0; i < x.nDescs; ++i)
     {
-        for (std::uint32_t j = 0; j < x.descBytes; ++j)
+        for (std::uint32_t j = 0; j < x.len(i); ++j)
         {
             if (got[x.off[i] + j] != patSeed(x.seed, i, j))
             {

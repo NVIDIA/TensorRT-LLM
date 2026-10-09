@@ -309,15 +309,67 @@ std::optional<bounce::BounceRejectReason> NixlTransferAgent::bounceRejectReason(
     std::uint64_t totalBytes = 0;
     // BounceTransport may clamp the configured cap further to the buddy allocator's usable capacity.
     auto const maxChunkSizeBytes = mBounce->transport->maxChunkSizeBytes();
-    for (std::size_t i = 0; i < srcs.size(); ++i)
+    // Shape-check descs [begin, end) and sum their bytes; false at the first violating desc. The sum is
+    // kept in a local and stored once, so concurrent segments never write neighbouring slots per desc.
+    auto const scanShape = [&](std::size_t begin, std::size_t end, std::uint64_t& bytesOut)
     {
-        auto const len = srcs[i].getLen();
-        if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
-            || dsts[i].getDeviceId() != destinationDeviceId)
+        std::uint64_t bytes = 0;
+        for (std::size_t i = begin; i < end; ++i)
+        {
+            auto const len = srcs[i].getLen();
+            if (len != dsts[i].getLen() || len > maxChunkSizeBytes || srcs[i].getDeviceId() != sourceDeviceId
+                || dsts[i].getDeviceId() != destinationDeviceId)
+            {
+                return false;
+            }
+            bytes += len;
+        }
+        bytesOut = bytes;
+        return true;
+    };
+    std::size_t const n = srcs.size();
+    std::size_t const segments = bounce::bulkSegmentCount(n);
+    // The pool is only consulted for a request large enough to split; without one (or if it cannot be
+    // created) the scan runs in one pass here.
+    bounce::HostWorkerPool* const pool = segments > 1 ? mBounce->transport->cpuPool() : nullptr;
+    if (pool == nullptr)
+    {
+        if (!scanShape(0, n, totalBytes))
         {
             return BounceRejectReason::kDescriptorShape;
         }
-        totalBytes += len;
+    }
+    else
+    {
+        // Large request: the same scan over equal segments on the transport's host worker pool. Any
+        // violating desc rejects the request, so the outcome does not depend on which segment saw it.
+        std::vector<std::uint64_t> segmentBytes(segments, 0);
+        std::vector<std::uint8_t> segmentOk(segments, 0);
+        auto const scanSegment = [&](std::size_t s)
+        { segmentOk[s] = scanShape(n * s / segments, n * (s + 1) / segments, segmentBytes[s]) ? 1 : 0; };
+        try
+        {
+            pool->parallelFor(segments, scanSegment);
+        }
+        catch (std::exception const& e)
+        {
+            // parallelFor throws only if it cannot hand out the segments (scanShape itself never throws);
+            // the gate must not throw, so scan the segments here instead.
+            TLLM_LOG_DEBUG("NixlTransferAgent(%s): parallel admission scan unavailable (%s); scanning inline",
+                mName.c_str(), e.what());
+            for (std::size_t s = 0; s < segments; ++s)
+            {
+                scanSegment(s);
+            }
+        }
+        for (std::size_t s = 0; s < segments; ++s)
+        {
+            if (segmentOk[s] == 0)
+            {
+                return BounceRejectReason::kDescriptorShape;
+            }
+            totalBytes += segmentBytes[s];
+        }
     }
     // max_average_descriptor_size = 0 disables outbound routing (gate off): reject unconditionally (an all-zero-length
     // request would otherwise pass "avg > 0").
@@ -885,6 +937,24 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         init1[key] = value;
         TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent backendParams: %s: %s", key.c_str(), value.c_str());
     }
+
+#ifdef TLLM_BOUNCE_V2
+    // bounce requested + UCX + num_threads > 0 + progress thread -> split_batch_size=1 unless set
+    // explicitly (see bounce::bounceWantsSplitBatchSizeOne).
+    {
+        auto const numThreads = init1.find("num_threads");
+        bool const splitBatchSizeSet = config.backendParams.find("split_batch_size") != config.backendParams.end();
+        if (bounce::bounceWantsSplitBatchSizeOne(config.agentBufferSizeMb > 0, nixlBackend, config.useProgThread,
+                splitBatchSizeSet,
+                numThreads != init1.end() ? std::optional<std::string>(numThreads->second) : std::nullopt))
+        {
+            init1["split_batch_size"] = "1";
+            TLLM_LOG_INFO(
+                "NixlTransferAgent::NixlTransferAgent bounce requested -> backendParams split_batch_size: 1 (set "
+                "split_batch_size, e.g. via TRTLLM_NIXL_SPLIT_BATCH_SIZE, to override)");
+        }
+    }
+#endif
 
     status = mRawAgent->createBackend(nixlBackend.c_str(), init1, mRawBackend);
     if (status != NIXL_SUCCESS || !mRawBackend)

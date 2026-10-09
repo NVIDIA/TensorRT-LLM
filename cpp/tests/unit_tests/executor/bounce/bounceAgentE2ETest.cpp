@@ -200,6 +200,99 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     freeXferBufs(bufs);
 }
 
+namespace
+{
+// Agent config for the large-request tests: 64 KiB chunks in a 4 MiB arena.
+kvc::BaseAgentConfig makeLargeRequestConfig(std::string name)
+{
+    kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    cfg.agentBufferSizeMb = 4;
+    cfg.bounceParams = {
+        {"min_descriptor_count", "4"},
+        {"max_chunk_size", "65536"},
+        {"arena_allocation_granularity", "4096"},
+        {"max_inflight_chunks_per_request", "4"},
+    };
+    return cfg;
+}
+} // namespace
+
+// A request of at least kBulkSegmentItems descriptors takes the segmented paths end to end: the
+// admission scan and the plan build run on the transport's host worker pool. 8192 x 64 B -> 8 chunks of
+// 64 KiB, byte-exact.
+TEST(BounceAgentE2E, LargeRequestUsesSegmentedAdmissionAndPlan)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeLargeRequestConfig("lrAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeLargeRequestConfig("lrAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    a->loadRemoteAgent("lrAgentB", b->getLocalAgentDesc());
+
+    auto bufs = makeXferBufs(/*nDescs=*/8192, /*descBytes=*/64, /*seed=*/70);
+    auto req = makeReq(bufs, "lrAgentB");
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 1u);
+    EXPECT_TRUE(verifyXferBufs(bufs));
+
+    a->shutdown();
+    b->shutdown();
+    freeXferBufs(bufs);
+}
+
+// The same request with one descriptor larger than the chunk cap, in the last segment of the parallel
+// admission scan: bounce must reject it (kDescriptorShape) and the standard NIXL path must still
+// deliver it byte-exact (the src/dst buffers are registered for that path).
+TEST(BounceAgentE2E, LargeRequestWithOversizedDescFallsBackToStandardNixl)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeLargeRequestConfig("lrbAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeLargeRequestConfig("lrbAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+
+    constexpr std::uint32_t kDescs = 8192;
+    std::vector<std::uint32_t> sizes(kDescs, 64);
+    sizes[kDescs - 3] = 128 * 1024; // > max_chunk_size (64 KiB): a shape rejection, valid for standard NIXL
+    auto bufs = bounce_test::makeXferBufsSized(sizes, {}, /*seed=*/71);
+    kvc::RegisterDescs const srcRegion{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{bufs.src, bufs.total, 0}}};
+    kvc::RegisterDescs const dstRegion{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{bufs.dst, bufs.total, 0}}};
+    a->registerMemory(srcRegion);
+    b->registerMemory(dstRegion);
+    a->loadRemoteAgent("lrbAgentB", b->getLocalAgentDesc());
+
+    auto req = makeReq(bufs, "lrbAgentB");
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 0u);
+    auto const bucket = static_cast<std::size_t>(kvc::bounce::BounceRejectReason::kDescriptorShape);
+    EXPECT_EQ(a->getBounceRejectCounts()[bucket], 1u);
+    EXPECT_TRUE(verifyXferBufs(bufs));
+    EXPECT_TRUE(status->release());
+    status.reset();
+
+    a->deregisterMemory(srcRegion);
+    b->deregisterMemory(dstRegion);
+    a->shutdown();
+    b->shutdown();
+    freeXferBufs(bufs);
+}
+
 // A non-power-of-two arena can clamp the effective chunk cap below the configured cap. A descriptor
 // between those limits must use ordinary NIXL instead of entering bounce and failing plan creation.
 TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
