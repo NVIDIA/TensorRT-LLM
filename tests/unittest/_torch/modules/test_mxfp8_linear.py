@@ -172,6 +172,11 @@ def _mock_mxfp8_ops(
         ops=SimpleNamespace(trtllm=fake_trtllm_ops),
         ones=torch.ones,
         float32=torch.float32,
+        float8_e4m3fn=torch.float8_e4m3fn,
+        uint8=torch.uint8,
+        full=torch.full,
+        compiler=torch.compiler,
+        cuda=torch.cuda,
     )
     monkeypatch.setattr(linear_module, "torch", fake_torch)
     return (
@@ -789,3 +794,97 @@ def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_siz
     static_x.copy_(replay_x)
     graph.replay()
     torch.testing.assert_close(graph_output, native(replay_x), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_e4m3_input_uses_cached_unit_scales(monkeypatch):
+    """A native E4M3 producer bypasses BF16 widening and re-quantization."""
+    monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+
+    _, _, quantize, native_gemm, native_output, _, _ = _mock_mxfp8_ops(monkeypatch)
+    module = SimpleNamespace(
+        weight=torch.empty((3, 32), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty(512, dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    activation = torch.randn((2, 32), dtype=torch.float32).to(torch.float8_e4m3fn)
+    method = MXFP8LinearMethod()
+    method.mark_native_autotuned()
+
+    assert method.supports_e4m3_input
+    assert method.apply(module, activation, bias=None) is native_output
+    # Graph backend tuning must not route a native E4M3 producer back through
+    # the fused quantize+GEMM entry point, which expects compute-dtype input.
+    fused = Mock()
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_gemm_autotuned", fused)
+    monkeypatch.setattr(
+        linear_module,
+        "_FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE",
+        SimpleNamespace(get=lambda: True),
+    )
+    method.tune_decode_graph_backends = True
+    assert method.apply(module, activation, bias=None) is native_output
+    quantize.assert_not_called()
+    fused.assert_not_called()
+
+    first = native_gemm.call_args_list[0].args
+    second = native_gemm.call_args_list[1].args
+    assert first[0] is activation
+    assert first[1].dtype == torch.uint8
+    assert first[1].numel() == 128 * 4
+    assert torch.all(first[1] == 127)
+    assert first[1].data_ptr() == second[1].data_ptr()
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(), reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100"
+)
+def test_mxfp8_linear_native_e4m3_unit_scales_matches_reference():
+    """Native E4M3 + unit scales is a valid MXFP8 activation operand."""
+    torch.manual_seed(17)
+    out_f, in_f = 256, 512
+    w = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    w_e4m3, scale = quant_bf16_to_mxfp8(w, 32)
+
+    qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    lin = Linear(
+        in_features=in_f, out_features=out_f, bias=False, dtype=torch.bfloat16, quant_config=qc
+    ).cuda()
+    lin.load_weights([{"weight": w_e4m3, "weight_scale_inv": scale}])
+
+    x_e4m3 = torch.randn(16, in_f, dtype=torch.float32, device="cuda").to(torch.float8_e4m3fn)
+    got = lin(x_e4m3)
+    w_deq = dequant_mxfp8_weight(w_e4m3, scale, 32).cuda()
+    ref = (x_e4m3.float() @ w_deq.t()).to(torch.bfloat16)
+    rel = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6)
+    assert rel < 0.05, f"native E4M3 MXFP8 vs reference rel err {rel}"
+
+    unit_scales = next(iter(lin._mxfp8_unit_activation_scales.values()))
+    assert unit_scales.numel() == 128 * 16
+    assert torch.all(unit_scales == 127)
+
+
+@pytest.mark.skipif(
+    not _mxfp8_cutlass_op_available(), reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100"
+)
+def test_mxfp8_linear_native_e4m3_fullgraph_compile():
+    """A cold unit-scale cache is initialized while tracing a context graph."""
+    torch.manual_seed(19)
+    out_f, in_f = 256, 512
+    w = torch.randn(out_f, in_f, dtype=torch.bfloat16)
+    w_e4m3, scale = quant_bf16_to_mxfp8(w, 32)
+
+    qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    lin = Linear(
+        in_features=in_f, out_features=out_f, bias=False, dtype=torch.bfloat16, quant_config=qc
+    ).cuda()
+    lin.load_weights([{"weight": w_e4m3, "weight_scale_inv": scale}])
+    x_e4m3 = torch.randn(128, in_f, dtype=torch.float32, device="cuda").to(torch.float8_e4m3fn)
+
+    compiled = torch.compile(lin, backend="eager", fullgraph=True)
+    got = compiled(x_e4m3)
+    eager = lin(x_e4m3)
+
+    torch.testing.assert_close(got, eager, rtol=0, atol=0)
+    assert len(lin._mxfp8_unit_activation_scales) == 1

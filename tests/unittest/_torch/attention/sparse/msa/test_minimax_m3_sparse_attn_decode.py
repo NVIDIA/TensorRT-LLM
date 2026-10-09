@@ -35,9 +35,16 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_spa
     minimax_m3_sparse_attn_decode,
     resolve_num_topk_chunks,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
+    _get_bmm_scales,
+    _persistent_counter_buffer,
+    build_sparse_p32_table,
+    minimax_m3_trtllm_gen_sparse_decode,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import (
     MiniMaxM3MsaSparseAttentionMetadata,
 )
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 
 PAGE_SIZE = SPARSE_BLOCK_SIZE
@@ -300,6 +307,7 @@ def _make_nvfp4_inputs(seq_lens, *, num_kv_heads=1, group=8, decode_query_len=1,
         block_table=block_table,
         seq_lens=seq_lens_dev,
         scales=scales,
+        data_pool=data_pool,
         scale_pool=scale_pool,
         k_ref=reference[0],
         v_ref=reference[1],
@@ -1369,3 +1377,207 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     checked = jit._compute_cache_base()
     assert checked.parent == tmp_path / ".cache/minfer/fmha_sm100_gmem_check"
     assert checked.name != default.name
+
+
+class _FlatNvfp4Pool:
+    """Expose a focused test pool through the production manager protocol."""
+
+    def __init__(self, data_pool: torch.Tensor, scale_pool: torch.Tensor):
+        self.data_pool = data_pool.flatten(0, 1)
+        self.scale_pool = scale_pool.flatten(0, 1)
+
+    def get_kv_subpage_pool(self, layer_idx: int, kv_layout: str):
+        assert layer_idx == 0 and kv_layout == "HND"
+        return self.data_pool, 2
+
+    def get_kv_scale_subpage_pool(self, layer_idx: int, kv_layout: str):
+        assert layer_idx == 0 and kv_layout == "HND"
+        return self.scale_pool, 2
+
+
+def _reference_sparse_p32_table(
+    topk_idx: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    decode_query_len: int,
+    subpages_per_slot: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized reference for the fused metadata transform."""
+    total_q, num_kv_heads, max_topk = topk_idx.shape
+    token = torch.arange(total_q, device=topk_idx.device, dtype=torch.int64)
+    req = token // decode_query_len
+    intra = token - req * decode_query_len
+    kv_len = (seq_lens[req].to(torch.int64) - decode_query_len + intra + 1).clamp_min(0)
+    num_blocks = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
+    real_topk = num_blocks.clamp_max(max_topk)
+    valid = torch.arange(max_topk, device=topk_idx.device)[None, None, :] < real_topk[:, None, None]
+    logical = torch.where(valid, topk_idx, torch.zeros_like(topk_idx)).to(torch.int64)
+    slots = block_table[req[:, None, None], logical]
+    heads = torch.arange(num_kv_heads, device=topk_idx.device)[None, :, None]
+    old_k = slots * subpages_per_slot
+    halves = torch.arange(4, device=topk_idx.device)
+    k_pages = ((old_k * num_kv_heads + heads) * 4)[..., None]
+    v_pages = (((old_k + 1) * num_kv_heads + heads) * 4)[..., None]
+    k_pages = (k_pages + halves).flatten(2)
+    v_pages = (v_pages + halves).flatten(2)
+    valid_pages = valid[..., None].expand(-1, -1, -1, 4).flatten(2)
+    pages = torch.stack((k_pages, v_pages), dim=2)
+    pages = torch.where(valid_pages[:, :, None], pages, torch.zeros_like(pages))
+    pages = pages.flatten(0, 1).to(torch.int32)
+
+    safe_last = (real_topk - 1).clamp_min(0)
+    last = topk_idx.gather(2, safe_last[:, None, None].expand(-1, num_kv_heads, 1)).squeeze(2)
+    unused_tail = num_blocks * PAGE_SIZE - kv_len
+    compact = real_topk[:, None] * PAGE_SIZE
+    compact = compact - torch.where(
+        last == num_blocks[:, None] - 1,
+        unused_tail[:, None],
+        torch.zeros_like(compact),
+    )
+    compact = torch.where(real_topk[:, None] > 0, compact, torch.zeros_like(compact))
+    return pages, compact.flatten().to(torch.int32)
+
+
+def test_trtllm_gen_sparse_p32_metadata_matches_reference():
+    """The fused transform preserves page order, partial tails, and padding."""
+    case = _make_nvfp4_inputs(
+        [0, 65, 2049, 8192], num_kv_heads=4, group=16, decode_query_len=4, seed=29
+    )
+    token_major = case.topk_idx.permute(1, 0, 2)
+    actual = build_sparse_p32_table(token_major, case.block_table, case.seq_lens, 4, 2)
+    expected = _reference_sparse_p32_table(token_major, case.block_table, case.seq_lens, 4, 2)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+
+
+@skip_not_sm100
+@pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="flashinfer required")
+def test_trtllm_gen_sparse_nvfp4_decode_matches_selected_page_reference():
+    """The pseudo-request P32 view must consume the intended cache bytes."""
+    case = _make_nvfp4_inputs(
+        [300, 1500, 4097], num_kv_heads=4, group=16, decode_query_len=4, seed=31
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    output = torch.empty(case.q.shape, device="cuda", dtype=torch.bfloat16)
+    owner = SimpleNamespace()
+    minimax_m3_trtllm_gen_sparse_decode(
+        owner,
+        case.q,
+        _FlatNvfp4Pool(case.data_pool, case.scale_pool),
+        0,
+        case.topk_idx.permute(1, 0, 2),
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        output=output,
+        decode_query_len=case.decode_query_len,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+    )
+    first = output.clone()
+    minimax_m3_trtllm_gen_sparse_decode(
+        owner,
+        case.q,
+        _FlatNvfp4Pool(case.data_pool, case.scale_pool),
+        0,
+        case.topk_idx.permute(1, 0, 2),
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        output=output,
+        decode_query_len=case.decode_query_len,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+    )
+    assert torch.equal(first, output)
+    counter = next(iter(owner._msa_trtllm_gen_sparse_counter_buffers.values()))
+    assert int(torch.count_nonzero(counter)) == 0
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
+    )
+    torch.testing.assert_close(output.float(), expected, rtol=0.3, atol=0.35)
+
+
+def test_trtllm_gen_sparse_bmm_scales_preserve_logical_output_scale():
+    owner = SimpleNamespace()
+    k_scale = torch.tensor([0.25], device="cuda", dtype=torch.float32)
+    v_scale = torch.tensor([0.5], device="cuda", dtype=torch.float32)
+
+    bmm1, bmm2 = _get_bmm_scales(owner, k_scale, v_scale, 0.125)
+
+    torch.testing.assert_close(bmm1[0], torch.tensor(0.03125, device="cuda"))
+    torch.testing.assert_close(bmm1[1], bmm1[0] * 1.4426950408889634)
+    torch.testing.assert_close(bmm2[0], torch.tensor(0.5, device="cuda"))
+
+
+def test_trtllm_gen_sparse_counter_is_owner_local_and_not_recleared():
+    first_owner = SimpleNamespace()
+    second_owner = SimpleNamespace()
+
+    first = _persistent_counter_buffer(
+        first_owner,
+        torch.device("cuda"),
+        16,
+        256,
+    )
+    first.fill_(7)
+    reused = _persistent_counter_buffer(
+        first_owner,
+        torch.device("cuda"),
+        16,
+        256,
+    )
+    separate = _persistent_counter_buffer(
+        second_owner,
+        torch.device("cuda"),
+        16,
+        256,
+    )
+
+    assert reused.data_ptr() == first.data_ptr()
+    assert torch.equal(reused, torch.full_like(reused, 7))
+    assert separate.data_ptr() != first.data_ptr()
+    assert int(torch.count_nonzero(separate)) == 0
+
+
+@skip_not_sm100
+@pytest.mark.skipif(not IS_FLASHINFER_AVAILABLE, reason="flashinfer required")
+def test_trtllm_gen_sparse_nvfp4_decode_writes_logical_e4m3_for_mxfp8_o_proj():
+    """Native E4M3 plus unit MXFP8 scales represents the logical output."""
+    case = _make_nvfp4_inputs(
+        [300, 1500, 4097], num_kv_heads=4, group=16, decode_query_len=4, seed=37
+    )
+    case.q = case.q.to(torch.float8_e4m3fn)
+    output = torch.empty(case.q.shape, device="cuda", dtype=torch.float8_e4m3fn)
+    minimax_m3_trtllm_gen_sparse_decode(
+        SimpleNamespace(),
+        case.q,
+        _FlatNvfp4Pool(case.data_pool, case.scale_pool),
+        0,
+        case.topk_idx.permute(1, 0, 2),
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        output=output,
+        decode_query_len=case.decode_query_len,
+        k_global_scale=case.scales["k_global_scale"],
+        v_global_scale=case.scales["v_global_scale"],
+    )
+    expected = _reference_sparse_decode(
+        case.q.to(torch.bfloat16),
+        case.k_ref,
+        case.v_ref,
+        case.topk_idx,
+        case.block_table,
+        case.seq_lens,
+        sm_scale=HEAD_DIM**-0.5,
+        decode_query_len=case.decode_query_len,
+    )
+    torch.testing.assert_close(output.float(), expected, rtol=0.3, atol=0.35)

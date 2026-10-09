@@ -22,6 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import math
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -37,6 +38,18 @@ if TYPE_CHECKING:
     )
 
     from ..sparse.minimax_m3.kernels.trtllm_gen_dense_decode import DenseDecodeWorkspaceLayout
+
+
+def use_trtllm_gen_sparse_decode() -> bool:
+    """Select the opt-in Blackwell NVFP4 sparse decode experiment.
+
+    Set TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE=trtllm_gen to enable it.
+    Triton remains the default until matched task-level accuracy is validated.
+    """
+    mode = os.environ.get("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "triton").lower()
+    if mode not in ("triton", "trtllm_gen"):
+        raise ValueError(f"Unknown MiniMax-M3 NVFP4 sparse decode mode: {mode!r}")
+    return mode == "trtllm_gen"
 
 
 class MsaDecodeFmha(PhasedFmha):
@@ -183,7 +196,6 @@ class MsaDecodeFmha(PhasedFmha):
         attn = params.attn
         head_dim = attn.head_dim
         num_tokens = params.num_tokens
-        k_paged, v_paged = msa_paged_kv(params.meta.kv_cache_manager, attn.layer_idx)
         nvfp4_args = {}
         manager = params.meta.kv_cache_manager
         if getattr(manager, "is_nvfp4_layer", lambda _: False)(attn.layer_idx):
@@ -192,6 +204,26 @@ class MsaDecodeFmha(PhasedFmha):
             if params.fwd.kv_scale_quant_orig is None:
                 raise RuntimeError("NVFP4 sparse decode requires dequantization scales")
             k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, params.fwd.kv_scale_quant_orig)
+            if use_trtllm_gen_sparse_decode():
+                from ..sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
+                    minimax_m3_trtllm_gen_sparse_decode,
+                )
+
+                minimax_m3_trtllm_gen_sparse_decode(
+                    self,
+                    params.query_input.view(num_tokens, attn.num_heads, head_dim),
+                    manager,
+                    attn.layer_idx,
+                    kv_block_indexes[params.token_offset : params.token_offset + num_tokens],
+                    block_table,
+                    seq_lens,
+                    sm_scale=(head_dim**-0.5) / float(attn.q_scaling),
+                    output=params.output.view(num_tokens, attn.num_heads, head_dim),
+                    decode_query_len=params.input_seq_length,
+                    k_global_scale=k_scale,
+                    v_global_scale=v_scale,
+                )
+                return
             scales = manager.get_block_scale_buffers(attn.layer_idx, "HND")
             nvfp4_args = dict(
                 k_block_scale=scales[:, 0],
@@ -199,6 +231,7 @@ class MsaDecodeFmha(PhasedFmha):
                 k_global_scale=k_scale,
                 v_global_scale=v_scale,
             )
+        k_paged, v_paged = msa_paged_kv(manager, attn.layer_idx)
         # q may still be FP8 from a fused producer; the kernel widens it
         # in-register, so it is passed through as it arrives.
         minimax_m3_sparse_attn_decode(

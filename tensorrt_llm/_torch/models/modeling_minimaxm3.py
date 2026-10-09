@@ -38,6 +38,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.fmha.msa_decode import use_trtllm_gen_sparse_decode
 from ..attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from ..attention.backends.interface import (
     AttentionForwardArgs,
@@ -1968,11 +1969,21 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # q may be FP8 on the MSA FP8-KV path, so pin the output to the compute
-        # dtype rather than inheriting it from q.
+        # Preserve the experimental cubin's native E4M3 result for MXFP8
+        # o_proj on pure decode. Mixed steps share one output tensor with
+        # prefill and keep the established compute-dtype contract.
+        use_e4m3_output = (
+            self.is_sparse_attention_layer
+            and self.main_kv_is_nvfp4
+            and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
+            and use_trtllm_gen_sparse_decode()
+            and attn_metadata.num_contexts == 0
+            and self.o_proj.has_mxfp8
+            and getattr(self.o_proj.quant_method, "supports_e4m3_input", False)
+        )
         output = q.new_empty(
             (q.shape[0], self.num_heads * self.head_dim),
-            dtype=self.attn_activation_dtype,
+            dtype=torch.float8_e4m3fn if use_e4m3_output else self.attn_activation_dtype,
         )
         if self.register_to_config and (is_torch_compiling() or is_in_breakable_cuda_graph()):
             maybe_bcg_minimax_m3_attn_custom_op_inplace(
