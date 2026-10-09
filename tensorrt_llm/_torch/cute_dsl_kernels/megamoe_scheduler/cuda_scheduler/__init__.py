@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure-CUDA physical-slot scheduler.
 
 HALO-M hierarchical placement followed by HALO-Q quota repair, behind one

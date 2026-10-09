@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The driver-call wrapper and setup collectives production SAMI needs.
 
 Two small helpers rather than two small modules.  They are unrelated to each

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """CUDA Fabric and NVSwitch multicast memory.
 
 This module is in the runtime dependency closure. It is imported lazily by the

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Frozen seven-plane MegaMoE weight geometry.
 
 Storage placement is owned by :mod:`megamoe_scheduler.sami.arena`; production

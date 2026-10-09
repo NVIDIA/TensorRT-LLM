@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """The R4 rank hierarchy shared by the CUDA scheduler and the SAMI copy."""
 
 from __future__ import annotations
