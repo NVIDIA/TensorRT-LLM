@@ -1466,12 +1466,17 @@ def test_skip_rope_quantization_partial_rotary_keys(skip_rope_quantization) -> N
         assert metadata.integers[:2, 4:].tolist() == [[192, 256, 64], [256, 256, 0]]
 
 
-def test_skip_rope_quantization_leaves_the_mla_rope_tail() -> None:
+@pytest.mark.parametrize("model_type", ("glm_moe_dsa", "deepseek_v32"))
+def test_skip_rope_quantization_leaves_the_mla_rope_tail(model_type: str) -> None:
     """MLA latent rows: 512 NoPE elements then 64 RoPE elements."""
 
     native, _ = _native()
-    layout = _create_kv(native, _mla_config(), 576, roles=("key",))
+    config = _mla_config()
+    config.architectures = ["GlmMoeDsaForCausalLM"]
+    config.model_type = model_type
+    layout = _create_kv(native, config, 576, roles=("key",))
     assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 512)]
+    assert config.model_type == model_type
 
     metadata = _configure_lifecycle(native, {0: {"key": 64 * 576 * 2}})
     # 16384 B packed + 2048 B scales + 8192 B RoPE copied.
@@ -1594,12 +1599,14 @@ def test_skip_rope_quantization_quantizes_draft_kv_rows_whole() -> None:
     assert [_quantized_range(buffer) for buffer in layout.buffers] == [(0, 256), (0, 256)]
 
 
-@pytest.mark.parametrize("model_type", ("qwen3", "deepseek_v3", None))
+@pytest.mark.parametrize("model_type", ("qwen3", "deepseek_v3", "deepseek_v32", None))
 def test_skip_rope_quantization_is_ignored_with_a_warning_outside_the_supported_models(
     model_type,
 ) -> None:
     native, _ = _native()
     config = _text_config(model_type, head_dim=576, kv_lora_rank=512, qk_rope_head_dim=64)
+    if model_type == "deepseek_v32":
+        config.architectures = ["DeepseekV32ForCausalLM"]
     with patch(
         "tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page."
         "nvfp4_quantization.logger"

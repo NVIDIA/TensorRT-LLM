@@ -213,6 +213,9 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         self._skip_rope_quantization = bool(config.skip_rope_quantization)
         self._nvfp4_residual_dim = config.nvfp4_residual_dim
         model_type = getattr(pretrained_config, "model_type", None)
+        architectures = getattr(pretrained_config, "architectures", None) or []
+        if architectures and architectures[0] == "GlmMoeDsaForCausalLM":
+            model_type = "glm_moe_dsa"
         if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
             logger.warning(
                 "skip_rope_quantization is supported for model types "
