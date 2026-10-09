@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 #include <thread>
 #include <type_traits>
 #ifndef _WIN32
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -695,6 +696,87 @@ void MpiWaitThread::notifyStop()
     mRunning = false;
     mCondVar.notify_one();
     TLLM_LOG_TRACE("%s: %s stop", mName.c_str(), __PRETTY_FUNCTION__);
+}
+
+MpiProgressThread::MpiProgressThread(MPI_Comm comm, std::chrono::microseconds interval, int probeTag)
+    : mComm{comm}
+    , mInterval{interval}
+    , mProbeTag{probeTag}
+{
+#if ENABLE_MULTI_DEVICE
+    TLLM_CHECK_WITH_INFO(interval.count() > 0, "MPI progress thread interval must be positive, got %lld us",
+        static_cast<long long>(interval.count()));
+    int provided = MPI_THREAD_SINGLE;
+    TLLM_MPI_CHECK(MPI_Query_thread(&provided));
+    TLLM_CHECK_WITH_INFO(provided == MPI_THREAD_MULTIPLE,
+        "MPI progress thread needs MPI_THREAD_MULTIPLE, but MPI provides thread level %d", provided);
+    mRunning.store(true);
+    mThread = std::thread(&MpiProgressThread::run, this);
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif // ENABLE_MULTI_DEVICE
+}
+
+MpiProgressThread::~MpiProgressThread()
+{
+    stop();
+}
+
+MPI_Comm MpiProgressThread::commFromFortranHandle(int64_t fortranHandle)
+{
+#if ENABLE_MULTI_DEVICE
+    return MPI_Comm_f2c(static_cast<MPI_Fint>(fortranHandle));
+#else
+    TLLM_THROW("Multi device support is disabled.");
+    return nullptr;
+#endif // ENABLE_MULTI_DEVICE
+}
+
+void MpiProgressThread::stop()
+{
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mShouldStop = true;
+    }
+    mCondVar.notify_all();
+    if (mThread.joinable())
+    {
+        mThread.join();
+    }
+}
+
+bool MpiProgressThread::isRunning() const
+{
+    return mRunning.load();
+}
+
+std::uint64_t MpiProgressThread::getNumProbes() const
+{
+    return mNumProbes.load(std::memory_order_relaxed);
+}
+
+void MpiProgressThread::run()
+{
+#if ENABLE_MULTI_DEVICE
+#ifndef _WIN32
+    pthread_setname_np(pthread_self(), "mpi_progress");
+#endif
+    std::unique_lock<std::mutex> lock(mMutex);
+    while (!mCondVar.wait_for(lock, mInterval, [this] { return mShouldStop; }))
+    {
+        lock.unlock();
+        int flag = 0;
+        int const rc = MPI_Iprobe(MPI_ANY_SOURCE, mProbeTag, mComm, &flag, MPI_STATUS_IGNORE);
+        mNumProbes.fetch_add(1, std::memory_order_relaxed);
+        lock.lock();
+        if (rc != MPI_SUCCESS)
+        {
+            TLLM_LOG_ERROR("MPI progress thread: MPI_Iprobe failed with error code %d; the thread stops.", rc);
+            break;
+        }
+    }
+#endif // ENABLE_MULTI_DEVICE
+    mRunning.store(false);
 }
 
 } // namespace tensorrt_llm::mpi
