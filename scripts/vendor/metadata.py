@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from pathlib import Path
+from difflib import SequenceMatcher
+from pathlib import Path, PurePosixPath
 
 import yaml
 
@@ -23,6 +24,8 @@ else:
 
 BEGIN = "<!-- vendor-promotion:start -->"
 END = "<!-- vendor-promotion:end -->"
+SIMILARITY_THRESHOLD = 0.9
+_SIMILARITY_METRIC = "sequence-matcher-lines-v1"
 
 
 def template(vendor_name: str, upstream_repo: str) -> str:
@@ -38,6 +41,7 @@ def parse(body: str, vendor_name: str, upstream_repo: str) -> dict:
     """Read exactly one marked block and validate the selected vendor's inputs."""
     if len(body) > 65536:
         raise ValueError("PR description exceeds the supported metadata size.")
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
     if body.count(BEGIN) != 1 or body.count(END) != 1:
         raise ValueError("PR description must contain exactly one vendor-promotion marked block.")
     start, end = body.index(BEGIN) + len(BEGIN), body.index(END)
@@ -121,8 +125,40 @@ def fingerprint(value: dict) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def _patch(repo: Path, base: str, head: str) -> str:
-    """Normalize hunk coordinates, retaining whitespace, paths, modes, and binary data."""
+def _patch(
+    repo: Path, base: str, head: str, *, source: str = ".", include: tuple[str, ...] = ("**/*",)
+) -> str:
+    """Compare lock-selected edits, retaining bytes, paths, modes, and hunk boundaries."""
+    changed = promote._run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base,
+            head,
+            "--",
+        ],
+        strip=False,
+        binary_output=True,
+    )
+    # Use the vendoring glob semantics rather than Git's different pathspec
+    # rules. Enumerate both sides without rename detection to include deletions
+    # and moves across the selection boundary; pass the results as literal paths.
+    selected = []
+    for path in changed.split("\0"):
+        if not path or not PurePosixPath(path).is_relative_to(source):
+            continue
+        relative = PurePosixPath(path).relative_to(source).as_posix()
+        if relative != "." and manage._matches(relative, include):
+            selected.append(f":(top,literal){path}")
+    if not selected:
+        return ""
     diff = promote._run(
         [
             "git",
@@ -135,18 +171,20 @@ def _patch(repo: Path, base: str, head: str) -> str:
             "--binary",
             "--full-index",
             "--no-color",
-            "--unified=3",
+            "--unified=0",
+            "--inter-hunk-context=0",
             base,
             head,
             "--",
+            *selected,
         ],
         strip=False,
         binary_output=True,
     )
-    # Blob IDs and hunk positions change on rebases. Keep surrounding lines and
-    # function context so identical edits at different code sites do not match.
+    # Hunk labels are Git-generated context, not changed code. Keep only the
+    # boundary marker; edit bytes, including changed function definitions, remain.
     return "\n".join(
-        re.sub(r"^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@", "@@", line)
+        re.sub(r"^@@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? @@.*$", "@@", line)
         for line in diff.split("\n")
         if not line.startswith("index ")
     )
@@ -156,41 +194,99 @@ def _commits(repo: Path, base: str, head: str) -> list[str]:
     return promote._git(repo, "rev-list", "--reverse", f"{base}..{head}").splitlines()
 
 
+def _similarity(source_patch: str, upstream_patch: str) -> float:
+    """Score normalized patch lines without discarding whitespace or frequent lines."""
+    if not source_patch or not upstream_patch:
+        return 0.0
+    if source_patch == upstream_patch:
+        return 1.0
+    return SequenceMatcher(
+        None,
+        source_patch.removesuffix("\n").split("\n"),
+        upstream_patch.removesuffix("\n").split("\n"),
+        autojunk=False,
+    ).ratio()
+
+
+def _upstream_reference(number: int, repository: str | None) -> str:
+    label = f"upstream PR #{number}"
+    return f"[{label}](https://github.com/{repository}/pull/{number})" if repository else label
+
+
+def similarity_feedback(evidence: dict[str, dict], upstream_repo: str | None = None) -> str:
+    """Describe accepted non-exact matches for feedback and durable provenance."""
+    lines = [
+        f"- `{sha}`: {_upstream_reference(item['upstream_pr'], upstream_repo)}, similarity "
+        f"**{item['similarity']:.2%}** — accepted "
+        f"(threshold {item['similarity_threshold']:.2%}; {item['method']})."
+        for sha, item in evidence.items()
+        if "similarity" in item
+    ]
+    if not lines:
+        return ""
+    return (
+        "No exact match was found for the following commits; similarity matching accepted them:\n\n"
+        + "\n".join(lines)
+        + "\n\nScores compare normalized patch lines in lock-selected files, not semantic "
+        "equivalence. These changes retain `retain-until-verified` refresh policy."
+    )
+
+
 def match(
     repo: Path,
     previous: str,
     reviewed: str,
     upstream_prs: dict[int, dict],
     resolutions: dict[str, dict] | None = None,
-) -> tuple[dict[str, int], dict[str, dict]]:
+    *,
+    source: str = ".",
+    include: tuple[str, ...] = ("**/*",),
+    upstream_repo: str | None = None,
+) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Match a linear source range against fetched immutable upstream PR snapshots.
 
-    Exact edits are compared across all files, not only selected vendored files.
+    Only lock-selected files are compared. None assignments record commits with
+    no selected changes, not upstream equivalence for the rest of those commits.
     Ambiguities remain author-actionable; titles and cherry-pick trailers are not proof.
     """
     commits = _commits(repo, previous, reviewed)
     if not commits:
         raise ValueError("Source update has no new commits to attribute.")
+    source_parents = {}
     for sha in commits:
-        if len(promote._git(repo, "show", "-s", "--format=%P", sha).split()) != 1:
+        parents = promote._git(repo, "show", "-s", "--format=%P", sha).split()
+        if len(parents) != 1:
             raise ValueError("Source history must be linear; rebase merge commits first.")
+        source_parents[sha] = parents[0]
     resolutions = resolutions or {}
     if set(resolutions) - set(commits):
         raise ValueError("Resolutions include commits outside the reviewed source delta.")
     candidates: dict[str, set[int]] = {sha: set() for sha in commits}
-    patches = {sha: _patch(repo, f"{sha}^", sha) for sha in commits}
+    patches = {sha: _patch(repo, f"{sha}^", sha, source=source, include=include) for sha in commits}
+    if any(not patches[sha] for sha in resolutions):
+        raise ValueError("Remove resolutions for commits with no lock-selected file changes.")
+    series = _patch(repo, previous, reviewed, source=source, include=include)
     methods: dict[tuple[str, int], str] = {}
+    comparisons: dict[int, list[tuple[str, str, str, str]]] = {}
     for number, pr in upstream_prs.items():
         base, head = promote._sha(pr["base"]["sha"]), promote._sha(pr["head"]["sha"])
         merge_base = promote._git(repo, "merge-base", base, head)
         upstream_commits = _commits(repo, merge_base, head)
         upstream_patches = set()
+        comparisons[number] = []
         for sha in upstream_commits:
             parents = promote._git(repo, "show", "-s", "--format=%P", sha).split()
             if len(parents) == 1:
-                upstream_patches.add(_patch(repo, parents[0], sha))
-        aggregate = _patch(repo, merge_base, head)
+                patch = _patch(repo, parents[0], sha, source=source, include=include)
+                upstream_patches.add(patch)
+                if patch:
+                    comparisons[number].append(("similar-edits", parents[0], sha, patch))
+        aggregate = _patch(repo, merge_base, head, source=source, include=include)
+        if aggregate:
+            comparisons[number].append(("similar-upstream-aggregate", merge_base, head, aggregate))
         for sha in commits:
+            if not patches[sha]:
+                continue
             if sha in upstream_commits:
                 candidates[sha].add(number)
                 methods[sha, number] = "same-commit"
@@ -202,13 +298,43 @@ def match(
                 methods[sha, number] = "upstream-aggregate"
         # A whole reviewed series may be squashed into one upstream PR. Do not
         # invent individual correspondences: identify the shared group explicitly.
-        if aggregate and _patch(repo, previous, reviewed) == aggregate:
+        if aggregate and series == aggregate:
             for sha in commits:
+                if not patches[sha]:
+                    continue
                 candidates[sha].add(number)
                 methods.setdefault((sha, number), "source-series-aggregate")
+    # Exact matches take priority across all listed PRs. Approximate attribution
+    # is considered only when none exists, and is not permission to drop changes.
+    similarities: dict[str, dict[int, dict]] = {}
+    for sha in commits:
+        if not patches[sha] or sha in resolutions or candidates[sha]:
+            continue
+        similarities[sha] = {}
+        for number, choices in comparisons.items():
+            best = {"similarity": 0.0}
+            for method, base, head, patch in choices:
+                score = _similarity(patches[sha], patch)
+                if score > best["similarity"]:
+                    best = {
+                        "method": method,
+                        "similarity": score,
+                        "comparison": {
+                            "source_base": source_parents[sha],
+                            "source_head": sha,
+                            "upstream_base": base,
+                            "upstream_head": head,
+                        },
+                    }
+            similarities[sha][number] = best
+            if best["similarity"] >= SIMILARITY_THRESHOLD:
+                candidates[sha].add(number)
     assignments, evidence, unresolved = {}, {}, []
     for sha in commits:
-        if sha in resolutions:
+        if not patches[sha]:
+            assignments[sha] = None
+            evidence[sha] = {"method": "outside-vendor-scope", "refresh_policy": "retain"}
+        elif sha in resolutions:
             resolution = resolutions[sha]
             number = resolution["upstream_pr"]
             if number not in upstream_prs:
@@ -223,25 +349,54 @@ def match(
             number = next(iter(candidates[sha]))
             assignments[sha] = number
             evidence[sha] = {
-                "method": methods[sha, number],
                 "upstream_head": upstream_prs[number]["head"]["sha"],
                 "upstream_base": upstream_prs[number]["base"]["sha"],
             }
+            if sha in similarities:
+                evidence[sha].update(
+                    similarities[sha][number],
+                    upstream_pr=number,
+                    similarity_threshold=SIMILARITY_THRESHOLD,
+                    similarity_metric=_SIMILARITY_METRIC,
+                    refresh_policy="retain-until-verified",
+                )
+            else:
+                evidence[sha]["method"] = methods[sha, number]
         else:
             options = (
                 ", ".join(f"#{number}" for number in sorted(candidates[sha])) or "no exact match"
             )
-            unresolved.append(f"- `{sha}`: {options}")
+            detail = f"- `{sha}`: {options}"
+            if sha in similarities:
+                closest = sorted(
+                    similarities[sha].items(), key=lambda item: (-item[1]["similarity"], item[0])
+                )[:3]
+                scores = (
+                    ", ".join(
+                        f"{_upstream_reference(number, upstream_repo)}: {item['similarity']:.2%}"
+                        for number, item in closest
+                    )
+                    or "no upstream candidates"
+                )
+                outcome = "multiple PRs meet" if candidates[sha] else "no PR meets"
+                detail += (
+                    f"; best similarities: {scores}; {outcome} the "
+                    f"{SIMILARITY_THRESHOLD:.2%} similarity threshold"
+                )
+            unresolved.append(detail)
+    accepted = similarity_feedback(evidence, upstream_repo)
     if unresolved:
         raise ValueError(
             "Author action required: upstream attribution is unresolved. Add missing upstream PRs, "
             "update/rebase the source pin, or add a targeted resolution with an upstream_pr and "
             "reason for each commit below. No complete commit_map is required.\n"
             + "\n".join(unresolved)
+            + ("\n\n" + accepted if accepted else "")
         )
-    if set(assignments.values()) != set(upstream_prs):
+    if set(assignments.values()) - {None} != set(upstream_prs):
         raise ValueError(
-            "Some listed upstream PRs cover no new source commits; remove unrelated PRs."
+            "Some listed upstream PRs cover no new lock-selected changes; remove unrelated PRs."
+            + ("\n\n" + accepted if accepted else "")
         )
     return assignments, evidence
 
@@ -252,8 +407,13 @@ def resolve(
     reviewed: manage.Vendor,
     entry: dict,
     cache: Path,
-) -> tuple[dict[str, int], dict[str, dict]]:
+) -> tuple[dict[str, int | None], dict[str, dict]]:
     """Fetch only Git data into a private bare cache and resolve declared PRs."""
+    if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
+        raise ValueError(
+            "Automatic attribution requires unchanged lock source/include selection; "
+            "separate the selection change from the source update."
+        )
     cache.mkdir(parents=True, exist_ok=True)
     if not (cache / "HEAD").exists():
         promote._git(cache, "init", "--bare", "--quiet")
@@ -299,4 +459,13 @@ def resolve(
                 promote._sha(sha),
             )
         prs[number] = pr
-    return match(cache, previous.commit, reviewed.commit, prs, entry["resolutions"])
+    return match(
+        cache,
+        previous.commit,
+        reviewed.commit,
+        prs,
+        entry["resolutions"],
+        source=reviewed.source,
+        include=reviewed.include,
+        upstream_repo=gh.upstream_repo,
+    )

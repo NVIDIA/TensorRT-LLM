@@ -27,7 +27,7 @@ lock and is not migrated by this change.
 ```mermaid
 flowchart TD
     source[Source-update PR changes a vendor pin] --> metadata[Author lists upstream PRs in description]
-    metadata --> match[Bot validates metadata and matches immutable commits]
+    metadata --> match[Bot validates metadata and matches lock-selected file changes]
     match -->|missing or ambiguous| feedback[Request changes with author-facing instructions]
     feedback -->|author corrects block, pin, or targeted resolution| metadata
     match -->|valid and source PR merged| verify[Verify ancestry, current lock, and materialization]
@@ -86,11 +86,52 @@ vendors:
 <!-- vendor-promotion:end -->
 ````
 
-No complete commit map is required. The bot compares the exact source delta
-against immutable upstream PR snapshots. Matching uses commit identity,
-whitespace- and context-preserving edits, and whole-series aggregate changes for squash/split
-cases. Commit titles, cherry-pick trailers, and fuzzy similarity are not proof.
+No complete commit map is required. The bot compares only files selected by the
+vendor lock's `source` directory and `include` patterns, using the same selection
+rules as vendoring, on both sides of each comparison. For `flashinfer-prims-ts`,
+this currently selects `flashinfer/attention/prims_ts/**/*.py`: differences in
+external tests, benchmarks, or unselected documentation do not prevent a match.
+Changing `source` or `include` during the source update requires a separate
+selection change; automatic attribution refuses to silently narrow its scope.
+
+The selected source delta is compared against immutable upstream PR snapshots.
+Matching uses commit identity, zero-context edits, and whole-series aggregate
+changes for squash/split cases.
+Edit matching ignores unchanged neighboring lines, line numbers, blob IDs, and
+Git-generated hunk labels. It preserves changed-line whitespace, file paths/modes,
+binary data, and hunk boundaries. Function definitions that are actually added or
+removed remain part of the comparison; only labels in hunk headers are ignored.
+Identical edits at different locations in the same file can therefore match;
+this establishes textual attribution, not semantic equivalence. Exact matches
+take priority; multiple exact matches remain ambiguous.
 Merged upstream PRs can still be paired using their original head history.
+
+When a source commit has no exact match, the bot compares its normalized patch
+lines against each upstream commit and PR aggregate. A unique upstream PR with
+similarity **>= 0.9** is accepted. The metric is Python
+`SequenceMatcher(autojunk=False)`: `2 * matched_lines / (source_lines + upstream_lines)`.
+Whitespace remains significant, repeated lines are not discarded, and empty
+patches never establish similarity. The unrounded score determines acceptance;
+comments display rounded percentages. Whole-source-series matching still requires
+exact equality, so aggregate similarity cannot hide an unmatched individual commit.
+
+Comments show accepted non-exact matches with their scores and threshold. Below
+the threshold, or when multiple PRs qualify, author-action feedback shows the
+closest upstream PRs and scores. Similarity matches record the score, metric,
+threshold, compared immutable revisions, and `retain-until-verified` refresh policy
+in promotion provenance. They count as attribution for promotion, not code-review
+approval or proof that changes can be dropped during refresh. Commit titles and
+cherry-pick trailers are not evidence. Authors still resolve ambiguous or
+below-threshold matches explicitly.
+
+Commits with no lock-selected changes need no upstream attribution or author
+resolution. Empty selected patches never count as an upstream match; omit PRs
+that cover only excluded changes. The promotion record saves `attribution_scope`
+and marks excluded-only commits `outside-vendor-scope`, in an unpaired group with
+`refresh_policy: retain`. All source commits still undergo the linear-history
+and ancestry checks, and the promoted SHA and vendored-tree verification remain
+unchanged. Scoped attribution does not prove whole-commit equivalence or authorize
+dropping changes to excluded files during a future source-branch refresh.
 
 If attribution is unresolved, feedback lists the full source SHAs and candidate
 PRs. **The PR author**, not the operator, resolves it by adding missing upstream
@@ -164,6 +205,59 @@ An explicit `--since 2026-01-01T00:00:00Z` restricts historical discovery; use t
 same cutoff on every launch, including recovery. Historical updates belonging
 to another canonical branch, or superseded pins without a recoverable promotion,
 are not promoted or sent author feedback.
+
+### Monitoring health
+
+`--log-level INFO` is the default, in both foreground and daemon mode. Logs use
+UTC timestamps. INFO includes poll start/end, discovery counts, elapsed time,
+PR metadata/feedback and promotion transitions, and the next polling deadline.
+Unchanged PR outcomes are not logged repeatedly. `WARNING`/`ERROR` suppress the
+INFO heartbeat and summaries; DEBUG is not needed for normal monitoring. Git
+and promotion subprocess output still goes to the daemon log independently of
+the Python logging threshold.
+
+During an active operation, a log-only heartbeat runs every 30 seconds, including
+while the worker waits for GitHub or Git. It reports the phase, PR number (when
+known), operation age, and counters. A heartbeat proves only that the reporting
+thread is alive: unchanged counters and growing operation age may indicate a
+slow or stuck operation. It does not advance the progress or completion timestamp.
+Idle intervals are described by `Next poll at ...`, not continuous heartbeat noise.
+
+`status` reads the local cache without creating or repairing a database:
+
+```bash
+python scripts/vendor/bot.py status --workdir /path/to/private/vendor-bot-state
+tail -n 100 /path/to/private/vendor-bot-state/bot.log
+```
+
+The JSON separates process liveness from work completion:
+
+| Field | Meaning |
+| --- | --- |
+| `running`, `pid`, `publish` | Process lock held, recorded PID, and whether remote writes are enabled; not a health verdict |
+| `operation`, `progress_at` | Current phase/PR/start time and last worker checkpoint |
+| `counts` | Current poll's scanned records, tracked lock PRs, relevant vendor updates, processed PRs, author-blocked PRs, and errors |
+| `last_completed_poll` | Last fully scanned/processed poll, even if individual PRs needed attention |
+| `last_successful_poll` | Last completed poll with no blocked PRs or processing errors; not a code-review approval or guarantee that promotions have merged |
+| `last_poll_summary` | Duration, counts, and outcome: `ok`, `needs_attention`, `failed`, or `interrupted` |
+| `last_error` | Historical error timestamp, PR, and bounded single-line diagnostic; retained after recovery |
+| `next_poll_at` | Next scheduled poll, including exponential backoff after discovery failures |
+| `state_available`, `state_error` | Whether cached telemetry could be read; missing/corrupt state does not mean a held process lock is healthy |
+
+`scanned` counts PR records visited, not unique PRs (the initial open/history
+scans overlap). `tracked` includes lock changes for other vendors; `relevant`
+counts the selected vendor's eligible updates before promotion-state checks.
+Blocked PRs are author/metadata issues; errors are failed processing attempts.
+Logs include their PR numbers and reasons. Diagnostic summaries redact configured
+GitHub tokens, recognizable token formats, URL credentials, and authorization
+headers, and omit multiline YAML excerpts; no PR bodies or authentication
+configuration are intentionally logged.
+
+For monitoring, check the latest poll outcome and deadline along with the log.
+Do not interpret `running: true` or an old `last_error` alone as health/failure.
+Stopped processes have no current PID, operation, or next deadline in `status`,
+but retain historical poll/error information. Telemetry is disposable and never
+authorizes publication; restart recovery still verifies Git/GitHub provenance.
 
 ### Recovery after cache loss
 
