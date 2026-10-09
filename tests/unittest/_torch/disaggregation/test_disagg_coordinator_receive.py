@@ -339,12 +339,13 @@ def test_deferred_receive_of_a_terminated_request_is_dropped_unpublished(
     terminal_state,
 ) -> None:
     """A request that failed or finished while its receive waited is removed
-    on the next poll without querying its fence or starting the receive."""
+    on the next poll without querying its fence or starting the receive. It
+    stays active, as it does until the executor's error or completion pass
+    retires it, so the drop is decided by the state alone."""
     fence = _ScriptedEvent(False)
     h = _deferring_harness({1: fence})
     req = _gen_init(h, 1)
     h.coordinator.receive_gen_init([req])
-    h.active.remove(req)
     req.state = terminal_state
     fence._answers = [True]
 
