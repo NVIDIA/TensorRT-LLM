@@ -1381,7 +1381,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons_host = state.host.first_finish_reasons
         if first_finish_reasons_host is not None:
             first_finish_reasons = first_finish_reasons_host.tolist()
@@ -1399,6 +1398,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
             logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+
+        # Beam-search requests read their finish reasons from
+        # first_finish_reasons; only single-beam requests (and the batched
+        # fast path below) consume the per-step finish_reasons list, whose
+        # conversion scales with max_num_sequences x max_beam_width.
+        finish_reasons: FinishReasonsList = []
+        if (self._batch_fastpath_eligible and logprobs_state_list is None) or any(
+            req.py_beam_width == 1 for req in state.requests
+        ):
+            finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
         assert (beam_history_builders is not None) == self._use_beam_search
@@ -1492,9 +1501,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    beam_width_out = _get_beam_width_out(req)
+                    if beam_width_out == req.py_beam_width:
+                        # One binding call appends this step's token to every
+                        # beam; the C++ side requires exactly beam_width tokens.
+                        assert req.py_seq_slot is not None
+                        req.add_new_tokens(new_tokens_list[0][req.py_seq_slot][:beam_width_out])
+                    else:
+                        for beam_idx in range(beam_width_out):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
