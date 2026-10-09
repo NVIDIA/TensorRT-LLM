@@ -36,17 +36,22 @@ class TestFP4CalculateGlobalScale(unittest.TestCase):
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-    @parameterized.expand([
-        [1, 64, 7168, torch.bfloat16, False],
-        [1, 64, 7168, torch.float16, False],
-        [1, 64, 7168, torch.bfloat16, True],
-        [1, 64, 4096, torch.bfloat16, True],
-        [8, 8 * 64, 7168, torch.bfloat16, False],
-        [8, 8 * 64, 7168, torch.bfloat16, True],
-        [16, 16 * 64, 7168, torch.bfloat16, True],
-        [32, 32 * 64, 7168, torch.bfloat16, True],
-    ],
-                          name_func=unittest_name_func)
+    @parameterized.expand(
+        [
+            [1, 64, 7168, torch.bfloat16, False],
+            [1, 64, 7168, torch.float16, False],
+            [1, 64, 7168, torch.bfloat16, True],
+            [1, 64, 4096, torch.bfloat16, True],
+            [8, 8 * 64, 7168, torch.bfloat16, False],
+            [8, 8 * 64, 7168, torch.bfloat16, True],
+            [16, 16 * 64, 7168, torch.bfloat16, True],
+            [32, 32 * 64, 7168, torch.bfloat16, True],
+            # Hidden sizes above 8192 make each thread run more than one vector
+            # iteration in the per-token global-scale kernel.
+            [1, 64, 12288, torch.bfloat16, False],
+            [1, 64, 16384, torch.bfloat16, False],
+        ],
+        name_func=unittest_name_func)
     @skip_pre_blackwell_unittest
     def test_calculate_nvfp4_global_scale_accuracy(self, batch_size,
                                                    max_token_num, hidden_size,
