@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from functools import wraps
 from typing import TYPE_CHECKING, List
 
@@ -29,8 +44,15 @@ class SingleProcessGroup:
 
     @staticmethod
     def get_group():
-        return dist.group.WORLD if dist.is_initialized(
-        ) else SingleProcessGroup()
+        # The world process group when the whole job is a single rank, so
+        # callers can pass it to torch collectives. In a larger job there is
+        # no single-rank process group to return, so this object stands in:
+        # rank() is 0 and size() is 1, which is all a single-rank mapping
+        # needs. It is not a torch ProcessGroup; a collective handed it fails
+        # at the call.
+        if dist.is_initialized() and dist.get_world_size() == 1:
+            return dist.group.WORLD
+        return SingleProcessGroup()
 
     @staticmethod
     def rank():
@@ -150,7 +172,15 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     def _get_mesh_dim_by_name(self, name: str) -> dist.DeviceMesh:
         cls = DeviceMeshTopologyImpl
 
-        if cls.device_mesh is None and self.world_size == 1:
+        if self.world_size == 1:
+            # A single-rank mapping. Its dimensions are the mesh's only where
+            # the mesh dimension also has a single rank; otherwise the mesh
+            # belongs to a larger job and this mapping reports rank 0 of a
+            # size-1 group on its own.
+            mesh = cls.device_mesh
+            if mesh is not None and name in mesh.mesh_dim_names and mesh[
+                    name].size() == 1:
+                return mesh[name]
             return SingleProcessGroup()
 
         if name == 'tp':

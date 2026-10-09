@@ -63,6 +63,19 @@ class TestMapping(unittest.TestCase):
             join=True,
         )
 
+    @pytest.mark.gpu2
+    def test_one_rank_mapping_inside_a_larger_job(self):
+        """A Mapping with world_size 1 built while the job's mesh spans two ranks
+        must report rank 0 and size-1 groups of its own, not the job's."""
+        world_size = tp = 2
+
+        mp.spawn(
+            self._worker,
+            args=(world_size, get_free_port(), tp, 1, 1, -1, -1, "one_rank"),
+            nprocs=world_size,
+            join=True,
+        )
+
     @staticmethod
     def _worker(rank: int,
                 world_size: int,
@@ -128,6 +141,19 @@ class TestMapping(unittest.TestCase):
 
                 assert mpi_value == device_mesh_value, \
                     f"Property {prop} mismatch: MPI={mpi_value}, DeviceMesh={device_mesh_value} (rank {rank})"
+        elif test_type == "one_rank":
+            job = mapping_device_mesh
+            job.build_mesh()
+            assert job.tp_rank == rank and job.tp_group_pg.size() == world_size
+
+            one = Mapping(world_size=1, tp_size=1, rank=0)
+            assert (one.tp_rank, one.pp_rank, one.cp_rank) == (0, 0, 0)
+            assert one.tp_group == [0] and one.pp_group == [
+                0
+            ] and one.cp_group == [0]
+            for group in (one.tp_group_pg, one.pp_group_pg, one.cp_group_pg):
+                assert group.size() == 1 and group.rank() == 0, \
+                    f"one-rank mapping borrowed the job's group on rank {rank}"
         elif test_type == "pickle":
             mapping = mapping_device_mesh
 
