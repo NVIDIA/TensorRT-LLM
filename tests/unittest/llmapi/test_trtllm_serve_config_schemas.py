@@ -206,6 +206,68 @@ def test_serving_field_guard_rejects_empty_scan() -> None:
         _assert_serving_fields_in_schema("def serve(): pass", "serve", {})
 
 
+def test_input_schemas_come_from_runtime_validators(schemas: dict[str, dict]) -> None:
+    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs, MultimodalConfig, TorchLlmArgs
+
+    model_schema = generator._schema_for(TorchLlmArgs)
+    for name in ("env_overrides", "multimodal_config", "cuda_graph_config"):
+        assert (
+            schemas[generator.SERVE_SCHEMA]["properties"][name] == model_schema["properties"][name]
+        )
+    assert BaseLlmArgs.coerce_env_overrides_to_str({"FLAG": 1, "OTHER": True}) == {
+        "FLAG": "1",
+        "OTHER": "True",
+    }
+    assert isinstance(TorchLlmArgs.init_multimodal_config(None), MultimodalConfig)
+    assert TorchLlmArgs.infer_cuda_graph_config_mode({}) == {"mode": "decode"}
+    assert TorchLlmArgs.infer_cuda_graph_config_mode({"num_tokens": [8]})["mode"] == "encode"
+
+
+def test_yaml_aliases_are_shared(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.llmapi import llm_args
+
+    monkeypatch.setitem(llm_args.SERVE_CONFIG_ALIASES, "test_revision", "revision")
+    properties = generator.generate_serve_schema()["properties"]
+    for alias in ("hf_revision", "test_revision"):
+        assert properties[alias] == properties["revision"]
+        assert llm_args.update_llm_args_with_extra_dict({}, {alias: "branch"}) == {
+            "revision": "branch"
+        }
+        assert llm_args.update_llm_args_with_extra_dict(
+            {}, {alias: "branch", "revision": "canonical"}
+        ) == {"revision": "canonical"}
+
+
+@pytest.mark.parametrize(
+    ("config_name", "field", "cli_value", "yaml_value"),
+    [
+        ("kv_cache_config", "dtype", "fp8", "auto"),
+        ("multimodal_config", "video_pruning_rate", 0.4, 0.6),
+    ],
+)
+def test_flat_aliases_drive_runtime_and_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    config_name: str,
+    field: str,
+    cli_value: object,
+    yaml_value: object,
+) -> None:
+    from tensorrt_llm.llmapi import llm_args
+
+    monkeypatch.setitem(llm_args.SERVE_CLI_CONFIG_FIELDS[config_name], "test_alias", field)
+    config = llm_args.build_cli_config(config_name, test_alias=cli_value)
+    assert getattr(config, field) == cli_value
+    for explicit, expected in (({"test_alias"}, cli_value), (set(), yaml_value)):
+        merged = llm_args.update_llm_args_with_extra_dict(
+            {config_name: config}, {config_name: {field: yaml_value}}, explicit_cli_keys=explicit
+        )
+        assert getattr(merged[config_name], field) == expected
+    schema = generator.generate_disagg_schema()
+    expected = generator._schema_for(type(config))["properties"][field]
+    assert schema["properties"]["test_alias"] == expected
+    assert schema["$defs"]["DisaggServerBlock"]["properties"]["test_alias"] == expected
+
+
 @pytest.mark.parametrize(
     ("name", "definition", "field", "valid_values", "invalid_values"),
     [

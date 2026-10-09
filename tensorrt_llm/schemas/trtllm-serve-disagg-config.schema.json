@@ -1687,14 +1687,10 @@
         "cuda_graph_config": {
           "anyOf": [
             {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/DecodeCudaGraphConfig"
-                },
-                {
-                  "$ref": "#/$defs/EncodeCudaGraphConfig"
-                }
-              ]
+              "$ref": "#/$defs/DecodeCudaGraphConfig"
+            },
+            {
+              "$ref": "#/$defs/EncodeCudaGraphConfig"
             },
             {
               "type": "null"
@@ -2000,7 +1996,11 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "default": null,
+          "description": "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
+          "status": "prototype",
+          "title": "Env Overrides"
         },
         "force_dynamic_quantization": {
           "default": false,
@@ -2396,13 +2396,14 @@
         "multimodal_config": {
           "anyOf": [
             {
-              "$ref": "#/$defs/MultimodalConfig",
-              "status": "prototype"
+              "$ref": "#/$defs/MultimodalConfig"
             },
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Multimodal model configuration.",
+          "status": "prototype"
         },
         "mx_config": {
           "$ref": "#/$defs/ModelExpressConfig",
@@ -7632,14 +7633,10 @@
     "cuda_graph_config": {
       "anyOf": [
         {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DecodeCudaGraphConfig"
-            },
-            {
-              "$ref": "#/$defs/EncodeCudaGraphConfig"
-            }
-          ]
+          "$ref": "#/$defs/DecodeCudaGraphConfig"
+        },
+        {
+          "$ref": "#/$defs/EncodeCudaGraphConfig"
         },
         {
           "type": "null"
@@ -7957,7 +7954,11 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "default": null,
+      "description": "[EXPERIMENTAL] Environment variable overrides. NOTE: import-time-cached env vars in the code won't update unless the code fetches them from os.environ on demand.",
+      "status": "prototype",
+      "title": "Env Overrides"
     },
     "force_dynamic_quantization": {
       "default": false,
@@ -8383,13 +8384,14 @@
     "multimodal_config": {
       "anyOf": [
         {
-          "$ref": "#/$defs/MultimodalConfig",
-          "status": "prototype"
+          "$ref": "#/$defs/MultimodalConfig"
         },
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Multimodal model configuration.",
+      "status": "prototype"
     },
     "mx_config": {
       "$ref": "#/$defs/ModelExpressConfig",

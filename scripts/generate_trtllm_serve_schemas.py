@@ -100,30 +100,27 @@ def _nullable(schema: dict) -> dict:
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
-    from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_args import (
+        SERVE_CONFIG_ALIASES,
+        MoeLoadBalancerConfig,
+        TorchLlmArgs,
+    )
 
     # Annotated fields are derived; config changes still require snapshot regeneration and CPU tests.
     schema = _schema_for(TorchLlmArgs)
     # MODEL is supplied on the command line; nested required fields still apply.
     schema["required"] = [name for name in schema.get("required", []) if name != "model"]
     properties = schema["properties"]
-    # Keep YAML-only fields/aliases aligned with serve.py and update_llm_args_with_extra_dict().
+    for alias, name in SERVE_CONFIG_ALIASES.items():
+        properties[alias] = copy.deepcopy(properties[name])
+    # Keep server-only fields aligned with serve.py.
     properties.update(
-        hf_revision=copy.deepcopy(properties["revision"]),
         allow_request_chat_template={"type": "boolean", "default": False},
         internal_request_auth_key=_schema_for(InternalRequestAuthKey),
         disagg_cluster=_nullable(_schema_for(DisaggClusterConfig, schema)),
     )
-    # Update these input exceptions when serving merges or llm_args.py validators change normalization.
-    properties["env_overrides"] = _nullable({"type": "object", "additionalProperties": True})
-    properties["multimodal_config"] = _nullable(properties["multimodal_config"])
+    # Serving treats null as unset before constructing the non-optional telemetry model.
     properties["telemetry_config"] = _nullable(properties["telemetry_config"])
-    # The runtime infers mode when it is omitted; both variants can match a partial config.
-    # Revisit this relaxation when infer_cuda_graph_config_mode() changes.
-    for branch in properties["cuda_graph_config"]["anyOf"]:
-        if "oneOf" in branch:
-            branch["anyOf"] = branch.pop("oneOf")
-            branch.pop("discriminator", None)
     # Keep accepted forms aligned with TorchLlmArgs.validate_load_balancer().
     schema["$defs"]["MoeConfig"]["properties"]["load_balancer"] = {
         "anyOf": [_schema_for(MoeLoadBalancerConfig, schema), {"type": ["string", "null"]}]
@@ -154,16 +151,14 @@ def generate_disagg_schema() -> dict:
         extract_ctx_gen_cfgs,
         extract_disagg_cfg,
     )
+    from tensorrt_llm.llmapi.llm_args import SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs
 
     schema = generate_serve_schema()
     properties = schema["properties"]
-    # Keep flat aliases aligned with get_llm_args(); constraints come from the nested schemas.
-    for name, (definition, field) in {
-        "free_gpu_memory_fraction": ("KvCacheConfig", "free_gpu_memory_fraction"),
-        "kv_cache_dtype": ("KvCacheConfig", "dtype"),
-        "video_pruning_rate": ("MultimodalConfig", "video_pruning_rate"),
-    }.items():
-        properties[name] = copy.deepcopy(schema["$defs"][definition]["properties"][field])
+    for config_name, aliases in SERVE_CLI_CONFIG_FIELDS.items():
+        config = _schema_for(TorchLlmArgs.model_fields[config_name].annotation, schema)
+        for name, field in aliases.items():
+            properties[name] = copy.deepcopy(config["properties"][field])
     worker = _schema_for(extract_ctx_gen_cfgs, schema)
     # Only type is required and supplied internally; revisit if worker inputs gain required fields.
     worker["properties"].pop("type")
