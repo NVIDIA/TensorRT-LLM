@@ -22,7 +22,6 @@ TRTLLM backend) may consume them. These checks run on CPU.
 """
 
 import pytest
-import torch
 
 from tensorrt_llm._torch.attention.backends import VanillaAttentionMetadata
 
@@ -30,7 +29,7 @@ from tensorrt_llm._torch.attention.backends import VanillaAttentionMetadata
 def _make_metadata() -> VanillaAttentionMetadata:
     """Minimal metadata using the base-class update_helix_param hook."""
     return VanillaAttentionMetadata(
-        seq_lens=torch.tensor([1], dtype=torch.int),
+        seq_lens=None,
         num_contexts=0,
         max_num_requests=1,
         max_num_tokens=8,
