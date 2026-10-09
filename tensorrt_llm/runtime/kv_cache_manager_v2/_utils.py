@@ -406,11 +406,12 @@ MADV_HUGEPAGE: Final[int] = 14
 MADV_NOHUGEPAGE: Final[int] = 15
 MADV_POPULATE_WRITE: Final[int] = 23
 
-# TLLM_KV_CACHE_MANAGER_V2_THP=0 backs host pools with regular 4KB pages
-# (MADV_NOHUGEPAGE). On nodes with fragmented physical memory and THP
-# defrag=madvise, every 2MB THP fault stalls in direct compaction that
-# rarely succeeds, slowing pool population from GB/s to GB/min.
-USE_THP: Final[bool] = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_THP", "1") == "1"
+# Host pools use regular 4KB pages (MADV_NOHUGEPAGE) unless
+# TLLM_KV_CACHE_MANAGER_V2_THP=1 opts into MADV_HUGEPAGE. On nodes with
+# fragmented physical memory and THP defrag=madvise, every 2MB THP fault stalls
+# in direct compaction that rarely succeeds, slowing pool population from GB/s
+# to GB/min. Must match hostUseThp() in the C++ backend.
+USE_THP: Final[bool] = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_THP", "0") == "1"
 # TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS=0 disables prefaulting; pages are
 # then faulted in lazily, single-threaded, inside cuMemHostRegister.
 PREFAULT_THREADS: Final[int] = int(
