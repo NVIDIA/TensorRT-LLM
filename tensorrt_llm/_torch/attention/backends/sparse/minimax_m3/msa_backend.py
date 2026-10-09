@@ -535,9 +535,7 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
                 capture_graph=capture_graph,
             )
             prewarm_split_proxy_variants(
-                self._msa_index_kv_dtype(),
-                num_index_heads,
-                int(kv_cache_manager.tokens_per_block),
+                self._msa_index_kv_dtype(), num_index_heads, int(kv_cache_manager.tokens_per_block)
             )
         self._msa_buffers_ready = True
 

@@ -1397,9 +1397,7 @@ def test_long_prefix_chunk_gets_a_split_proxy_plan_over_its_own_pages(
     proxy = metadata.msa_prefill_proxy_plan
     assert proxy["qo_lens"] == [128] * 8 + [1]
     assert proxy["num_kv_splits"] == 16 and proxy["output_maxscore"]
-    expected = torch.cat(
-        [torch.arange(7, 7 + 1025 + i) for i in range(8)] + [torch.arange(7, 7 + 1033)]
-    )
+    expected = torch.cat([torch.arange(7, 7 + n) for n in range(1025, 1034)])
     assert torch.equal(metadata.msa_prefill_proxy_kv_indices, expected.to(torch.int32))
     assert metadata.msa_prefill_dense_plan["qo_lens"] == [1025]
 
