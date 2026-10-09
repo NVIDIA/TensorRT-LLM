@@ -18,6 +18,8 @@ Verifies that pretrained_config is populated and valid when the telemetry
 hook fires, and that telemetry_disabled flows through correctly.
 """
 
+import builtins
+import json
 import os
 import threading
 from pathlib import Path
@@ -35,7 +37,7 @@ from tensorrt_llm.usage import usage_lib
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
-MODEL_NAME = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+MODEL_NAME = "Qwen3/Qwen3-0.6B"
 _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 
 
@@ -82,15 +84,13 @@ class TestProcessLifecycleCounters:
         usage_lib._SESSION_LOCK = threading.Lock()
         usage_lib._REPORTER_STARTED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._REPORTER_STOP = threading.Event()
-        usage_lib._PENDING_TERMINAL = None
+        usage_lib._HEARTBEAT_STOP = threading.Event()
         usage_lib._PROCESS_PID = os.getpid()
         yield
-        usage_lib._REPORTER_STOP.set()
+        usage_lib._HEARTBEAT_STOP.set()
         usage_lib._SESSION = None
         usage_lib._SESSION_DISABLED = False
         usage_lib._REPORTER_ACTIVE = False
-        usage_lib._PENDING_TERMINAL = None
 
     def test_two_live_objects_update_concurrency_counters(self, enable_telemetry):
         """Two successful constructors share one session and prove overlap."""
@@ -149,7 +149,7 @@ class TestProcessLifecycleCounters:
         assert snapshot["llmInitializationFailures"] == 1
         assert snapshot["llmInstancesCreated"] == 0
 
-    def test_validated_dict_config_tracks_success_only(self, enable_telemetry):
+    def test_validated_dict_config_tracks_success(self, enable_telemetry):
         """A raw dict starts tracking only after it becomes a validated config."""
 
         def initialize(instance, *args, **kwargs):
@@ -169,6 +169,56 @@ class TestProcessLifecycleCounters:
         assert snapshot["llmInstancesCreated"] == 1
         with patch.object(BaseLLM, "_shutdown_resources"):
             llm.shutdown()
+
+    @pytest.mark.cpu_only
+    @pytest.mark.parametrize(
+        "telemetry_config", [{}, {"usage_context": "cli_bench"}, {"disabled": True}]
+    )
+    def test_validated_dict_config_tracks_build_failure(self, enable_telemetry, telemetry_config):
+        """Real argument validation enables tracking before model construction fails."""
+        from tensorrt_llm.commands._telemetry import run_with_terminal_reporting
+
+        error = RuntimeError("expected model build failure")
+        payloads = []
+        with (
+            patch.object(BaseLLM, "_build_model", side_effect=error) as build,
+            patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
+            patch.object(usage_lib, "_is_reporting_rank", return_value=True),
+            patch.object(usage_lib, "bounded_gpu_fields", return_value={}),
+            pytest.raises(RuntimeError) as raised,
+        ):
+            run_with_terminal_reporting(
+                lambda: LLM_torch(
+                    model="unused",
+                    skip_tokenizer_init=True,
+                    gpus_per_node=1,
+                    telemetry_config=telemetry_config,
+                )
+            )
+
+        assert raised.value is error
+        build.assert_called_once_with()
+        assert usage_lib._REPORTER_STARTED is False
+        if telemetry_config.get("disabled"):
+            assert payloads == []
+            assert usage_lib._SESSION is None
+            return
+
+        assert len(payloads) == 1
+        initial, terminal = payloads[0]["events"]
+        assert initial["name"] == "trtllm_initial_report"
+        assert terminal["name"] == "trtllm_exit_report"
+        for event in (initial, terminal):
+            params = event["parameters"]
+            assert params["llmInitializationAttempts"] == 1
+            assert params["llmInitializationFailures"] == 1
+            assert params["llmInstancesCreated"] == 0
+            assert params["ingressPoint"] == telemetry_config.get("usage_context", "llm_class")
+        meta = json.loads(initial["parameters"]["llmApiConfigMetaJson"])
+        assert meta["report_context"] == "pre_initialization_exit"
+        assert meta["source"] == "validated_pre_initialization"
+        assert terminal["parameters"]["terminationKind"] == "exception"
+        assert terminal["parameters"]["lifecyclePhase"] == "model_initialization"
 
     def test_invalid_config_does_not_disable_later_session(self, enable_telemetry):
         """A rejected config object cannot poison later valid telemetry."""
@@ -204,6 +254,42 @@ class TestProcessLifecycleCounters:
 
         assert llm._usage_lifecycle_active is False
         start_reporting.assert_called_once_with()
+
+    @pytest.mark.parametrize("failure", ["import", "collector"])
+    def test_startup_capture_failure_preserves_constructor(
+        self, monkeypatch, enable_telemetry, failure
+    ):
+        """Optional capture failures must not replace errors after argument validation."""
+        from tensorrt_llm.llmapi import llm as llm_module
+
+        downstream_error = RuntimeError("constructor continued past telemetry")
+
+        class Args:
+            model_fields = {}
+
+            def __init__(self, **kwargs):
+                self.telemetry_config = llm_args.TelemetryConfig()
+
+            @property
+            def mpi_session(self):
+                raise downstream_error
+
+        original_import = builtins.__import__
+
+        def fail_import(name, *args, **kwargs):
+            if name == "tensorrt_llm.usage.usage_lib":
+                raise ImportError("optional telemetry unavailable")
+            return original_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(llm_module, "TorchLlmArgs", Args)
+        monkeypatch.setattr(llm_module, "mpi_disabled", lambda: False)
+        if failure == "import":
+            monkeypatch.setattr(builtins, "__import__", fail_import)
+        else:
+            monkeypatch.setattr(usage_lib, "_capture_startup_context", lambda *a, **kw: 1 / 0)
+        with pytest.raises(RuntimeError) as raised:
+            LLM_torch(model="unused")
+        assert raised.value is downstream_error
 
     def test_shutdown_decrements_once_per_object(self, enable_telemetry):
         """Repeated shutdown calls cannot decrement the active gauge twice."""
@@ -241,7 +327,7 @@ class TestTelemetryPyTorchBackend:
         )
         assert isinstance(pretrained_config.architectures, list)
         assert len(pretrained_config.architectures) > 0
-        assert pretrained_config.architectures[0] == "LlamaForCausalLM"
+        assert pretrained_config.architectures[0] == "Qwen3ForCausalLM"
 
         assert captured.get("llm_args") is not None, "report_usage was not called with llm_args"
 
@@ -300,14 +386,13 @@ class TestRuntimeArchitecturePayloadFlow:
         monkeypatch.setattr(usage_lib, "_SESSION_LOCK", threading.Lock())
         monkeypatch.setattr(usage_lib, "_REPORTER_STARTED", False)
         monkeypatch.setattr(usage_lib, "_REPORTER_ACTIVE", False)
-        monkeypatch.setattr(usage_lib, "_PENDING_TERMINAL", None)
         monkeypatch.setattr(usage_lib, "_PROCESS_PID", os.getpid())
         monkeypatch.setattr(usage_lib, "_PROCESS_EXIT_HOOK_REGISTERED", True)
         assert usage_lib.apply_usage_session_config()
 
         with (
             patch.object(usage_lib, "_send_to_gxt", side_effect=payloads.append),
-            patch.object(usage_lib, "_REPORTER_STOP", stop_event),
+            patch.object(usage_lib, "_HEARTBEAT_STOP", stop_event),
         ):
             usage_lib._background_reporter(
                 report_args["llm_args"],
@@ -339,7 +424,7 @@ class TestTelemetryArchitectureExtraction:
         assert pretrained_config is not None
 
         arch = usage_lib._extract_architecture_class_name(pretrained_config)
-        assert arch == "LlamaForCausalLM", f"Expected 'LlamaForCausalLM', got '{arch}'"
+        assert arch == "Qwen3ForCausalLM", f"Expected 'Qwen3ForCausalLM', got '{arch}'"
 
 
 class TestTelemetryDisabledFlag:
@@ -487,7 +572,7 @@ class TestFeatureTrackingIntegration:
         assert set(features.keys()) == set(usage_lib._FEATURES_DEFAULTS.keys())
 
     def test_features_json_default_values_pytorch(self):
-        """Default TinyLlama config has expected feature defaults."""
+        """Default Qwen3-0.6B config has expected feature defaults."""
         import json
 
         captured, spy = _make_spy()
@@ -499,7 +584,7 @@ class TestFeatureTrackingIntegration:
         llm_args = captured.get("llm_args")
         features = json.loads(usage_lib._collect_features(llm_args))
 
-        # TinyLlama loaded with defaults: no LoRA, no spec dec, no chunked prefill
+        # Qwen3-0.6B loaded with defaults: no LoRA, no spec dec, no chunked prefill
         assert features["lora"] is False
         assert features["speculative_decoding"] is False
         assert features["chunked_context"] is False

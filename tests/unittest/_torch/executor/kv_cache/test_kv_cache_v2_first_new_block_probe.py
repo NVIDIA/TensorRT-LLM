@@ -48,6 +48,7 @@ def make_stub_manager(
     mgr = object.__new__(KVCacheManagerV2)
     mgr.tokens_per_block = tokens_per_block
     mgr.enable_block_reuse = enable_block_reuse
+    mgr._swa_endpoint_rewind = 0
     # Read by _context_reuse_tokens, which both paths marshal through. Non-zero
     # for a one-model draft, which reads D prompt tokens past the target's end.
     mgr.reuse_match_backoff = reuse_match_backoff
@@ -70,7 +71,7 @@ def make_stub_manager(
     mgr._stream = Mock()
     mgr.impl = Mock()
     mgr.impl.probe_first_new_block_key.return_value = b"probed-block-key"
-    mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0)
+    mgr.impl.create_kv_cache.return_value = Mock(num_committed_tokens=0, beam_width=1)
     # Resume touches real CUDA state; the token marshalling is already done.
     mgr._resume_and_restore = lambda req_id, kv_cache: True
     return mgr

@@ -952,6 +952,40 @@ def _minimax_m3_fused_sparse_qkv_producer_fake(
     )
 
 
+def _dispatch_attention_over_live_tokens(
+    attn_layer: "MiniMaxM3Attention",
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    attn_metadata: AttentionMetadata,
+    output: torch.Tensor,
+) -> None:
+    """Run the attention core over the step's live tokens alone.
+
+    A piecewise CUDA graph pads token-shaped inputs up to its capture bucket
+    without adding requests to go with them (see _get_padding_params in
+    model_engine), so q can outrun the rows the batch has. The kernels below
+    read a request out of a token index, so the pad comes off here, once for
+    both dispatch paths.
+
+    The pad rows of output are left as the buffer supplied them. Nothing reads
+    them for its own result, and clearing them would put a device launch behind
+    a host-side count on every layer of every step.
+    """
+    num_tokens = int(attn_metadata.num_tokens)
+    attn_layer._dispatch_attention_backend(
+        q[:num_tokens],
+        k[:num_tokens] if k is not None else None,
+        v[:num_tokens] if v is not None else None,
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
+    )
+
+
 @torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
 def minimax_m3_attn_custom_op_inplace(
     q: Optional[torch.Tensor],
@@ -989,15 +1023,9 @@ def minimax_m3_attn_custom_op_inplace(
         k = v = idx_k = None
     if q is None:
         raise RuntimeError(f"MiniMax-M3 attention layer {layer_idx} received no query tensor.")
-    attn_layer._dispatch_attention_backend(
-        q[:num_tokens],
-        k[:num_tokens] if k is not None else None,
-        v[:num_tokens] if v is not None else None,
-        idx_q[:num_tokens] if idx_q is not None else None,
-        idx_k[:num_tokens] if idx_k is not None else None,
-        attn_metadata,
-        output[:num_tokens],
-    )
+    # The live token count is a host value, so the compiled graph above must
+    # not see it: it would guard on it and recapture per count.
+    _dispatch_attention_over_live_tokens(attn_layer, q, k, v, idx_q, idx_k, attn_metadata, output)
 
 
 maybe_bcg_minimax_m3_attn_custom_op_inplace = eager_on_graph(minimax_m3_attn_custom_op_inplace)
@@ -1959,7 +1987,9 @@ class MiniMaxM3Attention(Attention):
                 output,
             )
         else:
-            self._dispatch_attention_backend(q, k, v, idx_q, idx_k, attn_metadata, output)
+            # A step that runs here rather than through compile is padded all
+            # the same, since the bucket is agreed across ranks.
+            _dispatch_attention_over_live_tokens(self, q, k, v, idx_q, idx_k, attn_metadata, output)
         return output
 
     def _dispatch_attention_backend(
@@ -2854,7 +2884,7 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             model_config = get_text_model_config(model_config)
         if model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4:
             # M3's 57 sparse target layers have an MSA NVFP4 consumer, but the
-            # one-model Eagle layer has no shipped P32 NVFP4 decode cubin.
+            # one-model Eagle layer has no shipped NVFP4 trtllm-gen cubin.
             # Keep its modules and shared draft cache on their established FP8
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8

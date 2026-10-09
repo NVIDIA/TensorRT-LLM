@@ -15,12 +15,14 @@ to PyExecutor, including:
 import threading
 import time
 import types
+from contextlib import nullcontext
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch import models as torch_models
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import GenTransferStatus
 from tensorrt_llm._torch.disaggregation.orchestration.admission import (
     DisaggTransferAdmissionController,
@@ -28,6 +30,9 @@ from tensorrt_llm._torch.disaggregation.orchestration.admission import (
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.orchestration.interfaces import ExecutorEffects
 from tensorrt_llm._torch.distributed.communicator import ReduceOp
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledModelRunner
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
@@ -58,6 +63,129 @@ from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfi
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize(
+    "request_flags, expected_gather",
+    [
+        ([False], False),
+        ([True], True),
+        ([False, False], False),
+        ([False, True], True),
+        ([True, False], True),
+    ],
+)
+def test_forward_step_carries_context_logits_request_to_runner(request_flags, expected_gather):
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [
+        types.SimpleNamespace(context_chunk_size=3, py_return_context_logits=flag)
+        for flag in request_flags
+    ]
+    logits = torch.arange(len(request_flags) * 12).reshape(-1, 4)
+    runner = Mock(spec=ScheduledModelRunner)
+    runner.forward.side_effect = lambda inputs, **kwargs: {
+        "logits": logits if inputs.gather_context_logits else logits[2::3]
+    }
+    engine = object.__new__(PyTorchModelEngine)
+    engine._runner = runner
+    engine.enable_spec_decode = False
+    engine.runtime_draft_len = 0
+    resources = object()
+    cache_indirection = object()
+    new_tensors = object()
+    executor = types.SimpleNamespace(
+        model_engine=engine,
+        resource_manager=resources,
+        iter_counter=0,
+        sampler=Mock(get_cache_indirection=Mock(return_value=cache_indirection)),
+        execution_stream=Mock(),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=Mock(),
+        _attach_encoder_output_to_execution_stream=Mock(),
+        _mark_cross_kv_projection_consumed=Mock(),
+        _kv_connector_wait_for_save=Mock(),
+        _handle_errors=Mock(),
+    )
+    with (
+        patch("torch.cuda.current_stream", return_value=Mock()),
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter"),
+    ):
+        outputs = PyExecutor._forward_step(executor, batch, new_tensors)
+
+    executor._handle_errors.assert_not_called()
+    runner.forward.assert_called_once()
+    inputs = runner.forward.call_args.args[0]
+    assert inputs.batch is batch
+    assert inputs.gather_context_logits is expected_gather
+    assert inputs.new_tensors_device is new_tensors
+    assert inputs.cache_indirection_buffer is cache_indirection
+    assert runner.forward.call_args.kwargs["resource_manager"] is resources
+    torch.testing.assert_close(outputs["logits"], logits if expected_gather else logits[2::3])
+
+
+@pytest.mark.parametrize("end_id", [None, -1, 0, 127])
+def test_validate_token_id_range_accepts_end_id(end_id) -> None:
+    model = Mock(spec=DecoderModelForCausalLM)
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(
+        py_end_id=end_id,
+        py_multimodal_data=None,
+        check_token_id_range=lambda _vocab_size: True,
+    )
+
+    PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize("end_id", [-2, 128])
+def test_validate_token_id_range_rejects_end_id(end_id) -> None:
+    model = Mock(spec=DecoderModelForCausalLM)
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
+        PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-1, 127])
+def test_validate_token_id_range_accepts_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    PyExecutor._validate_token_id_range(executor, request)
+
+
+@pytest.mark.parametrize(
+    "model_class_name",
+    [
+        "BartForConditionalGeneration",
+        "T5ForConditionalGeneration",
+        "WhisperForConditionalGeneration",
+    ],
+)
+@pytest.mark.parametrize("end_id", [-2, 128])
+def test_validate_token_id_range_rejects_encoder_decoder_end_id(model_class_name, end_id) -> None:
+    model = Mock(spec=getattr(torch_models, model_class_name))
+    object.__setattr__(model, "lm_head", types.SimpleNamespace(num_embeddings=128))
+    executor = types.SimpleNamespace(model_engine=types.SimpleNamespace(model=model))
+    request = types.SimpleNamespace(py_end_id=end_id)
+
+    with pytest.raises(ValueError, match=rf"EndId \({end_id}\) is not within acceptable range"):
+        PyExecutor._validate_token_id_range(executor, request)
 
 
 class _InflightRequestIds:
@@ -169,6 +297,15 @@ def _make_async_encoder_executor(future):
     return executor
 
 
+def _encoder_decoder_runner(batch_sizes, *, pad_to_limit):
+    runner = object.__new__(EncoderDecoderRunner)
+    runner._encoder_stage = types.SimpleNamespace(
+        _encoder_graph_batch_sizes=tuple(batch_sizes),
+        _encoder_graph_pad_to_limit=pad_to_limit,
+    )
+    return runner
+
+
 def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8):
     """Build a PyExecutor stub wired for token-path encoder batch-wait admission."""
     executor = object.__new__(PyExecutor)
@@ -185,8 +322,7 @@ def _make_encoder_batch_wait_executor(batch_sizes=None, encoder_max_batch_size=8
     )
     executor.model_engine = object.__new__(PyTorchModelEngine)
     executor.model_engine._cleanup_done = True
-    executor.model_engine._encoder_graph_batch_sizes = tuple(batch_sizes)
-    executor.model_engine._encoder_graph_pad_to_limit = True
+    executor.model_engine._runner = _encoder_decoder_runner(batch_sizes, pad_to_limit=True)
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor
@@ -209,10 +345,9 @@ def _make_feature_encoder_batch_wait_executor(
     )
     executor.model_engine = object.__new__(PyTorchModelEngine)
     executor.model_engine._cleanup_done = True
-    executor.model_engine._encoder_graph_batch_sizes = (
-        tuple(runner_batch_sizes) if runner_enabled else ()
+    executor.model_engine._runner = _encoder_decoder_runner(
+        runner_batch_sizes if runner_enabled else (), pad_to_limit=False
     )
-    executor.model_engine._encoder_graph_pad_to_limit = False
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     return executor

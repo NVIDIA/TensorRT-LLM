@@ -17,10 +17,12 @@
 
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 
+#include "kv_cache_manager_v2/batch.h"
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/coldPageCodec.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/introspection.h"
@@ -31,6 +33,7 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/streamingEventSink.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
@@ -65,6 +68,14 @@ namespace tensorrt_llm::nanobind::batch_manager
 {
 namespace
 {
+
+//! A DLPack view keeps the batch's device allocation alive without importing torch.
+struct BatchDeviceArray
+{
+    std::shared_ptr<kv::Batch> batch;
+    kv::LayerGroupId group;
+    bool counts;
+};
 
 // Exposed via introspection sub-module for tests.
 class TestPaddingColdPageCodec final : public kv::IKvCacheColdPageCodec
@@ -460,10 +471,10 @@ static std::vector<kv::MmKey> castMmKeys(nb::handle values)
     return result;
 }
 
-static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
+static nb::list castMmKeys(std::vector<kv::MmKey> const& mmKeys)
 {
     nb::list result;
-    for (auto const& mmKey : data.mmKeys)
+    for (auto const& mmKey : mmKeys)
     {
         auto hash = nb::bytes(mmKey.hash.data(), mmKey.hash.size());
         if (mmKey.hasUuidField)
@@ -474,6 +485,21 @@ static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
         {
             result.append(nb::make_tuple(std::move(hash), mmKey.startOffset));
         }
+    }
+    return result;
+}
+
+static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
+{
+    return castMmKeys(data.mmKeys);
+}
+
+static nb::list castStreamingMmKeys(kv::StreamingBlockStoredData const& data)
+{
+    nb::list result;
+    for (auto const& mmKeys : data.mmKeys)
+    {
+        result.append(castMmKeys(mmKeys));
     }
     return result;
 }
@@ -1049,7 +1075,38 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         self.attentionDpRank, self.layerGroupId));
             });
 
-    nb::class_<kv::EventManager>(m, "KVCacheEventManager")
+    nb::class_<kv::EventSink>(m, "KVCacheEventSink");
+
+    nb::class_<kv::StreamingBlockStoredData>(m, "StreamingBlockStoredData")
+        .def_ro("block_hashes", &kv::StreamingBlockStoredData::blockHashes)
+        .def_ro("parent_block_hash", &kv::StreamingBlockStoredData::parentBlockHash)
+        .def_ro("token_ids", &kv::StreamingBlockStoredData::tokenIds)
+        .def_ro("lora_id", &kv::StreamingBlockStoredData::loraId)
+        .def_prop_ro("mm_keys", [](kv::StreamingBlockStoredData const& self) { return castStreamingMmKeys(self); });
+
+    nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
+        .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
+
+    nb::class_<kv::StreamingEventStats>(m, "StreamingEventStats")
+        .def_ro("stored_blocks", &kv::StreamingEventStats::storedBlocks)
+        .def_ro("removed_blocks", &kv::StreamingEventStats::removedBlocks)
+        .def_ro("partial_blocks_suppressed", &kv::StreamingEventStats::partialBlocksSuppressed)
+        .def_ro("non_target_life_cycles_ignored", &kv::StreamingEventStats::nonTargetLifeCyclesIgnored)
+        .def_ro("dropped_events", &kv::StreamingEventStats::droppedEvents);
+
+    nb::class_<kv::StreamingEventSink, kv::EventSink>(m, "StreamingEventSink")
+        .def(nb::init<int, std::optional<int>>(), nb::arg("max_entries") = 50'000,
+            nb::arg("mm_token_id_offset") = std::nullopt)
+        .def(
+            "set_target_life_cycle",
+            [](kv::StreamingEventSink& self, int lifeCycleId)
+            { self.setTargetLifeCycle(kv::LifeCycleId{lifeCycleId}); },
+            nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>())
+        .def("drain_iteration_events", &kv::StreamingEventSink::drainIterationEvents,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("stats", &kv::StreamingEventSink::getStats, nb::call_guard<nb::gil_scoped_release>());
+
+    nb::class_<kv::EventManager, kv::EventSink>(m, "KVCacheEventManager")
         .def(
             "__init__",
             [](kv::EventManager* self, int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
@@ -1341,13 +1398,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__bool__", [](kv::ScratchDesc const& self) { return static_cast<bool>(self); });
 
     nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
-        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"))
+        .def(nb::init<std::optional<int>, int, bool>(), nb::arg("window_size").none(), nb::arg("num_sink_blocks"),
+            nb::arg("is_sparse") = false)
         // Sink tokens round up to whole blocks. Bound rather than repeated in Python so the
         // connector's view of a life cycle is built by the same code as the allocator's.
         .def_static("make", &kv::AttnLifeCycle::make, nb::arg("window_size").none(), nb::arg("num_sink_tokens").none(),
-            nb::arg("tokens_per_block"))
+            nb::arg("tokens_per_block"), nb::arg("is_sparse") = false)
         .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
         .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def_ro("is_sparse", &kv::AttnLifeCycle::isSparse)
         .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
             nb::arg("tokens_per_block"))
         .def("__eq__", &kv::AttnLifeCycle::operator==);
@@ -1538,11 +1597,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool>(), nb::arg("role"), nb::arg("size"),
+            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
-        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride) DEF_COPY(kv::BufferConfig);
+        .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
+        .def_rw("is_sparse", &kv::BufferConfig::isSparse) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
         .def(nb::init<kv::LayerId, std::vector<kv::BufferConfig>, std::optional<int>, std::optional<int>>(),
@@ -1564,9 +1624,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("buffers", &kv::SsmLayerConfig::buffers) DEF_COPY(kv::SsmLayerConfig);
 
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
-        .def(nb::init<int, int>(), nb::arg("capacity"), nb::arg("history_length"))
+        .def(nb::init<int, int, int, int>(), nb::arg("capacity"), nb::arg("history_length"), nb::arg("beam_width") = 1,
+            nb::arg("prompt_length") = 0)
         .def_rw("capacity", &kv::KVCacheDesc::capacity)
         .def_rw("history_length", &kv::KVCacheDesc::historyLength)
+        .def_rw("beam_width", &kv::KVCacheDesc::beamWidth)
+        .def_rw("prompt_length", &kv::KVCacheDesc::promptLength)
         .def("__eq__",
             [](kv::KVCacheDesc const& self, nb::handle other)
             {
@@ -1579,8 +1642,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("__repr__",
             [](kv::KVCacheDesc const& self)
             {
-                return "KVCacheDesc(capacity=" + std::to_string(self.capacity)
-                    + ", history_length=" + std::to_string(self.historyLength) + ")";
+                return "KVCacheDesc(capacity=" + std::to_string(self.capacity) + ", history_length="
+                    + std::to_string(self.historyLength) + ", beam_width=" + std::to_string(self.beamWidth)
+                    + ", prompt_length=" + std::to_string(self.promptLength) + ")";
             }) DEF_COPY(kv::KVCacheDesc);
 
     nb::class_<kv::BatchDesc>(m, "BatchDesc")
@@ -1641,7 +1705,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::vector<kv::BatchDesc> constraints, std::optional<kv::BatchDesc> typicalStep,
                 std::optional<std::vector<float>> initialPoolRatio,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
-                bool textOnly)
+                bool textOnly, bool enablePartialCommit)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1664,6 +1728,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
                 cfg->textOnly = textOnly;
+                cfg->enablePartialCommit = enablePartialCommit;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1673,13 +1738,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("reuse_match_backoff") = 0, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("typical_step") = std::nullopt, nb::arg("initial_pool_ratio").none() = std::nullopt,
             nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("commit_min_snapshot") = false,
-            nb::arg("enable_stats") = true, nb::arg("text_only") = false)
+            nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
+        .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio,
@@ -1697,19 +1763,140 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<kv::PageStorageSnapshot>(m, "PageStorageSnapshot")
+        .def_prop_ro("version", &kv::PageStorageSnapshot::version)
+        .def_prop_ro("row", &kv::PageStorageSnapshot::row)
+        .def_prop_ro("base_page_indices", &kv::PageStorageSnapshot::basePageIndices)
+        .def_prop_ro("cache_levels",
+            [](kv::PageStorageSnapshot const& self)
+            {
+                std::vector<std::optional<int>> levels;
+                levels.reserve(self.cacheLevels().size());
+                for (auto const& level : self.cacheLevels())
+                    levels.push_back(level ? std::optional<int>{level->value()} : std::nullopt);
+                return levels;
+            })
+        .def_prop_ro("eligible_history_blocks", &kv::PageStorageSnapshot::eligibleHistoryBlocks)
+        .def("wait_ready", &kv::PageStorageSnapshot::waitReady, nb::arg("cuda_stream"),
+            nb::call_guard<nb::gil_scoped_release>());
+
+    nb::class_<BatchDeviceArray>(m, "BatchDeviceArray")
+        .def("__dlpack_device__",
+            [](BatchDeviceArray const& self)
+            { return std::make_pair(nb::device::cuda::value, self.batch->deviceId()); })
+        .def(
+            "__dlpack__",
+            [](BatchDeviceArray const& self, std::optional<intptr_t> stream, nb::kwargs kwargs)
+            {
+                if (kwargs.contains("copy") && !kwargs["copy"].is_none() && nb::cast<bool>(kwargs["copy"]))
+                {
+                    throw std::invalid_argument("Batch arrays support only zero-copy DLPack export");
+                }
+                if (kwargs.contains("dl_device") && !kwargs["dl_device"].is_none()
+                    && nb::cast<std::pair<int, int>>(kwargs["dl_device"])
+                        != std::make_pair(nb::device::cuda::value, self.batch->deviceId()))
+                {
+                    throw std::invalid_argument("Batch arrays cannot be exported to a different device");
+                }
+                // DLPack 1/2 denote the legacy/per-thread default CUDA streams.
+                auto cudaStream = stream.value_or(1);
+                if (cudaStream == 0 || cudaStream < -1)
+                {
+                    throw std::invalid_argument("Invalid DLPack CUDA stream");
+                }
+                if (cudaStream != -1)
+                {
+                    auto const consumerStream = cudaStream == 1 ? CU_STREAM_LEGACY
+                        : cudaStream == 2                       ? CU_STREAM_PER_THREAD
+                                                                : reinterpret_cast<CUstream>(cudaStream);
+                    nb::gil_scoped_release release;
+                    self.batch->waitReady(reinterpret_cast<kv::CudaStream>(consumerStream));
+                }
+                else
+                {
+                    nb::gil_scoped_release release;
+                    if (!self.batch->dirtyRows().empty())
+                    {
+                        throw kv::LogicError("Publish Batch metadata before exporting it");
+                    }
+                }
+                std::vector<size_t> shape{
+                    static_cast<size_t>(self.batch->maxRows()), static_cast<size_t>(self.batch->maxBeamWidth())};
+                auto address
+                    = self.counts ? self.batch->numBlocksAddress(self.group) : self.batch->pageTableAddress(self.group);
+                if (!self.counts)
+                {
+                    shape.push_back(self.batch->maxBlocks());
+                }
+                return nb::ndarray<int32_t, nb::device::cuda>(reinterpret_cast<int32_t*>(address), shape.size(),
+                    shape.data(), nb::cast(self.batch), nullptr, nb::dtype<int32_t>(), nb::device::cuda::value,
+                    self.batch->deviceId());
+            },
+            nb::arg("stream").none() = nb::none(), nb::arg("kwargs"));
+
+    nb::class_<kv::Batch>(m, "Batch")
+        .def(nb::init<std::shared_ptr<kv::KvCacheManager>, int, int, int>(), nb::arg("manager"), nb::arg("max_rows"),
+            nb::arg("max_blocks"), nb::arg("max_beam_width") = 1, nb::call_guard<nb::gil_scoped_release>())
+        .def("add", &kv::Batch::add, nb::arg("kv_cache"), nb::arg("row").none() = std::nullopt,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("remove", &kv::Batch::remove, nb::arg("kv_cache"), nb::call_guard<nb::gil_scoped_release>())
+        .def("close", &kv::Batch::close, nb::call_guard<nb::gil_scoped_release>())
+        .def("publish", &kv::Batch::publish, nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def("wait_ready", &kv::Batch::waitReady, nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def("record_read", &kv::Batch::recordRead, nb::arg("cuda_stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def("resize", &kv::Batch::resize, nb::arg("capacities"), nb::arg("history_lengths"), nb::arg("cuda_stream"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("dirty_rows", &kv::Batch::dirtyRows, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("max_rows", &kv::Batch::maxRows)
+        .def_prop_ro("max_blocks", &kv::Batch::maxBlocks)
+        .def_prop_ro("max_beam_width", &kv::Batch::maxBeamWidth)
+        .def_prop_ro("num_layer_groups", &kv::Batch::numLayerGroups)
+        .def(
+            "page_table",
+            [](std::shared_ptr<kv::Batch> self, int group)
+            {
+                self->pageTableAddress(kv::LayerGroupId{group});
+                return BatchDeviceArray{std::move(self), kv::LayerGroupId{group}, false};
+            },
+            nb::arg("layer_group_id"))
+        .def(
+            "num_blocks",
+            [](std::shared_ptr<kv::Batch> self, int group)
+            {
+                self->numBlocksAddress(kv::LayerGroupId{group});
+                return BatchDeviceArray{std::move(self), kv::LayerGroupId{group}, true};
+            },
+            nb::arg("layer_group_id"));
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
             "resume",
-            [](kv::KvCache& self, nb::object stream)
+            [](kv::KvCache& self, nb::object stream, std::optional<bool> isDecoding)
             {
                 std::optional<CUstream> optStream;
                 if (!stream.is_none())
                     optStream = reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream));
                 nb::gil_scoped_release rel;
-                return self.resume(optStream);
+                return self.resume(optStream, isDecoding);
             },
-            nb::arg("cuda_stream") = nb::none())
+            nb::arg("cuda_stream") = nb::none(), nb::arg("is_decoding") = nb::none())
+        .def("enter_decode", &kv::KvCache::enterDecode, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("is_decoding", &kv::KvCache::isDecoding)
+        .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("page_storage_dirty", &kv::KvCache::pageStorageDirty, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("page_storage_row", &kv::KvCache::pageStorageRow, nb::call_guard<nb::gil_scoped_release>())
+        .def("bind_page_storage_row", &kv::KvCache::bindPageStorageRow, nb::arg("row").none(),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("acknowledge_page_storage", &kv::KvCache::acknowledgePageStorage, nb::arg("version"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_page_storage_snapshot",
+            [](kv::KvCache const& self, int layerGroupId, int beamIdx)
+            { return self.getPageStorageSnapshot(kv::LayerGroupId{layerGroupId}, kv::BeamIndex{beamIdx}); },
+            nb::arg("layer_group_id"), nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
+        .def("record_page_storage_read", &kv::KvCache::recordPageStorageRead, nb::arg("cuda_stream"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("suspend", &kv::KvCache::suspend, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
@@ -1830,7 +2017,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 self.setCapacity(cap);
             })
         .def_prop_ro("tokens_per_block", &kv::KvCache::tokensPerBlock)
-        .def_prop_ro("beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); })
+        .def_prop_rw(
+            "beam_width", [](kv::KvCache const& self) { return self.beamWidth().value(); },
+            [](kv::KvCache& self, int beamWidth)
+            {
+                nb::gil_scoped_release release;
+                self.setBeamWidth(kv::BeamIndex{beamWidth});
+            })
         .def_prop_rw(
             "cuda_stream",
             [](kv::KvCache const& self) -> intptr_t { return reinterpret_cast<intptr_t>(self.cudaStream()); },
@@ -1860,6 +2053,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 kv::LayerGroupId const typedLayerGroupId{layerGroupId};
                 if (bufObj.is_none())
                 {
+                    nb::gil_scoped_release release;
                     self.setBasePageIndexBuf(typedBeamIdx, typedLayerGroupId, nullptr, 0);
                     return;
                 }
@@ -1879,6 +2073,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 } cleanup{&view};
                 if (std::string(view.format) != "i" || view.ndim != 1)
                     throw std::invalid_argument("set_base_page_index_buf: buffer must be 1-D int32 ('i')");
+                nb::gil_scoped_release release;
                 self.setBasePageIndexBuf(typedBeamIdx, typedLayerGroupId, static_cast<int32_t*>(view.buf),
                     static_cast<int>(view.len / sizeof(int32_t)));
             },
@@ -2032,6 +2227,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         [](kv::EventManager& eventManager, EventManagerTestBlock const& block, int lifeCycleId)
         { eventManager.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
         nb::arg("event_manager"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_stored_block",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block)
+        { eventSink.addStoredBlock(*block.block); },
+        nb::arg("event_sink"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_stored_life_cycle",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventSink.addStoredLifeCycle(*block.block, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_sink"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_removed_block",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block)
+        { eventSink.addRemovedBlock(block.block->key); },
+        nb::arg("event_sink"), nb::arg("block"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "streaming_event_sink_add_removed_life_cycle",
+        [](kv::StreamingEventSink& eventSink, EventManagerTestBlock const& block, int lifeCycleId)
+        { eventSink.addRemovedLifeCycle(block.block->key, kv::LifeCycleId{lifeCycleId}); },
+        nb::arg("event_sink"), nb::arg("block"), nb::arg("life_cycle_id"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "active_page_stats",
         [](kv::KvCache const& kvCache)
@@ -2227,6 +2442,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("quota"), nb::arg("slot_size_lists"), nb::arg("ratio_list"), nb::arg("granularity"),
         nb::arg("min_slots"), nb::call_guard<nb::gil_scoped_release>());
 
+    // CUDA virtual-memory primitives, reached through _introspection because they carry no
+    // stability promise: the native disaggregated bounce buffer reserves one contiguous fabric
+    // region with them and maps physical chunks into it up front.
+    nb::class_<kv::PooledPhysMemAllocator>(mIntrospection, "PooledPhysMemAllocator")
+        .def(nb::init<size_t>(), nb::arg("phys_mem_size"))
+        .def_prop_ro("device_id", &kv::PooledPhysMemAllocator::deviceId);
+    nb::class_<kv::VirtMem>(mIntrospection, "VirtMem")
+        // keep_alive<1, 3>: VirtMem holds PooledPhysMemAllocator by reference, so the allocator
+        // must outlive it. Argument 3 is the allocator (1 is self, 2 is vm_size).
+        .def(nb::init<size_t, kv::PooledPhysMemAllocator&, size_t>(), nb::arg("vm_size"), nb::arg("phys_mem_allocator"),
+            nb::arg("init_num_phys_mem") = 0, nb::keep_alive<1, 3>())
+        .def("destroy", &kv::VirtMem::destroy)
+        .def_prop_ro("address", &kv::VirtMem::address);
+
     // ---- Cold-page codec --------------------------------------------------
     nb::class_<kv::IKvCacheColdPageCodec>(m, "IKvCacheColdPageCodec");
     m.def("create_default_kv_cache_cold_page_codec", &kv::createDefaultKvCacheColdPageCodec,
@@ -2245,7 +2474,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::shared_ptr<kv::EventSink> eventSink;
                 if (!eventManager.is_none())
                 {
-                    eventSink = nb::cast<std::shared_ptr<kv::EventManager>>(eventManager);
+                    eventSink = nb::cast<std::shared_ptr<kv::EventSink>>(eventManager);
                 }
 
                 std::unique_ptr<kv::IKvCacheColdPageCodec> codec;
@@ -2282,6 +2511,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("config"), nb::arg("event_manager").none() = nb::none(),
             nb::arg("cold_page_codec").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
+        .def("is_sparse", &kv::KvCacheManager::isSparse, nb::arg("layer_id"), nb::arg("data_role"))
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -2509,6 +2739,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
+        .def_prop_ro("enable_partial_commit", &kv::KvCacheManager::enablePartialCommit)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KvCacheManager::isSwaScratchReuseEnabled)
         .def(
             "supports_index_mode",

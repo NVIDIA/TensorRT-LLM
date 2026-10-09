@@ -222,6 +222,15 @@
       "path": "cuda_graph_config.enable_padding"
     },
     {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "cuda_graph_config.extra_model_inputs.shape"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "cuda_graph_config.max_batch_size"
@@ -412,6 +421,15 @@
       "path": "encoder_cuda_graph_config.enable_padding"
     },
     {
+      "allowed_values": [
+        "num_tokens",
+        "batch_size"
+      ],
+      "capture_policy": "tuple[int|literal]",
+      "kind": "categorical",
+      "path": "encoder_cuda_graph_config.extra_model_inputs.shape"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "encoder_cuda_graph_config.max_batch_size"
@@ -503,6 +521,11 @@
       "path": "guided_decoding_backend"
     },
     {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "iter_stats_max_iterations"
@@ -573,6 +596,11 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_config.block_reuse_config.policy"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens"
     },
     {
       "capture_policy": "bool",
@@ -1070,6 +1098,11 @@
       "path": "peft_cache_config.optimal_adapter_size"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "per_request_spec_decode_stats"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "perf_metrics_max_requests"
@@ -1167,7 +1200,8 @@
         "nano-v3",
         "gemma4",
         "kimi_k2",
-        "kimi_k25"
+        "kimi_k25",
+        "k-exaone"
       ],
       "capture_policy": "allowlist|none",
       "kind": "categorical",
@@ -1287,6 +1321,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "sparse_attention_config.enable_heuristic_topk"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "sparse_attention_config.enable_kv_cache_offload"
     },
     {
       "capture_policy": "bool",

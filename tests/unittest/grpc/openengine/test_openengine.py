@@ -12,32 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for the OpenEngine gRPC adapter.
-
-The OpenEngine bindings resolve only from a custom index, so they are
-installed on the CPU-Generic stages that own this test (see the gateway
-install guard in jenkins/L0_Test.groovy). Tests that need the bindings are
-guarded with ``importorskip`` so the module still collects cleanly in an
-environment without them; the optional-dependency error path that every
-environment can exercise lives in ``tests/unittest/grpc/test_grpc_optional.py``.
-"""
+"""Unit tests for the OpenEngine gRPC adapter."""
 
 import asyncio
+import gc
 from types import SimpleNamespace
 
 import pytest
 
-openengine_pb2_grpc = pytest.importorskip(
-    "openengine.v1.openengine_pb2_grpc",
-    reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
-)
-server_pb2 = pytest.importorskip(
-    "openengine.v1.server_pb2",
-    reason='OpenEngine bindings not installed (pip install "tensorrt_llm[openengine]")',
+grpc = pytest.importorskip(  # noqa: E402
+    "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
 )
 
-import grpc  # noqa: E402
-
+from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc, server_pb2  # noqa: E402
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
@@ -93,6 +80,9 @@ def test_openengine_server_serves_the_control_contract() -> None:
             control = openengine_pb2_grpc.ControlStub(channel)
             info = await control.GetServerInfo(server_pb2.GetServerInfoRequest(), timeout=5)
             assert info.engine_name == "tensorrt_llm"
+            assert info.schema_revision == 1
+            assert info.minimum_client_revision == 1
+            assert info.schema_release == "768a93c7b44e40f28c692ad0b471a8f2"
         finally:
             await channel.close()
             await server.stop(grace=0)
@@ -112,3 +102,57 @@ def test_is_loopback_classifies_bind_hosts() -> None:
     assert not _is_loopback("10.0.0.7")
     # An unresolvable name is not assumed safe.
     assert not _is_loopback("some-host")
+
+
+class _StopLaunch(Exception):
+    """Ends launch_server once the server would start accepting requests."""
+
+
+@pytest.mark.parametrize(
+    ("value", "gc_enabled"),
+    [("1", False), ("0", True), (None, True)],
+)
+def test_launch_server_disables_gc_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, gc_enabled: bool
+) -> None:
+    """TRTLLM_SERVER_DISABLE_GC=1 turns cyclic GC off before serving, as trtllm-serve does."""
+    import tensorrt_llm.grpc.openengine.server as oe_server
+
+    if value is None:
+        monkeypatch.delenv("TRTLLM_SERVER_DISABLE_GC", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_SERVER_DISABLE_GC", value)
+    seen = {}
+
+    class _Llm:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        def shutdown(self) -> None:
+            pass
+
+    class _Server:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def start(self) -> None:
+            seen["gc_enabled"] = gc.isenabled()
+            raise _StopLaunch
+
+        async def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(oe_server, "PyTorchLLM", _Llm)
+    monkeypatch.setattr(oe_server, "OpenEngineServer", _Server)
+    gc_was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        with pytest.raises(_StopLaunch):
+            oe_server.launch_server("127.0.0.1", 0, {"backend": "pytorch", "model": "test-model"})
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+        else:
+            gc.disable()
+
+    assert seen["gc_enabled"] is gc_enabled

@@ -45,6 +45,7 @@ exclude = [
     "triton_kernels/**",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/manual_mma_128dp.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
+    "tensorrt_llm/grpc/openengine/_generated/**",
 ]
 
 
@@ -62,7 +63,6 @@ exclude = [
     ".devcontainer/make_env.py",
     ".github/scripts/label_community_user.py",
     ".github/scripts/pr_checklist_check.py",
-    "cpp/conanfile.py",
     "cpp/kernels/fmha_v2/conftest.py",
     "cpp/kernels/fmha_v2/fmha_test.py",
     "cpp/kernels/fmha_v2/setup.py",
@@ -81,7 +81,6 @@ exclude = [
     "cpp/kernels/xqa/gen_cpp_header.py",
     "cpp/kernels/xqa/gen_cubins.py",
     "cpp/kernels/xqa/ref.py",
-    "cpp/libnuma_conan.py",
     "cpp/micro_benchmarks/gen-moe-benchmark-file.py",
     "cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py",
     "cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py",
@@ -737,7 +736,6 @@ exclude = [
     "tests/unittest/llmapi/apps/_test_openai_responses.py",
     "tests/unittest/llmapi/apps/_test_openai_tool_call.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py",
-    "tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_example.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py",
     "tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py",
@@ -898,10 +896,6 @@ files = [
 #   tests/unittest   -> 'utils'
 #   tests/unittest/_torch/sampler   -> for 'test_beam_search_util'
 mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
-
-[[tool.mypy.overrides]]
-module = ["tensorrt_llm.runtime.kv_cache_manager_v2.*"]
-disallow_any_generics = false
 
 [[tool.mypy.overrides]]
 module = ["tensorrt_llm.bindings.*"]

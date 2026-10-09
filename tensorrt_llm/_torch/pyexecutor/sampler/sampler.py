@@ -293,6 +293,9 @@ class MultimodalResult:
 
     def __post_init__(self) -> None:
         num_embeddings = len(self.mm_embeddings)
+        metadata = (self.extra_data or {}).get("mm_embedding_metadata")
+        if metadata is not None and len(metadata) != num_embeddings:
+            raise ValueError("mm_embedding_metadata batch size does not match mm_embeddings")
         num_lengths = len(self.mm_embedding_lengths)
         if num_lengths != num_embeddings:
             raise ValueError(
@@ -350,9 +353,19 @@ class SampleStateWithMMResult(SampleState[SampleStateTensors, SampleStateTensors
 class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
     """
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
+
+    Args:
+        return_mm_results: Whether to attach the multimodal outputs to the
+            requests' results. Disable it on ranks whose responses never reach
+            the frontend: the results are exported as CUDA IPC handles, and
+            PyTorch keeps an exported allocation alive until a consumer opens
+            and releases its handle.
     """
 
     SampleState: TypeAlias = SampleStateWithMMResult
+
+    def __init__(self, return_mm_results: bool = True) -> None:
+        self.return_mm_results = return_mm_results
 
     @override
     def sample_async(
@@ -387,6 +400,9 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
 
+        if not self.return_mm_results:
+            return
+
         request_indices = state.data.mm_embedding_request_indices
         for result_index, (request_index, mm_embedding) in enumerate(
             zip(request_indices, mm_embeddings, strict=True)
@@ -394,7 +410,13 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request = requests[request_index]
             mm_embedding_lengths = state.data.mm_embedding_lengths[result_index]
 
-            request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            embedding_metadata = extra_data.get("mm_embedding_metadata")
+            if embedding_metadata is None:
+                request.py_result.append_mm_embeddings(mm_embedding, mm_embedding_lengths)
+            else:
+                request.py_result.append_mm_embeddings(
+                    mm_embedding, mm_embedding_lengths, embedding_metadata[result_index]
+                )
 
             # Store mrope data if available
             if mrope_position_ids is not None and mrope_position_deltas is not None:
@@ -772,7 +794,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         in-graph, so a request using one cannot be sampled there at all.
         """
         return (
-            request._py_embedding_bias_1d is not None
+            request.py_embedding_bias is not None
             or bool(getattr(request, "py_bad_words", None))
             or bool(getattr(request, "py_no_repeat_ngram_size", None))
             or has_occurrence_penalty(request)
@@ -838,7 +860,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         state staged for its target.
         """
         return (
-            request.guided_decoding_params is not None
+            request.py_guided_decoding_params is not None
             or bool(getattr(request, "py_logits_post_processors", None))
             or bool(getattr(request, "py_is_draft", False))
         )
