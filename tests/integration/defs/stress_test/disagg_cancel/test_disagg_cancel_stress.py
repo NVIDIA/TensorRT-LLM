@@ -40,7 +40,7 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 # Marathon configurations exercised by the parametrized test below.
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
-    "marathon_cpp_v1_deepseek.yaml",
+    "marathon_python_v2_deepseek.yaml",
 ]
 
 

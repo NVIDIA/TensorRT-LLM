@@ -56,7 +56,7 @@ worker_config:
       enable_padding: true
       max_batch_size: 256
     kv_cache_config:
-      use_kv_cache_manager_v2: false
+      use_kv_cache_manager_v2: true
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
@@ -82,7 +82,7 @@ worker_config:
     enable_attention_dp: false
     cuda_graph_config: null
     kv_cache_config:
-      use_kv_cache_manager_v2: false
+      use_kv_cache_manager_v2: true
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8

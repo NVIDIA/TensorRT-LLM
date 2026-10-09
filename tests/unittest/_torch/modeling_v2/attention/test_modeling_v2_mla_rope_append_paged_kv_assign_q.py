@@ -3,7 +3,7 @@
 """GPU test for the mla_rope_append_paged_kv_assign_q catalog entry.
 
 The op reads paged-KV-cache addressing tensors and cumulative-length
-tensors that the runtime normally derives from a KVCacheManager and a
+tensors that the runtime normally derives from a KVCacheManagerV2 and a
 TrtllmAttentionMetadata prepared with enable_context_mla_with_cached_kv=True.
 The test builds that state for real, pre-writes known cached-prefix rows
 into the paged pool, then checks the three kernel effects against a torch
@@ -42,7 +42,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_ap
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -123,7 +123,7 @@ class _MlaCtxEnv:
         self.fp8_pool = fp8_pool
         self.pool_dtype = torch.float8_e4m3fn if fp8_pool else self.torch_dtype
         self.quant_mode = QUANT_MODE_FP8_KV_CACHE if fp8_pool else 0
-        self.kv_cache_manager = KVCacheManager(
+        self.kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=131072, enable_block_reuse=False),
             CacheType.SELFKONLY,  # MLA latent cache: kv_factor=1, one kv head
             num_layers=num_layers,

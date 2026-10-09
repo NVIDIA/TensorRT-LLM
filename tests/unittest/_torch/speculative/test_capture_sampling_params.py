@@ -12,7 +12,7 @@ rewriting every request's sampling params to the synthetic capture values
 (temperature=0.7, top_k=50, top_p=0.9).
 
 The fix drives capture with *real* non-greedy warmup ``SamplingParams``
-(``KVCacheManager.add_dummy_requests(capture_sampling_params=...)``) instead
+(``KVCacheManagerV2.add_dummy_requests(capture_sampling_params=...)``) instead
 of a metadata flag: warmup requests carry genuine sampling params, so
 ``SpecMetadata._scan_one_model_sampling`` classifies them as non-greedy the
 same way it would classify any real client request. There is no capture-only
@@ -30,8 +30,8 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
     NON_GREEDY_CAPTURE_SAMPLING_PARAMS,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -44,12 +44,12 @@ CAPTURE_MIN_P = NON_GREEDY_CAPTURE_SAMPLING_PARAMS.min_p
 
 
 class TestAddDummyRequestsCaptureSamplingParams(unittest.TestCase):
-    """`KVCacheManager.add_dummy_requests(capture_sampling_params=...)` must
+    """`KVCacheManagerV2.add_dummy_requests(capture_sampling_params=...)` must
     stamp the synthetic non-greedy values onto the dummy requests it builds,
     and must leave requests greedy when no capture params are supplied."""
 
     def _kv_cache_manager(self):
-        return KVCacheManager(
+        return KVCacheManagerV2(
             kv_cache_config=KvCacheConfig(max_tokens=256, enable_block_reuse=False),
             kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=2,

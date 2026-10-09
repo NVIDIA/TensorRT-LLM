@@ -54,6 +54,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.attention.backends.fp4_mla.state import Fp4MlaState
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -943,7 +944,6 @@ def run_one_trtllm_rubin(
     )
     from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
     from tensorrt_llm._torch.metadata import KVCacheParams
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
     from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
     from tensorrt_llm.functional import PositionEmbeddingType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -974,7 +974,7 @@ def run_one_trtllm_rubin(
     max_tokens = batch * ((seq + page_size - 1) // page_size) * page_size
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager = KVCacheManagerV2(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=1,

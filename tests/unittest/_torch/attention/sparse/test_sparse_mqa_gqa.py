@@ -58,9 +58,9 @@ from tensorrt_llm._torch.attention.backends.trtllm import (
     generate_spec_decoding_position_offsets,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -325,7 +325,7 @@ class _ContextInputs:
     q: torch.Tensor
     k: torch.Tensor
     v: torch.Tensor
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     request_ids: List[int]
     metadata: _SparseMqaGqaMetadata
 
@@ -342,7 +342,7 @@ class _GenerationInputs:
     k_new: torch.Tensor
     v_new: torch.Tensor
     local_sparse_attn_indices: torch.Tensor
-    kv_cache_manager: KVCacheManager
+    kv_cache_manager: KVCacheManagerV2
     request_ids: List[int]
     metadata: _SparseMqaGqaMetadata
 
@@ -1096,13 +1096,13 @@ def _quant_config(s: SparseMqaGqaScenario) -> Optional[QuantConfig]:
 
 
 def _create_kv_cache_manager(
-    s: SparseMqaGqaScenario, kv_cache: Optional[torch.Tensor] = None
-) -> KVCacheManager:
+    s: SparseMqaGqaScenario, *, random_history: bool = False
+) -> KVCacheManagerV2:
     """Create kv cache manager for testing."""
     kv_cache_config = KvCacheConfig(max_tokens=s.kv_pool_num_pages * s.page_size)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
 
-    manager = KVCacheManager(
+    manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=s.num_layers,
@@ -1115,9 +1115,13 @@ def _create_kv_cache_manager(
         dtype=str_dtype_to_binding(torch_dtype_to_str(s.kvcache_dtype)),
     )
 
-    if kv_cache is not None:
-        for i in range(s.num_layers):
-            manager.get_buffers(i, kv_layout="HND").copy_(kv_cache[i])
+    # Size the physical pool from V2, including its reserved pages.
+    for i in range(s.num_layers):
+        buffer = manager.get_buffers(i, kv_layout="HND")
+        if random_history:
+            buffer.copy_(torch.randn(buffer.shape, device=buffer.device, dtype=s.dtype))
+        else:
+            buffer.zero_()
 
     return manager
 
@@ -1265,7 +1269,7 @@ def _build_expected_compacted_kv(
 
 
 def _read_paged_kv_cache(
-    kv_cache_manager: KVCacheManager,
+    kv_cache_manager: KVCacheManagerV2,
     request_ids: List[int],
     token_lens: Tuple[int, ...],
     s: SparseMqaGqaScenario,
@@ -1510,17 +1514,7 @@ def _create_context_inputs(s: ContextScenario) -> _ContextInputs:
     k = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
     v = torch.randn(s.nnz_q, s.num_kv_heads * s.head_dim, device=device, dtype=s.dtype)
 
-    kv_cache = torch.zeros(
-        s.num_layers,
-        s.kv_pool_num_pages,
-        2,
-        s.num_kv_heads,
-        s.page_size,
-        s.head_dim,
-        device=device,
-        dtype=s.kvcache_dtype,
-    )
-    kv_cache_manager = _create_kv_cache_manager(s, kv_cache)
+    kv_cache_manager = _create_kv_cache_manager(s, random_history=False)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, list(s.seq_lens))
@@ -1572,17 +1566,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         available_kv_lens, s.num_kv_heads, num_sparse_topk, device
     )
 
-    kv_cache = torch.randn(
-        s.num_layers,
-        s.kv_pool_num_pages,
-        2,
-        s.num_kv_heads,
-        s.page_size,
-        s.head_dim,
-        device=device,
-        dtype=s.dtype,
-    ).to(s.kvcache_dtype)
-    kv_cache_manager = _create_kv_cache_manager(s, kv_cache)
+    kv_cache_manager = _create_kv_cache_manager(s, random_history=True)
 
     request_ids = list(range(s.batch_size))
     kv_cache_manager.add_dummy_requests(request_ids, token_nums)

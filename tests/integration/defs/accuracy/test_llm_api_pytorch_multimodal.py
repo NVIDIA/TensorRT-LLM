@@ -590,17 +590,12 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
-            # V2 cache-manager preference, but the qualified K3 MMMU
-            # configuration ran V1, and under V2 this test's long-generation
-            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
-            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
-            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
-            # qualified at this shape.
+            # Preserve the long-output KDA-hybrid shape that previously stalled
+            # under V2; this migration still needs that regression qualified.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
-                use_kv_cache_manager_v2=False,
+                use_kv_cache_manager_v2=True,
             ),
         ) as llm:
             # Reference-key contract: the K3 checkpoint carries its

@@ -7,14 +7,15 @@ context_servers:
   num_instances: 1
   enable_chunked_prefill: false
   kv_cache_config:
+    use_kv_cache_manager_v2: true
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: UCX
-    transceiver_runtime: CPP
+    backend: NIXL
+    transceiver_runtime: PYTHON
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -25,9 +26,10 @@ generation_servers:
     cp_type: HELIX
     tokens_per_block: 32
   kv_cache_config:
+    use_kv_cache_manager_v2: true
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
   cache_transceiver_config:
-    backend: UCX
-    transceiver_runtime: CPP
+    backend: NIXL
+    transceiver_runtime: PYTHON

@@ -15,8 +15,9 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_nemotron_nas import \
     NemotronNASForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -83,9 +84,9 @@ def decilm_model() -> NemotronNASForCausalLM:
 
 @pytest.fixture
 def decilm_cache(
-        decilm_model: NemotronNASForCausalLM) -> Iterator[KVCacheManager]:
+        decilm_model: NemotronNASForCausalLM) -> Iterator[KVCacheManagerV2]:
     config = decilm_model.config
-    cache = KVCacheManager(
+    cache = KVCacheManagerV2(
         KvCacheConfig(max_tokens=512, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=config.num_hidden_layers,
@@ -108,7 +109,7 @@ def decilm_cache(
 @torch.inference_mode()
 def _forward(
     model: NemotronNASForCausalLM,
-    cache: KVCacheManager,
+    cache: KVCacheManagerV2,
     input_ids: torch.Tensor,
     *,
     request_id: int,
@@ -163,7 +164,7 @@ class TestDeciLMForCausalLM:
         assert hasattr(layers[3], "mlp")
 
     def test_forward(self, decilm_model: NemotronNASForCausalLM,
-                     decilm_cache: KVCacheManager) -> None:
+                     decilm_cache: KVCacheManagerV2) -> None:
         input_ids = torch.tensor([3, 5, 7, 11, 13, 17, 19, 23],
                                  dtype=torch.int,
                                  device="cuda")

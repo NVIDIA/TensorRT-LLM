@@ -26,10 +26,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import CppMambaHybridCacheManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs import (
     create_input_processor,
     create_input_processor_with_hash,
@@ -37,6 +36,7 @@ from tensorrt_llm.inputs import (
     prompt_inputs,
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as PyKvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -303,7 +303,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         # VL configs (e.g. Qwen3VLConfig) in transformers 5.x no longer
         # proxy text_config attributes to the outer config level.
         text_config = getattr(config, "text_config", config)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=text_config.num_hidden_layers,
@@ -638,10 +638,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         if not isinstance(head_dim, int):
             head_dim = text_config.hidden_size // text_config.num_attention_heads
 
-        # CppMambaHybridCacheManager reads Pydantic-only fields
-        # (mamba_state_config, enable_block_reuse) so we have to
-        # construct the llmapi.llm_args.KvCacheConfig here, not the C++
-        # bindings KvCacheConfig that the standard KVCacheManager path uses.
+        # Hybrid managers read Pydantic-only Mamba fields from KvCacheConfig.
         kv_cache_config = PyKvCacheConfig(max_tokens=num_blocks * tokens_per_block)
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
 

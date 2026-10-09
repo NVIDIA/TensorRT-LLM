@@ -61,7 +61,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -340,7 +340,7 @@ def _cupti_kernel_counter():
 # --------------------------------------------------------------------------- #
 
 
-def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManager:
+def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManagerV2:
     num_blocks = case.batch_size * case.num_pages
     tokens_per_block = case.page_size
     max_seq_len = num_blocks * tokens_per_block
@@ -348,7 +348,7 @@ def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManag
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
-    mgr = KVCacheManager(
+    mgr = KVCacheManagerV2(
         kv_cache_config,
         cache_type,
         num_layers=num_layers,
@@ -366,7 +366,7 @@ def _build_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManag
     return mgr
 
 
-def _build_metadata(case: AttnCase, kv_mgr: KVCacheManager):
+def _build_metadata(case: AttnCase, kv_mgr: KVCacheManagerV2):
     request_ids = list(range(case.batch_size))
     num_cached = [case.num_cached_tokens] * case.batch_size
     kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=num_cached)
@@ -496,7 +496,7 @@ def _mla_tokens_per_block() -> int:
     return 32 if major >= 10 else 64
 
 
-def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManager:
+def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheManagerV2:
     tokens_per_block = _mla_tokens_per_block()
     head_dim = _mla_kv_head_dim(case)
     per_seq = case.num_cached_tokens + case.seq_len
@@ -508,7 +508,7 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
         * case.batch_size
     )
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    mgr = KVCacheManager(
+    mgr = KVCacheManagerV2(
         KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
         num_layers=num_layers,
@@ -530,7 +530,7 @@ def _build_mla_kv_cache_manager(case: AttnCase, num_layers: int = 1) -> KVCacheM
     return mgr
 
 
-def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManager):
+def _build_mla_gen_metadata(case: AttnCase, kv_mgr: KVCacheManagerV2):
     request_ids = list(range(case.batch_size))
     kv_cache_params = KVCacheParams(
         use_cache=True, num_cached_tokens_per_seq=[case.num_cached_tokens] * case.batch_size

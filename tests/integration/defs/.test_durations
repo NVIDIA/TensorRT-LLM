@@ -30,7 +30,7 @@
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_on]": 331.7888735632184,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill": 368.763,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first": 224.94254761904764,
-   "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1": 206.3839195402299,
+   "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_with_block_reuse": 206.3839195402299,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend": 258.28123529411766,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse]": 471.4677272727273,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]": 542.1681061946903,

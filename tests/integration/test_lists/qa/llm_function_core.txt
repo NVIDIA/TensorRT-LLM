@@ -1,4 +1,4 @@
-accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]
+accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False]
@@ -15,13 +15,12 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_gen_first
 accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashBase::test_auto_dtype
-accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v1]
+accuracy/test_disaggregated_serving.py::TestGLM52NVFP4::test_nvfp4_nixl[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=False]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_eagle3[overlap_scheduler=True]
-accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v1]
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v2]
 accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4
 accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=True]
@@ -39,7 +38,7 @@ accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_on]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first
-accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_with_block_reuse
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
 accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse]
 accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]
