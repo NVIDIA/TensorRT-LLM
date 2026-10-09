@@ -20,7 +20,7 @@ from tensorrt_llm.logger import logger
 
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
-from .kv_events import KvEventsUnavailableError, events_config
+from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -42,11 +42,7 @@ _SERVER_OPTIONS = [
 ]
 
 
-def _format_bind_address(host: str, port: int) -> str:
-    """Format a host and port as a gRPC bind address."""
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
-    return f"{host}:{port}"
+_format_bind_address = _format_host_port
 
 
 def _is_loopback(host: str) -> bool:

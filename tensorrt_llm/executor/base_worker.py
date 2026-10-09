@@ -243,6 +243,10 @@ class BaseWorker(GenerationExecutor):
 
         return {}
 
+    def get_kv_cache_capacity(self) -> dict:
+        """Read KV capacity directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_capacity()
+
     def fetch_openengine_discovery(self) -> dict:
         if self.engine is None:
             return {}
@@ -253,6 +257,10 @@ class BaseWorker(GenerationExecutor):
 
         return {}
 
+    def get_openengine_discovery(self) -> dict:
+        """Read OpenEngine discovery directly when this worker serves as the executor."""
+        return self.fetch_openengine_discovery()
+
     def fetch_kv_cache_load(self) -> dict:
         if self.engine is None:
             return {}
@@ -262,6 +270,10 @@ class BaseWorker(GenerationExecutor):
             return self.engine.get_kv_cache_load()
 
         return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Read KV load directly when this worker serves as the executor."""
+        return self.fetch_kv_cache_load()
 
     def fetch_kv_cache_events(self) -> list:
         return self.engine.get_latest_kv_cache_events()

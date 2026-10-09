@@ -40,6 +40,12 @@ def _split_tcp_endpoint(endpoint: str) -> tuple[str, int]:
     return host.strip("[]"), int(port_text)
 
 
+def _format_host_port(host: str, port: int) -> str:
+    """Format a gRPC bind address, preserving already-bracketed IPv6 hosts."""
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
 def _format_tcp_endpoint(host: str, port: int) -> str:
-    formatted_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    return f"tcp://{formatted_host}:{port}"
+    return f"tcp://{_format_host_port(host, port)}"
