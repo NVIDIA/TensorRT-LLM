@@ -37,6 +37,8 @@ def is_builtin_zoo_module(module_name: str) -> bool:
 # ``AutoModelForCausalLM._resolve_class``) -> providing module.
 MODEL_ARCH_TO_MODULE = {
     "AfmoeForCausalLM": "modeling_afmoe",
+    "Apertus1p5ForConditionalGeneration": "modeling_apertus",
+    "ApertusForCausalLM": "modeling_apertus",
     "BartForConditionalGeneration": "modeling_bart",
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",
@@ -126,6 +128,8 @@ MODEL_ARCH_TO_MODULE = {
 # Public class name exported by ``tensorrt_llm._torch.models`` -> providing module.
 MODEL_CLASS_TO_MODULE = {
     "AfmoeForCausalLM": "modeling_afmoe",
+    "Apertus1p5ForConditionalGeneration": "modeling_apertus",
+    "ApertusForCausalLM": "modeling_apertus",
     "BartForConditionalGeneration": "modeling_bart",
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",

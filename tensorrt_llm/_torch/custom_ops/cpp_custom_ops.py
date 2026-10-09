@@ -1716,6 +1716,11 @@ def _register_fake():
         sf_out = x.new_empty((scale_shape, ), dtype=torch.uint8)
         return y_fp4, sf_out
 
+    @torch.library.register_fake("trtllm::xielu")
+    def _(input: torch.Tensor, a_p: float, a_n: float, beta: float,
+          eps: float) -> torch.Tensor:
+        return torch.empty_like(input, memory_format=torch.contiguous_format)
+
     @torch.library.register_fake("trtllm::fused_relu2_quantize")
     def _(
         input: torch.Tensor,

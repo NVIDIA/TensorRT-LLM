@@ -27,6 +27,8 @@ from .modeling_utils import get_model_architecture
 
 __all__ = [
     "AfmoeForCausalLM",
+    "Apertus1p5ForConditionalGeneration",
+    "ApertusForCausalLM",
     "AutoModelForCausalLM",
     "BartForConditionalGeneration",
     "BertForSequenceClassification",
