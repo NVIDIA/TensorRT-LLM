@@ -25,6 +25,9 @@
 
 #include <climits>
 #include <cstdint>
+#include <functional>
+#include <map>
+#include <mutex>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -1985,6 +1988,26 @@ bool validPlanChannelLaunch(std::uintptr_t pointer, int abiVersion, int words, i
         && expected <= INT_MAX && words == expected;
 }
 
+cudaError_t ensureDynamicSharedMemory(void const* kernel, int sharedBytes)
+{
+    int device = -1;
+    auto error = cudaGetDevice(&device);
+    if (error != cudaSuccess)
+        return error;
+
+    using KernelCache = std::map<void const*, int, std::less<void const*>>;
+    static std::mutex mutex;
+    static std::map<int, KernelCache> configuredBytes;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto& current = configuredBytes[device][kernel];
+    if (current >= sharedBytes)
+        return cudaSuccess;
+    error = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedBytes);
+    if (error == cudaSuccess)
+        current = sharedBytes;
+    return error;
+}
+
 } // namespace
 
 void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t stream)
@@ -2029,8 +2052,7 @@ void invokeMoeRebalanceHaloQ(MoeRebalanceHaloQParams const& params, cudaStream_t
     }
     if (sharedBytes > 48 * 1024)
     {
-        TLLM_CUDA_CHECK(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sharedBytes)));
+        TLLM_CUDA_CHECK(ensureDynamicSharedMemory(kernel, static_cast<int>(sharedBytes)));
     }
 
     auto routes = params.routes;

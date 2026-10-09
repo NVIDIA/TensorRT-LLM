@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """CPU contract tests; GPU numerical/concurrent admission runs separately."""
 
 import __future__
 
 import ast
 import inspect
-import json
 import os
 import unittest
 from contextlib import nullcontext
 from copy import deepcopy
-from functools import lru_cache
 from itertools import product
 from pathlib import Path
+from threading import Condition, Event, RLock, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -89,6 +87,14 @@ class CpuContractTests(unittest.TestCase):
             is_tuning_mode=False, _active_capture=None, profiling_cache=ProfilingCache()
         )
         properties = SimpleNamespace(multi_processor_count=80, major=10, minor=7)
+        self.device_syncs = []
+        self.stream_syncs = []
+
+        def external_stream(stream_handle, *, device):
+            return SimpleNamespace(
+                synchronize=lambda: self.stream_syncs.append((device, stream_handle))
+            )
+
         torch = SimpleNamespace(
             Tensor=Tensor,
             bfloat16="bf16",
@@ -98,6 +104,8 @@ class CpuContractTests(unittest.TestCase):
                 get_device_properties=lambda device: properties,
                 device=lambda device: nullcontext(),
                 current_stream=lambda device: SimpleNamespace(cuda_stream=17),
+                ExternalStream=external_stream,
+                synchronize=lambda device: self.device_syncs.append(device),
             ),
             empty_like=lambda x: Tensor(x.shape, x.dtype),
         )
@@ -107,7 +115,8 @@ class CpuContractTests(unittest.TestCase):
             DynamicTensorSpec=SimpleNamespace,
             TunableRunner=TunableRunner,
             TuningConfig=TuningConfig,
-            lru_cache=lru_cache,
+            Condition=Condition,
+            RLock=RLock,
             deepcopy=deepcopy,
             product=product,
         )
@@ -127,8 +136,6 @@ class CpuContractTests(unittest.TestCase):
             launches = self.launches
 
             class Compiled:
-                audit = {"tactic": list(args[-1])}
-
                 def __call__(self, *tensors):
                     launches.append((args[-1], tensors[0].shape[0]))
                     return tensors[0]
@@ -162,9 +169,6 @@ class CpuContractTests(unittest.TestCase):
             valid = runner.get_valid_tactics([], None)
             self.assertEqual(set(valid), set(catalog) - {rejected})
             self.assertEqual(runner.get_valid_tactics([], None), valid)
-            self.assertEqual(
-                runner.audit_state()["rejected_tactics"][0]["stage"], "descriptor_resources"
-            )
         self.assertEqual(len(calls), 96)
         with self.assertRaises(ValueError):
             self.ns["shared_fc12_tactic_descriptor"]((1, 256, 512, "atomic_counter", True))
@@ -201,7 +205,7 @@ class CpuContractTests(unittest.TestCase):
         r.forward(inputs(256), tactic=-1)
         self.assertEqual(self.creations[-1][-1], (1, 256, 128, "atomic_counter", True))
 
-    def test_public_dispatch_obeys_chooser_and_distinguishes_replay_fallback(self):
+    def test_public_dispatch_obeys_chooser_and_reuses_compilation(self):
         tactic = (2, 64, 256, "grid_stride", False)
         choices = []
 
@@ -215,30 +219,80 @@ class CpuContractTests(unittest.TestCase):
             return runner, tactic
 
         self.tuner.choose_one = choose
-        for tokens in (129, 200):
+        outputs = [
             self.ns["run_shared_fc12"](*inputs(tokens), swiglu_limit=10.0, sm_count=72)
-        state = self.ns["shared_fc12_autotune_state"]()
-        row = state["instances"][0]["selections"][0]
+            for tokens in (129, 200)
+        ]
+
         self.assertEqual(len(choices), 2)
         self.assertEqual(choices[0], choices[1])
         self.assertEqual(len(self.creations), 1)
-        self.assertEqual(row["tactic"], list(tactic))
-        self.assertEqual(row["calls"], 2)
-        self.assertTrue(row["cache_hit"])
-        self.assertFalse(row["fallback"])
-        self.assertEqual(row["min_time_ms"], 0.25)
-        runner = next(iter(self.ns["_tunable_runners"].values()))
-        self.tuner._active_capture = SimpleNamespace(is_replaying=lambda: True)
-        runner.record_selection(self.tuner, inputs(129), tactic)
-        self.tuner._active_capture = None
-        runner.record_selection(self.tuner, inputs(129), -1)
-        current = self.ns["shared_fc12_autotune_state"]()
-        self.assertTrue(current["instances"][0]["selections"][1]["replay"])
-        self.assertFalse(current["instances"][0]["selections"][2]["cache_hit"])
-        self.assertTrue(current["instances"][0]["selections"][2]["fallback"])
-        json.dumps(current, allow_nan=False)
-        state["instances"][0]["selections"][0]["calls"] = 999
-        self.assertEqual(runner.audit_state()["selections"][0]["calls"], 2)
+        self.assertEqual([output.shape[0] for output in outputs], [129, 200])
+        self.assertEqual([tokens for _, tokens in self.launches], [129, 200])
+
+    def test_terminal_release_drops_all_device_runner_references(self):
+        first = self.runner(stream=17)
+        second = self.runner(stream=18)
+        first._compiled_runners[(1, 256, 128, "atomic_counter", True)] = object()
+        second._compiled_runners[(2, 128, 128, "grid_stride", True)] = object()
+        first_key = (0, 7168, 3072, 8192, 72, 10.0, 17, ("layout",))
+        second_key = (0, 7168, 3072, 8192, 72, 10.0, 18, ("layout",))
+        self.ns["_tunable_runners"].update({first_key: first, second_key: second})
+        self.ns["_RUNNER_CACHE"].update({first_key: object(), second_key: object()})
+        first.kernel_cache.update({first_key: object(), second_key: object()})
+
+        self.ns["release_shared_fc12_cache"](0)
+
+        self.assertEqual(self.ns["_tunable_runners"], {})
+        self.assertEqual(self.ns["_RUNNER_CACHE"], {})
+        self.assertEqual(first.kernel_cache, {})
+        self.assertEqual(first._compiled_runners, {})
+        self.assertEqual(second._compiled_runners, {})
+        self.assertEqual(self.device_syncs, [0])
+        self.assertEqual(self.stream_syncs, [])
+
+    def test_terminal_release_is_scoped_to_the_executor_stream(self):
+        first = self.runner(stream=17)
+        second = self.runner(stream=18)
+        first._compiled_runners[(1, 256, 128, "atomic_counter", True)] = object()
+        second._compiled_runners[(2, 128, 128, "grid_stride", True)] = object()
+        first_key = (0, 7168, 3072, 8192, 72, 10.0, 17, ("layout",))
+        second_key = (0, 7168, 3072, 8192, 72, 10.0, 18, ("layout",))
+        self.ns["_tunable_runners"].update({first_key: first, second_key: second})
+        self.ns["_RUNNER_CACHE"].update({first_key: object(), second_key: object()})
+        first.kernel_cache.update({first_key: object(), second_key: object()})
+
+        self.ns["release_shared_fc12_cache"](0, 17)
+
+        self.assertNotIn(first_key, self.ns["_tunable_runners"])
+        self.assertIn(second_key, self.ns["_tunable_runners"])
+        self.assertNotIn(first_key, self.ns["_RUNNER_CACHE"])
+        self.assertIn(second_key, self.ns["_RUNNER_CACHE"])
+        self.assertNotIn(first_key, first.kernel_cache)
+        self.assertIn(second_key, first.kernel_cache)
+        self.assertEqual(first._compiled_runners, {})
+        self.assertNotEqual(second._compiled_runners, {})
+        self.assertEqual(self.device_syncs, [])
+        self.assertEqual(self.stream_syncs, [(0, 17)])
+
+    def test_overlapping_terminal_releases_are_serialized(self):
+        first = self.ns["_begin_shared_fc12_release"](0, 17)
+        acquired = Event()
+
+        def acquire_same_scope():
+            second = self.ns["_begin_shared_fc12_release"](0, 17)
+            acquired.set()
+            self.ns["_end_shared_fc12_release"](0, second)
+
+        thread = Thread(target=acquire_same_scope)
+        thread.start()
+        blocked = not acquired.wait(0.05)
+        self.ns["_end_shared_fc12_release"](0, first)
+
+        self.assertTrue(blocked)
+        self.assertTrue(acquired.wait(1.0))
+        thread.join(timeout=1.0)
+        self.assertFalse(thread.is_alive())
 
     def test_original_autotuner_primes_each_cached_tactic_before_serving(self):
         source = ast.parse(_AUTOTUNER.read_text())

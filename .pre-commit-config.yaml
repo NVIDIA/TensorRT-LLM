@@ -1515,7 +1515,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|^tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|^tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1643,8 +1643,6 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
-        # The scheduler GPU-visible host mailbox requires pinned memory.
-        exclude: ^tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

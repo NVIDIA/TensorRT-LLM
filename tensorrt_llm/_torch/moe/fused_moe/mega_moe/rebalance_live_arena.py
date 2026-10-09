@@ -12,13 +12,13 @@ rebalance path is enabled.
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from weakref import WeakKeyDictionary
 
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["allocate_rebalance_arena_v2", "release_rebalance_resources_collectively"]
+__all__ = ["SharedSlotArenaProvider", "allocate_rebalance_arena"]
 
 BUFFER_ALIGNMENT = 2 * 1024 * 1024
 
@@ -115,6 +115,7 @@ class RebalanceLiveArena:
     provider: Any
     arena: Any
     bound: Any
+    bundle: Any
     plane_names: Tuple[str, ...]
     local_plane_views: Tuple[torch.Tensor, ...]
     tekit_alias_views: Tuple[torch.Tensor, ...]
@@ -164,43 +165,49 @@ class RebalanceLiveArena:
             guard()
 
 
-# Reuse one EP communicator per pipeline stage; Split is itself collective.
-# Ranks within each stage are ordered by their EP rank.
-_EP_MPI_COMMS: Dict[Tuple[int, int], Any] = {}
-
-
-def _ep_mpi_comm(mapping: Any) -> Any:
-    """Cache an EP-scoped MPI communicator per (pipeline rank, EP size)."""
-    from tensorrt_llm._utils import mpi_comm
-
-    key = (int(mapping.pp_rank), int(mapping.moe_ep_size))
-    comm = _EP_MPI_COMMS.get(key)
-    if comm is None:
-        comm = mpi_comm().Split(int(mapping.pp_rank), int(mapping.moe_ep_rank))
-        _EP_MPI_COMMS[key] = comm
-    return comm
-
-
 class _EpComm:
-    """Adapt the EP-scoped MPI communicator to SAMI's collective interface.
+    """Adapt the resolved torch EP ProcessGroup to SAMI's collectives.
 
     Using the default distributed group could include ranks outside this arena
     and deadlock its collective allocation or binding.
     """
 
-    def __init__(self, ep_comm: Any) -> None:
-        self._comm = ep_comm
-        self.rank = int(ep_comm.Get_rank())
-        self.world = int(ep_comm.Get_size())
+    def __init__(self, process_group: Any) -> None:
+        if process_group is None:
+            raise ValueError("MoE rebalance requires an EP ProcessGroup")
+        self.process_group = process_group
+        self.rank = int(torch.distributed.get_rank(group=process_group))
+        self.world = int(torch.distributed.get_world_size(group=process_group))
+
+    def validate_geometry(self, *, expected_rank: int, expected_world: int) -> None:
+        expected = (int(expected_rank), int(expected_world))
+        actual = (self.rank, self.world)
+        if actual != expected:
+            raise ValueError(
+                "EP ProcessGroup rank/size differs from the model mapping: "
+                f"process_group={actual}, mapping={expected}."
+            )
 
     def barrier(self) -> None:
-        self._comm.Barrier()
+        with _disable_current_modes():
+            torch.distributed.barrier(group=self.process_group)
 
     def bcast(self, payload: object, root: int) -> object:
-        return self._comm.bcast(payload, root=int(root))
+        if type(root) is not int or not 0 <= root < self.world:
+            raise ValueError(f"broadcast root must be in [0, {self.world}); got {root!r}")
+        values = [payload]
+        source_rank = torch.distributed.get_global_rank(self.process_group, root)
+        with _disable_current_modes():
+            torch.distributed.broadcast_object_list(
+                values, src=source_rank, group=self.process_group
+            )
+        return values[0]
 
     def allgather(self, value: object) -> list:
-        return list(self._comm.allgather(value))
+        values = [None] * self.world
+        with _disable_current_modes():
+            torch.distributed.all_gather_object(values, value, group=self.process_group)
+        return values
 
 
 class _RawPointer:
@@ -227,11 +234,6 @@ _RECORD_PLANE_ALIGNMENT = 256
 
 
 _HELPER_BANK_COUNT = 2
-_POOL_SCOPE_ATTRIBUTE = "_trtllm_rebalance_shared_slot_scope"
-
-
-class _PoolScope:
-    """Identity key whose copy does not retain CUDA allocation owners."""
 
 
 class _ViewSpec:
@@ -269,8 +271,8 @@ class _Vmm:
     def __init__(self, device: int, group_sizes: Tuple[int, ...]) -> None:
         from cuda.bindings import driver as cuda
 
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami._util import check_cuda
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami.fabric import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami._util import check_cuda
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami.fabric import (
             FABRIC,
             _allocation_properties,
             _read_write_access,
@@ -547,10 +549,6 @@ class _SharedLayer:
         self.holders: List[_RawPointer] = []
 
 
-_ACTIVE_SHARED_SLOT_POOLS: Dict[int, "_SharedSlotPool"] = {}
-_NEXT_SHARED_SLOT_POOL_ID = 0
-
-
 class _SharedSlotPool:
     """Helper-slot sets shared by every MoE layer of one geometry.
 
@@ -574,12 +572,11 @@ class _SharedSlotPool:
         bundle: Any,
         device: int,
         comm: Any,
+        owner_registry: List["_SharedSlotPool"],
     ) -> None:
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
             hierarchy_group_sizes,
         )
-
-        global _NEXT_SHARED_SLOT_POOL_ID
 
         torch.cuda.set_device(device)
         self.world = world
@@ -631,9 +628,8 @@ class _SharedSlotPool:
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
         self._construction_complete = False
-        self._registry_id = _NEXT_SHARED_SLOT_POOL_ID
-        _NEXT_SHARED_SLOT_POOL_ID += 1
-        _ACTIVE_SHARED_SLOT_POOLS[self._registry_id] = self
+        self._owner_registry = owner_registry
+        self._owner_registry.append(self)
         self.sets = self._create_sets(comm)
         self._construction_complete = True
 
@@ -738,7 +734,8 @@ class _SharedSlotPool:
                 lambda: self._on_device(self.vmm.release_created_handles),
             )
             self._closed = True
-            _ACTIVE_SHARED_SLOT_POOLS.pop(self._registry_id, None)
+            if self in self._owner_registry:
+                self._owner_registry.remove(self)
             self.sets = ()
             self.pages.clear()
             return True
@@ -818,7 +815,7 @@ class _SharedSlotPool:
     def build_layer(self, comm: Any) -> Tuple[Any, Dict[str, torch.Tensor], _SharedLayer, int]:
         """Collectively map one layer; returns its arena, framework views,
         owner and own allocation bytes."""
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
             HierarchicalLiveWeightArena,
             LivePlaneView,
             LiveTerminalView,
@@ -920,11 +917,6 @@ class _SharedSlotPool:
         return arena, tekit_views, layer, sum(self.home_bytes.values())
 
 
-_SHARED_SLOT_POOLS: WeakKeyDictionary[_PoolScope, Dict[tuple, _SharedSlotPool]] = (
-    WeakKeyDictionary()
-)
-
-
 class SharedSlotArenaProvider:
     """Provide one layer's arena over the two shared helper-slot banks.
 
@@ -933,18 +925,16 @@ class SharedSlotArenaProvider:
     """
 
     def __init__(self, owner: Any) -> None:
-        # Scope physical helper banks to the model Mapping instance. A
-        # process-global geometry cache would let two engines overwrite each
-        # the slots of another engine when their shapes happen to match.
+        # The model-level per-iteration manager owns both the geometry cache
+        # and creation order. No Mapping attribute or process-global registry
+        # participates in allocation lifetime.
         self._owner = owner
-        scope = getattr(owner, _POOL_SCOPE_ATTRIBUTE, None)
-        if scope is None:
-            scope = _PoolScope()
-            setattr(owner, _POOL_SCOPE_ATTRIBUTE, scope)
-        elif not isinstance(scope, _PoolScope):
-            raise RuntimeError(f"Mapping attribute {_POOL_SCOPE_ATTRIBUTE!r} is already in use")
-        self._scope = scope
-        self._pools = _SHARED_SLOT_POOLS.setdefault(scope, {})
+        pools = getattr(owner, "_rebalance_shared_slot_pools", None)
+        order = getattr(owner, "_rebalance_shared_slot_pool_order", None)
+        if not isinstance(pools, dict) or not isinstance(order, list):
+            raise TypeError("SharedSlotArenaProvider owner must expose model-local pool state")
+        self._pools = pools
+        self._pool_order = order
         self.buffer_bytes = 0
         self.group_sizes: Tuple[int, ...] = ()
         self.pool: Optional[_SharedSlotPool] = None
@@ -1003,6 +993,7 @@ class SharedSlotArenaProvider:
                 bundle=bundle,
                 device=int(device),
                 comm=comm,
+                owner_registry=self._pool_order,
             )
             self._pools[key] = pool
         self._built, self._tekit_views, self.layer, self.buffer_bytes = pool.build_layer(comm)
@@ -1020,54 +1011,14 @@ class SharedSlotArenaProvider:
         return self._tekit_views[name]
 
 
-def _active_pools_for_comm(raw_comm: Any) -> List[_SharedSlotPool]:
-    return [
-        pool
-        for _, pool in sorted(_ACTIVE_SHARED_SLOT_POOLS.items())
-        if getattr(pool.comm, "_comm", None) is raw_comm
-    ]
-
-
-def release_rebalance_resources_collectively(local_safe: bool = True) -> bool:
-    """Collectively release every live shared-slot pool in creation order."""
-    released = True
-    for comm_key, raw_comm in sorted(_EP_MPI_COMMS.items()):
-        local_pools = _active_pools_for_comm(raw_comm)
-        preflight = list(
-            raw_comm.allgather(
-                {
-                    "local_safe": bool(local_safe),
-                    "pools": [pool._cleanup_manifest() for pool in local_pools],
-                }
-            )
-        )
-        expected = int(raw_comm.Get_size())
-        if len(preflight) != expected:
-            raise RuntimeError(
-                f"shared-slot module preflight {comm_key} returned {len(preflight)} ranks; "
-                f"expected {expected}"
-            )
-        if not all(item["local_safe"] for item in preflight):
-            released = False
-            continue
-        descriptors = [item["pools"] for item in preflight]
-        if any(descriptor != descriptors[0] for descriptor in descriptors[1:]):
-            raise RuntimeError(
-                f"shared-slot pool count or order differs across EP communicator {comm_key}"
-            )
-        for pool in local_pools:
-            if not pool.close_collectively(local_safe=True):
-                released = False
-    return released
-
-
-def allocate_rebalance_arena_v2(
+def allocate_rebalance_arena(
     *,
     home_experts: int,
     helper_slots: int,
-    hidden_size: int,
-    intermediate_size: int,
+    bundle: Any,
+    ep_comm: Any,
     mapping: Any,
+    provider: SharedSlotArenaProvider,
     device: int,
     layer_idx: Optional[int],
 ) -> RebalanceLiveArena:
@@ -1075,16 +1026,18 @@ def allocate_rebalance_arena_v2(
 
     Every rank must call this with identical geometry and collective order.
     """
-    from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami.geometry import BundleLayout
-
     world = int(mapping.moe_ep_size)
     rank = int(mapping.moe_ep_rank)
     if world < 2:
         raise RuntimeError(f"MoE rebalance needs at least two EP ranks; got moe_ep_size={world}.")
 
-    bundle = BundleLayout.create(hidden=int(hidden_size), intermediate=int(intermediate_size))
-    mpi = _ep_mpi_comm(mapping)
-    provider = SharedSlotArenaProvider(mapping)
+    if bundle is None or not getattr(bundle, "planes", None):
+        raise TypeError("rebalance arena requires a quant-method live-weight plane spec")
+    if not isinstance(ep_comm, _EpComm):
+        raise TypeError("rebalance arena requires its model-owned EP communicator")
+    ep_comm.validate_geometry(expected_rank=rank, expected_world=world)
+    if not isinstance(provider, SharedSlotArenaProvider):
+        raise TypeError("rebalance arena provider must be owned by the model load balancer")
     arena = provider.build_hierarchical_live_arena(
         world=world,
         rank=rank,
@@ -1092,13 +1045,13 @@ def allocate_rebalance_arena_v2(
         helper_count=int(helper_slots),
         bundle=bundle,
         device=int(device),
-        comm=_EpComm(mpi),
+        comm=ep_comm,
     )
     # Initialize READY terminals explicitly before peers can observe them.
     # This startup-only reset does not depend on allocator initialization details.
     arena.base.terminals.local_view.zero_()
     torch.cuda.synchronize()
-    mpi.Barrier()
+    ep_comm.barrier()
     bound = arena.bind(
         world=world,
         rank=rank,
@@ -1113,6 +1066,7 @@ def allocate_rebalance_arena_v2(
         provider=provider,
         arena=arena,
         bound=bound,
+        bundle=bundle,
         plane_names=plane_names,
         # The bound hierarchy exposes local plane views through its base arena.
         local_plane_views=tuple(bound.base.local_plane_views),
@@ -1123,9 +1077,7 @@ def allocate_rebalance_arena_v2(
     pool = provider.pool
     layer = provider.layer
     assert pool is not None and layer is not None
-    verbose = pool.layer_count <= len(pool.sets) or pool.layer_count % 20 == 0
-    log_fn = logger.info if verbose else logger.debug
-    log_fn(
+    logger.debug(
         f"[MegaMoECuteDsl] layer={layer_idx} MoE rebalance SHARED-SLOT live arena: "
         f"{provider.buffer_bytes} B of home rows for M={live.slot_count} slots "
         f"(H={home_experts} + S={helper_slots}) on helper set "

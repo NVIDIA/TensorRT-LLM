@@ -58,18 +58,6 @@ extern "C" int megamoe_tma_copy_create(uint64_t, int, int, MegamoeTmaCopyState**
     return unsupported();
 }
 
-extern "C" int megamoe_tma_copy_submit(
-    MegamoeTmaCopyState*, MegamoeTmaCopySegment const*, uint64_t, MegamoeTmaCopyRange const*, uint64_t, void*)
-{
-    return unsupported();
-}
-
-extern "C" int megamoe_tma_copy_submit_notify(MegamoeTmaCopyState*, MegamoeTmaCopySegment const*, uint64_t,
-    MegamoeTmaCopyRange const*, uint64_t, uint64_t, uint64_t, void*)
-{
-    return unsupported();
-}
-
 extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState*, MegamoeTmaGpuPlanConfig const*)
 {
     return unsupported();

@@ -178,31 +178,6 @@ extern "C"
      */
     int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps, MegamoeTmaCopyState** out);
 
-    /* Copies caller descriptors into preallocated pinned storage before returning.
-     * The stream is an opaque cudaStream_t, including NULL for the default stream.
-     * Source/destination allocations must outlive completion on that stream.
-     * Repeated submissions are ordered across streams using a completion event.
-     * Reuse can wait for the preceding descriptor DMA, never for its full payload.
-     * CUDA graph capture is unsupported. Calls require the state's current device.
-     * Concurrent submits are serialized; destroy must not race any other call.
-     * range_count=0 is an ordered no-op. The caller owns SYS READY/terminal publication
-     * after this stream's kernel, which returns only after multicast writes finish.
-     */
-    int megamoe_tma_copy_submit(MegamoeTmaCopyState* state, MegamoeTmaCopySegment const* segments,
-        uint64_t segment_count, MegamoeTmaCopyRange const* ranges, uint64_t range_count, void* cuda_stream);
-    /* Fused GPU completion publication. After every CTA's multicast payload is
-     * complete, the last finishing CTA writes generation to this rank's 8-byte
-     * terminal slot through flag_mc (a nonzero, 8-byte-aligned multicast VA).
-     * generation must be nonzero. No extra notification kernel, stream barrier,
-     * host generation-table upload, or copy-engine terminal write is submitted.
-     * Empty work still launches one notification-only CTA. The counter is reset
-     * by the last CTA; submissions on this state remain ordered across streams.
-     * A consumer must acquire the expected generation from every rank before
-     * reading the payload. READY does not itself grant next-generation reuse.
-     */
-    int megamoe_tma_copy_submit_notify(MegamoeTmaCopyState* state, MegamoeTmaCopySegment const* segments,
-        uint64_t segment_count, MegamoeTmaCopyRange const* ranges, uint64_t range_count, uint64_t flag_mc,
-        uint64_t generation, void* cuda_stream);
     /* GPU-direct cold setup: input config contains HOST pointer tables. They are
      * uploaded once; current HALO-Q outputs are bound by device address, never copied.
      * Submit is stream-ordered and does not read or wait for plan data on the CPU.

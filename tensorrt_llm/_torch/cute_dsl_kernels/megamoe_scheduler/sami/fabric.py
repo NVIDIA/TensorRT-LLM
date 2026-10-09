@@ -1,21 +1,7 @@
 """CUDA Fabric and NVSwitch multicast memory.
 
-ON A RUNTIME PATH -- do not move this module out of the shipped package.
-
-It was moved to bench/ once, on the reasoning that "the shipped scheduler
-allocates its live banks through the framework, so none of this is on a runtime
-path". That is wrong. The framework allocates them *with this module*: the
-consumer implements HierarchicalLiveWeightArenaProvider and, inside
-build_hierarchical_live_arena, imports FabricAllocation and MulticastGroup back
-out of here. In TensorRT-LLM that is rebalance_live_arena_v2.py, which reaches
-it through _HierarchicalRegion.__init__.
-
-That import sits inside a function body on purpose because importing this package
-at module scope triggers an eager native build. A module-level grep or AST
-closure therefore does not see it and may conclude that nothing uses this. Walk
-consumers with ast.walk before touching it.
-
-megamoe_scheduler/sami/_driver.py carries the one helper shared with production.
+This module is in the runtime dependency closure. It is imported lazily by the
+live-weight arena to avoid eager native initialization at module import time.
 """
 
 from __future__ import annotations

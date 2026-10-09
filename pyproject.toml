@@ -47,7 +47,7 @@ exclude = [
     "tensorrt_llm/_torch/cute_dsl_kernels/rubin/moe/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py",
     "tensorrt_llm/grpc/openengine/_generated/**",
     # Keep pinned scheduler sources comparable to upstream.
-    "tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/**",
+    "tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler/**",
 ]
 
 

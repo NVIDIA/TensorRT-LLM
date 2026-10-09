@@ -182,18 +182,6 @@ def _quant_to_dict(quant_config: Any) -> Any:
     return str(quant_config)
 
 
-def _moe_rebalance_is_inert(rebalance_config: Any) -> bool:
-    """Whether rebalancing leaves the resident weight layout unchanged."""
-    return rebalance_config is None or not rebalance_config.is_active
-
-
-def _moe_rebalance_to_dict(rebalance_config: Any) -> Optional[dict]:
-    """Hash fields that affect the rebalance weight layout."""
-    if rebalance_config is None:
-        return None
-    return rebalance_config.model_dump(mode="python")
-
-
 @dataclass(frozen=True)
 class IdentityMatchResult:
     """Outcome of comparing two :class:`SourceIdentity` instances."""
@@ -414,10 +402,9 @@ class SourceIdentity:
             "use_cute_dsl_bf16_bmm": getattr(model_config, "use_cute_dsl_bf16_bmm", False),
             "use_cute_dsl_bf16_gemm": getattr(model_config, "use_cute_dsl_bf16_gemm", False),
         }
-        # Inert configurations must retain the existing weight-sharing digest.
-        rebalance_config = getattr(model_config, "moe_rebalance", None)
-        if not _moe_rebalance_is_inert(rebalance_config):
-            payload["moe_rebalance"] = _moe_rebalance_to_dict(rebalance_config)
+        load_balancer = getattr(model_config, "moe_load_balancer", None)
+        if load_balancer is not None:
+            payload["moe_load_balancer"] = load_balancer.model_dump(mode="python")
         return _canonical_hash(payload)
 
     @staticmethod

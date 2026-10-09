@@ -3,7 +3,7 @@ commit: 4f71c8bb46c4b4c262b71eb279172749b4dec4d1
 original_authors: Jintao Peng <jintaop@nvidia.com>; Ethan Zhang
 license: Apache-2.0
 source_tree_dirty: false
-kind: complete scheduler package
+kind: HALO-Q scheduler and SAMI Python runtime closure
 downstream_modified: true
 manifest: VENDOR_MANIFEST.json
-Downstream THOP integration, native-cache hardening, and demo-launcher omission are recorded in VENDOR_MANIFEST.json.
+Native HALO-Q and in-switch copy code is integrated through TensorRT-LLM's standard kernel and THOP paths; duplicate vendored native sources are intentionally omitted.

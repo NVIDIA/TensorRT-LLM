@@ -18,7 +18,6 @@ collective or auxiliary copy submitter is needed in the serving path.
 
 from __future__ import annotations
 
-import os
 import threading
 from typing import Any, Optional, Tuple
 
@@ -26,55 +25,13 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-__all__ = ["RebalanceSlotSchedulerGroupV2", "build_rebalance_slot_scheduler_group_v2"]
+__all__ = ["RebalanceSlotSchedulerGroup", "build_rebalance_slot_scheduler_group"]
 
 # Shared-expert persistent grids use the same capacity hint as the copy grid.
 TMA_COPY_SM_COUNT = 8
 
 
-def configured_halo_q_sm_count() -> int:
-    value = os.environ.get("TRTLLM_MOE_REBALANCE_CTAS_V2", "").strip()
-    count = int(value) if value else TMA_COPY_SM_COUNT
-    if count <= 0:
-        raise ValueError("HALO-Q SM count must be positive")
-    return count
-
-
-def rebalance_auxiliary_sm_count() -> int:
-    # HALO-Q and TMA copy share one stream and cannot run concurrently.
-    return max(configured_halo_q_sm_count(), TMA_COPY_SM_COUNT)
-
-
-_COPY_STREAM: Optional[torch.cuda.Stream] = None
-
-
-def _global_copy_stream(device: int) -> torch.cuda.Stream:
-    """Return the single highest-priority copy stream owned by this process."""
-    global _COPY_STREAM
-    if _COPY_STREAM is None:
-        _, priority = torch.cuda.Stream.priority_range()
-        _COPY_STREAM = torch.cuda.Stream(device=device, priority=priority)
-    elif _COPY_STREAM.device.index != device:
-        raise RuntimeError("Rebalance copy stream cannot span CUDA devices")
-    return _COPY_STREAM
-
-
-def _pin_halo_q_arch(device: int) -> str:
-    """Select the local GPU architecture before the first HALO-Q JIT compile.
-
-    The Torch-free scheduler defaults to sm_100. An explicit
-    MEGAMOE_HALO_Q_ARCH override takes precedence over local capability.
-    """
-    env = os.environ.get("MEGAMOE_HALO_Q_ARCH", "").strip()
-    if env:
-        return env
-    major, minor = torch.cuda.get_device_capability(device)
-    arch = f"sm_{major}{minor}"
-    os.environ["MEGAMOE_HALO_Q_ARCH"] = arch
-    return arch
-
-
-class _V2LiveBankLeaseProvider:
+class _LiveBankLeaseProvider:
     """Authorize ordered reuse, not a claim of completed GPU work on the host.
 
     release_generation_after() enqueues the local consumer wait on COPY.
@@ -88,7 +45,7 @@ class _V2LiveBankLeaseProvider:
     producer_reuse_guarded = True
     live_bank_count = 1
 
-    def __init__(self, group: RebalanceSlotSchedulerGroupV2) -> None:
+    def __init__(self, group: RebalanceSlotSchedulerGroup) -> None:
         self.bound_copy_module = group.broadcaster
         self._group = group
         self.proved_generation = 0
@@ -107,7 +64,7 @@ class _V2LiveBankLeaseProvider:
         self.proved_generation = generation
 
 
-class RebalanceSlotSchedulerGroupV2:
+class RebalanceSlotSchedulerGroup:
     """One layer's scheduler, copy endpoint, and paired consumer generations."""
 
     def __init__(
@@ -115,39 +72,31 @@ class RebalanceSlotSchedulerGroupV2:
         *,
         arena: Any,
         mapping: Any,
+        ep_comm: Any,
         device: int,
         home_experts: int,
         helper_slots: int,
-        hidden_size: int,
-        intermediate_size: int,
         topk: int,
         max_tokens_per_rank: int,
+        copy_stream: torch.cuda.Stream,
+        auxiliary_sms: int,
         layer_idx: Optional[int],
     ) -> None:
         from cuda.bindings import driver
 
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.cuda_scheduler import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler import (
             CudaPhysicalSlotScheduler,
             CudaSchedulerConfig,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.cuda_scheduler.multirank_dist import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler.multirank_dist import (
             FabricSymmetricBuffer,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.cuda_scheduler.runtime import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.cuda_scheduler.runtime import (
             symmetric_buffer_ints,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami import (
+        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler.sami import (
             HierarchicalSamiWeightBroadcast,
         )
-        from tensorrt_llm._torch.cute_dsl_kernels.megamoe_scheduler_v2.sami.geometry import (
-            BundleLayout,
-        )
-
-        from .rebalance_live_arena_v2 import _ep_mpi_comm, _EpComm
-
-        # Before the first CudaPhysicalSlotScheduler is built: the nvcc JIT
-        # reads the target once, at first compile, for the whole process.
-        _halo_q_arch = _pin_halo_q_arch(int(device))
 
         ep_size = int(mapping.moe_ep_size)
         ep_rank = int(mapping.moe_ep_rank)
@@ -159,6 +108,13 @@ class RebalanceSlotSchedulerGroupV2:
         self.helper_slots = int(helper_slots)
         self.topk = int(topk)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
+        self.auxiliary_sms = int(auxiliary_sms)
+        if self.auxiliary_sms < TMA_COPY_SM_COUNT:
+            raise ValueError(
+                f"auxiliary_sms must be at least {TMA_COPY_SM_COUNT}; got {self.auxiliary_sms}"
+            )
+        if copy_stream.device.index != self.device:
+            raise ValueError("copy stream device does not match scheduler device")
         self.arena = arena
         self.plan_calls = 0
         self._plan_part: Optional[Tuple[Any, int]] = None
@@ -178,8 +134,11 @@ class RebalanceSlotSchedulerGroupV2:
         # Keep a partially initialized producer reachable by the arena's
         # collective shutdown path. Constructor failures must not attempt a
         # rank-local teardown while peers may still be initializing.
-        ep_comm = _ep_mpi_comm(mapping)
+        ep_comm.validate_geometry(expected_rank=ep_rank, expected_world=ep_size)
         self._ep_comm = ep_comm
+        pool = getattr(arena.provider, "pool", None)
+        if pool is None or pool.comm is not ep_comm:
+            raise RuntimeError("rebalance arena and scheduler must use the same EP ProcessGroup")
         arena.provider.register_producer(self)
 
         logical_expert_count = self.home_experts * ep_size
@@ -193,14 +152,14 @@ class RebalanceSlotSchedulerGroupV2:
             max_tokens_per_rank=self.max_tokens_per_rank,
             topk=self.topk,
             local_rank=ep_rank,
-            ctas=configured_halo_q_sm_count(),
+            ctas=self.auxiliary_sms,
         )
         cfg.validate()
         self.cfg = cfg
         self.scheduler = CudaPhysicalSlotScheduler(cfg, device=f"cuda:{self.device}")
 
-        # All layers share one highest-priority copy stream on this device.
-        self.copy_stream = _global_copy_stream(self.device)
+        # All layers share the model manager's highest-priority copy stream.
+        self.copy_stream = copy_stream
         self.scheduler_stream = self.copy_stream
         self._stream_handle = int(self.copy_stream.cuda_stream)
         self._driver = driver
@@ -239,28 +198,26 @@ class RebalanceSlotSchedulerGroupV2:
         # The scheduler input is already initialized and peer allocations synchronized.
         self.scheduler.launch(self.scheduler_stream)
         torch.cuda.synchronize(self.device)
-        ep_comm.Barrier()
+        ep_comm.barrier()
 
         # The provider must return the existing arena with identical bundle geometry.
         # A second allocation would separate the loader aliases from the copy target.
-        bundle = BundleLayout.create(hidden=int(hidden_size), intermediate=int(intermediate_size))
+        bundle = arena.bundle
         self.broadcaster = HierarchicalSamiWeightBroadcast(
-            comm=_EpComm(ep_comm),
+            comm=ep_comm,
             device=self.device,
             bundle=bundle,
             helper_count=self.helper_slots,
             global_expert_count=logical_expert_count,
             arena_provider=arena.provider,
-            copy_backend="tma",
             tma_sm_count=TMA_COPY_SM_COUNT,
             tma_warps=7,
             tma_route="plan",
-            tma_plan_mode="gpu_direct",
         )
         self.broadcaster.bind_scheduler(self.scheduler, self.scheduler_stream)
 
         # A prior consumer event precedes the next HALO-Q EP rendezvous.
-        self.lease = _V2LiveBankLeaseProvider(self)
+        self.lease = _LiveBankLeaseProvider(self)
         self.broadcaster.bind_generation_reuse_authority(self.lease)
 
         logger.debug("[MegaMoECuteDsl] layer=%s rebalance producer initialized", layer_idx)
@@ -330,6 +287,28 @@ class RebalanceSlotSchedulerGroupV2:
         ):
             raise RuntimeError("Warmup owner handoff requires all plans to be finished")
         self._owner_thread_id = None
+
+    def release_quiesced_submission_owner(self, execution_stream_handle: int) -> None:
+        """Release a stopped executor's MAIN owner after a device drain.
+
+        Unlike the warmup handoff, this is called by the shutdown thread after
+        the serving worker has exited. The caller must synchronize the device
+        first, so neither the old CPU thread nor its MAIN stream can still be
+        submitting work.
+        """
+        if self._closed:
+            raise RuntimeError("Rebalance scheduler group is closed")
+        handle = int(execution_stream_handle)
+        if (
+            self._plan_part is not None
+            or self._generation != self._finished_generation
+            or self._generation != self.plan_calls
+        ):
+            raise RuntimeError("Quiesced owner release requires all plans to be finished")
+        if self._execution_stream_handle is not None and self._execution_stream_handle != handle:
+            raise RuntimeError("Quiesced owner release requires the bound MAIN stream")
+        self._owner_thread_id = None
+        self._execution_stream_handle = None
 
     def _record_event(self, event_handle: int, stream_handle: int) -> None:
         (error,) = self._driver.cuEventRecord(event_handle, stream_handle)
@@ -408,8 +387,7 @@ class RebalanceSlotSchedulerGroupV2:
         if self._generation <= 0:
             raise RuntimeError("No scheduler generation is available")
         if self._route_wait_generation != self._generation:
-            with torch.cuda.nvtx.range("rebal/route_wait"):
-                self._wait_event(self._execution_stream_handle, self._plan_ready_handle)
+            self._wait_event(self._execution_stream_handle, self._plan_ready_handle)
             self._route_wait_generation = self._generation
 
     def plan(
@@ -441,7 +419,7 @@ class RebalanceSlotSchedulerGroupV2:
         self._finished_generation = self._generation
 
 
-def build_rebalance_slot_scheduler_group_v2(backend: Any) -> RebalanceSlotSchedulerGroupV2:
+def build_rebalance_slot_scheduler_group(backend: Any) -> RebalanceSlotSchedulerGroup:
     """Build the layer's scheduler/copy group after its live arena exists."""
     arena = getattr(backend, "_rebalance_arena", None)
     if arena is None:
@@ -454,112 +432,27 @@ def build_rebalance_slot_scheduler_group_v2(backend: Any) -> RebalanceSlotSchedu
         raise RuntimeError(
             f"MoE rebalance requires a positive resident expert count; got {home!r}."
         )
-    return RebalanceSlotSchedulerGroupV2(
+    layer_balancer = getattr(backend, "layer_load_balancer", None)
+    manager = getattr(layer_balancer, "manager", None)
+    get_copy_stream = getattr(manager, "get_copy_stream", None)
+    get_ep_comm = getattr(manager, "get_ep_comm", None)
+    if not callable(get_copy_stream) or not callable(get_ep_comm):
+        raise RuntimeError(
+            "per-iteration EPLB scheduler requires model-owned stream and communicator"
+        )
+    return RebalanceSlotSchedulerGroup(
         arena=arena,
         mapping=backend.mapping,
+        ep_comm=get_ep_comm(backend._ep_pg),
         home_experts=home,
         helper_slots=int(backend._rebalance_slots_active),
-        hidden_size=int(backend.hidden_size),
-        intermediate_size=int(backend.intermediate_size_per_partition),
         max_tokens_per_rank=int(backend._maxt_buckets[-1]),
         topk=int(backend.routing_method.experts_per_token),
         device=int(backend.mapping.local_rank),
+        copy_stream=get_copy_stream(int(backend.mapping.local_rank)),
+        auxiliary_sms=int(manager.auxiliary_sms),
         layer_idx=getattr(backend, "layer_idx", None),
     )
-
-
-_PLAN_GAP_HOOK_ATTR = "_rebalance_plan_gap_hook"
-
-
-def _resident_slot_ids(
-    token_selected_slots: torch.Tensor,
-    *,
-    home_experts: int,
-    helper_slots: int,
-) -> torch.Tensor:
-    """Map logical IDs to the widened resident slots while preserving padding."""
-    ids = token_selected_slots
-    slot_count = home_experts + helper_slots
-    logical = ids.long()
-    owner = torch.div(logical, home_experts, rounding_mode="floor")
-    physical = owner * slot_count + (logical - owner * home_experts)
-    return torch.where(logical < 0, logical, physical).to(ids.dtype)
-
-
-def apply_rebalance_scheduler(
-    moe: Any,
-    token_selected_slots: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
-    """Produce physical routes and enqueue the matching helper-weight copy."""
-    backend = getattr(moe, "backend", None)
-    helper_slots = getattr(backend, "_rebalance_slots_active", 0)
-    if type(helper_slots) is not int or helper_slots <= 0:
-        return token_selected_slots
-    if getattr(moe, "layer_load_balancer", None) is not None:
-        raise RuntimeError(
-            "MoE rebalance helper slots and EPLB cannot both remap the "
-            "routing tensor: layer_load_balancer is not None while S="
-            f"{helper_slots} > 0 (layer_idx={getattr(moe, 'layer_idx', None)})."
-        )
-
-    group = getattr(backend, "_rebalance_scheduler_group", None)
-    if group is None:
-        raise RuntimeError(
-            f"MoE rebalance helper slots are live (S={helper_slots}, "
-            f"layer_idx={getattr(moe, 'layer_idx', None)}) but the scheduler "
-            "group is absent. Set TRTLLM_MOE_REBALANCE_DISABLE=1 to run "
-            "without helper slots."
-        )
-    if not backend.is_rebalance_active():
-        home_experts = getattr(backend, "_rebalance_home_experts", None)
-        if type(home_experts) is not int or home_experts <= 0:
-            raise RuntimeError(
-                "MoE rebalance bypass requires a positive resident expert count; "
-                f"got {home_experts!r}."
-            )
-        backend._rebalance_plan_ran = False
-        return _resident_slot_ids(
-            token_selected_slots,
-            home_experts=home_experts,
-            helper_slots=helper_slots,
-        )
-
-    backend._rebalance_plan_ran = True
-    gap_hook = getattr(moe, _PLAN_GAP_HOOK_ATTR, None)
-    gap_hook_owner = moe
-    backend_gap_hook = getattr(backend, _PLAN_GAP_HOOK_ATTR, None)
-    if backend_gap_hook is not None:
-        if gap_hook is not None:
-            raise RuntimeError(
-                "MoE rebalance found shared-expert hooks on both wrapper and backend"
-            )
-        gap_hook, gap_hook_owner = backend_gap_hook, backend
-    if gap_hook is None:
-        physical_slot_ids, generation = group.plan(token_selected_slots, defer_wait=True)
-    else:
-        part = group.plan_schedule(token_selected_slots)
-        setattr(gap_hook_owner, _PLAN_GAP_HOOK_ATTR, None)
-        try:
-            gap_hook()
-        except BaseException as error:  # noqa: BLE001
-            try:
-                group.discard_plan(part)
-                backend._rebalance_plan_ran = False
-                cleanup_note = "the unused rebalance generation was safely released."
-            except BaseException as cleanup_error:  # noqa: BLE001
-                cleanup_note = (
-                    "rebalance generation cleanup failed and the group requires teardown: "
-                    f"{cleanup_error!r}"
-                )
-            notes = getattr(error, "__notes__", None)
-            if type(notes) is not list:
-                notes = []
-                error.__notes__ = notes
-            notes.append("Shared-expert hook failed after HALO-Q/TMA enqueue; " + cleanup_note)
-            raise
-        physical_slot_ids, generation = group.plan_finish(part, defer_wait=True)
-    backend._rebalance_generation = int(generation)
-    return physical_slot_ids
 
 
 def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
@@ -567,11 +460,11 @@ def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
     arena = getattr(module, "_rebalance_arena", None)
     if arena is None:
         return
-    from ....cute_dsl_kernels.megamoe_scheduler_v2.integrations.megamoe.direct_live_weight_bridge import (
-        CANONICAL_WEIGHT_PLANE_NAMES,
-    )
-
-    if tuple(arena.plane_names) != CANONICAL_WEIGHT_PLANE_NAMES:
+    expected_bundle = quant_method.live_weight_plane_spec(module)
+    if expected_bundle != arena.bundle:
+        raise RuntimeError("MoE rebalance arena does not match the quant-method plane spec")
+    expected_names = tuple(plane.name for plane in expected_bundle.planes)
+    if tuple(arena.plane_names) != expected_names:
         raise RuntimeError("MoE rebalance arena plane order is not canonical")
     rebound = False
     for name, arena_view, alias in zip(
@@ -607,3 +500,4 @@ def bind_live_weight_planes(quant_method: Any, module: Any) -> None:
     norm_const = getattr(module, "fc1_norm_const", None)
     if norm_const is not None and arena.home_experts < norm_const.data.shape[0]:
         norm_const.data[int(arena.home_experts) :].fill_(1.0)
+    quant_method.assert_live_weight_aliases(module, arena)

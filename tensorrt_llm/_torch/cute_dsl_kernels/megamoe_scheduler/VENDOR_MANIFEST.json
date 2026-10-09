@@ -1,0 +1,78 @@
+{
+  "upstream": "https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy",
+  "commit": "4f71c8bb46c4b4c262b71eb279172749b4dec4d1",
+  "source_tree_dirty": false,
+  "kind": "HALO-Q scheduler and SAMI Python runtime closure",
+  "native_integration": {
+    "layout": "TensorRT-LLM standard kernel/THOP paths",
+    "vendored_duplicate_sources": false
+  },
+  "files": [
+    {
+      "file": "__init__.py",
+      "upstream_sha256": "2077e75537e4128e5f02c51a45c13f6188b522ffddb0dfc63983ebcf7bc98daa",
+      "downstream_sha256": "d770471fd5b841085853b0330a55b5702447e03a0e8f4fcacc9d84c5acb2e504",
+      "downstream_modified": true
+    },
+    {
+      "file": "cuda_scheduler/__init__.py",
+      "upstream_sha256": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
+      "downstream_sha256": "dfd129c1690f404c60185d67bf68aca0a58c813178e3583cf0aaf54ce043382a",
+      "downstream_modified": false
+    },
+    {
+      "file": "cuda_scheduler/multirank_dist.py",
+      "upstream_sha256": "91fae2b153518feb5fc24c9fc666429b9fa101549570965812ac47390b4181ca",
+      "downstream_sha256": "47cb5916b1954acebe5eaf10789dceb3bc388f8b5050d1847d85e66769da3296",
+      "downstream_modified": true
+    },
+    {
+      "file": "cuda_scheduler/runtime.py",
+      "upstream_sha256": "53e63bae0dc32c3599b87b0ce08bec479aeb488d876d872872827c219c10fc8c",
+      "downstream_sha256": "27b1a934d569bf5604ff92bd932c3d910d585bb765c5b48770bd0447c030797e",
+      "downstream_modified": true
+    },
+    {
+      "file": "geometry.py",
+      "upstream_sha256": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
+      "downstream_sha256": "74de927de618beffcffa69231f10d283dcf92f86f2aaf5f0ec59b56a15dae56c",
+      "downstream_modified": false
+    },
+    {
+      "file": "sami/__init__.py",
+      "upstream_sha256": "47e138c48486d203f9169acb6f6d364bfcc86c4bc987cf0e483c9d82177a5845",
+      "downstream_sha256": "43dac9deaa737d5419a798c968b104f1ce9d3192d99e608c7c1705a842c2f276",
+      "downstream_modified": true
+    },
+    {
+      "file": "sami/_util.py",
+      "upstream_sha256": "22ad1b52d8ba8811818a90180d81213ff253c5c6edc651cc9db51a23778d76d9",
+      "downstream_sha256": "22ad1b52d8ba8811818a90180d81213ff253c5c6edc651cc9db51a23778d76d9",
+      "downstream_modified": false
+    },
+    {
+      "file": "sami/arena.py",
+      "upstream_sha256": "a3ecaf8acf30fe35e9898b694dbf37ecd0f5d7196f264948d2bc37158037776f",
+      "downstream_sha256": "a3ecaf8acf30fe35e9898b694dbf37ecd0f5d7196f264948d2bc37158037776f",
+      "downstream_modified": false
+    },
+    {
+      "file": "sami/fabric.py",
+      "upstream_sha256": "48bbc47b5b0e35db09c9238e30d08c80d6ca1949bff2c072588a6bf27b85a27b",
+      "downstream_sha256": "9179c5e7bd2a6e0d6b315f55b84e9e9d990f83717cac8c2cfd371f9fd6f1e8e0",
+      "downstream_modified": true
+    },
+    {
+      "file": "sami/geometry.py",
+      "upstream_sha256": "e39195802acbe498ab647fec84f651b230290432847a092a6ba31a0236781559",
+      "downstream_sha256": "514a4c027cff8f262f58388b5f3bb064c5278c0d4f48e41cdaf54848b478caa9",
+      "downstream_modified": true
+    },
+    {
+      "file": "sami/hierarchical.py",
+      "upstream_sha256": "67c2bfbacff38fcebd78438c83af63ebd7fbaa1013de2e4c72616c96b5dde857",
+      "downstream_sha256": "8be90360b63460a2ed01366361eff4953a3d0e0496cd6ab65834373a1710e17d",
+      "downstream_modified": true
+    }
+  ]
+}

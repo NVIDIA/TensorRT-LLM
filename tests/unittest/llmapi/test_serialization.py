@@ -24,6 +24,33 @@ def test_serialization_allowed_class():
     assert type(obj) == type(b) and obj.name == b.name
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        pytest.param(
+            __import__("tensorrt_llm.llmapi.llm_args",
+                       fromlist=["MoeLoadBalancerConfig"
+                                 ]).MoeLoadBalancerConfig(num_slots=8),
+            id="standard",
+        ),
+        pytest.param(
+            __import__(
+                "tensorrt_llm.llmapi.llm_args",
+                fromlist=["MoePerIterationLoadBalancerConfig"],
+            ).MoePerIterationLoadBalancerConfig(num_slots=16),
+            id="per-iteration",
+        ),
+    ],
+)
+def test_moe_load_balancer_configs_use_restricted_serialization(config):
+    restored = serialization.loads(
+        serialization.dumps(config),
+        approved_imports=serialization.BASE_EXAMPLE_CLASSES,
+    )
+    assert type(restored) is type(config)
+    assert restored == config
+
+
 def test_serialization_disallowed_class():
     obj = TestClass("test")
     a = serialization.dumps(obj)

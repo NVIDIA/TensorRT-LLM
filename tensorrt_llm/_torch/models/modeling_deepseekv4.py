@@ -1606,13 +1606,17 @@ class DeepseekV4MoE(nn.Module):
             shared_expert_intermediate_size, block_size
         )
 
-        rebalance_backend = getattr(self.experts, "backend", self.experts)
-        descriptor = getattr(rebalance_backend, "descriptor", None)
+        load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+        self._per_iteration_eplb_enabled = (
+            getattr(load_balancer_config, "mode", None) == "per_iteration"
+        )
+        self._per_iteration_eplb_auxiliary_sms = (
+            int(load_balancer_config.auxiliary_sms) if self._per_iteration_eplb_enabled else 0
+        )
+        # Select the shared backend from the final projection quantization.
+        # Per-iteration EPLB only supplies an optional SM budget below.
         use_fused_fc12 = (
-            descriptor is not None
-            and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
-            and self._shared_fc12_rebalance_enabled(rebalance_backend)
-            and get_sm_version() == 107
+            get_sm_version() == 107
             and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
             and not model_config.use_cuda_graph
         )
@@ -1624,14 +1628,11 @@ class DeepseekV4MoE(nn.Module):
             shared_mlp_cls = MegaMoESharedMLP
 
         # Only fused FC12 accepts an SM budget; other shared MLP backends stay unrestricted.
-        shared_reserved_sms = 0
-        if (
-            getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
-            and get_sm_version() == 107
-            and not model_config.use_cuda_graph
-            and os.environ.get("TRTLLM_MOE_REBALANCE_PLAN_GAP", "1") == "1"
-        ):
-            shared_reserved_sms = int(getattr(rebalance_backend, "_rebalance_reserved_sms", 0))
+        shared_reserved_sms = (
+            self._per_iteration_eplb_auxiliary_sms
+            if use_fused_fc12 and self._per_iteration_eplb_enabled
+            else 0
+        )
         shared_mlp_kwargs = {"fc12_reserved_sms": shared_reserved_sms} if use_fused_fc12 else {}
 
         self.shared_experts = shared_mlp_cls(
@@ -1718,45 +1719,36 @@ class DeepseekV4MoE(nn.Module):
         quant_config_dict = getattr(model_config, "quant_config_dict", None) or {}
         global_quant_config = model_config.quant_config
 
-        def resolve_projection(*projection_names: str) -> Optional[QuantConfig]:
-            quant_config = quant_config_dict.get(base_name, global_quant_config)
-            overrides = [
-                candidate
-                for name, candidate in quant_config_dict.items()
-                if any(
-                    name == projection_name or name.startswith(projection_name + ".")
-                    for projection_name in projection_names
-                )
-            ]
-            if overrides:
-                quant_config = overrides[0]
-                if any(candidate != quant_config for candidate in overrides[1:]):
-                    return None
+        gate_up_name = f"{base_name}.gate_up_proj"
+        gate_name = f"{base_name}.gate_proj"
+        up_name = f"{base_name}.up_proj"
+        down_name = f"{base_name}.down_proj"
 
-            # modules_to_not_convert is applied after layerwise overrides, so
-            # the global exclusion list must win here as well.
-            if global_quant_config is not None and any(
+        # Match apply_layerwise_quant_config exactly for the actual fused
+        # gate_up Linear: the first gate_proj/gate_up_proj entry wins, while an
+        # up-only entry does not independently reconfigure a fused weight.
+        gate_up_quant_config = global_quant_config
+        for name, candidate in quant_config_dict.items():
+            if gate_name in name or gate_up_name in name:
+                gate_up_quant_config = candidate
+                break
+        down_quant_config = quant_config_dict.get(down_name, global_quant_config)
+
+        # apply_quant_config_exclude_modules runs after layerwise overrides and
+        # excludes the fused gate_up Linear when any fused constituent matches.
+        if global_quant_config is not None:
+            unquantized = QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo,
+            )
+            if any(
                 global_quant_config.is_module_excluded_from_quantization(name)
-                for name in projection_names
+                for name in (gate_up_name, gate_name, up_name)
             ):
-                return QuantConfig(
-                    quant_algo=None,
-                    kv_cache_quant_algo=global_quant_config.kv_cache_quant_algo,
-                )
-            return quant_config
-
-        gate_up_quant_config = resolve_projection(
-            f"{base_name}.gate_up_proj",
-            f"{base_name}.gate_proj",
-            f"{base_name}.up_proj",
-        )
-        down_quant_config = resolve_projection(f"{base_name}.down_proj")
+                gate_up_quant_config = unquantized
+            if global_quant_config.is_module_excluded_from_quantization(down_name):
+                down_quant_config = unquantized
         return gate_up_quant_config, down_quant_config
-
-    @staticmethod
-    def _shared_fc12_rebalance_enabled(rebalance_backend) -> bool:
-        """Keep the fused shared kernel inside the opt-in rebalance path."""
-        return getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
 
     @staticmethod
     def _shared_fc12_quantization_supported(
@@ -1840,15 +1832,11 @@ class DeepseekV4MoE(nn.Module):
         # enqueued both HALO-Q and TMA copy on the shared high-priority stream.
         # Shared experts then run on MAIN while helper weights are copied.
         # Install identically across ranks and clear the hook on every exit.
-        _plan_gap_slots = getattr(
-            getattr(self.experts, "backend", self.experts), "_rebalance_slots_active", 0
-        )
-        _plan_gap_default = "1" if type(_plan_gap_slots) is int and _plan_gap_slots > 0 else "0"
         _plan_gap_installed = False
         if (
-            self.shared_experts is not None
+            self._per_iteration_eplb_enabled
+            and self.shared_experts is not None
             and not do_multi_stream()
-            and os.environ.get("TRTLLM_MOE_REBALANCE_PLAN_GAP", _plan_gap_default) == "1"
         ):
             _shared_box = {}
 

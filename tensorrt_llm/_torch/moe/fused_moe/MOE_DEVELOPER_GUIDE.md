@@ -713,11 +713,11 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
   weight tensors registered by its quantization method, with the constraint
   `num_slots % ep_size == 0`. `TrtllmCutedslMegaMoeNvfp4Impl` publishes `capabilities.supports_eplb=True` on its descriptor, and its quantization method declares `eplb_support_status = SUPPORTED` and registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
-- Dynamic rebalance uses `MoeConfig.backend=MEGAMOE_CUTEDSL` with
-  `rebalance.enabled=true` and a positive `helper_slots_per_rank`. The disabled
-  environment override is part of the same active-state predicate used by
-  validation, source identity, launch-queue setup, and runtime construction.
-- Active rebalance requires `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA context
+- Per-iteration EPLB uses `MoeConfig.load_balancer.mode=per_iteration` with
+  `num_slots` greater than the model expert count. Backend resolution selects
+  `MEGAMOE_CUTEDSL` when no concrete backend is requested and rejects an
+  incompatible explicit backend before model construction.
+- Per-iteration EPLB requires `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA context
   initialization. TensorRT-LLM applies the setting before `TorchLlmArgs`
   validation and CUDA initialization/device probes, and propagates it to MPI,
   direct, and Ray workers. Applications that initialize CUDA before TensorRT-LLM
@@ -736,12 +736,10 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
   rollback must release the scheduler, TMA bindings, shared-slot mappings,
   and fabric allocations collectively. Forward execution must not retain
   activation tensors after their consumer has been enqueued.
-- Active rebalance selects the complete fused shared FC12 kernel only when
-  the final projection quantization supports that implementation. Disabled,
-  BF16, and unsupported configurations keep the model's existing shared-MLP
-  backend. SM reservation is an optional launch budget for kernels that expose
-  such a control; backend selection and quantization selection remain
-  independent of it.
+- Fused shared FC12 selection depends only on the final projection
+  quantization, hardware, and graph support. Per-iteration EPLB supplies an
+  optional SM budget when that backend exposes resource control. BF16 and
+  unsupported configurations keep the model's existing shared-MLP backend.
 
 ## Canonical Examples
 

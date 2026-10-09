@@ -494,8 +494,12 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
         moe_load_balancer = get_moe_load_balancer()
         moe_load_balancer_config = model_config.moe_load_balancer
 
-        # Calculate initial expert assignments
-        if moe_load_balancer_config:
+        # Standard EPLB checkpoints carry one expert id per physical slot.
+        # Per-iteration EPLB keeps checkpoint/source storage on the resident
+        # axis H=E/EP; only the live kernel planes are widened to M=P/EP.
+        per_iteration_eplb = (getattr(moe_load_balancer_config, "mode",
+                                      None) == "per_iteration")
+        if moe_load_balancer_config and not per_iteration_eplb:
             init_expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.initial_global_assignments = [
                 (ep_rank * self.num_experts // self.ep_size + local_slot_id) %
@@ -503,7 +507,7 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 for local_slot_id in range(init_expert_size_per_partition)
             ]
         else:
-            # Sequential mapping: expert i → slot i; covers all experts regardless of divisibility
+            # Sequential resident mapping covers every logical expert exactly once.
             self.initial_global_assignments = list(range(self.num_experts))
 
         # Setup load balancer if available
@@ -523,23 +527,44 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     f"by ep_size ({self.ep_size}) so each rank holds the same "
                     f"number of slots.")
             top_k = self.routing_method.experts_per_token
-            self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
+            if per_iteration_eplb:
+                validate_capacity = getattr(moe_load_balancer_config,
+                                            "validate_expert_capacity", None)
+                if callable(validate_capacity):
+                    validate_capacity(self.num_experts)
+                if self.num_experts % self.ep_size != 0:
+                    raise ValueError(
+                        f"{type(self).__name__}: per-iteration EPLB requires "
+                        f"num_experts ({self.num_experts}) divisible by ep_size "
+                        f"({self.ep_size}) so resident H is rank-identical.")
+                self.expert_size_per_partition = self.num_experts // self.ep_size
+            else:
+                self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
 
-            # Add this layer to the load balancer
+            # Add this layer to the load balancer. slot_count_per_rank is the
+            # compute capacity M for per-iteration mode and the ordinary local
+            # slot count for standard mode.
             aux_stream = getattr(self, '_get_load_balancer_aux_stream',
                                  lambda: None)()
+            slot_count_per_rank = (moe_load_balancer_config.num_local_slots
+                                   if per_iteration_eplb else
+                                   self.expert_size_per_partition)
             self.layer_load_balancer = moe_load_balancer.add_layer(
                 self.num_experts,
                 top_k,
-                self.expert_size_per_partition,
+                slot_count_per_rank,
                 aux_stream=aux_stream)
 
             self.repeat_count = self.layer_load_balancer.get_repeat_count()
 
             # Handle initial global assignments
-            loaded_initial_global_assignments = (
-                moe_load_balancer_config.get_layer_initial_global_assignments(
-                    self.layer_idx))
+            get_initial_assignments = getattr(
+                moe_load_balancer_config,
+                "get_layer_initial_global_assignments",
+                None,
+            )
+            loaded_initial_global_assignments = (get_initial_assignments(
+                self.layer_idx) if callable(get_initial_assignments) else None)
             self.num_slots = moe_load_balancer_config.num_slots
 
             if loaded_initial_global_assignments is not None:
@@ -561,7 +586,8 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 f"initial_global_assignments (layer {self.layer_idx}) = {self.initial_global_assignments}"
             )
 
-            # Slot boundaries for EPLB (uniform: all ranks hold same num_local_slots)
+            # Source/checkpoint boundaries are resident H in per-iteration
+            # mode. The layer manager separately owns compute slots M.
             self.slot_start = self.ep_rank * self.expert_size_per_partition
             self.slot_end = self.slot_start + self.expert_size_per_partition
             self.initial_local_expert_ids = self.initial_global_assignments[
@@ -655,12 +681,40 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
 
     def _load_balancer_route(self, token_selected_experts: torch.Tensor,
                              use_dp: bool) -> torch.Tensor:
-        """Route tokens using load balancer."""
-        if self.layer_load_balancer:
-            return self.layer_load_balancer.route(token_selected_experts,
-                                                  use_dp)
-        else:
+        """Route tokens and enqueue a per-iteration replica plan when enabled."""
+        if not self.layer_load_balancer:
             return token_selected_experts
+
+        gap_hook = getattr(self, "_rebalance_plan_gap_hook", None)
+        if gap_hook is not None:
+            # The hook is one-shot: DeepSeekV4 falls back to ordinary shared
+            # expert execution if routing exits before consuming it.
+            self._rebalance_plan_gap_hook = None
+        route = self.layer_load_balancer.route
+        if gap_hook is not None:
+            return route(token_selected_experts, use_dp, gap_hook=gap_hook)
+        return route(token_selected_experts, use_dp)
+
+    def _load_balancer_uses_replica_plan(self) -> bool:
+        """Whether routing is produced by the per-iteration device planner."""
+        return bool(self.layer_load_balancer and callable(
+            getattr(self.layer_load_balancer, "require_replica_plan", None)))
+
+    def _load_balancer_replica_plan(self):
+        """Return the plan produced by the most recent route, if this mode has one."""
+        if not self._load_balancer_uses_replica_plan():
+            return None
+        return self.layer_load_balancer.require_replica_plan()
+
+    def _load_balancer_finish_replica_plan(self, plan) -> None:
+        """Release a caller-owned plan after its last MAIN-stream consumer."""
+        if plan is None or not self.layer_load_balancer:
+            return
+        finish = getattr(self.layer_load_balancer, "finish_replica_plan", None)
+        if not callable(finish):
+            raise RuntimeError(
+                "an EPLB replica plan was produced without a finish method")
+        finish(plan)
 
     def _load_balancer_start_set_cpu_stage(self, is_last_call: bool):
         """Start CPU stage in load balancer."""

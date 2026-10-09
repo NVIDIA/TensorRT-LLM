@@ -51,7 +51,7 @@ def _load_classes() -> tuple[type[MoEWeightLoadingMode], type[NVFP4MegaMoECuteDs
 class _StreamingMoEModule(nn.Module):
     """Minimal single-rank module for the quant-method load path."""
 
-    def __init__(self, weight_loading_mode: MoEWeightLoadingMode) -> None:
+    def __init__(self, weight_loading_mode: MoEWeightLoadingMode, helper_slots: int = 0) -> None:
         from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
         super().__init__()
@@ -61,6 +61,7 @@ class _StreamingMoEModule(nn.Module):
         self.intermediate_size_per_partition = INTERMEDIATE_SIZE
         self.expand_intermediate_size_per_partition = 2 * INTERMEDIATE_SIZE
         self.expert_size_per_partition = NUM_EXPERTS
+        self.helper_slots = int(helper_slots)
         self.initial_local_expert_ids = list(range(NUM_EXPERTS))
         self.tp_size = 1
         self.tp_rank = 0
@@ -71,6 +72,10 @@ class _StreamingMoEModule(nn.Module):
         self.weight_loading_mode = weight_loading_mode
         # No EPLB in this test: need_load_shared_weights() must be False.
         self.layer_load_balancer = None
+
+    @property
+    def compute_slot_count(self) -> int:
+        return int(self.expert_size_per_partition) + self.helper_slots
 
     def _add_raw_shared_weights_for_unmap(self, weight_tensors: list[torch.Tensor]) -> None:
         # Only forwards to the dynamic load balancer in production; no-op here.
@@ -176,6 +181,33 @@ def _expected_fc1_norm_const() -> torch.Tensor:
         dtype=torch.float32,
         device="cuda",
     )
+
+
+def test_helper_slots_widen_only_seven_kernel_planes() -> None:
+    mode_cls, method_cls = _load_classes()
+    helper_slots = 2
+    module = _StreamingMoEModule(mode_cls.VANILLA, helper_slots=helper_slots)
+    method = method_cls()
+    with torch.device("cuda"):
+        method.create_weights(module)
+
+    assert module.expert_size_per_partition == NUM_EXPERTS
+    for name in _STREAMED_PARAMS:
+        assert module.rebuild_tensor_metadata[name]["meta"].shape[0] == NUM_EXPERTS
+
+    compute_slots = NUM_EXPERTS + helper_slots
+    kernel_planes = (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+        "fc31_alpha",
+        "fc2_alpha",
+        "fc1_norm_const",
+    )
+    assert all(getattr(module, name).shape[0] == compute_slots for name in kernel_planes)
+    assert module.quant_scales.fc1_global is module.fc31_alpha
+    assert module.quant_scales.fc2_global is module.fc2_alpha
 
 
 def test_initial_streaming_load_layer_atomic() -> None:

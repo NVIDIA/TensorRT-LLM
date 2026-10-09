@@ -202,12 +202,6 @@ package_data += [
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
-    # Runtime-compiled scheduler and transfer sources shipped in wheels.
-    '_torch/cute_dsl_kernels/megamoe_scheduler_v2/csrc/**/*.c',
-    '_torch/cute_dsl_kernels/megamoe_scheduler_v2/csrc/**/*.h',
-    '_torch/cute_dsl_kernels/megamoe_scheduler_v2/csrc/**/*.cu',
-    '_torch/cute_dsl_kernels/megamoe_scheduler_v2/csrc/**/*.cuh',
-    '_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/csrc/**/*.cu',
     'usage/schemas/*.json',
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',

@@ -18,7 +18,6 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (  # noqa: E402
     KimiMLARuntime,
     _Fp8BlockScaleWeightReadLinear,
     _helix_cp_v_b_shard,
-    _k3_checkpoint_local_slots,
     _shard_head_major_param,
     resolve_attention_quant_config,
 )
@@ -55,17 +54,6 @@ def test_checkpoint_plan_preserves_external_attention_names():
     }
     assert expected_keys == set(name_map.values())
     assert expert_jobs == []
-
-
-def test_checkpoint_slots_exclude_dynamic_helper_capacity():
-    backend = SimpleNamespace(expert_size_per_partition=7)
-    moe = SimpleNamespace(
-        local_expert_ids=(24, 25, 26, 27),
-        routed_experts=SimpleNamespace(backend=backend),
-    )
-
-    assert _k3_checkpoint_local_slots(moe) == {0, 1, 2, 3}
-    assert len(moe.local_expert_ids) < backend.expert_size_per_partition
 
 
 def _distinct(*shape: int) -> torch.Tensor:

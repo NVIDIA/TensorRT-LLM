@@ -417,6 +417,20 @@ class RPCServer:
                         logger_debug(
                             f"[server] RPC Server sent response for request {req}"
                         )
+                        # Worker cleanup and server exit use a two-phase
+                        # handshake. Wake RpcWorker.main_task only after the
+                        # successful commit response is on the wire; otherwise
+                        # main_task could cancel this coroutine before the client
+                        # receives its acknowledgement.
+                        if (req.method_name == "commit_shutdown"
+                                and response.error is None):
+                            complete_commit = getattr(
+                                self._instance,
+                                "_complete_shutdown_commit",
+                                None,
+                            )
+                            if callable(complete_commit):
+                                complete_commit()
 
             # Decrement pending count
             if req.method_name not in ["_rpc_shutdown", "shutdown"]:

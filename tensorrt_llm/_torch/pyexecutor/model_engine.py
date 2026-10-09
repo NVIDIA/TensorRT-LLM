@@ -904,14 +904,11 @@ class PyTorchModelEngine(ModelEngine):
         set_moe_a2a_warmup(value)
 
         self.moe_load_balancer_iter_info = (not value, not value)
-        # The backend controls helper migration during warmup and tactic tuning.
-        model = getattr(self, "model", None)
-        if model is not None:
-            for module in model.modules():
-                set_rebalance_warmup = getattr(module, "set_rebalance_warmup",
-                                               None)
-                if callable(set_rebalance_warmup):
-                    set_rebalance_warmup(value)
+        moe_load_balancer = self.moe_load_balancer
+        if moe_load_balancer is not None:
+            set_warmup = getattr(moe_load_balancer, "set_warmup", None)
+            if callable(set_warmup):
+                set_warmup(value)
 
     @property
     def moe_load_balancer_iter_info(self):
@@ -1085,76 +1082,84 @@ class PyTorchModelEngine(ModelEngine):
                 "Item-level MM scheduling requires MultimodalModelMixin")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
-    def cleanup(self) -> None:
-        """Release resources owned by this model engine.
+    def prepare_cleanup(self) -> None:
+        """Release local graph captures before collective model teardown."""
+        if self._cleanup_done:
+            return
+        self._release_cuda_graphs()
 
-        Tears down, in order:
+    def shutdown_moe_load_balancer(self, *, local_safe: bool) -> bool:
+        """Run the manager's rank-aligned teardown preflight and collectives."""
+        if self._cleanup_done:
+            return True
+        moe_load_balancer = getattr(self, "moe_load_balancer", None)
+        if moe_load_balancer is None:
+            return bool(local_safe)
+        return moe_load_balancer.shutdown(
+            local_safe=bool(local_safe)) is not False
 
-        1. The optional ``ModelLoader`` (which in turn releases any
-           GMS client; see :meth:`ModelLoader.cleanup`).
-        2. Runner resources and engine-owned CUDA Graph captures.
-        3. The runner, model caller, MM item scheduler, and model references.
-        4. Input processors.
-
-        Idempotency:
-            Subsequent calls are no-ops (guarded by ``_cleanup_done``).
-            The flag is set only at the end, so a partial cleanup that
-            raises mid-way will be retried on the next call.
-
-        Called from:
-            :meth:`__del__`, and only from there. ``PyExecutor.shutdown``
-            deliberately does *not* call this: it is also invoked mid-init by
-            ``configure_kv_cache_capacity``, which reads ``model`` right
-            afterwards, so clearing ``model`` here would break it. That path
-            calls :meth:`_release_cuda_graphs` and then drops its reference
-            instead.
-        """
+    def finish_cleanup(self) -> None:
+        """Release rank-local model resources after collective teardown."""
         if self._cleanup_done:
             return
 
-        # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
-        # rolled back.  Keep each handle live until its own release succeeds,
-        # so a failed cleanup can be retried without double-freeing resources
-        # that were already released.
         model_loader = self.model_loader
         if model_loader is not None:
             model_loader.cleanup()
             self.model_loader = None
 
-        # Release runner-owned graphs before dropping the runner. Keep the
-        # handle available if graph release fails and cleanup is retried.
-        self._release_cuda_graphs()
-
-        # The runner, caller and scheduler retain the model, so
-        # clearing the engine's attribute alone would leave the weights
-        # reachable past `release_gc()` below.
+        self.moe_load_balancer = None
+        # The runner, caller and scheduler retain the model, so clearing the
+        # engine's attribute alone would leave the weights reachable.
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
         self.model = None
-
         self.input_processor = None
-
-        # Release model weights.
         release_gc()
         self._cleanup_done = True
 
-    def __del__(self) -> None:
-        """Best-effort cleanup during garbage collection.
+    def cleanup(self, *, collective: bool = True) -> None:
+        """Release model resources without rank-asymmetric collectives.
 
-        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (which a
-        release step such as :meth:`_release_cuda_graphs` or
-        ``ModelLoader.cleanup`` may raise) and ``AttributeError`` (typical
-        on partially-initialized engines torn down during interpreter
-        shutdown when module references have already been cleared); both
-        are logged and swallowed because destructors cannot reliably
-        surface exceptions.
-
-        This is the only production caller of :meth:`cleanup` -- see the
-        note there on why ``PyExecutor.shutdown`` must not call it.
+        Explicit terminal cleanup first releases local graph captures on every
+        rank, then passes that local result into the load-balancer's collective
+        preflight, and only then drops rank-local model state. Python finalizers
+        perform local cleanup only; worker-owned terminal cleanup is responsible
+        for collective resources.
         """
+        if self._cleanup_done:
+            return
+
+        if not collective:
+            self.prepare_cleanup()
+            if getattr(self, "moe_load_balancer", None) is not None:
+                logger.warning(
+                    "Skipping collective MoE load-balancer shutdown from Python finalization; "
+                    "terminal executor shutdown must release it explicitly")
+            self.finish_cleanup()
+            return
+
+        prepare_error = None
         try:
-            self.cleanup()
+            self.prepare_cleanup()
+        except BaseException as error:  # Preserve rank alignment before surfacing it.
+            prepare_error = error
+
+        manager_safe = self.shutdown_moe_load_balancer(
+            local_safe=prepare_error is None)
+        if prepare_error is not None:
+            raise prepare_error
+        if not manager_safe:
+            raise RuntimeError(
+                "MoE load-balancer collective shutdown was not safe on every rank"
+            )
+        self.finish_cleanup()
+
+    def __del__(self) -> None:
+        """Best-effort rank-local cleanup during garbage collection."""
+        try:
+            self.cleanup(collective=False)
         except (RuntimeError, AttributeError) as e:
             logger.warning(
                 "PyTorchModelEngine cleanup failed during destruction: %s", e)

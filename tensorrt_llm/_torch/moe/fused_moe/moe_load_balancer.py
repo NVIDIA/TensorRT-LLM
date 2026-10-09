@@ -807,8 +807,12 @@ class MoeLoadBalancer:
         self.next_layer_repeated_count = None
 
     def __del__(self):
-        if not self.is_shutdown:
-            self.shutdown()
+        # MPI collectives are unsafe from rank-asymmetric Python finalization.
+        # Normal worker teardown calls shutdown() explicitly on every rank.
+        if not getattr(self, "is_shutdown", True):
+            logger.warning(
+                "MoeLoadBalancer was finalized before explicit collective shutdown"
+            )
 
     def is_static_routing(self):
         # if we don't update, then it is statistic routing.
@@ -949,10 +953,13 @@ class MoeLoadBalancer:
         self.in_iter = False
         self.iter_id += 1
 
-    def shutdown(self):
-        """
-        Shutdown the load balancer and release resources.
-        """
+    def shutdown(self, local_safe: bool = True) -> bool:
+        """Collectively release resources after an all-rank safety preflight."""
+        if self.is_shutdown:
+            return True
+        local_safe = bool(local_safe and not self.in_iter)
+        if not all(self.shared_mpi_comm.allgather(local_safe)):
+            return False
         for single_layer_load_balancer in self.single_layer_load_balancers:
             single_layer_load_balancer.py_pre_shutdown_cleanup()
         self.load_balancer_impl.shutdown()
@@ -962,6 +969,7 @@ class MoeLoadBalancer:
             single_layer_load_balancer.py_post_shutdown_cleanup()
         self.shared_mpi_comm.barrier()
         self.is_shutdown = True
+        return True
 
     def __repr__(self):
         """
@@ -1050,22 +1058,56 @@ def maybe_create_moe_load_balancer(
     using_smart_router = mapping and mapping.moe_cluster_size > 1
     moe_load_balancer: AbstractContextManager[MoeLoadBalancer
                                               | None] = nullcontext()
-    if in_supported_model_arch and using_ep and not using_smart_router and model_config.moe_load_balancer is not None:
-        model_config.moe_load_balancer.setup(ep_rank=ep_rank, ep_size=ep_size)
-        if model_config.moe_load_balancer.layer_updates_per_iter > 0:
-            # TODO: remove this when supported.
-            # cpu_arch = platform.machine().lower()
-            # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
-            pass
+    config = model_config.moe_load_balancer
+    mode = getattr(config, "mode", "standard")
+    if config is not None and mode == "per_iteration":
+        if not in_supported_model_arch:
+            raise ValueError(
+                "per-iteration EPLB does not support model architecture "
+                f"{model_arch!r}")
+        if not using_ep:
+            raise ValueError("per-iteration EPLB requires expert parallelism "
+                             "(moe_ep_size > 1)")
+        if using_smart_router:
+            raise ValueError(
+                "per-iteration EPLB is incompatible with smart routing "
+                "(moe_cluster_size > 1)")
 
-        moe_load_balancer = MoeLoadBalancer(
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            layer_updates_per_iter=model_config.moe_load_balancer.
-            layer_updates_per_iter)
-        logger.info(
-            f"Created MoE LoadBalancer, layer_updates_per_iter={model_config.moe_load_balancer.layer_updates_per_iter}..."
-        )
+    if (in_supported_model_arch and using_ep and not using_smart_router
+            and config is not None):
+        config.setup(ep_rank=ep_rank, ep_size=ep_size)
+        if mode == "per_iteration":
+            from .per_iteration_eplb import PerIterationMoeLoadBalancer
+
+            moe_load_balancer = PerIterationMoeLoadBalancer(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                config=config,
+                mapping=mapping,
+            )
+            logger.info(
+                "Created per-iteration MoE LoadBalancer, num_slots=%s, "
+                "auxiliary_sms=%s...",
+                config.num_slots,
+                getattr(config, "auxiliary_sms", 8),
+            )
+        elif mode == "standard":
+            if config.layer_updates_per_iter > 0:
+                # TODO: remove this when supported.
+                # cpu_arch = platform.machine().lower()
+                # assert cpu_arch == 'aarch64', "online load balancer only support aarch64, e.g. GB200 now, x86 coming soon."
+                pass
+
+            moe_load_balancer = MoeLoadBalancer(
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                layer_updates_per_iter=config.layer_updates_per_iter)
+            logger.info(
+                "Created standard MoE LoadBalancer, layer_updates_per_iter=%s...",
+                config.layer_updates_per_iter,
+            )
+        else:
+            raise ValueError(f"Unknown MoE load-balancer mode: {mode!r}")
     return moe_load_balancer
 
 

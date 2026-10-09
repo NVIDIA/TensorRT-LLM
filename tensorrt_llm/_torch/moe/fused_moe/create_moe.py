@@ -116,9 +116,16 @@ def create_moe_backend(
     # backend that cannot run under a load balancer already declines in
     # ``can_implement``.
     eplb_enabled = get_moe_load_balancer() is not None
+    load_balancer_config = getattr(model_config, "moe_load_balancer", None)
+    eplb_mode = (getattr(load_balancer_config, "mode", "standard")
+                 if eplb_enabled else "disabled")
     if eplb_enabled and not moe_cls.capabilities.supports_eplb:
         raise ValueError(
             f"{moe_cls.__name__} does not support the MoE load balancer.")
+    if (eplb_mode == "per_iteration"
+            and not moe_cls.capabilities.supports_per_iteration_eplb):
+        raise ValueError(
+            f"{moe_cls.__name__} does not support per-iteration EPLB plans.")
 
     if bias and not moe_cls.capabilities.supports_expert_bias:
         raise ValueError(f"bias not supported in {moe_cls.__name__}.")

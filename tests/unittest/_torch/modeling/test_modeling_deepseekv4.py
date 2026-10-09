@@ -636,8 +636,32 @@ def test_deepseek_v4_nvfp4_mixed_precision_config():
                 "model.layers.4.mlp.shared_experts.up_proj": QuantConfig(quant_algo=None),
             },
             None,
+            True,
+        ),
+        # The actual shared gate/up module is one fused Linear: its first
+        # gate_proj/gate_up_proj override wins and up-only overrides are ignored.
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+            },
+            None,
             False,
         ),
+        (
+            {
+                "model.layers.4.mlp.shared_experts.gate_proj": QuantConfig(
+                    quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128
+                ),
+                "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(quant_algo=None),
+            },
+            None,
+            True,
+        ),
+        (None, ["*shared_experts.gate_proj"], False),
+        (None, ["*shared_experts.up_proj"], False),
         (
             {
                 "model.layers.4.mlp.shared_experts.gate_up_proj": QuantConfig(
@@ -672,32 +696,25 @@ def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
     assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
 
 
-@pytest.mark.parametrize(("helper_slots", "expected"), [(0, False), (3, True)])
-def test_deepseek_v4_shared_fc12_requires_active_rebalance(helper_slots, expected):
-    backend = SimpleNamespace(_rebalance_slots_active=helper_slots)
-
-    assert DeepseekV4MoE._shared_fc12_rebalance_enabled(backend) is expected
-
-
-def test_deepseek_v4_shared_fc12_rejects_backend_without_rebalance_state():
-    assert not DeepseekV4MoE._shared_fc12_rebalance_enabled(SimpleNamespace())
-
-
-def test_dynamic_eplb_auxiliary_sm_budget_tracks_largest_serial_kernel(
-    monkeypatch,
-):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import (
-        rebalance_auxiliary_sm_count,
+def test_deepseek_v4_shared_fc12_ignores_up_only_layerwise_override():
+    global_quant_config = QuantConfig(quant_algo=None)
+    fp8_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+    model_config = ModelConfig(
+        pretrained_config=DeepseekV4Config(),
+        quant_config=global_quant_config,
+        quant_config_dict={
+            "model.layers.4.mlp.shared_experts.up_proj": fp8_quant_config,
+            "model.layers.4.mlp.shared_experts.down_proj": fp8_quant_config,
+        },
     )
 
-    monkeypatch.delenv("TRTLLM_MOE_REBALANCE_CTAS_V2", raising=False)
-    assert rebalance_auxiliary_sm_count() == 8
+    gate_up_quant, down_quant = DeepseekV4MoE._get_shared_expert_projection_quant_configs(
+        model_config, layer_idx=4
+    )
 
-    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_CTAS_V2", "3")
-    assert rebalance_auxiliary_sm_count() == 8
-
-    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_CTAS_V2", "12")
-    assert rebalance_auxiliary_sm_count() == 12
+    assert gate_up_quant is global_quant_config
+    assert down_quant is fp8_quant_config
+    assert not DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant)
 
 
 def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):

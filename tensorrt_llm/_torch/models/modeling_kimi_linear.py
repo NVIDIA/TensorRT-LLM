@@ -1101,11 +1101,6 @@ def _k3_expert_ckpt_spec(quant_algo: Optional[QuantAlgo]) -> _K3ExpertCkptSpec:
     return spec
 
 
-def _k3_checkpoint_local_slots(moe: "KimiK3MoERuntime") -> set[int]:
-    """Local slot IDs populated from the checkpoint, excluding helper capacity."""
-    return set(range(len(moe.local_expert_ids)))
-
-
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
@@ -2932,7 +2927,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             backend = moe.routed_experts.backend
             with finalize_lock:
                 loaded = len(getattr(backend, spec.loaded_slots_attr, ()))
-                if loaded != len(moe.local_expert_ids):
+                if loaded != backend.expert_size_per_partition:
                     return
                 if id(backend) in finalized_backends:
                     return
@@ -3078,7 +3073,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             spec = moe.expert_ckpt_spec
             backend = moe.routed_experts.backend
             loaded_slots = getattr(backend, spec.loaded_slots_attr, set())
-            expected_slots = _k3_checkpoint_local_slots(moe)
+            expected_slots = set(range(backend.expert_size_per_partition))
             if loaded_slots != expected_slots:
                 missing_slots = sorted(expected_slots - loaded_slots)
                 raise RuntimeError(

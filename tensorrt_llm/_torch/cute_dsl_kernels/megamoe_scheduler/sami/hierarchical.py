@@ -2,55 +2,17 @@
 
 from __future__ import annotations
 
-import ctypes
 from dataclasses import dataclass, field
-import os
 import threading
 from typing import Protocol, runtime_checkable
 
 import torch
 from cuda.bindings import driver as cuda
 
-from ..native import load_hierarchical_native
 from .arena import BoundLiveWeightArena, LiveWeightArena, _TensorIdentity
 from ._util import check_cuda
 from ..geometry import hierarchy_group_sizes
 from .geometry import BundleLayout
-
-# Bound on waiting for every peer to publish its mapped plan. Steady state
-# surfaces a lost peer promptly; the first generation allows for compilation
-# inside the rendezvous and the resulting arrival skew.
-_DEFAULT_PLAN_TIMEOUT_NS = 2_000_000_000
-_DEFAULT_FIRST_PLAN_TIMEOUT_NS = 120_000_000_000
-
-
-def _read_plan_timeout_ns() -> int:
-    raw = os.environ.get("MEGAMOE_SAMI_PLAN_TIMEOUT_NS", "").strip()
-    if not raw:
-        return _DEFAULT_PLAN_TIMEOUT_NS
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(
-            "MEGAMOE_SAMI_PLAN_TIMEOUT_NS must be a positive integer of "
-            f"nanoseconds; got {raw!r}"
-        ) from None
-    if value <= 0:
-        raise ValueError(
-            "MEGAMOE_SAMI_PLAN_TIMEOUT_NS must be positive; got "
-            f"{value}. There is deliberately no way to disable the bound."
-        )
-    return value
-
-
-# Resolved once at import. submit() is on the per-iteration path, so the bound
-# must not cost an environment lookup per generation; it is also not something
-# that may legitimately change mid-run.
-_PLAN_TIMEOUT_NS = _read_plan_timeout_ns()
-# An explicit override is a deliberate widening, so never let the first
-# generation end up tighter than what the operator asked for.
-_FIRST_PLAN_TIMEOUT_NS = max(_DEFAULT_FIRST_PLAN_TIMEOUT_NS, _PLAN_TIMEOUT_NS)
-
 
 @dataclass(frozen=True)
 class BoundHierarchicalLiveWeightArena:
@@ -199,69 +161,6 @@ class HierarchicalLiveWeightArenaProvider(Protocol):
         """Construct the external live bank and all aligned-group aliases."""
 
 
-class HierarchicalPlanChannel:
-    """Private copy ABI6, populated by the fused GPU copy-policy adapter."""
-
-    ABI_VERSION = 6
-
-    @staticmethod
-    def stride_for(helper_count: int) -> int:
-        if type(helper_count) is not int or helper_count <= 0:
-            raise ValueError("helper_count must be a positive exact int")
-        return (helper_count + 3) // 4 * 4
-
-    def __init__(self, helper_count: int) -> None:
-        self.S = helper_count
-        self.stride = self.stride_for(helper_count)
-        self.word_count = 4 + 7 * self.stride
-        if self.word_count > (1 << 31) - 1:
-            raise ValueError("PlanChannel word count exceeds native int32 indexing")
-        self.host = torch.full((self.word_count,), -1, dtype=torch.int32, pin_memory=True)
-        self.host_ptr = int(self.host.data_ptr())
-        if self.host_ptr % 16:
-            raise RuntimeError("hierarchical PlanChannel is not 16-byte aligned")
-        self.dev_ptr = int(check_cuda(cuda.cuMemHostGetDevicePointer(self.host_ptr, 0),
-                                     "cuMemHostGetDevicePointer(HierarchicalPlanChannel)"))
-
-    def _field(self, index: int) -> torch.Tensor:
-        begin = 4 + index * self.stride
-        return self.host[begin:begin + self.S]
-
-    @property
-    def selected(self) -> torch.Tensor:
-        return self._field(0)
-
-    @property
-    def levels(self) -> torch.Tensor:
-        return self._field(1)
-
-    @property
-    def owners(self) -> torch.Tensor:
-        return self._field(2)
-
-    @property
-    def copy_modes(self) -> torch.Tensor:
-        return self._field(3)
-
-    @property
-    def global_max_send(self) -> torch.Tensor:
-        return self.host[1]
-
-def _u64_array(size: int) -> ctypes.Array:
-    return (ctypes.c_uint64 * size)()
-
-
-def _i32_array(values: tuple[int, ...]) -> ctypes.Array:
-    result = (ctypes.c_int32 * len(values))()
-    for index, value in enumerate(values):
-        result[index] = value
-    return result
-
-
-def _address(values: ctypes.Array) -> int:
-    return ctypes.addressof(values)
-
-
 def _stream_handle(stream: object) -> int:
     if isinstance(stream, bool):
         raise TypeError("stream must be a CUDA stream handle")
@@ -303,15 +202,11 @@ class HierarchicalSamiWeightBroadcast:
         helper_count: int,
         global_expert_count: int,
         arena_provider: HierarchicalLiveWeightArenaProvider,
-        copy_backend: str = "batch",
         tma_sm_count: int | None = None,
         tma_warps: int | None = None,
         tma_route: str = "plan",
         tma_source_load_factor: float = 1.0,
-        tma_plan_mode: str | None = None,
     ) -> None:
-        if copy_backend not in ("batch", "tma"):
-            raise ValueError("copy_backend must be 'batch' or 'tma'")
         for name, value in (("tma_sm_count", tma_sm_count), ("tma_warps", tma_warps)):
             if value is not None and (type(value) is not int or value <= 0):
                 raise ValueError(f"{name} must be a positive exact int or None")
@@ -325,17 +220,6 @@ class HierarchicalSamiWeightBroadcast:
                 not 0.01 <= tma_source_load_factor < 2.0 or
                 abs(100 * tma_source_load_factor - round(100 * tma_source_load_factor)) > 1e-9):
             raise ValueError("tma_source_load_factor must be 0.01..1.99 in steps of 0.01")
-        if copy_backend != "tma" and (
-            tma_sm_count is not None or tma_warps is not None or tma_route != "plan" or
-            tma_source_load_factor != 1.0
-        ):
-            raise ValueError("TMA settings require copy_backend='tma'")
-        if tma_plan_mode is not None and tma_plan_mode not in ("gpu_direct", "host"):
-            raise ValueError("tma_plan_mode must be 'gpu_direct', 'host', or None")
-        if copy_backend != "tma" and tma_plan_mode == "gpu_direct":
-            raise ValueError("device plan requires copy_backend='tma'")
-        self.tma_plan_mode = tma_plan_mode or ("gpu_direct" if copy_backend == "tma" else "host")
-        self.copy_backend = copy_backend
         self.tma_route = tma_route
         self.tma_source_load_factor = round(100 * tma_source_load_factor) / 100
         world = getattr(comm, "world", None)
@@ -371,27 +255,16 @@ class HierarchicalSamiWeightBroadcast:
         self.provider = arena_provider
         self.cuda = cuda
         torch.cuda.set_device(device)
-        if self.tma_plan_mode == "host":
-            self._validate_mapped_capabilities()
-        # Fail toolchain/launch-geometry checks before allocating collective
-        # Fabric resources. The optional backend must not leave half an arena.
-        tma_module = None
-        if copy_backend == "tma":
-            device_sms = torch.cuda.get_device_properties(device).multi_processor_count
-            if tma_sm_count is not None and tma_sm_count > device_sms:
-                raise ValueError(f"tma_sm_count must be at most {device_sms} on this GPU")
-            self._validate_tma_warp_capacity(tma_warps)
-            # Unlike CTA/warp counts, the ownership rule must agree across ranks.
-            # This is one cold-path collective, outside every copy submission.
-            factors = comm.allgather(self.tma_source_load_factor)
-            if any(value != self.tma_source_load_factor for value in factors):
-                raise ValueError("tma_source_load_factor must agree across all ranks")
-            if self.tma_plan_mode == "host":
-                # The host-plan backend remains a diagnostic fallback. The
-                # production GPU-direct path uses the statically linked THOP.
-                from ..native import load_tma_native
-
-                tma_module = load_tma_native()
+        # Fail launch-geometry checks before allocating collective Fabric resources.
+        device_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        if tma_sm_count is not None and tma_sm_count > device_sms:
+            raise ValueError(f"tma_sm_count must be at most {device_sms} on this GPU")
+        self._validate_tma_warp_capacity(tma_warps)
+        # Unlike CTA/warp counts, the ownership rule must agree across ranks.
+        # This is one cold-path collective, outside every copy submission.
+        factors = comm.allgather(self.tma_source_load_factor)
+        if any(value != self.tma_source_load_factor for value in factors):
+            raise ValueError("tma_source_load_factor must agree across all ranks")
 
         live = arena_provider.build_hierarchical_live_arena(
             world=world,
@@ -426,101 +299,45 @@ class HierarchicalSamiWeightBroadcast:
         torch.cuda.synchronize(device)
         comm.barrier()
 
-        # GPU-direct consumes the scheduler's original device storage: no
-        # mapped channel, duplicate device plan, or plan publication is needed.
-        self.plan_channel = (None if self.tma_plan_mode == "gpu_direct"
-                             else HierarchicalPlanChannel(helper_count))
+        # GPU-direct consumes the scheduler's device storage through the
+        # statically linked THOP; no mapped channel or runtime compilation exists.
         plan_stride = (helper_count + 3) // 4 * 4
         plan_words = 4 + 7 * plan_stride
-        self._thop_tma = copy_backend == "tma" and self.tma_plan_mode == "gpu_direct"
-        self.mod = (None if self._thop_tma else
-                    tma_module if copy_backend == "tma" else load_hierarchical_native())
-        tma_kwargs = {}
-        if copy_backend == "tma":
-            tma_kwargs = dict(tma_sm_count=tma_sm_count or 0, tma_warps=tma_warps or 0,
-                              tma_route={"plan": 0, "source": 1, "scatter": 2}[tma_route],
-                              tma_source_load_percent=round(100 * self.tma_source_load_factor),
-                              plan_on_device=self.tma_plan_mode == "gpu_direct")
         planes = len(bundle.planes)
-        self._plane_bytes = _u64_array(planes)
-        for index, plane in enumerate(bundle.planes):
-            self._plane_bytes[index] = plane.nbytes
-        self._source_table = _u64_array(global_expert_count * planes)
-        for index, pointer in enumerate(self.arena.base.scatter_source_ptrs):
-            self._source_table[index] = pointer
-        self._destination_table = _u64_array(
-            len(self.arena.group_destination_ptrs)
+        ctx = torch.ops.trtllm.moe_rebalance_tma_create(
+            helper_count * planes, tma_sm_count or 0, tma_warps or 0
         )
-        for index, pointer in enumerate(self.arena.group_destination_ptrs):
-            self._destination_table[index] = pointer
-        self._group_sizes = _i32_array(self.arena.group_sizes)
-        partition = {"bundle": 1, "per_plane": 0}.get(self.partition)
-        if partition is None:
-            raise ValueError(f"unknown hierarchy partition {self.partition!r}")
-        if self._thop_tma:
-            ctx = torch.ops.trtllm.moe_rebalance_tma_create(
-                helper_count * planes, tma_sm_count or 0, tma_warps or 0
+        try:
+            target_count = sum(world // size for size in self.arena.group_sizes[1:])
+            torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
+                ctx, world, rank, helper_count, planes,
+                global_expert_count, self.home_count, plan_stride,
+                len(self.arena.group_sizes), target_count, 6, plan_words, 0,
+                {"plan": 0, "source": 1, "scatter": 2}[tma_route],
+                round(100 * self.tma_source_load_factor),
+                list(self.arena.group_sizes),
+                list(self.arena.base.scatter_source_ptrs),
+                list(self.arena.group_destination_ptrs), [],
+                [plane.nbytes for plane in bundle.planes],
             )
-            try:
-                target_count = sum(world // size for size in self.arena.group_sizes[1:])
-                torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
-                    ctx, world, rank, helper_count, planes,
-                    global_expert_count, self.home_count, plan_stride,
-                    len(self.arena.group_sizes), target_count, 6, plan_words, 0,
-                    {"plan": 0, "source": 1, "scatter": 2}[tma_route],
-                    round(100 * self.tma_source_load_factor),
-                    list(self.arena.group_sizes),
-                    list(self.arena.base.scatter_source_ptrs),
-                    list(self.arena.group_destination_ptrs), [],
-                    [plane.nbytes for plane in bundle.planes],
-                )
-                config_names = (
-                    "abi_version", "device", "device_sm_count", "sms", "warps",
-                    "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
-                    "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
-                    "device_optin_shared_bytes", "device_shared_bytes_per_sm",
-                    "max_active_ctas_per_sm", "compute_major", "compute_minor",
-                    "total_slots", "max_slots_per_warp", "extra_slot_warps",
-                    "max_warps", "max_segments",
-                )
-                tma_config = dict(zip(
-                    config_names, torch.ops.trtllm.moe_rebalance_tma_config(ctx)
-                ))
-                current_generation = torch.ops.trtllm.moe_rebalance_tma_current_gen(ctx)
-                if int(current_generation) != 1:
-                    raise RuntimeError("hierarchical SAMI context is not fresh")
-            except BaseException:
-                torch.ops.trtllm.moe_rebalance_tma_destroy(ctx)
-                raise
-            self.ctx = ctx
-            self.tma_config = tma_config
-        else:
-            self.ctx = self.mod.create(
-                world=world,
-                rank=rank,
-                helper_count=helper_count,
-                planes=planes,
-                global_experts=global_expert_count,
-                src_table=_address(self._source_table),
-                dst_table=_address(self._destination_table),
-                plane_bytes=_address(self._plane_bytes),
-                plan_ptr=(0 if self.plan_channel is None else self.plan_channel.host_ptr),
-                level_count=len(self.arena.group_sizes),
-                group_sizes=_address(self._group_sizes),
-                owner_stride=plan_stride,
-                flag_mc=self.flags_mc,
-                partition=partition,
-                plan_abi_version=6,
-                plan_words=plan_words,
-                **tma_kwargs,
+            config_names = (
+                "abi_version", "device", "device_sm_count", "sms", "warps",
+                "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
+                "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
+                "device_optin_shared_bytes", "device_shared_bytes_per_sm",
+                "max_active_ctas_per_sm", "compute_major", "compute_minor",
+                "total_slots", "max_slots_per_warp", "extra_slot_warps",
+                "max_warps", "max_segments",
             )
-            self.tma_config = (
-                self.mod.tma_config(self.ctx) if copy_backend == "tma" else None
-            )
-            self.mod.set_loc_hint(self.ctx, device, device)
-            current_generation = self.mod.current_gen(self.ctx)
-        if not self._thop_tma and int(current_generation) != 1:
-            raise RuntimeError("hierarchical SAMI context is not fresh")
+            self.tma_config = dict(zip(
+                config_names, torch.ops.trtllm.moe_rebalance_tma_config(ctx)
+            ))
+            if int(torch.ops.trtllm.moe_rebalance_tma_current_gen(ctx)) != 1:
+                raise RuntimeError("hierarchical SAMI context is not fresh")
+        except BaseException:
+            torch.ops.trtllm.moe_rebalance_tma_destroy(ctx)
+            raise
+        self.ctx = ctx
 
         self._lock = threading.Lock()
         self._scheduler: object | None = None
@@ -557,31 +374,6 @@ class HierarchicalSamiWeightBroadcast:
                 f"tma_warps must be at most {max_warps} on this GPU "
                 "(at least two 8 KiB slices per worker pair)"
             )
-
-    def _validate_mapped_capabilities(self) -> None:
-        device = check_cuda(
-            self.cuda.cuDeviceGet(self.device),
-            "cuDeviceGet(hierarchical plan device)",
-        )
-        attributes = (
-            (
-                self.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY,
-                "CAN_MAP_HOST_MEMORY",
-            ),
-            (
-                self.cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NATIVE_ATOMIC_SUPPORTED,
-                "HOST_NATIVE_ATOMIC_SUPPORTED",
-            ),
-        )
-        for attribute, name in attributes:
-            supported = int(
-                check_cuda(
-                    self.cuda.cuDeviceGetAttribute(attribute, device),
-                    f"cuDeviceGetAttribute({name})",
-                )
-            )
-            if supported != 1:
-                raise RuntimeError(f"CUDA device lacks {name}")
 
     def _validate_stream_context(self, handle: int) -> None:
         get_current = getattr(self.cuda, "cuCtxGetCurrent", None)
@@ -681,52 +473,32 @@ class HierarchicalSamiWeightBroadcast:
                     raise TypeError("scheduler stream exposes an invalid device") from exc
                 if stream_device != scheduler_device:
                     raise ValueError("scheduler stream and output devices differ")
-            gpu_direct = self.plan_channel is None
-            bind = getattr(scheduler, "bind_gpu_direct" if gpu_direct else "bind_plan_channel", None)
+            bind = getattr(scheduler, "bind_gpu_direct", None)
             release = getattr(scheduler, "release_plan_channel", None)
             if not callable(bind) or not callable(release):
                 raise TypeError("scheduler lacks the copy handoff lifecycle")
-            if gpu_direct:
-                workspace = getattr(scheduler, "plan_workspace", None)
-                status = getattr(scheduler, "status", None)
-                grid_sync = getattr(scheduler, "grid_sync", None)
-                capacity = getattr(scheduler, "max_broadcasts", None)
-                if type(capacity) is not int or capacity <= 0:
-                    raise ValueError("GPU-direct requires the scheduler plan capacity")
-                if (not isinstance(workspace, torch.Tensor) or
-                        workspace.device != scheduler_device or workspace.dtype != torch.int32 or
-                        not workspace.is_contiguous() or tuple(workspace.shape) != (2 + 6 * capacity,)):
-                    raise ValueError("GPU-direct requires the original CUDA scheduler plan workspace")
-                if (not isinstance(status, torch.Tensor) or status.device != scheduler_device or
-                        status.dtype != torch.int32 or not status.is_contiguous() or status.numel() < 6):
-                    raise ValueError("GPU-direct requires the CUDA scheduler status workspace")
-                if (not isinstance(grid_sync, torch.Tensor) or grid_sync.device != scheduler_device or
-                        grid_sync.dtype != torch.int32 or not grid_sync.is_contiguous() or grid_sync.numel() < 2):
-                    raise ValueError("GPU-direct requires the CUDA scheduler epoch workspace")
-                native_bind = (torch.ops.trtllm.moe_rebalance_tma_bind_gpu_direct
-                               if self._thop_tma else
-                               getattr(self.mod, "bind_gpu_direct", None))
-                if not callable(native_bind):
-                    raise TypeError("native copy module lacks GPU-direct binding")
+            workspace = getattr(scheduler, "plan_workspace", None)
+            status = getattr(scheduler, "status", None)
+            grid_sync = getattr(scheduler, "grid_sync", None)
+            capacity = getattr(scheduler, "max_broadcasts", None)
+            if type(capacity) is not int or capacity <= 0:
+                raise ValueError("GPU-direct requires the scheduler plan capacity")
+            if (not isinstance(workspace, torch.Tensor) or
+                    workspace.device != scheduler_device or workspace.dtype != torch.int32 or
+                    not workspace.is_contiguous() or tuple(workspace.shape) != (2 + 6 * capacity,)):
+                raise ValueError("GPU-direct requires the original CUDA scheduler plan workspace")
+            if (not isinstance(status, torch.Tensor) or status.device != scheduler_device or
+                    status.dtype != torch.int32 or not status.is_contiguous() or status.numel() < 6):
+                raise ValueError("GPU-direct requires the CUDA scheduler status workspace")
+            if (not isinstance(grid_sync, torch.Tensor) or grid_sync.device != scheduler_device or
+                    grid_sync.dtype != torch.int32 or not grid_sync.is_contiguous() or grid_sync.numel() < 2):
+                raise ValueError("GPU-direct requires the CUDA scheduler epoch workspace")
             self._validate_stream_context(handle)
             try:
-                if gpu_direct:
-                    bind(handle)
-                    if self._thop_tma:
-                        native_bind(self.ctx, *tensors[1:], workspace, status, grid_sync, capacity)
-                    else:
-                        native_bind(
-                            self.ctx,
-                            *(int(tensor.data_ptr()) for tensor in tensors[1:]),
-                            int(workspace.data_ptr()),
-                            int(status.data_ptr()),
-                            int(grid_sync.data_ptr()),
-                            capacity,
-                        )
-                else:
-                    bind(self.plan_channel.dev_ptr, handle,
-                         abi_version=self.plan_channel.ABI_VERSION,
-                         channel_words=self.plan_channel.word_count)
+                bind(handle)
+                torch.ops.trtllm.moe_rebalance_tma_bind_gpu_direct(
+                    self.ctx, *tensors[1:], workspace, status, grid_sync, capacity
+                )
             except BaseException:
                 self._handoff_aborted = True
                 raise
@@ -847,44 +619,8 @@ class HierarchicalSamiWeightBroadcast:
         start_event: object | None = None,
         end_event: object | None = None,
         payload_end_event: object | None = None,
-        timeout_ns: int | None = None,
     ) -> HierarchicalCopyTicket:
-        """Enqueue copy after the bound scheduler on its static stream.
-
-        With ``tma_plan_mode="gpu_direct"``, the copy kernel consumes the
-        original scheduler outputs and workspace directly. Submission never reads
-        that plan, waits for its publication,
-        or constructs/uploads host descriptors. ``timeout_ns`` is retained for
-        the host-plan mode; it does not add a CPU wait to the device mode.
-        The ticket counts one fused copy/READY kernel in device mode. Detailed
-        descriptor counts are available only from ``last_mode_counts()``.
-
-        For TMA, READY is published by the last completed GPU CTA. Both
-        ``payload_end_event`` and ``end_event`` therefore follow fused payload
-        and notification; the former is not a payload-only timing boundary.
-        Batch-copy retains its separate payload/release/terminal boundaries.
-
-        For host plans, the bound turns a lost peer into an error instead of a
-        hang. It is not a
-        correctness barrier, so widening it costs only how long a genuine hang
-        takes to surface.
-
-        ``timeout_ns=None`` selects a wider first-generation bound because
-        ranks can enter the rendezvous at different times while required kernels are
-        compiled. Later generations use the steady-state bound so a lost peer surfaces
-        promptly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` can raise both defaults; callers may
-        pass ``timeout_ns`` explicitly when a different diagnostic bound is required.
-        The timeout is an error bound, not a correctness barrier.
-        """
-
-        if timeout_ns is None:
-            # ``_active_generation`` is still the PREVIOUS generation here; it is
-            # advanced a few lines below, after the native submit returns. So 0
-            # means "nothing has been submitted yet" == this is frame 1.
-            timeout_ns = (_PLAN_TIMEOUT_NS if self._active_generation
-                          else _FIRST_PLAN_TIMEOUT_NS)
-        elif type(timeout_ns) is not int or timeout_ns <= 0:
-            raise ValueError("timeout_ns must be a positive exact int")
+        """Enqueue the fused GPU-direct TMA copy and READY publication."""
 
         with self._lock:
             if self._handoff_aborted:
@@ -895,42 +631,20 @@ class HierarchicalSamiWeightBroadcast:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
             try:
-                if self._thop_tma:
-                    with torch.cuda.device(self.device), torch.cuda.stream(
-                        self._stream_owner
-                    ):
-                        if start_event is not None:
-                            start_event.record()
-                        commands = int(
-                            torch.ops.trtllm.moe_rebalance_tma_submit_gpu_direct(
-                                self.ctx, self.flags_mc
-                            )
-                        )
-                        if payload_end_event is not None:
-                            payload_end_event.record()
-                        if end_event is not None:
-                            end_event.record()
-                elif payload_end_event is None:
+                with torch.cuda.device(self.device), torch.cuda.stream(
+                    self._stream_owner
+                ):
+                    if start_event is not None:
+                        start_event.record()
                     commands = int(
-                        self.mod.submit(
-                            self.ctx,
-                            self._stream,
-                            _event_handle(start_event),
-                            _event_handle(end_event),
-                            timeout_ns,
+                        torch.ops.trtllm.moe_rebalance_tma_submit_gpu_direct(
+                            self.ctx, self.flags_mc
                         )
                     )
-                else:
-                    commands = int(
-                        self.mod.submit(
-                            self.ctx,
-                            self._stream,
-                            _event_handle(start_event),
-                            _event_handle(end_event),
-                            timeout_ns,
-                            _event_handle(payload_end_event),
-                        )
-                    )
+                    if payload_end_event is not None:
+                        payload_end_event.record()
+                    if end_event is not None:
+                        end_event.record()
                 self._active_generation = self._generation
                 release = getattr(self._scheduler, "release_plan_channel")
                 release()
@@ -950,9 +664,7 @@ class HierarchicalSamiWeightBroadcast:
         with self._lock, torch.cuda.device(self.device):
             if self.ctx is None:
                 return
-            if self._thop_tma:
-                torch.ops.trtllm.moe_rebalance_tma_destroy(self.ctx)
-            # Non-THOP contexts are PyCapsules whose destructor owns cleanup.
+            torch.ops.trtllm.moe_rebalance_tma_destroy(self.ctx)
             self.ctx = None
             self._scheduler = None
             self._outputs = None
@@ -965,11 +677,8 @@ class HierarchicalSamiWeightBroadcast:
         This opt-in diagnostic must stay outside the submission/timing path.
         """
 
-        if self._thop_tma:
-            result = torch.ops.trtllm.moe_rebalance_tma_result(self.ctx)
-            direct, scatter, commands = result[1], result[2], result[7]
-        else:
-            direct, scatter, commands = self.mod.last_mode_counts(self.ctx)
+        result = torch.ops.trtllm.moe_rebalance_tma_result(self.ctx)
+        direct, scatter, commands = result[1], result[2], result[7]
         return int(direct), int(scatter), int(commands)
 
 
@@ -978,7 +687,6 @@ __all__ = [
     "HierarchicalCopyTicket",
     "HierarchicalLiveWeightArena",
     "HierarchicalLiveWeightArenaProvider",
-    "HierarchicalPlanChannel",
     "HierarchicalSamiWeightBroadcast",
     "hierarchy_group_sizes",
 ]

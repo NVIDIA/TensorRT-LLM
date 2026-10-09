@@ -36,7 +36,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-import os as _os
 import weakref
 from typing import Any, List, Optional, Tuple
 
@@ -59,28 +58,6 @@ from tensorrt_llm._torch.utils import (
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div, pad_up
-
-# Enable host-overhead NVTX ranges with TRTLLM_MOE_REBALANCE_NVTX=1.
-if _os.environ.get("TRTLLM_MOE_REBALANCE_NVTX") == "1":
-    from torch.cuda import nvtx as _nvtx_mod
-
-    def _nvtx(label):
-        _nvtx_mod.range_push(label)
-
-    def _nvtx_end():
-        _nvtx_mod.range_pop()
-
-else:
-
-    def _nvtx(label):
-        pass
-
-    def _nvtx_end():
-        pass
-
-
-# MEGAMOE_RUNNER_CACHE=0 disables host runner reuse.
-_MEGAMOE_RUNNER_CACHE_ON = _os.environ.get("MEGAMOE_RUNNER_CACHE", "1") != "0"
 
 # Default tactics validated once when the runtime becomes available.
 _PREVALIDATED_TACTICS: List[Tuple] = []
@@ -205,17 +182,8 @@ _AUTOTUNE_PL_SEED = 0xA107
 
 
 def _autotune_pl_alpha(helper_expert_count: int = 0) -> float:
-    """Use the balanced-rank power-law workload for ON tuning by default."""
-    raw = _os.environ.get("MEGAMOE_AUTOTUNE_PL_ALPHA", "").strip()
-    if not raw:
-        return 0.8 if helper_expert_count > 0 else 0.0
-    try:
-        alpha = float(raw)
-    except ValueError:
-        raise ValueError("MEGAMOE_AUTOTUNE_PL_ALPHA must be a finite non-negative float") from None
-    if not math.isfinite(alpha) or alpha < 0:
-        raise ValueError("MEGAMOE_AUTOTUNE_PL_ALPHA must be a finite non-negative float")
-    return alpha
+    """Use the balanced-rank power-law workload only for load-balanced tuning."""
+    return 0.8 if helper_expert_count > 0 else 0.0
 
 
 def synthesize_profiling_topk(
@@ -279,17 +247,8 @@ def synthesize_profiling_topk(
 
 
 def _token_back_ready_granularity_choices(*, load_balance: bool = False) -> tuple[str, ...]:
-    """ON tuning compares expert and token-tile readiness unless explicitly pinned."""
-    value = _os.environ.get("MEGAMOE_TOKEN_BACK_READY_GRANULARITY", "").strip()
-    if not value:
-        return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
-    if value == "auto":
-        return _TOKEN_BACK_READY_GRANULARITIES
-    if value not in _TOKEN_BACK_READY_GRANULARITIES:
-        raise ValueError(
-            "MEGAMOE_TOKEN_BACK_READY_GRANULARITY must be 'expert', 'token_tile', or 'auto'"
-        )
-    return (value,)
+    """Compare both readiness modes only for load-balanced tuning."""
+    return _TOKEN_BACK_READY_GRANULARITIES if load_balance else ("expert",)
 
 
 def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
@@ -764,19 +723,19 @@ def _default_megamoe_tactic_for_problem(
     shape_tuned_tactic: Optional[Tuple] = None,
 ) -> Tuple:
     if combine_format != "bf16":
-        return _MEGAMOE_NONBULK_STANDALONE_TACTIC
+        return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     bucket = _sm107_tactic_bucket(max_tokens_per_rank) if sm_version == 107 else None
     if bucket is not None:
         expected_in_kernel_fc2_reduce = _sm107_use_in_kernel_fc2_reduce(
             max_tokens_per_rank, apply_topk_in_fc1
         )
         if in_kernel_fc2_reduce != expected_in_kernel_fc2_reduce:
-            return _MEGAMOE_NONBULK_STANDALONE_TACTIC
-        return _SM107_GENPHASE_TACTICS[bucket]
+            return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+        return _unpack_tactic(_SM107_GENPHASE_TACTICS[bucket])
     if in_kernel_fc2_reduce:
-        return _MEGAMOE_NONBULK_STANDALONE_TACTIC
+        return _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
     if shape_tuned_tactic is not None:
-        return shape_tuned_tactic
+        return _unpack_tactic(shape_tuned_tactic)
     return default_megamoe_tactic(num_tokens)
 
 
@@ -794,14 +753,16 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
     """Return the heuristic tactic followed by shape-safe fallbacks."""
+    tactic = _unpack_tactic(tactic)
     candidates = [tactic]
-    schedule_policy = _unpack_tactic(tactic)[3]
+    schedule_policy = tactic[3]
     if schedule_policy[0] == "phase_interleave" and schedule_policy[1] is not None:
         auto_hint_tactic = list(tactic)
         auto_hint_tactic[3] = ("phase_interleave", None)
         candidates.append(tuple(auto_hint_tactic))
-    if _MEGAMOE_NONBULK_STANDALONE_TACTIC not in candidates:
-        candidates.append(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    nonbulk_tactic = _unpack_tactic(_MEGAMOE_NONBULK_STANDALONE_TACTIC)
+    if nonbulk_tactic not in candidates:
+        candidates.append(nonbulk_tactic)
     return tuple(candidates)
 
 
@@ -1256,11 +1217,9 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
 ) -> list[Tuple]:
-    """Expose legal token-tile choices while preserving the OFF candidate set."""
+    """Return canonical tactics for every legal token-back READY mode."""
     choices = _token_back_ready_granularity_choices(load_balance=load_balance)
-    if choices == ("expert",):
-        return candidates
-    if sm_version == 107:
+    if sm_version == 107 and choices != ("expert",):
         # At every token bucket include a legal local-TMA/atomic-counter
         # base; the historical candidates otherwise exclude token_tile.
         for cluster, fallback, policy, mode, flag, epi in (
@@ -2322,8 +2281,10 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if default_tactic not in candidates:
                 candidates.append(default_tactic)
             default_tactic = _SM107_DSV4_PRO_DEFAULT_TACTICS.get(self.unique_id())
-            if default_tactic is not None and default_tactic not in candidates:
-                candidates.append(default_tactic)
+            if default_tactic is not None:
+                default_tactic = _unpack_tactic(default_tactic)
+                if default_tactic not in candidates:
+                    candidates.append(default_tactic)
             choices = _token_back_ready_granularity_choices(
                 load_balance=self.helper_expert_count > 0
             )
@@ -2678,16 +2639,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # first, and `tactic_t` is final from `_resolve_megamoe_kernel_tactic`
             # above.
             cache_key = self._tactic_cache_key(tactic_t)
-            _nvtx("moe/local_workspace")
-            try:
-                local_workspace = _get_or_alloc_local_workspace(
-                    kernel,
-                    cache_key=cache_key,
-                    device=activation.device,
-                    latch_in_tuning_mode=self.tactic_autotune,
-                )
-            finally:
-                _nvtx_end()
+            local_workspace = _get_or_alloc_local_workspace(
+                kernel,
+                cache_key=cache_key,
+                device=activation.device,
+                latch_in_tuning_mode=self.tactic_autotune,
+            )
             # ``shared_workspace`` is peer-mapped (symmetric heap) for
             # multi-rank or local CUDA for the single-rank degenerate
             # path. The MegaMoECuteDsl backend supplies it; for the rare
@@ -2961,7 +2918,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
 
         # Autotuning runners own profiling scratch and are not reused.
-        if (not _MEGAMOE_RUNNER_CACHE_ON) or tactic_autotune:
+        if tactic_autotune:
             return _make()
         runner = _MEGAMOE_RUNNER_CACHE.get(args)
         if runner is None:
@@ -3059,64 +3016,54 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # oversized num_tokens keeps the full bucket; so does
         # num_tokens == 0 (a zero-token rank still launches so peers can cross
         # the NVLink barrier -- a 0-row slice would build a zero grid).
-        # Separate op setup from runner execution; balance ranges on errors.
-        _nvtx("moe/op_prologue")
-        try:
-            if num_tokens > 0:
-                combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
+        if num_tokens > 0:
+            combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
 
-            _nvtx("moe/runner_ctor")
-            try:
-                runner = _megamoe_get_runner(
-                    world_size,
-                    local_rank,
-                    num_topk,
-                    num_experts_per_rank,
-                    hidden_size,
-                    intermediate_size_per_partition,
-                    expand_intermediate_size_per_partition,
-                    max_tokens_per_rank,
-                    combine_output.dtype,
-                    apply_topk_in_fc1,
-                    swiglu_alpha,
-                    swiglu_beta,
-                    gate_up_clamp,
-                    act_alpha,
-                    act_beta,
-                    in_kernel_fc2_reduce,
-                    combine_format,
-                    tactic_autotune,
-                    helper_expert_count,
-                )
-                # READY inputs belong to this launch. Never regenerate them or retain stale
-                # values across calls, even when the runner itself is cached.
-                runner._helper_ready_flags = hot_expert_weight_ready_flags
-                runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
-            finally:
-                _nvtx_end()
-            inputs = [
-                activation,
-                activation_sf,
-                topk_idx,
-                topk_weights,
-                fc1_weight,
-                fc1_weight_sf,
-                fc2_weight,
-                fc2_weight_sf,
-                fc1_alpha,
-                fc2_alpha,
-                fc1_norm_const,
-                combine_output,
-            ]
-        finally:
-            _nvtx_end()
+        runner = _megamoe_get_runner(
+            world_size,
+            local_rank,
+            num_topk,
+            num_experts_per_rank,
+            hidden_size,
+            intermediate_size_per_partition,
+            expand_intermediate_size_per_partition,
+            max_tokens_per_rank,
+            combine_output.dtype,
+            apply_topk_in_fc1,
+            swiglu_alpha,
+            swiglu_beta,
+            gate_up_clamp,
+            act_alpha,
+            act_beta,
+            in_kernel_fc2_reduce,
+            combine_format,
+            tactic_autotune,
+            helper_expert_count,
+        )
+        # READY inputs belong to this launch. Never regenerate them or retain stale
+        # values across calls, even when the runner itself is cached.
+        runner._helper_ready_flags = hot_expert_weight_ready_flags
+        runner._helper_ready_generation = int(hot_expert_weight_ready_generation)
+        inputs = [
+            activation,
+            activation_sf,
+            topk_idx,
+            topk_weights,
+            fc1_weight,
+            fc1_weight_sf,
+            fc2_weight,
+            fc2_weight_sf,
+            fc1_alpha,
+            fc2_alpha,
+            fc1_norm_const,
+            combine_output,
+        ]
         if not tactic_autotune:
             # Opt-OUT (default; serving never opts in): skip the AutoTuner.
             # ``choose_one`` is NOT a safe no-op -- in tuning mode a cache miss
             # materializes the multi-GiB scratch and MERGE-sweeps every
             # candidates. tactic=-1 guarantees deterministic default selection
             # with no tuning collectives, even inside a global autotune().
-            _nvtx("moe/runner_call")
             try:
                 runner(
                     inputs,
@@ -3125,7 +3072,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     shared_workspace=shared_workspace,
                 )
             finally:
-                _nvtx_end()
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None

@@ -34,12 +34,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
-#include <limits>
 #include <mutex>
 #include <new>
 
@@ -57,19 +54,6 @@ constexpr unsigned kSlotControlBytes = MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES;
 constexpr unsigned kSlotDataBytes = MEGAMOE_TMA_COPY_SLOT_DATA_BYTES;
 constexpr unsigned kCoalesced = 4U;
 constexpr unsigned kFallbackBulk = 8U;
-
-// Small, dynamic plans travel with the launch instead of a separate DMA.
-// Typed arrays preserve object lifetime/alignment and fit below 4 KiB of args.
-constexpr uint64_t kInlineSegments = 16;
-constexpr uint64_t kInlineRanges = 4;
-
-struct InlineDescriptors
-{
-    MegamoeTmaCopySegment segments[kInlineSegments];
-    MegamoeTmaCopyRange ranges[kInlineRanges];
-};
-
-static_assert(sizeof(InlineDescriptors) == 800, "inline descriptor layout");
 
 struct alignas(16) SlotControl
 {
@@ -595,46 +579,14 @@ __device__ __forceinline__ void tma_copy_body(MegamoeTmaCopySegment const* segme
             }
             // READY still covers destination completion, not merely SMEM reads.
             wait_all_writes();
-            // The notifying path joins every issuer through the CTA barrier
-            // and the acq_rel counter chain. Its last CTA executes the alias
-            // and SYS fences in multicast_generation before publishing READY.
-            // Raw submit has no final publisher and retains issuer fences.
-            if (!flag_mc)
-                system_publish_fence();
+            // Every issuer joins through the CTA barrier and the acq_rel
+            // counter chain before the final CTA publishes READY.
         }
     }
     __syncthreads();
     if (threadIdx.x == 0 && flag_mc)
         finish_cta_and_notify(completed_ctas, flag_mc, generation);
 }
-
-// Both entry points execute the same payload and READY protocol.
-__global__ void tma_copy_kernel(MegamoeTmaCopySegment const* segments, MegamoeTmaCopyRange const* ranges,
-    uint64_t range_count, uint64_t total_slices, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc,
-    uint64_t generation)
-{
-    tma_copy_body(segments, ranges, range_count, total_slices, warps, total_slots, completed_ctas, flag_mc, generation);
-}
-
-__global__ void tma_copy_inline_kernel(const __grid_constant__ InlineDescriptors descriptors, uint64_t range_count,
-    uint64_t total_slices, int warps, int total_slots, unsigned* completed_ctas, uint64_t flag_mc, uint64_t generation)
-{
-    // __grid_constant__ keeps these addresses in parameter storage; no
-    // per-thread local copy and no shared-memory descriptor staging.
-    tma_copy_body(descriptors.segments, descriptors.ranges, range_count, total_slices, warps, total_slots,
-        completed_ctas, flag_mc, generation);
-}
-
-// Compile-time validation table: no host division or mutable cache per submit.
-constexpr auto make_slice_reciprocals()
-{
-    std::array<uint64_t, 3201> values{};
-    for (unsigned divisor = 2; divisor < values.size(); ++divisor)
-        values[divisor] = UINT64_MAX / divisor;
-    return values;
-}
-
-constexpr auto kSliceReciprocals = make_slice_reciprocals();
 
 // Per-CTA scratch is allocated once. No plan tensor is copied between kernels.
 struct GpuDirectStorage
@@ -711,68 +663,13 @@ __global__ void tma_copy_gpu_direct_kernel(GpuDirectStorage direct, int warps, i
         flag_mc, generation);
 }
 
-cudaError_t validate_descriptors(MegamoeTmaCopySegment const* segments, uint64_t segment_count,
-    MegamoeTmaCopyRange const* ranges, uint64_t range_count, uint64_t* total_slices)
-{
-    for (uint64_t i = 0; i < segment_count; ++i)
-    {
-        auto const& s = segments[i];
-        if (!s.src || !s.dst || ((s.src | s.dst | s.bytes | s.virtual_begin) & 3U) || !s.bytes
-            || s.bytes - 1 > UINT64_MAX - s.src || s.bytes - 1 > UINT64_MAX - s.dst
-            || s.bytes > UINT64_MAX - s.virtual_begin)
-            return cudaErrorInvalidValue;
-    }
-    uint64_t prefix = 0, virtual_end = 0;
-    for (uint64_t i = 0; i < range_count; ++i)
-    {
-        auto const& r = ranges[i];
-        if (!r.bytes || (r.bytes & 3U) || !r.slice_stride || !r.slice_count || !r.segment_count
-            || r.segment_begin > segment_count || r.segment_count > segment_count - r.segment_begin)
-            return cudaErrorInvalidValue;
-        // Adjacent residue ranges may share one virtual segment stream. Its
-        // continuity is invariant within this call; validate each range below.
-        if (!i || r.segment_begin != ranges[i - 1].segment_begin || r.segment_count != ranges[i - 1].segment_count)
-        {
-            virtual_end = 0;
-            for (uint64_t j = r.segment_begin; j < r.segment_begin + r.segment_count; ++j)
-            {
-                if (segments[j].virtual_begin != virtual_end || segments[j].bytes > UINT64_MAX - virtual_end)
-                    return cudaErrorInvalidValue;
-                virtual_end += segments[j].bytes;
-            }
-        }
-        if (virtual_end != r.bytes)
-            return cudaErrorInvalidValue;
-        const uint64_t slices = 1 + (r.bytes - 1) / kSlice;
-        if (!r.slice_divisor || r.slice_divisor > 3200 || r.slice_stride < r.slice_divisor || slices > UINT64_MAX / 3200
-            || r.slice_reciprocal != kSliceReciprocals[r.slice_divisor])
-            return cudaErrorInvalidValue;
-        const uint64_t limit = slices * r.slice_divisor;
-        if (r.first_slice >= limit || r.slice_count != 1 + (limit - 1 - r.first_slice) / r.slice_stride
-            || r.slice_count > UINT64_MAX - prefix)
-            return cudaErrorInvalidValue;
-        prefix += r.slice_count;
-        if (r.prefix_end != prefix)
-            return cudaErrorInvalidValue;
-    }
-    *total_slices = prefix;
-    return cudaSuccess;
-}
-
 } // namespace
 
 struct MegamoeTmaCopyState
 {
     MegamoeTmaCopyConfig config{};
-    MegamoeTmaCopySegment* device_segments = nullptr;
-    MegamoeTmaCopySegment* host_segments = nullptr;
     unsigned* completed_ctas = nullptr;
-    cudaEvent_t descriptors_uploaded = nullptr;
-    cudaEvent_t kernel_complete = nullptr;
     cudaStream_t last_stream = nullptr;
-    bool inline_supported = false;
-    bool upload_recorded = false;
-    bool completion_recorded = false;
     bool work_queued = false;
     cudaError_t poison = cudaSuccess;
     GpuDirectStorage direct{};
@@ -803,8 +700,8 @@ extern "C" int megamoe_tma_copy_destroy(MegamoeTmaCopyState** state_ptr)
     }
     if (error != cudaSuccess)
         return static_cast<int>(first); // Preserve state for a later cleanup attempt.
-    // last_stream also covers work whose event recording failed. New streams
-    // wait on the previous completion event before reusing device descriptors.
+    // GPU-direct submissions use one stream; synchronize it before releasing
+    // the bound plan storage and completion counter.
     if (state->work_queued)
         record(cudaStreamSynchronize(state->last_stream));
     if (state->direct_tables)
@@ -819,14 +716,6 @@ extern "C" int megamoe_tma_copy_destroy(MegamoeTmaCopyState** state_ptr)
         record(cudaFree(state->direct.results));
     if (state->completed_ctas)
         record(cudaFree(state->completed_ctas));
-    if (state->device_segments)
-        record(cudaFree(state->device_segments));
-    if (state->host_segments)
-        record(cudaFreeHost(state->host_segments));
-    if (state->descriptors_uploaded)
-        record(cudaEventDestroy(state->descriptors_uploaded));
-    if (state->kernel_complete)
-        record(cudaEventDestroy(state->kernel_complete));
     if (previous_device != state->config.device)
         record(cudaSetDevice(previous_device));
     delete state;
@@ -897,7 +786,7 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
     if (error != cudaSuccess)
         return fail(error);
     cudaFuncAttributes attributes{};
-    error = cudaFuncGetAttributes(&attributes, tma_copy_kernel);
+    error = cudaFuncGetAttributes(&attributes, tma_copy_gpu_direct_kernel);
     if (error != cudaSuccess)
         return fail(error);
     const size_t available = config.device_optin_shared_bytes > attributes.sharedSizeBytes
@@ -919,54 +808,19 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
     config.bank1_slots_per_warp = config.slots_per_warp / 2;
     config.dynamic_shared_bytes = static_cast<int>(dynamic_bytes);
     error = cudaFuncSetAttribute(
-        tma_copy_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(available));
+        tma_copy_gpu_direct_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config.dynamic_shared_bytes);
     if (error != cudaSuccess)
         return fail(error);
     error = cudaFuncSetAttribute(
-        tma_copy_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+        tma_copy_gpu_direct_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
     if (error != cudaSuccess)
         return fail(error);
-    error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &config.max_active_ctas_per_sm, tma_copy_kernel, config.threads_per_cta, config.dynamic_shared_bytes);
+    error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&config.max_active_ctas_per_sm, tma_copy_gpu_direct_kernel,
+        config.threads_per_cta, config.dynamic_shared_bytes);
     if (error != cudaSuccess)
         return fail(error);
     if (config.max_active_ctas_per_sm != 1)
         return fail(cudaErrorNotSupported);
-    // Keep the original geometry valid even if a future compiler needs more
-    // resources for the inline entry. In that case use the upload path.
-    cudaFuncAttributes inline_attributes{};
-    error = cudaFuncGetAttributes(&inline_attributes, tma_copy_inline_kernel);
-    if (error != cudaSuccess)
-        return fail(error);
-    if (config.threads_per_cta <= inline_attributes.maxThreadsPerBlock
-        && dynamic_bytes + inline_attributes.sharedSizeBytes <= static_cast<size_t>(config.device_optin_shared_bytes))
-    {
-        error = cudaFuncSetAttribute(
-            tma_copy_inline_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config.dynamic_shared_bytes);
-        if (error != cudaSuccess)
-            return fail(error);
-        error = cudaFuncSetAttribute(
-            tma_copy_inline_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        if (error != cudaSuccess)
-            return fail(error);
-        int inline_active_ctas = 0;
-        error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &inline_active_ctas, tma_copy_inline_kernel, config.threads_per_cta, config.dynamic_shared_bytes);
-        if (error != cudaSuccess)
-            return fail(error);
-        state->inline_supported = inline_active_ctas == 1;
-    }
-    // Pack the used ranges immediately after the used segments on each submit.
-    // One cold allocation per side supports a single exact-size HtoD upload.
-    static_assert(sizeof(MegamoeTmaCopySegment) % alignof(MegamoeTmaCopyRange) == 0, "packed range alignment");
-    const size_t descriptor_bytes
-        = static_cast<size_t>(max_segments) * (sizeof(MegamoeTmaCopySegment) + sizeof(MegamoeTmaCopyRange));
-    error = cudaMalloc(reinterpret_cast<void**>(&state->device_segments), descriptor_bytes);
-    if (error != cudaSuccess)
-        return fail(error);
-    error = cudaHostAlloc(reinterpret_cast<void**>(&state->host_segments), descriptor_bytes, cudaHostAllocDefault);
-    if (error != cudaSuccess)
-        return fail(error);
     error = cudaMalloc(reinterpret_cast<void**>(&state->completed_ctas), sizeof(unsigned));
     if (error != cudaSuccess)
         return fail(error);
@@ -978,133 +832,8 @@ extern "C" int megamoe_tma_copy_create(uint64_t max_segments, int sms, int warps
     error = cudaStreamSynchronize(nullptr);
     if (error != cudaSuccess)
         return fail(error);
-    error = cudaEventCreateWithFlags(&state->descriptors_uploaded, cudaEventDisableTiming);
-    if (error != cudaSuccess)
-        return fail(error);
-    error = cudaEventCreateWithFlags(&state->kernel_complete, cudaEventDisableTiming);
-    if (error != cudaSuccess)
-        return fail(error);
     *out = state;
     return static_cast<int>(cudaSuccess);
-}
-
-static int submit_impl(MegamoeTmaCopyState* state, MegamoeTmaCopySegment const* segments, uint64_t segment_count,
-    MegamoeTmaCopyRange const* ranges, uint64_t range_count, void* cuda_stream, uint64_t flag_mc, uint64_t generation)
-{
-    if ((flag_mc && ((flag_mc & 7U) || !generation)) || (!flag_mc && generation))
-        return static_cast<int>(cudaErrorInvalidValue);
-    if (!state || state->direct_configured || segment_count > state->config.max_segments
-        || range_count > state->config.max_segments || (segment_count && !segments) || (range_count && !ranges))
-        return static_cast<int>(cudaErrorInvalidValue);
-    std::lock_guard<std::mutex> lock(state->submit_mutex);
-    if (state->poison != cudaSuccess)
-        return static_cast<int>(state->poison);
-    int current_device = -1;
-    cudaError_t error = cudaGetDevice(&current_device);
-    if (error != cudaSuccess)
-        return static_cast<int>(error);
-    if (current_device != state->config.device)
-        return static_cast<int>(cudaErrorInvalidDevice);
-    auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-    cudaStreamCaptureStatus capture;
-    error = cudaStreamIsCapturing(stream, &capture);
-    if (error != cudaSuccess)
-        return static_cast<int>(error);
-    if (capture != cudaStreamCaptureStatusNone)
-        return static_cast<int>(cudaErrorStreamCaptureUnsupported);
-    uint64_t total_slices = 0;
-    error = validate_descriptors(segments, segment_count, ranges, range_count, &total_slices);
-    if (error != cudaSuccess)
-        return static_cast<int>(error);
-    bool const inline_descriptors
-        = state->inline_supported && range_count && segment_count <= kInlineSegments && range_count <= kInlineRanges;
-    // Only the upload path touches the pinned tables. Inline launch arguments
-    // have their own storage, including after an outstanding large-plan DMA.
-    // Device tables and the READY counter retain cross-stream completion waits.
-    if (range_count && !inline_descriptors && state->upload_recorded)
-    {
-        error = cudaEventSynchronize(state->descriptors_uploaded);
-        if (error != cudaSuccess)
-        {
-            state->poison = error;
-            return static_cast<int>(error);
-        }
-    }
-    if (state->completion_recorded)
-    {
-        error = cudaStreamWaitEvent(stream, state->kernel_complete, 0);
-        if (error != cudaSuccess)
-        {
-            state->poison = error;
-            return static_cast<int>(error);
-        }
-    }
-    if (!range_count && !flag_mc)
-        return static_cast<int>(cudaSuccess);
-    state->last_stream = stream;
-    state->work_queued = true;
-    auto fail = [state](cudaError_t e)
-    {
-        state->poison = e;
-        return static_cast<int>(e);
-    };
-    if (range_count && !inline_descriptors)
-    {
-        const size_t segment_bytes = static_cast<size_t>(segment_count) * sizeof(MegamoeTmaCopySegment);
-        const size_t range_bytes = static_cast<size_t>(range_count) * sizeof(MegamoeTmaCopyRange);
-        auto* host_ranges = reinterpret_cast<unsigned char*>(state->host_segments) + segment_bytes;
-        std::memcpy(state->host_segments, segments, segment_bytes);
-        std::memcpy(host_ranges, ranges, range_bytes);
-        error = cudaMemcpyAsync(
-            state->device_segments, state->host_segments, segment_bytes + range_bytes, cudaMemcpyHostToDevice, stream);
-        if (error != cudaSuccess)
-            return fail(error);
-        error = cudaEventRecord(state->descriptors_uploaded, stream);
-        if (error != cudaSuccess)
-            return fail(error);
-        state->upload_recorded = true;
-    }
-    auto const& config = state->config;
-    int const ctas = range_count ? config.sms : 1;
-    int const threads = range_count ? config.threads_per_cta : 32;
-    int const shared_bytes = range_count ? config.dynamic_shared_bytes : 0;
-    if (inline_descriptors)
-    {
-        InlineDescriptors descriptors{};
-        std::memcpy(descriptors.segments, segments, static_cast<size_t>(segment_count) * sizeof(MegamoeTmaCopySegment));
-        std::memcpy(descriptors.ranges, ranges, static_cast<size_t>(range_count) * sizeof(MegamoeTmaCopyRange));
-        tma_copy_inline_kernel<<<ctas, threads, shared_bytes, stream>>>(descriptors, range_count, total_slices,
-            config.warps, config.total_slots, state->completed_ctas, flag_mc, generation);
-    }
-    else
-    {
-        tma_copy_kernel<<<ctas, threads, shared_bytes, stream>>>(state->device_segments,
-            reinterpret_cast<MegamoeTmaCopyRange const*>(state->device_segments + segment_count), range_count,
-            total_slices, config.warps, config.total_slots, state->completed_ctas, flag_mc, generation);
-    }
-    error = cudaGetLastError();
-    if (error != cudaSuccess)
-        return fail(error);
-    error = cudaEventRecord(state->kernel_complete, stream);
-    if (error != cudaSuccess)
-        return fail(error);
-    state->completion_recorded = true;
-    return static_cast<int>(cudaSuccess);
-}
-
-extern "C" int megamoe_tma_copy_submit(MegamoeTmaCopyState* state, MegamoeTmaCopySegment const* segments,
-    uint64_t segment_count, MegamoeTmaCopyRange const* ranges, uint64_t range_count, void* cuda_stream)
-{
-    return submit_impl(state, segments, segment_count, ranges, range_count, cuda_stream, 0, 0);
-}
-
-extern "C" int megamoe_tma_copy_submit_notify(MegamoeTmaCopyState* state, MegamoeTmaCopySegment const* segments,
-    uint64_t segment_count, MegamoeTmaCopyRange const* ranges, uint64_t range_count, uint64_t flag_mc,
-    uint64_t generation, void* cuda_stream)
-{
-    if (!flag_mc || !generation)
-        return static_cast<int>(cudaErrorInvalidValue);
-    return submit_impl(state, segments, segment_count, ranges, range_count, cuda_stream, flag_mc, generation);
 }
 
 extern "C" int megamoe_tma_copy_config_info(MegamoeTmaCopyState const* state, MegamoeTmaCopyConfig* out)
@@ -1222,36 +951,7 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
         || (error = upload(c.foreign_dst_table, foreign, &d.config.foreign_dst_table)) != cudaSuccess
         || (error = upload(c.plane_bytes, c.planes, &d.config.plane_bytes)) != cudaSuccess)
         return fail(error);
-    auto& config = state->config;
-    cudaFuncAttributes attrs{};
-    error = cudaFuncGetAttributes(&attrs, tma_copy_gpu_direct_kernel);
-    if (error != cudaSuccess)
-        return fail(error);
-    int const available = config.device_optin_shared_bytes - static_cast<int>(attrs.sharedSizeBytes);
-    config.total_slots = megamoe_tma_copy_total_slots(available);
-    config.max_warps = megamoe_tma_copy_max_warps(config.total_slots, attrs.maxThreadsPerBlock);
-    if (config.warps > config.max_warps)
-        return fail(cudaErrorInvalidConfiguration);
-    config.slots_per_warp = config.total_slots / config.warps;
-    config.extra_slot_warps = config.total_slots % config.warps;
-    config.max_slots_per_warp = config.slots_per_warp + (config.extra_slot_warps != 0);
-    config.bank0_slots_per_warp = (config.slots_per_warp + 1) / 2;
-    config.bank1_slots_per_warp = config.slots_per_warp / 2;
-    config.dynamic_shared_bytes = (config.total_slots * (kSlotDataBytes + kSlotControlBytes) + 127) & ~127;
-    error = cudaFuncSetAttribute(
-        tma_copy_gpu_direct_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, config.dynamic_shared_bytes);
-    if (error != cudaSuccess)
-        return fail(error);
-    error = cudaFuncSetAttribute(
-        tma_copy_gpu_direct_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-    if (error != cudaSuccess)
-        return fail(error);
-    error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&config.max_active_ctas_per_sm, tma_copy_gpu_direct_kernel,
-        config.threads_per_cta, config.dynamic_shared_bytes);
-    if (error != cudaSuccess)
-        return fail(error);
-    if (config.max_active_ctas_per_sm != 1)
-        return fail(cudaErrorNotSupported);
+    auto const& config = state->config;
     const uint64_t n = config.sms;
     d.max_segments = config.max_segments;
     if (d.max_segments > SIZE_MAX / n / sizeof(MegamoeTmaCopyRange))

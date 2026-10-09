@@ -864,15 +864,18 @@ def test_collect_llm_api_config_honors_raw_json_schema_extra_exclude():
     assert config == {"kept": 1}
 
 
-def test_manifest_excludes_loosely_typed_model_children():
-    # B-1 regression: moe_config.load_balancer is Optional[Union[object, str]];
-    # a validator coerces it into a MoeLoadBalancerConfig at runtime, but the
-    # annotation names no BaseModel, so its children must NOT be capturable.
+def test_manifest_includes_safe_load_balancer_fields():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.usage.llmapi_config import build_capture_manifest
 
-    paths = {e.path for e in build_capture_manifest(TorchLlmArgs)}
-    assert not any(p.startswith("moe_config.load_balancer.") for p in paths)
+    paths = {entry.path for entry in build_capture_manifest(TorchLlmArgs)}
+    assert {
+        "moe_config.load_balancer.auxiliary_sms",
+        "moe_config.load_balancer.layer_updates_per_iter",
+        "moe_config.load_balancer.mode",
+        "moe_config.load_balancer.num_slots",
+    } <= paths
+    assert "moe_config.load_balancer.initial_global_assignments" not in paths
 
 
 def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):

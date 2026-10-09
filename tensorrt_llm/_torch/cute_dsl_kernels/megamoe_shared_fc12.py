@@ -1,22 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """Single-expert use of MegaMoE's complete fused FC1/activation/FC2 kernel."""
 
-from copy import deepcopy
-from functools import lru_cache
 from itertools import product
+from threading import Condition, RLock
 
 import torch
 
 from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
 
 __all__ = [
+    "release_shared_fc12_cache",
     "run_shared_fc12",
     "shared_fc12_cache_info",
     "shared_fc12_candidate_tactics",
     "shared_fc12_tactic_descriptor",
-    "shared_fc12_autotune_state",
 ]
 
 _SHARED_FC12_OP = "trtllm::megamoe_shared_fc12"
@@ -152,7 +150,6 @@ class _SharedFc12Runner:
             swiglu_limit,
             self.tactic,
         )
-        cluster_size = implementation["cluster_shape_mn"][0]
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         if shared_bytes:
             raise RuntimeError("shared FC12 must not allocate a communication workspace")
@@ -223,31 +220,6 @@ class _SharedFc12Runner:
             "fc1_norm_const": None,
         }
         self.compiled = cute.compile[cute.EnableTVMFFI(True)](kernel, **fake_arguments)
-        self.audit = {
-            "kernel_class": type(kernel).__name__,
-            "tactic": list(self.tactic),
-            "fc2_use_bulk": implementation["fc2_use_bulk"],
-            "fc2_tma_stages": implementation["fc2_tma_stages"],
-            "upstream_commit": "522fbb019942ad6bbe0f418dba02541f837ea46c",
-            "kernel_descriptor_architecture": kernel.architecture,
-            "device_compute_capability": [properties.major, properties.minor],
-            "input_quantizer": "fp8_quantize_1x128_packed_ue8m0.sm_budget",
-            "input_quantization_block": 128,
-            "fc1_output_quantization_block": 32,
-            "requested_sm_count": sm_count,
-            "input_quantizer_reserved_sms": self.reserved_sms,
-            "launch_cluster_count": launch_clusters,
-            "work_id_mode": implementation["work_id_mode"],
-            "launch_grid": [cluster_size, 1, launch_clusters],
-            "mma_tiler_mnk": list(implementation["mma_tiler_mnk"]),
-            "cluster_shape_mn": list(implementation["cluster_shape_mn"]),
-            "use_2cta_instrs": implementation["use_2cta_instrs"],
-            "max_tokens": max_tokens,
-            "dynamic_token_dimension": True,
-            "routing_or_communication": False,
-            "reset_strategy": "cuMemsetD8Async_before_fc12_same_stream",
-            "workspace_reset_bytes": self.workspace_reset_bytes,
-        }
 
     def __call__(
         self,
@@ -258,41 +230,102 @@ class _SharedFc12Runner:
         fc2_weight_sf: torch.Tensor,
     ) -> torch.Tensor:
         token_rows = activation.shape[0]
-        with torch.cuda.nvtx.range("MEGAMOE_SHARED_INPUT_QUANT"):
-            quantized, scales = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0.sm_budget(
-                activation, reserved_sms=self.reserved_sms
-            )
+        quantized, scales = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0.sm_budget(
+            activation, reserved_sms=self.reserved_sms
+        )
         output = torch.empty(
             (token_rows, 1, self.hidden_size), dtype=torch.bfloat16, device=activation.device
         )
-        with torch.cuda.nvtx.range("MEGAMOE_SHARED_FC12"):
-            # The standalone FC12 readiness counters require reset before every invocation.
-            (status,) = self._memset_async(
-                self.workspace_pointer, 0, self.workspace_reset_bytes, self._cuda_stream
-            )
-            if status != self._cuda_success:
-                raise RuntimeError(f"shared FC12 asynchronous counter reset failed: {status}")
-            self.compiled(
-                activation=quantized,
-                fc1_weight=fc1_weight.transpose(1, 2),
-                activation_sf=scales.view(torch.float8_e8m0fnu).view(-1, self.hidden_size // 32),
-                fc1_weight_sf=fc1_weight_sf.view(torch.float8_e8m0fnu),
-                fc2_weight=fc2_weight.transpose(1, 2),
-                fc2_weight_sf=fc2_weight_sf.view(torch.float8_e8m0fnu),
-                fc2_output=output,
-                local_workspace=self.workspace_pointer,
-                stream=self.stream_handle,
-                expert_token_sizes=self.token_counts[token_rows : token_rows + 1],
-                expert_token_prefix_sum=None,
-                topk_scores=None,
-                fc1_alpha=None,
-                fc2_alpha=None,
-                fc1_norm_const=None,
-            )
+        # The standalone FC12 readiness counters require reset before every invocation.
+        (status,) = self._memset_async(
+            self.workspace_pointer, 0, self.workspace_reset_bytes, self._cuda_stream
+        )
+        if status != self._cuda_success:
+            raise RuntimeError(f"shared FC12 asynchronous counter reset failed: {status}")
+        self.compiled(
+            activation=quantized,
+            fc1_weight=fc1_weight.transpose(1, 2),
+            activation_sf=scales.view(torch.float8_e8m0fnu).view(-1, self.hidden_size // 32),
+            fc1_weight_sf=fc1_weight_sf.view(torch.float8_e8m0fnu),
+            fc2_weight=fc2_weight.transpose(1, 2),
+            fc2_weight_sf=fc2_weight_sf.view(torch.float8_e8m0fnu),
+            fc2_output=output,
+            local_workspace=self.workspace_pointer,
+            stream=self.stream_handle,
+            expert_token_sizes=self.token_counts[token_rows : token_rows + 1],
+            expert_token_prefix_sum=None,
+            topk_scores=None,
+            fc1_alpha=None,
+            fc2_alpha=None,
+            fc1_norm_const=None,
+        )
         return output[:, 0, :]
 
 
-@lru_cache(maxsize=None)
+_SHARED_FC12_CACHE_LOCK = RLock()
+_SHARED_FC12_CACHE_CONDITION = Condition(_SHARED_FC12_CACHE_LOCK)
+_ACTIVE_FC12_CALLS: dict[tuple[int, int], int] = {}
+_RELEASING_FC12_DEVICES: set[int] = set()
+_RELEASING_FC12_STREAMS: set[tuple[int, int]] = set()
+_RUNNER_CACHE: dict[tuple, _SharedFc12Runner] = {}
+_RUNNER_CACHE_HITS = 0
+_RUNNER_CACHE_MISSES = 0
+
+
+def _begin_shared_fc12_release(
+    device_index: int, stream_handle: int | None
+) -> tuple[int, int] | None:
+    stream_key = (device_index, stream_handle) if stream_handle is not None else None
+    with _SHARED_FC12_CACHE_CONDITION:
+        while (
+            device_index in _RELEASING_FC12_DEVICES
+            or (
+                stream_key is None
+                and any(device == device_index for device, _ in _RELEASING_FC12_STREAMS)
+            )
+            or (stream_key is not None and stream_key in _RELEASING_FC12_STREAMS)
+        ):
+            _SHARED_FC12_CACHE_CONDITION.wait()
+        if stream_key is None:
+            _RELEASING_FC12_DEVICES.add(device_index)
+        else:
+            _RELEASING_FC12_STREAMS.add(stream_key)
+        while any(
+            count and device == device_index and (stream_handle is None or stream == stream_handle)
+            for (device, stream), count in _ACTIVE_FC12_CALLS.items()
+        ):
+            _SHARED_FC12_CACHE_CONDITION.wait()
+    return stream_key
+
+
+def _end_shared_fc12_release(device_index: int, stream_key: tuple[int, int] | None) -> None:
+    with _SHARED_FC12_CACHE_CONDITION:
+        if stream_key is None:
+            _RELEASING_FC12_DEVICES.discard(device_index)
+        else:
+            _RELEASING_FC12_STREAMS.discard(stream_key)
+        _SHARED_FC12_CACHE_CONDITION.notify_all()
+
+
+def _begin_shared_fc12_call(device_index: int, stream_handle: int) -> tuple[int, int]:
+    key = (int(device_index), int(stream_handle))
+    with _SHARED_FC12_CACHE_CONDITION:
+        while key[0] in _RELEASING_FC12_DEVICES or key in _RELEASING_FC12_STREAMS:
+            _SHARED_FC12_CACHE_CONDITION.wait()
+        _ACTIVE_FC12_CALLS[key] = _ACTIVE_FC12_CALLS.get(key, 0) + 1
+    return key
+
+
+def _end_shared_fc12_call(key: tuple[int, int]) -> None:
+    with _SHARED_FC12_CACHE_CONDITION:
+        remaining = _ACTIVE_FC12_CALLS[key] - 1
+        if remaining:
+            _ACTIVE_FC12_CALLS[key] = remaining
+        else:
+            del _ACTIVE_FC12_CALLS[key]
+            _SHARED_FC12_CACHE_CONDITION.notify_all()
+
+
 def _get_runner(
     device_index: int,
     hidden_size: int,
@@ -303,22 +336,47 @@ def _get_runner(
     stream_handle: int,
     tactic: _SharedFc12Tactic | None = None,
 ) -> _SharedFc12Runner:
-    with torch.cuda.device(device_index):
-        return _SharedFc12Runner(
-            device_index,
-            hidden_size,
-            intermediate_size,
-            max_tokens,
-            sm_count,
-            swiglu_limit,
-            stream_handle,
-            tactic=tactic,
-        )
+    global _RUNNER_CACHE_HITS, _RUNNER_CACHE_MISSES
+    key = (
+        device_index,
+        hidden_size,
+        intermediate_size,
+        max_tokens,
+        sm_count,
+        swiglu_limit,
+        stream_handle,
+        tactic,
+    )
+    with _SHARED_FC12_CACHE_LOCK:
+        runner = _RUNNER_CACHE.get(key)
+        if runner is not None:
+            _RUNNER_CACHE_HITS += 1
+            return runner
+        _RUNNER_CACHE_MISSES += 1
+        with torch.cuda.device(device_index):
+            runner = _SharedFc12Runner(
+                device_index,
+                hidden_size,
+                intermediate_size,
+                max_tokens,
+                sm_count,
+                swiglu_limit,
+                stream_handle,
+                tactic=tactic,
+            )
+        _RUNNER_CACHE[key] = runner
+        return runner
 
 
 def shared_fc12_cache_info() -> dict[str, int | None]:
-    """Compiled runners are keyed by capacity/tactic, not the current token count."""
-    return _get_runner.cache_info()._asdict()
+    """Return process-cache counters for diagnostics."""
+    with _SHARED_FC12_CACHE_LOCK:
+        return {
+            "hits": _RUNNER_CACHE_HITS,
+            "misses": _RUNNER_CACHE_MISSES,
+            "maxsize": None,
+            "currsize": len(_RUNNER_CACHE),
+        }
 
 
 class SharedFc12TunableRunner(TunableRunner):
@@ -380,10 +438,8 @@ class SharedFc12TunableRunner(TunableRunner):
             use_cuda_graph=False,
         )
         self._valid_tactics = None
-        self._rejected_tactics = {}
         self._compiled_runners = {}
-        self._cache_keys = {}
-        self._selections = {}
+        self._compile_lock = RLock()
 
     def unique_id(self):
         return self._unique_id
@@ -400,12 +456,8 @@ class SharedFc12TunableRunner(TunableRunner):
                 for tactic in shared_fc12_candidate_tactics():
                     try:
                         _make_kernel(*self._runner_args[:6], tactic)
-                    except (ValueError, AssertionError) as error:
-                        self._rejected_tactics[tactic] = {
-                            "tactic": list(tactic),
-                            "stage": "descriptor_resources",
-                            "reason": str(error),
-                        }
+                    except (ValueError, AssertionError):
+                        continue
                     else:
                         valid.append(tactic)
             self._valid_tactics = tuple(valid)
@@ -423,97 +475,53 @@ class SharedFc12TunableRunner(TunableRunner):
                 else (2, 128, 128, "grid_stride", True)
             )
         tactic = tuple(tactic)
-        runner = self._compiled_runners.get(tactic)
-        if runner is None:
-            try:
+        with self._compile_lock:
+            runner = self._compiled_runners.get(tactic)
+            if runner is None:
                 runner = _get_runner(*self._runner_args, tactic)
-            except Exception as error:
-                # Preserve compilation failures for audit; AutoTuner retains its exception policy.
-                self._rejected_tactics[tactic] = {
-                    "tactic": list(tactic),
-                    "stage": "compile",
-                    "reason": str(error),
-                }
-                raise
-            self._compiled_runners[tactic] = runner
-            self.kernel_cache[(*self._runner_args, tactic)] = runner
+                self._compiled_runners[tactic] = runner
+                self.kernel_cache[(*self._runner_args, tactic)] = runner
         return runner(*inputs)
-
-    def record_selection(self, tuner, inputs, tactic):
-        bucket = self.token_bucket(inputs[0].shape[0])
-        key = self._cache_keys.get(bucket)
-        if key is None:
-            key = tuner.profiling_cache.get_cache_key(
-                _SHARED_FC12_OP, self, tuple(t.shape for t in inputs), self.tuning_config
-            )
-            self._cache_keys[bucket] = key
-        entry = tuner.profiling_cache.cache.get(key)
-        fallback = tactic == -1
-        selected = -1 if fallback else tuple(tactic)
-        cache_hit = (
-            entry is not None and not fallback and entry[1] != -1 and tuple(entry[1]) == selected
-        )
-        active_capture = tuner._active_capture is not None
-        replay = active_capture and tuner._active_capture.is_replaying()
-        signature = (bucket, selected, tuner.is_tuning_mode, active_capture, replay, cache_hit)
-        row = self._selections.get(signature)
-        tokens = inputs[0].shape[0]
-        if row is None:
-            row = self._selections[signature] = {
-                "bucket": bucket,
-                "tactic": list(selected) if not fallback else -1,
-                "production_cache_key": repr(key),
-                "cache_hit": cache_hit,
-                "min_time_ms": float(entry[2]) if cache_hit else None,
-                "is_tuning_mode": tuner.is_tuning_mode,
-                "active_capture": active_capture,
-                "replay": replay,
-                "fallback": fallback,
-                "calls": 0,
-                "actual_token_min": tokens,
-                "actual_token_max": tokens,
-            }
-        row["calls"] += 1
-        row["actual_token_min"] = min(row["actual_token_min"], tokens)
-        row["actual_token_max"] = max(row["actual_token_max"], tokens)
-
-    def audit_state(self):
-        return {
-            "unique_id": repr(self.unique_id()),
-            "device_index": self.device_index,
-            "stream_handle": self.stream_handle,
-            "sm_count": self.sm_count,
-            "reserved_sms": self.reserved_sms,
-            "max_tokens": self.max_tokens,
-            "tuning_buckets": list(self.buckets),
-            "use_cuda_graph": self.tuning_config.use_cuda_graph,
-            "use_cold_l2_cache": self.tuning_config.use_cold_l2_cache,
-            "timing_scope": ["input_quantization", "counter_reset", "complete_fc12"],
-            "timing_metric": "AutoTuner_mean_gpu_time_ms_full_runner_call",
-            "distributed_tuning_strategy": self.tuning_config.distributed_tuning_strategy.value,
-            "valid_tactics": (
-                None if self._valid_tactics is None else [list(t) for t in self._valid_tactics]
-            ),
-            "rejected_tactics": list(self._rejected_tactics.values()),
-            "selections": list(self._selections.values()),
-            "compiled_runners": [r.audit for r in self._compiled_runners.values()],
-        }
 
 
 _tunable_runners: dict[tuple, SharedFc12TunableRunner] = {}
 
 
-def shared_fc12_autotune_state() -> dict:
-    """Snapshot actual dispatches; fallback/capture replay are not autotuned serving winners."""
-    return deepcopy(
-        {
-            "schema_version": 1,
-            "custom_op": _SHARED_FC12_OP,
-            "catalog_version": _CATALOG_VERSION,
-            "candidate_catalog": [shared_fc12_tactic_descriptor(t) for t in _CANDIDATES],
-            "instances": [runner.audit_state() for runner in _tunable_runners.values()],
-        }
-    )
+def release_shared_fc12_cache(device_index: int, stream_handle: int | None = None) -> None:
+    """Drain and release shared-FC12 runners for one executor stream.
+
+    Dispatches already in progress finish before teardown. New dispatches for
+    the same stream wait, while unrelated streams and devices remain usable.
+    Passing no stream handle retains the process-exit fallback that releases
+    every runner on the device.
+    """
+    device_index = int(device_index)
+    stream_handle = None if stream_handle is None else int(stream_handle)
+    stream_key = _begin_shared_fc12_release(device_index, stream_handle)
+
+    def matches(key: tuple) -> bool:
+        return int(key[0]) == device_index and (
+            stream_handle is None or int(key[6]) == stream_handle
+        )
+
+    try:
+        with torch.cuda.device(device_index):
+            if stream_handle is None:
+                torch.cuda.synchronize(device_index)
+            else:
+                torch.cuda.ExternalStream(stream_handle, device=device_index).synchronize()
+        with _SHARED_FC12_CACHE_CONDITION:
+            tunable_keys = [key for key in _tunable_runners if matches(key)]
+            for key in tunable_keys:
+                _tunable_runners.pop(key)._compiled_runners.clear()
+            kernel_keys = [key for key in SharedFc12TunableRunner.kernel_cache if matches(key)]
+            for key in kernel_keys:
+                SharedFc12TunableRunner.kernel_cache.pop(key, None)
+            runner_keys = [key for key in _RUNNER_CACHE if matches(key)]
+            for key in runner_keys:
+                _RUNNER_CACHE.pop(key, None)
+    finally:
+        _end_shared_fc12_release(device_index, stream_key)
 
 
 def run_shared_fc12(
@@ -578,14 +586,16 @@ def run_shared_fc12(
         stream.cuda_stream,
         input_signature,
     )
-    with torch.cuda.device(activation.device):
-        runner = _tunable_runners.get(runner_key)
-        if runner is None:
-            runner = _tunable_runners[runner_key] = SharedFc12TunableRunner(*runner_key)
+    active_key = _begin_shared_fc12_call(activation.device.index, stream.cuda_stream)
+    try:
+        with _SHARED_FC12_CACHE_LOCK, torch.cuda.device(activation.device):
+            runner = _tunable_runners.get(runner_key)
+            if runner is None:
+                runner = _tunable_runners[runner_key] = SharedFc12TunableRunner(*runner_key)
         tuner = AutoTuner.get()
         selected_runner, tactic = tuner.choose_one(
             _SHARED_FC12_OP, [runner], runner.tuning_config, inputs
         )
-        output = selected_runner(inputs, tactic=tactic)
-        selected_runner.record_selection(tuner, inputs, tactic)
-        return output
+        return selected_runner(inputs, tactic=tactic)
+    finally:
+        _end_shared_fc12_call(active_key)

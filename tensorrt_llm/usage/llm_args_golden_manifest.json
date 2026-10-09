@@ -954,19 +954,33 @@
       "path": "moe_config.disable_finalize_fusion"
     },
     {
-      "capture_policy": "int|none",
+      "capture_policy": "int",
       "kind": "value",
-      "path": "moe_config.max_num_tokens"
-    },
-    {
-      "capture_policy": "bool",
-      "kind": "value",
-      "path": "moe_config.rebalance.enabled"
+      "path": "moe_config.load_balancer.auxiliary_sms"
     },
     {
       "capture_policy": "int",
       "kind": "value",
-      "path": "moe_config.rebalance.helper_slots_per_rank"
+      "path": "moe_config.load_balancer.layer_updates_per_iter"
+    },
+    {
+      "allowed_values": [
+        "standard",
+        "per_iteration"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "moe_config.load_balancer.mode"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.load_balancer.num_slots"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "moe_config.max_num_tokens"
     },
     {
       "capture_policy": "bool",

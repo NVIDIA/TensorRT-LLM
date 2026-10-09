@@ -361,6 +361,7 @@ def build_moe_deployment(
     # num_experts, so the deployment must say the same.
     eplb_enabled = get_moe_load_balancer() is not None
     balancer_config = getattr(model_config, "moe_load_balancer", None)
+    eplb_mode = getattr(balancer_config, "mode", "standard") if eplb_enabled else "disabled"
     num_slots = getattr(balancer_config, "num_slots", None) if eplb_enabled else None
     if num_slots is None:
         num_slots = num_experts if num_experts is not None else 0
@@ -377,6 +378,7 @@ def build_moe_deployment(
         env=environment if environment is not None else collect_moe_environment(),
         # Registered balancer only; config alone does not enable EPLB.
         eplb_enabled=eplb_enabled,
+        eplb_mode=eplb_mode,
         # Routed-expert LoRA only; attention-only LoRA stays False.
         moe_lora_enabled=has_moe_lora_targets(lora_config),
         # Same expression the impls use to set ``use_fused_finalize``; any
@@ -592,6 +594,27 @@ def resolve_moe_impl(
     rejected = []
     eligible: List[MoEImplClass] = []
     for candidate in candidates:
+        if (
+            deployment.eplb_mode == "per_iteration"
+            and not candidate.capabilities.supports_per_iteration_eplb
+        ):
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"{candidate.__name__} does not consume per-iteration EPLB plans",
+                )
+            )
+            continue
+        if deployment.eplb_enabled and not candidate.capabilities.supports_eplb:
+            rejected.append(
+                MoERejection(
+                    _legacy_backend_name(candidate),
+                    MoERejectReason.EPLB_UNSUPPORTED,
+                    f"{candidate.__name__} does not support EPLB slot layouts",
+                )
+            )
+            continue
         if deployment.moe_lora_enabled and not candidate.capabilities.supports_moe_lora:
             rejected.append(
                 MoERejection(

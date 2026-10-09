@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tensorrt_llm.llmapi.llm_args import LoadFormat, MoeRebalanceConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import LoadFormat, TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
 
@@ -128,59 +128,48 @@ class TestGmsCrossFieldWarning:
 
 
 class TestGmsMoeCompatibility:
-    def test_rejects_gms_with_active_rebalance(self):
-        with pytest.raises(
-            ValueError,
-            match=r"LoadFormat\.GMS.*active moe_config\.rebalance",
-        ):
-            _make_args(
-                load_format=LoadFormat.GMS,
-                moe_config={
-                    "rebalance": {
-                        "enabled": True,
-                        "helper_slots_per_rank": 3,
-                    }
-                },
-            )
-
     @pytest.mark.parametrize(
-        "load_format, rebalance",
+        "load_balancer",
         [
-            pytest.param(LoadFormat.GMS, None, id="no-rebalance"),
+            pytest.param({"num_slots": 64}, id="standard"),
             pytest.param(
-                LoadFormat.GMS,
-                {"enabled": False, "helper_slots_per_rank": 3},
-                id="disabled",
-            ),
-            pytest.param(
-                LoadFormat.GMS,
-                {"enabled": True, "helper_slots_per_rank": 0},
-                id="zero-helper-slots",
-            ),
-            pytest.param(
-                LoadFormat.AUTO,
-                {"enabled": True, "helper_slots_per_rank": 3},
-                id="active-without-gms",
+                {"mode": "per_iteration", "num_slots": 72},
+                id="per-iteration",
             ),
         ],
     )
-    def test_accepts_compatible_rebalance(self, load_format, rebalance):
+    def test_rejects_gms_with_load_balancer(self, load_balancer):
+        with pytest.raises(
+            ValueError,
+            match=r"LoadFormat\.GMS.*moe_config\.load_balancer",
+        ):
+            _make_args(
+                load_format=LoadFormat.GMS,
+                moe_config={"load_balancer": load_balancer},
+            )
+
+    @pytest.mark.parametrize(
+        "load_format, load_balancer",
+        [
+            pytest.param(LoadFormat.GMS, None, id="gms-without-eplb"),
+            pytest.param(
+                LoadFormat.AUTO,
+                {"num_slots": 64},
+                id="standard-without-gms",
+            ),
+            pytest.param(
+                LoadFormat.AUTO,
+                {"mode": "per_iteration", "num_slots": 72},
+                id="per-iteration-without-gms",
+            ),
+        ],
+    )
+    def test_accepts_compatible_load_balancer(self, load_format, load_balancer):
         args = _make_args(
             load_format=load_format,
-            moe_config={"rebalance": rebalance},
+            moe_config={"load_balancer": load_balancer},
         )
         assert args.load_format == load_format
-
-    def test_disable_override_makes_rebalance_inactive(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
-        rebalance = MoeRebalanceConfig(enabled=True, helper_slots_per_rank=3)
-        assert not rebalance.is_active
-
-        args = _make_args(
-            load_format=LoadFormat.GMS,
-            moe_config={"rebalance": rebalance},
-        )
-        assert args.load_format == LoadFormat.GMS
 
 
 class TestLoadFormatGms:

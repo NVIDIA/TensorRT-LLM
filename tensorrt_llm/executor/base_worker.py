@@ -17,7 +17,6 @@ import enum
 import gc
 import json
 import os
-import sys
 import time
 import traceback
 import uuid
@@ -86,18 +85,6 @@ def _init_hf_modules():
 
 
 _init_hf_modules()
-
-_REBALANCE_LIVE_ARENA_MODULE = (
-    "tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_live_arena_v2")
-
-
-def _release_rebalance_resources_collectively(local_safe: bool = True) -> None:
-    """Release active shared-slot pools without importing the optional path."""
-    module = sys.modules.get(_REBALANCE_LIVE_ARENA_MODULE)
-    release = (None if module is None else getattr(
-        module, "release_rebalance_resources_collectively", None))
-    if callable(release):
-        release(local_safe=local_safe)
 
 
 class BaseWorker(GenerationExecutor):
@@ -1041,33 +1028,50 @@ class BaseWorker(GenerationExecutor):
     def shutdown(self):
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        self.doing_shutdown = True
 
-        engine = self.engine
-        can_shutdown_now = False
-        shutdown_succeeded = False
         try:
-            if engine is not None:
+            if self.engine is not None:
+                engine = self.engine
+                engine_shutdown_completed = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
                 can_shutdown = getattr(engine, "can_shutdown", None)
                 if can_shutdown is None:
                     can_shutdown = engine.can_enqueue_requests
-                can_shutdown_now = can_shutdown()
-                if can_shutdown_now:
-                    engine.shutdown()
-                    shutdown_succeeded = True
-        finally:
-            try:
-                _release_rebalance_resources_collectively(
-                    local_safe=shutdown_succeeded
-                    and not getattr(engine, "worker_started", False))
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Failed to release MoE rebalance resources on shutdown: %s",
-                    exc,
-                )
-        if can_shutdown_now:
-            self.engine = None
+                # PyExecutor separates leader-only shutdown publication from the
+                # all-rank join/finalize path. Other backends retain their gate.
+                # A retry must bypass that gate once shutdown already completed.
+                if (engine_shutdown_completed
+                        or getattr(engine, "shutdown_all_ranks", False)
+                        or can_shutdown()):
+                    shutdown_error = None
+                    local_safe = engine_shutdown_completed
+                    if not local_safe:
+                        try:
+                            engine.shutdown()
+                            self._engine_shutdown_completed = True
+                            local_safe = True
+                        except BaseException as error:
+                            shutdown_error = error
+                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                    if terminal_cleanup is not None:
+                        try:
+                            if getattr(engine, "shutdown_all_ranks", False):
+                                terminal_cleanup(local_safe=local_safe)
+                            elif local_safe:
+                                terminal_cleanup()
+                        except BaseException as error:
+                            if shutdown_error is None:
+                                shutdown_error = error
+                    if shutdown_error is not None:
+                        raise shutdown_error
+                    self.engine = None
+                    self._engine_shutdown_completed = False
+        except BaseException:
+            # Keep the engine reachable so a caller can retry a failed
+            # collective terminal cleanup in this long-lived worker process.
+            self.doing_shutdown = False
+            raise
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

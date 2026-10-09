@@ -9,6 +9,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+CANONICAL_WEIGHT_PLANE_NAMES = (
+    "mega_fc1_weight",
+    "mega_fc1_weight_sf",
+    "mega_fc2_weight",
+    "mega_fc2_weight_sf",
+    "fc31_alpha",
+    "fc2_alpha",
+    "fc1_norm_const",
+)
+
+
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -124,4 +135,4 @@ class BundleLayout:
         return len(self.planes)
 
 
-__all__ = ["BundleLayout", "Plane"]
+__all__ = ["BundleLayout", "CANONICAL_WEIGHT_PLANE_NAMES", "Plane"]

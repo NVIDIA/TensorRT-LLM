@@ -4171,6 +4171,54 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     # "peak = steady set + ONE layer" bound. Class-level on purpose.
     _streamed_transient_lock = threading.Lock()
 
+    def live_weight_plane_spec(self, module: torch.nn.Module):
+        """Return the canonical seven-plane ABI for this quantized module."""
+        from ...cute_dsl_kernels.megamoe_scheduler.sami.geometry import \
+            BundleLayout
+
+        return BundleLayout.create(
+            hidden=int(module.hidden_size),
+            intermediate=int(module.intermediate_size_per_partition),
+        )
+
+    def assert_live_weight_aliases(self, module: torch.nn.Module,
+                                   arena) -> None:
+        """Fail if loading or transformation replaced an arena-backed plane."""
+        if self.live_weight_plane_spec(module) != arena.bundle:
+            raise RuntimeError(
+                "MoE rebalance arena does not match the quant-method plane spec"
+            )
+        if not (len(arena.bundle.planes) == len(arena.local_plane_views) == len(
+                arena.tekit_alias_views)):
+            raise RuntimeError(
+                "MoE rebalance live-plane collections differ in length")
+        for plane, arena_view, alias in zip(
+                arena.bundle.planes,
+                arena.local_plane_views,
+                arena.tekit_alias_views,
+        ):
+            current = getattr(module, plane.name, None)
+            if current is None or bool(getattr(current, "is_meta", False)):
+                raise RuntimeError(
+                    f"MoE rebalance live weight plane {plane.name!r} is not materialized"
+                )
+            if (tuple(current.shape) != tuple(alias.shape)
+                    or tuple(current.stride()) != tuple(alias.stride())
+                    or current.dtype != alias.dtype
+                    or current.device != alias.device):
+                raise RuntimeError(
+                    f"MoE rebalance live weight plane {plane.name!r} changed layout after binding"
+                )
+            pointers = (
+                int(current.data_ptr()),
+                int(alias.data_ptr()),
+                int(arena_view.data_ptr()),
+            )
+            if pointers[0] != pointers[1] or pointers[1] != pointers[2]:
+                raise RuntimeError(
+                    f"MoE rebalance live weight plane {plane.name!r} changed storage after binding"
+                )
+
     # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
     # the grandparent's standard NVFP4 parameters.
@@ -4229,7 +4277,32 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # init tensors are actually released.
         self.setup_quant_scales(module)
 
-        num_local_slots = module.expert_size_per_partition
+        # The generic NVFP4 source/checkpoint Parameters created above use
+        # the resident axis H (``expert_size_per_partition``). Only the seven
+        # tensors consumed directly by the MegaMoE kernel use M = H + S.
+        num_resident_experts = int(module.expert_size_per_partition)
+        num_compute_slots = int(module.compute_slot_count)
+        if num_compute_slots < num_resident_experts:
+            raise ValueError(
+                "MegaMoE compute_slot_count must cover every resident expert: "
+                f"M={num_compute_slots}, H={num_resident_experts}.")
+
+        # The NVFP4 parent owns alpha construction, but these two alphas are
+        # kernel planes. Resize only them to M; loaders still populate the H
+        # resident prefix and the rebalance copy fills [H, M).
+        for name in ("fc31_alpha", "fc2_alpha"):
+            resident = getattr(module, name)
+            if int(resident.shape[0]) != num_resident_experts:
+                raise RuntimeError(
+                    f"{name} source axis must be resident H="
+                    f"{num_resident_experts}, got {tuple(resident.shape)}.")
+            if num_compute_slots != num_resident_experts:
+                expanded = resident.detach().new_ones((num_compute_slots, ) +
+                                                      tuple(resident.shape[1:]))
+                expanded[:num_resident_experts].copy_(resident.detach())
+                module.register_parameter(
+                    name, nn.Parameter(expanded, requires_grad=False))
+
         hidden = module.hidden_size
         intermediate = module.intermediate_size_per_partition
         expand_intermediate = module.expand_intermediate_size_per_partition
@@ -4244,7 +4317,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # expand_intermediate (the N axis). ``mega_fc2_weight`` is byte-
         # equivalent to ``w2_weight``.
         mega_fc1_weight = nn.Parameter(
-            torch.empty(num_local_slots,
+            torch.empty(num_compute_slots,
                         expand_intermediate,
                         hidden // 2,
                         dtype=torch.uint8),
@@ -4253,7 +4326,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         module.register_parameter("mega_fc1_weight", mega_fc1_weight)
 
         mega_fc2_weight = nn.Parameter(
-            torch.empty(num_local_slots,
+            torch.empty(num_compute_slots,
                         hidden,
                         intermediate // 2,
                         dtype=torch.uint8),
@@ -4262,7 +4335,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         module.register_parameter("mega_fc2_weight", mega_fc2_weight)
 
         mega_fc1_weight_sf = nn.Parameter(
-            torch.empty(num_local_slots,
+            torch.empty(num_compute_slots,
                         self.fc1_sf_flat_size(intermediate, hidden),
                         dtype=torch.uint8),
             requires_grad=False,
@@ -4270,7 +4343,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         module.register_parameter("mega_fc1_weight_sf", mega_fc1_weight_sf)
 
         mega_fc2_weight_sf = nn.Parameter(
-            torch.empty(num_local_slots,
+            torch.empty(num_compute_slots,
                         self.fc2_sf_flat_size(hidden, intermediate),
                         dtype=torch.uint8),
             requires_grad=False,
@@ -4278,7 +4351,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         module.register_parameter("mega_fc2_weight_sf", mega_fc2_weight_sf)
 
         # Per-expert FC1-output (= FC2-input) NVFP4 quantization norm_const.
-        # The MegaMoE CuteDSL kernel ABI is per-expert ``(num_local_slots,)``.
+        # The MegaMoE CuteDSL kernel ABI is per-slot ``(compute_slot_count,)``.
         # This buffer is filled in ``process_weights_after_loading`` from each
         # local expert's raw ``w2.input_scale`` as ``1 / w2.input_scale`` and is
         # a stable, contiguous, device-local tensor (NOT a stride-0 expand view)
@@ -4288,16 +4361,14 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # per-expert, EPLB shared-load paths also register CPU staging for this
         # parameter.
         fc1_norm_const = nn.Parameter(
-            torch.ones(num_local_slots, dtype=torch.float32),
+            torch.ones(num_compute_slots, dtype=torch.float32),
             requires_grad=False,
         )
         module.register_parameter("fc1_norm_const", fc1_norm_const)
 
-        if getattr(module, "_rebalance_arena", None) is not None:
-            from .mega_moe.rebalance_slot_scheduler_v2 import \
-                bind_live_weight_planes
-
-            bind_live_weight_planes(self, module)
+        # Alpha Parameters may have been resized or rebound after the parent
+        # built its view; refresh it against the final seven-plane identities.
+        self.setup_quant_scales(module)
 
     def _materialize_source_params(self, module: torch.nn.Module):
         """Rematerialize this module's streamed source params (full shape)
@@ -4551,9 +4622,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     def _check_initial_aux_scale_coverage(self,
                                           module: torch.nn.Module) -> None:
         """Reject partially populated NVFP4 auxiliary-scale families."""
-        n_slots = int(
-            getattr(module, "_rebalance_home_experts", None)
-            or module.expert_size_per_partition)
+        n_slots = int(module.expert_size_per_partition)
         # A whole-checkpoint load is handed every expert's input_scale, because
         # the weights dict holds the entire checkpoint; a streaming EP load
         # only ever reads its own rank's experts, so its complete answer is
@@ -4623,9 +4692,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if module.w3_w1_weight.data.numel() == 0:
             return
 
-        n_slots = int(
-            getattr(module, "_rebalance_home_experts", None)
-            or module.expert_size_per_partition)
+        n_slots = int(module.expert_size_per_partition)
         coverage = self._streamed_coverage(module)
         incomplete = {k: v for k, v in coverage.items() if v < n_slots}
         if incomplete:
@@ -4772,9 +4839,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             raw_input_scales,
             module.initial_local_expert_ids,
             device=module.fc1_norm_const.device)
-        n_home = int(
-            getattr(module, "_rebalance_home_experts", None)
-            or module.expert_size_per_partition)
+        n_home = int(module.expert_size_per_partition)
         if routed_norm_const.numel() != n_home:
             raise RuntimeError(
                 "MegaMoE-CuteDSL fc1_norm_const expected one entry per "
