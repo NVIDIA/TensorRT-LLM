@@ -706,6 +706,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         self,
         param: MultimodalParams,
         item_indices: Sequence[int],
+        modality: Optional[str] = None,
     ) -> MultimodalParams:
         """Build a Gemma4 image or audio input containing selected items.
 
@@ -716,12 +717,13 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
         Partial encoder-cache hits therefore need this override to slice those tensors, together
         with their per-item position, length, and mask fields.
         """
-        modality = self._encoder_cache_modality(param)
+        if modality is None:
+            modality = self._encoder_cache_modality(param)
         # Partial video partitions are converted to full misses above, so they cannot call this
         # hook. Delegate unexpected direct calls to the generic validation so they fail instead of
         # returning an incorrectly unsliced input.
         if modality not in ("image", "audio"):
-            return super().build_multimodal_encoder_input(param, item_indices)
+            return super().build_multimodal_encoder_input(param, item_indices, modality=modality)
         input_key = {"image": "pixel_values", "audio": "audio_features"}[modality]
 
         modality_data = param.multimodal_data[modality]
@@ -740,7 +742,7 @@ class Gemma4MultimodalModelBase(MultimodalModelMixin, PreTrainedModel):
             or input_tensor.dim() == 0
             or input_tensor.shape[0] != item_count
         ):
-            return super().build_multimodal_encoder_input(param, item_indices)
+            return super().build_multimodal_encoder_input(param, item_indices, modality=modality)
 
         indices = list(item_indices)
         sliced = {input_key: input_tensor[indices]}
