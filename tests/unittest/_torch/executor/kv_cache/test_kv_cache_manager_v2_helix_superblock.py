@@ -229,6 +229,7 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         kv_cache_map={7: kv},
         kv_compression_manages_history=False,
         _has_cp_helix=True,
+        _after_shrink=lambda request_id, kv_cache: None,
     )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)

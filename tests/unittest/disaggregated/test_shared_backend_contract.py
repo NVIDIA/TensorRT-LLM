@@ -20,6 +20,8 @@ from tensorrt_llm._torch.disaggregation.base import shared
 from tensorrt_llm._torch.disaggregation.base.shared import (
     Attempt,
     CacheExtent,
+    CancelDisposition,
+    CancellableAttempt,
     Cancelled,
     Delivered,
     Failed,
@@ -31,6 +33,7 @@ from tensorrt_llm._torch.disaggregation.base.shared import (
     Route,
     SubmissionRejected,
     Unit,
+    request_cancel,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -174,6 +177,30 @@ class _ControlledStore:
         raise NotImplementedError("single-source backend")
 
 
+class _CancellableControlledAttempt(_ControlledAttempt):
+    """An optional cancellation request that changes neither completion event."""
+
+    def __init__(self, disposition: CancelDisposition = CancelDisposition.REQUESTED) -> None:
+        """Initialize a pending attempt with a controlled request disposition.
+
+        Args:
+            disposition: Whether this double can record a cancellation request.
+        """
+        super().__init__()
+        self.disposition = disposition
+        self.cancel_requests = 0
+
+    def request_cancel(self) -> CancelDisposition:
+        """Record at most one request without resolving the pending delivery.
+
+        Returns:
+            The configured disposition, independent of logical and access state.
+        """
+        if self.disposition is CancelDisposition.REQUESTED and not self.cancel_requests:
+            self.cancel_requests += 1
+        return self.disposition
+
+
 def _extent() -> CacheExtent:
     """Return two units with equal region IDs in different local groups."""
     return CacheExtent(
@@ -196,6 +223,9 @@ def test_export_surface_and_fields_match_canonical_contract() -> None:
         "Cancelled",
         "Outcome",
         "Attempt",
+        "CancelDisposition",
+        "CancellableAttempt",
+        "request_cancel",
         "SubmissionRejected",
         "Route",
         "Registration",
@@ -203,7 +233,7 @@ def test_export_surface_and_fields_match_canonical_contract() -> None:
         "Publishes",
         "RegistersPools",
     }
-    assert len(shared.__all__) == 13
+    assert len(shared.__all__) == 16
     for cls, names in (
         (Unit, ["name", "local_group", "local"]),
         (CacheExtent, ["name", "units", "is_last"]),
@@ -218,6 +248,11 @@ def test_export_surface_and_fields_match_canonical_contract() -> None:
     route = signature(Fetches.fetch).parameters["route"]
     assert route.kind is Parameter.KEYWORD_ONLY and route.default is None
     assert set(signature(Publishes.publish).parameters) == {"self", "extent"}
+    assert set(CancelDisposition.__members__) == {"REQUESTED", "UNSUPPORTED"}
+    assert get_type_hints(request_cancel) == {
+        "attempt": Attempt,
+        "return": CancelDisposition,
+    }
 
 
 @pytest.mark.parametrize("local_group,local", [(-1, 0), (0, -1), (-1, -1)])
@@ -289,6 +324,59 @@ def test_handles_do_not_advertise_runtime_protocol_checks() -> None:
     for protocol in (Route, Registration):
         with pytest.raises(TypeError, match="runtime_checkable"):
             isinstance(object(), protocol)
+
+
+def test_cancellation_helper_supports_an_ordinary_attempt() -> None:
+    """An existing provider needs no cancellation method to remain compatible."""
+    attempt = _ControlledAttempt()
+    assert isinstance(attempt, Attempt)
+    assert not isinstance(attempt, CancellableAttempt)
+    for _ in range(2):
+        assert request_cancel(attempt) is CancelDisposition.UNSUPPORTED
+        assert attempt.poll() is None
+        assert not attempt.access_ended.is_set()
+
+
+@pytest.mark.parametrize("disposition", list(CancelDisposition))
+def test_cancellation_requests_do_not_wait_or_establish_quiescence(
+    disposition: CancelDisposition,
+) -> None:
+    """Dispatch preserves a pending outcome and the provider's access evidence."""
+    store = _ControlledStore({})
+    attempt = _CancellableControlledAttempt(disposition)
+    store.attempts.append(attempt)
+    assert isinstance(attempt, CancellableAttempt)
+    for _ in range(2):
+        assert request_cancel(attempt) is disposition
+        assert attempt.poll() is None
+        assert not attempt.logical_ready.is_set()
+        assert not store.quiesce([attempt])
+    assert attempt.cancel_requests == int(disposition is CancelDisposition.REQUESTED)
+    attempt.access_ended.set()
+    assert store.quiesce([attempt])
+    assert attempt.poll() is None
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [Delivered(frozenset({b"first"})), Failed("transport failure"), Cancelled(False)],
+    ids=["delivered", "failed", "cancelled"],
+)
+@pytest.mark.parametrize("completion_first", [False, True])
+def test_cancellation_request_preserves_the_first_terminal_outcome(
+    outcome: Outcome, completion_first: bool
+) -> None:
+    """A request can race completion without the helper rewriting its outcome."""
+    attempt = _CancellableControlledAttempt()
+    if completion_first:
+        attempt.answer(outcome)
+    assert request_cancel(attempt) is CancelDisposition.REQUESTED
+    if not completion_first:
+        attempt.answer(outcome)
+    assert request_cancel(attempt) is CancelDisposition.REQUESTED
+    assert attempt.poll() is outcome
+    assert attempt.cancel_requests == 1
+    assert not attempt.access_ended.is_set()
 
 
 @pytest.mark.parametrize(

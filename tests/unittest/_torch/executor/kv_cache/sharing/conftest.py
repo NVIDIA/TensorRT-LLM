@@ -223,21 +223,32 @@ def real_manager():
 
 @contextmanager
 def _host_tiered(factory: Callable[[], object]) -> Iterator[object]:
-    """``_managed``, checked to have the automatic host tier below its GPU pool."""
+    """``_managed``, checked to have enough host slots to spill its GPU pool."""
     with _managed(factory) as mgr:
         tiers = [str(tier) for tier in mgr.impl.cache_tier_list]
         assert len(tiers) == 2 and "HOST" in tiers[1], f"no host tier below the GPU pool: {tiers}"
+        gpu_slots = sum(int(stats.total) for stats in mgr.impl.get_storage_statistics(0))
+        host_slots = sum(int(stats.total) for stats in mgr.impl.get_storage_statistics(1))
+        assert host_slots >= gpu_slots, (
+            f"host tier has {host_slots} slots for a GPU pool of {gpu_slots} slots"
+        )
         yield mgr
 
 
 @pytest.fixture
 def host_tier_manager():
     """``with host_tier_manager(**kwargs) as mgr:`` like ``real_manager`` on a pool of
-    ``POOL_TOKENS``, with its automatic host tier checked present. Index slots for many one-block
+    ``POOL_TOKENS``, with an explicitly sized host tier. Index slots for many one-block
     requests and resume allowed up to a full pool let other requests push pages to host and back."""
 
     def factory(**kwargs):
-        config = dict(max_tokens=POOL_TOKENS, max_batch_size=64, max_util_for_resume=1.0)
+        # Keep spill capacity independent of the process's memlock-limited automatic quota.
+        config = dict(
+            max_tokens=POOL_TOKENS,
+            max_batch_size=64,
+            max_util_for_resume=1.0,
+            host_cache_size=16 << 20,
+        )
         config.update(kwargs)
         return _host_tiered(lambda: make_manager(**config))
 
