@@ -7,8 +7,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional, Tuple, Type,
-                    Union)
+from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
+                    Tuple, Type, Union)
 
 import torch
 import torch._dynamo.config
