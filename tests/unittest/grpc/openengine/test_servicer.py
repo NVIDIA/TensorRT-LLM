@@ -5,6 +5,9 @@
 
 import asyncio
 import base64
+import hashlib
+import hmac
+import json
 from collections.abc import AsyncIterator, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -820,6 +823,91 @@ def test_generate_lets_conversation_affinity_own_dp_rank() -> None:
 
     assert llm.generate_kwargs["scheduling_params"] is None
     assert llm.generate_kwargs["conversation_params"].conversation_id == "session-a"
+
+
+def test_generate_rejects_rank_hint_without_conversation_affinity_key() -> None:
+    """Dropping an explicit rank hint must not leave placement unkeyed."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=(("openengine-target-dp-rank", "1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="missing-conversation", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("key", ["openengine-routing-key", "openengine-unknown-route"])
+def test_generate_rejects_ignored_routing_metadata(key: str) -> None:
+    """A caller's routing request must not succeed after being discarded."""
+    llm = _FakeLlm([])
+    servicer = OpenEngineInferenceServicer(llm, model="test-model")
+    context = FakeServicerContext(metadata=((key, "parent-1"),))
+    request = generation_pb2.GenerateRequest(
+        request_id="unsupported-route", model="test-model", prompt="hello"
+    )
+
+    async def collect_responses() -> None:
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(collect_responses())
+    assert error.value.code == grpc.StatusCode.UNIMPLEMENTED
+
+
+def test_generate_preserves_child_identity_and_authenticates_parent_affinity() -> None:
+    """A sidecar parent hint must place the request without replacing its child ID."""
+    llm = _FakeLlm([])
+    llm.args.enable_attention_dp = True
+    llm.args.attention_dp_config = SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+    servicer = OpenEngineInferenceServicer(
+        llm, model="test-model", subagent_affinity_auth_key="shared-secret"
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="child-request", model="test-model", prompt="hello"
+    )
+    request.extra.update({"conversation_id": "child-a", "request_type": "context_only"})
+    payload = {
+        "purpose": "x-trtllm-subagent-affinity-id",
+        "model": "test-model",
+        "request_id": "child-request",
+        "conversation_id": "child-a",
+        "subagent_affinity_id": "parent-1",
+        "request_type": "context_only",
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    signature = "sha256=" + hmac.new(b"shared-secret", encoded, hashlib.sha256).hexdigest()
+
+    async def send(parent: str) -> None:
+        context = FakeServicerContext(
+            metadata=(
+                ("x-trtllm-subagent-affinity-id", parent),
+                ("x-trtllm-subagent-affinity-auth", signature),
+            )
+        )
+        async for _ in servicer.Generate(request, context):
+            pass
+
+    asyncio.run(send("parent-1"))
+    assert llm.generate_kwargs["conversation_params"].conversation_id == "child-a"
+    scheduling = llm.generate_kwargs["scheduling_params"]
+    assert scheduling.subagent_affinity_id == "parent-1"
+    assert scheduling.attention_dp_rank is None
+
+    with pytest.raises(AbortError) as error:
+        asyncio.run(send("different-parent"))
+    assert error.value.code == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_generate_rejects_target_dp_rank_with_multiple_sequences() -> None:

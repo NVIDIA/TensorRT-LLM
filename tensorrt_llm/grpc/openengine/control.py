@@ -248,6 +248,14 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         info.extra.update(
             {"trtllm_supports_dp_rank_targeting": not conversation_affinity_enabled(self._llm)}
         )
+        info.extra.update(
+            {
+                "trtllm_supports_subagent_affinity": bool(
+                    getattr(self._inference, "subagent_affinity_auth_key", None)
+                    and conversation_affinity_enabled(self._llm)
+                )
+            }
+        )
         if events_config(self._llm) is not None:
             info.extra.update({"trtllm_kv_event_hash_algo": "v2_sha256_64"})
         if self._capacity_reporting_enabled:

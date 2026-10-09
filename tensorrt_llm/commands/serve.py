@@ -1621,7 +1621,7 @@ def serve(
                 allow_request_chat_template
                 if allow_request_chat_template else None,
                 "internal_request_auth_key":
-                internal_disagg_auth_key,
+                internal_disagg_auth_key if grpc_protocol != "openengine" else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1663,7 +1663,8 @@ def serve(
                     port,
                     llm_args,
                     served_model_name=served_model_name,
-                    enable_load_metrics=openengine_enable_load_metrics)
+                    enable_load_metrics=openengine_enable_load_metrics,
+                    subagent_affinity_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

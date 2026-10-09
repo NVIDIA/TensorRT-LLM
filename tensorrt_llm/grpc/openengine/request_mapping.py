@@ -206,9 +206,10 @@ def conversation_params_from_request(
 
 def _metadata_from_context(
     context: grpc.aio.ServicerContext,
-) -> tuple[Mapping[str, str] | None, int | None]:
+) -> tuple[Mapping[str, str] | None, int | None, dict[str, str]]:
     """Extract tracing and strict attention-DP routing metadata."""
     headers: dict[str, str] = {}
+    affinity_headers: dict[str, str] = {}
     openengine_keys: set[str] = set()
     target_dp_rank = None
     for item in context.invocation_metadata():
@@ -219,8 +220,7 @@ def _metadata_from_context(
                 raise ValueError(f"gRPC metadata key '{key}' must not be repeated")
             openengine_keys.add(key)
             if key == "openengine-routing-key":
-                if not value:
-                    raise ValueError("openengine-routing-key must be non-empty")
+                raise UnsupportedFeatureError("openengine-routing-key is not supported")
             elif key == "openengine-priority":
                 raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
             elif key == "openengine-target-dp-rank":
@@ -230,9 +230,15 @@ def _metadata_from_context(
                     raise ValueError("openengine-target-dp-rank must be an integer") from error
                 if target_dp_rank < 0:
                     raise ValueError("openengine-target-dp-rank must be non-negative")
+            else:
+                raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
         elif key in ("traceparent", "tracestate"):
             headers[key] = value
-    return headers or None, target_dp_rank
+        elif key in ("x-trtllm-subagent-affinity-id", "x-trtllm-subagent-affinity-auth"):
+            if key in affinity_headers:
+                raise ValueError(f"gRPC metadata key '{key}' must not be repeated")
+            affinity_headers[key] = value
+    return headers or None, target_dp_rank, affinity_headers
 
 
 def _input_from_request(request: generation_pb2.GenerateRequest) -> str | dict[str, list[int]]:

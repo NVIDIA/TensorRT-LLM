@@ -82,15 +82,28 @@ class OpenEngineServer:
         port: Port on which the server listens. Use zero to select a free port.
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
-    def __init__(self, host: str, port: int, llm: Any, model: str) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        llm: Any,
+        model: str,
+        subagent_affinity_auth_key: str | None = None,
+    ) -> None:
         self.host = host
         self.port = port
         self._llm = llm
         self._server = grpc.aio.server(options=_SERVER_OPTIONS)
         kv_transfer_backend = _kv_transfer_backend(llm)
-        inference = OpenEngineInferenceServicer(llm, model, kv_transfer_backend=kv_transfer_backend)
+        inference = OpenEngineInferenceServicer(
+            llm,
+            model,
+            kv_transfer_backend=kv_transfer_backend,
+            subagent_affinity_auth_key=subagent_affinity_auth_key,
+        )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
         # Abort and GetLoad see the same requests Generate is serving.
@@ -150,6 +163,7 @@ def launch_server(
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
     enable_load_metrics: bool = False,
+    subagent_affinity_auth_key: str | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -159,6 +173,7 @@ def launch_server(
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
     async def serve() -> None:
@@ -200,7 +215,13 @@ def launch_server(
             }
             llm = PyTorchLLM(**llm_args)
             logger.info("Model loaded successfully")
-            server = OpenEngineServer(host=host, port=port, llm=llm, model=model)
+            server = OpenEngineServer(
+                host=host,
+                port=port,
+                llm=llm,
+                model=model,
+                subagent_affinity_auth_key=subagent_affinity_auth_key,
+            )
             await server.start()
             await stop_event.wait()
         finally:

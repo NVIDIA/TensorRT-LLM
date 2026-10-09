@@ -655,13 +655,16 @@ async def test_routing_capabilities_are_independent(events_enabled, load_enabled
 
 @pytest.mark.asyncio
 async def test_server_info_disables_dp_rank_targeting_with_conversation_affinity():
+    inference = _inference()
+    inference.subagent_affinity_auth_key = "shared-secret"
     affinity = _servicer(
-        attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True)
+        inference, attention_dp_config=SimpleNamespace(kv_cache_routing_conversation_affinity=True)
     )
     affinity_info = await affinity.GetServerInfo(
         server_pb2.GetServerInfoRequest(), FakeServicerContext()
     )
     assert affinity_info.extra["trtllm_supports_dp_rank_targeting"] is False
+    assert affinity_info.extra["trtllm_supports_subagent_affinity"] is True
 
 
 @pytest.mark.asyncio
