@@ -147,8 +147,8 @@ def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Opt
     that returns from the allocation is agreed and handled the same way. A rank that fails inside the allocation's
     handle exchange can leave its peers waiting in that exchange: that failure is not turned into an error on the
     other ranks."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
     from tensorrt_llm._torch.distributed.ops import (
-        _get_mnnvl_tp_group_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_device_index,
         _mnnvl_workspace_all_succeeded,
@@ -156,7 +156,7 @@ def _create_buffer(cls, mapping, words: int, flag_words: int, fabric_handle: Opt
     from tensorrt_llm._utils import mpi_disabled
 
     use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-    comm = _get_mnnvl_tp_group_comm(mapping)
+    comm = mnnvl_workspace.mnnvl_tp_group_comm(mapping)
     # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
     # failing inside the allocation would leave its peers in the handle exchange.
     problem: Optional[str] = None
@@ -339,7 +339,7 @@ def k3_sandwich_oproj(
     src_slab: Optional[torch.Tensor] = None,
     src_buf: int = 0,
 ) -> List[torch.Tensor]:
-    """``(normed, updated)`` of ``o_proj`` followed by ``allreduce_attn_res_rmsnorm``.
+    """``(normed, updated)`` of ``o_proj`` followed by ``trtllm::mnnvl_allreduce_attn_res``.
 
     ``core`` bf16 [M, 768] is this rank's attention output, ``o_weight`` [7168, 768] its o_proj slice;
     ``prefix`` [M, 7168] (or None), ``block_residual`` [S, M, 7168] the S valid snapshots, the weights [7168];
@@ -471,7 +471,7 @@ def k3_sandwich_tail(
     updated_out: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
     """``(normed, updated)`` of the row-parallel MoE tail (``[rmsnorm(latent)[:, lo:lo+224] | act] @ tail_weight^T``,
-    the RMS on the fp32 latent accumulator) followed by ``allreduce_attn_res_rmsnorm`` of that partial. ``latent`` is
+    the RMS on the fp32 latent accumulator) followed by ``mnnvl_allreduce_attn_res`` of that partial. ``latent`` is
     the whole reduced latent row (16-byte aligned: its rows are bulk-copied), ``act`` the shared-expert activation,
     ``tail_weight`` [7168, 256 + 384] the latent up columns of the slice zero-padded to 256 and the shared down
     projection; ``src_slab`` (int32 [3, 8, 1792]) supplies the latent in buffer ``src_buf``; with ``lat_uc`` /

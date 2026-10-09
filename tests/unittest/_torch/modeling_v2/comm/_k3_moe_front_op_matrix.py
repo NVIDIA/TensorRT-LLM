@@ -681,7 +681,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
     raises RuntimeError under capture before any launch. The workspace keeps its bits and the next call returns the
     bits of the same call made alone.
     """
-    from tensorrt_llm._torch.distributed import ops
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
 
     nxt = Call(7500, 4, layer=1, kind="front")
     want = alone_results([nxt], WS_A, "before the capture refusals")[0]
@@ -690,7 +690,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
     def create():
         OPS.workspace.create(R.mapping, fabric_handle=R.fabric)
 
-    make = ops._get_mnnvl_tp_group_comm
+    make = mnnvl_workspace.mnnvl_tp_group_comm
     comms = []
 
     def recording_make(mapping):
@@ -698,13 +698,13 @@ def check_create_and_first_compile_refuse_capture() -> None:
         return comms[-1]
 
     capturing = R.world - 1
-    ops._get_mnnvl_tp_group_comm = recording_make
+    mnnvl_workspace.mnnvl_tp_group_comm = recording_make
     try:
         every = raised_under_capture(create)
         R.barrier()
         one = raised_under_capture(create) if R.rank == capturing else raised_eagerly(create)
     finally:
-        ops._get_mnnvl_tp_group_comm = make
+        mnnvl_workspace.mnnvl_tp_group_comm = make
     R.barrier()
     first = raised_under_capture(
         lambda: OPS.front(

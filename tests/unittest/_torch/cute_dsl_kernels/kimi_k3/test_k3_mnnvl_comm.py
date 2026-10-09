@@ -14,12 +14,12 @@
 # limitations under the License.
 """The Kimi K3 decode collectives on the MNNVL all-reduce workspace, one process per GPU over the TP group of this
 run (4 on one GB200 tray), at every M in 1..8 and at 16, 32, 64 tokens:
-  trtllm::mnnvl_allreduce_attn_res (MNNVLAllReduce.allreduce_attn_res_rmsnorm): against the unfused path it replaces,
+  trtllm::mnnvl_allreduce_attn_res (over the stock MNNVL all-reduce's workspace): against the unfused path it replaces,
     the MNNVL all-reduce then trtllm::attn_res_add_rmsnorm_fwd (attn_res_rmsnorm_fwd without a prefix sum): the
     updated prefix sum bit for bit, the normed rows within 1e-2 (max |d| / max |ref|), both against an fp32 port of the
     attention-residual selection within 2e-2; 0, 1, 3, 8 and 11 snapshots, with and without the prefix; the reference
     all-reduce sent one-shot (the fused op's order);
-  trtllm::mnnvl_allgather_split (MNNVLAllReduce.allgather_split): bit for bit against the same gather on the host (bf16
+  trtllm::mnnvl_allgather_split (over the same workspace): bit for bit against the same gather on the host (bf16
     columns rounded to nearest, -0.0 arriving as +0.0), at the K3 sharded MoE head's per-rank widths for TP16 (224 bf16
     + 56 fp32 columns) and TP4 (896 + 224), interleaved with all-reduces on the same Lamport rotation;
 each with run-to-run identical bits, the same bits on every rank, each M's rows bit-identical to the same rows of the
@@ -124,6 +124,39 @@ def _allreduce(ctx, x):
     )
 
 
+def _stock_attn_res(mnnvl, input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps,
+                    output_rms_eps):  # fmt: skip
+    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+
+    num_tokens, hidden_dim = input.shape
+    one_shot_bytes = num_tokens * hidden_dim * mnnvl.mapping.tp_size * input.element_size()
+    workspace = get_or_scale_allreduce_mnnvl_workspace(
+        mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=one_shot_bytes
+    )
+    normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+        input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
+        workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1), workspace["buffer_flags"],
+    )  # fmt: skip
+    return normed, updated
+
+
+def _stock_allgather_split(mnnvl, input, bf16_columns):
+    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+
+    num_tokens, columns = input.shape
+    footprint = (
+        num_tokens * mnnvl.mapping.tp_size * (bf16_columns * 2 + (columns - bf16_columns) * 4)
+    )
+    workspace = get_or_scale_allreduce_mnnvl_workspace(
+        mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=footprint
+    )
+    bf16_out, fp32_out = torch.ops.trtllm.mnnvl_allgather_split(
+        input, bf16_columns, mnnvl.mapping.tp_size, workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1),
+        workspace["buffer_flags"],
+    )  # fmt: skip
+    return bf16_out, fp32_out
+
+
 def _all_ranks(ctx, good) -> bool:
     return all(ctx.comm.allgather(bool(good)))
 
@@ -184,7 +217,7 @@ def check_attn_res(ctx):
 
             def fused(rows, part=None):
                 pre = prefix64[:rows].contiguous() if with_prefix else None
-                return ctx.mnnvl.allreduce_attn_res_rmsnorm(
+                return _stock_attn_res(ctx.mnnvl,
                     (part if part is not None else partial64[:rows]).contiguous(), pre,
                     block64[:, :rows].contiguous(), res_w, rms_w, out_w, EPS, OUT_EPS)  # fmt: skip
 
@@ -241,12 +274,12 @@ def check_allgather(ctx):
     )
     for label, (bf16_cols, fp32_cols) in heads:
         mine64 = _gather_input(M_MAX, bf16_cols, fp32_cols, ctx.rank)
-        b64, f64 = ctx.mnnvl.allgather_split(mine64, bf16_cols)
+        b64, f64 = _stock_allgather_split(ctx.mnnvl, mine64, bf16_cols)
         for m in M_CASES:
             mine = mine64[:m].contiguous()
             everyone = [torch.from_numpy(a).cuda() for a in ctx.comm.allgather(mine.cpu().numpy())]
             want_b, want_f = _host_gather(everyone, bf16_cols)
-            got_b, got_f = ctx.mnnvl.allgather_split(mine, bf16_cols)
+            got_b, got_f = _stock_allgather_split(ctx.mnnvl, mine, bf16_cols)
             exact = _same(got_b, want_b) and _same(got_f, want_f)
             interleaved = True
             partial = torch.randn(m, H, device="cuda").bfloat16()
@@ -257,15 +290,13 @@ def check_allgather(ctx):
                 if i % 2:
                     block = torch.randn(2, m, H, device="cuda").bfloat16()
                     ones = torch.ones(H, device="cuda").bfloat16()
-                    ctx.mnnvl.allreduce_attn_res_rmsnorm(
-                        partial, None, block, ones, ones, ones, EPS, EPS
-                    )
-                b, f = ctx.mnnvl.allgather_split(mine, bf16_cols)
+                    _stock_attn_res(ctx.mnnvl, partial, None, block, ones, ones, ones, EPS, EPS)
+                b, f = _stock_allgather_split(ctx.mnnvl, mine, bf16_cols)
                 interleaved &= _same(b, want_b) and _same(f, want_f)
             bad = mine.clone()
             if ctx.rank == min(1, ctx.world - 1):
                 bad.view(-1)[3] += 1.0
-            bad_b, bad_f = ctx.mnnvl.allgather_split(bad, bf16_cols)
+            bad_b, bad_f = _stock_allgather_split(ctx.mnnvl, bad, bf16_cols)
             row = dict(
                 op="mnnvl_allgather_split",
                 case=label,

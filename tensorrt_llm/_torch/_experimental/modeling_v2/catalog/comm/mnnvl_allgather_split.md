@@ -202,6 +202,3 @@ depend on it.
   rack, fabric handles) the matrix passes, every check on every rank, in a recorded run.
 - Not exercised: `B` = 0 or `F` = 0 (the op accepts both), denormal and non-finite values in the bf16 columns, an
   accepted call of more than 64 tokens, the fake implementation.
-- In the model today the call is `MNNVLAllReduce.allgather_split(input, bf16_columns)` on `MNNVLAllReduce`'s workspace
-  (a dict keyed by `Mapping`, grown to the call's footprint by the first eager call that needs more). This entry takes
-  the explicit object instead, sized at construction.

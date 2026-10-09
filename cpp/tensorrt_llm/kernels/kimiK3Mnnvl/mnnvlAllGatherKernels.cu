@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/communicationKernels/mnnvlAllGatherKernels.h"
+#include "tensorrt_llm/kernels/kimiK3Mnnvl/mnnvlAllGatherKernels.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -22,7 +22,7 @@
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace kernels::mnnvl
+namespace kernels::kimiK3Mnnvl
 {
 
 using tensorrt_llm::common::isLamportDirty;
@@ -160,6 +160,6 @@ void mnnvlAllGatherSplitOp(AllGatherSplitParams const& params)
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, mnnvlAllGatherSplitKernel, params));
 }
 
-} // namespace kernels::mnnvl
+} // namespace kernels::kimiK3Mnnvl
 
 TRTLLM_NAMESPACE_END

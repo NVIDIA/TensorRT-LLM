@@ -252,7 +252,7 @@ def check_create_needs_only_the_tp_group() -> None:
     create() uses). With the job split into two TP groups of W / 2 (pipeline parallel 2), the first group's ranks make
     theirs while the second group's ranks do not call at all; each communicator holds exactly its group, in TP-rank
     order. The exchanges in use also hold their TP group's communicator."""
-    from tensorrt_llm._torch.distributed import ops
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
     from tensorrt_llm.mapping import Mapping
 
     for ex in (EX_A, EX_B):
@@ -267,7 +267,7 @@ def check_create_needs_only_the_tp_group() -> None:
     R.barrier()
     ok = True
     if half.pp_rank == 0:
-        comm = ops._get_mnnvl_tp_group_comm(half)
+        comm = mnnvl_workspace.mnnvl_tp_group_comm(half)
         ok = (
             comm.Get_size() == half.tp_size
             and comm.Get_rank() == half.tp_rank
@@ -307,16 +307,16 @@ def check_capture_refusals() -> None:
             return str(exc)
         return ""
 
-    from tensorrt_llm._torch.distributed import ops
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
 
-    make = ops._get_mnnvl_tp_group_comm
+    make = mnnvl_workspace.mnnvl_tp_group_comm
     comms = []
 
     def recording_make(mapping):
         comms.append(make(mapping))
         return comms[-1]
 
-    ops._get_mnnvl_tp_group_comm = recording_make
+    mnnvl_workspace.mnnvl_tp_group_comm = recording_make
     try:
         for case, capturing in (("every rank", True), ("one rank", R.rank == R.world - 1)):
             R.barrier()
@@ -327,7 +327,7 @@ def check_capture_refusals() -> None:
                 f"{case} capturing: rank {R.rank} (capturing {capturing}) got {message!r}"
             )
     finally:
-        ops._get_mnnvl_tp_group_comm = make
+        mnnvl_workspace.mnnvl_tp_group_comm = make
     freed = len(comms) == 2 and all(c == R.MPI.COMM_NULL for c in comms)
     assert R.all_true(freed), "a refused create kept the communicator made for it"
     R.barrier()

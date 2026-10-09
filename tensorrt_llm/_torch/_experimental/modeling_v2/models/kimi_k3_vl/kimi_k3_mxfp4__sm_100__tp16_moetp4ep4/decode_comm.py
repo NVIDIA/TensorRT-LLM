@@ -92,6 +92,7 @@ def use_decode_one_shot(model: nn.Module) -> None:
         mnnvl = getattr(module, "mnnvl_allreduce", None)
         if mnnvl is not None:
             mnnvl.one_shot_max_bytes = DECODE_AR_ONE_SHOT_MAX_BYTES
+            mnnvl.early_trigger = True
 
 
 def skip_all_reduce() -> AllReduceParams:

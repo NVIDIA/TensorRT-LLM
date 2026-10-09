@@ -22,6 +22,26 @@ FLAG_WORDS = 9
 access count]."""
 
 
+def mnnvl_tp_group_comm(mapping):
+    """A new communicator of exactly mapping.tp_group (its rank i = TP rank i) for a caller-owned
+    MNNVL state's create(); only the group's ranks take part (MPI_Comm_create_group). The caller
+    frees it. Under Ray the TP ProcessGroup (c10d's).
+    """
+    from tensorrt_llm._utils import mpi_comm, mpi_disabled
+
+    if mpi_disabled():
+        pg = mapping.tp_group_pg
+        assert pg is not None, "TP ProcessGroup not initialised"
+        return pg
+    session = mpi_comm()
+    session_group = session.Get_group()
+    group = session_group.Incl(mapping.tp_group)
+    session_group.Free()
+    comm = session.Create_group(group)
+    group.Free()
+    return comm
+
+
 @dataclass(eq=False)
 class MnnvlWorkspace:
     """One TP group's MNNVL Lamport workspace: three buffers of ``buffer_bytes`` behind one multicast mapping, and
@@ -66,7 +86,6 @@ class MnnvlWorkspace:
         ``fabric_handle``: share the memory by fabric handle (required across nodes) rather than POSIX file
         descriptor; default ``mapping.is_multi_node()``."""
         from tensorrt_llm._torch.distributed.ops import (
-            _get_mnnvl_tp_group_comm,
             _initialize_allreduce_mnnvl_protocol,
             _make_mnnvl_mcast_buffer,
             _mnnvl_device_index,
@@ -76,7 +95,7 @@ class MnnvlWorkspace:
 
         use_fabric = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
         total = NUM_LAMPORT_BUFFERS * buffer_bytes
-        comm = _get_mnnvl_tp_group_comm(mapping)
+        comm = mnnvl_tp_group_comm(mapping)
         # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a
         # rank failing inside the allocation would leave its peers in the handle exchange.
         problem: Optional[str] = None

@@ -103,12 +103,12 @@ def check_workspace_is_armed_and_sized() -> None:
 def check_create_refuses_on_every_rank() -> None:
     """One rank asks for three buffers past its device's free memory: every rank raises before any allocates and frees
     the communicator it made, and the workspaces in use stay correct."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_workspace import (
         MnnvlWorkspace,
     )
-    from tensorrt_llm._torch.distributed import ops
 
-    make = ops._get_mnnvl_tp_group_comm
+    make = mnnvl_workspace.mnnvl_tp_group_comm
     comms = []
 
     def recording_make(mapping):
@@ -117,7 +117,7 @@ def check_create_refuses_on_every_rank() -> None:
 
     free_bytes, _ = torch.cuda.mem_get_info()
     too_big = (free_bytes // 3 // 16 + (64 << 20) // 16) * 16
-    ops._get_mnnvl_tp_group_comm = recording_make
+    mnnvl_workspace.mnnvl_tp_group_comm = recording_make
     try:
         MnnvlWorkspace.create(
             R.mapping, too_big if R.rank == 0 else BUFFER_BYTES, fabric_handle=R.fabric
@@ -126,7 +126,7 @@ def check_create_refuses_on_every_rank() -> None:
     except RuntimeError as exc:
         raised = "not every rank can allocate" in str(exc)
     finally:
-        ops._get_mnnvl_tp_group_comm = make
+        mnnvl_workspace.mnnvl_tp_group_comm = make
     assert R.all_true(raised), "a rank short of memory did not make every rank raise"
     freed = len(comms) == 1 and comms[0] == R.MPI.COMM_NULL
     assert R.all_true(freed), "a refused create kept the communicator it made"

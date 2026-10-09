@@ -14,6 +14,15 @@ from .mnnvl_workspace import MnnvlWorkspace
 __all__ = ["MnnvlWorkspace", "mnnvl_allgather_split", "required_buffer_bytes"]
 
 
+@torch.library.register_fake("trtllm::mnnvl_allgather_split")
+def _(input, bf16_columns, world_size, comm_buffer, buffer_flags):
+    num_tokens, columns = input.shape
+    return [
+        input.new_empty((num_tokens, world_size * bf16_columns), dtype=torch.bfloat16),
+        input.new_empty((num_tokens, world_size * (columns - bf16_columns))),
+    ]
+
+
 def required_buffer_bytes(
     num_tokens: int, bf16_columns: int, fp32_columns: int, world_size: int
 ) -> int:

@@ -16,9 +16,9 @@
 one kernel, M <= 8) at the Kimi K3 TP16 per-rank shapes, one process per GPU over the TP group of this run (4 on one
 GB200 tray; the per-rank shapes do not depend on the group size, the reduction is 4-way instead of 16-way), at every M
 in 1..8:
-  oproj  against o_proj (cuBLAS, rows as in an 8-row call) -> MNNVLAllReduce.allreduce_attn_res_rmsnorm, bit for bit,
+  oproj  against o_proj (cuBLAS, rows as in an 8-row call) -> trtllm::mnnvl_allreduce_attn_res, bit for bit,
          0 / 1 / 3 / 8 snapshots, with and without the prefix sum;
-  tail   against the tail in torch (fp32 accumulators, the latent RMS on the latent one) -> allreduce_attn_res_rmsnorm
+  tail   against the tail in torch (fp32 accumulators, the latent RMS on the latent one) -> mnnvl_allreduce_attn_res
          (fp32 tolerance: another summation order), and with the DSpark capture tap (the pre-norm mixture against
          trtllm::attn_res_fwd) and updated_out (a snapshot bank row);
   plain  against k3_ctm_gemv -> the MNNVL one-shot RESIDUAL_RMS_NORM all-reduce, bit for bit (drafter o_proj, K 384),
@@ -156,9 +156,19 @@ def _plain(ctx, x, w, residual, norm_w, swiglu=False):
 
 def _attn_res_ar(ctx, partial, prefix, block, res_w, rms_w, out_w):
     """The unfused post-projection step: the MNNVL one-shot all-reduce with the attention-residual epilogue."""
-    return ctx.mnnvl.allreduce_attn_res_rmsnorm(
-        partial, prefix, block, res_w, rms_w, out_w, EPS, EPS
+    from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+
+    mnnvl = ctx.mnnvl
+    num_tokens, hidden_dim = partial.shape
+    workspace = get_or_scale_allreduce_mnnvl_workspace(
+        mnnvl.mapping,
+        mnnvl.dtype,
+        buffer_size_bytes=num_tokens * hidden_dim * mnnvl.mapping.tp_size * partial.element_size(),
     )
+    return _trtllm().mnnvl_allreduce_attn_res(
+        partial, prefix, block, res_w, rms_w, out_w, EPS, EPS,
+        workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1), workspace["buffer_flags"],
+    )  # fmt: skip
 
 
 def _tail_partial(latent, act, w, lo):

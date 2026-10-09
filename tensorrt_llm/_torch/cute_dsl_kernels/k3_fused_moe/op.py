@@ -126,8 +126,8 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
     returns from the allocation or from ``build`` is agreed and handled the same way. A rank that fails inside the
     allocation's handle exchange can leave its peers waiting in that exchange: that failure is not turned into an
     error on the other ranks."""
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_workspace
     from tensorrt_llm._torch.distributed.ops import (
-        _get_mnnvl_tp_group_comm,
         _make_mnnvl_mcast_buffer,
         _mnnvl_device_index,
         _mnnvl_workspace_all_succeeded,
@@ -135,7 +135,7 @@ def create_mcast_state(name: str, mapping, words: int, fabric_handle: Optional[b
     from tensorrt_llm._utils import mpi_disabled
 
     use_fabric_handle = mapping.is_multi_node() if fabric_handle is None else bool(fabric_handle)
-    comm = _get_mnnvl_tp_group_comm(mapping)
+    comm = mnnvl_workspace.mnnvl_tp_group_comm(mapping)
     # Every condition one rank alone can fail is checked before the allocation, and the ranks agree on it: a rank
     # failing inside the allocation would leave its peers in the handle exchange.
     problem: Optional[str] = None

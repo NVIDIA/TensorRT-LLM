@@ -12,6 +12,12 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from .mnnvl_workspace import MnnvlWorkspace
 
 
+@torch.library.register_fake("trtllm::mnnvl_allreduce_attn_res")
+def _(input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
+      comm_buffer, buffer_flags):  # fmt: skip
+    return [torch.empty_like(input), torch.empty_like(input)]
+
+
 def mnnvl_allreduce_attn_res(
     input: torch.Tensor,
     prefix_sum: Optional[torch.Tensor],

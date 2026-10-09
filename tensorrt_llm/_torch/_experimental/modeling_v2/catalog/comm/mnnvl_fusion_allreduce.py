@@ -75,5 +75,6 @@ def mnnvl_fusion_allreduce(
         None,
         int(fusion_op),
         one_shot_max_bytes,
+        True,
     )
     return (outputs[0], outputs[1]) if fused else outputs[0]
