@@ -27,8 +27,10 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
+    NON_GREEDY_CAPTURE_SAMPLING_PARAMS,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.model_engine import NON_GREEDY_CAPTURE_SAMPLING_PARAMS
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode, KvCacheConfig
@@ -106,7 +108,10 @@ def _request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
 
 def _fake_meta():
     return types.SimpleNamespace(
-        runtime_draft_len=1, dummy_slot_row=0, group_all_greedy_sample=None
+        runtime_draft_len=1,
+        is_ragged_verify=False,
+        dummy_slot_row=0,
+        group_all_greedy_sample=None,
     )
 
 
@@ -194,6 +199,7 @@ def _populate_meta(mode, draft_len=1):
     """
     meta = types.SimpleNamespace(
         runtime_draft_len=draft_len,
+        is_ragged_verify=False,
         dummy_slot_row=0,
         group_all_greedy_sample=None,
         max_num_requests=4,

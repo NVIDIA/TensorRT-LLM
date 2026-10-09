@@ -14,7 +14,9 @@
 # limitations under the License.
 
 import abc
+import functools
 import json
+import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
 from unittest.mock import Mock
@@ -2125,26 +2127,19 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             self, sample_tools, parser):
         """Test streaming parser with complete tool call in chunks."""
 
-        # Send bot token with function name
+        # Nothing is reported until the call is complete
         result = parser.parse_streaming_increment("<tool_call>get_weather\n",
                                                   sample_tools)
+        assert result.calls == []
 
-        # Should send tool name
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert result.calls[0].parameters == ""
-
-        # Send arguments
         result = parser.parse_streaming_increment(
             "<arg_key>location</arg_key>\n"
             "<arg_value>SF</arg_value>\n"
             "</tool_call>", sample_tools)
 
-        # Should stream arguments and complete the tool call
-        all_params = "".join(call.parameters for call in result.calls
-                             if call.parameters)
-        assert "location" in all_params
-        assert "SF" in all_params
+        # One item carries the name and the arguments
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("get_weather", dict(location="SF"))]
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
@@ -2159,40 +2154,27 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
             "</tool_call>", sample_tools)
 
         # Second tool
-        result = parser.parse_streaming_increment("<tool_call>search_web\n",
-                                                  sample_tools)
+        result = parser.parse_streaming_increment(
+            "<tool_call>search_web\n</tool_call>", sample_tools)
 
-        # Should have started second tool
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert [(c.tool_index, c.name)
+                for c in result.calls] == [(1, "search_web")]
 
     def test_parse_streaming_multiple_params(self, sample_tools, parser):
-        """Test streaming parser handles multiple parameters."""
-
-        # Send function name
+        """The arguments arrive together once the call closes."""
         parser.parse_streaming_increment("<tool_call>get_weather\n",
                                          sample_tools)
-
-        # Send first parameter
         result1 = parser.parse_streaming_increment(
             "<arg_key>location</arg_key>\n"
             "<arg_value>NYC</arg_value>\n", sample_tools)
+        assert result1.calls == []
 
-        params1 = "".join(call.parameters for call in result1.calls
-                          if call.parameters)
-        assert "location" in params1
-
-        # Send second parameter and close
         result2 = parser.parse_streaming_increment(
             "<arg_key>unit</arg_key>\n"
             "<arg_value>celsius</arg_value>\n"
             "</tool_call>", sample_tools)
-
-        params2 = "".join(call.parameters for call in result2.calls
-                          if call.parameters)
-        assert "unit" in params2
+        assert [json.loads(c.parameters) for c in result2.calls
+                ] == [dict(location="NYC", unit="celsius")]
 
     def test_detect_and_parse_multiple_params(self, sample_tools):
         """Test one-shot parsing with multiple parameters."""
@@ -2267,16 +2249,14 @@ class TestGlm4ToolParser(BaseToolParserTestClass):
     def test_streaming_no_args(self, sample_tools, parser):
         """Test streaming a tool call with no arguments."""
 
-        # First increment sends the tool name
         result1 = parser.parse_streaming_increment("<tool_call>get_weather\n",
                                                    sample_tools)
-        names = [c.name for c in result1.calls if c.name]
-        assert "get_weather" in names
+        assert result1.calls == []
 
-        # Second increment closes the tool call with empty args
+        # Closing the call reports it with empty arguments
         result2 = parser.parse_streaming_increment("</tool_call>", sample_tools)
-        params = "".join(c.parameters for c in result2.calls)
-        assert "{}" in params
+        assert [(c.name, c.parameters)
+                for c in result2.calls] == [("get_weather", "{}")]
 
     def test_supports_structural_tag(self, parser):
         """Test that supports_structural_tag returns False."""
@@ -2409,26 +2389,19 @@ class TestGlm47ToolParser(BaseToolParserTestClass):
     def test_parse_streaming_increment_complete_tool_call(
             self, sample_tools, parser):
         """Test streaming parser with complete tool call in chunks."""
-        # Send bot token with function name and first arg_key
+        # Nothing is reported until the call is complete
         result = parser.parse_streaming_increment(
             "<tool_call>get_weather<arg_key>", sample_tools)
+        assert result.calls == []
 
-        # Should send tool name (has_arg_key is True)
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "get_weather"
-        assert result.calls[0].parameters == ""
-
-        # Send arguments
         result = parser.parse_streaming_increment(
             "location</arg_key>"
             "<arg_value>SF</arg_value>"
             "</tool_call>", sample_tools)
 
-        # Should stream arguments and complete the tool call
-        all_params = "".join(call.parameters for call in result.calls
-                             if call.parameters)
-        assert "location" in all_params
-        assert "SF" in all_params
+        # One item carries the name and the arguments
+        assert [(c.name, json.loads(c.parameters))
+                for c in result.calls] == [("get_weather", dict(location="SF"))]
 
     def test_parse_streaming_increment_multiple_tools_streaming(
             self, sample_tools, parser):
@@ -2440,13 +2413,10 @@ class TestGlm47ToolParser(BaseToolParserTestClass):
 
         # Second tool
         result = parser.parse_streaming_increment(
-            "<tool_call>search_web<arg_key>", sample_tools)
+            "<tool_call>search_web</tool_call>", sample_tools)
 
-        # Should have started second tool
-        assert len(result.calls) == 1
-        assert result.calls[0].name == "search_web"
-        assert result.calls[0].parameters == ""
-        assert result.calls[0].tool_index == 1
+        assert [(c.tool_index, c.name)
+                for c in result.calls] == [(1, "search_web")]
 
     def test_streaming_zero_arg_tool(self, parser):
         """Test streaming a zero-argument tool call."""
@@ -5774,3 +5744,405 @@ class TestUnparsedToolCallWarning:
             for call in mock_logger.warning_once.call_args_list
         ]
         assert keys == [self._PARSER_NAME, self._OTHER_PARSER_NAME]
+
+
+# ============================================================================
+# GLM parsers: streaming reports what detect_and_parse reports
+# ============================================================================
+
+
+def _glm_tool(name, properties=None):
+    """One declared tool; `properties` is its JSON-schema property map."""
+    return ChatCompletionToolsParam(type="function",
+                                    function=FunctionDefinition(
+                                        name=name,
+                                        parameters={
+                                            "type": "object",
+                                            "properties": properties or {},
+                                        }))
+
+
+def _glm_typed_tool(name, **types):
+    """A tool whose properties are declared with the given JSON types."""
+    return _glm_tool(name, {key: dict(type=t) for key, t in types.items()})
+
+
+AGENT_TOOLS = [
+    _glm_tool(name) for name in ("exec_command", "apply_patch", "update_plan",
+                                 "spawn_agent", "followup_task", "exec")
+]
+
+# (emitted name, the name the call is delivered under).
+MANGLED_NAMES = [
+    # A group qualifier the declaration lacks.
+    ("functions.exec_command", "exec_command"),
+    ("collaboration.spawn_agent", "spawn_agent"),
+    ("functions.collaboration.followup_task", "followup_task"),
+    # An unbalanced tag fused onto an otherwise exact name.
+    ("apply_patch</arg_value>", "apply_patch"),
+    ("exec</arg_value>", "exec"),
+    ("<tool_call>exec_command", "exec_command"),
+    ("coll</arg_value><tool_call>collaboration.spawn_agent", "spawn_agent"),
+    # Declared and unknown names are delivered as written.
+    ("exec_command", "exec_command"),
+    ("no_such_tool", "no_such_tool"),
+    ("my_exec_command", "my_exec_command"),
+]
+
+# Prose and code in the name position, mostly mentioning a declared tool; none
+# is a call.
+PROSE_NAMES = [
+    "ops_check - re-querying for current status. Since my last report",
+    "exec_command depended on the tools. Let me use the correct approach",
+    "exec_sudo_command onCompleteCommand=\"export SKILLS_DIR=/x\"",
+    "collaboration.immediately_agent(\"target\" => \"/root/builder\")",
+    "exec_command(cmd=\"cat /workspace/kernel.cu\"",
+    "exec command",
+]
+
+
+def _chunkings(text):
+    """(label, chunks): whole, per character, fixed sizes, every two-way split."""
+    yield "arriving whole", [text]
+    yield "one character per delta", list(text)
+    for size in (2, 3, 5, 8, 13, 40):
+        yield f"{size} characters per delta", [
+            text[i:i + size] for i in range(0, len(text), size)
+        ]
+    for i in range(1, len(text)):
+        yield f"split at {i}", [text[:i], text[i:]]
+
+
+def _glm_raw_call(parser_cls, name, argument_text):
+    """One call around `argument_text`; GLM-4.5 ends the name with a newline."""
+    newline = "\n" if parser_cls is Glm4ToolParser else ""
+    return f"<tool_call>{name}{newline}{argument_text}</tool_call>"
+
+
+def _glm_pairs(*pairs, separator=""):
+    return "".join(
+        f"<arg_key>{key}</arg_key>{separator}<arg_value>{value}</arg_value>"
+        f"{separator}" for key, value in pairs)
+
+
+def _glm_call(parser_cls, name, *pairs):
+    """One call in `parser_cls`'s own markup."""
+    separator = "\n" if parser_cls is Glm4ToolParser else ""
+    return _glm_raw_call(parser_cls, name,
+                         _glm_pairs(*pairs, separator=separator))
+
+
+def _glm_stream(parser_cls, chunks, tools):
+    """(text, [(name, arguments)]) from the increments plus `finish`.
+
+    Each call must arrive complete, as one item with its name and arguments.
+    """
+    parser = parser_cls()
+    results = [parser.parse_streaming_increment(c, tools) for c in chunks]
+    results.append(parser.finish(tools))
+    calls = [call for result in results for call in result.calls]
+    assert [c.tool_index for c in calls] == list(range(len(calls)))
+    assert not parser.current_tool_name_sent
+    return ("".join(r.normal_text for r in results), [(c.name, c.parameters)
+                                                      for c in calls])
+
+
+def _glm_parity(parser_cls, text, tools, chunkings=None):
+    """Assert every chunking streams detect_and_parse's text and calls.
+
+    Returns the whole-text normal text and its [(name, arguments)].
+    """
+    whole = parser_cls().detect_and_parse(text, tools)
+    expected = [(c.name, json.loads(c.parameters)) for c in whole.calls]
+    for label, chunks in chunkings or _chunkings(text):
+        normal, calls = _glm_stream(parser_cls, chunks, tools)
+        assert [(n, json.loads(a)) for n, a in calls] == expected, label
+        assert normal.strip() == whole.normal_text, label
+    return whole.normal_text, expected
+
+
+_GLM_SCHEMAS = {
+    kind: dict(type=kind)
+    for kind in ("string", "integer", "number", "boolean", "object", "array")
+}
+_GLM_SCHEMAS.update({"any": {}, "$ref": {"$ref": "#/$defs/F"}, "none": None})
+
+# Declared strings are delivered verbatim, whatever they look like, markup
+# included.
+_GLM_STRING_VALUES = [
+    "99797", "true", "1e3", "null", "0099797", " padded \n", "", "北京",
+    'say "hi"', "C:\\Users\\test.txt", "line one\nline two", '{"k": "v"}',
+    'echo "}" >> a.json', "printf '{\"a\": [1, 2]}' | jq .",
+    'let s = "</arg_value>"; run(s)', "a</arg_value>b",
+    "ends with the tag</arg_value>", "</arg_value> starts with it",
+    "two</arg_value>of</arg_value>them", "tag then newline</arg_value>\nmore",
+    "</arg_valueX>", "<arg_key>not a key</arg_key>", "<b>bold</b>",
+    "1 < 2 && 3 > 2", "struct MMA_Traits<SM100_MMA_F16BF16_(TS|SS)<", "<",
+    "a<<b<<<c<", "closes with </", "almost the tag </arg_valu",
+    "almost the whole tag </arg_value", "a</arg_value><"
+]
+
+# (raw value, schema, delivered value). Other declared types decode, keeping
+# the text when the result is not strict JSON; with no resolvable type ("none",
+# "any", "$ref") only strict JSON decodes.
+_GLM_TYPED_VALUES = [(value, "string", value) for value in _GLM_STRING_VALUES]
+_GLM_TYPED_VALUES += [
+    ("42", "integer", 42),
+    ('"42"', "integer", 42),
+    ("1.5", "number", 1.5),
+    ("1e308", "number", 1e308),
+    ("1e309", "number", "1e309"),
+    ("-1e309", "integer", "-1e309"),
+    ("NaN", "number", "NaN"),
+    ("-Infinity", "number", "-Infinity"),
+    ("true", "boolean", True),
+    ("{}", "object", {}),
+    ('{"a": 1e308}', "object", dict(a=1e308)),
+    ('{"a": 1e309}', "object", '{"a": 1e309}'),
+    ('{"k": "x</arg_value>y"}', "object", dict(k="x</arg_value>y")),
+    ('[{\\"id\\": \\"1\\"}]', "array", [dict(id="1")]),
+    ("['a', 'b']", "array", ["a", "b"]),
+    ("...", "array", "..."),
+    ("{1, 2}", "object", "{1, 2}"),
+    ("{['a']: 1}", "object", "{['a']: 1}"),
+    ("1j", "number", "1j"),
+    ("b'x'", "array", "b'x'"),
+    ("not json", "object", "not json"),
+    ("8000", "none", 8000),
+    ('{"a": [1, 2]}', "none", dict(a=[1, 2])),
+    ("true", "none", True),
+    ("null", "none", None),
+    ("ls -la", "none", "ls -la"),
+    ("", "none", ""),
+    ("NaN", "none", "NaN"),
+    ("'single'", "none", "'single'"),
+    ('{"a": 1}', "any", dict(a=1)),
+    ('{"a": 1}', "$ref", dict(a=1)),
+]
+
+_GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
+
+_GLM_TOOLS = [_glm_typed_tool("f", code="string", n="integer", opts="object")]
+
+# (argument text of a call to `f`, delivered arguments or None for no call).
+# A call is delivered only if its argument text is nothing but separators and
+# complete pairs; otherwise its whole markup is released as text.
+_GLM_ARGUMENT_TEXTS = [
+    ("", {}),
+    ("\n ", {}),
+    ("<arg_key>code</arg_key>\n<arg_value>a</arg_value>\\n <arg_key>n"
+     "</arg_key> <arg_value>1</arg_value>\n", dict(code="a", n=1)),
+    # A repeated key keeps its first value.
+    (_glm_pairs(("code", "a"), ("code", "b")), dict(code="a")),
+    (_glm_pairs(("n", "1"), ("code", "a"), ("n", "2")), dict(n=1, code="a")),
+    (_glm_pairs(("code", "a"), ("code", "x</arg_value>y")), dict(code="a")),
+    # A value quoting the closing tag, or ending in a prefix of it.
+    (_glm_pairs(("code", "'</arg_value>'"),
+                ("n", "3")), dict(code="'</arg_value>'", n=3)),
+    (_glm_pairs(("n", "3"), ("code", "a<")), dict(n=3, code="a<")),
+    (_glm_pairs(("code", "a</arg_valu"),
+                ("n", "3")), dict(code="a</arg_valu", n=3)),
+    # Each argument is typed alone, and an object value still closes the call.
+    (_glm_pairs(("code", "w"), ("n", "3"), ("budget", "8000"), ("note", ""),
+                ("opts", '{"verbose": true}')),
+     dict(code="w", n=3, budget=8000, note="", opts=dict(verbose=True))),
+    ("<arg_key>code</arg_key><arg_value>ls -la", None),
+    ("<arg_key>n</arg_key><arg_value>5", None),
+    ("<arg_key>code</arg_key><arg_value>ls</think>", None),
+    (_glm_pairs(("code", "ls -la")) + ".", None),
+    (_glm_pairs(("code", "ls")) + "<arg_k", None),
+    ("<arg_key>code</arg_key>", None),
+    ("<arg_key>code</arg_key>junk<arg_value>ls</arg_value>", None),
+    ("<arg_key>code<arg_value>ls</arg_value>", None),
+    ("<arg_key>a</arg_key>" + _glm_pairs(("code", "ls")), None),
+    (_glm_pairs(("code", "x</arg_value><arg_key>y")), None),
+    (_glm_pairs(("code", "a")) + "<arg_key>n</arg_key><arg_value>2", None),
+]
+
+
+@pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
+class TestGlmStreamingMatchesWholeParse:
+    """Any chunking streams the calls and text detect_and_parse returns."""
+
+    def test_declares_the_contract(self, parser_cls):
+        assert parser_cls.streaming_matches_whole_parse
+
+    @pytest.mark.parametrize("value,schema,expected", _GLM_TYPED_VALUES)
+    def test_argument_typing(self, parser_cls, value, schema, expected):
+        properties = {"v": _GLM_SCHEMAS[schema]} if schema != "none" else {}
+        text = _glm_call(parser_cls, "f", ("v", value))
+
+        _, calls = _glm_parity(parser_cls, text, [_glm_tool("f", properties)])
+
+        assert calls == [("f", dict(v=expected))]
+
+    @pytest.mark.parametrize("value", _GLM_VALUES)
+    def test_every_value_under_every_schema(self, parser_cls, value):
+        text = _glm_call(parser_cls, "f", ("v", value))
+        for schema in _GLM_SCHEMAS.values():
+            properties = {} if schema is None else {"v": schema}
+            _glm_parity(parser_cls, text, [_glm_tool("f", properties)],
+                        [("whole", [text]), ("per character", list(text))])
+
+    @pytest.mark.parametrize("argument_text,expected", _GLM_ARGUMENT_TEXTS)
+    def test_argument_text(self, parser_cls, argument_text, expected):
+        text = _glm_raw_call(parser_cls, "f", argument_text)
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_TOOLS)
+
+        if expected is None:
+            assert (normal, calls) == (text, [])
+        else:
+            assert (normal, calls) == ("", [("f", expected)])
+
+    @pytest.mark.parametrize("text", [
+        "To end a call the model writes </tool_call> and then stops.",
+        "The answer is 42. See </tool_",
+        "Compare a <tool",
+        "<tool_call>get_w",
+        "Cut off: <tool_call>exec<arg_key>k</arg_key><arg_value>v</tool_c",
+    ])
+    def test_text_without_a_complete_call_streams_verbatim(
+            self, parser_cls, text):
+        assert _glm_parity(parser_cls, text, AGENT_TOOLS) == (text, [])
+
+    def test_a_response_with_several_calls(self, parser_cls):
+        """Unreadable and restarted calls among good ones, then a cut-off."""
+        call = functools.partial(_glm_call, parser_cls)
+        out_of_order = call("exec<arg_value>input</arg_key>", ("k", "v"))
+        unclosed = _glm_raw_call(parser_cls, "exec",
+                                 "<arg_key>cmd</arg_key><arg_value>ls</think>")
+        text = ("Checking now." + call("exec", ("cmd", 'echo "}" >> a.json')) +
+                out_of_order + call("get_time") + " Then " + unclosed +
+                call("exec<tool_call>exec",
+                     ("cmd", "ls")) + " </tool_call> is prose. <tool_call>exec")
+
+        normal, calls = _glm_parity(parser_cls, text,
+                                    [_glm_typed_tool("exec", cmd="string")])
+
+        assert calls == [("exec", dict(cmd='echo "}" >> a.json')),
+                         ("get_time", {}), ("exec", dict(cmd="ls"))]
+        assert normal == (
+            "Checking now." + out_of_order + " Then " + unclosed +
+            "<tool_call>exec </tool_call> is prose. <tool_call>exec")
+
+    def test_a_name_without_its_own_line(self, parser_cls):
+        """GLM-4.7 reads these calls; GLM-4.5 needs a newline after the name."""
+        text = ("<tool_call>get_time</tool_call><tool_call>exec<arg_key>k"
+                "</arg_key><arg_value>v</arg_value></tool_call>")
+
+        result = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        if parser_cls is Glm4ToolParser:
+            assert result == (text, [])
+        else:
+            assert result == ("", [("get_time", {}), ("exec", dict(k="v"))])
+
+    def test_text_after_a_call_waits_for_the_next_increment(
+            self, parser_cls, sample_tools):
+        """The text an increment returns always precedes its calls."""
+        call = _glm_call(parser_cls, "get_weather", ("location", "NYC"))
+        parser = parser_cls()
+
+        results = [
+            parser.parse_streaming_increment(chunk, sample_tools)
+            for chunk in ("Before. ", call + "After." + call + " Done.", "", "")
+        ]
+
+        expected = [("Before. ", 0), ("", 1), ("After.", 1), (" Done.", 0)]
+        assert [(r.normal_text, len(r.calls)) for r in results] == expected
+
+    @pytest.mark.parametrize("emitted,delivered", MANGLED_NAMES)
+    def test_mangled_name(self, parser_cls, emitted, delivered):
+        text = _glm_call(parser_cls, emitted, ("cmd", "ls -la /workspace"))
+
+        _, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        assert calls == [(delivered, dict(cmd="ls -la /workspace"))]
+
+    @pytest.mark.parametrize("prose", PROSE_NAMES)
+    @pytest.mark.parametrize("pairs", [[("cmd", "ls")], []],
+                             ids=["with arguments", "without arguments"])
+    def test_a_prose_name_is_released_as_text(self, parser_cls, prose, pairs):
+        text = _glm_call(parser_cls, prose, *pairs)
+
+        normal, calls = _glm_parity(parser_cls, text, AGENT_TOOLS)
+
+        assert (normal, calls) == (text, [])
+
+    def test_a_bare_name_is_typed_by_its_qualified_declaration(
+            self, parser_cls):
+        tools = [
+            _glm_typed_tool("functions.exec",
+                            cmd="string",
+                            max_output_tokens="integer")
+        ]
+        text = _glm_call(parser_cls, "exec", ("cmd", "8000"),
+                         ("max_output_tokens", "8000"))
+
+        _, calls = _glm_parity(parser_cls, text, tools)
+
+        assert calls == [("functions.exec",
+                          dict(cmd="8000", max_output_tokens=8000))]
+
+    def test_a_long_separator_run_streams_in_linear_time(self, parser_cls):
+        """A long run of literal backslash-n separators, two per increment.
+
+        A linear parse takes a fraction of a second; one that rescans the
+        buffer on every increment takes tens of seconds, well past the bound.
+        """
+        text = _glm_raw_call(parser_cls, "f",
+                             _glm_pairs(("code", "ls")) + "\\n" * 40000)
+        chunks = [text[i:i + 2] for i in range(0, len(text), 2)]
+        start = time.monotonic()
+
+        _, calls = _glm_parity(parser_cls, text, _GLM_TOOLS,
+                               [("two per delta", chunks)])
+
+        assert calls == [("f", dict(code="ls"))]
+        assert time.monotonic() - start < 10
+
+
+# ============================================================================
+# BaseToolParser.resolve_tool_name
+# ============================================================================
+
+_NAMESPACED = ("functions.exec", "functions.wait", "collaboration.spawn_agent",
+               "collaboration.list_agents")
+
+
+@pytest.mark.parametrize(
+    "name,declared,expected",
+    [
+        # A bare name maps onto its qualified declaration, fused markup or not.
+        ("exec", _NAMESPACED, "functions.exec"),
+        ("spawn_agent", _NAMESPACED, "collaboration.spawn_agent"),
+        ("<tool_call>exec", _NAMESPACED, "functions.exec"),
+        ("exec</arg_value>", _NAMESPACED, "functions.exec"),
+        ("functions.exec </arg_value>", _NAMESPACED, "functions.exec"),
+        # A qualifier the declaration lacks is dropped; an exact name wins.
+        ("functions.exec_command", ("exec_command", ), "exec_command"),
+        ("exec", ("exec", "functions.exec"), "exec"),
+        # An ambiguous tail, prose mentioning a tool, unknown or empty names.
+        ("status", ("a.status", "b.status"), None),
+        ("collab? no. Use exec.<tool_call>exec", _NAMESPACED, None),
+        ("ops_check - re-querying for current status", _NAMESPACED, None),
+        ("exec surg? No, use proper functions.exec tool", _NAMESPACED, None),
+        ("exec_command_placeholder</arg_value>", _NAMESPACED, None),
+        ("totally_undeclared", _NAMESPACED, None),
+        ("", _NAMESPACED, None),
+        (None, _NAMESPACED, None),
+    ])
+def test_resolve_tool_name(name, declared, expected):
+    tool_indices = {tool: index for index, tool in enumerate(declared)}
+    assert BaseToolParser.resolve_tool_name(name, tool_indices) == expected
+
+
+def test_parse_base_json_reports_the_name_as_emitted(sample_tools):
+    """Only the GLM parsers resolve names; the shared path keeps them as is."""
+    action = dict(name="functions.get_weather", parameters={})
+
+    calls = ConcreteToolParser().parse_base_json(action, sample_tools)
+
+    assert [(c.name, c.tool_index)
+            for c in calls] == [("functions.get_weather", -1)]

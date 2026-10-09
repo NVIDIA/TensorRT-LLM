@@ -46,7 +46,8 @@ struct AttnLifeCycle
     {
         int numBlocks = divUp(historyLength, tokensPerBlock);
         BlockOrdinal start{std::min(numBlocks, numSinkBlocks)};
-        if (!windowSize.has_value())
+        // Sparse selection may revisit any history block, including outside the sliding window.
+        if (isSparse || !windowSize.has_value())
             return {start, start};
         // `+ 1` is intentional: attention always runs for >= 1 in-flight input
         // token at position `historyLength`, so the live window is

@@ -122,7 +122,7 @@ def _get_num_cuda_graph_padding_dummy_slots(
 
     This is computed before ``ModelEngine`` exists and covers draft lengths
     reachable at every batch size, including the zero-length acceptance-rate
-    fallback. ``ModelEngine._compute_dynamic_draft_len_mapping`` is created
+    fallback. ``DecoderRunner._compute_dynamic_draft_len_mapping`` is created
     later and covers only configured CUDA-graph batch sizes, so it cannot size
     this persistent ID set.
     """
@@ -1637,6 +1637,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
     Does not support block reuse / prefix caching for mamba states.
     """
 
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
+
     def __init__(
         self,
         # mamba cache parameters
@@ -2216,6 +2221,11 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
     manager preference override and legacy disaggregated routing.
 
     """
+
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
 
     def __init__(
         self,
@@ -2978,6 +2988,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Recurrent-state snapshots use a specialized commit/history protocol, so
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
+
+    # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
+    # cache manager __init__ coerces a positive spec recompute tail to a full
+    # re-prefill (see _has_recurrent_state on the attention-only base classes).
+    _has_recurrent_state = True
 
     # Qwen4-Exp PLE state is opt-in. These class-level defaults keep every other
     # model — and any partially-constructed instance that sets only the fields it

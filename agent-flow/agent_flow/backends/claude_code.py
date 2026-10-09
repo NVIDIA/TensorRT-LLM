@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -445,6 +449,73 @@ def _sdk_tools(tools: list) -> list[SdkMcpTool]:
     return result
 
 
+# The Agent SDK passes the system prompt to the ``claude`` binary as a single
+# argv string, and Linux caps one argv string at 128 KiB (MAX_ARG_STRLEN), so
+# a long prompt kills the CLI at exec with ``[Errno 7] Argument list too
+# long``. Above the threshold the full prompt is written to a file under the
+# working directory and the argv prompt becomes a short pointer telling the
+# model to read it first. The pointer is deliberately plain: no SDK feature
+# is involved.
+_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD = 64 * 1024
+
+
+def _system_prompt_file_threshold() -> int:
+    raw = os.environ.get("AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD")
+    if raw is None:
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[agent-flow] ignoring invalid AGENT_FLOW_SYSTEM_PROMPT_FILE_THRESHOLD={raw!r}; "
+            f"falling back to {_DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return _DEFAULT_SYSTEM_PROMPT_FILE_THRESHOLD
+
+
+SYSTEM_PROMPT_FILE_THRESHOLD = _system_prompt_file_threshold()
+
+
+def spill_system_prompt(system_prompt: str, cwd: Path, threshold: int | None = None) -> str:
+    """Return the prompt to pass on argv; spill the full text to a file if large.
+
+    Files are content-addressed (``.agent-flow/system-prompt-<sha12>.md``) so
+    every role/session with the same prompt shares one file and a changed
+    prompt never overwrites a file a live session may still be reading.
+    """
+    limit = SYSTEM_PROMPT_FILE_THRESHOLD if threshold is None else threshold
+    data = system_prompt.encode("utf-8")
+    if len(data) <= limit:
+        return system_prompt
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    target_dir = Path(cwd) / ".agent-flow"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"system-prompt-{digest}.md"
+    if not target.exists():
+        # Use a unique temp file per writer so concurrent sessions spilling
+        # the same prompt can't truncate or unlink each other's in-progress
+        # file before os.replace runs.
+        fd, tmp_name = tempfile.mkstemp(dir=target_dir, prefix=target.name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp_name, target)
+        except BaseException:
+            Path(tmp_name).unlink(missing_ok=True)
+            raise
+    kb = (len(data) + 1023) // 1024
+    return (
+        "Your full system instructions could not be passed inline and were written to "
+        f"this file: {target}\n\n"
+        f"Before doing anything else, read that file IN FULL with the Read tool ({kb} KB; "
+        "if a single read stops short of the end, continue with offset until you have read "
+        "the last line) and follow it as your system prompt for the whole session. "
+        "Everything it says applies unchanged; the human's task and all rules are in it."
+    )
+
+
 class ClaudeCodeBackend(Backend):
     def __init__(
         self,
@@ -489,6 +560,9 @@ class ClaudeCodeBackend(Backend):
                 tools=_sdk_tools(tools),
             )
 
+        work_dir = cwd or Path.cwd()
+        system_prompt = spill_system_prompt(system_prompt, work_dir)
+
         options = ClaudeAgentOptions(
             tools=ToolsPreset(type="preset", preset="claude_code"),
             system_prompt=SystemPromptPreset(
@@ -499,7 +573,7 @@ class ClaudeCodeBackend(Backend):
             mcp_servers=mcp_servers,
             model=model,
             effort=self._reasoning_effort,
-            cwd=cwd or Path.cwd(),
+            cwd=work_dir,
             sandbox={"enabled": False},
             permission_mode="bypassPermissions",
             hooks=hooks,
@@ -507,6 +581,9 @@ class ClaudeCodeBackend(Backend):
                 *(disallowed_tools or []),
                 *(f"Skill({name})" for name in self._disabled_skills),
             ],
+            # Forward the CLI's stderr so startup failures are diagnosable
+            # instead of vanishing with the subprocess.
+            stderr=lambda line: print(f"[claude-cli stderr] {line}", file=sys.stderr, flush=True),
         )
 
         async with ClaudeSDKClient(options=options) as sdk_client:
