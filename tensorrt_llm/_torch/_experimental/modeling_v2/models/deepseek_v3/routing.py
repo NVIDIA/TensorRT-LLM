@@ -2,17 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where a DeepseekV3ForCausalLM config lands. Read this file and you know.
 
-One forward-reading decision tree per architecture family: the criteria are
-evaluated in the order a reader would ask them, and every branch that does not
-end in a target returns None (in ``auto`` the engine then uses the built-in
-DeepseekV3 implementation; in ``require`` it raises, quoting the trace below).
+One forward-reading decision tree per architecture family, in two stages.
+``route`` reads the configuration's identity and names a target;
+``within_bounds`` reads the deployment's LLM API arguments and says whether
+that target was certified for it. The criteria are evaluated in the order a
+reader would ask them, and every branch that does not end in an accepted
+target returns None or False (in ``auto`` the engine then uses the built-in
+DeepseekV3 implementation; in ``require`` it raises, quoting the trace).
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target.
@@ -74,3 +80,20 @@ def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
         return None
 
     return _TARGETS.get((ckpt, parallel))
+
+
+def within_bounds(
+    target: str, args: "TorchLlmArgs", ctx: ModelingV2Context, trace: Trace = NULL_TRACE
+) -> bool:
+    """Whether this deployment is one ``target`` was certified for; see the
+    sibling gpt_oss routing module for what the hook is and is not allowed
+    to read.
+
+    No target in this family bounds anything yet: every deployment the
+    identity stage routes here is accepted.
+    """
+    if target not in TARGET_MODULES:
+        raise ValueError(
+            f"{target!r} is not a target of this routing module; targets: {sorted(TARGET_MODULES)}"
+        )
+    return True

@@ -13,15 +13,36 @@ instead of shared abstractions. The one-to-one correspondence between
 
 ## Using it
 
-```bash
-export TRTLLM_MODELING_V2=require        # off | auto | require
+```python
+LLM(model, modeling_v2="require")        # off | auto | require
 ```
 
-| `TRTLLM_MODELING_V2` | Behaviour |
+```yaml
+# trtllm-serve --config serve.yaml
+modeling_v2: require
+```
+
+| `modeling_v2` | Behaviour |
 |---|---|
-| unset or `off` (default) | The resolver returns immediately. Nothing in this package is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one matches this exact configuration; falls back to the built-in implementation when none does. |
-| `require` | Raises instead of falling back, naming the criterion that did not match. |
+| `off` (default) | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
+| `auto` | Uses a target when one claims this exact configuration *and* the deployment is within that target's bounds; falls back to the built-in implementation otherwise. |
+| `require` | Raises instead of falling back, naming the criterion -- identity or bound -- that did not hold. |
+
+It is an LLM API argument rather than an environment variable so that it
+reaches every rank the way the rest of the arguments do; a variable set after
+MPI initialized reached the driver and not the workers, and a driver building
+a target while its workers build the built-in is exactly the split `require`
+exists to catch.
+
+The decision has two stages, both in the family's `routing.py`. `route` reads
+the configuration's *identity* -- checkpoint shape, GPU architecture, parallel
+topology -- and names a target. `within_bounds` then reads the *deployment* --
+the LLM API arguments it was configured with, `max_batch_size`,
+`max_num_tokens`, speculative decoding, anything the target's gates did or did
+not exercise -- and says whether the target was certified for it. The model
+loader decides once per deployment, before model defaults are applied, and
+carries the answer on `ModelConfig.modeling_v2_target`. `explain.py` replays
+both stages; pass it the same `--config` YAML `trtllm-serve` takes.
 
 **Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
 a configuration that misses a target's criteria silently gets the built-in
@@ -156,13 +177,13 @@ checkpoints", which is the opposite of what this package is for.
 ## Gates
 
 1. **Boot** — minutes, binary. `examples/llm-api/quickstart_advanced.py` with
-   the target's topology flags and `TRTLLM_MODELING_V2=require` exported. Engine
+   the target's topology flags and `modeling_v2=require` passed. Engine
    cold start, weight-manifest coverage, a handful of greedy continuations.
    Catches catastrophes, not accuracy. A variant that changes the forward gets
    its own minutes-scale gate on the same footing.
 2. **Accuracy** — the release criterion. `trtllm-eval` with the protocol from
-   `tests/integration/defs/accuracy/references/` and `TRTLLM_MODELING_V2=require`
-   exported. One-sided: measured >= reference − tol. This is the gate CI runs,
+   `tests/integration/defs/accuracy/references/` and `modeling_v2=require`
+   passed. One-sided: measured >= reference − tol. This is the gate CI runs,
    in the accuracy suite's modeling_v2 files.
 3. **Acceptance** — required whenever a variant is distribution-preserving by
    construction, speculative decoding above all. Rejection sampling holds the
@@ -170,7 +191,7 @@ checkpoints", which is the opposite of what this package is for.
    produces correct text more slowly: boot passes, accuracy passes, only
    speed moves. The detector is `acceptance_length` against the same
    checkpoint under stock in-tree modeling at the same workload and the same
-   `speculative_config` — i.e. `TRTLLM_MODELING_V2=off` versus `=require`,
+   `speculative_config` — i.e. `modeling_v2=off` versus `=require`,
    which is now one variable rather than two harnesses.
 
 Compare a variant against an identity run **in the same session**: one target
@@ -209,7 +230,7 @@ tolerance, and each is written up in its own contract:
   by the op, not certified here).
 
 **gpt-oss-120b / sm_103 / tp1 is gated on GB300.** Both gates pass with
-`TRTLLM_MODELING_V2=require` in force, which is what rules out the built-in
+`modeling_v2=require` in force, which is what rules out the built-in
 implementation having been measured instead:
 
 | Gate | Result |

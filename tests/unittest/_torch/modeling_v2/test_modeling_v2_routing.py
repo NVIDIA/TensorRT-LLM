@@ -2,41 +2,52 @@
 # SPDX-License-Identifier: Apache-2.0
 """What ``modeling_v2_resolve`` actually does, driven by synthetic configs.
 
-No checkpoint and no weights: routing reads config *shape*, the mapping and
-the SM version, all of which can be stated directly. The SM version is
-monkeypatched so these run on any device -- the point here is the decision
-logic, not the kernels.
+No checkpoint and no weights: routing reads config *shape*, the mapping, the
+SM version and the LLM API arguments the deployment was configured with, all
+of which can be stated directly. The SM version is monkeypatched so these run
+on any device -- the point here is the decision logic, not the kernels.
 
-The three things worth proving:
+The things worth proving:
 
-* ``off`` changes nothing. This is the whole safety argument for putting the
-  hook in ``_resolve_class`` at all.
+* ``off`` changes nothing. This is the whole safety argument for making the
+  decision in the model loader at all.
 * a matching configuration reaches a target class, and that class is
   *external* -- so it wins the registry slot rather than losing it to the
   built-in provider, which the lazy zoo may import afterwards.
 * ``require`` raises on a near-miss and says which criterion missed.
+* a target's ``within_bounds`` has the last word: outside it, ``auto`` falls
+  back to the built-in implementation and ``require`` raises.
+* ``AutoModelForCausalLM._resolve_class`` reads the decision off the
+  ``ModelConfig`` rather than deciding again.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
+from pydantic import ValidationError
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
-    MODELING_V2_ENV,
-    ModelingV2Mode,
+    NULL_TRACE,
     modeling_v2_resolve,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss import routing as gpt_oss_routing
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import (
     _is_builtin_model_class,
     get_registered_model_class,
 )
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 _SM103 = (10, 3)
+_DUMMY_MODEL = "/tmp/dummy_model"
+_BUILTIN_GPT_OSS = "tensorrt_llm._torch.models.modeling_gpt_oss"
+_GPT_OSS_TARGET = "ModelingV2GptOss120bSm103Tp1"
 
 
 @pytest.fixture(autouse=True)
@@ -73,21 +84,13 @@ def _r1_config(**overrides):
     return PretrainedConfig(**fields)
 
 
-@pytest.fixture(autouse=True)
-def _mode(monkeypatch, request):
-    """Default every case to 'auto'; a case that wants another mode sets it.
+def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
+    """The deployment, as the LLM API would have been given it.
 
-    The switch is an environment variable, so the tests set one too -- that is
-    the surface under test.
+    The switch is an LLM API argument, so the tests set one too -- that is the
+    surface under test.
     """
-    monkeypatch.setenv(MODELING_V2_ENV, "auto")
-
-
-def _set_mode(monkeypatch, mode):
-    if mode is None:
-        monkeypatch.delenv(MODELING_V2_ENV, raising=False)
-    else:
-        monkeypatch.setenv(MODELING_V2_ENV, mode)
+    return TorchLlmArgs(model=_DUMMY_MODEL, modeling_v2=mode, **kwargs)
 
 
 def _model_config(pretrained_config, **mapping_kwargs):
@@ -98,44 +101,42 @@ def _model_config(pretrained_config, **mapping_kwargs):
 _DEP4 = dict(world_size=4, tp_size=4, moe_ep_size=4, moe_tp_size=1, enable_attention_dp=True)
 
 
-@pytest.mark.parametrize("unset", [True, False], ids=["env-unset", "env-off"])
-def test_off_resolves_nothing(monkeypatch, unset):
+@pytest.mark.parametrize("mode", [None, "off"], ids=["default", "off"])
+def test_off_resolves_nothing(mode):
     """The default must be indistinguishable from modeling_v2 not existing.
 
-    Unset and an explicit "off" have to behave identically: the common case is
-    that nobody has heard of this package.
+    Leaving the argument alone and an explicit "off" have to behave
+    identically: the common case is that nobody has heard of this package.
     """
-    _set_mode(monkeypatch, None if unset else "off")
+    args = TorchLlmArgs(model=_DUMMY_MODEL) if mode is None else _llm_args(mode)
     config = _model_config(_gpt_oss_config())
-    assert modeling_v2_resolve(config) is None
+    assert modeling_v2_resolve(config, args) is None
 
 
-def test_off_still_reaches_the_builtin_implementation(monkeypatch):
-    _set_mode(monkeypatch, "off")
+def test_off_still_reaches_the_builtin_implementation():
     config = _model_config(_gpt_oss_config())
+    assert modeling_v2_resolve(config, _llm_args("off")) is None
     resolved = AutoModelForCausalLM._resolve_class(config)
     assert resolved is not None
-    assert resolved.__module__ == "tensorrt_llm._torch.models.modeling_gpt_oss"
+    assert resolved.__module__ == _BUILTIN_GPT_OSS
 
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
-def test_gpt_oss_tp1_matches(monkeypatch, mode):
-    _set_mode(monkeypatch, mode)
+def test_gpt_oss_tp1_matches(mode):
     config = _model_config(_gpt_oss_config())
-    assert modeling_v2_resolve(config) == "ModelingV2GptOss120bSm103Tp1"
+    assert modeling_v2_resolve(config, _llm_args(mode)) == _GPT_OSS_TARGET
 
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
-def test_r1_dep4_matches(monkeypatch, mode):
-    _set_mode(monkeypatch, mode)
+def test_r1_dep4_matches(mode):
     config = _model_config(_r1_config(), **_DEP4)
-    assert modeling_v2_resolve(config) == "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
+    assert modeling_v2_resolve(config, _llm_args(mode)) == "ModelingV2DeepseekR10528Nvfp4Sm103Dep4"
 
 
 def test_resolving_registers_the_target_class():
     """The synthetic name is a key; the import behind it is what fills it."""
     config = _model_config(_gpt_oss_config())
-    name = modeling_v2_resolve(config)
+    name = modeling_v2_resolve(config, _llm_args())
     cls = get_registered_model_class(name)
     assert cls is not None, f"{name} resolved to no class"
     assert cls.__name__ == name
@@ -147,14 +148,17 @@ def test_the_target_registration_counts_as_external():
     empty ones. Living beside the zoo rather than inside it is what buys
     this, and a move into _torch/models/ would silently reverse it."""
     config = _model_config(_gpt_oss_config())
-    cls = get_registered_model_class(modeling_v2_resolve(config))
+    cls = get_registered_model_class(modeling_v2_resolve(config, _llm_args()))
     assert not _is_builtin_model_class(cls)
 
 
-def test_resolve_class_rewrites_the_architecture_end_to_end():
+def test_resolve_class_reads_the_decision_off_the_config():
+    """The loader decides and writes the result on the ModelConfig; the class
+    lookup only has to honour it."""
     config = _model_config(_gpt_oss_config())
-    resolved = AutoModelForCausalLM._resolve_class(config)
-    assert resolved.__name__ == "ModelingV2GptOss120bSm103Tp1"
+    target = modeling_v2_resolve(config, _llm_args())
+    decided = replace(config, modeling_v2_target=target)
+    assert AutoModelForCausalLM._resolve_class(decided).__name__ == target
 
 
 @pytest.mark.parametrize(
@@ -166,13 +170,12 @@ def test_resolve_class_rewrites_the_architecture_end_to_end():
         (dict(), dict(world_size=2, tp_size=2), "parallel"),
     ],
 )
-def test_gpt_oss_near_misses_do_not_match(monkeypatch, config_kwargs, mapping_kwargs, missed):
+def test_gpt_oss_near_misses_do_not_match(config_kwargs, mapping_kwargs, missed):
     config = _model_config(_gpt_oss_config(**config_kwargs), **mapping_kwargs)
-    assert modeling_v2_resolve(config) is None
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
 
-    _set_mode(monkeypatch, "require")
     with pytest.raises(ValueError, match=missed):
-        modeling_v2_resolve(config)
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 def test_r1_without_attention_dp_does_not_match():
@@ -180,15 +183,14 @@ def test_r1_without_attention_dp_does_not_match():
     attention DP is an identity criterion rather than a knob."""
     mapping_kwargs = dict(_DEP4, enable_attention_dp=False)
     config = _model_config(_r1_config(), **mapping_kwargs)
-    assert modeling_v2_resolve(config) is None
+    assert modeling_v2_resolve(config, _llm_args()) is None
 
 
 def test_require_names_the_criterion_that_missed(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 0))
-    _set_mode(monkeypatch, "require")
     config = _model_config(_gpt_oss_config())
     with pytest.raises(ValueError) as excinfo:
-        modeling_v2_resolve(config)
+        modeling_v2_resolve(config, _llm_args("require"))
     message = str(excinfo.value)
     assert "sm" in message and "(10, 0)" in message
     assert "no match" in message
@@ -196,42 +198,55 @@ def test_require_names_the_criterion_that_missed(monkeypatch):
 
 def test_an_unrouted_architecture_is_not_an_error_under_auto():
     config = _model_config(PretrainedConfig(architectures=["LlamaForCausalLM"]))
-    assert modeling_v2_resolve(config) is None
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
 
 
-def test_an_unrouted_architecture_raises_under_require(monkeypatch):
-    _set_mode(monkeypatch, "require")
+def test_an_unrouted_architecture_raises_under_require():
     config = _model_config(PretrainedConfig(architectures=["LlamaForCausalLM"]))
     with pytest.raises(ValueError, match="LlamaForCausalLM"):
-        modeling_v2_resolve(config)
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
-@pytest.mark.parametrize(
-    "raw,expected",
-    [(None, "off"), ("off", "off"), ("AUTO", "auto"), (" require ", "require"), ("", "off")],
-)
-def test_the_env_var_is_read_leniently(monkeypatch, raw, expected):
-    """``None`` is the unset case, and it is the one that must never drift.
-
-    Everything in the accuracy suite rests on modeling_v2 being opt-in: unset has
-    to read as off on the code path the engine actually takes.
-    """
-    if raw is None:
-        monkeypatch.delenv(MODELING_V2_ENV, raising=False)
-    else:
-        monkeypatch.setenv(MODELING_V2_ENV, raw)
-    assert ModelingV2Mode.from_env().value == expected
-
-
-def test_an_unknown_mode_raises_rather_than_falling_back(monkeypatch):
+def test_an_unknown_mode_is_rejected_when_the_arguments_are_built():
     """A typo must not read as "off".
 
     That would hand back the built-in implementation while the caller believed
     they had asked for a target -- the exact mis-attribution the require mode
-    exists to prevent.
+    exists to prevent. Pydantic refuses it before anything is built.
     """
     # "yes" rather than a misspelling: it is what someone reaching for a
     # boolean would write, and it is the reading that must not be invented.
-    monkeypatch.setenv(MODELING_V2_ENV, "yes")
-    with pytest.raises(ValueError, match="not a modeling_v2 mode"):
-        ModelingV2Mode.from_env()
+    with pytest.raises(ValidationError, match="modeling_v2"):
+        _llm_args("yes")
+
+
+# --- within_bounds: the target's certified deployment envelope -----------------
+
+
+def _outside(label, value):
+    """A ``within_bounds`` that rejects on one named criterion."""
+
+    def within_bounds(target, args, ctx, trace=NULL_TRACE):
+        return trace.check(label, value, False)
+
+    return within_bounds
+
+
+def test_outside_its_bounds_a_target_falls_back_under_auto(monkeypatch):
+    monkeypatch.setattr(gpt_oss_routing, "within_bounds", _outside("max_batch_size", 2048))
+    config = _model_config(_gpt_oss_config())
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+
+
+def test_outside_its_bounds_a_target_raises_under_require(monkeypatch):
+    """Falling back silently would break the promise ``require`` makes, the
+    same way a missed identity criterion would -- so the error names the
+    target that claimed the configuration and the bound it failed."""
+    monkeypatch.setattr(gpt_oss_routing, "within_bounds", _outside("max_batch_size", 2048))
+    config = _model_config(_gpt_oss_config())
+    with pytest.raises(ValueError) as excinfo:
+        modeling_v2_resolve(config, _llm_args("require"))
+    message = str(excinfo.value)
+    assert _GPT_OSS_TARGET in message
+    assert "bounds" in message
+    assert "max_batch_size" in message and "2048" in message
