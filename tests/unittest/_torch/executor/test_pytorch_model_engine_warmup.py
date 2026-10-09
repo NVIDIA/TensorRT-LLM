@@ -387,7 +387,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
             num_gen_requests=num_gen_requests
         ),
         _release_batch_context=lambda batch, resources: contextlib.nullcontext(batch),
-        _should_run_warmup_batch=Mock(return_value=True),
+        _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
@@ -1273,7 +1273,7 @@ class TestWarmupCleanup(unittest.TestCase):
                         contextlib.nullcontext(object()),
                     ]
                 ),
-                _should_run_warmup_batch=Mock(return_value=True),
+                _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(side_effect=lambda *args, **kwargs: calls.append("forward")),
             )
@@ -1395,7 +1395,7 @@ class TestWarmupCleanup(unittest.TestCase):
                         contextlib.nullcontext(None),
                     ]
                 ),
-                _should_run_warmup_batch=Mock(return_value=False),
+                _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=False)),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )
@@ -1495,7 +1495,7 @@ class TestWarmupCleanup(unittest.TestCase):
                 no_cuda_graph=lambda: contextlib.nullcontext(),
                 _create_warmup_request=Mock(return_value=object()),
                 _release_batch_context=Mock(return_value=contextlib.nullcontext(object())),
-                _should_run_warmup_batch=Mock(return_value=True),
+                _agreement=SimpleNamespace(should_run_warmup_batch=Mock(return_value=True)),
                 _release_megamoe_profiling_scratch=Mock(),
                 _forward_warmup=Mock(),
             )

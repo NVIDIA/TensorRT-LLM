@@ -78,7 +78,7 @@ from tensorrt_llm._torch.utils import (
     set_per_request_prefill_cuda_graph_flag,
     with_model_extra_attrs,
 )
-from tensorrt_llm._utils import global_mpi_rank, maybe_pin_memory, nvtx_range, prefer_pinned
+from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
@@ -122,6 +122,7 @@ from .speculative import (
     set_spec_metadata_all_rank_num_tokens,
     update_spec_metadata,
 )
+from .warmup import WarmupAgreement
 
 
 def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> int:
@@ -275,6 +276,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._model_caller = model_caller
         self.mapping = mapping
         self.dist = dist
+        self._agreement = WarmupAgreement(dist, mapping)
         self.moe_load_balancer = moe_load_balancer
         self.sparse_attention_config = sparse_attention_config
         self._torch_compile_backend = torch_compile_backend
@@ -655,7 +657,7 @@ class DecoderRunner(ScheduledModelRunner):
         # ``guided_decoder`` is installed only on the last pipeline rank, so
         # this predicate is not rank-uniform on its own. Agree it before it
         # gates either the attention or the general phase.
-        can_run_general_warmup = self._agree_warmup_flag(
+        can_run_general_warmup = self._agreement.agree_flag(
             self._context_warmups_supported
             and not self.mapping.has_cp_helix()
             and self.guided_decoder is None
@@ -680,7 +682,7 @@ class DecoderRunner(ScheduledModelRunner):
             with self._warmup_timer.phase(
                 "general", metrics=self._metrics, metric_name="general_warmup_seconds"
             ):
-                warmup_requests_configs = self._agree_warmup_shapes(
+                warmup_requests_configs = self._agreement.agree_shapes(
                     self._get_full_general_warmup_requests(resource_manager)
                 )
                 # Currently graph has not been captured, disable cuda graph for this warmup.
@@ -1039,171 +1041,6 @@ class DecoderRunner(ScheduledModelRunner):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
-    def _is_distributed_forward(self) -> bool:
-        """Return whether model forward can communicate with peer workers.
-
-        ``dist`` is optional. An engine built without a communicator cannot
-        enter a collective at all, so it has no peers to strand and every
-        warmup failure stays rank-local.
-        """
-        if self.dist is None:
-            return False
-        return self.dist.world_size > 1 or self.mapping.dwdp_enabled
-
-    def _warmup_agreement_allgather(self) -> Callable[[int], list[int]] | None:
-        """Return an allgather over the ranks this warmup forward synchronizes with.
-
-        ``None`` means agreement cannot be established here, so a missing batch
-        stays fatal rather than being skipped unilaterally.
-
-        DWDP is the case that cannot be answered: its peers are reached through
-        a ``COMM_WORLD``-derived subgroup built in ``dwdp.py``, not through
-        ``self.dist``, so a ``self.dist`` allgather would report a unanimity it
-        never observed.
-        """
-        if self.dist is None or self.mapping.dwdp_enabled:
-            return None
-        if self.dist.world_size <= 1:
-            return None
-        return self.dist.allgather
-
-    def _agree_warmup_flag(self, flag: bool) -> bool:
-        """Reduce a phase-entry decision to one the whole forward group shares.
-
-        Several predicates that gate a warmup phase are rank-local. The
-        capturable guided decoder is installed only on the last pipeline rank,
-        so ``guided_decoder is None`` -- and through it
-        ``can_run_general_warmup`` -- differs across pipeline stages. Mamba's
-        entry test reads this rank's free KV capacity. Letting one rank enter a
-        phase its peers skip strands whoever enters the collective, and it also
-        unbalances the per-shape agreement below.
-
-        Any rank opting out takes the whole group out with it.
-        """
-        allgather = self._warmup_agreement_allgather()
-        if allgather is None:
-            return flag
-        return all(allgather(int(flag)))
-
-    def _agree_warmup_shapes(self, configs: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        """Reduce warmup shapes to the ones every rank in the group proposed.
-
-        ``_get_max_shape_warmup_requests`` derives shapes from this rank's free
-        KV capacity, so under attention-DP the values -- and, once
-        ``dict.fromkeys`` drops a collision, the length -- differ per rank.
-        Ranks would then walk different loops and meet in different forwards.
-
-        The intersection keeps rank 0's ordering, which matters because the
-        general warmup list is ordered for torch.compile specialization.
-        """
-        allgather = self._warmup_agreement_allgather()
-        if allgather is None:
-            return configs
-        per_rank = allgather([list(config) for config in configs])
-        shared = set.intersection(
-            *({tuple(config) for config in rank_configs} for rank_configs in per_rank)
-        )
-        agreed = [config for config in configs if config in shared]
-        dropped = [config for config in configs if config not in shared]
-        if dropped:
-            logger.warning(
-                f"Dropping warmup shapes {dropped} that not every rank could "
-                f"propose; per-rank KV capacity differs. Remaining: {agreed}."
-            )
-        return agreed
-
-    def _should_run_warmup_batch(
-        self, batch: ScheduledRequests | None, num_tokens: int, shape: str
-    ) -> bool:
-        """Decide whether this warmup shape runs, is skipped, or fails the rank.
-
-        A rank that skips a shape its peers run leaves them blocked in that
-        forward's collectives for the rest of the job. Skipping is therefore
-        safe exactly when every rank in the forward group skips too, and an
-        allgather establishes that before any rank enters the forward.
-
-        The plan agreed by ``_agree_warmup_plan`` is what makes that allgather
-        safe: every rank walks the same shape list, so this runs the same
-        number of times everywhere.
-        """
-        if not self._is_distributed_forward():
-            if batch is not None:
-                return True
-            # Safe to skip, but never silently: a skip during KV cache
-            # estimation makes the profiling peak unrepresentative of
-            # this shape.
-            logger.warning(f"Skipping warmup shape ({shape}): not enough KV cache space.")
-            return False
-
-        allgather = self._warmup_agreement_allgather()
-        if allgather is None:
-            # No reachable group to agree with. Keep the TP-only check, which
-            # still catches the attention-DP asymmetry it was written for.
-            self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
-            if batch is None:
-                raise RuntimeError(
-                    f"Warmup batch creation failed for shape ({shape}) on "
-                    f"global_rank={global_mpi_rank()}, "
-                    f"model_rank={self.dist.rank}, and this topology offers no "
-                    f"way to confirm that peers are skipping it too. They may "
-                    f"already be inside the matching forward, so this rank "
-                    f"cannot skip the shape without stranding them."
-                )
-            return True
-
-        flags = list(allgather(int(batch is not None)))
-        if all(flags):
-            return True
-        if not any(flags):
-            # Every rank in the forward group is skipping, so none of them is
-            # left inside a collective. This is the ordinary outcome for a
-            # shape that does not fit the configuration at all, such as a
-            # mixed context+generation shape under ``max_batch_size=1``.
-            logger.info(
-                f"Skipping warmup shape ({shape}) on all "
-                f"{len(flags)} ranks: not enough KV cache space."
-            )
-            return False
-
-        all_tokens = list(allgather(num_tokens))
-        failed_ranks = [i for i, flag in enumerate(flags) if not flag]
-        raise RuntimeError(
-            f"Warmup batch creation failed for shape ({shape}) on rank(s) "
-            f"{failed_ranks} but succeeded on others, so entering this forward "
-            f"would deadlock the ranks that still hold a batch. Per-rank "
-            f"curr_max_num_tokens: {all_tokens}. This indicates asymmetric KV "
-            f"cache capacity across ranks. Consider increasing "
-            f"--kv_cache_free_gpu_mem_fraction."
-        )
-
-    def _assert_all_tp_ranks_have_warmup_batch(self, batch, num_tokens: int) -> None:
-        """Assert every TP rank has a valid warmup batch, or raise with diagnostics.
-
-        Under attention-DP, each rank's KV cache available capacity can differ at
-        runtime, causing _create_warmup_request to return None on some ranks while
-        others proceed into forward() with tp_comm collectives — deadlocking the
-        job. This check prevents the deadlock by failing early with diagnostic info.
-
-        ``tp_size`` alone does not establish that peers are reachable: ``dist``
-        is optional, and without a communicator there is no tp_comm collective
-        to deadlock in.
-        """
-        if self.mapping.tp_size <= 1 or self.dist is None:
-            return
-        has_batch = int(batch is not None)
-        all_flags = list(self.dist.tp_allgather(has_batch))
-        if any(all_flags) and not all(all_flags):
-            # Gather token counts for diagnostics
-            all_tokens = list(self.dist.tp_allgather(num_tokens))
-            failed_ranks = [i for i, f in enumerate(all_flags) if not f]
-            raise RuntimeError(
-                f"Warmup batch creation failed on TP rank(s) {failed_ranks} "
-                f"but succeeded on others. This would cause a collective "
-                f"deadlock. Per-rank curr_max_num_tokens: {all_tokens}. "
-                f"This indicates asymmetric KV cache capacity across TP ranks. "
-                f"Consider increasing --kv_cache_free_gpu_mem_fraction."
-            )
-
     def _general_warmup_impl(
         self, resource_manager: ResourceManager, warmup_requests_configs: list[tuple[int, int]]
     ) -> None:
@@ -1216,7 +1053,7 @@ class DecoderRunner(ScheduledModelRunner):
                     self._create_warmup_request(resource_manager, num_tokens, num_gen_tokens),
                     resource_manager,
                 ) as batch:
-                    if not self._should_run_warmup_batch(
+                    if not self._agreement.should_run_warmup_batch(
                         batch,
                         num_tokens,
                         f"general, num_tokens={num_tokens}, num_gen_tokens={num_gen_tokens}",
@@ -1238,7 +1075,7 @@ class DecoderRunner(ScheduledModelRunner):
                         )
                         torch.cuda.synchronize()
             except torch.OutOfMemoryError:
-                if self._is_distributed_forward():
+                if self._agreement.is_distributed_forward():
                     # Peers are inside the same forward's collectives and
                     # cannot follow a rank-local skip.
                     raise
@@ -1330,7 +1167,7 @@ class DecoderRunner(ScheduledModelRunner):
                 self.no_cuda_graph(),
                 self._release_batch_context(warmup_request, resource_manager) as batch,
             ):
-                if not self._should_run_warmup_batch(
+                if not self._agreement.should_run_warmup_batch(
                     batch,
                     num_tokens,
                     f"attention, num_tokens={num_tokens}, num_gen_requests={num_gen_requests}",
@@ -1489,7 +1326,7 @@ class DecoderRunner(ScheduledModelRunner):
                         resource_manager, num_tokens, num_gen_requests
                     )
                     with self._release_batch_context(warmup_request, resource_manager) as batch:
-                        if not self._should_run_warmup_batch(
+                        if not self._agreement.should_run_warmup_batch(
                             batch,
                             num_tokens,
                             f"autotuner, num_tokens={num_tokens}, "
@@ -1628,7 +1465,7 @@ class DecoderRunner(ScheduledModelRunner):
         )
         # Rank-local capacity, so peers can disagree. Leaving the phase alone
         # would unbalance the per-shape agreement inside it.
-        if not self._agree_warmup_flag(curr_max_num_tokens >= 4):
+        if not self._agreement.agree_flag(curr_max_num_tokens >= 4):
             return
 
         # Cap the multi-seq warmup token count so we don't fill the KV cache
@@ -1703,7 +1540,7 @@ class DecoderRunner(ScheduledModelRunner):
                             chunk_aligned=chunk_aligned_i,
                         )
                     except torch.OutOfMemoryError as e:
-                        if self._is_distributed_forward():
+                        if self._agreement.is_distributed_forward():
                             raise
                         logger.warning(
                             f"Warmup skipped for shape ({shape}): {type(e).__name__}: {e}"
@@ -1715,7 +1552,7 @@ class DecoderRunner(ScheduledModelRunner):
                         # forward and is recoverable only when no peer worker
                         # can advance independently. Any other RuntimeError is
                         # a defect, not a capacity limit, and is fatal.
-                        if self._is_distributed_forward():
+                        if self._agreement.is_distributed_forward():
                             raise
                         if "Can't allocate new blocks for window size" not in str(e):
                             raise
@@ -1727,7 +1564,9 @@ class DecoderRunner(ScheduledModelRunner):
 
                     try:
                         with self._release_batch_context(warmup_request, resource_manager) as batch:
-                            if not self._should_run_warmup_batch(batch, num_tokens_i, shape):
+                            if not self._agreement.should_run_warmup_batch(
+                                batch, num_tokens_i, shape
+                            ):
                                 continue
                             self._forward_warmup(
                                 batch,
@@ -1745,7 +1584,7 @@ class DecoderRunner(ScheduledModelRunner):
                     # Once peers can enter warmup synchronization or forward,
                     # any rank-local exception can strand them in a collective.
                     except Exception as e:  # noqa: BLE001
-                        if self._is_distributed_forward():
+                        if self._agreement.is_distributed_forward():
                             raise
                         # ``torch.OutOfMemoryError`` is a ``RuntimeError``
                         # subclass; anything outside that hierarchy is a defect
@@ -2137,7 +1976,7 @@ class DecoderRunner(ScheduledModelRunner):
             for num_tokens in prefill_cuda_graph_num_tokens:
                 warmup_request = self._create_warmup_request(resource_manager, num_tokens, 0)
                 with self._release_batch_context(warmup_request, resource_manager) as batch:
-                    self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+                    self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                     if batch is None:
                         continue
 
@@ -2189,7 +2028,7 @@ class DecoderRunner(ScheduledModelRunner):
                     resource_manager, num_tokens, 0, least_requests=False
                 )
                 with self._release_batch_context(warmup_request, resource_manager) as batch:
-                    self._assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+                    self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
                     if batch is None:
                         continue
                     logger.info(

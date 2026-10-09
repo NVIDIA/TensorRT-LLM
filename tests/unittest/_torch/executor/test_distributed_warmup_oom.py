@@ -13,6 +13,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor import py_executor as py_executor_module
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import WarmupAgreement
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 
 pytestmark = pytest.mark.cpu_only
@@ -28,7 +29,7 @@ class _StandInMambaCacheManager:
         return self._available_tokens
 
 
-def _engine(
+def _agreement(
     *,
     world_size: int = 1,
     dwdp_size: int = 0,
@@ -36,8 +37,8 @@ def _engine(
     tp_peer_values: tuple[int, ...] = (),
     peer_values: tuple[int, ...] | None = None,
     with_dist: bool = True,
-) -> DecoderRunner:
-    """Build an engine carrying only what the warmup policy reads.
+) -> WarmupAgreement:
+    """Build the warmup agreement over a stand-in communicator and mapping.
 
     ``dist`` is ``Optional`` on the real engine -- stub engines such as
     ``DummyModelEngine`` construct without a communicator -- so ``with_dist``
@@ -48,13 +49,12 @@ def _engine(
     ``peer_values`` defaults to peers that mirror this rank, i.e. a world that
     agrees with whatever this rank reports.
     """
-    engine = object.__new__(DecoderRunner)
 
     def _allgather(value):
         peers = [value] * (world_size - 1) if peer_values is None else list(peer_values)
         return [value, *peers]
 
-    engine.dist = (
+    dist = (
         SimpleNamespace(
             world_size=world_size,
             rank=3,
@@ -64,11 +64,20 @@ def _engine(
         if with_dist
         else None
     )
-    engine.mapping = SimpleNamespace(
+    mapping = SimpleNamespace(
         dwdp_enabled=dwdp_size > 1,
         has_cp_helix=lambda: False,
         tp_size=tp_size,
     )
+    return WarmupAgreement(dist, mapping)
+
+
+def _engine(*, world_size: int = 1, dwdp_size: int = 0) -> DecoderRunner:
+    """Build an engine carrying only what the warmup phases read."""
+    engine = object.__new__(DecoderRunner)
+    engine._agreement = _agreement(world_size=world_size, dwdp_size=dwdp_size)
+    engine.dist = engine._agreement.dist
+    engine.mapping = engine._agreement.mapping
     engine._reset_moe_alltoall_state = mock.Mock()
     engine._config = SimpleNamespace(is_spec_decode=False, max_draft_len=0, spec_config=None)
     return engine
@@ -250,13 +259,13 @@ class TestAllRanksCrashedProbe:
 def test_warmup_batch_policy(
     world_size: int, dwdp_size: int, has_batch: bool, expected: bool | None
 ) -> None:
-    engine = _engine(world_size=world_size, dwdp_size=dwdp_size)
+    agreement = _agreement(world_size=world_size, dwdp_size=dwdp_size)
     batch = object() if has_batch else None
     if expected is None:
         with pytest.raises(RuntimeError, match="cannot skip the shape"):
-            engine._should_run_warmup_batch(batch, 128, "general")
+            agreement.should_run_warmup_batch(batch, 128, "general")
     else:
-        assert engine._should_run_warmup_batch(batch, 128, "general") is expected
+        assert agreement.should_run_warmup_batch(batch, 128, "general") is expected
 
 
 def test_symmetric_absence_skips_instead_of_failing_the_world() -> None:
@@ -267,20 +276,20 @@ def test_symmetric_absence_skips_instead_of_failing_the_world() -> None:
     verdict from configuration alone, so the group agrees and skips. Failing
     here took down ten multi-GPU tests that had always skipped this shape.
     """
-    engine = _engine(world_size=2, tp_size=2, peer_values=(0,))
+    agreement = _agreement(world_size=2, tp_size=2, peer_values=(0,))
 
     assert (
-        engine._should_run_warmup_batch(None, 2, "attention, num_tokens=2, num_gen_requests=1")
+        agreement.should_run_warmup_batch(None, 2, "attention, num_tokens=2, num_gen_requests=1")
         is False
     )
 
 
 def test_group_disagreement_still_fails_with_the_ranks_named() -> None:
     """Asymmetric capacity is the deadlock the agreement exists to catch."""
-    engine = _engine(world_size=3, peer_values=(1, 0))
+    agreement = _agreement(world_size=3, peer_values=(1, 0))
 
     with pytest.raises(RuntimeError) as excinfo:
-        engine._should_run_warmup_batch(None, 128, "general")
+        agreement.should_run_warmup_batch(None, 128, "general")
 
     message = str(excinfo.value)
     assert "rank(s) [0, 2]" in message
@@ -293,15 +302,15 @@ def test_pipeline_only_world_agrees_without_a_tp_group() -> None:
     Three of the ten failures were disaggregated context servers at
     `tensor_parallel_size: 1, pipeline_parallel_size: 2`.
     """
-    engine = _engine(world_size=2, tp_size=1, peer_values=(0,))
+    agreement = _agreement(world_size=2, tp_size=1, peer_values=(0,))
 
-    assert engine._should_run_warmup_batch(None, 128, "general") is False
+    assert agreement.should_run_warmup_batch(None, 128, "general") is False
 
 
 def test_agreement_group_is_absent_for_dwdp() -> None:
-    engine = _engine(world_size=4, dwdp_size=4)
+    agreement = _agreement(world_size=4, dwdp_size=4)
 
-    assert engine._warmup_agreement_allgather() is None
+    assert agreement.allgather() is None
 
 
 @pytest.mark.parametrize(
@@ -318,31 +327,31 @@ def test_agreement_group_is_absent_for_dwdp() -> None:
 def test_phase_entry_flag_is_agreed(
     world_size: int, peer_values: tuple[int, ...] | None, flag: bool, expected: bool
 ) -> None:
-    engine = _engine(world_size=world_size, peer_values=peer_values)
+    agreement = _agreement(world_size=world_size, peer_values=peer_values)
 
-    assert engine._agree_warmup_flag(flag) is expected
+    assert agreement.agree_flag(flag) is expected
 
 
 def test_shape_list_narrows_to_what_every_rank_proposed() -> None:
     """Attention-DP gives ranks different capacities and so different shapes."""
-    engine = _engine(world_size=2)
-    engine.dist.allgather = lambda value: [value, [[1, 0], [2, 0]]]
+    agreement = _agreement(world_size=2)
+    agreement.dist.allgather = lambda value: [value, [[1, 0], [2, 0]]]
 
-    assert engine._agree_warmup_shapes([(1, 0), (2, 0), (4096, 0)]) == [(1, 0), (2, 0)]
+    assert agreement.agree_shapes([(1, 0), (2, 0), (4096, 0)]) == [(1, 0), (2, 0)]
 
 
 def test_shape_list_is_untouched_without_a_group() -> None:
-    engine = _engine(world_size=1)
+    agreement = _agreement(world_size=1)
     configs = [(1, 0), (128, 0)]
 
-    assert engine._agree_warmup_shapes(configs) == configs
+    assert agreement.agree_shapes(configs) == configs
 
 
 def test_warmup_batch_policy_without_communicator() -> None:
     """An engine built without a communicator cannot strand anyone: skip, don't raise."""
-    engine = _engine(with_dist=False)
+    agreement = _agreement(with_dist=False)
 
-    assert engine._should_run_warmup_batch(None, 128, "general") is False
+    assert agreement.should_run_warmup_batch(None, 128, "general") is False
 
 
 def test_tp_agreement_needs_a_communicator_not_just_a_mapping() -> None:
@@ -351,10 +360,10 @@ def test_tp_agreement_needs_a_communicator_not_just_a_mapping() -> None:
     The agreement check gates on `tp_size`, so it has to answer for that
     state rather than walking into a collective on `None`.
     """
-    engine = _engine(tp_size=2, with_dist=False)
+    agreement = _agreement(tp_size=2, with_dist=False)
 
-    assert engine._should_run_warmup_batch(object(), 128, "general") is True
-    assert engine._should_run_warmup_batch(None, 128, "general") is False
+    assert agreement.should_run_warmup_batch(object(), 128, "general") is True
+    assert agreement.should_run_warmup_batch(None, 128, "general") is False
 
 
 def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
@@ -369,10 +378,10 @@ def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
     check remains the only thing standing between an asymmetric world and a
     deadlock.
     """
-    engine = _engine(world_size=2, dwdp_size=4, tp_size=2, tp_peer_values=(0,))
+    agreement = _agreement(world_size=2, dwdp_size=4, tp_size=2, tp_peer_values=(0,))
 
     with pytest.raises(RuntimeError) as excinfo:
-        engine._should_run_warmup_batch(object(), 128, "general")
+        agreement.should_run_warmup_batch(object(), 128, "general")
 
     message = str(excinfo.value)
     assert "TP rank(s) [1]" in message
@@ -380,9 +389,9 @@ def test_tp_disagreement_reports_the_ranks_that_lost_their_batch() -> None:
 
 
 def test_tp_agreement_lets_a_symmetric_world_run() -> None:
-    engine = _engine(world_size=2, tp_size=2, tp_peer_values=(1,))
+    agreement = _agreement(world_size=2, tp_size=2, tp_peer_values=(1,))
 
-    assert engine._should_run_warmup_batch(object(), 128, "general") is True
+    assert agreement.should_run_warmup_batch(object(), 128, "general") is True
 
 
 def _general_warmup_engine(*, world_size: int, dwdp_size: int) -> DecoderRunner:
