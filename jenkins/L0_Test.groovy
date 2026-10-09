@@ -1086,6 +1086,67 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
+// Cap on GPUs used concurrently on gcp-iad across all Jenkins instances. Every
+// submission goes through GCP_IAD_GPU_BUDGET_SCRIPT on the frontend, which keeps a
+// ledger of {slurm job id, gpus} under GCP_IAD_GPU_BUDGET_DIR and serializes the
+// check-and-submit step with flock, so concurrent submitters cannot overbook. Usage is
+// the ledger entries whose job is still queued/running in Slurm (squeue is the source of
+// truth, so jobs that died without cleanup stop counting by themselves).
+GCP_IAD_GPU_LIMIT = 144
+GCP_IAD_GPU_BUDGET_DIR = "/home/svc_tensorrt/gpu_budget/gcp-iad"
+// Args: <gpus> <limit> <state dir> <base64 submit command>
+GCP_IAD_GPU_BUDGET_SCRIPT = '''
+gpus=$1
+limit=$2
+dir=$3
+cmd=$(printf %s "$4" | base64 -d)
+if [ "$gpus" -gt "$limit" ]; then
+    echo "[gpu-budget] request of $gpus GPUs exceeds the limit of $limit" >&2
+    exit 1
+fi
+mkdir -p "$dir"
+ledger="$dir/ledger"
+touch "$ledger"
+exec 9>>"$dir/lock"
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+while true; do
+    flock -x 9
+    # Drop ledger entries whose job left the queue. If squeue fails, keep every entry.
+    if active=$(squeue -h -u "$(id -un)" -t R,PD,CF,CG -o %i 2>/dev/null); then
+        printf '%s\n' "$active" | awk 'NR==FNR {a[$1]=1; next} ($1 in a)' - "$ledger" > "$ledger.tmp" && mv "$ledger.tmp" "$ledger"
+    fi
+    used=$(awk '{s+=$2} END {print s+0}' "$ledger")
+    if [ $((used + gpus)) -le "$limit" ]; then
+        echo "[gpu-budget] using $used/$limit GPUs, submitting $gpus more" >&2
+        rc=0
+        # Close the lock fd for the command so background children cannot hold the lock.
+        bash -c "$cmd" > "$out" 2>&1 9>&- || rc=$?
+        cat "$out"
+        if [ "$rc" -eq 0 ]; then
+            id=$(grep -oE '(Submitted batch job |srun: job |SLURM_JOB_ID=|SLURM_JOBID=)[0-9]+' "$out" | grep -oE '[0-9]+$' | tail -1)
+            if [ -n "$id" ]; then
+                echo "$id $gpus" >> "$ledger"
+            fi
+        fi
+        exit "$rc"
+    fi
+    flock -u 9
+    echo "[gpu-budget] $used/$limit GPUs in use, need $gpus; waiting" >&2
+    sleep $((45 + RANDOM % 30))
+done
+'''
+
+// Wrap a Slurm submission command in the gcp-iad GPU budget check (see above). Other
+// platforms get the command back unchanged.
+def withGpuBudget(platform, String command, gpuCount) {
+    if (!platform.toString().contains("gcp-iad")) {
+        return command
+    }
+    def b64 = { String text -> java.util.Base64.getEncoder().encodeToString(text.getBytes("UTF-8")) }
+    return "bash <(echo ${b64(GCP_IAD_GPU_BUDGET_SCRIPT)} | base64 -d) ${gpuCount as int} ${GCP_IAD_GPU_LIMIT} ${GCP_IAD_GPU_BUDGET_DIR} ${b64(command)}"
+}
+
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -1185,6 +1246,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = withGpuBudget(platform, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -2369,7 +2431,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_attempt=1
                     while true; do
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
+                        sbatch_output=\$(${withGpuBudget(platform, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
                         printf '%s\\n' "\${sbatch_output}"
                         printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
                         if [ "\${sbatch_rc}" -eq 0 ]; then
