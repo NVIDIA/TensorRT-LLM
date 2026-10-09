@@ -3484,8 +3484,11 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                pytest.raises(click.UsageError,
-                              match="num_serve_frontends must be 1"),
+                pytest.raises(
+                    click.UsageError,
+                    match=
+                    "Multiple gRPC frontends require --grpc-protocol openengine"
+                ),
         ):
             serve_main(
                 args=[
@@ -3493,6 +3496,24 @@ class TestServeDefaults:
                 ],
                 standalone_mode=False,
             )
+
+    def test_serve_set_grpc_openengine_uses_multiple_frontends(self) -> None:
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.grpc.openengine.server.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--grpc", "--grpc-protocol", "openengine",
+                    "--gpus_per_node", "1", "--set", "num_serve_frontends=2"
+                ],
+                standalone_mode=False,
+            )
+
+        mock_launch_server.assert_called_once()
+        assert mock_launch_server.call_args.args[2]["num_serve_frontends"] == 2
 
     def test_serve_set_does_not_capture_misspelled_options(self) -> None:
         with pytest.raises(click.NoSuchOption):

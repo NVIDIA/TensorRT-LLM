@@ -454,9 +454,9 @@ class BaseLLM:
 
         # Attached serving frontends connect to an already-running worker:
         # they must not spawn an MPI session (see GenerationExecutor.create).
-        is_attached_frontend = os.getenv(
+        self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
-        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
+        if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -1622,8 +1622,10 @@ class BaseLLM:
                 "(Router Replay): routes are not captured otherwise.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session)
+        model_loader = CachedModelLoader(
+            self.args,
+            mpi_session=self.mpi_session,
+            is_attached_frontend=self._is_attached_frontend)
         self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
