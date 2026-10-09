@@ -1260,6 +1260,16 @@ def test_bf16_configuration_opts_into_the_fused_swiglu_epilogue(
 )
 def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
     """With eligible shapes every refiner and transformer block's FFN takes the fused op once."""
+    if not gated_mlp_module.gate_up_swiglu_quack_available():
+        pytest.skip("QuACK gemm_act is unavailable")
+    # The kernel is built on first use; when it does not build against the installed CUTLASS
+    # DSL it disables itself and GatedMLP falls back, which is not what this test is about.
+    gated_mlp_module.gate_up_swiglu_quack_bf16(
+        torch.randn(16, 64, dtype=torch.bfloat16, device="cuda"),
+        torch.randn(128, 64, dtype=torch.bfloat16, device="cuda"),
+    )
+    if not gated_mlp_module.gate_up_swiglu_quack_available():
+        pytest.skip("QuACK gemm_act does not run against the installed CUTLASS DSL (see warning)")
     model = h3.MiniMaxH3Transformer3DModel(
         _make_model_config(num_layers=2, num_refiner_layers=1, **_NVFP4_SHAPES)
     ).to("cuda")
