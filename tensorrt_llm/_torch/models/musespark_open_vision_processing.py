@@ -702,7 +702,9 @@ def patchify(frames: torch.Tensor, cfg: Any = None) -> torch.Tensor:
 # --------------------------------------------------------------------------
 
 
-def _check_grid(grid_thw: Sequence[int], cfg: MuseSparkOpenPreprocessConfig) -> tuple[int, int, int]:
+def _check_grid(
+    grid_thw: Sequence[int], cfg: MuseSparkOpenPreprocessConfig
+) -> tuple[int, int, int]:
     if len(grid_thw) != 3:
         raise VisionPreprocessError(f"grid_thw must be (t, h, w), got {tuple(grid_thw)}")
     t, h, w = (int(x) for x in grid_thw)

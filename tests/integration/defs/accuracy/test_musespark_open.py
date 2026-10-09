@@ -40,7 +40,9 @@ class TestMuseSparkOpen(LlmapiAccuracyTestHarness):
     # Pre-release the NVFP4 checkpoint is staged outside llm-models and named
     # by MUSESPARK_REFERENCE_CKPT; the llm_models_root() path takes over
     # once it lands there.
-    MODEL_PATH = os.environ.get("MUSESPARK_REFERENCE_CKPT") or (f"{llm_models_root()}/MuseSparkOpen")
+    MODEL_PATH = os.environ.get("MUSESPARK_REFERENCE_CKPT") or (
+        f"{llm_models_root()}/MuseSparkOpen"
+    )
 
     @staticmethod
     def _llm_kwargs(cuda_graph: bool) -> dict:

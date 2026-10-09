@@ -323,7 +323,9 @@ class _StubTokenizer:
 
 
 def _build_processor(model_path="/nonexistent/checkpoint"):
-    from tensorrt_llm._torch.models.modeling_musespark_open_omni import MuseSparkOpenOmniInputProcessor
+    from tensorrt_llm._torch.models.modeling_musespark_open_omni import (
+        MuseSparkOpenOmniInputProcessor,
+    )
 
     return MuseSparkOpenOmniInputProcessor(
         model_path=model_path,
@@ -1124,7 +1126,9 @@ def test_a_null_sampling_fps_omits_the_fps_key():
     the frame cap as the only bound."""
     from dataclasses import replace
 
-    from tensorrt_llm._torch.models.musespark_open_vision_processing import MuseSparkOpenPreprocessConfig
+    from tensorrt_llm._torch.models.musespark_open_vision_processing import (
+        MuseSparkOpenPreprocessConfig,
+    )
 
     processor = _build_processor()
     processor._vision_config = replace(MuseSparkOpenPreprocessConfig(), sampling_fps=None)

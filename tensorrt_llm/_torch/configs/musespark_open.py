@@ -507,7 +507,9 @@ class MuseSparkOpenConfig(PretrainedConfig):
         # `**kwargs`, so a checkpoint variant with a different activation fails
         # here instead of silently running SwiGLU against non-SwiGLU weights.
         if non_linearity != "swiglu":
-            raise ValueError(f"MuseSparkOpen supports non_linearity='swiglu', got {non_linearity!r}")
+            raise ValueError(
+                f"MuseSparkOpen supports non_linearity='swiglu', got {non_linearity!r}"
+            )
         self.non_linearity = non_linearity
         self.use_qk_norm = use_qk_norm
         self.use_rope = use_rope

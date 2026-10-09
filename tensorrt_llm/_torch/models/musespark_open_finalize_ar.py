@@ -1102,7 +1102,9 @@ class FinalizeIpcWorkspace:
         for pointer in self._imports:
             (error,) = cudart.cudaIpcCloseMemHandle(pointer)
             if error != cudart.cudaError_t.cudaSuccess:
-                logger.warning(f"MuseSparkOpen finalize workspace release: unmapping failed: {error}")
+                logger.warning(
+                    f"MuseSparkOpen finalize workspace release: unmapping failed: {error}"
+                )
                 ok = False
         self._imports = []
         return ok

@@ -558,7 +558,9 @@ class MuseSparkOpenNaViTVisionTower(nn.Module, MultimodalEncoderMixin):
         super().__init__()
         vision_config = getattr(model_config.pretrained_config, "vision_config", None)
         if vision_config is None:
-            raise ValueError("MuseSparkOpen checkpoint has no vision_config; cannot build the tower")
+            raise ValueError(
+                "MuseSparkOpen checkpoint has no vision_config; cannot build the tower"
+            )
         if not isinstance(vision_config, MuseSparkOpenVisionConfig):
             vision_config = MuseSparkOpenVisionConfig.from_hf(
                 vision_config if isinstance(vision_config, dict) else vision_config.to_dict()

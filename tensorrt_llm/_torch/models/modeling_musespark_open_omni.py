@@ -154,7 +154,9 @@ _MAX_AUDIO_TOKENS_PER_ITEM = 1024
 _DUMMY_AUDIO_SAMPLES = AUDIO_TARGET_SAMPLE_RATE
 
 
-class MuseSparkOpenOmniInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
+class MuseSparkOpenOmniInputProcessor(
+    BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
+):
     """Turn (text, images/videos) into token ids plus per-modality tensors.
 
     There is no HF ``AutoProcessor`` for this model in the pinned

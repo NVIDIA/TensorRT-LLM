@@ -20,7 +20,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE, MuseSparkOpenRoutingMethod
+from tensorrt_llm._torch.models.modeling_musespark_open import (
+    MuseSparkOpenMoE,
+    MuseSparkOpenRoutingMethod,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

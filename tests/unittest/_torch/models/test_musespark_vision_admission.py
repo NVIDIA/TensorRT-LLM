@@ -118,7 +118,9 @@ def _hook(mm_encoder):
     """Call the (plain) method without instantiating the model."""
     fake_self = types.SimpleNamespace(mm_encoder=mm_encoder)
     return lambda mm_data: (
-        MuseSparkOpenOmniForConditionalGeneration.validate_multimodal_request_data(fake_self, mm_data)
+        MuseSparkOpenOmniForConditionalGeneration.validate_multimodal_request_data(
+            fake_self, mm_data
+        )
     )
 
 

@@ -2636,7 +2636,9 @@ def assert_supported_spec_config(spec_config: Any) -> None:
 # one, so a registration left here would win the slot and the perception tower
 # would never be built. This class keeps no architecture string of its own and
 # is reached by import: from the omni wrapper, and from its tests.
-class MuseSparkOpenForCausalLM(SpecDecOneEngineForCausalLM[MuseSparkOpenModel, MuseSparkOpenConfig]):
+class MuseSparkOpenForCausalLM(
+    SpecDecOneEngineForCausalLM[MuseSparkOpenModel, MuseSparkOpenConfig]
+):
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         quant_config = model_config.quant_config
         if quant_config is not None and quant_config.exclude_modules:

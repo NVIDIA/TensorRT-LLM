@@ -118,7 +118,9 @@ def test_three_layer_boundary_carry_and_graph(tokens):
             layer.post_attn_norm = RMSNorm(
                 hidden_size=hidden, eps=1e-5, dtype=torch.bfloat16, has_weights=False
             ).cuda()
-            layer.post_ffn_norm = MuseSparkOpenRMSNormWeightFirst(hidden, 1e-5, torch.bfloat16).cuda()
+            layer.post_ffn_norm = MuseSparkOpenRMSNormWeightFirst(
+                hidden, 1e-5, torch.bfloat16
+            ).cuda()
             layer.add_attn = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).cuda()
             layer.add_ffn = MuseSparkOpenGatedResidual(hidden, torch.bfloat16).cuda()
             layer.self_attn = lambda hidden_states, **kwargs: hidden_states * 0.7
