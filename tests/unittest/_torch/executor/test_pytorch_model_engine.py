@@ -79,7 +79,6 @@ def _input_preparer() -> DecoderInputPreparer:
                                 None, {},
                                 None,
                                 use_beam_search=False,
-                                steady_gen_cache_supported=True,
                                 fast_path=lambda *args, **kwargs: None,
                                 new_extra_inputs=None)
 
@@ -1325,7 +1324,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             "graphs_disabled",
             "speculative_nonzero_runtime_draft",
             "beam",
-            "encoder_decoder",
+            "extra_inputs",
             "ple_recurrent_state",
             "nested_ple_recurrent_state",
             "context_parallel",
@@ -1345,8 +1344,8 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                         get_runtime_tokens_per_gen_step=Mock(return_value=1))
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
-                elif case == "encoder_decoder":
-                    engine._runner._context_graph_promotion_supported = False
+                elif case == "extra_inputs":
+                    engine._runner._new_extra_inputs = Mock()
                 elif case == "ple_recurrent_state":
                     engine.model.has_ple = True
                 elif case == "nested_ple_recurrent_state":
@@ -3091,7 +3090,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 elif case == "beam":
                     engine._runner._config.max_beam_width = 2
                 elif case == "encoder_decoder":
-                    engine._runner._context_graph_promotion_supported = False
+                    engine._runner._new_extra_inputs = Mock()
                 elif case == "context_parallel":
                     engine.mapping.cp_size = 2
                 elif case == "draft_key":

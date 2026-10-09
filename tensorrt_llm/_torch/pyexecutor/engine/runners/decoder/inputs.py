@@ -190,9 +190,8 @@ class DecoderInputPreparer:
         lora: LoraParamBuilder,
         *,
         use_beam_search: bool,
-        steady_gen_cache_supported: bool,
         fast_path: Callable[..., PreparedInputs | None],
-        new_extra_inputs: Callable[[], ExtraInputsCollector],
+        new_extra_inputs: Callable[[], ExtraInputsCollector] | None,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
         self._buffers = buffers
@@ -205,7 +204,6 @@ class DecoderInputPreparer:
         self.iter_states = iter_states
         self._lora = lora
         self.use_beam_search = use_beam_search
-        self._steady_gen_cache_supported = steady_gen_cache_supported
         self._prepare_inputs_fast_path = fast_path
         self._new_extra_inputs = new_extra_inputs
         self.guided_decoder: CapturableGuidedDecoder | None = None
@@ -624,7 +622,9 @@ class DecoderInputPreparer:
             self._config.max_num_tokens, self.mapping.pp_size
         )
         num_accepted_draft_tokens = []  # per request
-        extra_inputs = self._new_extra_inputs()
+        extra_inputs = (
+            _NO_EXTRA_INPUTS if self._new_extra_inputs is None else self._new_extra_inputs()
+        )
 
         context_prompt_lookahead = None
         if spec_metadata is not None and spec_metadata.context_prompt_lookahead_tokens is not None:
@@ -1744,7 +1744,7 @@ class DecoderInputPreparer:
                 and not mrope_delta_read_seq_slots
                 and not self.use_beam_search
                 and self._config.max_beam_width == 1
-                and self._steady_gen_cache_supported
+                and self._new_extra_inputs is None
                 and not _has_cp_helix
                 and num_ctx_requests == 0
                 and not extend_requests

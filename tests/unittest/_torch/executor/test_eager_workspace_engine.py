@@ -16,6 +16,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer, WorkspaceShrinkPolicy
 
 _RUNNER_MODULE = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner"
@@ -228,8 +229,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         scope.return_value.__exit__.assert_called_once_with(None, None, None)
 
     def test_ineligible_modes_and_workspaces_do_not_create_reclaimer(self) -> None:
-        with patch.object(self.engine, "_eager_workspace_reclaim_supported", False):
-            self.freeze()
+        EncoderDecoderRunner._freeze_eager_workspace_floor(self.engine)
         self.assertIsNone(self.engine._eager_workspace_reclaimer)
         self.reclaimer_class.assert_not_called()
         for target, name, value in [

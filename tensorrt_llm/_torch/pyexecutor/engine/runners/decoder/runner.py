@@ -81,12 +81,7 @@ from ..interface import PreparedInputs, ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs
-from .inputs import (
-    _NO_EXTRA_INPUTS,
-    DecoderInputBuffers,
-    DecoderInputPreparer,
-    ExtraInputsCollector,
-)
+from .inputs import DecoderInputBuffers, DecoderInputPreparer, ExtraInputsCollector
 from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
 from .speculative import get_spec_managers, resolve_runtime_draft_len, update_spec_metadata
 from .warmup import WarmupAgreement
@@ -151,14 +146,15 @@ def _make_single_token_context_graph_batch(
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
-    # Optional execution paths that a subclass can turn off.
+    # Warmups that synthesize context batches; a subclass can turn them off.
     _context_warmups_supported = True
-    _context_graph_promotion_supported = True
-    _steady_gen_cache_supported = True
-    _eager_workspace_reclaim_supported = True
     # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
     # the longest one; None keeps the cache manager's default.
     _dummy_request_tokens: int | None = None
+    # Collects per-sequence model inputs beyond the decoder's own; None when the
+    # model takes none. Steady-generation reuse and context-row promotion do
+    # not carry such inputs, so both stay off while it is set.
+    _new_extra_inputs: Callable[[], ExtraInputsCollector] | None = None
 
     def __init__(
         self,
@@ -231,7 +227,6 @@ class DecoderRunner(ScheduledModelRunner):
             iter_states,
             self._lora,
             use_beam_search=self.use_beam_search,
-            steady_gen_cache_supported=self._steady_gen_cache_supported,
             fast_path=self._prepare_inputs_fast_path,
             new_extra_inputs=self._new_extra_inputs,
             mm_item_scheduler=mm_item_scheduler,
@@ -679,14 +674,13 @@ class DecoderRunner(ScheduledModelRunner):
         if (
             self._config.is_spec_decode
             or self.mapping.cp_size != 1
-            or not self._eager_workspace_reclaim_supported
             or self.sparse_attention_config is not None
             or self._torch_compile_backend is not None
             or self.breakable_cuda_graph_runner is not None
         ):
             logger.info(
                 "Eager workspace reclamation is disabled for speculative, "
-                "CP, encoder-decoder, sparse, compiled, or breakable-graph models"
+                "CP, sparse, compiled, or breakable-graph models"
             )
             return
         if (
@@ -1803,9 +1797,6 @@ class DecoderRunner(ScheduledModelRunner):
         """Return the prepared inputs when a specialized path prepares the batch."""
         return None
 
-    def _new_extra_inputs(self) -> "ExtraInputsCollector":
-        return _NO_EXTRA_INPUTS
-
     def _forward_warmup(
         self,
         batch: ScheduledRequests,
@@ -1893,7 +1884,7 @@ class DecoderRunner(ScheduledModelRunner):
             and can_promote_spec_decode
             and not ced_enabled
             and not self.use_beam_search
-            and self._context_graph_promotion_supported
+            and self._new_extra_inputs is None
             # PLE owns recurrent n-gram and convolution state. Promoting a
             # fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
@@ -2388,7 +2379,7 @@ class DecoderRunner(ScheduledModelRunner):
             and not promoted_context_request_ids
             and not enable_spec_decode
             and not self.use_beam_search
-            and self._context_graph_promotion_supported
+            and self._new_extra_inputs is None
             and self.mapping.cp_size == 1
         ):
             return defer()
