@@ -65,6 +65,7 @@ def _register_custom_configs_with_transformers() -> None:
         "cosmos3_omni": Cosmos3Config,
         "deepseek_v32": DeepseekV3Config,
         "kimi_k2": DeepseekV3Config,
+        "xing4_0": DeepseekV3Config,
         "deepseek_v4": DeepseekV4Config,
         "glm5_next": Glm5NextConfig,
         "glm5_next_text": Glm5NextTextConfig,
