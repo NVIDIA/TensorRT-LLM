@@ -2917,6 +2917,9 @@
               "type": "string"
             },
             {
+              "not": {}
+            },
+            {
               "type": "null"
             }
           ],
@@ -8944,6 +8947,9 @@
         {
           "format": "path",
           "type": "string"
+        },
+        {
+          "not": {}
         },
         {
           "type": "null"

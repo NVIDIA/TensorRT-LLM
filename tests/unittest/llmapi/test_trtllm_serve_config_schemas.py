@@ -27,7 +27,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, create_model
 
 pytestmark = pytest.mark.cpu_only
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -206,6 +206,45 @@ def test_serving_field_guard_rejects_empty_scan() -> None:
         _assert_serving_fields_in_schema("def serve(): pass", "serve", {})
 
 
+def _assert_model_fields_in_schema(model: type[BaseModel], properties: dict) -> None:
+    """Guard top-level model input names, including validation aliases."""
+    expected = set()
+    for name, field in model.model_fields.items():
+        alias = field.validation_alias or name
+        aliases = alias if isinstance(alias, AliasChoices) else AliasChoices(alias)
+        expected.update(path[0] for path in aliases.convert_to_aliases())
+        if model.model_config.get("validate_by_name", model.model_config.get("populate_by_name")):
+            expected.add(name)
+    missing = expected - properties.keys()
+    assert not missing, f"Model fields/aliases missing from schema: {sorted(missing)}"
+
+
+def test_llm_model_fields_have_schema(schemas: dict[str, dict]) -> None:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    disagg = schemas[generator.DISAGG_SCHEMA]
+    for schema in (
+        schemas[generator.SERVE_SCHEMA],
+        disagg,
+        disagg["$defs"]["DisaggServerBlock"],
+    ):
+        _assert_model_fields_in_schema(TorchLlmArgs, schema["properties"])
+
+
+def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
+    class Config(BaseModel):
+        plain: int
+        renamed: int = Field(alias="external")
+        choice: int | None = Field(default=None, validation_alias=AliasChoices("new", "old"))
+
+    properties = generator._schema_for(Config)["properties"]
+    _assert_model_fields_in_schema(Config, properties)
+    for name in ("plain", "external", "new", "old"):
+        incomplete = {key: value for key, value in properties.items() if key != name}
+        with pytest.raises(AssertionError, match=f"missing from schema.*{name}"):
+            _assert_model_fields_in_schema(Config, incomplete)
+
+
 def test_input_schemas_come_from_runtime_validators(schemas: dict[str, dict]) -> None:
     from tensorrt_llm.llmapi.llm_args import BaseLlmArgs, MultimodalConfig, TorchLlmArgs
 
@@ -366,7 +405,7 @@ def test_runtime_only_union_does_not_disable_validation() -> None:
         pass
 
     class Config(BaseModel):
-        model_config = ConfigDict(arbitrary_types_allowed=True)
+        model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
         tokenizer: str | RuntimeObject | None = None
         count: int = Field(1, json_schema_extra={"type": "Python int"})
 
@@ -375,10 +414,40 @@ def test_runtime_only_union_does_not_disable_validation() -> None:
     Draft202012Validator.check_schema(schema)
     validator = Draft202012Validator(schema)
     validator.validate({"tokenizer": "name", "count": 2})
+    validator.validate({"tokenizer": None})
     for value in (1, [], {}, True):
         assert not validator.is_valid({"tokenizer": value})
     assert not validator.is_valid({"count": "two"})
     assert Config.model_fields["count"].json_schema_extra == original
+
+
+@pytest.mark.parametrize("nullable", [False, True])
+@pytest.mark.parametrize("union", [False, True])
+def test_runtime_only_fields_are_preserved(nullable: bool, union: bool) -> None:
+    class RuntimeObject:
+        pass
+
+    class OtherRuntimeObject:
+        pass
+
+    annotation = RuntimeObject | OtherRuntimeObject if union else RuntimeObject
+    if nullable:
+        annotation = annotation | None
+    config_model = create_model(
+        "Config",
+        __config__=ConfigDict(arbitrary_types_allowed=True, extra="forbid"),
+        hook=(annotation, Field(alias="external_hook")),
+    )
+    value = None if nullable else RuntimeObject()
+    assert config_model(external_hook=value).hook is value
+    schema = generator._schema_for(config_model)
+    Draft202012Validator.check_schema(schema)
+    _assert_model_fields_in_schema(config_model, schema["properties"])
+    assert schema["required"] == ["external_hook"]
+    validator = Draft202012Validator(schema)
+    assert not validator.is_valid({})
+    for value in (None, "name", 1, True, [], {}):
+        assert validator.is_valid({"external_hook": value}) == (nullable and value is None)
 
 
 def test_nested_validation_alias(schemas: dict[str, dict]) -> None:

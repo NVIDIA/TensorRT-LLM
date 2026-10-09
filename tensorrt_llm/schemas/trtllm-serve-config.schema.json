@@ -7249,6 +7249,9 @@
           "type": "string"
         },
         {
+          "not": {}
+        },
+        {
           "type": "null"
         }
       ],
