@@ -130,6 +130,12 @@ def test_bad_arguments():
         torch.ops.trtllm.scatter_kv_slots_(pool, k, k, torch.arange(9, device=DEV))
     with pytest.raises(RuntimeError, match="entries"):
         torch.ops.trtllm.scatter_kv_slots_(pool, k, k, dst, dst2=dst[:4])
+    # [8 tokens, heads, head_dim], a view of the pool, the shape of k
+    pool_view = pool[0, 0].permute(1, 0, 2)[:8]
+    with pytest.raises(RuntimeError, match="share storage"):
+        torch.ops.trtllm.scatter_kv_slots_(pool, pool_view, k, dst)
+    with pytest.raises(RuntimeError, match="share storage"):
+        torch.ops.trtllm.scatter_kv_slots_(pool, k, pool_view, dst)
 
 
 def test_traces_under_torch_compile():

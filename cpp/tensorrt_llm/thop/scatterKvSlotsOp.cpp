@@ -42,7 +42,8 @@ void checkSlotIndex(torch::Tensor const& t, char const* name, int64_t numEntries
 //! is ``page * tokens_per_page + slot``.
 //! ``pool``: ``[pages, 2, heads, tokens_per_page, head_dim]``, any strides with a unit head_dim stride.
 //! ``k``, ``v``: ``[tokens, heads, head_dim]``, same dtype as ``pool``, unit head_dim stride, any
-//! token and head strides (e.g. slices of a fused QKV projection). Indices are not range-checked
+//! token and head strides (e.g. slices of a fused QKV projection). The host checks shapes, dtypes,
+//! devices and that ``k``/``v`` do not share storage with ``pool``; slot ids are not range-checked
 //! on the device. No allocation, safe inside CUDA graph capture.
 void scatter_kv_slots_(torch::Tensor pool, torch::Tensor k, torch::Tensor v, torch::Tensor dst,
     std::optional<torch::Tensor> dst2, std::optional<torch::Tensor> src)
@@ -61,6 +62,10 @@ void scatter_kv_slots_(torch::Tensor pool, torch::Tensor k, torch::Tensor v, tor
     TORCH_CHECK(pool.stride(4) == 1 && k.stride(2) == 1 && v.stride(2) == 1,
         "scatter_kv_slots_: head_dim must be contiguous in pool, k and v");
     TORCH_CHECK(k.device() == pool.device() && v.device() == pool.device(), "scatter_kv_slots_: device mismatch");
+    // A view of the pool as a source would race with the writes; the kernel reads k and v
+    // while other threads write pool slots.
+    TORCH_CHECK(!k.is_alias_of(pool) && !v.is_alias_of(pool),
+        "scatter_kv_slots_: k and v must not share storage with the pool");
 
     int64_t const numEntries = dst.numel();
     checkSlotIndex(dst, "dst", numEntries, pool.device());
