@@ -111,7 +111,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_att
     k3_kda_decode_attn,
 )
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
+from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
 
 # <<< route B
 from tensorrt_llm._torch.distributed import AllReduce

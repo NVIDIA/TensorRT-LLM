@@ -109,10 +109,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_decode_att
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.k3_kda_verify import k3_kda_verify
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
-from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import k3_mla_decode_view
 
 # Registers trtllm::kda_mtp_decode (REQUIRED_TRTLLM_OPS), which the built-in KDA module loads on its first verify.
 from tensorrt_llm._torch.custom_ops import cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.k3_mla.decode_view import k3_mla_decode_view
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
