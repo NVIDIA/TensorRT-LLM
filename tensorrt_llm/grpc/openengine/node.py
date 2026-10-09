@@ -19,7 +19,7 @@ from .bindings import (
     openengine_pb2_grpc,
     server_pb2,
 )
-from .kv_events import _WILDCARD_HOSTS, _format_tcp_endpoint, _split_tcp_endpoint
+from .kv_events import _WILDCARD_HOSTS, _format_host_port, _format_tcp_endpoint, _split_tcp_endpoint
 
 __all__ = ["NodeMetadataServer", "initialize_node_discovery"]
 
@@ -78,7 +78,7 @@ class NodeMetadataServer:
         )
         openengine_pb2_grpc.add_ControlServicer_to_server(_NodeControl(info, sources), self._server)
         try:
-            address = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+            address = _format_host_port(host, port)
             self.port = self._server.add_insecure_port(address)
             if not self.port:
                 raise RuntimeError(f"Cannot bind OpenEngine node discovery to {address}")
