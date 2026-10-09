@@ -24,7 +24,7 @@ from typing import Any
 
 from pydantic import TypeAdapter
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
-from pydantic_core import PydanticOmit, core_schema
+from pydantic_core import core_schema
 
 _DOCS_URL = "https://nvidia.github.io/TensorRT-LLM"
 _JSON_TYPES = {"string", "number", "integer", "boolean", "null", "array", "object"}
@@ -40,8 +40,8 @@ class ServeSchemaGenerator(GenerateJsonSchema):
     def handle_invalid_for_json_schema(
         self, schema: core_schema.CoreSchema, error_info: str
     ) -> JsonSchemaValue:
-        # An unconstrained fallback would make e.g. str | Tokenizer accept any YAML value.
-        raise PydanticOmit
+        # Reject unsupported values without dropping the field or its nullable/union alternatives.
+        return {"not": {}}
 
     def generate_inner(self, schema: core_schema.CoreSchema) -> JsonSchemaValue:
         metadata = schema.get("metadata", {})
