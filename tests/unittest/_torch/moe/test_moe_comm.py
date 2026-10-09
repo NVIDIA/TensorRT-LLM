@@ -2752,6 +2752,8 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     executor.dist = SimpleNamespace(rank=rank, world_size=world_size)
     executor.model_engine = SimpleNamespace(model=_Model())
     executor.draft_model_engine = None
+    executor._is_kv_manager_v2 = False
+    executor.enable_kv_cache_reuse = False
 
     class _ControlRequestQueue:
         def enqueue_control_request(self, *, drain, control_id):

@@ -19,9 +19,13 @@ via object.__new__ + manual attribute injection.
 """
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,8 +62,81 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
         complete_wakeup_transition=MagicMock(),
         abort_wakeup_transition=MagicMock(),
         fail_sleep_wakeup_transition=MagicMock(),
+        validate_sleep_tags=MagicMock(),
+        invalidate_v1_prefix_cache_for_sleep=MagicMock(),
     )
     return w
+
+
+class TestV2KvCacheSleepRejection:
+    @pytest.mark.parametrize(
+        "use_v2,tags,should_raise",
+        [
+            (True, ["kv_cache"], True),
+            (True, ["model", "kv_cache"], True),
+            (True, ["model"], False),
+            (False, ["kv_cache"], False),
+        ],
+    )
+    def test_validation_conditions(self, use_v2, tags, should_raise):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = use_v2
+        parsed_tags = [ExecutorMemoryType(tag) for tag in tags]
+
+        if should_raise:
+            with pytest.raises(
+                ValueError,
+                match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+            ):
+                executor.validate_sleep_tags(parsed_tags)
+        else:
+            executor.validate_sleep_tags(parsed_tags)
+
+    def test_rejected_before_transition_or_mpi_dispatch(self):
+        worker = _make_worker(world_size=2)
+        worker.engine.validate_sleep_tags.side_effect = ValueError(
+            "KV_CACHE sleep is not supported with KVCacheManagerV2"
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="KV_CACHE sleep is not supported with KVCacheManagerV2",
+        ):
+            worker.sleep(["kv_cache"])
+
+        worker.engine.begin_sleep_transition.assert_not_called()
+
+
+class TestV1PrefixCacheInvalidation:
+    @pytest.mark.parametrize(
+        "use_v2,enable_reuse,tags,restore_mode,should_reset",
+        [
+            (False, True, ["kv_cache"], "NONE", True),
+            (False, True, ["kv_cache"], "MEMSET", True),
+            (False, True, ["kv_cache"], "CPU", False),
+            (False, True, ["model"], "NONE", False),
+            (True, True, ["kv_cache"], "NONE", False),
+            (False, False, ["kv_cache"], "NONE", False),
+        ],
+    )
+    def test_invalidation_conditions(self, use_v2, enable_reuse, tags, restore_mode, should_reset):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+        executor = object.__new__(PyExecutor)
+        executor._is_kv_manager_v2 = use_v2
+        executor.enable_kv_cache_reuse = enable_reuse
+        executor.llm_args = SimpleNamespace(
+            sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: restore_mode})
+        )
+        executor.reset_prefix_cache = MagicMock()
+
+        executor.invalidate_v1_prefix_cache_for_sleep([ExecutorMemoryType(tag) for tag in tags])
+
+        assert executor.reset_prefix_cache.called is should_reset
 
 
 def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
@@ -148,6 +225,92 @@ class TestBaseWorkerSleepGuards:
         w = _make_worker(world_size=2, sleep_config=None)
         with pytest.raises(ValueError, match="Sleep feature is not enabled"):
             getattr(w, method)(["kv_cache"])
+
+
+class TestBaseWorkerRetrySemantics:
+    def test_releasing_an_already_parked_tag_is_a_noop(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        w.sleep(["model"])
+
+        w.engine.begin_sleep_transition.assert_not_called()
+
+    def test_releasing_an_additional_tag_while_parked_conflicts(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="additional tags"):
+            w.sleep(["model", "kv_cache"])
+
+    def test_resuming_active_tags_is_a_noop(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "running",
+                "parked_tags": [],
+            }
+        )
+
+        w.wakeup(["model"])
+
+        w.engine.begin_wakeup_transition.assert_not_called()
+
+    def test_resuming_mixed_parked_and_active_tags_restores_only_parked(self):
+        import threading
+        from contextlib import contextmanager
+        from unittest.mock import patch
+
+        from tensorrt_llm.llmapi import ExecutorMemoryType
+
+        w = _make_worker()
+        w.doing_shutdown = True
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parked",
+                "parked_tags": ["model"],
+            }
+        )
+
+        @contextmanager
+        def _noop_control_action():
+            yield None
+
+        w.engine._sleep_wakeup_lock = threading.Lock()
+        w.engine.control_action = _noop_control_action
+
+        with (
+            patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag") as materialize,
+            patch("torch.cuda.synchronize"),
+        ):
+            w.wakeup(["model", "kv_cache"])
+
+        expected = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        w.engine.begin_wakeup_transition.assert_called_once_with(expected)
+        materialize.assert_called_once_with(*expected)
+        w.engine.complete_wakeup_transition.assert_called_once_with()
+
+    def test_transitional_state_rejects_operations(self):
+        w = _make_worker()
+        w.engine.get_memory_status = MagicMock(
+            return_value={
+                "state": "parking",
+                "parked_tags": [],
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="state is 'parking'"):
+            w.sleep(["model"])
 
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1290,8 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor.control_request_barrier.set()
         executor.control_action_done = threading.Event()
         executor._active_control_id = None
+        executor._is_kv_manager_v2 = False
+        executor.enable_kv_cache_reuse = False
 
         with (
             patch("torch.cuda.set_device"),
@@ -1542,6 +1707,7 @@ class TestSingleRankLockAcquired:
             complete_wakeup_transition=MagicMock(),
             abort_wakeup_transition=MagicMock(),
             fail_sleep_wakeup_transition=MagicMock(),
+            invalidate_v1_prefix_cache_for_sleep=MagicMock(),
         )
 
         with (
@@ -1554,6 +1720,10 @@ class TestSingleRankLockAcquired:
             getattr(w, method)(["kv_cache"])
 
         assert lock_entered, f"{method}() with world_size=1 did not acquire _sleep_wakeup_lock"
+        if method == "sleep":
+            w.engine.invalidate_v1_prefix_cache_for_sleep.assert_called_once()
+        else:
+            w.engine.invalidate_v1_prefix_cache_for_sleep.assert_not_called()
 
     @pytest.mark.parametrize(
         ("method", "mutation"),
@@ -1600,22 +1770,33 @@ class TestSingleRankLockAcquired:
 class TestProxyCollectiveRpcGuards:
     """Guard-path tests for both IPC and RPC proxy collective_rpc() shims."""
 
-    def test_multirank_allowed_for_sleep_wakeup(self, cls):
-        """Sleep and wakeup may be called with model_world_size > 1.
+    def test_multirank_allowed_for_runtime_memory_control(self, cls):
+        """Runtime-memory methods may be called with model_world_size > 1.
 
-        Both are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise
-        and the call must be forwarded to rpc_client.
+        All three are in _MULTI_RANK_ALLOWED_METHODS; the guard must not raise,
+        and each call must be forwarded with the worker method's real signature.
         """
         from unittest.mock import MagicMock as _MM
 
-        for method_name in ("sleep", "wakeup"):
+        method_args = (
+            ("get_memory_status", ()),
+            ("sleep", (["kv_cache"],)),
+            ("wakeup", (["kv_cache"],)),
+        )
+        for method_name, args in method_args:
             mock_call = _MM()
             mock_call.remote.return_value = "ok"
             mock_client = _MM()
-            getattr(mock_client, method_name).return_value = mock_call
+            mock_method = getattr(mock_client, method_name)
+            mock_method.return_value = mock_call
             p = _make_proxy(cls, model_world_size=2, rpc_client=mock_client)
-            result = p.collective_rpc(method_name, args=(["kv_cache"],))
+            result = p.collective_rpc(method_name, args=args)
+
             assert result == ["ok"]
+            mock_method.assert_called_once_with(*args)
+            if cls == "ipc":
+                p.workers_started = False
+            mock_call.remote.assert_called_once_with()
 
     def test_multirank_raises_for_non_allowlisted_method(self, cls):
         """Non-allowlisted methods still raise NotImplementedError for world_size > 1."""
@@ -1672,3 +1853,80 @@ class TestIpcProxyRpcClientGuard:
         p = _make_proxy("ipc", rpc_client=None)
         with pytest.raises(RuntimeError, match="RPC client is not initialised"):
             p.collective_rpc("sleep")
+
+
+class TestWorkerCollectiveRpc:
+    @staticmethod
+    def _make_worker(world_size: int = 1) -> "GenerationExecutorWorker":
+        from tensorrt_llm.executor.worker import GenerationExecutorWorker
+
+        worker = object.__new__(GenerationExecutorWorker)
+        worker.doing_shutdown = True
+        worker.llm_args = SimpleNamespace(parallel_config=SimpleNamespace(world_size=world_size))
+        worker.sleep = MagicMock()
+        worker.wakeup = MagicMock()
+        worker.get_memory_status = MagicMock(
+            return_value={"state": "parked", "parked_tags": ["kv_cache"]}
+        )
+        return worker
+
+    def test_llm_runtime_memory_dispatch(self) -> None:
+        from tensorrt_llm.llmapi.llm import LLM
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+        worker = self._make_worker()
+        llm = object.__new__(LLM)
+        llm.shutdown = MagicMock()
+        llm._executor = worker
+        llm._encode_only = False
+        llm.args = SimpleNamespace(sleep_config=object())
+
+        llm.release(["kv_cache"])
+        status = llm.get_memory_status()
+        llm.resume()
+
+        assert status.state == "parked"
+        assert status.parked_tags == [ExecutorMemoryType.KV_CACHE]
+        worker.sleep.assert_called_once_with(["kv_cache"])
+        worker.get_memory_status.assert_called_with()
+        assert worker.get_memory_status.call_count == 2
+        worker.wakeup.assert_called_once_with(["kv_cache"])
+
+    @pytest.mark.parametrize("world_size", [1, 2])
+    @pytest.mark.parametrize("method", ["sleep", "wakeup", "get_memory_status"])
+    def test_blocking_dispatch(self, world_size: int, method: str) -> None:
+        worker = self._make_worker(world_size)
+        worker_method = getattr(worker, method)
+        args = () if method == "get_memory_status" else (["kv_cache"],)
+        result = worker.collective_rpc(method, args=args)
+
+        assert result == [worker_method.return_value]
+        worker_method.assert_called_once_with(*args)
+
+    def test_forwards_keyword_arguments(self) -> None:
+        worker = self._make_worker()
+        worker.collective_rpc("sleep", kwargs={"sleep_tags": ["kv_cache"]})
+        worker.sleep.assert_called_once_with(sleep_tags=["kv_cache"])
+
+    @pytest.mark.parametrize(
+        "options",
+        [{"non_block": True}, {"unique_reply_rank": 0}, {"target_ranks": [0]}],
+    )
+    def test_unsupported_options_rejected_before_dispatch(self, options: dict) -> None:
+        worker = self._make_worker()
+        with pytest.raises(NotImplementedError):
+            worker.collective_rpc("sleep", args=(["kv_cache"],), **options)
+        worker.sleep.assert_not_called()
+
+    def test_multirank_other_method_rejected_before_dispatch(self) -> None:
+        worker = self._make_worker(world_size=2)
+        worker.update_weights = MagicMock()
+        with pytest.raises(NotImplementedError, match="model_world_size > 1"):
+            worker.collective_rpc("update_weights")
+        worker.update_weights.assert_not_called()
+
+    def test_worker_error_propagates(self) -> None:
+        worker = self._make_worker()
+        worker.sleep.side_effect = RuntimeError("transition failed")
+        with pytest.raises(RuntimeError, match="transition failed"):
+            worker.collective_rpc("sleep", args=(["kv_cache"],))
