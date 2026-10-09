@@ -2733,6 +2733,7 @@
           "properties": {
             "type": {
               "default": "round_robin",
+              "title": "Type",
               "type": "string"
             }
           },
@@ -6979,6 +6980,17 @@
       },
       "title": "SchedulerConfig",
       "type": "object"
+    },
+    "ServerRole": {
+      "enum": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "title": "ServerRole",
+      "type": "integer"
     },
     "SkipSoftmaxAttentionConfig": {
       "additionalProperties": false,
