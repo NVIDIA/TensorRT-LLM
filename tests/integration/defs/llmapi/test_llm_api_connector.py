@@ -44,6 +44,7 @@ from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           KvCacheConfig, KvCacheConnectorConfig,
                                           NGramDecodingConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
+from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.logger import logger as trtllm_logger_singleton
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -2898,7 +2899,7 @@ def test_connector_transfers_only_in_window_blocks_to_the_sliding_group(
 @pytest.fixture
 def recording_connector(monkeypatch: pytest.MonkeyPatch,
                         tmp_path: Path) -> KvCacheConnectorConfig:
-    """Expose the recording backend to both local and spawned workers."""
+    """Expose the backend and forward its TRTLLM-prefixed controls to MPI workers."""
     examples_dir = Path(__file__).resolve().parents[4] / "examples/llm-api"
     paths = [str(examples_dir), str(Path(__file__).resolve().parent)]
     for path in paths:
@@ -2906,9 +2907,10 @@ def recording_connector(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setenv(
         "PYTHONPATH",
         os.pathsep.join(paths + [os.environ.get("PYTHONPATH", "")]))
-    monkeypatch.setenv("CONNECTOR_TEST_RECORDS",
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS",
                        str(tmp_path / "producer-loads"))
-    monkeypatch.delenv("CONNECTOR_TEST_ASYNC", raising=False)
+    monkeypatch.delenv("TRTLLM_TEST_CONNECTOR_ASYNC", raising=False)
+    monkeypatch.delenv("TRTLLM_TEST_CONNECTOR_STALL", raising=False)
     return KvCacheConnectorConfig(
         connector_module="connector_test_backend",
         connector_scheduler_class="RecordingConnectorScheduler",
@@ -2937,7 +2939,7 @@ def test_connector_adp_persistent_pool(
     balanced batches; unequal prompt lengths exercise uneven prefill work.
     """
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER", str(tmp_path))
     kwargs = dict(
         model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         backend="pytorch",
@@ -2963,7 +2965,7 @@ def test_connector_adp_persistent_pool(
     assert list(
         tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
     consumer_records = tmp_path / "consumer-loads"
-    monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(consumer_records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(consumer_records))
     with LLM(**kwargs) as consumer:
         for prompts, token_ids in zip(workloads, expected):
             outputs = consumer.generate(prompts, params)
@@ -2989,7 +2991,8 @@ def test_connector_adp_async_without_dummy(
 ) -> None:
     """An async owner at its slot cap must preserve its peer's prepared V2 batch."""
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER",
+                       str(tmp_path / "cache"))
     kwargs = dict(
         model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
         backend="pytorch",
@@ -3014,8 +3017,8 @@ def test_connector_adp_async_without_dummy(
     assert list((tmp_path / "cache").glob("*.pt"))
 
     consumer_records = tmp_path / "consumer-loads"
-    monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(consumer_records))
-    monkeypatch.setenv("CONNECTOR_TEST_ASYNC", "1")
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(consumer_records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_ASYNC", "1")
     with LLM(**kwargs) as consumer:
         outputs = consumer.generate([prompt] * 2, params)
         assert [len(out.outputs[0].token_ids)
@@ -3040,7 +3043,8 @@ def test_connector_adp_transfer_timeout(
 ) -> None:
     """A real two-GPU executor fails when an owner withholds load completion."""
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
-    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER",
+                       str(tmp_path / "cache"))
     prompt = "Explain how a computer stores information. " * 16
     options = dict(
         model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
@@ -3062,18 +3066,23 @@ def test_connector_adp_transfer_timeout(
     assert list((tmp_path / "cache").glob("*.pt"))
     options["kv_connector_config"]["transfer_timeout_sec"] = 0.5
     records = tmp_path / "timeout-records"
-    monkeypatch.setenv("CONNECTOR_TEST_RECORDS", str(records))
-    monkeypatch.setenv("CONNECTOR_TEST_ASYNC", "1")
-    monkeypatch.setenv("CONNECTOR_TEST_STALL", "1")
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_ASYNC", "1")
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_STALL", "1")
     log_path = tmp_path / "timeout-consumer.log"
+    # Give the fatal consumer its own MPI job; inheriting pytest's MPI identity
+    # would make its initialization or abort affect the parent test runner.
+    consumer_env, _ = split_mpi_env()
     with log_path.open("w") as log:
         process = subprocess.Popen(
             [
-                sys.executable, "-m", "connector_test_backend",
+                "mpirun", "--allow-run-as-root", "-n", "1", sys.executable,
+                "-m", "connector_test_backend",
                 json.dumps(options), prompt
             ],
             stdout=log,
             stderr=subprocess.STDOUT,
+            env=consumer_env,
             start_new_session=True,
         )
         try:

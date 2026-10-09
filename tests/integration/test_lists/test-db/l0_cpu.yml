@@ -85,6 +85,8 @@ l0_cpu:
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_route_capture.py

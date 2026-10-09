@@ -22,7 +22,7 @@ from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 def _record(event: str, count: int) -> None:
-    folder = Path(os.environ["CONNECTOR_TEST_RECORDS"])
+    folder = Path(os.environ["TRTLLM_TEST_CONNECTOR_RECORDS"])
     folder.mkdir(parents=True, exist_ok=True)
     with (folder / f"rank-{mpi_rank()}.jsonl").open("a") as stream:
         stream.write(json.dumps({"event": event, "count": count}) + "\n")
@@ -55,11 +55,11 @@ class RecordingConnectorWorker(PersistentKvCacheConnectorWorker):
 
     def get_finished_prefix_loads(self) -> list[int]:
         finished = super().get_finished_prefix_loads()
-        if os.environ.get("CONNECTOR_TEST_STALL") == "1":
+        if os.environ.get("TRTLLM_TEST_CONNECTOR_STALL") == "1":
             if finished:
                 _record("withheld_prefix_load", len(finished))
             return []
-        if os.environ.get("CONNECTOR_TEST_ASYNC") == "1":
+        if os.environ.get("TRTLLM_TEST_CONNECTOR_ASYNC") == "1":
             ready = self._pending_prefix_load_ids
             self._pending_prefix_load_ids = finished
             if ready:
@@ -83,6 +83,9 @@ class RecordingConnectorScheduler(PersistentKvCacheConnectorLeader):
     """Optionally force an async hit on owner zero and a cache miss on its peer."""
 
     def __init__(self, llm_args: TorchLlmArgs) -> None:
+        # MPI forwards TRTLLM-prefixed overrides; the filesystem example reads
+        # CONNECTOR_CACHE_FOLDER when its scheduler is constructed.
+        os.environ["CONNECTOR_CACHE_FOLDER"] = os.environ["TRTLLM_TEST_CONNECTOR_CACHE_FOLDER"]
         super().__init__(llm_args)
         self._async_ids: set[int] = set()
         self._async_loads: list[tuple[Path, int]] = []
@@ -90,7 +93,7 @@ class RecordingConnectorScheduler(PersistentKvCacheConnectorLeader):
     def reserve_prefix(
         self, request: LlmRequest, num_computed_tokens: int, reservation_id: int
     ) -> tuple[int, bool]:
-        asynchronous = os.environ.get("CONNECTOR_TEST_ASYNC") == "1"
+        asynchronous = os.environ.get("TRTLLM_TEST_CONNECTOR_ASYNC") == "1"
         if asynchronous and mpi_rank() != 0:
             return 0, False
         matched, _ = super().reserve_prefix(request, num_computed_tokens, reservation_id)
@@ -99,7 +102,7 @@ class RecordingConnectorScheduler(PersistentKvCacheConnectorLeader):
     def get_num_new_matched_tokens(
         self, request: LlmRequest, num_computed_tokens: int
     ) -> tuple[int, bool]:
-        asynchronous = os.environ.get("CONNECTOR_TEST_ASYNC") == "1"
+        asynchronous = os.environ.get("TRTLLM_TEST_CONNECTOR_ASYNC") == "1"
         if asynchronous and mpi_rank() != 0:
             self.pending_loads[request.request_id] = []
             return 0, False
@@ -142,14 +145,17 @@ def _run_timeout_consumer() -> None:
     options["kv_connector_config"] = KvCacheConnectorConfig(**options["kv_connector_config"])
     prompt = sys.argv[2]
     try:
-        with LLM(**options) as llm:
-            llm.generate([prompt] * 2, SamplingParams(max_tokens=8, ignore_eos=True))
+        # A fatal transfer error requires immediate process exit. A context
+        # manager would try graceful shutdown before reaching the handler.
+        llm = LLM(**options)
+        llm.generate([prompt] * 2, SamplingParams(max_tokens=8, ignore_eos=True))
     except Exception:
         traceback.print_exc()
         sys.stderr.flush()
         # Fatal connector failures require process exit; never construct a
         # replacement executor or reuse a potentially damaged worker here.
         os._exit(86)
+    llm.shutdown()
     raise AssertionError("The stalled connector unexpectedly completed")
 
 
