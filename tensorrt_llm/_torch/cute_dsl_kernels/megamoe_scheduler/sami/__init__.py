@@ -11,7 +11,7 @@ from .arena import (
     LiveWeightArenaProvider,
 )
 from ._util import Comm
-from .geometry import BundleLayout, Plane
+from .geometry import BundleLayout, Plane, PlaneViewLayout
 from .hierarchical import (
     BoundHierarchicalLiveWeightArena,
     HierarchicalCopyTicket,
@@ -35,5 +35,6 @@ __all__ = [
     "LiveWeightArena",
     "LiveWeightArenaProvider",
     "Plane",
+    "PlaneViewLayout",
     "hierarchy_group_sizes",
 ]

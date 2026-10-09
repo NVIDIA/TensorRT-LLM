@@ -47,60 +47,35 @@ def _plane_dtypes() -> Dict[str, torch.dtype]:
             f"{fp4 is not None}, float8_e4m3fn={fp8 is not None}."
         )
     return {
-        "mega_fc1_weight": fp4,
-        "mega_fc1_weight_sf": fp8,
-        "mega_fc2_weight": fp4,
-        "mega_fc2_weight_sf": fp8,
-        "fc31_alpha": torch.float32,
-        "fc2_alpha": torch.float32,
-        "fc1_norm_const": torch.float32,
+        "uint8": torch.uint8,
+        "float4_e2m1fn_x2": fp4,
+        "float8_e4m3fn": fp8,
+        "float32": torch.float32,
     }
 
 
-def _fork_plane_view(
-    flat_u8: torch.Tensor, name: str, nbytes: int, slots: int, hidden: int, intermediate: int
+def _plane_view(
+    flat_u8: torch.Tensor,
+    plane: Any,
+    slots: int,
+    *,
+    kernel: bool,
 ) -> torch.Tensor:
-    """Create a kernel-facing view matching the canonical plane ABI.
-
-    Weight views are K-major with the middle dimension contiguous.
-    """
-    typed = flat_u8.view(_plane_dtypes()[name])
-    gate_up = 2 * intermediate
-    if name == "mega_fc1_weight":
-        return typed.as_strided(
-            (slots, hidden // 2, gate_up), (hidden * gate_up // 2, 1, hidden // 2)
+    """Create a kernel or framework view from the canonical plane descriptor."""
+    metadata = plane.kernel_metadata(slots) if kernel else plane.storage_metadata(slots)
+    shape, stride, dtype_name, element_size, pointer_alignment = metadata
+    dtype = _plane_dtypes().get(dtype_name)
+    if dtype is None:
+        raise RuntimeError(f"unsupported live-plane dtype {dtype_name!r}")
+    typed = flat_u8.view(dtype)
+    if typed.element_size() != element_size:
+        raise RuntimeError(
+            f"{plane.name} descriptor element size {element_size} does not "
+            f"match torch dtype {dtype_name} ({typed.element_size()})"
         )
-    if name == "mega_fc2_weight":
-        return typed.as_strided(
-            (slots, intermediate // 2, hidden), (intermediate * hidden // 2, 1, intermediate // 2)
-        )
-    if name.endswith("_sf"):
-        return typed.as_strided((slots, nbytes), (nbytes, 1))
-    return typed.as_strided((slots,), (1,))
-
-
-def _tekit_plane_view(
-    flat_u8: torch.Tensor, name: str, nbytes: int, slots: int, hidden: int, intermediate: int
-) -> torch.Tensor:
-    """Create the framework storage view over the same plane bytes.
-
-    Weights use the layout consumed by the loader; the launch path transposes
-    them to the kernel layout. Do not substitute a kernel-facing view here.
-    """
-    gate_up = 2 * intermediate
-    if name == "mega_fc1_weight":
-        # (M, 2*I, H/2) uint8, contiguous -- matches quantization.py's
-        # torch.empty(num_local_slots, expand_intermediate, hidden // 2).
-        return flat_u8.view(slots, gate_up, hidden // 2)
-    if name == "mega_fc2_weight":
-        # (M, H, I/2) uint8, contiguous.
-        return flat_u8.view(slots, hidden, intermediate // 2)
-    if name.endswith("_sf"):
-        # (M, sf_flat_size) uint8, contiguous.
-        return flat_u8.view(slots, nbytes)
-    # fc31_alpha / fc2_alpha / fc1_norm_const: (M,) float32, identical on both
-    # sides, so no bridging is needed -- only the dtype reinterpretation.
-    return flat_u8.view(torch.float32)
+    if int(typed.data_ptr()) % pointer_alignment:
+        raise RuntimeError(f"{plane.name} pointer is not {pointer_alignment}-byte aligned")
+    return typed.as_strided(shape, stride)
 
 
 @dataclass
@@ -823,7 +798,6 @@ class _SharedSlotPool:
         )
 
         world, rank, slots = self.world, self.rank, self.slots
-        hidden, intermediate = self.bundle.hidden, self.bundle.intermediate
         index = self.layer_count
         if index % self.records_per_page == 0:
             self.pages.append(self._create_page(comm))
@@ -877,17 +851,13 @@ class _SharedSlotPool:
                 level_ptrs = tuple(pointer + offset for pointer in page.mc_ptrs)
                 owners = page.level_specs
             flat = self._flat(layer, uc_ptrs[rank], span)
-            kernel_view = _fork_plane_view(
-                flat, plane.name, plane.nbytes, slots, hidden, intermediate
-            )
+            kernel_view = _plane_view(flat, plane, slots, kernel=True)
             uc_views = tuple(
                 kernel_view if peer == rank else _ViewSpec(pointer, kernel_view)
                 for peer, pointer in enumerate(uc_ptrs)
             )
             level_views = tuple(_ViewSpec(pointer, kernel_view) for pointer in level_ptrs)
-            tekit_views[plane.name] = _tekit_plane_view(
-                flat, plane.name, plane.nbytes, slots, hidden, intermediate
-            )
+            tekit_views[plane.name] = _plane_view(flat, plane, slots, kernel=False)
             planes.append(
                 LivePlaneView(
                     name=plane.name,
@@ -959,10 +929,8 @@ class SharedSlotArenaProvider:
             int(rank),
             int(home_count),
             int(helper_count),
-            int(bundle.hidden),
-            int(bundle.intermediate),
             int(device),
-            tuple((pl.name, pl.nbytes) for pl in bundle.planes),
+            bundle,
         )
         if self._built is not None:
             if self._signature != signature:

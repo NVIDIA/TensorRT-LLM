@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import functools
 import importlib.util
 import math
@@ -76,6 +77,270 @@ def test_shared_slot_provider_uses_model_owned_pool_state():
     assert first._pools is not second._pools
     with pytest.raises(TypeError, match="model-local pool state"):
         provider_cls(SimpleNamespace())
+
+
+def test_shared_slot_provider_pool_key_includes_complete_bundle():
+    source = _TORCH_ROOT / "moe/fused_moe/mega_moe/rebalance_live_arena.py"
+
+    class FakePool:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.bundle = kwargs["bundle"]
+            self._closed = False
+            self.group_sizes = ()
+            self.instances.append(self)
+
+        def build_layer(self, comm):
+            return object(), {}, object(), 0
+
+    provider_cls = _extract_class(
+        source,
+        "SharedSlotArenaProvider",
+        {"__init__", "build_hierarchical_live_arena"},
+        {
+            "Any": Any,
+            "Dict": dict,
+            "Optional": Optional,
+            "Tuple": Tuple,
+            "_SharedSlotPool": FakePool,
+        },
+    )
+
+    @dataclasses.dataclass(frozen=True)
+    class Plane:
+        name: str
+        nbytes: int
+        descriptor: str
+
+    @dataclasses.dataclass(frozen=True)
+    class Bundle:
+        hidden: int
+        intermediate: int
+        planes: tuple[Plane, ...]
+
+    # Equal names and byte sizes but different view descriptors must not share.
+    first_bundle = Bundle(160, 80, (Plane("weight", 12800, "storage-a"),))
+    second_bundle = Bundle(160, 80, (Plane("weight", 12800, "storage-b"),))
+    owner = SimpleNamespace(
+        _rebalance_shared_slot_pools={},
+        _rebalance_shared_slot_pool_order=[],
+    )
+    kwargs = dict(
+        world=8,
+        rank=0,
+        home_count=4,
+        helper_count=1,
+        device=0,
+        comm=object(),
+    )
+    first_provider = provider_cls(owner)
+    first_provider.build_hierarchical_live_arena(bundle=first_bundle, **kwargs)
+    with pytest.raises(RuntimeError, match="single-geometry"):
+        first_provider.build_hierarchical_live_arena(bundle=second_bundle, **kwargs)
+    provider_cls(owner).build_hierarchical_live_arena(bundle=second_bundle, **kwargs)
+
+    assert len(owner._rebalance_shared_slot_pools) == 2
+    assert [pool.bundle for pool in FakePool.instances] == [first_bundle, second_bundle]
+
+
+@pytest.mark.parametrize(
+    (
+        "hidden",
+        "intermediate",
+        "expected_total_bytes",
+        "expected_stride_bytes",
+        "expected_planes",
+    ),
+    [
+        (
+            7168,
+            3072,
+            37158924,
+            37159424,
+            (
+                (
+                    "mega_fc1_weight",
+                    0,
+                    22020096,
+                    512,
+                    ((3, 6144, 3584), (22020096, 3584, 1), "uint8", 1, 16),
+                    (
+                        (3, 3584, 6144),
+                        (22020096, 1, 3584),
+                        "float4_e2m1fn_x2",
+                        1,
+                        16,
+                    ),
+                ),
+                (
+                    "mega_fc1_weight_sf",
+                    22020096,
+                    2752512,
+                    512,
+                    ((3, 2752512), (2752512, 1), "uint8", 1, 16),
+                    ((3, 2752512), (2752512, 1), "float8_e4m3fn", 1, 16),
+                ),
+                (
+                    "mega_fc2_weight",
+                    24772608,
+                    11010048,
+                    512,
+                    ((3, 7168, 1536), (11010048, 1536, 1), "uint8", 1, 16),
+                    (
+                        (3, 1536, 7168),
+                        (11010048, 1, 1536),
+                        "float4_e2m1fn_x2",
+                        1,
+                        16,
+                    ),
+                ),
+                (
+                    "mega_fc2_weight_sf",
+                    35782656,
+                    1376256,
+                    512,
+                    ((3, 1376256), (1376256, 1), "uint8", 1, 16),
+                    ((3, 1376256), (1376256, 1), "float8_e4m3fn", 1, 16),
+                ),
+                (
+                    "fc31_alpha",
+                    37158912,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+                (
+                    "fc2_alpha",
+                    37158928,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+                (
+                    "fc1_norm_const",
+                    37158944,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+            ),
+        ),
+        (
+            160,
+            80,
+            24332,
+            25088,
+            (
+                (
+                    "mega_fc1_weight",
+                    0,
+                    12800,
+                    512,
+                    ((3, 160, 80), (12800, 80, 1), "uint8", 1, 16),
+                    (
+                        (3, 80, 160),
+                        (12800, 1, 80),
+                        "float4_e2m1fn_x2",
+                        1,
+                        16,
+                    ),
+                ),
+                (
+                    "mega_fc1_weight_sf",
+                    12800,
+                    3072,
+                    512,
+                    ((3, 3072), (3072, 1), "uint8", 1, 16),
+                    ((3, 3072), (3072, 1), "float8_e4m3fn", 1, 16),
+                ),
+                (
+                    "mega_fc2_weight",
+                    15872,
+                    6400,
+                    512,
+                    ((3, 160, 40), (6400, 40, 1), "uint8", 1, 16),
+                    (
+                        (3, 40, 160),
+                        (6400, 1, 40),
+                        "float4_e2m1fn_x2",
+                        1,
+                        16,
+                    ),
+                ),
+                (
+                    "mega_fc2_weight_sf",
+                    22528,
+                    2048,
+                    512,
+                    ((3, 2048), (2048, 1), "uint8", 1, 16),
+                    ((3, 2048), (2048, 1), "float8_e4m3fn", 1, 16),
+                ),
+                (
+                    "fc31_alpha",
+                    24576,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+                (
+                    "fc2_alpha",
+                    24592,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+                (
+                    "fc1_norm_const",
+                    24608,
+                    4,
+                    16,
+                    ((3,), (1,), "float32", 4, 4),
+                    ((3,), (1,), "float32", 4, 4),
+                ),
+            ),
+        ),
+    ],
+    ids=["production", "padding-sensitive"],
+)
+def test_vendored_live_plane_abi_matches_independent_goldens(
+    hidden,
+    intermediate,
+    expected_total_bytes,
+    expected_stride_bytes,
+    expected_planes,
+):
+    path = _TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler/sami/geometry.py"
+    module_name = f"_live_plane_geometry_{hidden}_{intermediate}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    bundle = module.BundleLayout.create(hidden=hidden, intermediate=intermediate)
+    observed = tuple(
+        (
+            plane.name,
+            plane.offset,
+            plane.nbytes,
+            plane.alignment,
+            plane.storage_metadata(3),
+            plane.kernel_metadata(3),
+        )
+        for plane in bundle.planes
+    )
+    assert observed == expected_planes
+    assert bundle.total_bytes == expected_total_bytes
+    assert bundle.stride_bytes == expected_stride_bytes
 
 
 def test_ep_collective_adapter_uses_the_resolved_process_group():

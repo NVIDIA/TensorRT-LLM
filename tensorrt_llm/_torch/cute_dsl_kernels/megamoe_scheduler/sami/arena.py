@@ -92,49 +92,6 @@ def _device_index(value: object, *, name: str) -> int:
     return index
 
 
-def _expected_plane_metadata(
-    bundle: BundleLayout, slot_count: int
-) -> dict[str, tuple[tuple[int, ...], tuple[int, ...], str, int, int]]:
-    hidden = bundle.hidden
-    intermediate = bundle.intermediate
-    by_name = {plane.name: plane for plane in bundle.planes}
-    gate_up = 2 * intermediate
-    fc1_sf = by_name["mega_fc1_weight_sf"].nbytes
-    fc2_sf = by_name["mega_fc2_weight_sf"].nbytes
-    return {
-        "mega_fc1_weight": (
-            (slot_count, hidden // 2, gate_up),
-            (hidden * gate_up // 2, 1, hidden // 2),
-            "float4_e2m1fn_x2",
-            1,
-            16,
-        ),
-        "mega_fc1_weight_sf": (
-            (slot_count, fc1_sf),
-            (fc1_sf, 1),
-            "float8_e4m3fn",
-            1,
-            16,
-        ),
-        "mega_fc2_weight": (
-            (slot_count, intermediate // 2, hidden),
-            (intermediate * hidden // 2, 1, intermediate // 2),
-            "float4_e2m1fn_x2",
-            1,
-            16,
-        ),
-        "mega_fc2_weight_sf": (
-            (slot_count, fc2_sf),
-            (fc2_sf, 1),
-            "float8_e4m3fn",
-            1,
-            16,
-        ),
-        "fc31_alpha": ((slot_count,), (1,), "float32", 4, 4),
-        "fc2_alpha": ((slot_count,), (1,), "float32", 4, 4),
-        "fc1_norm_const": ((slot_count,), (1,), "float32", 4, 4),
-    }
-
 @dataclass(frozen=True)
 class LivePlaneView:
     """One live plane's rank-ordered UC views and its MC alias.
@@ -255,7 +212,6 @@ class LiveWeightArena:
             raise ValueError("live arena must contain exactly seven planes")
 
         slot_count = home_count + helper_count
-        expected_metadata_by_name = _expected_plane_metadata(bundle, slot_count)
         local_planes: list[object] = []
         plane_bytes: list[int] = []
         owner_sources: list[int] = []
@@ -286,7 +242,7 @@ class LiveWeightArena:
                 expected_dtype,
                 expected_element_size,
                 expected_pointer_alignment,
-            ) = expected_metadata_by_name[view.name]
+            ) = layout.kernel_metadata(slot_count)
             expected_metadata = (
                 expected_shape,
                 expected_stride,

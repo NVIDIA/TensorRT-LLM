@@ -1,5 +1,5 @@
 upstream: external-source://nvidia/megamoe-scheduler
-locked_commit: 40af454528cac303ae7a2527b19521945486a83f
+locked_commit: 4dc8616031b18dd948bdf11b49afe0d86be15e22
 project: MegaMoE HALO-Q scheduler and SAMI runtime
 original_authors: Jintao Peng <jintaop@nvidia.com>; Ethan Zhang
 license: Apache-2.0

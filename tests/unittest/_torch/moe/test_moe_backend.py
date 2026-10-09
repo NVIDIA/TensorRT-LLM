@@ -1525,11 +1525,12 @@ def test_megamoe_quant_method_defines_canonical_live_plane_spec():
     module = SimpleNamespace(
         hidden_size=7168,
         intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
     )
 
     spec = method.live_weight_plane_spec(module)
 
-    assert (spec.hidden, spec.intermediate) == (7168, 3072)
+    assert (spec.hidden, spec.intermediate, spec.expand_intermediate) == (7168, 3072, 6144)
     assert tuple(plane.name for plane in spec.planes) == (
         "mega_fc1_weight",
         "mega_fc1_weight_sf",
@@ -1539,6 +1540,65 @@ def test_megamoe_quant_method_defines_canonical_live_plane_spec():
         "fc2_alpha",
         "fc1_norm_const",
     )
+
+    # Exercise the storage-to-kernel dtype/view bridge on a small legal
+    # geometry; production metadata is covered by the independent goldens.
+    bridge = method._live_weight_bundle_layout(160, 80, 160)
+    for plane in bridge.planes:
+        shape, stride, dtype_name, element_size, pointer_alignment = plane.storage_metadata(3)
+        tensor = torch.empty(shape, dtype=getattr(torch, dtype_name))
+        assert tuple(tensor.stride()) == stride
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
+
+        kernel_shape, kernel_stride, _, kernel_element_size, _ = plane.kernel_metadata(3)
+        kernel_view = tensor
+        if plane.name in ("mega_fc1_weight", "mega_fc2_weight"):
+            kernel_view = kernel_view.transpose(1, 2)
+        assert tuple(kernel_view.shape) == kernel_shape
+        assert tuple(kernel_view.stride()) == kernel_stride
+        assert kernel_view.element_size() == kernel_element_size
+
+
+@pytest.mark.cpu_only
+def test_megamoe_live_plane_spec_rejects_expand_before_allocation():
+    method = NVFP4MegaMoECuteDslMethod()
+    module = SimpleNamespace(
+        hidden_size=160,
+        intermediate_size_per_partition=80,
+        expand_intermediate_size_per_partition=176,
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        method.live_weight_plane_spec(module)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_rejects_expand_before_provider_allocation():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._weights_created = False
+    moe.expert_size_per_partition = 4
+    moe._rebalance_slots_active = 1
+    moe._rebalance_home_experts = None
+    moe.layer_idx = 0
+    moe.hidden_size = 160
+    moe.intermediate_size_per_partition = 80
+    moe.expand_intermediate_size_per_partition = 176
+    moe.quant_method = NVFP4MegaMoECuteDslMethod()
+    moe.ep_size = 2
+    allocate_provider = MagicMock()
+    moe._alloc_symm_provider = allocate_provider
+    create_arena_provider = MagicMock()
+    moe.layer_load_balancer = SimpleNamespace(
+        manager=SimpleNamespace(create_arena_provider=create_arena_provider)
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        moe.create_weights()
+
+    allocate_provider.assert_not_called()
+    create_arena_provider.assert_not_called()
 
 
 @pytest.mark.cpu_only

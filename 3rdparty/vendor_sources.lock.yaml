@@ -73,8 +73,8 @@ vendors:
     digest: sha256-tree-v1:fa65b674a9ec6121b4158069d5585cc56df28243d1ac1199eb97003d81135d76
   megamoe-scheduler:
     url: external-source://nvidia/megamoe-scheduler
-    branch: trtllm/pr-19646-vendor-snapshot
-    commit: 40af454528cac303ae7a2527b19521945486a83f
+    branch: trtllm/pr-19646-single-plane-spec
+    commit: 4dc8616031b18dd948bdf11b49afe0d86be15e22
     source: megamoe_scheduler
     destination: tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler
     include:
@@ -89,7 +89,7 @@ vendors:
     - sami/fabric.py
     - sami/geometry.py
     - sami/hierarchical.py
-    digest: sha256-tree-v1:f4f767e5bdad5c664a8fb6706e45daa7a79c979f888e0ac9dd19dbce78a4d1b2
+    digest: sha256-tree-v1:00210684fbffaa623fc00839bcacce000650db9090cf7a1a07bdd0ef3a9afc33
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
