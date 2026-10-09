@@ -227,6 +227,29 @@ int KvCacheManager::probeReuse(ReuseScope reuseScope, TokenSpan inputTokens, boo
     return matchReuse(reuseScope, inputTokens, knownNoDigest).numTokens;
 }
 
+std::optional<BlockKey> KvCacheManager::probeFirstNewBlockKey(
+    ReuseScope reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
+{
+    // The matched Block* remain protected until the key has been copied out.
+    // Call matchReuse directly: probeReuse would nest shared-lock acquisitions.
+    auto const apiLock = lockShared();
+    auto const match = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    int const blockSize = tokensPerBlock();
+    int const blockIndex = match.numTokens / blockSize;
+    size_t const begin = static_cast<size_t>(blockIndex) * static_cast<size_t>(blockSize);
+    if (begin + static_cast<size_t>(blockSize) > static_cast<size_t>(inputTokens.size()))
+    {
+        return std::nullopt;
+    }
+
+    // Derive the boundary from the final, pruned match, not the raw token path.
+    // A partial match can end in a block with a different suffix, so only the
+    // preceding fully matched block supplies the query's exact prefix key.
+    BlockKey const previousKey
+        = blockIndex == 0 ? RootBlock::makeKey(reuseScope) : match.blocks[BlockOrdinal{blockIndex - 1}]->key;
+    return Block::makeKey(previousKey, inputTokens.begin() + begin, static_cast<size_t>(blockSize), knownNoDigest);
+}
+
 // ---- Memory pool queries --------------------------------------------------
 
 MemAddress KvCacheManager::getMemPoolBaseAddress(

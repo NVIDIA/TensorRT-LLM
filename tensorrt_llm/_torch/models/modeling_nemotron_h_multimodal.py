@@ -55,6 +55,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..peft.lora.config import LoraConfig
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -2953,6 +2954,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # use llm.config as config for pytorch model engine
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @classmethod
+    def lora_config(cls, model_dir: str) -> LoraConfig:
+        """Return the decoder's LoRA target configuration.
+
+        Callers supply adapter paths and capacity through this configuration
+        and select adapters with per-prompt LoRARequest objects.
+        """
+        return NemotronHForCausalLM.lora_config(model_dir)
 
     def _build_evs_adjusted_context_ids(
         self,

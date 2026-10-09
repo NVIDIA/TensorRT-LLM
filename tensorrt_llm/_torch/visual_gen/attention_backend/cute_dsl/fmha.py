@@ -26,6 +26,7 @@ from typing import Any, NamedTuple, Tuple
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
@@ -86,7 +87,12 @@ def _resolve_skip_softmax_threshold_scale_factor(
                 "through.",
                 key="cute_dsl_skip_softmax_missing_timestep",
             )
-        runtime_params = sparse_params.scheduler.get_runtime_params(timestep=timestep)
+        # Prefer the phase the CUDA-graph runner resolved host-side; the tensor
+        # read is a `.item()`, which is illegal while a graph is being captured.
+        runtime_params = sparse_params.scheduler.get_runtime_params(
+            timestep=timestep,
+            graph_phase=resolved_extra_key("skip_softmax_phase"),
+        )
         threshold_scale_factor = runtime_params.threshold_scale_factor_prefill
     if threshold_scale_factor is None or threshold_scale_factor <= 0.0:
         return None

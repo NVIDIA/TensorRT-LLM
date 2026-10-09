@@ -52,6 +52,8 @@ MODEL_PATH_DICT = {
     # Nemotron-3-Nano-Omni-30B (text + image multimodal)
     "nemotron_3_nano_omni_nvfp4": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
     "nemotron_3_nano_omni_nvfp4_image": "NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+    "nemotron_3.5_lightning_30b_nvfp4_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+    "nemotron_3.5_lightning_30b_bf16_mtp": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
     # MiniMax M3 (block-sparse MoE, MXFP8 weights, BF16 activations + KV cache)
     "minimax_m3_mxfp8": "MiniMax-M3-MXFP8",
     # Qwen3.5 dense + MoE

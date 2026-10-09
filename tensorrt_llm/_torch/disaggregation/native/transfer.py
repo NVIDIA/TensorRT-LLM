@@ -106,12 +106,12 @@ class RecvReqInfo:
     sender_req_id: int
     instance_name: str
     instance_rank: int
-    block_ids_per_layer_groups: list[
-        np.ndarray
-    ]  # Block IDs per layer group, each np.ndarray(dtype=np.int64)
+    # Positional pool slots per layer group (see Chunk): entry i is the
+    # receiver's slot for block ordinal i, or -1 where it accepts nothing.
+    block_ids_per_layer_groups: list[np.ndarray]
     unique_rid: int
-    # Block-aligned token offset where the receiver's block list starts.
-    # None means "end-of-range suffix" — sender derives it from len(blocks).
+    # Optional extra lower bound (block-aligned token offset) below which the
+    # receiver accepts nothing, on top of the -1 holes already in its table.
     dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
@@ -153,36 +153,6 @@ class ReadMeta:
 class WriteMetaType(Enum):
     KV = "KV"
     AUX = "AUX"
-
-
-def project_blocks_to_global_chunk(
-    block_ids: np.ndarray,
-    chunk_block_offset: int,
-    chunk_block_count: int,
-    resident_block_end: int,
-) -> np.ndarray:
-    """Project a global block chunk into a suffix-resident block list.
-
-    ``block_ids`` represents the resident suffix of the logical range
-    ``[0, resident_block_end)``. ``chunk_block_offset`` and
-    ``chunk_block_count`` describe a chunk in that global coordinate space.
-    """
-    if chunk_block_count <= 0 or len(block_ids) == 0:
-        return block_ids[:0]
-
-    resident_start = max(0, resident_block_end - len(block_ids))
-    resident_end = resident_block_end
-    chunk_start = chunk_block_offset
-    chunk_end = chunk_start + chunk_block_count
-
-    overlap_start = max(chunk_start, resident_start)
-    overlap_end = min(chunk_end, resident_end)
-    if overlap_start >= overlap_end:
-        return block_ids[:0]
-
-    local_start = overlap_start - resident_start
-    local_end = overlap_end - resident_start
-    return block_ids[local_start:local_end]
 
 
 @dataclass
@@ -1278,67 +1248,31 @@ class Sender(SenderBase):
             )
 
     @staticmethod
-    def _align_kv_blocks(
+    def _pair_ordinals(
         src_block_ids: np.ndarray,
         dst_block_ids: np.ndarray,
-        src_token_start: int,
-        dst_token_start: int,
-        tokens_per_block: int,
+        dst_start_block: int = 0,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Align src/dst block arrays using explicit token-start positions.
+        """Pair src/dst positional block tables ordinal by ordinal.
 
-        Both src_token_start and dst_token_start must be block-aligned
-        (multiples of tokens_per_block), which is always true for prefix-cache
-        boundaries in current KV cache managers.
-
-        Returns the (src, dst) sub-arrays that cover the shared token overlap.
-        Returns a pair of empty arrays when there is no overlap (i.e. this
-        context slice is entirely within generation's already-cached prefix).
-
-        This handles four cases without special-casing:
-          1. No prefix cache on either side  → identity (start_token == 0 both)
-          2. Context prefix cache (src starts later than 0)  → trim dst head
-          3. Generation prefix cache (dst starts later than 0)  → trim src head
-          4. Chunked context (each slice has its own token_range)  → correct
-             overlap even when the slice is entirely before dst_token_start
+        Both tables are indexed by block ordinal (see Chunk); an entry is -1
+        where that side has nothing to offer/accept. A block moves only where
+        both sides hold it, so a sender that has not evicted yet, a receiver
+        that already reused a prefix, a receiver with a wider speculative
+        window, or a sender chunk that blanks everything outside its range all
+        fall out of the same intersection without any per-case arithmetic.
+        Ordinals below ``dst_start_block`` are excluded as well.
         """
-        overlap_start = max(src_token_start, dst_token_start)
-        src_skip = (overlap_start - src_token_start) // tokens_per_block
-        dst_skip = (overlap_start - dst_token_start) // tokens_per_block
-        n_transfer = min(src_block_ids.size - src_skip, dst_block_ids.size - dst_skip)
-        if n_transfer <= 0:
-            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
-        return (
-            src_block_ids[src_skip : src_skip + n_transfer],
-            dst_block_ids[dst_skip : dst_skip + n_transfer],
-        )
-
-    @staticmethod
-    def _trim_receiver_window_head(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
-        peer_window_size: Optional[int],
-    ) -> np.ndarray:
-        """Drop the receiver's extra leading blocks for a windowed layer group.
-
-        A windowed receiver keeps a larger window when only it runs speculative
-        decoding, so its suffix starts earlier and the extra blocks are at the
-        head. Both starts are derived from list length, so trimming the tail
-        instead would shift every block one position early.
-
-        Non-windowed lists are both trimmed to ceil(prompt_len / tpb) in
-        _create_chunk, so there dst must not exceed src. A smaller dst
-        (generation prefix-cache reuse) is handled via dst_start.
-        """
-        block_diff = dst_block_ids.size - src_block_ids.size
-        if block_diff <= 0:
-            return dst_block_ids
-        if peer_window_size is None:
+        if src_block_ids.size != dst_block_ids.size:
             raise ValueError(
-                f"src/dst block count mismatch: {src_block_ids.size} vs "
-                f"{dst_block_ids.size} (dst must not exceed src)"
+                f"positional block tables differ in length: src={src_block_ids.size} "
+                f"dst={dst_block_ids.size}; both sides must span the same prompt"
             )
-        return dst_block_ids[block_diff:]
+        mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
+        if dst_start_block > 0:
+            mask[:dst_start_block] = False
+        idx = np.flatnonzero(mask)
+        return src_block_ids[idx], dst_block_ids[idx]
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1401,70 +1335,27 @@ class Sender(SenderBase):
                 src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
                 dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
             else:
-                tpb = extractor.page_table.tokens_per_block
+                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
+                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
                 if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix). The strided
-                    # subset has exactly the receiver's block count, so the
-                    # suffix alignment below degenerates to identity; block
-                    # reuse is rejected under helix.
+                    # (same protocol as partition_context_for_helix), so its
+                    # table is the strided subset of ours; block reuse is
+                    # rejected under helix.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                window_size = getattr(lg_info, "sliding_window_size", None)
-
-                # Block lists are the suffix of [..., slice_end); cached prefix
-                # is implicit in their size. token_start = (total_blocks - n) * tpb.
-                slice_end = token_range.end
-                total_blocks = (slice_end + tpb - 1) // tpb
-
-                # Project the peer's whole-prompt list only for partial chunks.
-                # A final SWA slice carries the complete active window rather than
-                # only the last context chunk, so its peer list must remain whole.
-                prompt_blocks = (task._prompt_len + tpb - 1) // tpb
-                is_windowed = window_size is not None and window_size < task._prompt_len
-                if (token_range.start > 0 or total_blocks < prompt_blocks) and not (
-                    is_windowed and task._chunk.is_last
-                ):
-                    dst_block_ids = project_blocks_to_global_chunk(
-                        dst_block_ids,
-                        chunk_block_offset=token_range.start // tpb,
-                        chunk_block_count=total_blocks - token_range.start // tpb,
-                        resident_block_end=prompt_blocks,
-                    )
-
-                peer_lg_info = peer_extractor.page_table.layer_groups[peer_lg]
-                dst_block_ids = Sender._trim_receiver_window_head(
-                    src_block_ids,
-                    dst_block_ids,
-                    peer_window_size=getattr(peer_lg_info, "sliding_window_size", None),
+                tpb = extractor.page_table.tokens_per_block
+                dst_start_block = (
+                    req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
                 )
-                assert src_block_ids.size <= total_blocks, (
-                    f"src block list ({src_block_ids.size}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
+                # Both tables are positional (index == block ordinal, -1 == not
+                # held), so pairing is a plain intersection: SWA eviction, prefix
+                # reuse, and pipelined chunk bounds are all already encoded as
+                # holes by whichever side owns that state.
+                src_block_ids, dst_block_ids = Sender._pair_ordinals(
+                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
                 )
-                assert dst_block_ids.size <= total_blocks, (
-                    f"dst block list ({dst_block_ids.size}) exceeds total slice "
-                    f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
-                )
-                src_start = (total_blocks - src_block_ids.size) * tpb
-                dst_start = (total_blocks - dst_block_ids.size) * tpb
-                if req_info.dst_start_token is not None:
-                    dst_start = max(dst_start, req_info.dst_start_token)
-                if window_size is not None:
-                    # SWA eviction is based on the full prompt, not this slice.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
-                    )
-                    stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
-                    src_start = max(stale_end * tpb, src_start)
-                    dst_start = max(stale_end * tpb, dst_start)
-                src_block_ids, dst_block_ids = Sender._align_kv_blocks(
-                    src_block_ids,
-                    dst_block_ids,
-                    src_token_start=src_start,
-                    dst_token_start=dst_start,
-                    tokens_per_block=tpb,
-                )
+                if src_block_ids.size == 0:
+                    continue
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
                 dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
 

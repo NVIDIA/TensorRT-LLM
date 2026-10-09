@@ -54,6 +54,11 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # KDA runtime: host-derived prefill metadata and the bf16 state pool
+  # round-trip. Both are single-device cases that use GPU 0 only.
+  - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
+  - unittest/_torch/modules/kimi_kda/test_kimi_kda_bf16_state_pool.py
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"

@@ -2403,7 +2403,9 @@ _FUSED_Q_FP8_PREFILL_BATCHES = [
 @pytest.mark.skipif(get_sm_version() < 100,
                     reason="DSv4 fused FP8 Q-quant requires SM100")
 @pytest.mark.parametrize("batch_name", _FUSED_Q_FP8_PREFILL_BATCHES)
-def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
+@pytest.mark.parametrize("q_rope_applied", [False, True])
+def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name,
+                                                q_rope_applied):
     """Regression test for the sparse-MLA context-branch fused FP8 Q-quant
     wiring.  The wo-linear helper bypasses `_q_branch`, so we monkey-patch
     `forward_context_sparse_attn` to manually populate the fused buffers
@@ -2430,16 +2432,41 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
             quant_q_buffer = torch.empty((num_tokens, num_heads * head_dim),
                                          dtype=torch.float8_e4m3fn,
                                          device=q.device)
-            quant_q_buffer.view(
-                num_tokens, num_heads,
-                head_dim)[:, :, :nope_dim] = q_view[:, :, :nope_dim].float().to(
+            quant_q_view = quant_q_buffer.view(num_tokens, num_heads, head_dim)
+            quant_q_view[:, :, :nope_dim] = q_view[:, :, :nope_dim].float().to(
+                torch.float8_e4m3fn)
+            if q_rope_applied:
+                position_ids = kwargs["position_ids"].reshape(-1).long()
+                rope_dim = head_dim - nope_dim
+                cache = self.mqa.rotary_cos_sin.view(-1, rope_dim, 2)
+                coefficient = cache[position_ids, :rope_dim // 2].unsqueeze(1)
+                q_pe = q_view[:, :, nope_dim:].float()
+                q0, q1 = q_pe[..., 0::2], q_pe[..., 1::2]
+                cos, sin = coefficient[..., 0], coefficient[..., 1]
+                rotated = torch.stack(
+                    [cos * q0 - sin * q1, cos * q1 + sin * q0],
+                    dim=-1).flatten(-2)
+                quant_q_view[:, :, nope_dim:] = rotated.to(q.dtype).to(
                     torch.float8_e4m3fn)
+                self._fused_q_pe = None
+            else:
+                self._fused_q_pe = q_view[:, :, nope_dim:].contiguous()
             self._fused_quant_q_buffer = quant_q_buffer
-            self._fused_q_pe = q_view[:, :, nope_dim:].contiguous()
+            self._fused_q_rope_applied = q_rope_applied
             self._quant_scale_qkv = torch.tensor([1.0],
                                                  dtype=torch.float32,
                                                  device=q.device)
-            q = torch.full_like(q, float('nan'))
+            if q_rope_applied:
+                # q_b GEMM fusion carries only compact q_lora once the complete
+                # rotated Q has been written to quant_q_buffer.
+                q = torch.full(
+                    (num_tokens, self.q_lora_rank),
+                    float("nan"),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+            else:
+                q = torch.full_like(q, float("nan"))
         return original_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                             **kwargs)
 

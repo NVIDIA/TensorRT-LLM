@@ -66,7 +66,7 @@ Optionally, you can alter the logits produced by the network by providing an ins
 std::unordered_map<std::string, function<Tensor(IdType, Tensor&, BeamTokens const&, StreamPtr const&, std::optional<IdType>)>>
 ```
 
-The map key is the name associated with that logits post-processing callback. Each request can then specify the name of the logits post-processor to use for that particular request, if any.
+The map key is the name associated with that logits post-processing callback.
 
 The first argument to the callback is the request id, second is the logits tensor, third are the tokens produced by the request so far, fourth is the operation stream used by the logits tensor, and last one is an optional client id. The callback returns a modified tensor of logits. Multiple requests can share same client id and callback can use different logic based on client id.
 
@@ -78,7 +78,7 @@ The executor also includes a {cpp:class}`LogitsPostProcessorBatched <tensorrt_ll
 std::function<void(std::vector<IdType> const&, std::vector<Tensor>&, std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&, std::vector<std::optional<IdType>> const&)>
 ```
 
-A single batched callback can be specified in `LogitsPostProcessorConfig`. Each request can opt to apply this callback by specifying the name of the logits post-processor as `Request::kBatchedPostProcessorName`.
+A single batched callback can be specified in `LogitsPostProcessorConfig`.
 
 Note: Neither callback variant is supported with the `STATIC` batching type for the moment.
 

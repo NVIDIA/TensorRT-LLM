@@ -24,7 +24,6 @@ SPECULATIVE_MAP = {
 class RuntimeConfig(BaseModel):
     model: str
     model_path: Optional[Path] = None
-    engine_dir: Optional[Path] = None
     revision: Optional[str] = None
     sw_version: str
     settings_config: ExecutorSettingsConfig
@@ -39,7 +38,7 @@ class RuntimeConfig(BaseModel):
     explicit_cli_keys: Optional[Set[str]] = None
 
     def get_llm_args(self) -> Dict:
-        model = self.engine_dir or self.model_path or self.model
+        model = self.model_path or self.model
 
         llm_args = {
             "scheduler_config":

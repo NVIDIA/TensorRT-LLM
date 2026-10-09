@@ -34,6 +34,8 @@ l0_b300:
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
+  # ------------- Visual Gen sparse attention (sm103) ---------------
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_sol_attn.py
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   - unittest/_torch/disaggregation
@@ -72,8 +74,19 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_drains_staging_per_expert
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
-  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTLASS]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTEDSL]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_allow_list_matches_what_the_backends_declare
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_situ_betas_reach_the_kernel_cache_key
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_beta]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_linear]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_beta]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_linear]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[zero]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[negative]
+  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutlass]
+  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutedsl]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[CUTLASS-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[TRTLLM-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
