@@ -99,7 +99,6 @@ worker_config:
       max_tokens_in_buffer: 8448
       # Shared C++ agent arena for chunked gather/write/scatter transfers.
       kv_cache_bounce_size_mb: 1024
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -126,6 +125,5 @@ worker_config:
       transceiver_runtime: PYTHON
       max_tokens_in_buffer: 8448
       kv_cache_bounce_size_mb: 1024
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: true
     trust_remote_code: true

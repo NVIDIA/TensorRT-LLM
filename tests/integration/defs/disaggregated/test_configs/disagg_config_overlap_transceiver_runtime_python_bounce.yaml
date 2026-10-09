@@ -25,7 +25,6 @@ context_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     kv_cache_bounce_size_mb: 128
-    agent_bounce_buffer_enable: true
     agent_bounce_params:
       min_descriptor_count: "1"
       max_average_descriptor_size: "4MB"
@@ -46,7 +45,6 @@ generation_servers:
     backend: NIXL
     transceiver_runtime: PYTHON
     kv_cache_bounce_size_mb: 128
-    agent_bounce_buffer_enable: true
     agent_bounce_params:
       min_descriptor_count: "1"
       max_average_descriptor_size: "4MB"
