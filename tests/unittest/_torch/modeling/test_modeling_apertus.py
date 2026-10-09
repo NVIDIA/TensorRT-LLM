@@ -21,6 +21,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from unittest import mock
 
+import pytest
 import torch
 import torch.nn.functional as F
 from _torch.helpers import create_mock_cuda_graph_runner
@@ -28,7 +29,7 @@ from parameterized import parameterized
 from transformers import ApertusConfig
 from transformers import ApertusForCausalLM as HFApertusForCausalLM
 from transformers.activations import XIELUActivation
-from utils.llm_data import llm_models_root
+from utils.llm_data import get_checkpoint
 from utils.util import default_dtype
 
 import tensorrt_llm
@@ -133,6 +134,7 @@ class TestXIELU(unittest.TestCase):
         act.load_weights([dict(hf_act.state_dict())])
         return hf_act, act
 
+    @pytest.mark.cpu_only
     def test_load_weights_computes_coefficients(self):
         hf_act, act = self._make_pair(torch.bfloat16, "cpu", 0.3, -1.7)
         self.assertAlmostEqual(act.a_p, F.softplus(torch.tensor(0.3)).item(), places=6)
@@ -140,22 +142,30 @@ class TestXIELU(unittest.TestCase):
         self.assertEqual(act.beta_value, hf_act.beta.item())
         self.assertEqual(act.eps_value, hf_act.eps.item())
 
+    @pytest.mark.cpu_only
     def test_load_weights_requires_alphas(self):
         act = XIELU()
         with self.assertRaises(AssertionError):
             act.load_weights([{"beta": torch.tensor(0.5), "eps": torch.tensor(-1e-6)}])
 
     @parameterized.expand(
-        [
-            (dtype, device)
-            for dtype in (torch.bfloat16, torch.float16)
-            for device in ("cpu", "cuda")
-        ],
-        lambda f, n, p: f"{f.__name__}[{p.args[0]}-{p.args[1]}]",
+        [(torch.bfloat16,), (torch.float16,)],
+        lambda f, n, p: f"{f.__name__}[{p.args[0]}]",
     )
-    def test_matches_reference(self, dtype, device):
-        if device == "cuda" and not torch.cuda.is_available():
+    @pytest.mark.cpu_only
+    def test_matches_reference_cpu(self, dtype):
+        self._check_matches_reference(dtype, "cpu")
+
+    @parameterized.expand(
+        [(torch.bfloat16,), (torch.float16,)],
+        lambda f, n, p: f"{f.__name__}[{p.args[0]}]",
+    )
+    def test_matches_reference_cuda(self, dtype):
+        if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
+        self._check_matches_reference(dtype, "cuda")
+
+    def _check_matches_reference(self, dtype, device):
         hf_act, act = self._make_pair(dtype, device, 0.3, -1.7)
         x = _xielu_test_input(dtype, device)
         if dtype == torch.float16:
@@ -175,8 +185,9 @@ class TestXIELU(unittest.TestCase):
             rtol=torch.finfo(dtype).eps,
         )
 
-        # HF's fp32 path is the same expression.
-        torch.testing.assert_close(out, hf_act(x.float()).to(dtype), atol=0, rtol=0)
+        # HF's fp32 Python path is the same expression. Its forward() may
+        # dispatch to the optional xielu CUDA extension, which rounds differently.
+        torch.testing.assert_close(out, hf_act._xielu_python(x.float()).to(dtype), atol=0, rtol=0)
 
         # Exact zeros take the negative branch: a_n * expm1(eps) - 0 + 0.
         zero_out = act(torch.zeros(4, dtype=dtype, device=device)).float()
@@ -185,6 +196,7 @@ class TestXIELU(unittest.TestCase):
             zero_out.cpu(), expected_zero.to(dtype).float().expand(4), atol=0, rtol=0
         )
 
+    @pytest.mark.cpu_only
     def test_reference_function_matches_module(self):
         act = XIELU()
         x = _xielu_test_input(torch.bfloat16, "cpu")
@@ -451,6 +463,7 @@ def _to_apertus1p5_state_dict(hf_state_dict: dict, output_vocab_size: int) -> di
     return weights
 
 
+@pytest.mark.cpu_only
 class TestApertus1p5Config(unittest.TestCase):
     def test_text_config_is_flattened(self):
         text_config = {
@@ -528,6 +541,41 @@ class TestApertus1p5(unittest.TestCase):
         self.assertTrue(quantized(model.model.layers[1].mlp.down_proj))
         # The caller's QuantConfig is not modified.
         self.assertEqual(quant_config.exclude_modules, [excluded, "lm_head"])
+
+    def test_layer_quant_configs_use_checkpoint_names(self):
+        """Per-layer configs of mixed-precision 1.5 exports are keyed by checkpoint names."""
+        config_dict = deepcopy(APERTUS_TINY_CONFIG)
+        config_dict["vocab_size"] = self.INPUT_VOCAB_SIZE
+        config = ApertusConfig.from_dict(
+            {**config_dict, "output_vocab_size": self.OUTPUT_VOCAB_SIZE}
+        )
+        down_proj_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+        o_proj_config = QuantConfig(quant_algo=QuantAlgo.FP8)
+        quant_config_dict = {
+            "model.language_model.layers.0.mlp.down_proj": down_proj_config,
+            "model.language_model.layers.1.self_attn.o_proj": o_proj_config,
+        }
+        callers_dict = dict(quant_config_dict)
+        with torch.device("cuda"), default_dtype(config.torch_dtype):
+            model = Apertus1p5ForConditionalGeneration(
+                ModelConfig(
+                    pretrained_config=config,
+                    quant_config=QuantConfig(),
+                    quant_config_dict=quant_config_dict,
+                    # As AutoModelForCausalLM does: weights are created after
+                    # the per-layer configs are applied.
+                    skip_create_weights_in_init=True,
+                )
+            )
+
+        layers = model.model.layers
+        self.assertIs(layers[0].mlp.down_proj.quant_config, down_proj_config)
+        self.assertIs(layers[1].self_attn.o_proj.quant_config, o_proj_config)
+        self.assertIsNot(layers[1].mlp.down_proj.quant_config, down_proj_config)
+        self.assertIsNot(layers[0].self_attn.o_proj.quant_config, o_proj_config)
+        self.assertEqual(layers[0].mlp.down_proj.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layers[1].mlp.down_proj.weight.dtype, config.torch_dtype)
+        self.assertEqual(quant_config_dict, callers_dict)
 
     def setUp(self):
         if not torch.cuda.is_available():
@@ -644,11 +692,7 @@ class _RealCheckpointGreedyTest:
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("needs CUDA")
-        root = llm_models_root()
-        path = os.path.join(root, self.CHECKPOINT) if root is not None else None
-        if path is None or not os.path.isdir(path):
-            self.skipTest(f"{self.CHECKPOINT} not found under LLM_MODELS_ROOT")
-        self.model_path = path
+        self.model_path = get_checkpoint(self.CHECKPOINT)
 
     def _load_hf_model(self):
         from transformers import AutoModelForCausalLM

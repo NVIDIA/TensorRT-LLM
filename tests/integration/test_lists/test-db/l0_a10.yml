@@ -30,6 +30,8 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_phi3.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
+  # The 8B real-checkpoint classes are covered by the accuracy tests instead.
+  - unittest/_torch/modeling/test_modeling_apertus.py -k "not TestApertus8BInstruct and not TestApertus1p5_8B"
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
