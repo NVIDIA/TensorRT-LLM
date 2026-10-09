@@ -29,7 +29,7 @@ def _get_param_types(param_name: str, func_name: str, tools: List[Tool]) -> Opti
             continue
         if param_name not in properties:
             continue
-        return infer_type_from_json_schema(properties[param_name])
+        return infer_type_from_json_schema(properties[param_name], parameters)
     return None
 
 

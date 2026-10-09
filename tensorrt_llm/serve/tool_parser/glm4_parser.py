@@ -38,7 +38,7 @@ def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -
         properties = {}
     if arg_key not in properties:
         return None
-    return infer_type_from_json_schema(properties[arg_key])
+    return infer_type_from_json_schema(properties[arg_key], tool.function.parameters)
 
 
 def _convert_to_number(value: str) -> Any:
