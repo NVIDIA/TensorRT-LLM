@@ -6,7 +6,7 @@
 import math
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -187,6 +187,83 @@ class ExtraInputsCollector:
 
 
 _NO_EXTRA_INPUTS = ExtraInputsCollector()
+
+
+@dataclass(slots=True)
+class HostInputs:
+    """Host-side inputs of one full prepare pass, built up stage by stage.
+
+    Stages bind the fields they use to locals, since the per-request loops are
+    hot, and write back only the names they rebind.
+    """
+
+    use_mrope: bool
+    # Extra model-side cache slot reserved for CUDA graph / warmup dummy
+    # requests, whose outputs are discarded, and for generation requests
+    # that carry no MRoPE metadata at all. The cache is zero-initialized and
+    # the write path only ever targets real ``py_seq_slot``s, so this slot
+    # permanently reads back a zero delta.
+    mrope_dummy_seq_slot: int
+    extra_inputs: ExtraInputsCollector
+    context_prompt_lookahead: list[int] | None
+
+    # if new_tensors_device exist, input_ids will only contain new context tokens
+    input_ids: list[int] = field(default_factory=list)  # per sequence
+    sequence_lengths: list[int] = field(default_factory=list)  # per sequence
+    prompt_lengths: list[int] = field(default_factory=list)  # per sequence
+    request_ids: list[int] = field(default_factory=list)  # per request
+    gather_ids: list[int] = field(default_factory=list)
+    position_ids: list[int] = field(default_factory=list)  # per sequence
+    num_cached_tokens_per_seq: list[int] = field(default_factory=list)  # per sequence
+    draft_tokens: list[int] = field(default_factory=list)
+    draft_lens: list[int] = field(default_factory=list)
+    gen_request_seq_slots: list[int] = field(default_factory=list)  # per generation request
+    # One-model rejection: slots of gen requests that produced 0 real draft
+    # tokens this step (marked in _handle_dynamic_draft_len); their stale
+    # draft_probs rows are one-hot'd after spec_metadata.prepare().
+    padding_gen_slots: list[int] = field(default_factory=list)
+    multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
+    # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
+    mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
+    mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
+    mrope_delta_read_seq_slots: list[int] = field(default_factory=list)
+    num_accepted_draft_tokens: list[int] = field(default_factory=list)  # per request
+    # will contain previous batch indices of generation requests
+    previous_batch_indices: list[int] = field(default_factory=list)
+    previous_pos_indices: list[int] = field(default_factory=list)
+
+    num_ctx_requests: int = 0
+    num_ctx_tokens: int = 0
+    text_token_indices_ctx: Any = None
+    mm_token_indices: Any = None
+
+    extend_requests: list[LlmRequest] = field(default_factory=list)
+    extend_dummy_requests: list[LlmRequest] = field(default_factory=list)
+    generation_requests: list[LlmRequest] = field(default_factory=list)
+    first_draft_requests: list[LlmRequest] = field(default_factory=list)
+    # Collect generation request IDs during categorization to avoid
+    # a separate iteration over scheduled_requests.generation_requests later.
+    all_gen_request_ids: list[int] = field(default_factory=list)
+
+    has_cp_helix: bool = False
+    helix_is_inactive_rank: list[bool] = field(default_factory=list)
+    helix_position_offsets: list[int] = field(default_factory=list)
+    helix_owned_new_tokens: list[int] = field(default_factory=list)
+    helix_local_len_host: Callable[[int], int] | None = None
+    helix_pack_extend: Callable[[LlmRequest, int], int] | None = None
+
+    n_gen: int = 0
+    has_any_multimodal_request: bool = False
+    beam_width: int = 1
+
+    num_tokens: int = 0
+    total_num_tokens: int = 0
+    previous_batch_len: int = 0
+    host_position_ids: torch.Tensor | None = None
+    num_cached_tokens_snapshot: list[int] | None = None
+    remote_tail_modes: set[Any] = field(default_factory=set)
+    spec_all_rank_counts: list[list[int]] | None = None
+    virtual_num_tokens: int = 0
 
 
 class DecoderInputPreparer:
@@ -535,7 +612,8 @@ class DecoderInputPreparer:
             return request.py_multimodal_data
         return self._mm_item_scheduler.build_multimodal_data_for_llm(request, runtime)
 
-    def _prepare_tp_inputs(
+    @nvtx_range("_prepare_inputs")
+    def prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
@@ -553,9 +631,29 @@ class DecoderInputPreparer:
         is_dummy: bool,
         gather_context_logits: bool = False,
     ) -> PreparedInputs:
+        """Prepare decoder model inputs for one step.
+
+        A fast path reuses earlier state when the batch allows it. Otherwise
+        every request is packed on the host, copied into the persistent
+        buffers, and the attention and speculative metadata are prepared.
         """
-        Prepare inputs for Pytorch Model.
-        """
+        set_per_request_prefill_cuda_graph_flag(False)
+        if self.mapping is not None and "cp_type" in self.mapping.cp_config:
+            cp_type = self.mapping.cp_config["cp_type"]
+            if cp_type in (CpType.HELIX, CpType.ULYSSES):
+                # Prepared like any other batch.
+                pass
+            else:
+                raise NotImplementedError(
+                    f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}."
+                )
+
+        self._register_suffix_automaton_requests(scheduled_requests, resource_manager)
+
+        # Outside capture, before any steady-input early return.
+        prepare_request_inputs = getattr(self.model, "prepare_request_inputs", None)
+        if prepare_request_inputs is not None:
+            prepare_request_inputs(scheduled_requests, attn_metadata, promoted_context_request_ids)
 
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
@@ -589,60 +687,204 @@ class DecoderInputPreparer:
             enable_spec_decode=enable_spec_decode,
         )
         if fast_inputs is not None:
-            return fast_inputs
+            return self._attach_context_requests(fast_inputs, scheduled_requests, kv_cache_manager)
 
         if not promoted_context_request_ids and self._can_use_steady_gen_fast_prepare(
             scheduled_requests, new_tokens_device, next_draft_tokens_device, spec_metadata, is_dummy
         ):
-            return self._apply_steady_gen_fast_prepare(
-                kv_cache_manager, attn_metadata, new_tensors_device, resource_manager
+            return self._attach_context_requests(
+                self._apply_steady_gen_fast_prepare(
+                    kv_cache_manager, attn_metadata, new_tensors_device, resource_manager
+                ),
+                scheduled_requests,
+                kv_cache_manager,
             )
         # Any full pass invalidates the steady-state cache; it is re-recorded
         # at the end of this pass when the batch qualifies.
         self._steady_gen_cache = None
 
-        # Hoist self.use_mrope to a function-scope local so the per-request /
-        # per-context-request mrope branches use LOAD_FAST instead of LOAD_ATTR.
-        _use_mrope = self._config.use_mrope
-
-        # if new_tensors_device exist, input_ids will only contain new context tokens
-        input_ids = []  # per sequence
-        sequence_lengths = []  # per sequence
-        prompt_lengths = []  # per sequence
-        request_ids = []  # per request
-        gather_ids = []
-        position_ids = []  # per sequence
-        num_cached_tokens_per_seq = []  # per sequence
-        draft_tokens = []
-        draft_lens = []
-        gen_request_seq_slots = []  # per generation request
-        # One-model rejection: slots of gen requests that produced 0 real draft
-        # tokens this step (marked in _handle_dynamic_draft_len); their stale
-        # draft_probs rows are one-hot'd after spec_metadata.prepare().
-        padding_gen_slots = []
-        multimodal_params_list = []
-        mrope_position_ids = []  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
-        mrope_delta_write_seq_slots = []
-        mrope_delta_read_seq_slots = []
-        # Whether any generation request in this batch carries real MRoPE
-        # metadata; see the post-loop cleanup below.
-        has_gen_mrope_delta = False
-        # Extra model-side cache slot reserved for CUDA graph / warmup dummy
-        # requests, whose outputs are discarded, and for generation requests
-        # that carry no MRoPE metadata at all. The cache is zero-initialized and
-        # the write path only ever targets real ``py_seq_slot``s, so this slot
-        # permanently reads back a zero delta.
-        mrope_dummy_seq_slot = get_mrope_dummy_seq_slot(
-            self._config.max_num_tokens, self.mapping.pp_size
+        host = HostInputs(
+            use_mrope=self._config.use_mrope,
+            mrope_dummy_seq_slot=get_mrope_dummy_seq_slot(
+                self._config.max_num_tokens, self.mapping.pp_size
+            ),
+            extra_inputs=(
+                _NO_EXTRA_INPUTS if self._new_extra_inputs is None else self._new_extra_inputs()
+            ),
+            context_prompt_lookahead=(
+                []
+                if spec_metadata is not None
+                and spec_metadata.context_prompt_lookahead_tokens is not None
+                else None
+            ),
         )
-        num_accepted_draft_tokens = []  # per request
-        extra_inputs = (
-            _NO_EXTRA_INPUTS if self._new_extra_inputs is None else self._new_extra_inputs()
+        self._pack_context_requests(host, scheduled_requests)
+        self._classify_generation_requests(
+            host,
+            scheduled_requests,
+            promoted_context_request_ids,
+            next_draft_tokens_device,
+            enable_spec_decode,
+        )
+        self._prepare_helix_state(host, kv_cache_manager)
+
+        spec_config = self._config.spec_config if enable_spec_decode else None
+        if not self._config.disable_overlap_scheduler and spec_config is not None:
+            assert spec_config.spec_dec_mode.support_overlap_scheduler(), (
+                f"{spec_config.decoding_type} does not support overlap scheduler"
+            )
+
+        runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
+
+        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
+        self._pack_extend_requests(
+            host,
+            promoted_context_request_ids,
+            next_draft_tokens_device,
+            runtime_tokens_per_gen_step,
+            spec_config,
+            enable_spec_decode=enable_spec_decode,
+        )
+        self._pack_first_draft_requests(host)
+        self._pack_generation_requests(host, promoted_context_request_ids, new_tokens_device)
+
+        self._copy_token_ids_to_device(
+            host,
+            scheduled_requests,
+            new_tokens_device,
+            new_tokens_lens_device,
+            next_draft_tokens_device,
+            runtime_draft_len,
+        )
+        self._copy_position_ids_to_device(host)
+
+        if enable_spec_decode:
+            self._buffers.gather_ids_cuda[: len(host.gather_ids)].copy_(
+                torch.tensor(host.gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+                non_blocking=True,
+            )
+
+        self._prepare_attn_metadata(
+            host,
+            scheduled_requests,
+            kv_cache_manager,
+            attn_metadata,
+            cache_indirection_buffer,
+            spec_config,
+            enable_spec_decode=enable_spec_decode,
+            is_dummy=is_dummy,
+        )
+        extra_model_inputs = host.extra_inputs.build(attn_metadata, resource_manager)
+
+        peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER
+        )
+        lora_params = self._lora.build(
+            scheduled_requests,
+            attn_metadata,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            peft_cache_manager=peft_cache_manager,
+            maybe_graph=maybe_graph,
+            use_lora_graph=use_lora_graph,
         )
 
-        context_prompt_lookahead = None
-        if spec_metadata is not None and spec_metadata.context_prompt_lookahead_tokens is not None:
-            context_prompt_lookahead = []
+        self._pad_inputs(
+            host,
+            scheduled_requests,
+            attn_metadata,
+            spec_metadata,
+            maybe_graph,
+            gather_context_logits,
+        )
+        inputs = self._build_inputs(
+            host,
+            scheduled_requests,
+            attn_metadata,
+            spec_metadata,
+            resource_manager,
+            extra_model_inputs,
+            lora_params,
+            runtime_draft_len,
+        )
+        self._record_iter_states(host, scheduled_requests)
+        if not is_dummy:
+            self._record_steady_gen_cache(
+                host, kv_cache_manager, attn_metadata, spec_metadata, new_tokens_device, lora_params
+            )
+
+        gather_ids_device = (
+            self._buffers.gather_ids_cuda[: len(host.gather_ids)] if enable_spec_decode else None
+        )
+        return self._attach_context_requests(
+            PreparedInputs(inputs, gather_ids_device), scheduled_requests, kv_cache_manager
+        )
+
+    def _attach_context_requests(
+        self,
+        prepared: PreparedInputs,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+    ) -> PreparedInputs:
+        """Pass the context requests to models that select rows or replay encoder tokens."""
+        from tensorrt_llm._torch.pyexecutor.ced_replay import (
+            encoder_replay_tokens,
+            uses_private_decoder_cache,
+        )
+
+        if scheduled_requests.num_context_requests and (
+            (
+                self._config.enable_attention_dp
+                and getattr(self.model, "prepare_adp_inputs", None) is not None
+            )
+            or uses_private_decoder_cache(getattr(self.model, "model", None), kv_cache_manager)
+            or any(encoder_replay_tokens(req) for req in scheduled_requests.context_requests)
+        ):
+            prepared.kwargs["context_requests"] = scheduled_requests.context_requests
+        return prepared
+
+    def _register_suffix_automaton_requests(
+        self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager | None
+    ) -> None:
+        """Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)."""
+        has_sa_enhancer = (
+            self._config.spec_config is not None
+            and getattr(self._config.spec_config, "sa_config", None) is not None
+        )
+        if has_sa_enhancer and resource_manager is not None and self.mapping.is_last_pp_rank():
+            from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
+
+            spec_rm = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER
+            )
+            sa_manager = None
+            if spec_rm is not None:
+                if isinstance(spec_rm, SuffixAutomatonManager):
+                    sa_manager = spec_rm
+                else:
+                    sa_manager = getattr(spec_rm, "sa_manager", None)
+            if sa_manager is not None:
+                for request in scheduled_requests.all_requests():
+                    if request.py_request_id not in sa_manager._initialized_requests:
+                        sa_manager.add_request(request.py_request_id, request.get_tokens(0))
+                        sa_manager._initialized_requests.add(request.py_request_id)
+
+    def _pack_context_requests(
+        self, host: HostInputs, scheduled_requests: ScheduledRequests
+    ) -> None:
+        """Pack the current chunk of every context request."""
+        input_ids = host.input_ids
+        sequence_lengths = host.sequence_lengths
+        prompt_lengths = host.prompt_lengths
+        request_ids = host.request_ids
+        gather_ids = host.gather_ids
+        position_ids = host.position_ids
+        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        draft_lens = host.draft_lens
+        num_accepted_draft_tokens = host.num_accepted_draft_tokens
+        multimodal_params_list = host.multimodal_params_list
+        extra_inputs = host.extra_inputs
+        context_prompt_lookahead = host.context_prompt_lookahead
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -681,107 +923,15 @@ class DecoderInputPreparer:
             request.cached_tokens = request.context_current_position
             extra_inputs.add_context_request(request)
 
-            # Embed mask is required only for partial iterations (chunked
-            # prefill or KV-cache reuse); full-prefill degrades gracefully.
-            check_mm_embed_cumsum_if_needed(
-                request.py_multimodal_data,
-                begin_compute=past_seen_token_num,
-                end_compute=end_compute,
-                prompt_len=request.get_num_tokens(0),
+            self._pack_context_multimodal(
+                host,
+                request,
+                begin_compute,
+                end_compute,
+                past_seen_token_num,
+                prompt_tokens,
+                context_start_idx,
             )
-            mm_data = request.py_multimodal_data or {}
-            cumsum = mm_data.get("multimodal_embed_mask_cumsum")
-            py_multimodal_runtime = None
-            if cumsum is not None:
-                py_multimodal_runtime = MultimodalRuntimeData(
-                    embed_mask_cumsum=cumsum,
-                    past_seen_token_num=past_seen_token_num,
-                    chunk_end_pos=end_compute,
-                )
-
-            multimodal_params = MultimodalParams(
-                multimodal_input=_build_request_multimodal_input(
-                    request, self._config.mm_encoder_cache_enabled
-                ),
-                multimodal_data=self._build_multimodal_data_for_llm(request, py_multimodal_runtime),
-                multimodal_runtime=py_multimodal_runtime,
-                mm_item_order=getattr(request, "py_mm_item_order", None),
-                input_ids_start_offset=context_start_idx,
-            )
-            # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
-            # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
-            # not from the request.
-            # NOTE: the prefetch producer always writes the cached embedding into
-            # `py_multimodal_data` before stamping the event, so whenever the event is present,
-            # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
-            # it.
-            mm_encoder_event = request.py_mm_encoder_event
-            if mm_encoder_event is not None:
-                multimodal_params.encoder_event = mm_encoder_event
-                request.py_mm_encoder_event = None
-            if multimodal_params.has_content():
-                # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
-                # transferring raw encoder inputs for full hits in both regular and
-                # side-stream-prefetched paths.
-                multimodal_params.to_device(
-                    "multimodal_data",
-                    "cuda",
-                    pin_memory=prefer_pinned(),
-                    target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
-                )
-                if _use_mrope:
-                    # A request may carry multimodal content but no MRoPE
-                    # metadata (a text-only prompt whose input processor skips
-                    # ``mrope_config``, or a model that does not consume it).
-                    # Its per-axis positions are just the scalar positions,
-                    # which the (3,1,N) seeding further below already
-                    # broadcasts, so leave that span alone.
-                    mrope_config = multimodal_params.multimodal_data.get("mrope_config") or {}
-                    mrope_pos_ids = mrope_config.get("mrope_position_ids")
-                    if mrope_pos_ids is not None:
-                        ctx_mrope_position_ids = mrope_pos_ids[
-                            :, :, begin_compute : begin_compute + len(prompt_tokens)
-                        ]
-                        # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
-                        mrope_position_ids.append(
-                            (
-                                len(position_ids) - len(prompt_tokens),
-                                len(position_ids),
-                                ctx_mrope_position_ids,
-                            )
-                        )
-                    mrope_position_delta = mrope_config.get("mrope_position_deltas")
-                    if mrope_position_delta is not None:
-                        request.py_mrope_position_delta = mrope_position_delta
-                    if mrope_position_delta is not None and request.py_seq_slot is not None:
-                        mrope_delta_write_seq_slots.append(request.py_seq_slot)
-                        request.py_mrope_delta_cache_slot = request.py_seq_slot
-
-                # Item scheduling builds a per-forward copy holding this chunk's joined rows.
-                # Keep it off the request so chunked prefill does not retain those rows between
-                # chunks outside the encoder-cache memory budget. Legacy requests keep their
-                # device payload for generation.
-                if request.py_mm_encoder_state is None:
-                    request.py_multimodal_data = multimodal_params.multimodal_data
-                multimodal_params_list.append(multimodal_params)
-
-                # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
-                # This creates new IPC handles owned by the prefill worker, so the decode worker
-                # can access them even after the encode worker's GC deallocates the original memory.
-                # Without this, the decode worker would receive handles pointing to freed memory.
-                if (
-                    request.is_context_only_request
-                    and _use_mrope
-                    and "mrope_config" in multimodal_params.multimodal_data
-                ):
-                    mrope_config = multimodal_params.multimodal_data["mrope_config"]
-                    _mrope_position_ids = mrope_config.get("mrope_position_ids")
-                    _mrope_position_deltas = mrope_config.get("mrope_position_deltas")
-                    if _mrope_position_ids is not None and _mrope_position_deltas is not None:
-                        # Clone to allocate new memory owned by this (prefill) worker.
-                        request.py_result.set_mrope_position(
-                            _mrope_position_ids.clone(), _mrope_position_deltas.clone()
-                        )
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -800,15 +950,147 @@ class DecoderInputPreparer:
             text_token_indices_ctx = None
             mm_token_indices = None
 
+        host.num_ctx_requests = num_ctx_requests
+        host.num_ctx_tokens = num_ctx_tokens
+        host.text_token_indices_ctx = text_token_indices_ctx
+        host.mm_token_indices = mm_token_indices
+
+    def _pack_context_multimodal(
+        self,
+        host: HostInputs,
+        request: LlmRequest,
+        begin_compute: int,
+        end_compute: int,
+        past_seen_token_num: int,
+        prompt_tokens: list[int],
+        context_start_idx: int,
+    ) -> None:
+        """Attach a context request's multimodal inputs and MRoPE positions."""
+        _use_mrope = host.use_mrope
+        position_ids = host.position_ids
+        mrope_position_ids = host.mrope_position_ids
+        mrope_delta_write_seq_slots = host.mrope_delta_write_seq_slots
+        multimodal_params_list = host.multimodal_params_list
+
+        # Embed mask is required only for partial iterations (chunked
+        # prefill or KV-cache reuse); full-prefill degrades gracefully.
+        check_mm_embed_cumsum_if_needed(
+            request.py_multimodal_data,
+            begin_compute=past_seen_token_num,
+            end_compute=end_compute,
+            prompt_len=request.get_num_tokens(0),
+        )
+        mm_data = request.py_multimodal_data or {}
+        cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+        py_multimodal_runtime = None
+        if cumsum is not None:
+            py_multimodal_runtime = MultimodalRuntimeData(
+                embed_mask_cumsum=cumsum,
+                past_seen_token_num=past_seen_token_num,
+                chunk_end_pos=end_compute,
+            )
+
+        multimodal_params = MultimodalParams(
+            multimodal_input=_build_request_multimodal_input(
+                request, self._config.mm_encoder_cache_enabled
+            ),
+            multimodal_data=self._build_multimodal_data_for_llm(request, py_multimodal_runtime),
+            multimodal_runtime=py_multimodal_runtime,
+            mm_item_order=getattr(request, "py_mm_item_order", None),
+            input_ids_start_offset=context_start_idx,
+        )
+        # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
+        # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
+        # not from the request.
+        # NOTE: the prefetch producer always writes the cached embedding into
+        # `py_multimodal_data` before stamping the event, so whenever the event is present,
+        # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
+        # it.
+        mm_encoder_event = request.py_mm_encoder_event
+        if mm_encoder_event is not None:
+            multimodal_params.encoder_event = mm_encoder_event
+            request.py_mm_encoder_event = None
+        if multimodal_params.has_content():
+            # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
+            # transferring raw encoder inputs for full hits in both regular and
+            # side-stream-prefetched paths.
+            multimodal_params.to_device(
+                "multimodal_data",
+                "cuda",
+                pin_memory=prefer_pinned(),
+                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
+            )
+            if _use_mrope:
+                # A request may carry multimodal content but no MRoPE
+                # metadata (a text-only prompt whose input processor skips
+                # ``mrope_config``, or a model that does not consume it).
+                # Its per-axis positions are just the scalar positions,
+                # which the (3,1,N) seeding further below already
+                # broadcasts, so leave that span alone.
+                mrope_config = multimodal_params.multimodal_data.get("mrope_config") or {}
+                mrope_pos_ids = mrope_config.get("mrope_position_ids")
+                if mrope_pos_ids is not None:
+                    ctx_mrope_position_ids = mrope_pos_ids[
+                        :, :, begin_compute : begin_compute + len(prompt_tokens)
+                    ]
+                    # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
+                    mrope_position_ids.append(
+                        (
+                            len(position_ids) - len(prompt_tokens),
+                            len(position_ids),
+                            ctx_mrope_position_ids,
+                        )
+                    )
+                mrope_position_delta = mrope_config.get("mrope_position_deltas")
+                if mrope_position_delta is not None:
+                    request.py_mrope_position_delta = mrope_position_delta
+                if mrope_position_delta is not None and request.py_seq_slot is not None:
+                    mrope_delta_write_seq_slots.append(request.py_seq_slot)
+                    request.py_mrope_delta_cache_slot = request.py_seq_slot
+
+            # Item scheduling builds a per-forward copy holding this chunk's joined rows.
+            # Keep it off the request so chunked prefill does not retain those rows between
+            # chunks outside the encoder-cache memory budget. Legacy requests keep their
+            # device payload for generation.
+            if request.py_mm_encoder_state is None:
+                request.py_multimodal_data = multimodal_params.multimodal_data
+            multimodal_params_list.append(multimodal_params)
+
+            # Re-register mrope tensors for context-only requests (EPD disaggregated serving).
+            # This creates new IPC handles owned by the prefill worker, so the decode worker
+            # can access them even after the encode worker's GC deallocates the original memory.
+            # Without this, the decode worker would receive handles pointing to freed memory.
+            if (
+                request.is_context_only_request
+                and _use_mrope
+                and "mrope_config" in multimodal_params.multimodal_data
+            ):
+                mrope_config = multimodal_params.multimodal_data["mrope_config"]
+                _mrope_position_ids = mrope_config.get("mrope_position_ids")
+                _mrope_position_deltas = mrope_config.get("mrope_position_deltas")
+                if _mrope_position_ids is not None and _mrope_position_deltas is not None:
+                    # Clone to allocate new memory owned by this (prefill) worker.
+                    request.py_result.set_mrope_position(
+                        _mrope_position_ids.clone(), _mrope_position_deltas.clone()
+                    )
+
+    def _classify_generation_requests(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        promoted_context_request_ids: frozenset[int],
+        next_draft_tokens_device: torch.Tensor | None,
+        enable_spec_decode: bool,
+    ) -> None:
+        """Sort generation requests into the extend, first-draft and generation groups."""
+        extend_requests = host.extend_requests
+        extend_dummy_requests = host.extend_dummy_requests
+        generation_requests = host.generation_requests
+        first_draft_requests = host.first_draft_requests
+        all_gen_request_ids = host.all_gen_request_ids
+
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
-        extend_requests = []
-        extend_dummy_requests = []
-        generation_requests = []
-        first_draft_requests = []
-        # Collect generation request IDs during categorization to avoid
-        # a separate iteration over scheduled_requests.generation_requests later.
-        all_gen_request_ids = []
         for request in scheduled_requests.generation_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if is_promoted_context:
@@ -841,14 +1123,18 @@ class DecoderInputPreparer:
                 generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
+    def _prepare_helix_state(
+        self, host: HostInputs, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
         # Helix bookkeeping is needed by BOTH the extend (speculative verify
         # group) and the plain generation packing loops below, so initialize
         # it ahead of them. Positions are global; KV ownership follows the
         # round-robin ledger (page b -> rank b % cp); the host-side
         # provisional packing values come from the one shared definition in
         # _torch.utils.helix_local_len.
-        helix_is_inactive_rank, helix_position_offsets = [], []
-        helix_owned_new_tokens = []
+        helix_is_inactive_rank = host.helix_is_inactive_rank
+        helix_position_offsets = host.helix_position_offsets
+        position_ids = host.position_ids
         _has_cp_helix = self.mapping.has_cp_helix()
         if _has_cp_helix and kv_cache_manager is not None:
             _helix_phys = kv_cache_manager.tokens_per_block
@@ -871,18 +1157,41 @@ class DecoderInputPreparer:
                 helix_is_inactive_rank.append(False)
                 return base
 
-        spec_config = self._config.spec_config if enable_spec_decode else None
-        if not self._config.disable_overlap_scheduler and spec_config is not None:
-            assert spec_config.spec_dec_mode.support_overlap_scheduler(), (
-                f"{spec_config.decoding_type} does not support overlap scheduler"
-            )
+            host.helix_local_len_host = _helix_local_len_host
+            host.helix_pack_extend = _helix_pack_extend
+        host.has_cp_helix = _has_cp_helix
 
-        runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
+    def _pack_extend_requests(
+        self,
+        host: HostInputs,
+        promoted_context_request_ids: frozenset[int],
+        next_draft_tokens_device: torch.Tensor | None,
+        runtime_tokens_per_gen_step: int,
+        spec_config: DecodingBaseConfig | None,
+        *,
+        enable_spec_decode: bool,
+    ) -> None:
+        """Pack requests that verify draft tokens or take a promoted context row."""
+        extend_requests = host.extend_requests
+        padding_gen_slots = host.padding_gen_slots
+        request_ids = host.request_ids
+        input_ids = host.input_ids
+        draft_tokens = host.draft_tokens
+        draft_lens = host.draft_lens
+        prompt_lengths = host.prompt_lengths
+        sequence_lengths = host.sequence_lengths
+        num_accepted_draft_tokens = host.num_accepted_draft_tokens
+        gather_ids = host.gather_ids
+        position_ids = host.position_ids
+        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        previous_batch_indices = host.previous_batch_indices
+        previous_pos_indices = host.previous_pos_indices
+        helix_owned_new_tokens = host.helix_owned_new_tokens
+        extra_inputs = host.extra_inputs
+        _has_cp_helix = host.has_cp_helix
+        _helix_local_len_host = host.helix_local_len_host
+        _helix_pack_extend = host.helix_pack_extend
 
-        # will contain previous batch indices of generation requests
-        previous_batch_indices = []
-        previous_pos_indices = []
-        runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
@@ -1011,6 +1320,20 @@ class DecoderInputPreparer:
 
             extra_inputs.add_generation_request(request)
 
+    def _pack_first_draft_requests(self, host: HostInputs) -> None:
+        """Pack the first draft-model step of each request."""
+        first_draft_requests = host.first_draft_requests
+        request_ids = host.request_ids
+        draft_lens = host.draft_lens
+        position_ids = host.position_ids
+        input_ids = host.input_ids
+        gather_ids = host.gather_ids
+        num_accepted_draft_tokens = host.num_accepted_draft_tokens
+        sequence_lengths = host.sequence_lengths
+        prompt_lengths = host.prompt_lengths
+        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        extra_inputs = host.extra_inputs
+
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
             draft_lens.append(0)
@@ -1039,6 +1362,40 @@ class DecoderInputPreparer:
 
             # update batch index
             request.py_batch_idx = request.py_seq_slot
+
+    def _pack_generation_requests(
+        self,
+        host: HostInputs,
+        promoted_context_request_ids: frozenset[int],
+        new_tokens_device: torch.Tensor | None,
+    ) -> None:
+        """Pack one token per beam for every plain generation request."""
+        generation_requests = host.generation_requests
+        draft_lens = host.draft_lens
+        sequence_lengths = host.sequence_lengths
+        num_accepted_draft_tokens = host.num_accepted_draft_tokens
+        request_ids = host.request_ids
+        input_ids = host.input_ids
+        previous_batch_indices = host.previous_batch_indices
+        helix_is_inactive_rank = host.helix_is_inactive_rank
+        helix_position_offsets = host.helix_position_offsets
+        helix_owned_new_tokens = host.helix_owned_new_tokens
+        position_ids = host.position_ids
+        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        prompt_lengths = host.prompt_lengths
+        gather_ids = host.gather_ids
+        mrope_position_ids = host.mrope_position_ids
+        mrope_delta_write_seq_slots = host.mrope_delta_write_seq_slots
+        mrope_delta_read_seq_slots = host.mrope_delta_read_seq_slots
+        multimodal_params_list = host.multimodal_params_list
+        extra_inputs = host.extra_inputs
+        gen_request_seq_slots = host.gen_request_seq_slots
+        _use_mrope = host.use_mrope
+        _has_cp_helix = host.has_cp_helix
+        mrope_dummy_seq_slot = host.mrope_dummy_seq_slot
+        # Whether any generation request in this batch carries real MRoPE
+        # metadata; see the post-loop cleanup below.
+        has_gen_mrope_delta = False
 
         # Cache invariant method result to avoid repeated calls per-request
         _n_gen = len(generation_requests)
@@ -1253,6 +1610,30 @@ class DecoderInputPreparer:
             # reachable for text-only batches on MRoPE models.
             mrope_delta_read_seq_slots.clear()
 
+        host.n_gen = _n_gen
+        host.has_any_multimodal_request = _has_any_multimodal_request
+        if _n_gen > 0:
+            host.beam_width = beam_width
+
+    def _copy_token_ids_to_device(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        new_tokens_device: torch.Tensor | None,
+        new_tokens_lens_device: torch.Tensor | None,
+        next_draft_tokens_device: torch.Tensor | None,
+        runtime_draft_len: int,
+    ) -> None:
+        input_ids = host.input_ids
+        draft_tokens = host.draft_tokens
+        num_accepted_draft_tokens = host.num_accepted_draft_tokens
+        position_ids = host.position_ids
+        draft_lens = host.draft_lens
+        previous_batch_indices = host.previous_batch_indices
+        previous_pos_indices = host.previous_pos_indices
+        extend_requests = host.extend_requests
+        extend_dummy_requests = host.extend_dummy_requests
+
         previous_batch_len = len(previous_batch_indices)
 
         def previous_seq_slots_device():
@@ -1386,7 +1767,13 @@ class DecoderInputPreparer:
             self._buffers.previous_pos_id_offsets_cuda *= 0
             self._buffers.previous_kv_lens_offsets_cuda *= 0
 
-        position_ids = apply_position_id_offset(position_ids, model=self.model)
+        host.num_tokens = num_tokens
+        host.total_num_tokens = total_num_tokens
+        host.previous_batch_len = previous_batch_len
+
+    def _copy_position_ids_to_device(self, host: HostInputs) -> None:
+        total_num_tokens = host.total_num_tokens
+        position_ids = apply_position_id_offset(host.position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
         # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
         # for text-only batches: keeping position_ids rank-consistent between
@@ -1406,7 +1793,7 @@ class DecoderInputPreparer:
                 non_blocking=True,
             )
             # Overwrite multimodal spans with per-axis MRoPE positions.
-            for start_idx, end_idx, segment in mrope_position_ids:
+            for start_idx, end_idx, segment in host.mrope_position_ids:
                 if segment.ndim != 3:
                     raise RuntimeError(
                         f"Expected 3D mrope_position_ids, got shape {tuple(segment.shape)}"
@@ -1426,18 +1813,28 @@ class DecoderInputPreparer:
                 self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
-            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :total_num_tokens]
         else:
             self._buffers.position_ids_cuda[:total_num_tokens].copy_(
                 host_position_ids, non_blocking=True
             )
-            final_position_ids = self._buffers.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
-        if enable_spec_decode:
-            self._buffers.gather_ids_cuda[: len(gather_ids)].copy_(
-                torch.tensor(gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+        host.host_position_ids = host_position_ids
+
+    def _prepare_attn_metadata(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
+        attn_metadata: AttentionMetadata,
+        cache_indirection_buffer: torch.Tensor | None,
+        spec_config: DecodingBaseConfig | None,
+        *,
+        enable_spec_decode: bool,
+        is_dummy: bool,
+    ) -> None:
+        num_cached_tokens_per_seq = host.num_cached_tokens_per_seq
+        gen_request_seq_slots = host.gen_request_seq_slots
+        extend_requests = host.extend_requests
 
         if self.mapping.has_cp_helix():
             # A non-None owned-count list is what arms
@@ -1447,18 +1844,18 @@ class DecoderInputPreparer:
             # hand-off here, at the single choke point, so no packing loop can
             # arm the spec path for ordinary helix generation and send its
             # consumers to uninitialized buffers.
-            helix_spec_active = bool(enable_spec_decode and helix_owned_new_tokens)
+            helix_spec_active = bool(enable_spec_decode and host.helix_owned_new_tokens)
             attn_metadata.update_helix_param(
-                helix_position_offsets=helix_position_offsets,
-                helix_is_inactive_rank=helix_is_inactive_rank,
-                helix_owned_new_tokens=(helix_owned_new_tokens if helix_spec_active else None),
+                helix_position_offsets=host.helix_position_offsets,
+                helix_is_inactive_rank=host.helix_is_inactive_rank,
+                helix_owned_new_tokens=(host.helix_owned_new_tokens if helix_spec_active else None),
             )
 
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
             # to draft sequences too. This means that all draft sequences must be padded.
             attn_metadata.seq_lens = torch.tensor(
-                sequence_lengths,
+                host.sequence_lengths,
                 dtype=torch.int,
                 pin_memory=prefer_pinned(),
             )
@@ -1480,8 +1877,8 @@ class DecoderInputPreparer:
         else:
             attn_metadata.beam_width = 1
 
-        attn_metadata.request_ids = request_ids
-        attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.request_ids = host.request_ids
+        attn_metadata.prompt_lens = host.prompt_lengths
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
         remote_tail_modes = {
             getattr(request, "py_csa2_remote_tail_mode", None)
@@ -1541,20 +1938,19 @@ class DecoderInputPreparer:
                 ),
             )
         attn_metadata.prepare()
-        extra_model_inputs = extra_inputs.build(attn_metadata, resource_manager)
+        host.num_cached_tokens_snapshot = num_cached_tokens_snapshot
+        host.remote_tail_modes = remote_tail_modes
 
-        peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
-            ResourceManagerType.PEFT_CACHE_MANAGER
-        )
-        lora_params = self._lora.build(
-            scheduled_requests,
-            attn_metadata,
-            enable_spec_decode=enable_spec_decode,
-            runtime_draft_len=runtime_draft_len,
-            peft_cache_manager=peft_cache_manager,
-            maybe_graph=maybe_graph,
-            use_lora_graph=use_lora_graph,
-        )
+    def _pad_inputs(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        maybe_graph: bool,
+        gather_context_logits: bool,
+    ) -> None:
+        total_num_tokens = host.total_num_tokens
 
         if spec_metadata is not None:
             # Set the per-batch counts here, before the attention-DP allgather
@@ -1565,7 +1961,7 @@ class DecoderInputPreparer:
             # count prepare() uses.
             spec_metadata.num_tokens = total_num_tokens
             spec_metadata.num_generations = scheduled_requests.num_generation_requests
-            spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.seq_lens = host.sequence_lengths
 
         # Resolve row selection before the existing attention/spec count
         # exchange. Prefill graph padding is selected collectively below and
@@ -1604,13 +2000,13 @@ class DecoderInputPreparer:
         (padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens) = (
             get_padding_params(
                 total_num_tokens,
-                num_ctx_requests,
+                host.num_ctx_requests,
                 attn_all_rank_num_tokens,
                 dist=self.dist,
                 enable_attention_dp=self._config.enable_attention_dp,
                 prefill_cuda_graph_backend=(
                     PrefillCudaGraphBackend.DISABLED
-                    if remote_tail_modes
+                    if host.remote_tail_modes
                     or scheduled_requests.attention_dp_phase is RemoteTailPhase.CONTEXT
                     else self._config.prefill_cuda_graph_backend
                 ),
@@ -1626,25 +2022,38 @@ class DecoderInputPreparer:
         if attn_metadata.padded_num_tokens is not None:
             self._buffers.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
-            # Match the rank of the unpadded branch: MRoPE models always use
-            # the (3,1,N) layout (see the seeding block above), so the padded
-            # view must stay 3D as well to keep torch.compile guards stable.
             if self._config.use_mrope:
                 # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
                 self._buffers.mrope_position_ids_cuda[
                     :, :, total_num_tokens:padded_num_tokens
                 ].fill_(0)
-                final_position_ids = self._buffers.mrope_position_ids_cuda[
-                    :, :, :virtual_num_tokens
-                ]
             else:
                 self._buffers.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-                final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(
-                    0
-                )
 
         if self._config.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+
+        host.spec_all_rank_counts = spec_all_rank_counts
+        host.virtual_num_tokens = virtual_num_tokens
+
+    def _build_inputs(
+        self,
+        host: HostInputs,
+        scheduled_requests: ScheduledRequests,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: SpecMetadata | None,
+        resource_manager: ResourceManager | None,
+        extra_model_inputs: dict[str, Any],
+        lora_params: dict[str, Any] | None,
+        runtime_draft_len: int,
+    ) -> dict[str, Any]:
+        virtual_num_tokens = host.virtual_num_tokens
+        # MRoPE models always use the (3,1,N) layout, padded or not, to keep
+        # torch.compile guards stable.
+        if self._config.use_mrope:
+            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
+        else:
+            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
 
         # Prepare inputs
         inputs = {
@@ -1652,23 +2061,23 @@ class DecoderInputPreparer:
             "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
             "position_ids": final_position_ids,
             "inputs_embeds": None,
-            "multimodal_params": multimodal_params_list,
+            "multimodal_params": host.multimodal_params_list,
             "resource_manager": resource_manager,
         }
         inputs.update(extra_model_inputs)
 
         if self._config.use_mrope:
-            if mrope_delta_write_seq_slots:
+            if host.mrope_delta_write_seq_slots:
                 delta_write_seq_slots = torch.tensor(
-                    mrope_delta_write_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
+                    host.mrope_delta_write_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
                 )
                 inputs["mrope_delta_write_seq_slots"] = delta_write_seq_slots.to(
                     device="cuda", non_blocking=True
                 )
 
-            if mrope_delta_read_seq_slots:
+            if host.mrope_delta_read_seq_slots:
                 delta_read_seq_slots = torch.tensor(
-                    mrope_delta_read_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
+                    host.mrope_delta_read_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
                 )
                 inputs["mrope_delta_read_seq_slots"] = delta_read_seq_slots.to(
                     device="cuda", non_blocking=True
@@ -1678,206 +2087,123 @@ class DecoderInputPreparer:
             inputs["lora_params"] = lora_params
 
         if spec_metadata is not None:
-            total_draft_lens = sum(draft_lens)
+            total_draft_lens = sum(host.draft_lens)
             spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
-            spec_metadata.request_ids = request_ids
-            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(gather_ids)]
+            spec_metadata.request_ids = host.request_ids
+            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(host.gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
-            spec_metadata.host_position_ids = host_position_ids
+            spec_metadata.host_position_ids = host.host_position_ids
             spec_metadata.num_accepted_draft_tokens = self._buffers.num_accepted_draft_tokens_cuda[
-                : len(num_accepted_draft_tokens)
+                : len(host.num_accepted_draft_tokens)
             ]
-            if context_prompt_lookahead is not None:
-                spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
+            if host.context_prompt_lookahead is not None:
+                spec_metadata.populate_context_prompt_lookahead(host.context_prompt_lookahead)
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
             spec_metadata.prepare()
             # One-model rejection: one-hot the stale draft_probs rows of gen
             # requests that produced no draft tokens this step, so the (possibly
             # captured) rejection kernel reads a legal placeholder distribution.
-            spec_metadata.write_padding_onehot_draft_probs(padding_gen_slots, runtime_draft_len)
+            spec_metadata.write_padding_onehot_draft_probs(
+                host.padding_gen_slots, runtime_draft_len
+            )
             inputs["spec_metadata"] = spec_metadata
 
             if self._config.enable_attention_dp:
-                set_spec_metadata_all_rank_num_tokens(spec_metadata, *spec_all_rank_counts)
+                set_spec_metadata_all_rank_num_tokens(spec_metadata, *host.spec_all_rank_counts)
 
-        if mm_token_indices is not None:
+        if host.mm_token_indices is not None:
             ship_multimodal_indices(
                 inputs,
-                mm_token_indices_cpu=mm_token_indices,
-                text_token_indices_cpu=text_token_indices_ctx,
-                num_ctx_tokens=num_ctx_tokens,
-                total_num_tokens=total_num_tokens,
+                mm_token_indices_cpu=host.mm_token_indices,
+                text_token_indices_cpu=host.text_token_indices_ctx,
+                num_ctx_tokens=host.num_ctx_tokens,
+                total_num_tokens=host.total_num_tokens,
             )
+        return inputs
 
+    def _record_iter_states(self, host: HostInputs, scheduled_requests: ScheduledRequests) -> None:
         num_generation_tokens = (
-            len(generation_requests)
-            + len(extend_requests)
-            + sum(draft_lens)
-            + len(first_draft_requests)
+            len(host.generation_requests)
+            + len(host.extend_requests)
+            + sum(host.draft_lens)
+            + len(host.first_draft_requests)
         )
-        self.iter_states["num_ctx_requests"] = num_ctx_requests
-        self.iter_states["num_ctx_tokens"] = num_ctx_tokens
+        self.iter_states["num_ctx_requests"] = host.num_ctx_requests
+        self.iter_states["num_ctx_tokens"] = host.num_ctx_tokens
         self.iter_states["num_generation_tokens"] = num_generation_tokens
         # Count the already-cached prefix for the sequences scheduled this iteration.
-        self.iter_states["cached_kv_tokens"] = sum(num_cached_tokens_per_seq)
+        self.iter_states["cached_kv_tokens"] = sum(host.num_cached_tokens_per_seq)
         if self.log_cached_kv_tokens_per_req:
             self.record_cached_kv_tokens_per_req(
-                num_cached_tokens_per_seq,
+                host.num_cached_tokens_per_seq,
                 (
                     (scheduled_requests.context_requests, 1),
-                    (extend_requests, 1),
-                    (first_draft_requests, 1),
-                    (generation_requests, beam_width if generation_requests else 1),
+                    (host.extend_requests, 1),
+                    (host.first_draft_requests, 1),
+                    (host.generation_requests, host.beam_width),
                 ),
             )
 
-        if not is_dummy:
-            # Record the steady-state generation cache when this pass handled
-            # purely non-dummy generation requests that all carried a previous
-            # overlap-scheduler tensor (previous_batch_len == _n_gen implies
-            # every request took that branch and none appended input_ids).
-            # While the batch composition holds, the next passes only need to
-            # advance positions by one and refresh per-step metadata.
-            # MRoPE models are supported only for batches with no actual mrope
-            # work (text-only requests, empty mrope lists below): the full
-            # pass routes use_mrope models through the (3,1,N)
-            # mrope_position_ids_cuda layout even then (to keep torch.compile
-            # guards stable), with all three axes equal to the scalar
-            # positions, so the fast path advances that buffer in place and
-            # returns the same layout (see _apply_steady_gen_fast_prepare).
-            if (
-                self._config.spec_config is None
-                and spec_metadata is None
-                and new_tokens_device is not None
-                and self.guided_decoder is None
-                and not self._config.enable_attention_dp
-                and not mrope_position_ids
-                and not mrope_delta_write_seq_slots
-                and not mrope_delta_read_seq_slots
-                and not self.use_beam_search
-                and self._config.max_beam_width == 1
-                and self._new_extra_inputs is None
-                and not _has_cp_helix
-                and num_ctx_requests == 0
-                and not extend_requests
-                and not first_draft_requests
-                and _n_gen > 0
-                and previous_batch_len == _n_gen
-                and num_tokens == 0
-                and not _has_any_multimodal_request
-                and not multimodal_params_list
-                and not lora_params
-                and attn_metadata.padded_num_tokens is None
-                and get_position_id_offset(self.model) == 0
-                and not getattr(kv_cache_manager, "kv_compression_manages_history", False)
-            ):
-                self._buffers.steady_gen_positions_pinned[:_n_gen].copy_(
-                    torch.as_tensor(num_cached_tokens_snapshot, dtype=torch.int)
-                )
-                self._steady_gen_cache = {
-                    "num_requests": _n_gen,
-                    "request_ids": all_gen_request_ids,
-                    "prompt_lens": prompt_lengths,
-                    "seq_lens_ones": maybe_pin_memory(torch.ones(_n_gen, dtype=torch.int)),
-                    "use_mrope": _use_mrope,
-                }
-
-        gather_ids_device = (
-            self._buffers.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
-        )
-        return PreparedInputs(inputs, gather_ids_device)
-
-    @nvtx_range("_prepare_inputs")
-    def prepare_inputs(
+    def _record_steady_gen_cache(
         self,
-        scheduled_requests: ScheduledRequests,
+        host: HostInputs,
         kv_cache_manager: KVCacheManager | KVCacheManagerV2,
         attn_metadata: AttentionMetadata,
-        spec_metadata: SpecMetadata | None = None,
-        new_tensors_device: SampleStateTensors | None = None,
-        cache_indirection_buffer: torch.Tensor | None = None,
-        resource_manager: ResourceManager | None = None,
-        maybe_graph: bool = False,
-        promoted_context_request_ids: frozenset[int] = frozenset(),
-        use_lora_graph: bool = False,
-        *,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
-        is_dummy: bool,
-        gather_context_logits: bool = False,
-    ) -> PreparedInputs:
-        set_per_request_prefill_cuda_graph_flag(False)
-        if self.mapping is not None and "cp_type" in self.mapping.cp_config:
-            cp_type = self.mapping.cp_config["cp_type"]
-            if cp_type in (CpType.HELIX, CpType.ULYSSES):
-                # Take the usual route of _prepare_tp_inputs.
-                pass
-            else:
-                raise NotImplementedError(
-                    f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}."
-                )
-
-        # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
-        has_sa_enhancer = (
-            self._config.spec_config is not None
-            and getattr(self._config.spec_config, "sa_config", None) is not None
-        )
-        if has_sa_enhancer and resource_manager is not None and self.mapping.is_last_pp_rank():
-            from tensorrt_llm._torch.speculative.suffix_automaton import SuffixAutomatonManager
-
-            spec_rm = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER
-            )
-            sa_manager = None
-            if spec_rm is not None:
-                if isinstance(spec_rm, SuffixAutomatonManager):
-                    sa_manager = spec_rm
-                else:
-                    sa_manager = getattr(spec_rm, "sa_manager", None)
-            if sa_manager is not None:
-                for request in scheduled_requests.all_requests():
-                    if request.py_request_id not in sa_manager._initialized_requests:
-                        sa_manager.add_request(request.py_request_id, request.get_tokens(0))
-                        sa_manager._initialized_requests.add(request.py_request_id)
-
-        # Outside capture, before any steady-input early return in the TP path.
-        prepare_request_inputs = getattr(self.model, "prepare_request_inputs", None)
-        if prepare_request_inputs is not None:
-            prepare_request_inputs(scheduled_requests, attn_metadata, promoted_context_request_ids)
-
-        prepared = self._prepare_tp_inputs(
-            scheduled_requests,
-            kv_cache_manager,
-            attn_metadata,
-            spec_metadata,
-            new_tensors_device,
-            cache_indirection_buffer,
-            resource_manager,
-            maybe_graph,
-            promoted_context_request_ids,
-            use_lora_graph=use_lora_graph,
-            enable_spec_decode=enable_spec_decode,
-            runtime_draft_len=runtime_draft_len,
-            is_dummy=is_dummy,
-            gather_context_logits=gather_context_logits,
-        )
-        from tensorrt_llm._torch.pyexecutor.ced_replay import (
-            encoder_replay_tokens,
-            uses_private_decoder_cache,
-        )
-
-        if scheduled_requests.num_context_requests and (
-            (
-                self._config.enable_attention_dp
-                and getattr(self.model, "prepare_adp_inputs", None) is not None
-            )
-            or uses_private_decoder_cache(getattr(self.model, "model", None), kv_cache_manager)
-            or any(encoder_replay_tokens(req) for req in scheduled_requests.context_requests)
+        spec_metadata: SpecMetadata | None,
+        new_tokens_device: torch.Tensor | None,
+        lora_params: dict[str, Any] | None,
+    ) -> None:
+        # Record the steady-state generation cache when this pass handled
+        # purely non-dummy generation requests that all carried a previous
+        # overlap-scheduler tensor (previous_batch_len == _n_gen implies
+        # every request took that branch and none appended input_ids).
+        # While the batch composition holds, the next passes only need to
+        # advance positions by one and refresh per-step metadata.
+        # MRoPE models are supported only for batches with no actual mrope
+        # work (text-only requests, empty mrope lists below): the full
+        # pass routes use_mrope models through the (3,1,N)
+        # mrope_position_ids_cuda layout even then (to keep torch.compile
+        # guards stable), with all three axes equal to the scalar
+        # positions, so the fast path advances that buffer in place and
+        # returns the same layout (see _apply_steady_gen_fast_prepare).
+        if (
+            self._config.spec_config is None
+            and spec_metadata is None
+            and new_tokens_device is not None
+            and self.guided_decoder is None
+            and not self._config.enable_attention_dp
+            and not host.mrope_position_ids
+            and not host.mrope_delta_write_seq_slots
+            and not host.mrope_delta_read_seq_slots
+            and not self.use_beam_search
+            and self._config.max_beam_width == 1
+            and self._new_extra_inputs is None
+            and not host.has_cp_helix
+            and host.num_ctx_requests == 0
+            and not host.extend_requests
+            and not host.first_draft_requests
+            and host.n_gen > 0
+            and host.previous_batch_len == host.n_gen
+            and host.num_tokens == 0
+            and not host.has_any_multimodal_request
+            and not host.multimodal_params_list
+            and not lora_params
+            and attn_metadata.padded_num_tokens is None
+            and get_position_id_offset(self.model) == 0
+            and not getattr(kv_cache_manager, "kv_compression_manages_history", False)
         ):
-            prepared.kwargs["context_requests"] = scheduled_requests.context_requests
-        return prepared
+            self._buffers.steady_gen_positions_pinned[: host.n_gen].copy_(
+                torch.as_tensor(host.num_cached_tokens_snapshot, dtype=torch.int)
+            )
+            self._steady_gen_cache = {
+                "num_requests": host.n_gen,
+                "request_ids": host.all_gen_request_ids,
+                "prompt_lens": host.prompt_lengths,
+                "seq_lens_ones": maybe_pin_memory(torch.ones(host.n_gen, dtype=torch.int)),
+                "use_mrope": host.use_mrope,
+            }
 
     def _get_remote_tail_decode_rank_tokens(
         self, attn_metadata: AttentionMetadata, can_run_graph: bool

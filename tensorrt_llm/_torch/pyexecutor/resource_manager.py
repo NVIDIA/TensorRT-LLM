@@ -533,7 +533,7 @@ class KVCacheManager(BaseResourceManager):
             tail = -1
         self._spec_recompute_tail = tail
         # Kept so prepare_resources can re-validate the per-step token budget
-        # (the forward-pass scratch size enforced in _prepare_tp_inputs).
+        # (the forward-pass scratch size enforced in DecoderInputPreparer.prepare_inputs).
         self.max_num_tokens = max_num_tokens
         # Whether chunked prefill is enabled for this engine. Gates the shrink
         # path in fit_token_budget: a context request may only be shrunk into a
@@ -998,7 +998,7 @@ class KVCacheManager(BaseResourceManager):
         ``context_chunk_size`` still spans the reusable KV prefix and this
         over-counts by up to the whole cached prefix.
 
-        Mirrors ``_prepare_tp_inputs``: a context request contributes
+        Mirrors ``DecoderInputPreparer._pack_context_requests``: a context request contributes
         ``all_prompt_tokens[pos : pos + chunk]``, which Python slicing clamps to
         what is left of the prompt, plus draft tokens on the last chunk only.
         """
@@ -1056,7 +1056,7 @@ class KVCacheManager(BaseResourceManager):
         ``prepopulated_prompt_len``, computed later inside ``addSequence``. When
         the real reuse comes in lower than the estimate, the forward pass
         materializes more tokens than were charged and trips the
-        ``total_num_tokens <= max_num_tokens`` assert in ``_prepare_tp_inputs``
+        ``total_num_tokens <= max_num_tokens`` assert in ``DecoderInputPreparer.prepare_inputs``
         -- which fails every request in the batch and charges the executor's
         error budget (GitHub issue #13318).
 
@@ -1446,7 +1446,7 @@ class KVCacheManager(BaseResourceManager):
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
             # Helix active rank sets past_seen_token_num = seqlen_this_rank_cp - 1
-            # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
+            # in _pack_generation_requests; need token_num >= 2 so that doesn't go negative.
             if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
             encoder_output_len = (encoder_output_lens[i]

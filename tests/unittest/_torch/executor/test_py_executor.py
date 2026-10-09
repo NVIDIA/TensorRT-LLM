@@ -3347,7 +3347,7 @@ class TestOneModelMTPDraftTokenScheduling:
     draft-token budget while context requests are left untouched.
 
     The Python-side fill is placeholder-only: with the overlap scheduler
-    disabled, ``_prepare_tp_inputs`` sources a generation request's draft
+    disabled, ``DecoderInputPreparer._pack_extend_requests`` sources a generation request's draft
     tokens from ``py_draft_tokens``, which the one-model spec sampler wrote at
     the end of the previous iteration. Overwriting a populated list here would
     feed zeros to the target model and collapse the acceptance rate.

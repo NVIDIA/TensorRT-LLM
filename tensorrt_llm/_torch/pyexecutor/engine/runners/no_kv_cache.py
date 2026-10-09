@@ -120,7 +120,7 @@ class NoKVCacheRunner(ScheduledModelRunner):
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
             # Start offset of this request's tokens within the flattened
-            # input_ids (see _prepare_tp_inputs for rationale).
+            # input_ids (see DecoderInputPreparer._pack_context_requests for rationale).
             context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)

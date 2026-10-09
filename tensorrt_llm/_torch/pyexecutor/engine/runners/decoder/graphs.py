@@ -159,7 +159,7 @@ class DecoderCudaGraphs:
             return graphs
 
         # Case 2: Static draft length
-        # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
+        # Match the runtime_draft_len semantics enforced in resolve_runtime_draft_len:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
         # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
         draft_lengths = [get_static_draft_len(self._config.spec_config)]

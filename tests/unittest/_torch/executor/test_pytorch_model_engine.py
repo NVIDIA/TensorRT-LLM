@@ -2028,8 +2028,9 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         decoder.cuda_graph_runner.clear.assert_called_once_with()
         decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
 
-    def test_prepare_tp_inputs_returns_steady_gen_fast_inputs(self) -> None:
+    def test_prepare_inputs_returns_steady_gen_fast_inputs(self) -> None:
         inputs = _input_preparer()
+        inputs._config = SimpleNamespace(spec_config=None)
         inputs.guided_decoder = Mock()
         inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
         fast_inputs = PreparedInputs({"prepared": True})
@@ -2037,7 +2038,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         batch = ScheduledRequests()
         new_tokens = torch.zeros(1)
 
-        result = inputs._prepare_tp_inputs(
+        result = inputs.prepare_inputs(
             batch,
             Mock(),
             Mock(),
@@ -2085,7 +2086,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           kv_cache_manager=kv_cache_manager)
         attn_metadata.is_cuda_graph = False
         # A bare Mock auto-vivifies every attribute, so optional metadata
-        # fields read by _prepare_tp_inputs must be pinned off explicitly.
+        # fields read by prepare_inputs must be pinned off explicitly.
         spec_metadata = Mock(
             _force_non_greedy_for_capture=False,
             context_prompt_lookahead_tokens=None,
@@ -2116,7 +2117,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           device="cuda"),
         )
 
-        prepared = model_engine._runner._inputs._prepare_tp_inputs(
+        prepared = model_engine._runner._inputs.prepare_inputs(
             scheduled_requests=graph_batch,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
@@ -2630,8 +2631,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine.forward(batch, resource_manager)
 
     @skip_ray
-    def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:
-        """Test _prepare_tp_inputs function with helix parallelism."""
+    def test_prepare_inputs_with_helix_parallelism(self) -> None:
+        """Test prepare_inputs with helix parallelism."""
 
         # Create model engine with helix parallelism.
         llm_args = TorchLlmArgs(model="dummy")
@@ -2698,7 +2699,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
             max_num_tokens, dtype=torch.int32, device='cuda')
 
-        result = model_engine._runner._inputs._prepare_tp_inputs(
+        result = model_engine._runner._inputs.prepare_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
@@ -2920,7 +2921,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests_chunking = [context]
 
-        model_engine._runner._inputs._prepare_tp_inputs(
+        model_engine._runner._inputs.prepare_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,

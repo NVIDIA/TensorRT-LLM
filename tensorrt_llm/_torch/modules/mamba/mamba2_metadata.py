@@ -584,7 +584,7 @@ class Mamba2Metadata:
         # CppMambaHybridCacheManager.prepare_resources(). prepare_resources
         # only enqueues the async cudaMemcpyAsync calls and sets a pending
         # flag; we sync the onboard stream here, so CPU-side prep
-        # work in _prepare_tp_inputs overlaps with the in-flight transfers.
+        # work in DecoderInputPreparer.prepare_inputs overlaps with the in-flight transfers.
         # Cheap no-op on cache managers without this method or when no
         # transfers were scheduled this iteration.
         flush = getattr(kv_cache_manager, "flush_state_transfers", None)
