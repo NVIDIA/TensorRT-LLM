@@ -334,6 +334,42 @@ state).
 `TrtllmAttention` path. Its fields are algorithm-specific, not a generic
 sparse-attention ABI; `VanillaAttention` uses its own per-request contract.
 
+#### 3.1.1 Ragged verification rows
+
+DSA and DeepSeek-V4 keep request-major metadata for preparation, the indexer,
+KV ownership and overlap correction. Python `num_seqs` remains the request
+count. For ragged generation only, `presented_token_major()` temporarily
+presents one attention row per query token to the MLA RoPE/KV-append call and
+to FMHA selection plus dispatch. The native ops derive their sequence count
+from those runtime views; each generation row has query length one.
+
+The presentation swaps `kv_lens_cuda_runtime`, `kv_lens_runtime`,
+`prompt_lens_cpu_runtime`, `prompt_lens_cuda_runtime`,
+`host_request_types_runtime` and `kv_cache_block_offsets`. It also supplies
+the static row-capacity ceiling as `max_num_requests` for workspace sizing.
+All views and that capacity are restored on exit, including exceptional exit;
+`seq_lens` and request identities are not replaced.
+
+Preparation initializes both the indexer's per-row causal KV extents and the
+attention row extents on device, so prepare-to-forward callers can consume
+them immediately. `on_update_kv_lens()` refreshes those same buffers in place
+after device-side overlap correction. Device-selected windows must install
+their request map and KV corrections before that refresh/replay. Context
+attention rows start at zero; generation attention rows start at
+`num_contexts`, while generation tokens start at `num_ctx_tokens`.
+
+The module-level MLA prefix hook matches that presentation too. Ragged
+generation uses fixed-address, opt-in prefix buffers over generation rows
+(one query token per row), excluding the context prefix. KV prefixes scan
+the presented causal device extents, without extra reserved KV tokens.
+Prepare/update invalidation rebuilds them after overlap correction; uniform
+and context prefix preparation keep their existing paths.
+
+Uniform indexer scheduling uses the runtime query width, not the persistent
+draft-cap allocation width. Ragged generation is not supported with FlashMLA:
+its tile schedule uses a request-major scalar query width, so the backend
+rejects that combination before scheduling or dispatch.
+
 ### 3.2 KV-cache and decode-time semantics
 
 The main question is not just "does the backend read K and V?" but:
@@ -418,6 +454,18 @@ Availability requirements must be finalized before manager construction and
 remain invariant for its lifetime. Request-varying capability requirements
 must be represented in `FmhaManager._make_cache_key`, because a cache hit
 reuses the selected library without rechecking support.
+
+For a configuration a library would serve *incorrectly* rather than not at
+all -- a failure inside the library's own kernels that selection cannot see
+or route around -- `_is_supported` raises an actionable error instead of
+returning False. A False would let selection fall through to the generic
+no-library error (or, for a library that is not last in the registry, hand
+the request to a library that masks the broken configuration), while the
+raise names the cause and the remedy at dispatch. `Fp4MlaFmha` raises this
+way for FP4 MLA configurations only it can serve, and `FallbackFmha` raises
+to refuse paged-context FMHA on (SM, head_dim) combinations whose fused
+context kernel is proven absent, where the C++ op would silently fall back
+to unfused MHA and corrupt the cached prefix.
 
 The FMHA package is split by role:
 

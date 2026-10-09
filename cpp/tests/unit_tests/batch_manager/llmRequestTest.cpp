@@ -109,7 +109,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             texec::Request execReq(inputTokens, maxNewTokens);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(2, 1000, 0, 32000);
+            llmReq.validate(2, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "exceeds maximum input");
     }
@@ -121,7 +121,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setSamplingConfig(texec::SamplingConfig(-1));
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 0, 32000);
+            llmReq.validate(500, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
     }
@@ -163,21 +163,9 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setPromptTuningConfig(config);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
+            llmReq.validate(500, 1000, 1, std::nullopt, true);
         };
         lambdaErrMsgs.emplace_back(lambda, "Input token extra ids must be provided");
-    }
-
-    // Invalid endId
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(
-                inputTokens, maxNewTokens, false, texec::SamplingConfig(), texec::OutputConfig(), -2);
-            tb::LlmRequest llmReq(requestId, execReq);
-            llmReq.validate(500, 1000, 1, 32000);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "EndId (-2) is not within acceptable range [-1, 32000)");
     }
 
     for (auto& lambdaErrMsg : lambdaErrMsgs)
@@ -203,14 +191,14 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         // Validate output len truncation w/o draft tokens
         texec::Request execReq(inputTokens, maxNewTokens);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 0, 32000);
+        llmReq.validate(10, 60, 0);
         EXPECT_EQ(llmReq.mMaxNewTokens, 60 - inputTokens.size());
     }
     {
         // Validate output len truncation w draft tokens
         texec::Request execReq(inputTokens, maxNewTokens);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000);
+        llmReq.validate(10, 60, 2);
         EXPECT_EQ(llmReq.mMaxNewTokens, 60 - inputTokens.size() - 2);
     }
     {
@@ -223,7 +211,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
 
         EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
-        llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
+        llmReq.validate(500, 1000, 1, std::nullopt, true);
     }
     {
         using AdditionalModelOutput = texec::AdditionalModelOutput;
@@ -235,7 +223,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000, std::nullopt, false);
+        llmReq.validate(10, 60, 2, std::nullopt, false);
         auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
         EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
         EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);

@@ -45,6 +45,9 @@ std::optional<int32_t> getEnvXqaBlocksPerSequence();
 // Whether use tileSizeKv64 for multiCtasKvMode of trtllm-gen kernels.
 bool getEnvUseTileSizeKv64ForTrtllmGen();
 
+// Whether trtllm-gen context FMHA uses the static tile scheduler instead of the persistent one.
+bool getEnvUseStaticTileSchedulerForTrtllmGenContextFmha();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 
