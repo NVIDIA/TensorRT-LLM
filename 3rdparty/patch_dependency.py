@@ -78,10 +78,13 @@ def record_path(require_git=False):
     return Path(git("rev-parse", "--absolute-git-dir")) / RECORD_NAME
 
 
-def conflict(what):
-    return DependencyError(
-        f"the source tree in {Path.cwd()} has local changes that conflict with {what}. "
-        "Undo them or remove the directory, then reconfigure.")
+UNMODIFIED = "The source tree was not modified."
+PATCH_UNDONE = "The previously applied patch has been undone, so only the local changes remain."
+
+
+def blocked(problem, state):
+    return DependencyError(f"local changes in {Path.cwd()} {problem}. {state} "
+                           "Undo the local changes or remove the directory, then reconfigure.")
 
 
 def undo(patch_file):
@@ -90,17 +93,19 @@ def undo(patch_file):
         if patch(patch_file, "--reverse").returncode != 0:
             raise DependencyError(f"failed to undo {patch_file}")
     elif not can_apply(patch_file):
-        raise conflict("the applied patch")
+        raise blocked("conflict with undoing the applied patch", UNMODIFIED)
 
 
 def cmd_apply(patch_file):
     record = record_path()
+    state = UNMODIFIED
     if record.exists() and record.read_bytes() != patch_file.read_bytes():
         undo(record)
         record.unlink()
+        state = PATCH_UNDONE
     if not is_applied(patch_file):
         if not can_apply(patch_file):
-            raise conflict(patch_file.name)
+            raise blocked(f"conflict with {patch_file.name}", state)
         if patch(patch_file, "--forward").returncode != 0:
             raise DependencyError(f"failed to apply {patch_file}")
     shutil.copyfile(patch_file, record)
@@ -120,12 +125,14 @@ def cmd_update(name, ref):
         return
 
     print(f"-- {name}: checking out {ref}", flush=True)
+    state = UNMODIFIED
     if record.exists():
         undo(record)
         record.unlink()
+        state = PATCH_UNDONE
     if git("status", "--porcelain", "--ignore-submodules=dirty"):
-        raise DependencyError(f"the source tree in {Path.cwd()} has local changes. "
-                              "Undo them or remove the directory, then reconfigure.")
+        raise blocked(f"prevent checking out {ref}",
+                      f"{state} It is still at the previous commit {git('rev-parse', '--short', 'HEAD')}.")
     git("checkout", "--quiet", "--detach", target)
     modules = record.parent / "modules"
     if modules.is_dir() and any(modules.iterdir()):
