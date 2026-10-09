@@ -172,7 +172,7 @@ def _clear_rows(logits, bias, routed_scaling_factor):
 
 
 @pytest.mark.skipif(
-    not _sm_100(), reason="the TRTLLM-Gen MXFP4 cubins and k3_route_quant run on sm_100"
+    not _sm_100(), reason="the TRTLLM-Gen MXFP4 cubins and the fused route + quant run on sm_100"
 )
 @TARGETS
 def test_routing_outside_the_kernel_matches_inside(target, monkeypatch):
