@@ -188,10 +188,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("NVFP4", tensorrt_llm::DataType::kFP4)
         .export_values();
 
-    // Attention kernel enums and parameter structs. Bound here rather than in the thop
-    // submodule so every binding in the module presents them the same way; nanobind's
-    // enum caster still accepts a plain int for a valid enumerator, so Python callers may
-    // pass either these or the matching tensorrt_llm.functional IntEnum.
     nb::enum_<tk::AttentionMaskType>(m, "AttentionMaskType", nb::is_arithmetic())
         .value("PADDING", tk::AttentionMaskType::PADDING)
         .value("CAUSAL", tk::AttentionMaskType::CAUSAL)

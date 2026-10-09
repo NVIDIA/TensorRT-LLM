@@ -133,10 +133,6 @@ void initBindings(nb::module_& m)
         m.attr(kv.first) = kv.second;
     }
 
-    // ---- Phased attention API ----
-    // Bind the nested structs before FmhaParams so its `fwd` member has a registered
-    // type. def_rw hands back a reference into the parent, which is what lets Python
-    // fill a nested struct in place.
     auto sparseBackendForwardArgs
         = nb::class_<torch_ext::SparseBackendForwardArgs>(m, "SparseBackendForwardArgs").def(nb::init<>());
 #define TRTLLM_FMHA_PARAM_FIELD(name, cpp_type)                                                                        \
