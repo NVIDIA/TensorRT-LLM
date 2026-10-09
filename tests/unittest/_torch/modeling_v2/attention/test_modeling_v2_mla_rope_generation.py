@@ -3,9 +3,9 @@
 """GPU test for the mla_rope_generation catalog entry.
 
 The op reads paged-KV-cache addressing tensors and per-sequence length
-tensors that the runtime normally derives from a KVCacheManager and a
+tensors that the runtime normally derives from a KVCacheManagerV2 and a
 prepared TrtllmAttentionMetadata. The test builds that state for real —
-an actual MLA (SELFKONLY, kv_factor=1) KVCacheManager and a prepared
+an actual MLA (SELFKONLY, kv_factor=1) KVCacheManagerV2 and a prepared
 TrtllmAttentionMetadata — then checks the kernel effects against a torch
 fp32 reference.
 
@@ -54,7 +54,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_ge
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -137,7 +137,7 @@ class _MlaEnv:
         self.tokens_per_block = tokens_per_block
         self.num_heads = num_heads
         self.fp8_pool = fp8_pool
-        self.kv_cache_manager = KVCacheManager(
+        self.kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=131072, enable_block_reuse=False),
             CacheType.SELFKONLY,  # MLA latent cache: kv_factor=1, one kv head
             num_layers=1,
@@ -324,8 +324,8 @@ def _run_and_check_fp8(
     assert seq_lens[num_contexts:] == [p] * num_gen
     num_heads = env.num_heads
     for rid in gen_ids:
-        for _ in range(p):
-            env.kv_cache_manager.impl.add_token(rid)
+        cache = env.kv_cache_manager.kv_cache_map[rid]
+        assert cache.resize(cache.capacity + p)
     metadata = env.prepare_metadata(request_ids, seq_lens, num_contexts, cached_lens)
     kv_lens = [c + s for c, s in zip(cached_lens, seq_lens)]
     positions = _positions(kv_lens, num_contexts, num_gen, p)
@@ -790,8 +790,8 @@ class _Fp8Step:
         self.gen_ids = request_ids
         num_gen = len(request_ids)
         for rid in request_ids:
-            for _ in range(self.p):
-                env.kv_cache_manager.impl.add_token(rid)
+            cache = env.kv_cache_manager.kv_cache_map[rid]
+            assert cache.resize(cache.capacity + self.p)
         self.metadata = env.prepare_metadata(request_ids, [self.p] * num_gen, 0, cached_lens)
         kv_lens = [c + self.p for c in cached_lens]
         self.positions = _positions(kv_lens, 0, num_gen, self.p)

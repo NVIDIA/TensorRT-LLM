@@ -110,7 +110,7 @@ def _make_model_config_with_kv_quant(kv_cache_quant_algo):
 
 
 def _make_kv_cache_config(
-    *, use_kv_cache_manager_v2: bool = False, cross_kv_cache_fraction: float | None = None
+    *, use_kv_cache_manager_v2: bool = True, cross_kv_cache_fraction: float | None = None
 ):
     return types.SimpleNamespace(
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
@@ -273,10 +273,7 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
 
 
 def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
-    """V1 KVCacheManager is the default and production target for enc-dec models.
-
-    Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set.
-    """
+    """Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set."""
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,

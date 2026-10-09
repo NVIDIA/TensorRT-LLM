@@ -203,26 +203,21 @@ l0_h100:
   # Encoder-decoder Hopper smoke: CUDA-graph beam/greedy, kv-v2, overlap.
   # The primary pre-merge set runs on L40S (l0_l40s.yml); the full
   # dtype/model-size matrix runs post-merge below.
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-overlap-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-overlap-t5-small]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_transcribe_end_to_end
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v1-decoder-graphs-on-beam2]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v2-decoder-graphs-on-beam2]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_anthropic_messages
-  - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_final_token_reuse_cuda_graph[v2]
-  - kv_cache/test_final_single_token_context_cuda_graph.py::test_changed_final_token_reuse_cuda_graph[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_changed_final_token_reuse_cuda_graph[v2]
-  - kv_cache/test_final_single_token_context_cuda_graph.py::test_context_logits_after_final_token_reuse[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_context_logits_after_final_token_reuse[v2]
-  - kv_cache/test_final_single_token_context_cuda_graph.py::test_guided_decoding_after_final_token_reuse[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_guided_decoding_after_final_token_reuse[v2]
-  - kv_cache/test_final_single_token_context_cuda_graph.py::test_zero_runtime_draft_speculation_after_final_token_reuse[v1]
   - kv_cache/test_final_single_token_context_cuda_graph.py::test_zero_runtime_draft_speculation_after_final_token_reuse[v2]
   # ------------- Prefix-aware scheduling E2E tests ---------------
   - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
@@ -320,39 +315,39 @@ l0_h100:
   # ------------- PyTorch tests ---------------
   # Encoder-decoder full matrix (dtype, model-size, kv-v2, overlap variants);
   # the representative pre-merge subset runs on L40S (l0_l40s.yml).
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-on-greedy-bart-large-cnn]
-  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-overlap-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-greedy-bart-large-cnn]
+  - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-overlap-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-overlap-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2-bart-large-cnn]
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs[tp1]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-t5-large]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-base]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-large]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-xl]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-flan-t5-xxl]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-on-beam2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-on-beam2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v1-cuda-graph-on-beam2-flan-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v1-cuda-graph-on-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-base]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-t5-large]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-base]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-large]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-xl]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-flan-t5-xxl]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-on-beam2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-beam2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-on-beam2-flan-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-greedy-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-on-greedy-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-flan-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp16-kv-v2-cuda-graph-on-greedy-flan-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[fp32-kv-v2-cuda-graph-on-greedy-flan-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-off-greedy-byt5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-beam2-overlap-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-beam2-overlap-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v2-cuda-graph-on-greedy-overlap-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2-flan-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2-flan-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2-t5-small]
-  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2-t5-small]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch[fp32-kv-v2-decoder-cuda-graph-on-greedy-batch2-t5-small]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[fp32-kv-v1-graphs-off-beam2]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[fp32-kv-v2-graphs-off-beam2]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-off-greedy]
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v1-graphs-requested-greedy]
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v1-decoder-graphs-on-greedy]
-  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v1-graphs-off-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp32-kv-v2-graphs-requested-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v2-graphs-off-greedy]
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
   - unittest/bindings # 8 mins on H100
   - unittest/kv_cache_manager_v2_tests # 4 min

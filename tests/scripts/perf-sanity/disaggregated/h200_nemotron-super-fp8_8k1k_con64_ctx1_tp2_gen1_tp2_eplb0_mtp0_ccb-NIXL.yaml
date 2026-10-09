@@ -59,12 +59,13 @@ worker_config:
       max_batch_size: 16
     kv_cache_config:
       enable_block_reuse: false
+      use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      backend: UCX
-      transceiver_runtime: CPP
+      backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false
   ctx:
     print_iter_log: true
@@ -82,10 +83,11 @@ worker_config:
       max_batch_size: 16
     kv_cache_config:
       enable_block_reuse: false
+      use_kv_cache_manager_v2: true
       free_gpu_memory_fraction: 0.85
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      backend: UCX
-      transceiver_runtime: CPP
+      backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

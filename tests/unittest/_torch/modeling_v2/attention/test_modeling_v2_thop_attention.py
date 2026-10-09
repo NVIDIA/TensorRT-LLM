@@ -5,7 +5,7 @@
 The binding is stateless on the Python side: every piece of state it reads
 is an explicit argument. The test builds that state for real — a caller-
 owned paged KV pool, pool pointer/mapping tensors, block-offset tables
-(hand-filled for single-layer pools, produced by a real KVCacheManager for
+(hand-filled for single-layer pools, produced by a real KVCacheManagerV2 for
 the multi-layer case), and the int32 host/device length tensors — and
 compares against fp32 torch references. The certified configurations
 exercised:
@@ -109,7 +109,7 @@ exercised:
       new-token pass, folded together by the downstream trtllm merge op and
       checked against a single-pass full-range fp32 reference.
 4. Standard GQA over one paged pool shared by 4 layers: pool, layer->pool
-   mapping, and block offsets produced by a real multi-layer KVCacheManager
+   mapping, and block offsets produced by a real multi-layer KVCacheManagerV2
    and consumed by the op as-is, with local_layer_idx 0-3 selecting mapping
    rows. Per-layer outputs, bit-exact per-layer appends, sibling-layer
    isolation, and a doctored-mapping call pinning the pool-base shift to
@@ -157,7 +157,7 @@ exercised:
    mask). Covered on the three shipped bf16 geometries: bitwise equivalence
    with the packed path when nothing is cached; cached prefixes across the
    page grid, chunked prefill loops, and mixed cached/fresh/generation
-   batches; the same over a real 4-layer KVCacheManager pool, where the read
+   batches; the same over a real 4-layer KVCacheManagerV2 pool, where the read
    now also goes through the layer base shift; and the gpt-oss cell — sinks
    plus a 128-token window over a cached prefix past the window, with the
    attended key set read out one-hot and the read page set measured page by
@@ -176,7 +176,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -708,7 +709,7 @@ def _bitwise_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 class _MultiLayerPagedAttnEnv:
-    """Real multi-layer op state: a trtllm KVCacheManager hosting one paged
+    """Real multi-layer op state: a trtllm KVCacheManagerV2 hosting one paged
     pool shared by several layers, whose pool pointers, layer->pool mapping,
     and block offsets the op consumes exactly as produced. The pool element
     type follows the manager dtype (bf16, or fp8-e4m3 with the same quant
@@ -744,7 +745,7 @@ class _MultiLayerPagedAttnEnv:
         self.max_seq_len = max_seq_len
         self.quant_mode = quant_mode
 
-        self.mgr = KVCacheManager(
+        self.mgr = KVCacheManagerV2(
             KvCacheConfig(
                 max_tokens=num_blocks * tokens_per_block,
                 enable_block_reuse=False,
@@ -807,7 +808,8 @@ class _MultiLayerPagedAttnEnv:
 
     def add_decode_token(self, request_id: int) -> None:
         """Extend the manager's allocation by one generated token."""
-        self.mgr.impl.add_token(request_id)
+        cache = self.mgr.kv_cache_map[request_id]
+        assert cache.resize(cache.capacity + 1)
 
     def refresh_offsets(self, request_ids: List[int], num_contexts: int) -> None:
         """Copy the manager-produced block offsets for this batch to device."""
@@ -2427,7 +2429,7 @@ def test_bf16_paged_context_multilayer_shared_pool() -> None:
     """The paged-context read goes through the same layer base shift the
     append does.
 
-    One pool shared by 4 layers — real KVCacheManager state, GQA 32q/8kv d128
+    One pool shared by 4 layers — real KVCacheManagerV2 state, GQA 32q/8kv d128
     — with every layer served a fresh context chunk, then a context chunk over
     its own cached prefix, then a decode step. Each layer's output is gated
     against that layer's own history, so a read landing in a sibling's slabs

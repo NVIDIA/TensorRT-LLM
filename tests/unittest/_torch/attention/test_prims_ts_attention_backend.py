@@ -62,7 +62,7 @@ _DEEPSEEK_V3_LITE_MLA = {
 }
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 @pytest.mark.parametrize(
     "phase_args",
     [
@@ -107,7 +107,7 @@ def test_prims_ts_qwen2_gqa(
     run_case(case)
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_prims_ts_context_receives_zeroed_v_tail(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -354,7 +354,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
     assert torch.count_nonzero(captured_plan_state.workspace.split_kv_counter) == 0
 
 
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_prims_ts_deepseek_v3_lite_mla_generation(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -372,7 +372,7 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_prims_ts_fp8_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
 ) -> None:
@@ -595,7 +595,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
             seq_lens=[65, 37],
             num_cached_tokens=[0, 0],
             num_contexts=2,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
         )
     )
     assert "TRTLLM" in a_results

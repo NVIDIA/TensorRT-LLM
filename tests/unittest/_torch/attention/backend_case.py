@@ -120,7 +120,7 @@ class BackendCase:
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
-    use_kv_cache_manager_v2: bool = False
+    use_kv_cache_manager_v2: bool = True
 
     @property
     def num_seqs(self) -> int:

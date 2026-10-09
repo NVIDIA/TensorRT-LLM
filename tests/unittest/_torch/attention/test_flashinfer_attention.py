@@ -22,10 +22,11 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -332,7 +333,7 @@ class TestFlashInferAttention(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=256),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -348,6 +349,10 @@ class TestFlashInferAttention(unittest.TestCase):
             kv_cache_manager.add_dummy_requests([0], [32],
                                                 is_gen=True,
                                                 max_num_draft_tokens=3)
+            # V2 dummy token_nums is the complete capacity; reserve draft slots
+            # explicitly while keeping the logical generation length at 32.
+            cache = kv_cache_manager.kv_cache_map[0]
+            assert cache.resize(35)
             reserved_blocks = kv_cache_manager.get_batch_cache_indices([0])
             self.assertEqual(len(reserved_blocks[0]), 2)
 
@@ -391,7 +396,7 @@ class TestFlashInferAttention(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for FlashInfer metadata")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=256),
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=1,
@@ -485,7 +490,7 @@ class TestFlashInferAttention(unittest.TestCase):
             self.skipTest("FlashInfer trtllm-gen requires SM100 or SM103")
 
         def create_manager():
-            return KVCacheManager(
+            return KVCacheManagerV2(
                 KvCacheConfig(max_tokens=256),
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=1,
@@ -505,6 +510,9 @@ class TestFlashInferAttention(unittest.TestCase):
             draft_manager.add_dummy_requests([0, 1], [31, 45],
                                              is_gen=True,
                                              max_num_draft_tokens=3)
+            for request_id in (0, 1):
+                cache = draft_manager.kv_cache_map[request_id]
+                assert cache.resize(cache.capacity + 3)
             metadata = FlashInferAttentionMetadata(
                 seq_lens=torch.ones(2, dtype=torch.int32),
                 num_contexts=0,
@@ -660,7 +668,7 @@ class TestFlashInferAttention(unittest.TestCase):
 
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
@@ -1006,7 +1014,7 @@ class TestFlashInferAttention(unittest.TestCase):
         else:
             raise ValueError("Invalid dtype for unit test")
 
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,

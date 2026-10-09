@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from copy import deepcopy
 
@@ -13,8 +16,9 @@ from tensorrt_llm._torch.debug.debug_hook import (DebuggerContext, Filter,
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 LLAMA_3_1_8B_2_layer_CONFIG = {
@@ -124,7 +128,7 @@ class TestDebugger(unittest.TestCase):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
                                         tokens_per_block)
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,

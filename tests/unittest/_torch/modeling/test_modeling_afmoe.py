@@ -38,10 +38,10 @@ from tensorrt_llm._torch.models.modeling_utils import (
     MODEL_CLASS_MAPPING,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.llmapi import KvCacheConfig as LlmKvCacheConfig
 from tensorrt_llm.llmapi import MoeConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -107,7 +107,7 @@ def _force_mpi_collectives():
     return patch("tensorrt_llm._torch.distributed.ops.mpi_disabled", return_value=False)
 
 
-def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManager) -> None:
+def _shutdown_kv_cache_manager(kv_cache_manager: KVCacheManagerV2) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     kv_cache_manager.shutdown()
@@ -345,7 +345,7 @@ class TestAfmoeSanity(unittest.TestCase):
             copy_on_partial_reuse=False,
             max_tokens=num_blocks * tokens_per_block,
         )
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
@@ -682,7 +682,7 @@ class TestAfmoeAllCloseToHF(unittest.TestCase):
 
         num_blocks, tokens_per_block = 4, 128
         max_seq_len = num_blocks * tokens_per_block
-        kv_cache_manager = KVCacheManager(
+        kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(
                 enable_block_reuse=False,
                 enable_partial_reuse=False,

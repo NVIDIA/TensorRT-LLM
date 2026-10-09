@@ -18,9 +18,8 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import \
-    KvCacheConfig as BindingsKvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -192,9 +191,8 @@ def test_gpt_oss_xqa_kernel_selection():
 
     kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    kv_cache_config = BindingsKvCacheConfig(max_tokens=num_blocks *
-                                            tokens_per_block)
-    kv_cache_manager = KVCacheManager(
+    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+    kv_cache_manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,

@@ -227,7 +227,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
         )
         # Keep the TP=1 worker in this process so the call counter observes the
         # real PrimTS launch. Compile Inductor kernels synchronously because its
@@ -3795,7 +3795,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def test_guided_decoding(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype="auto",
-                                        use_kv_cache_manager_v2=False)
+                                        use_kv_cache_manager_v2=True)
         with self._create_1gpu_llm(
                 kv_cache_config=kv_cache_config,
                 moe_backend="CUTLASS",
@@ -6580,17 +6580,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(4)
     @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
-        "use_cpp_mamba",
-        [
-            False,
-            True,
-        ],
-        ids=[
-            "python_mamba_cache",
-            "cpp_mamba_cache",
-        ],
-    )
-    @pytest.mark.parametrize(
         "attention_dp",
         [
             False,
@@ -6601,9 +6590,9 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             "attention_dp_on",
         ],
     )
-    def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
-        monkeypatch.setenv("TRTLLM_USE_PY_MAMBA",
-                           "1" if not use_cpp_mamba else "0")
+    def test_fp8_4gpus(self, attention_dp, monkeypatch):
+        monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+        monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
 
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
@@ -6611,7 +6600,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     enable_block_reuse=False,
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
-                    use_kv_cache_manager_v2=False,
+                    use_kv_cache_manager_v2=True,
                 ),
                 max_batch_size=32,
                 tensor_parallel_size=4,

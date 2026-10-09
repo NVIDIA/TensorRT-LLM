@@ -139,7 +139,7 @@ def kv_cache_manager_from(
         kv_cache: torch.Tensor,
         request_ids: list[int],
         token_nums: list[int],
-        use_kv_cache_manager_v2: bool = False) -> KVCacheManager:
+        use_kv_cache_manager_v2: bool = True) -> KVCacheManager:
     paged = paged_backends[Attention]
 
     num_blocks = s.max_num_pages if paged else s.batch_size
@@ -203,7 +203,7 @@ def produce_outputs(
     q_at_layer: torch.Tensor,
     kv: Optional[torch.Tensor],
     s: Scenario,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     *,
     kv_cache: torch.Tensor,
     num_cached_tokens: Callable[[int], int] | int,
@@ -438,8 +438,7 @@ def test_flashinfer_prefill():
         Scenario(num_layers=1, qo_len=32, kv_len=64, causal=False)
     ],
     ids=["typical", "non-causal", "cross", "cross-diff-kv-len"])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False],
-                         ids=["v2_kv_cache", "v1_kv_cache"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2_kv_cache"])
 def test_attention_backend(s: Scenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
     num_layers = s.num_layers
@@ -586,8 +585,7 @@ def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
                   kvcache_dtype=torch.float8_e4m3fn),
 ],
                          ids=["fp16", "fp16-cross", "fp8", "fp8-cross"])
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False],
-                         ids=["v2_kv_cache", "v1_kv_cache"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2_kv_cache"])
 def test_attention_backend_ifb(s: PagedScenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
     is_fp8 = s.kvcache_dtype == torch.float8_e4m3fn
