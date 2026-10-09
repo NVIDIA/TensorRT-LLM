@@ -1,4 +1,9 @@
-# Disaggregated cancellation marathon: V2 KV cache and Python/NIXL transceiver.
+# C++ transceiver marathon: V1 KV cache + C++ transceiver + NIXL, DeepSeek-class MLA.
+#
+# Exercises the C++-backed disagg path (BindKvCacheTransceiver + V1
+# KVCacheManager + NIXL backend) — the configuration NVBug 6104831
+# was filed against and that the in-flight cancellation fix stabilizes. Schema
+# documentation lives in ../README.md.
 
 hostname: localhost
 model: DeepSeek-V3-Lite/bf16
@@ -16,10 +21,10 @@ context_servers:
     enable_block_reuse: true        # block reuse ON
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: true
+    use_kv_cache_manager_v2: false  # V1 KV cache (default)
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: PYTHON
+    transceiver_runtime: CPP        # C++ transceiver (default; explicit for clarity)
     max_tokens_in_buffer: 16384
     kv_transfer_timeout_ms: 60000   # production default
 
@@ -35,10 +40,10 @@ generation_servers:
     enable_block_reuse: true
     enable_partial_reuse: true
     free_gpu_memory_fraction: 0.3
-    use_kv_cache_manager_v2: true
+    use_kv_cache_manager_v2: false
   cache_transceiver_config:
     backend: NIXL
-    transceiver_runtime: PYTHON
+    transceiver_runtime: CPP
     max_tokens_in_buffer: 16384
     kv_transfer_timeout_ms: 60000
 
@@ -60,8 +65,8 @@ stress_config:
 
   # Backend-knob axis selectors. Must match
   # context_servers / generation_servers above.
-  kv_cache_manager: v2
-  transceiver: python
+  kv_cache_manager: v1               # V1 (C++) KV cache manager
+  transceiver: cpp                   # C++-backed transceiver (BindKvCacheTransceiver)
 
   log_only_probe:
     interval_s: 30
