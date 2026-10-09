@@ -217,7 +217,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
-    def test_prims_ts_bfloat16(self, mocker):
+    def test_prims_ts_bfloat16(self, mocker, record_property):
         from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
             KVCacheManagerV2
 
@@ -251,11 +251,19 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                      max_batch_size=1350) as llm:
                 assert isinstance(llm._executor.engine.kv_cache_manager,
                                   KVCacheManagerV2)
+                record_property(
+                    "kv_cache_manager",
+                    type(llm._executor.engine.kv_cache_manager).__name__)
+                record_property(
+                    "kv_cache_transceiver",
+                    type(llm._executor.engine.kv_cache_transceiver).__name__)
                 calls.update({name: 0 for name in calls})
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
 
         assert calls["mla_generation"] > 0
+        record_property("prims_ts_mla_generation_calls",
+                        calls["mla_generation"])
 
     @pytest.mark.skip_less_device_memory(60000)
     @parametrize_with_ids("v2_kv_cache", [True, False])
