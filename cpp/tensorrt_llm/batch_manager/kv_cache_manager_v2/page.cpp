@@ -382,25 +382,7 @@ void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
     finishEvents.reserve(1);
 }
 
-void UniqPageLock::prepareSparsePromotion()
-{
-    Page const& p = *page();
-    if (!p.hasValidSlot() || p.cacheLevel != kSparseHistoryLevel || p.queryLockLevel() != kSparseHistoryLevel
-        || mOwners.empty())
-    {
-        throw LogicError("Promotion requires a locked sparse host page");
-    }
-    for (auto const& owner : mOwners)
-    {
-        if (!owner.kvCache->isActive() || owner.lifeCycle != p.lifeCycle)
-        {
-            throw LogicError("Promotion requires active owners of the same sparse page");
-        }
-    }
-    finishEvents.reserve(1);
-}
-
-void UniqPageLock::recordMigrationEvent(CachedCudaEvent const& event)
+void UniqPageLock::recordOffloadEvent(CachedCudaEvent const& event)
 {
     // The copy stream already waited for every event being replaced here.
     page()->readyEvent = event;
@@ -411,27 +393,20 @@ void UniqPageLock::recordMigrationEvent(CachedCudaEvent const& event)
         owner.kvCache->onPageStorageChanged();
 }
 
-Slot UniqPageLock::moveToCacheLevel(CacheLevel destination, Slot&& slot)
+Slot UniqPageLock::moveToSparseHistory(Slot&& hostSlot)
 {
     Page& p = *page();
-    TLLM_CHECK_DEBUG(!p.scheduledForEviction());
-    TLLM_CHECK_DEBUG((p.cacheLevel == kHotLevel && destination == kSparseHistoryLevel)
-        || (p.cacheLevel == kSparseHistoryLevel && destination == kHotLevel));
-    Slot source = p.exchangeSlot(std::move(slot));
-    p.cacheLevel = destination;
+    TLLM_CHECK_DEBUG(p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+    Slot gpuSlot = p.exchangeSlot(std::move(hostSlot));
+    p.cacheLevel = kSparseHistoryLevel;
     for (auto const& owner : mOwners)
     {
         int const old = owner.kvCache->updateBasePageIndex(
             owner.beamIndex, owner.ordinal, owner.lifeCycle, slotIdToPageIndexValue(p.slotId()));
-        TLLM_CHECK_DEBUG(old == slotIdToPageIndexValue(source.slotId()));
-        if (destination == kHotLevel && owner.kvCache->mIsDecoding)
-        {
-            // Retry even without history growth once the prefill owner releases its GPU requirement.
-            owner.kvCache->mHasDeferredSparseOffload = true;
-        }
+        TLLM_CHECK_DEBUG(old == slotIdToPageIndexValue(gpuSlot.slotId()));
         owner.kvCache->onPageStorageChanged();
     }
-    return source;
+    return gpuSlot;
 }
 
 void UniqPageLock::removeOwner(LockOwner const& owner)
@@ -557,7 +532,6 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
     // Reserve and migrate once per page, but issue one lock per owner below.
     std::unordered_map<Page*, CacheLevel> destinations;
     TypedVec<CacheLevel, std::vector<SharedPtr<Page>>> pagesByLevel(storeMgr->numCacheLevels());
-    std::vector<SharedPtr<Page>> lockedHostPages;
     for (auto const& target : targets)
     {
         auto const& page = target.page;
@@ -566,18 +540,13 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
         {
             throw LogicError("Invalid destination for page locking; offload requires a separate handoff");
         }
+        if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
+            throw LogicError("Cannot migrate a page locked by another owner");
         auto const [it, inserted] = destinations.emplace(page.get(), level);
         if (!inserted && it->second != level)
             throw LogicError("Conflicting lock levels for a shared page");
         if (inserted)
-        {
             pagesByLevel[level].push_back(page);
-            if (page->status() == PageStatus::LOCKED && page->cacheLevel != level)
-            {
-                TLLM_CHECK_DEBUG(level == kHotLevel && page->cacheLevel == kSparseHistoryLevel);
-                lockedHostPages.push_back(page);
-            }
-        }
     }
 
     // Protect every destination group while any group is allocating. On failure,
@@ -610,10 +579,6 @@ std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<Batch
             if (page->cacheLevel != level)
                 ++requirements[storeMgr->getPoolGroupIndex(level, page->lifeCycle)];
         storeMgr->prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
-        if (level == kHotLevel && !lockedHostPages.empty())
-        {
-            storeMgr->promoteSparsePages(kvCache.cudaStream(), lockedHostPages, migrationRecorder, dropRecorder);
-        }
         storeMgr->batchedMigrate(level, pages, migrationRecorder);
     }
 
