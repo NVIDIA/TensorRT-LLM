@@ -577,11 +577,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         sender bytes against, so it must count what the mappers move, never physical slot bytes: a
         coalesced pool carries one view per role class (summing slot_bytes per view would double
         count the slot) and ignored-role buffers occupy slot offsets no view transfers.
-
-        Counterpart accounting: the bounce reserve sizing (bounce/impl.py block_bytes_per_group)
-        computes per-block bytes for the same layer groups but reads pool 0 only, while this sums
-        every pool view of a group. The pool-0-only sizing gap for multi-pool attention groups is
-        tracked under TRTLLM-15194; keep the two accountings in mind together when changing either.
         """
         pt = self._page_table
         if pt is None:
@@ -1196,7 +1191,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
-            # TODO: An idle bounce reservation is not handed back on the failure path.
             session = self._legacy_session(fetches)
             if session is not None:
                 self._recv_sessions[rid] = session

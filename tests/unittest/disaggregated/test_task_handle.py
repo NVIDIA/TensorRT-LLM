@@ -82,7 +82,6 @@ def _stub_receiver():
     receiver = MagicMock()
     receiver._enforce_physical_ownership = False
     receiver._ownership_poisoned = None
-    receiver._bounce.is_bounced.return_value = False
     return receiver
 
 
@@ -338,11 +337,11 @@ def test_an_owned_task_answers_from_the_cohort_it_sealed():
     )
     handle = TaskHandle(session, task, TOKENS)
 
-    task.record_writer_result(0, False, wait_for_local_completion=False)
+    task.record_writer_result(0, False)
     task.fail(RuntimeError("first writer failed"))
     assert handle.poll().reports_pending is True
 
-    task.record_writer_result(1, True, wait_for_local_completion=False)
+    task.record_writer_result(1, True)
     assert _owes_a_report(handle.poll()) is False
 
 
@@ -511,7 +510,6 @@ def _wired_receiver(owns_transfers: bool = False) -> Receiver:
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = MagicMock()
     receiver._dealers = {}
     receiver._messenger = MagicMock()
     receiver.dispatch_task = MagicMock()
@@ -880,63 +878,3 @@ def test_delivered_sender_piece_survives_a_direct_sibling_failure_without_pollin
 
     assert isinstance(TaskHandle(session, delivered, TOKENS).poll(), Delivered)
     assert isinstance(TaskHandle(session, failed, TOKENS).poll(), Failed)
-
-
-@pytest.mark.parametrize("owns_transfers", [False, True])
-@pytest.mark.parametrize("scatter_succeeded", [False, True])
-@pytest.mark.parametrize("cancel_first", [False, True])
-def test_scatter_callback_and_cancel_commit_in_event_order(
-    monkeypatch: pytest.MonkeyPatch,
-    owns_transfers: bool,
-    scatter_succeeded: bool,
-    cancel_first: bool,
-) -> None:
-    from tensorrt_llm._torch.disaggregation.native import bounce
-
-    session, handle = _receiving_from(1, owns_transfers=owns_transfers)
-    deferred = []
-    monkeypatch.setattr(bounce, "scatter_write_result", lambda *args: deferred.append(args[-1]))
-    _report(session, 0, AgentResult.SUCCESS)
-    assert len(deferred) == 1
-    assert handle.poll() is None
-    if owns_transfers:
-        assert session.resources_drained() is False
-
-    ready, resume, finished = threading.Event(), threading.Event(), threading.Event()
-
-    def finish_scatter() -> None:
-        ready.set()
-        if resume.wait(timeout=5):
-            deferred[0](scatter_succeeded)
-            finished.set()
-
-    worker = threading.Thread(target=finish_scatter)
-    worker.start()
-    try:
-        assert ready.wait(timeout=5)
-        if cancel_first:
-            session.cancel_local(by_peer=True)
-            assert isinstance(handle.poll(), Cancelled)
-            if owns_transfers:
-                assert session.resources_drained() is False
-        resume.set()
-        assert finished.wait(timeout=5)
-        if not cancel_first:
-            session.cancel_local(by_peer=True)
-    finally:
-        resume.set()
-        worker.join(timeout=5)
-    assert not worker.is_alive()
-
-    for observer in (handle, TaskHandle(session, session._kv_tasks[0], TOKENS)):
-        outcome = observer.poll()
-        if cancel_first:
-            assert isinstance(outcome, Cancelled)
-            assert outcome.by_peer is True
-        elif scatter_succeeded:
-            assert isinstance(outcome, Delivered)
-        else:
-            assert isinstance(outcome, Failed)
-            assert "bounce scatter failed" in outcome.reason
-    if owns_transfers:
-        assert session.resources_drained() is True
