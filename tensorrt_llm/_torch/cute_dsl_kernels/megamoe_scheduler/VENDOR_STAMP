@@ -1,10 +1,6 @@
-upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy
-commit: 4f71c8bb46c4b4c262b71eb279172749b4dec4d1
+upstream: external-source://nvidia/megamoe-scheduler
+locked_commit: 40af454528cac303ae7a2527b19521945486a83f
+project: MegaMoE HALO-Q scheduler and SAMI runtime
 original_authors: Jintao Peng <jintaop@nvidia.com>; Ethan Zhang
 license: Apache-2.0
-source_tree_dirty: false
-kind: HALO-Q scheduler and SAMI Python runtime closure
-downstream_modified: true
-downstream_notice: TensorRT-LLM adds the standard NVIDIA Apache-2.0 SPDX header to every vendored Python file.
-manifest: VENDOR_MANIFEST.json
-Native HALO-Q and in-switch copy code is integrated through TensorRT-LLM's standard kernel and THOP paths; duplicate vendored native sources are intentionally omitted.
+managed_by: 3rdparty/vendor_sources.lock.yaml

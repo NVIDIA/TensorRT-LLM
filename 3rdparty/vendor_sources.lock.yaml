@@ -1,5 +1,65 @@
 schema_version: 1
 vendors:
+  cutedsl-megamoe:
+    url: external-source://nvidia/cutedsl-megamoe
+    branch: trtllm/pr-19646-vendor-snapshot
+    commit: 1f0d454617f76eb2644e51cb18dbca01be2b3259
+    source: next/sources
+    destination: tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe
+    include:
+    - api.py
+    - communication/nvlink_domain/symmetric_buffer.py
+    - communication/nvlink_domain/token_comm.py
+    - communication/token_protocol.py
+    - helpers/constants.py
+    - helpers/cute_py_helpers.py
+    - helpers/device_workspace.py
+    - helpers/dlb_expert_count.py
+    - helpers/dsl_helpers.py
+    - helpers/fc2_ready_geometry.py
+    - helpers/flag_batch.py
+    - helpers/helper_weight_ready_gate.py
+    - helpers/iket_compat.py
+    - helpers/megamoe_aot.py
+    - helpers/ptx_helpers.py
+    - helpers/smem_workspace.py
+    - helpers/software_sync.py
+    - helpers/utils.py
+    - kernel_src/blackwell/custom_mix_cga_helpers.py
+    - kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+    - kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py
+    - kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_kernel.py
+    - kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+    - kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+    - kernel_src/blackwell/inference/mega/dynamic_mainloop.py
+    - kernel_src/blackwell/inference/mega/topk_reduce.py
+    - kernel_src/function_mapping.py
+    - kernel_src/rubin/custom_mix_cga_helpers.py
+    - kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_epilogue.py
+    - kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_extension.py
+    - kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_fc12_mainloop.py
+    - kernel_src/rubin/inference/local_mega/block_scaled_swap_ab_local_mega_moe_kernel.py
+    - kernel_src/rubin/inference/local_mega/local_routing.py
+    - kernel_src/rubin/inference/local_mega/tma_gather.py
+    - kernel_src/rubin/inference/local_mega/topk_reduce.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_extension.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+    - kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+    - kernel_src/rubin/inference/mega/dynamic_mainloop.py
+    - kernel_src/rubin/inference/mega/tma_gather.py
+    - kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
+    - kernel_src/rubin/inference/mega/topk_reduce.py
+    - kernel_src/schedulers/__init__.py
+    - kernel_src/schedulers/base.py
+    - kernel_src/schedulers/fc12_mapping.py
+    - kernel_src/schedulers/fc12_scheduler.py
+    - kernel_src/schedulers/non_clc_mixed_cga.py
+    - kernel_src/schedulers/work_id_claim.py
+    - quant_def.py
+    digest: sha256-tree-v1:4c6c091fab64b72f7872646c428ebec4f084fec631de8f14b08397be7fa5e6c0
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: trtllm-prims-ts-dev
@@ -11,6 +71,25 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:ba917f330d8281781ce30ddb89f1772ee8f9017264d948b588b881a92f511e45
     digest: sha256-tree-v1:fa65b674a9ec6121b4158069d5585cc56df28243d1ac1199eb97003d81135d76
+  megamoe-scheduler:
+    url: external-source://nvidia/megamoe-scheduler
+    branch: trtllm/pr-19646-vendor-snapshot
+    commit: 40af454528cac303ae7a2527b19521945486a83f
+    source: megamoe_scheduler
+    destination: tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler
+    include:
+    - __init__.py
+    - cuda_scheduler/__init__.py
+    - cuda_scheduler/multirank_dist.py
+    - cuda_scheduler/runtime.py
+    - geometry.py
+    - sami/__init__.py
+    - sami/_util.py
+    - sami/arena.py
+    - sami/fabric.py
+    - sami/geometry.py
+    - sami/hierarchical.py
+    digest: sha256-tree-v1:f4f767e5bdad5c664a8fb6706e45daa7a79c979f888e0ac9dd19dbce78a4d1b2
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
