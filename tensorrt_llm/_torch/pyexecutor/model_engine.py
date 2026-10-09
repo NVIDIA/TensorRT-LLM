@@ -1337,6 +1337,12 @@ class PyTorchModelEngine(ModelEngine):
         were still live afterwards, so the captures survive intact and PWCG
         stays hot.
 
+        No ``gc.collect()`` either. The previous wrapper is released by
+        reference count when it is replaced, and a full collection in a
+        process holding the executor, the request bookkeeping and the
+        trainer-side Ray state costs seconds; this hook sits inside the
+        refit bubble, so that was pure generation-idle time.
+
         ``resource_manager`` is unused here but is required by the
         ``warmup_with_kv_cache_cleanup`` decorator, and is part of the signature
         callers (including NeMo-RL) already pass.
@@ -1345,7 +1351,6 @@ class PyTorchModelEngine(ModelEngine):
             return
         self._apply_torch_compile(self._torch_compile_backend,
                                   self.torch_compile_config.enable_fullgraph)
-        gc.collect()
 
     # Back-compat aliases. Callers probe these names with getattr() and fall
     # back to doing nothing, so removing them would silently skip the unwrap
