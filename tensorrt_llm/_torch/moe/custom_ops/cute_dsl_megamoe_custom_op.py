@@ -828,6 +828,8 @@ def _launch_cluster_configuration(
     preferred_cluster_shape,
     fallback_cluster_shape=None,
     sm_version: Optional[int] = None,
+    reserved_sms: int = 0,
+    max_sm_count: Optional[int] = None,
 ) -> Tuple[int, Optional[int], Optional[int], int]:
     """Resolve canonical launch slots and physical mixed-CGA occupancy.
 
@@ -835,13 +837,40 @@ def _launch_cluster_configuration(
     mixed launch first keeps every preferred cluster, then fills only the
     remaining CTA capacity with complete fixed groups of fallback clusters.
     One fixed group covers the same CTA count as one preferred cluster and is
-    therefore one canonical scheduler slot.
+    therefore one canonical scheduler slot. ``reserved_sms`` removes that
+    many physical CTA slots before either cluster shape is admitted.
     """
+    if type(reserved_sms) is not int:
+        raise TypeError(f"reserved_sms must be an int, got {type(reserved_sms).__name__}")
+    if reserved_sms < 0:
+        raise ValueError(f"reserved_sms must be nonnegative, got {reserved_sms}")
+    if max_sm_count is None:
+        if reserved_sms:
+            raise ValueError("max_sm_count is required when reserved_sms is nonzero")
+        available_sms = None
+    else:
+        if type(max_sm_count) is not int:
+            raise TypeError(f"max_sm_count must be an int, got {type(max_sm_count).__name__}")
+        if max_sm_count <= 0 or reserved_sms >= max_sm_count:
+            raise ValueError(
+                "reserved_sms must be smaller than a positive device SM count; "
+                f"got reserved_sms={reserved_sms}, SMs={max_sm_count}."
+            )
+        available_sms = max_sm_count - reserved_sms
+
+    def budgeted_cluster_count(cluster_size: int) -> int:
+        hardware_count = _max_active_clusters(cluster_size, sm_version)
+        if available_sms is None:
+            return hardware_count
+        return min(hardware_count, available_sms // cluster_size)
+
     preferred_size = int(preferred_cluster_shape[0]) * int(preferred_cluster_shape[1])
     if fallback_cluster_shape is None or tuple(fallback_cluster_shape[:2]) == tuple(
         preferred_cluster_shape[:2]
     ):
-        launch_cluster_count = _max_active_clusters(preferred_size, sm_version)
+        launch_cluster_count = budgeted_cluster_count(preferred_size)
+        if launch_cluster_count <= 0:
+            raise ValueError("reserved_sms must leave capacity for at least one cluster")
         return (
             launch_cluster_count,
             None,
@@ -850,8 +879,10 @@ def _launch_cluster_configuration(
         )
 
     fallback_size = int(fallback_cluster_shape[0]) * int(fallback_cluster_shape[1])
-    preferred_cluster_count = _max_active_clusters(preferred_size, sm_version)
-    fallback_only_count = _max_active_clusters(fallback_size, sm_version)
+    preferred_cluster_count = budgeted_cluster_count(preferred_size)
+    fallback_only_count = budgeted_cluster_count(fallback_size)
+    if preferred_cluster_count <= 0:
+        raise ValueError("reserved_sms must leave capacity for at least one preferred cluster")
     preferred_cta_capacity = preferred_cluster_count * preferred_size
     fallback_cta_capacity = fallback_only_count * fallback_size
     if fallback_cta_capacity < preferred_cta_capacity:
@@ -2156,6 +2187,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
             helper_expert_count: int = 0,
+            reserved_sms: int = 0,
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -2171,6 +2203,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             if output_dtype != torch.bfloat16:
                 raise ValueError(f"MegaMoE NVFP4 only supports bfloat16 output; got {output_dtype}")
             self.sm_version = int(sm_version)
+            self.max_sm_count = int(torch.cuda.get_device_properties().multi_processor_count)
             self.world_size = int(world_size)
             self.local_rank = int(local_rank)
             self.num_topk = int(num_topk)
@@ -2213,6 +2246,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # share a compile-cache entry with the ungated baseline.  Hence it
             # is in unique_id() (which _tactic_cache_key wraps).
             self.helper_expert_count = int(helper_expert_count)
+            # Persistent launch geometry leaves this many physical CTA slots
+            # available to HALO-Q/TMA on the copy stream.
+            if type(reserved_sms) is not int:
+                raise TypeError(f"reserved_sms must be an int, got {type(reserved_sms).__name__}")
+            self.reserved_sms = reserved_sms
+            if not 0 <= self.reserved_sms < self.max_sm_count:
+                raise ValueError(
+                    "reserved_sms must be nonnegative and smaller than the "
+                    f"device SM count; got {self.reserved_sms} of {self.max_sm_count}"
+                )
             # Per-launch READY runtime bundle (device pointer + generation).
             # Set by the op right after construction; never a codegen input.
             self._helper_ready_flags = None
@@ -2223,7 +2266,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             # SAME tactic and MERGE merges timings by cache key across ranks,
             # so the key MUST be rank-identical. world_size stays so
             # single-rank and multi-rank never share entries.
-            return _megamoe_problem_key(
+            problem_key = _megamoe_problem_key(
                 sm_version=self.sm_version,
                 world_size=self.world_size,
                 num_topk=self.num_topk,
@@ -2245,6 +2288,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 combine_format=self.combine_format,
                 helper_expert_count=self.helper_expert_count,
             )
+            # Preserve established helper-free tuning keys while separating
+            # every reduced-grid codegen variant from the full-device build.
+            if self.reserved_sms:
+                return (*problem_key, ("reserved_sms", self.reserved_sms))
+            return problem_key
 
         def get_valid_tactics(
             self,
@@ -2456,6 +2504,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 cluster_shape,
                 fallback_cluster_shape,
                 self.sm_version,
+                reserved_sms=self.reserved_sms,
+                max_sm_count=self.max_sm_count,
             )
             schedule_hint = schedule_policy[1]
             common = dict(
@@ -2539,6 +2589,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 cluster_shape,
                 fallback_cluster_shape,
                 self.sm_version,
+                reserved_sms=self.reserved_sms,
+                max_sm_count=self.max_sm_count,
             )
             return (
                 self.unique_id(),
@@ -2867,6 +2919,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format,
         tactic_autotune,
         helper_expert_count,
+        reserved_sms,
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -2892,6 +2945,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            reserved_sms,
         )
 
         def _make():
@@ -2915,6 +2969,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 combine_format=combine_format,
                 tactic_autotune=tactic_autotune,
                 helper_expert_count=helper_expert_count,
+                reserved_sms=reserved_sms,
             )
 
         # Autotuning runners own profiling scratch and are not reused.
@@ -2975,9 +3030,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # view published by the weight transport, ``..._generation`` the
         # expected generation g in [1, 2**63). All three default to the
         # unchanged S == 0 baseline.
+        # reserved_sms is codegen-time launch geometry; zero preserves the
+        # full-device persistent grid.
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        reserved_sms: int = 0,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3039,6 +3097,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            reserved_sms,
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3170,8 +3229,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # view published by the weight transport, ``..._generation`` the
         # expected generation g in [1, 2**63). All three default to the
         # unchanged S == 0 baseline.
+        # reserved_sms is codegen-time launch geometry; zero preserves the
+        # full-device persistent grid.
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        reserved_sms: int = 0,
     ) -> None:
         return None

@@ -1841,13 +1841,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         plan_args = self._replica_plan_launch_args(replica_plan)
         if plan_args is None:
             _S_active = 0
+            reserved_sms = 0
         else:
             (
                 compute_slots,
                 _S_active,
                 helper_ready_flags,
                 helper_ready_generation,
-                _reserved_sms,
+                reserved_sms,
             ) = plan_args
         # Record the actual helper-slot ABI for verification.
         self._last_S_to_kernel = _S_active
@@ -1901,6 +1902,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
+                reserved_sms=reserved_sms,
             )
         finally:
             # Always clear: a raising op call must not leave the factory
