@@ -1217,8 +1217,8 @@ __global__ void onboardTiledKernel(std::array<PageIndexPairView, kMaxTasksPerLau
 #endif
 }
 
-// Transform 2 has a fixed DeepSeek-V4 CSA geometry. Reject a malformed residual
-// layout before any mapped-Host or GPU writes occur.
+// Validate quantized ranges before any mapped-Host or GPU writes occur.
+// Transform 2 additionally requires the fixed DeepSeek-V4 CSA geometry.
 void validateResidualLayouts(std::int64_t const* wide, std::int32_t const* integers, std::uint32_t numBuffers,
     std::size_t coldPageBytes, Nvfp4ColdPageRuntimeType runtimeType)
 {
@@ -1227,7 +1227,20 @@ void validateResidualLayouts(std::int64_t const* wide, std::int32_t const* integ
     for (std::uint32_t index = 0; index < numBuffers; ++index)
     {
         auto const* i = integers + index * kNvfp4ColdPageIntegerFields;
-        if (i[kTransform] != static_cast<std::int32_t>(Nvfp4ColdPageTransform::kNvfp4RopeResidual))
+        auto const transform = static_cast<Nvfp4ColdPageTransform>(i[kTransform]);
+        if (transform != Nvfp4ColdPageTransform::kNvfp4 && transform != Nvfp4ColdPageTransform::kNvfp4RopeResidual)
+        {
+            continue;
+        }
+        auto const start = i[kQuantizedRangeStart];
+        auto const length = i[kQuantizedRangeElements];
+        auto const stride = i[kRawRowStrideElements];
+        TLLM_CHECK_WITH_INFO(start >= 0 && length > 0 && stride > 0,
+            "NVFP4 quantized range requires nonnegative start and positive length and row stride");
+        TLLM_CHECK_WITH_INFO(start <= stride && length <= stride - start, "NVFP4 quantized range exceeds the hot row");
+        TLLM_CHECK_WITH_INFO(start % kElementsPerScaleGroup == 0 && length % kElementsPerScaleGroup == 0,
+            "NVFP4 quantized range start and length must be 16-element aligned");
+        if (transform != Nvfp4ColdPageTransform::kNvfp4RopeResidual)
         {
             continue;
         }

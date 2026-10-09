@@ -315,6 +315,9 @@ intermediate widths are rejected. Inference without cold-page compression is unc
 
 Compression may affect model accuracy. Choose the trade-off between accuracy
 and compression ratio that fits your workload and requirements.
+MTP draft KV is not excluded from cold-page compression. Its effect on draft
+acceptance rate has not been evaluated; validate this opt-in experimental
+feature on your workload.
 
 The indexer cache is always copied as it
 is, and the sliding-window, HCA, and compressor caches of the model are preserved

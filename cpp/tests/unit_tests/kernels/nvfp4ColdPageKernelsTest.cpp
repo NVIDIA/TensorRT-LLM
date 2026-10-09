@@ -2038,6 +2038,32 @@ TEST(Nvfp4ColdPageValidationTest, EmptyBatchIsAnAsyncNoOp)
     invokeNvfp4ColdPageDecode(nullptr, 0U, Nvfp4ColdPageTestMetadata{}, nullptr, nullptr);
 }
 
+TEST(Nvfp4ColdPageValidationTest, QuantizedRangeRejectsMalformedLayoutBeforeLaunching)
+{
+    auto const params = makeParams(PageGeometry{1, 1, 32});
+    std::vector<Nvfp4ColdPageTestBuffer> const buffers{
+        {1U, 64U, 64U, 0U, 16U, 18U, 14U, Nvfp4ColdPageTransform::kNvfp4, params}};
+    auto const valid = makeNvfp4ColdPageTestMetadata(buffers, 32U, Nvfp4ColdPageRuntimeType::kFloat16);
+    constexpr auto kIntMax = std::numeric_limits<std::int32_t>::max();
+    // Each case is {start, length, stride}; the last two would overflow start + length.
+    std::array<std::array<std::int32_t, 3>, 11> const invalidRanges{
+        {{-16, 16, 32}, {0, -16, 32}, {0, 0, 32}, {0, 16, 0}, {0, 16, -32}, {48, 16, 32}, {16, 32, 32}, {1, 16, 32},
+            {0, 17, 32}, {kIntMax - 15, 32, kIntMax}, {16, kIntMax, kIntMax}}};
+    PageIndexPair const page{0, 0};
+    // Dummy addresses are safe only because every case must fail before CUDA launch.
+    auto* cold = reinterpret_cast<void*>(1U);
+    for (auto const& range : invalidRanges)
+    {
+        SCOPED_TRACE(testing::Message() << "start=" << range[0] << " length=" << range[1] << " stride=" << range[2]);
+        auto bad = valid;
+        bad.integers[0][6] = range[0];
+        bad.integers[0][4] = range[1];
+        bad.integers[0][5] = range[2];
+        EXPECT_THROW(invokeNvfp4ColdPageEncode(&page, 1U, bad, cold, nullptr), std::exception);
+        EXPECT_THROW(invokeNvfp4ColdPageDecode(&page, 1U, bad, cold, nullptr), std::exception);
+    }
+}
+
 TEST(Nvfp4ColdPageValidationTest, ResidualFormatRejectsMalformedLayoutBeforeLaunching)
 {
     auto const params = makeParams(PageGeometry{1, 1, kDeepseekV4RowElements});
