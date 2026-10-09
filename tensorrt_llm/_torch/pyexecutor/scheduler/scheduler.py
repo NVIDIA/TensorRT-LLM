@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
+    MultimodalEncoderRequestState,
     format_multimodal_encoder_output_budget_error,
     is_multimodal_encoder_ready,
 )
@@ -323,6 +324,13 @@ class RequestScheduler(ABC):
         :return: True if current rank can schedule the requests, False otherwise
         """
         raise NotImplementedError
+
+    def release_context_admission(self, request: LlmRequest) -> None:
+        """Undo the admission of a first-chunk context withheld from the batch.
+
+        Only schedulers that allocate KV cache while scheduling have anything
+        to release; the default is a no-op.
+        """
 
 
 @dataclass
@@ -637,23 +645,75 @@ class MultimodalScheduler(RequestScheduler):
             if (state := request.py_mm_encoder_state) is not None
         )
 
+    def _output_budget_blocks(self, state: MultimodalEncoderRequestState, held_bytes: int) -> bool:
+        """Return whether a request that has not started encoding cannot fit beside ``held_bytes``.
+
+        Its first recorded item allocates the buffer for all of its items, so
+        it needs room for its whole embedding. A request larger than the whole
+        budget is left to `_select_items`, which raises.
+        """
+        request_bytes = sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
+        return held_bytes + request_bytes > self.output_budget_bytes >= request_bytes
+
+    def _holders_first(self, active_requests: RequestList, resident_bytes: int) -> RequestList:
+        """Order requests for a combined scheduler so encoder-output holders go first.
+
+        A combined scheduler (``KVCacheV2Scheduler``) charges the token budget
+        and grows KV for each context it admits, in request order, before MM
+        readiness is known. A request whose outputs cannot fit beside the
+        resident ones cannot start encoding until the requests holding them
+        run their prefill. So the holders behind the oldest such request move
+        ahead of it, where it cannot take the budget they need. Everything
+        else keeps FCFS order, so newer requests are still admitted after it.
+        """
+        if not resident_bytes:
+            return active_requests
+        for position, request in enumerate(active_requests):
+            state = request.py_mm_encoder_state
+            if (
+                state is None
+                or state.has_storage
+                or not self._output_budget_blocks(state, resident_bytes)
+            ):
+                continue
+            holders = [
+                holder
+                for holder in active_requests[position + 1 :]
+                if holder.py_mm_encoder_state is not None and holder.py_mm_encoder_state.has_storage
+            ]
+            if not holders:
+                return active_requests
+            holder_ids = {holder.py_request_id for holder in holders}
+            others = [
+                other
+                for other in active_requests[position:]
+                if other.py_request_id not in holder_ids
+            ]
+            return [*active_requests[:position], *holders, *others]
+        return active_requests
+
     def _select_items(
-        self, requests: RequestList, *, active_requests: RequestList | None = None
+        self,
+        requests: RequestList,
+        *,
+        active_requests: RequestList | None = None,
+        resident_bytes: int | None = None,
     ) -> tuple[dict[int, list[int]], RequestList]:
         """Greedily select pending MM items under the encoder budgets.
 
-        Requests are visited in the wrapped capacity scheduler's FCFS order
-        with no explicit `MultimodalEncoderProgress`-based priority: a
-        request left `PARTIAL` by a budget split necessarily sits ahead of
-        anything admitted later, so its remaining items resume before newer
-        work by order alone.
+        Requests are visited in the given order, which callers keep in FCFS
+        admission order, with no explicit `MultimodalEncoderProgress`-based
+        priority: a request left `PARTIAL` by a budget split necessarily sits
+        ahead of anything admitted later, so its remaining items resume before
+        newer work by order alone.
 
         When a byte budget is configured, selection also performs
         allocate-before-compute, per request rather than per item: a request
         starts only if its *whole* embedding fits alongside (a) storage
-        already held by live requests (derived from `active_requests`) and
-        (b) bytes claimed earlier in this pass. That matches how the storage
-        is allocated — the first recorded item sizes the buffer for all of
+        already held by live requests (derived from `active_requests` unless
+        the caller already summed it as `resident_bytes`) and (b) bytes
+        claimed earlier in this pass. That matches how the storage is
+        allocated — the first recorded item sizes the buffer for all of
         them — and means a started request can always finish, so no
         head-of-line reservation is needed to keep later requests from
         squatting the space it still needs.
@@ -665,13 +725,14 @@ class MultimodalScheduler(RequestScheduler):
         remaining_batch_slots = self.max_batch_size
         remaining_tokens = self.max_num_tokens
         budget = self.output_budget_bytes
-        resident_bytes = (
-            self._total_resident_output_bytes(
-                active_requests if active_requests is not None else requests
+        if resident_bytes is None:
+            resident_bytes = (
+                self._total_resident_output_bytes(
+                    active_requests if active_requests is not None else requests
+                )
+                if budget is not None
+                else 0
             )
-            if budget is not None
-            else 0
-        )
         reserved_bytes = 0
         selected: dict[int, list[int]] = {}
         llm_eligible: RequestList = []
@@ -781,15 +842,54 @@ class MultimodalScheduler(RequestScheduler):
             # schedule the LLM batch first, then enforce MM budgets on its
             # context requests, withholding contexts that will still lack MM
             # embeddings after this iteration.
+            resident_bytes = (
+                self._total_resident_output_bytes(active_requests)
+                if self.output_budget_bytes is not None
+                else 0
+            )
             scheduler_output = self.scheduler.schedule_request(
-                active_requests, inflight_request_ids
+                self._holders_first(active_requests, resident_bytes), inflight_request_ids
             )
+            contexts = scheduler_output.context_requests
+            if len(contexts) > 1:
+                # The combined scheduler returns non-last chunks first; spend
+                # the encoder budgets in admission order.
+                context_ids = {request.py_request_id for request in contexts}
+                contexts = [
+                    request for request in active_requests if request.py_request_id in context_ids
+                ]
             selected_items, llm_eligible = self._select_items(
-                list(scheduler_output.context_requests),
-                active_requests=active_requests,
+                contexts, resident_bytes=resident_bytes
             )
+            if self.output_budget_bytes is not None:
+                # Bytes held once the requests selected this pass allocate.
+                held_bytes = resident_bytes
+                for request in contexts:
+                    state = request.py_mm_encoder_state
+                    if request.py_request_id in selected_items and not state.has_storage:
+                        held_bytes += (
+                            sum(state.embedding_lengths) * self.bytes_per_encoder_embedding
+                        )
+                for request in contexts:
+                    state = request.py_mm_encoder_state
+                    if (
+                        state is not None
+                        and not state.has_storage
+                        and request.py_request_id not in selected_items
+                        and self._output_budget_blocks(state, held_bytes)
+                    ):
+                        # It cannot start encoding until the holders run their
+                        # prefill, so release the KV cache the combined
+                        # scheduler grew for it rather than pin what they need.
+                        self.scheduler.release_context_admission(request)
+            llm_eligible_ids = {request.py_request_id for request in llm_eligible}
             return scheduler_output._replace(
-                context_requests=llm_eligible,
+                # Keep the combined scheduler's order for the batch.
+                context_requests=[
+                    request
+                    for request in scheduler_output.context_requests
+                    if request.py_request_id in llm_eligible_ids
+                ],
                 scheduled_mm_encoder_items=selected_items or None,
             )
 

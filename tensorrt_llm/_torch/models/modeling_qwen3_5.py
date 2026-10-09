@@ -171,10 +171,10 @@ class Qwen35ConfigCompat:
     def normalize(config_dict: dict, require_text_config: bool = False) -> dict:
         """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict.
 
-        `require_text_config=True` is used by the Qwen-Image-Bench composite
-        checkpoint, which always nests its language model under `text_config`;
-        it forces extraction of that nested config rather than falling back to
-        treating the top-level dict as the text config.
+        `require_text_config=True` is used by composite checkpoints such as
+        MiniCPM-V 4.6, which always nest their language model under
+        `text_config`; it forces extraction of that nested config rather than
+        falling back to treating the top-level dict as the text config.
         """
         text_config = Qwen35ConfigCompat._extract_text_config(
             config_dict, require_text_config=require_text_config
@@ -206,7 +206,7 @@ class Qwen35ConfigCompat:
         """Pull nested text_config from VLM checkpoints, or use dict as-is.
 
         `require_text_config=True` forces extraction of the nested `text_config`
-        (used by the Qwen-Image-Bench composite checkpoint) and raises if it is
+        (used by composite checkpoints such as MiniCPM-V 4.6) and raises if it is
         missing, instead of falling back to the top-level dict.
         """
         if require_text_config:

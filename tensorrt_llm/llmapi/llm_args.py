@@ -3172,6 +3172,26 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    context_recompute_tail: Optional[int] = Field(
+        default=0,
+        description=
+        "Number of prompt-tail tokens to recompute through the target forward "
+        "when a request takes a KV-cache prefix hit, so the drafter's "
+        "hidden-state context covers them (reused tokens never pass a target "
+        "forward, which otherwise degrades acceptance length exactly when "
+        "prefix caching helps most). 0 (the default) disables the recompute: "
+        "the feature is opt-in, because recomputing reused tokens trades TTFT "
+        "and prefill throughput for acceptance length and disables "
+        "KV-connector prefix loads for the recomputed span. None resolves "
+        "from the draft model config: dflash_config.swa_window_size when the "
+        "drafter's context attention is windowed (a tail of the window size "
+        "reproduces the no-reuse drafter inputs exactly), else -1. -1 forces "
+        "a full re-prefill on a hit. Prefix reuse ahead of the recomputed "
+        "tail is kept. Requires chunked prefill and the all_reusable "
+        "block-reuse policy, and sliding-window attention layers are "
+        "unsupported on the V1 KV cache manager; the KV cache managers "
+        "disable it with a warning otherwise.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
     attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
@@ -3222,6 +3242,20 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             mask_id = dflash_cfg.get("mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
+        if self.context_recompute_tail is None:
+            # Reached only when the user explicitly set None (the default is 0,
+            # recompute off): auto-resolve the tail from the drafter geometry.
+            # A windowed drafter can never attend to prompt context beyond
+            # the most recent swa_window_size tokens (context K/V come
+            # straight from projected target hidden states, so the receptive
+            # field does not grow with drafter depth): recomputing that tail
+            # reproduces the no-reuse drafter inputs exactly. A non-windowed
+            # drafter needs the whole prompt, hence full re-prefill.
+            swa_window = dflash_cfg.get("swa_window_size")
+            if dflash_cfg.get("use_swa") and swa_window:
+                self.context_recompute_tail = int(swa_window)
+            else:
+                self.context_recompute_tail = -1
 
         # The drafter is trained for one block size. Another size still runs,
         # but acceptance length drops, so warn rather than silently serving a
@@ -5322,7 +5356,7 @@ class BaseLlmArgs(StrictBaseModel):
         # test_multi_frontend_routing pins the two together.
         le=64,
         description=
-        "The number of HTTP frontend processes serving one executor. Used by "
+        "The number of HTTP or OpenEngine frontend processes serving one executor. Used by "
         "trtllm-serve: values > 1 run additional attached frontend processes "
         "that share the serving port via SO_REUSEPORT (classic IPC executor "
         "path only).",
@@ -5337,7 +5371,7 @@ class BaseLlmArgs(StrictBaseModel):
                                              'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
-                                             'kimi_k25'))
+                                             'kimi_k25', 'k-exaone'))
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -5376,6 +5410,17 @@ class BaseLlmArgs(StrictBaseModel):
         description=
         "Allow serving responses to include per-request performance metrics when "
         "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    per_request_spec_decode_stats: bool = Field(
+        default=False,
+        description=
+        "Include per-request speculative-decoding acceptance statistics on each "
+        "response choice. Server-side opt-in only: unlike return_perf_metrics "
+        "this needs no per-request header, so benchmarking clients that "
+        "discover the payload by shape do not have to know they are talking to "
+        "TensorRT-LLM. Deliberately independent of return_perf_metrics, which "
+        "also mounts the Prometheus endpoint. PyTorch backend only.",
         status="prototype")
 
     perf_metrics_output_dir: Optional[str] = Field(
@@ -6089,6 +6134,27 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
+        status="prototype")
+
+    iter_perf_stats_interval: PositiveInt = Field(
+        default=1,
+        description=
+        "Build an iteration statistics record only every N executor iterations "
+        "when enable_iter_perf_stats is true, which reduces the host overhead "
+        "of collecting the statistics (including the per-request statistics of "
+        "enable_iter_req_stats). A value of 1 builds a record every iteration. "
+        "With N > 1, numCompletedRequests, numNewActiveRequests and the KV "
+        "cache iteration deltas of skipped iterations are carried into a later "
+        "record, so their totals stay exact but can be reported late. Without "
+        "attention DP, one extra record is emitted when the last active "
+        "request finishes in a skipped iteration; with attention DP, what is "
+        "left after the last record of a busy period is reported when the "
+        "executor resumes. All other fields describe only the sampled "
+        "iteration, so Prometheus counters built from them (e.g. speculative "
+        "decoding draft and accepted token totals) reach only about 1/N of the "
+        "true totals, and gauges such as KV cache utilization refresh every N "
+        "iterations. With enable_iter_req_stats, requests that finish in a "
+        "skipped iteration get no requestStats entry.",
         status="prototype")
 
     print_iter_log: bool = Field(default=False,

@@ -300,6 +300,13 @@ int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
     return mStorage->mSlotToPageIndices.at(attr.lifeCycleId).at(attr.poolIndex);
 }
 
+bool KvCacheManager::isSparse(LayerId layerId, DataRole role) const
+{
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycles[attr.lifeCycleId]);
+    return attn && attn->isSparse;
+}
+
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
     auto const& attr = mStorage->getBufferAttr(layerId, role);
@@ -409,6 +416,11 @@ int KvCacheManager::tokensPerBlock() const noexcept
 bool KvCacheManager::enablePartialMatch() const noexcept
 {
     return mConfig.enablePartialReuse;
+}
+
+bool KvCacheManager::enablePartialCommit() const noexcept
+{
+    return mConfig.enablePartialCommit;
 }
 
 int KvCacheManager::numLayers() const noexcept
@@ -959,14 +971,20 @@ void KvCacheManager::tryUpdateTargetRatios()
     int avgReusedLength = static_cast<int>(std::round(mAvgReusedLength.value()));
     int avgCapacity = static_cast<int>(std::round(std::sqrt(mAvgSqrCapacity.value())));
     int avgHistoryLength = static_cast<int>(std::round(std::sqrt(mAvgSqrHistoryLength.value())));
+    int avgBeamWidth = std::max(1, static_cast<int>(std::round(mAvgBeamWidth.value())));
+    int avgPromptLength = std::max(0, static_cast<int>(std::round(mAvgPromptLength.value())));
     if (avgCapacity > 0)
     {
-        auto const lifeCycleRatio = mStorage->ratioFromLength(kHotLevel, tokensPerBlock, avgHistoryLength, avgCapacity);
+        auto const lifeCycleRatio = mStorage->ratioFromLength(
+            kHotLevel, tokensPerBlock, avgHistoryLength, avgCapacity, avgBeamWidth, avgPromptLength);
         mTargetRatioListHot = mStorage->constrainPoolGroupRatio(mStorage->toPoolGroupRatio(kHotLevel, lifeCycleRatio));
     }
     if (avgReusedLength > 0)
     {
         CacheLevel const coldLevel = mStorage->numCacheLevels() > CacheLevel{1} ? CacheLevel{1} : kHotLevel;
+        // The cold tiers hold committed pages, which are canonicalized to beam 0
+        // (_commitBlock() truncates the other beams away), so they never carry a
+        // beam factor no matter how wide the requests that produced them were.
         auto const lifeCycleRatio
             = mStorage->ratioFromLength(coldLevel, tokensPerBlock, avgReusedLength, avgReusedLength);
         mTargetRatioListCold = mStorage->toPoolGroupRatio(coldLevel, lifeCycleRatio);

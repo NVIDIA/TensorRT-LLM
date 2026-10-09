@@ -689,7 +689,11 @@ def fixup_moe_backends(
         # ConfigurableMoE has its own ep_size, slot_start, etc. that are used
         # in its forward path.  The backend is the inner module that holds
         # weight parameters.
-        configurable_moe = getattr(layer.mlp, "experts", None)
+        # ``moe_module`` is what _get_moe_and_experts() just resolved, so this
+        # is model-agnostic: on DeepSeek it is layer.mlp and this stays exactly
+        # equivalent to the old getattr(layer.mlp, "experts", None); on K3 it
+        # is layer.block_sparse_moe, which has no ``.mlp`` at all.
+        configurable_moe = _get_configurable_moe(moe_module)
         targets = [experts_module]
         if configurable_moe is not None and configurable_moe is not experts_module:
             targets.insert(0, configurable_moe)
@@ -1110,6 +1114,20 @@ def _get_decoder_model(model: nn.Module) -> nn.Module:
     )
 
 
+def _get_configurable_moe(moe_module: Optional[nn.Module]) -> Optional[nn.Module]:
+    """The ConfigurableMoE wrapper of an MoE module, if the model uses one.
+
+    DeepSeek calls it ``experts``; Kimi K3's ``KimiK3MoERuntime`` calls the
+    same thing ``routed_experts``.  Returns None when the module has neither.
+    """
+    if moe_module is None:
+        return None
+    experts = getattr(moe_module, "experts", None)
+    if experts is None:
+        experts = getattr(moe_module, "routed_experts", None)
+    return experts
+
+
 def _get_moe_and_experts(
     layer: nn.Module,
 ) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
@@ -1118,13 +1136,22 @@ def _get_moe_and_experts(
     The standard path for DeepSeek is:
         layer.mlp (Deepseekv3MoE) -> .experts (MoE backend)
 
+    Kimi K3 spells the same shape differently:
+        layer.block_sparse_moe (KimiK3MoERuntime) -> .routed_experts (MoE backend)
+
     Returns:
         Tuple of (moe_module, experts_module) where moe_module is the wrapper
         (e.g. Deepseekv3MoE) and experts_module is the backend (e.g.
         CutlassFusedMoE, ConfigurableMoE, etc.). Both may be None if the
         layer is not an MoE layer.
     """
+    # K3's *dense* layers do carry an ``mlp``, but this function is only ever
+    # reached for layer indices that registered themselves from
+    # ConfigurableMoE.__init__, so a dense layer never gets here and the
+    # ``mlp``-first order stays safe.
     mlp = getattr(layer, "mlp", None)
+    if mlp is None:
+        mlp = getattr(layer, "block_sparse_moe", None)
     if mlp is None:
         return None, None
 
@@ -1132,8 +1159,8 @@ def _get_moe_and_experts(
     if hasattr(mlp, "w3_w1_weight"):
         return mlp, mlp
 
-    # Standard path: mlp.experts
-    experts = getattr(mlp, "experts", None)
+    # Standard path: mlp.experts (K3: block_sparse_moe.routed_experts)
+    experts = _get_configurable_moe(mlp)
     if experts is not None:
         # Prefer the inner backend (ConfigurableMoE wraps it)
         backend = getattr(experts, "backend", None)

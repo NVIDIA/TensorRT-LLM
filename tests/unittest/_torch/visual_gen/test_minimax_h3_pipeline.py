@@ -15,6 +15,7 @@
 
 """Synthetic pipeline-level tests for MiniMax-H3."""
 
+import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     discover_pipeline_components,
 )
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3 as h3_pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     MINIMAX_H3_TEXT_TAG,
@@ -85,6 +87,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         torch.nn.Module.__init__(self)
         # BasePipeline.__init__ is bypassed here, so set the backing attribute
         # that BasePipeline.device reads.
+        self.workflow = "fl2va"
         self._device = torch.device("cpu")
         self.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
         self.transformer = _FakeMiniMaxH3Transformer()
@@ -98,6 +101,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self.scheduler = MiniMaxH3Scheduler(shift=12.0)
         self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
         self._is_warmup = True
+        self._parallel_vae_enabled = False
 
     def _encode_prompt(
         self,
@@ -344,7 +348,10 @@ def test_pipeline_keeps_torch_compile_enabled(
 
     def _config(torch_compile: TorchCompileConfig) -> SimpleNamespace:
         return SimpleNamespace(
+            extra_attrs={},
             mapping=SimpleNamespace(world_size=1),
+            visual_gen_mapping=None,
+            parallel=SimpleNamespace(parallel_vae_size=1),
             attention=SimpleNamespace(backend="VANILLA"),
             cache=None,
             cpu_offload_config=SimpleNamespace(enable=False),
@@ -422,7 +429,10 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
     config = SimpleNamespace(
+        extra_attrs={},
         mapping=SimpleNamespace(world_size=1),
+        visual_gen_mapping=None,
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
     )
     with pytest.raises(NotImplementedError, match="SM100"):
@@ -438,7 +448,10 @@ def test_trtllm_attention_accepts_supported_gpu(
         h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
     )
     config = SimpleNamespace(
+        extra_attrs={},
         mapping=SimpleNamespace(world_size=1),
+        visual_gen_mapping=None,
+        parallel=SimpleNamespace(parallel_vae_size=1),
         attention=SimpleNamespace(backend="TRTLLM"),
         cache=None,
         cpu_offload_config=SimpleNamespace(enable=False),
@@ -452,7 +465,7 @@ def test_default_generation_steps_match_reference_app() -> None:
     assert pipeline.default_generation_params["num_inference_steps"] == 28
 
 
-def test_hf_download_is_scoped_to_the_supported_fl2va_components(
+def test_hf_download_is_scoped_to_the_supported_h3_components(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -501,6 +514,7 @@ def test_hf_download_is_scoped_to_the_supported_fl2va_components(
             "LICENSE",
             "README.md",
             "transformer/*",
+            "transformer_ref/*",
             "text_encoder/*",
             "tokenizer/*",
             "processor/*",
@@ -835,3 +849,446 @@ def test_keyframe_reference_role_must_be_a_keyframe_slot() -> None:
     )
     with pytest.raises(ValueError, match="first_frame"):
         _SyntheticMiniMaxH3Pipeline()._load_request_keyframes(req)
+
+
+@pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
+def test_h3_workflow_reference_slots(workflow: str) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.workflow = workflow
+    slots = pipeline.ref_slot_specs
+    if workflow == "ref2va":
+        assert set(slots) == {"image_reference", "video_reference", "audio_reference"}
+        assert slots["image_reference"].roles[0].max == 9
+        assert slots["video_reference"].roles[0].max == 3
+        assert "reference_order" in pipeline.extra_param_specs
+    else:
+        assert set(slots) == {"image_reference"}
+        assert not pipeline.extra_param_specs
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["image:0", ["image"], ["image:-1"], ["image:00"], ["image:0", "image:0"], ["unknown:0"], [1]],
+)
+def test_ref2va_invalid_reference_order(order: object) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import validate_reference_order
+
+    with pytest.raises(ValueError):
+        validate_reference_order(order)
+
+
+@pytest.mark.parametrize("order", [None, ["video:0", "image:1", "audio:0", "image:0"]])
+def test_ref2va_cross_modality_order(
+    monkeypatch: pytest.MonkeyPatch, order: list[str] | None
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import ref2va
+
+    params = SimpleNamespace(
+        image_reference=[
+            SimpleNamespace(role="reference", content="a"),
+            SimpleNamespace(role="reference", content="b"),
+        ],
+        video_reference=[SimpleNamespace(role="reference", content="v")],
+        audio_reference=[SimpleNamespace(role="reference", content="s")],
+        extra_params={"reference_order": order},
+    )
+    monkeypatch.setattr(ref2va, "_decode_reference", lambda kind, content: (kind, content))
+    actual = ref2va.load_references(params)
+    expected = [("image", "a"), ("image", "b"), ("video", "v"), ("audio", "s")]
+    if order:
+        expected = [expected[i] for i in (2, 1, 3, 0)]
+    assert actual == expected
+    params.extra_params = {"reference_order": ["image:0"]}
+    with pytest.raises(ValueError, match="every supplied"):
+        ref2va.load_references(params)
+
+
+def test_ref2va_image_bytes() -> None:
+    from io import BytesIO
+
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import load_references
+
+    stream = BytesIO()
+    Image.new("RGB", (32, 64), "red").save(stream, format="PNG")
+    params = SimpleNamespace(
+        image_reference=[SimpleNamespace(role="reference", content=stream.getvalue())],
+        extra_params={},
+    )
+    refs = load_references(params)
+    assert refs[0].image.size == (32, 64)
+    assert refs[0].image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import MiniMaxH3PackedSequence
+
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.workflow = "ref2va"
+    captured = []
+
+    def prepare(
+        pipeline: _SyntheticMiniMaxH3Pipeline,
+        refs: list,
+        prompt: str,
+        height: int,
+        width: int,
+        frames: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, MiniMaxH3PackedSequence, torch.Tensor, torch.Tensor]:
+        # Synthetic target geometry is deliberately small, with one frozen row
+        # in each modality. Layout indices need only match that row schedule.
+        layout = MiniMaxH3PackedSequence(
+            sequence_length=5,
+            position_ids=torch.zeros(5, 3, dtype=torch.float64),
+            token_tags=torch.tensor([1, 0, 2, 2, 0]),
+            video_indices=torch.tensor([1, 4]),
+            audio_indices=torch.tensor([2, 3]),
+            text_indices=torch.tensor([0]),
+            num_condition_video_rows=1,
+            num_condition_audio_rows=1,
+        )
+        return torch.ones(1, 1, 4), layout, torch.full((1, 8), 7.0), torch.full((1, 3), 9.0)
+
+    monkeypatch.setattr(h3_pipeline, "prepare_references", prepare)
+    original = pipeline.transformer.__class__.__call__
+
+    def observe(
+        self: _FakeMiniMaxH3Transformer, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        captured.append(
+            (kwargs["hidden_states"][:, :1].clone(), kwargs["audio_hidden_states"][:, :1].clone())
+        )
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(pipeline.transformer.__class__, "__call__", observe)
+    pipeline.forward(
+        prompt="subject",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=4,
+        references=[object()],
+    )
+    assert len(captured) > 1
+    for video, audio in captured:
+        assert (video == 7).all()
+        assert (audio == 9).all()
+
+
+@pytest.mark.parametrize("workflow,hidden_size", [("fl2va", 32), ("ref2va", 64)])
+def test_ref2va_selects_its_own_transformer_config(
+    tmp_path: Path, workflow: str, hidden_size: int
+) -> None:
+    for name, size in (("transformer", 32), ("transformer_ref", 64)):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.json").write_text(json.dumps({"hidden_size": size}))
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3ModularPipeline",
+                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
+                "transformer_ref": ["diffusers", "MiniMaxH3Transformer3DModel"],
+            }
+        )
+    )
+    config = DiffusionPipelineConfig.from_pretrained(
+        str(tmp_path), pipeline_config={"workflow": workflow}
+    )
+    assert config.primary_pretrained_config.hidden_size == hidden_size
+    assert config.extra_attrs["workflow"] == workflow
+
+
+def test_ref2va_requires_correct_partition(tmp_path: Path) -> None:
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "config.json").write_text('{"hidden_size": 32}')
+    (tmp_path / "modular_model_index.json").write_text(
+        json.dumps(
+            {
+                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="transformer_ref checkpoint"):
+        DiffusionPipelineConfig.from_pretrained(
+            str(tmp_path), pipeline_config={"workflow": "ref2va"}
+        )
+    with pytest.raises(ValueError, match="workflow"):
+        DiffusionPipelineConfig.from_pretrained(str(tmp_path), pipeline_config={"workflow": "typo"})
+
+
+def test_ref2va_loads_ref_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.workflow = "ref2va"
+    pipeline.mapping = object()
+    captured = {}
+
+    def load(
+        loader: h3_pipeline.WeightLoader, checkpoint: str, mapping: object
+    ) -> dict[str, torch.Tensor]:
+        captured.update(components=loader.components, checkpoint=checkpoint, mapping=mapping)
+        return {"sentinel": torch.ones(1)}
+
+    monkeypatch.setattr(h3_pipeline.WeightLoader, "load_weights", load)
+    result = pipeline.load_transformer_weights("checkpoint")
+    assert captured == {
+        "components": ["transformer_ref"],
+        "checkpoint": "checkpoint",
+        "mapping": pipeline.mapping,
+    }
+    assert "sentinel" in result
+
+
+@pytest.mark.parametrize(
+    "kinds",
+    [
+        [],
+        ["audio"],
+        ["image"] * 10,
+        ["video"] * 4,
+        ["image"] + ["audio"] * 4,
+        ["image"] * 9 + ["video"] * 3 + ["audio"],
+    ],
+)
+def test_ref2va_rejects_invalid_reference_combinations(kinds: list[str]) -> None:
+    from diffusers.modular_pipelines.minimax_h3.references import (
+        MiniMaxH3AudioReference,
+        MiniMaxH3ImageReference,
+        MiniMaxH3VideoReference,
+    )
+
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.ref2va import normalize_references
+
+    refs = {
+        "image": MiniMaxH3ImageReference(Image.new("RGB", (32, 32))),
+        "video": MiniMaxH3VideoReference(frames=[]),
+        "audio": MiniMaxH3AudioReference(torch.zeros(2, 32000), 32000),
+    }
+    with pytest.raises(ValueError):
+        normalize_references([refs[kind] for kind in kinds], 124, 32000)
+
+
+@pytest.mark.parametrize(
+    "order", itertools.permutations(("image", "audio", "video", "video_audio"))
+)
+def test_ref2va_native_layout_matches_diffusers(order: tuple[str, ...]) -> None:
+    from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+        MiniMaxH3Ref2VAPrepareLayoutStep,
+    )
+
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import build_reference_sequence
+
+    refs = [
+        SimpleNamespace(
+            kind="video" if kind == "video_audio" else kind,
+            has_audio=kind in ("audio", "video_audio"),
+        )
+        for kind in order
+    ]
+    visuals = [
+        torch.empty(1, 2, 1 if ref.kind == "image" else 17, 8, 12)
+        for ref in refs
+        if ref.kind != "audio"
+    ]
+    audios = [torch.empty(42, 3) for ref in refs if ref.has_audio]
+    tags = torch.tensor([1, 0, 1])
+    actual = build_reference_sequence(
+        tags,
+        [(ref.kind, ref.has_audio) for ref in refs],
+        [tuple(x.shape[2:]) for x in visuals],
+        [x.shape[0] for x in audios],
+        37,
+        8,
+        12,
+        207,
+        (1, 2, 2),
+    )
+    expected = MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
+        tags, refs, visuals, audios, 37, 8, 12, 207, (1, 2, 2), 2, 2, 0
+    )
+    for name, value in zip(
+        ("position_ids", "token_tags", "video_indices", "audio_indices", "text_indices"),
+        expected[:5],
+    ):
+        torch.testing.assert_close(getattr(actual, name), value, rtol=0, atol=0)
+    assert (actual.num_condition_video_rows, actual.num_condition_audio_rows) == expected[5:]
+
+
+def _ulysses_pipeline_config(world_size: int = 8) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(world_size=1, tp_size=1),
+        parallel=SimpleNamespace(parallel_vae_size=1),
+        visual_gen_mapping=SimpleNamespace(
+            world_size=world_size,
+            cfg_size=1,
+            ulysses_size=world_size,
+            cp_size=1,
+            ring_size=1,
+            attn2d_row_size=1,
+            attn2d_col_size=1,
+        ),
+        attention=SimpleNamespace(backend="VANILLA"),
+        cache=None,
+        cpu_offload_config=SimpleNamespace(enable=False),
+        cuda_graph=SimpleNamespace(enable=False),
+        extra_attrs={},
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pipeline_accepts_pure_ulysses(monkeypatch: pytest.MonkeyPatch, world_size: int) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(world_size)
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cfg_size", 2),
+        ("ulysses_size", 4),
+        ("cp_size", 2),
+        ("ring_size", 2),
+        ("attn2d_row_size", 2),
+        ("attn2d_col_size", 2),
+        ("tp_size", 2),
+        ("missing_mapping", True),
+    ],
+)
+def test_pipeline_rejects_unsupported_ulysses_topology(field: str, value: int) -> None:
+    config = _ulysses_pipeline_config()
+    if field == "missing_mapping":
+        config.visual_gen_mapping = None
+        config.mapping.world_size = 8
+    elif field == "tp_size":
+        config.mapping.tp_size = value
+        config.visual_gen_mapping.world_size *= value
+    else:
+        setattr(config.visual_gen_mapping, field, value)
+        if field != "ulysses_size":
+            config.visual_gen_mapping.world_size *= value
+    with pytest.raises(NotImplementedError, match="pure Ulysses"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("backend", ["TRTLLM", "CUTEDSL"])
+def test_pipeline_rejects_unvalidated_ulysses_attention(backend: str) -> None:
+    config = _ulysses_pipeline_config()
+    config.attention.backend = backend
+    with pytest.raises(NotImplementedError, match="VANILLA"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("size", [0, 9])
+def test_h3_rejects_out_of_range_vae_groups(size: int) -> None:
+    config = _ulysses_pipeline_config(8)
+    config.parallel.parallel_vae_size = size
+    with pytest.raises(ValueError, match="parallel_vae_size"):
+        MiniMaxH3Pipeline(config)
+
+
+@pytest.mark.parametrize("size", [2, 3, 4])
+@pytest.mark.parametrize("rank", range(4))
+def test_h3_uses_shared_vae_group(monkeypatch: pytest.MonkeyPatch, size: int, rank: int) -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    group = object()
+    pipeline.pipeline_config = _ulysses_pipeline_config(4)
+    pipeline.pipeline_config.parallel.parallel_vae_size = size
+    pipeline.pipeline_config.visual_gen_mapping.vae_ranks = list(range(size))
+    pipeline.pipeline_config.visual_gen_mapping.vae_group = group if rank < size else None
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    calls = []
+    pipeline.vae = SimpleNamespace(configure_parallel=lambda group: calls.append(group))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: size)
+    pipeline.setup_parallel_vae()
+    assert calls == ([group] if rank < size else [])
+    assert pipeline._parallel_vae_enabled
+
+
+def test_h3_parallel_vae_allows_skipped_vae() -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.pipeline_config = _ulysses_pipeline_config(2)
+    pipeline.pipeline_config.parallel.parallel_vae_size = 2
+    pipeline.vae = None
+    pipeline._parallel_vae_enabled = False
+    pipeline.setup_parallel_vae()
+    assert not pipeline._parallel_vae_enabled
+
+
+@pytest.mark.parametrize("size", range(1, 9))
+def test_h3_accepts_vae_groups_up_to_ulysses_size(
+    monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    initialized = []
+
+    def initialize(self, config):
+        torch.nn.Module.__init__(self)
+        initialized.append(config)
+
+    monkeypatch.setattr(h3_pipeline.BasePipeline, "__init__", initialize)
+    config = _ulysses_pipeline_config(8)
+    config.parallel.parallel_vae_size = size
+    config.visual_gen_mapping = VisualGenMapping(
+        world_size=8, rank=0, ulysses_size=8, parallel_vae_size=size
+    )
+    config.mapping = config.visual_gen_mapping.to_llm_mapping()
+    assert config.mapping.world_size == 1
+    MiniMaxH3Pipeline(config)
+    assert initialized == [config]
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4])
+@pytest.mark.parametrize("rank", range(4))
+def test_h3_forward_decodes_only_on_vae_ranks(
+    monkeypatch: pytest.MonkeyPatch, size: int, rank: int
+) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline._parallel_vae_enabled = size > 1
+    pipeline.pipeline_config.visual_gen_mapping = VisualGenMapping(
+        world_size=4, rank=rank, ulysses_size=4, parallel_vae_size=size
+    )
+    monkeypatch.setattr(MiniMaxH3Pipeline, "rank", property(lambda self: rank))
+    calls = []
+    video_decode, audio_decode = pipeline._decode_video, pipeline._decode_audio
+
+    def decode_video(*args):
+        calls.append("video")
+        return video_decode(*args)
+
+    def decode_audio(*args):
+        calls.append("audio")
+        return audio_decode(*args)
+
+    monkeypatch.setattr(pipeline, "_decode_video", decode_video)
+    monkeypatch.setattr(pipeline, "_decode_audio", decode_audio)
+    output = pipeline.forward(
+        prompt="a synthetic prompt",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=2,
+    )
+    assert calls == (["video", "audio"] if rank < size else [])
+    assert (output.video is not None) == (rank < size)
+    assert (output.audio is not None) == (rank < size)
+
+
+def test_pipeline_accepts_fa4_ulysses(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        h3_pipeline.BasePipeline, "__init__", lambda self, config: torch.nn.Module.__init__(self)
+    )
+    config = _ulysses_pipeline_config(2)
+    config.attention.backend = "FA4"
+    MiniMaxH3Pipeline(config)

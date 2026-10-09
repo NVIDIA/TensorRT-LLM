@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import json
 import os
+import random
+from pathlib import Path
 
 import pytest
 
@@ -887,6 +890,24 @@ def test_auto_detect_qwen3_no_tokenizer_config(tmp_path):
     assert result == "qwen3"
 
 
+@pytest.mark.parametrize(
+    ("model_type", "expected"),
+    [
+        ("glm_moe_dsa", "glm_moe_dsa"),  # GLM-5, GLM-5.2
+        # GLM-4.5/4.6 and GLM-4.7 share glm4_moe but differ on whether the
+        # template prefills <think>; GLM-5.3-Flash prefills it whatever
+        # enable_thinking says. Neither is resolved automatically.
+        ("glm4_moe", None),
+        ("glm5_next", None),
+    ])
+def test_auto_detect_glm(tmp_path, model_type, expected):
+    model_dir = str(tmp_path / "GLM")
+    os.makedirs(model_dir)
+    _write_config(model_dir, model_type)
+
+    assert resolve_auto_reasoning_parser(model_dir) == expected
+
+
 def test_auto_detect_deepseek_r1(tmp_path):
     """DeepSeek R1 model → 'deepseek-r1' parser."""
     model_dir = str(tmp_path / "DeepSeek-R1")
@@ -944,6 +965,19 @@ def test_auto_detect_laguna(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "poolside_v1"
+
+
+def test_auto_detect_exaone_moe(tmp_path: Path) -> None:
+    model_dir = str(tmp_path / "K-EXAONE")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "exaone_moe")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "k-exaone"
+
+    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
+        "k-exaone")
+    assert isinstance(reasoning_parser, NemotronV3ReasoningParser)
 
 
 @pytest.mark.parametrize("model_type",
@@ -1207,7 +1241,7 @@ def test_kimi_k3_reasoning_parser_stream_matches_parse(chunk_size: int,
     """Streaming in arbitrary chunkings must reproduce the one-shot parse.
 
     This sweeps every marker-split position, which is the riskiest logic in
-    the parser (`_partial_suffix_len` suffix holds).
+    the parser (`_trailing_partial_marker` suffix holds).
     """
     if thinking:
         text = _k3_completion("Let me think.", "Answer: 4.", K3_TOOLS_SECTION)
@@ -1255,3 +1289,100 @@ def test_auto_detect_kimi_k3(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result == "kimi_k3"
+
+
+_ARGS = "<arg_value>grep -c \"</think><tool_call>\" log</arg_value></tool_call>"
+_OFF = {"enable_thinking": False}
+
+# (key, chat_template_kwargs, text, content, reasoning). `glm`, `glm47` and
+# `glm_moe_dsa` start inside the prefilled block; `glm45` waits for `<think>`.
+_GLM_CASES = [
+    ("glm", None, "plan</think>The answer is 42.", "The answer is 42.", "plan"),
+    # A repeated close is dropped before any content or before the first call.
+    ("glm", None, "recovered.</think>Let me retry.</think><tool_call>f",
+     "Let me retry.<tool_call>f", "recovered."),
+    ("glm", None, "plan</think></think></think>done", "done", "plan"),
+    ("glm", None, "plan</think></think>", "", "plan"),
+    ("glm", None, "plan</think>It printed </think> here.",
+     "It printed </think> here.", "plan"),
+    ("glm", None, "r</think>text</think>", "text</think>", "r"),
+    # `<think>` never opens a second block.
+    ("glm", None, "r</think>a<think>b\n</", "a<think>b\n</", "r"),
+    ("glm", None, "a<think>", "", "a<think>"),
+    # A tool call ends the block; text that only resembles a marker is kept.
+    ("glm", None, "Plan.<tool_call>f<arg_key>m</arg_key></tool_call>",
+     "<tool_call>f<arg_key>m</arg_key></tool_call>", "Plan."),
+    ("glm", None, "plan</think>say<tool_call>f", "say<tool_call>f", "plan"),
+    ("glm", None, "x</t<tool_call>y", "<tool_call>y", "x</t"),
+    ("glm", None, "Planning <tools are useful", "",
+     "Planning <tools are useful"),
+    ("glm", None, "done<tool_c", "", "done<tool_c"),
+    # Tool-call arguments are passed through verbatim.
+    ("glm47", None, "Done.</think><tool_call>exec" + _ARGS,
+     "<tool_call>exec" + _ARGS, "Done."),
+    ("glm47", None, "Plan.<tool_call>exec" + _ARGS, "<tool_call>exec" + _ARGS,
+     "Plan."),
+    # With thinking off the template closed the block in the prompt.
+    ("glm47", _OFF, "Paris.", "Paris.", ""),
+    ("glm_moe_dsa", _OFF, "</think>Paris.</think><tool_call>f",
+     "Paris.<tool_call>f", ""),
+    # The block opens only at the start of the output.
+    ("glm45", None, "\n<think>let me think</think>Answer.", "Answer.",
+     "let me think"),
+    ("glm45", None, " <think>plan<tool_call>f", "<tool_call>f", "plan"),
+    ("glm45", None, "\nAnswer.", "\nAnswer.", ""),
+    ("glm45", None, "Answer.<think>x</think>y", "Answer.<think>x</think>y", ""),
+    ("glm45", None, "</think>a", "a", ""),
+    ("glm45", None, "hello<tool_call>f", "hello<tool_call>f", ""),
+]
+
+
+def _glm_stream(key: str, kwargs: dict | None,
+                deltas: list[str]) -> tuple[str, str]:
+    parser = ReasoningParserFactory.create_reasoning_parser(key, kwargs)
+    results = [parser.parse_delta(delta) for delta in deltas]
+    results.append(parser.finish())
+    content = "".join(r.content for r in results)
+    return content, "".join(r.reasoning_content for r in results)
+
+
+@pytest.mark.parametrize(("key", "kwargs", "text", "content", "reasoning"),
+                         _GLM_CASES)
+def test_glm_reasoning_parser(key: str, kwargs: dict | None, text: str,
+                              content: str, reasoning: str) -> None:
+    expected = (content, reasoning)
+    result = ReasoningParserFactory.create_reasoning_parser(key,
+                                                            kwargs).parse(text)
+    assert (result.content, result.reasoning_content) == expected
+    # Small chunks spread a marker over many deltas; the three-way splits put
+    # two delta boundaries at every pair of offsets.
+    for size in (1, 2, 4):
+        chunks = [text[i:i + size] for i in range(0, len(text), size)]
+        assert _glm_stream(key, kwargs, chunks) == expected, chunks
+    for i, j in itertools.combinations_with_replacement(range(len(text) + 1),
+                                                        2):
+        chunks = [text[:i], text[i:j], text[j:]]
+        assert _glm_stream(key, kwargs, chunks) == expected, chunks
+
+
+@pytest.mark.parametrize("key", ["glm", "glm45"])
+def test_glm_streaming_matches_parse_on_random_text(key: str) -> None:
+    pieces = [
+        "<think>", "</think>", "<tool_call>", "</tool_call>", "<", "</", "<t",
+        "</th", "<tool_", "think>", "call>", "a", " ", "\n"
+    ]
+    rng = random.Random(0)
+    for _ in range(3000):
+        text = "".join(rng.choices(pieces, k=rng.randint(0, 10)))
+        whole = ReasoningParserFactory.create_reasoning_parser(key).parse(text)
+        assert "<tool_call>" not in whole.reasoning_content
+        cuts = [i for i in range(1, len(text)) if rng.random() < 0.3]
+        chunks = [text[i:j] for i, j in zip([0] + cuts, cuts + [len(text)])]
+        expected = (whole.content, whole.reasoning_content)
+        assert _glm_stream(key, None, chunks) == expected, chunks
+
+
+def test_deepseek_r1_keeps_a_second_close_as_content() -> None:
+    result = ReasoningParserFactory.create_reasoning_parser(
+        "deepseek-r1").parse("a</think>b</think><tool_call>f")
+    assert result.content == "b</think><tool_call>f"
