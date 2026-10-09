@@ -2016,33 +2016,46 @@ def test_megamoe_cutedsl_rejects_non_minimax_swiglu_bias_package(
 
 
 @pytest.mark.cpu_only
-def test_megamoe_cutedsl_tep_requires_minimax_m3_activation() -> None:
-    deployment = _make_megamoe_cutedsl_test_deployment(ep_size=4, parallel_size=4)
-    minimax_verdict = MegaMoECuteDsl.can_implement(
-        _make_megamoe_cutedsl_minimax_problem(
-            bias=False,
-            activation=ActivationType.SwigluBias,
+@pytest.mark.parametrize("parallel_size", [2, 8])
+@pytest.mark.parametrize(
+    "activation,bias,constants,eligible",
+    [
+        pytest.param(
+            ActivationType.SwigluBias, False, {"alpha", "beta", "clamp"}, True, id="minimax"
         ),
-        deployment,
+        pytest.param(ActivationType.SiTu, False, {"alpha", "beta"}, True, id="kimi"),
+        pytest.param(ActivationType.Swiglu, False, set(), False, id="plain-swiglu"),
+        pytest.param(ActivationType.SiTu, True, {"alpha", "beta"}, False, id="situ-expert-bias"),
+        pytest.param(ActivationType.SiTu, False, {"alpha"}, False, id="situ-missing-softcap"),
+    ],
+)
+def test_megamoe_cutedsl_tep_requires_compatible_model_activation(
+    parallel_size: int,
+    activation: ActivationType,
+    bias: bool,
+    constants: set[str],
+    eligible: bool,
+) -> None:
+    deployment = _make_megamoe_cutedsl_test_deployment(
+        ep_size=parallel_size, parallel_size=parallel_size
     )
-    plain_swiglu_verdict = MegaMoECuteDsl.can_implement(
-        MoEProblem(
-            quant=QuantAlgo.NVFP4.value,
-            dtype_act=torch.bfloat16,
-            hidden_size=512,
-            intermediate_size=512,
-            num_experts=8,
-            top_k=2,
-            swiglu_gptoss_style=False,
-            bias=False,
-            activation=ActivationType.Swiglu.name,
-        ),
-        deployment,
+    problem = MoEProblem(
+        quant=QuantAlgo.NVFP4.value,
+        dtype_act=torch.bfloat16,
+        hidden_size=512,
+        intermediate_size=512,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=activation is ActivationType.SwigluBias,
+        bias=bias,
+        activation=activation.name,
+        activation_constants=frozenset(constants),
     )
+    verdict = MegaMoECuteDsl.can_implement(problem, deployment)
 
-    assert minimax_verdict.eligible, minimax_verdict.detail
-    assert not plain_swiglu_verdict.eligible
-    assert plain_swiglu_verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
+    assert verdict.eligible is eligible, verdict.detail
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.TOPOLOGY_UNSUPPORTED
 
 
 @pytest.mark.cpu_only
