@@ -84,11 +84,15 @@ class ProfilingCache:
 class CpuContractTests(unittest.TestCase):
     def setUp(self):
         self.tuner = SimpleNamespace(
-            is_tuning_mode=False, _active_capture=None, profiling_cache=ProfilingCache()
+            is_tuning_mode=False,
+            skip_dynamic_tuning_buckets=False,
+            _active_capture=None,
+            profiling_cache=ProfilingCache(),
         )
         properties = SimpleNamespace(multi_processor_count=80, major=10, minor=7)
         self.device_syncs = []
         self.stream_syncs = []
+        self.empty_cache_calls = 0
 
         def external_stream(stream_handle, *, device):
             return SimpleNamespace(
@@ -106,6 +110,7 @@ class CpuContractTests(unittest.TestCase):
                 current_stream=lambda device: SimpleNamespace(cuda_stream=17),
                 ExternalStream=external_stream,
                 synchronize=lambda device: self.device_syncs.append(device),
+                empty_cache=lambda: setattr(self, "empty_cache_calls", self.empty_cache_calls + 1),
             ),
             empty_like=lambda x: Tensor(x.shape, x.dtype),
         )
@@ -204,6 +209,107 @@ class CpuContractTests(unittest.TestCase):
         self.tuner.is_tuning_mode = False
         r.forward(inputs(256), tactic=-1)
         self.assertEqual(self.creations[-1][-1], (1, 256, 128, "atomic_counter", True))
+
+    def test_complete_profile_cache_prunes_only_loser_workspaces(self):
+        r = self.runner(capacity=300)
+        winners = (
+            (1, 256, 128, "atomic_counter", True),
+            (2, 128, 128, "grid_stride", True),
+        )
+        loser = (1, 64, 256, "grid_stride", False)
+        unrelated = (*r._runner_args[:-1], 18, loser)
+        for tactic in (*winners, loser):
+            cached = object()
+            r._compiled_runners[tactic] = cached
+            key = (*r._runner_args, tactic)
+            self.ns["_RUNNER_CACHE"][key] = cached
+            r.kernel_cache[key] = cached
+        self.ns["_RUNNER_CACHE"][unrelated] = object()
+        r.kernel_cache[unrelated] = object()
+
+        profiles = []
+        for index, bucket in enumerate(r.buckets):
+            shapes = tuple(t.shape for t in inputs(bucket))
+            tactic = winners[index % len(winners)]
+            key = self.tuner.profiling_cache.get_cache_key(
+                "trtllm::megamoe_shared_fc12",
+                r,
+                shapes,
+                r.tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            self.tuner.profiling_cache.cache[key] = (0, tactic, 0.1)
+            profiles.append(SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes))
+        self.tuner._optimization_profiles = lambda config, tensors: profiles
+
+        retained = r._cached_winner_tactics(self.tuner, inputs(300))
+        self.assertEqual(retained, set(winners))
+        r._retain_cached_winners(retained)
+        self.assertEqual(set(r._compiled_runners), set(winners))
+        for tactic in winners:
+            key = (*r._runner_args, tactic)
+            self.assertIn(key, self.ns["_RUNNER_CACHE"])
+            self.assertIn(key, r.kernel_cache)
+        loser_key = (*r._runner_args, loser)
+        self.assertNotIn(loser_key, self.ns["_RUNNER_CACHE"])
+        self.assertNotIn(loser_key, r.kernel_cache)
+        self.assertIn(unrelated, self.ns["_RUNNER_CACHE"])
+        self.assertIn(unrelated, r.kernel_cache)
+        self.assertEqual(self.stream_syncs, [(0, 17)])
+        self.assertEqual(self.empty_cache_calls, 1)
+        r._retain_cached_winners(retained)
+        self.assertEqual(self.empty_cache_calls, 1)
+
+    def test_incomplete_profile_cache_does_not_prune(self):
+        r = self.runner(capacity=300)
+        winner = (1, 256, 128, "atomic_counter", True)
+        loser = (1, 64, 256, "grid_stride", False)
+        for tactic in (winner, loser):
+            cached = object()
+            r._compiled_runners[tactic] = cached
+            key = (*r._runner_args, tactic)
+            self.ns["_RUNNER_CACHE"][key] = cached
+            r.kernel_cache[key] = cached
+        profiles = []
+        for bucket in r.buckets:
+            shapes = tuple(t.shape for t in inputs(bucket))
+            profiles.append(SimpleNamespace(get_opt_shapes=lambda shapes=shapes: shapes))
+        first_key = self.tuner.profiling_cache.get_cache_key(
+            "trtllm::megamoe_shared_fc12",
+            r,
+            profiles[0].get_opt_shapes(),
+            r.tuning_config,
+            apply_map_to_tuning_buckets=False,
+        )
+        self.tuner.profiling_cache.cache[first_key] = (0, winner, 0.1)
+        self.tuner._optimization_profiles = lambda config, tensors: profiles
+
+        before_compiled = dict(r._compiled_runners)
+        before_runners = dict(self.ns["_RUNNER_CACHE"])
+        before_kernels = dict(r.kernel_cache)
+        self.assertIsNone(r._cached_winner_tactics(self.tuner, inputs(300)))
+        self.assertEqual(r._compiled_runners, before_compiled)
+        self.assertEqual(self.ns["_RUNNER_CACHE"], before_runners)
+        self.assertEqual(r.kernel_cache, before_kernels)
+        self.assertEqual(self.stream_syncs, [])
+        self.assertEqual(self.empty_cache_calls, 0)
+
+    def test_skipped_dynamic_buckets_do_not_prune(self):
+        r = self.runner(capacity=300)
+        winner = (1, 256, 128, "atomic_counter", True)
+        loser = (1, 64, 256, "grid_stride", False)
+        for tactic in (winner, loser):
+            cached = object()
+            r._compiled_runners[tactic] = cached
+            key = (*r._runner_args, tactic)
+            self.ns["_RUNNER_CACHE"][key] = cached
+            r.kernel_cache[key] = cached
+        self.tuner.skip_dynamic_tuning_buckets = True
+
+        self.assertIsNone(r._cached_winner_tactics(self.tuner, inputs(300)))
+        self.assertEqual(set(r._compiled_runners), {winner, loser})
+        self.assertEqual(self.stream_syncs, [])
+        self.assertEqual(self.empty_cache_calls, 0)
 
     def test_public_dispatch_obeys_chooser_and_reuses_compilation(self):
         tactic = (2, 64, 256, "grid_stride", False)

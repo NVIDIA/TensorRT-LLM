@@ -463,6 +463,53 @@ class SharedFc12TunableRunner(TunableRunner):
             self._valid_tactics = tuple(valid)
         return list(self._valid_tactics)
 
+    def _cached_winner_tactics(self, tuner, inputs):
+        """Return every profiled bucket winner, or None if any is missing."""
+        if tuner.skip_dynamic_tuning_buckets:
+            return None
+        winners = set()
+        profiles = tuner._optimization_profiles(self.tuning_config, inputs)
+        if not profiles:
+            return None
+        for profile in profiles:
+            hit, runner_id, tactic, _ = tuner.profiling_cache.search_cache(
+                _SHARED_FC12_OP,
+                [self],
+                profile.get_opt_shapes(),
+                self.tuning_config,
+                apply_map_to_tuning_buckets=False,
+            )
+            if not hit or runner_id != 0 or tactic == -1:
+                return None
+            tactic = tuple(tactic)
+            if tactic not in _CANDIDATES:
+                return None
+            winners.add(tactic)
+        return winners
+
+    def _retain_cached_winners(self, winners) -> None:
+        """Drop profiled loser workspaces after all bucket winners are known."""
+        winners = {tuple(tactic) for tactic in winners}
+        if not winners or not winners.issubset(_CANDIDATES):
+            return
+        with self._compile_lock:
+            stale = set(self._compiled_runners) - winners
+            if not stale:
+                return
+            # Every cached runner is bound to this stream. Profiling has
+            # finished, but synchronize before releasing its workspace.
+            torch.cuda.ExternalStream(self.stream_handle, device=self.device_index).synchronize()
+            with _SHARED_FC12_CACHE_LOCK:
+                for tactic in stale:
+                    self._compiled_runners.pop(tactic, None)
+                    key = (*self._runner_args, tactic)
+                    self.kernel_cache.pop(key, None)
+                    _RUNNER_CACHE.pop(key, None)
+        # Return the released loser workspaces to CUDA before the routed
+        # MegaMoE autotuner allocates its symmetric profiling scratch.
+        with torch.cuda.device(self.device_index):
+            torch.cuda.empty_cache()
+
     def forward(self, inputs, *, tactic=-1, do_preparation=False, **kwargs):
         if do_preparation:
             return None
@@ -596,6 +643,10 @@ def run_shared_fc12(
         selected_runner, tactic = tuner.choose_one(
             _SHARED_FC12_OP, [runner], runner.tuning_config, inputs
         )
+        if tuner.is_tuning_mode:
+            winners = runner._cached_winner_tactics(tuner, inputs)
+            if winners is not None:
+                runner._retain_cached_winners(winners)
         return selected_runner(inputs, tactic=tactic)
     finally:
         _end_shared_fc12_call(active_key)
