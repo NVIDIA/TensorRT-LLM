@@ -324,6 +324,14 @@ def test_k3_situ_mul(situ, m):
     assert det and minv
 
 
+def test_k3_situ_mul_rejects_zero_linear_beta():
+    ops = _ops()
+    gu = _rows(2 * 2112, 14, 2.0)
+    with pytest.raises(ValueError, match="linear_beta"):
+        ops.k3_situ_mul(gu, 1.0, 0.0)
+    assert ops.k3_situ_mul(gu, 1.0, None).shape == (8, 2112)
+
+
 @pytest.mark.parametrize("m", [0, 9, 16])
 def test_token_limit(m):
     op = _ctm()

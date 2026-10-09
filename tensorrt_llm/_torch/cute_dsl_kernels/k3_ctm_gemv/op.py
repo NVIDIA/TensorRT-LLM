@@ -519,6 +519,10 @@ def k3_situ_mul(
 ) -> torch.Tensor:
     """``SituAndMul(beta, linear_beta)(gu)`` for a bf16 gate_up output ``gu`` [M <= 8, 2 K] (gate columns first), with
     programmatic dependent launch: the next kernel launches at once and may stream its weights meanwhile."""
+    if linear_beta is not None and float(linear_beta) == 0.0:
+        raise ValueError(
+            "k3_situ_mul: linear_beta=0.0 is not a SiTU scale; pass None to leave the up half unscaled"
+        )
     if not supports_situ_mul(gu):
         raise ValueError(f"k3_situ_mul: unsupported call gu {tuple(gu.shape)} {gu.dtype}")
     from . import k3_ctm_gemv_kernel as kernel
