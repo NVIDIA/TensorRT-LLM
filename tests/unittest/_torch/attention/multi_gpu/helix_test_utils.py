@@ -22,12 +22,11 @@ from mpi4py.futures import MPIPoolExecutor
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.interface import KVCacheParams
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import SamplingParams
 
 # Convenient aliases for the two KV-cache types used by MHA and MLA tests.
 CACHE_TYPE_SELF = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
@@ -156,7 +155,7 @@ def setup_kv_and_metadata(
     num_kv_heads: int,
     head_dim: int,
 ):
-    """Create a :class:`KVCacheManager` and context-phase attention metadata.
+    """Create a :class:`KVCacheManagerV2` and context-phase attention metadata.
 
     The caller supplies the KV-cache geometry that differs between MHA and MLA:
     *cache_type*, *num_kv_heads*, and *head_dim*.  Everything else is read from
@@ -174,7 +173,7 @@ def setup_kv_and_metadata(
         * scenario.kv_cache_tokens_per_block
         * scenario.batch
     )
-    kv_cache_manager = KVCacheManager(
+    kv_cache_manager = KVCacheManagerV2(
         KvCacheConfig(
             max_tokens=max_tokens,
             enable_block_reuse=False,
@@ -189,21 +188,12 @@ def setup_kv_and_metadata(
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
     )
-    requests = []
-    request_infos = []
-    for req_id in range(scenario.batch):
-        req = LlmRequest(
-            request_id=req_id,
-            max_new_tokens=1,
-            input_tokens=[1] * ctx_len_per_gpu,
-            sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
-            is_streaming=False,
-        )
-        req.is_dummy_request = True
-        req.paged_kv_block_ids = []
-        requests.append(req)
-        request_infos.append((req_id, ctx_len_per_gpu, 1))
-    kv_cache_manager.impl.add_sequence_batch(request_infos, requests)
+    # The attention test bypasses scheduling and uses rank-local dummy caches.
+    # Reserve the context plus the generation token written by this test.
+    requests = kv_cache_manager.add_dummy_requests(
+        list(range(scenario.batch)), [ctx_len_per_gpu + 1] * scenario.batch
+    )
+    assert requests is not None
     for req in requests:
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu

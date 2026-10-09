@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
@@ -139,7 +142,7 @@ def kv_cache_manager_from(
         kv_cache: torch.Tensor,
         request_ids: list[int],
         token_nums: list[int],
-        use_kv_cache_manager_v2: bool = False) -> KVCacheManager:
+        use_kv_cache_manager_v2: bool = True) -> KVCacheManager:
     paged = paged_backends[Attention]
 
     num_blocks = s.max_num_pages if paged else s.batch_size
@@ -203,7 +206,7 @@ def produce_outputs(
     q_at_layer: torch.Tensor,
     kv: Optional[torch.Tensor],
     s: Scenario,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     *,
     kv_cache: torch.Tensor,
     num_cached_tokens: Callable[[int], int] | int,

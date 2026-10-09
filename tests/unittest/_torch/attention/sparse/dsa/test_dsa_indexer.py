@@ -806,7 +806,7 @@ def create_dsa_cache_manager(
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
-    use_kv_cache_manager_v2: bool = False,
+    use_kv_cache_manager_v2: bool = True,
     pretrained_config=None,
 ):
     """Helper to create a DSA cache manager for testing."""

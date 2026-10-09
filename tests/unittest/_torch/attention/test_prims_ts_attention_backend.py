@@ -595,7 +595,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
             seq_lens=[65, 37],
             num_cached_tokens=[0, 0],
             num_contexts=2,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
         )
     )
     assert "TRTLLM" in a_results

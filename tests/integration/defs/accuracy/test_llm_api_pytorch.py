@@ -218,6 +218,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(60000)
     def test_prims_ts_bfloat16(self, mocker):
+        from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+            KVCacheManagerV2
+
         if get_sm_version() not in (100, 103):
             pytest.skip("PrimTS requires SM100 or SM103")
 
@@ -229,7 +232,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=0.75,
             tokens_per_block=32,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
         )
         # Keep the TP=1 worker in this process so the call counter observes the
         # real PrimTS launch. Compile Inductor kernels synchronously because its
@@ -246,6 +249,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                      cuda_graph_config=None,
                      speculative_config=None,
                      max_batch_size=1350) as llm:
+                assert isinstance(llm._executor.engine.kv_cache_manager,
+                                  KVCacheManagerV2)
                 calls.update({name: 0 for name in calls})
                 task = GSM8K(self.MODEL_NAME)
                 task.evaluate(llm)
