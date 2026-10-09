@@ -31,7 +31,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import ExecutorMemoryType, SleepConfig
 
 llm = LLM(
-    model="meta-llama/Llama-3.1-8B-Instruct",
+    model="Qwen/Qwen3-8B",
     sleep_config=SleepConfig(),
 )
 llm.release()
@@ -74,7 +74,7 @@ The asynchronous API has the same arguments and results:
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm.llmapi import SleepConfig
 
-async with AsyncLLM(model="meta-llama/Llama-3.1-8B-Instruct",
+async with AsyncLLM(model="Qwen/Qwen3-8B",
                     sleep_config=SleepConfig()) as llm:
     await llm.release()
     status = await llm.get_memory_status()
@@ -197,7 +197,7 @@ secret to come from the environment:
 
 ```bash
 export TRTLLM_RUNTIME_CONTROL_API_KEY='replace-with-a-long-random-secret'
-trtllm-serve meta-llama/Llama-3.1-8B-Instruct --enable_sleep_mode
+trtllm-serve Qwen/Qwen3-8B --enable_sleep_mode
 ```
 
 If the YAML configuration has no `sleep_config`, the command creates a default
