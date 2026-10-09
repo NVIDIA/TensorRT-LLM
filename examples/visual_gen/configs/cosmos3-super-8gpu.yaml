@@ -13,17 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Default 4-GPU Cosmos3-Super deployment for Blackwell (B200 / B300).
+# 8-GPU Cosmos3-Super with (CFG + Ulysses + parallel VAE).
 # Model: nvidia/Cosmos3-Super
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
-# trtllm-serve spawns the 4 workers itself — do not wrap it in torchrun/mpirun.
+# trtllm-serve spawns the 8 workers itself — do not wrap it in torchrun/mpirun.
 #
-# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=2 (sequence split).
-# For Hopper, use cosmos3-super-4gpu-hopper.yaml to shard the model weights.
+# GPU layout: cfg_size=2 (positive | negative) x ulysses_size=4 (sequence split).
 attention_config:
   backend: VANILLA
 parallel_config:
   cfg_size: 2
-  ulysses_size: 2
-  parallel_vae_size: 4
+  ulysses_size: 4
+  parallel_vae_size: 8
