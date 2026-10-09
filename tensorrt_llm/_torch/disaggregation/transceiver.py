@@ -431,15 +431,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # a CP rank can start decoding before its partner received the KV and
             # the helix all-to-all deadlocks.
             #
-            # Invariant: the collective below runs once per call to
-            # check_gen_transfer_status, and the executor enters that call behind
-            # a rank-local `admitted` predicate (receive_gen_init). The CP ranks
-            # of one DP group must therefore admit the same requests in the same
-            # iteration. The PP loop broadcasts the schedule over CP; the pp=1
-            # loops rely on deterministic scheduling (identical request stream
-            # and global-token KV capacity on every CP rank). The same
-            # requirement already held for non-DP tp x cp, which gathers over
-            # the world behind the same predicate.
+            # Invariant: check_gen_transfer_status gathers over this group, and
+            # besides the per-iteration poll the executor also enters it from
+            # receive_gen_init, only on ranks that admitted gen-init requests.
+            # The CP ranks of one DP group must therefore admit the same requests
+            # in the same iteration. Equal KV capacity is not enough: V1 deals
+            # helix blocks round-robin, and a client cancel or transfer timeout
+            # retires a request rank-locally, so one CP rank can have room
+            # before its peer. The pp=1 loops intersect the admitted ids over CP
+            # first (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # Non-DP tp x cp gathers over the world behind the same predicate and
+            # goes through the same step, which lines up its CP ranks but not its
+            # TP ranks; a rank-local cancel or timeout can still skew those, as it
+            # can without CP. The PP loop is not covered: under attention DP with
+            # tp > 1 its first-stage ranks admit from their own schedule.
             self._gen_need_sync = m.pp_size * m.cp_size > 1
             self._gen_allgather: Callable = self._dp_group_allgather
         else:
