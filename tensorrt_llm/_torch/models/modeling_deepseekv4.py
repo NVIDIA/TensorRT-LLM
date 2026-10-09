@@ -1613,10 +1613,14 @@ class DeepseekV4MoE(nn.Module):
         self._per_iteration_eplb_auxiliary_sms = (
             int(load_balancer_config.auxiliary_sms) if self._per_iteration_eplb_enabled else 0
         )
-        # Select the shared backend from the final projection quantization.
-        # Per-iteration EPLB only supplies an optional SM budget below.
+        rebalance_backend = getattr(self.experts, "backend", self.experts)
+        # The fused shared kernel is part of the opt-in per-iteration path. Ask
+        # the selected routed backend for the capability instead of naming a
+        # concrete implementation here.
         use_fused_fc12 = (
-            get_sm_version() == 107
+            self._per_iteration_eplb_enabled
+            and self._shared_fc12_backend_supported(rebalance_backend)
+            and get_sm_version() == 107
             and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
             and not model_config.use_cuda_graph
         )
@@ -1749,6 +1753,11 @@ class DeepseekV4MoE(nn.Module):
             if global_quant_config.is_module_excluded_from_quantization(down_name):
                 down_quant_config = unquantized
         return gate_up_quant_config, down_quant_config
+
+    @staticmethod
+    def _shared_fc12_backend_supported(backend) -> bool:
+        capabilities = getattr(backend, "capabilities", None)
+        return bool(getattr(capabilities, "supports_per_iteration_eplb", False))
 
     @staticmethod
     def _shared_fc12_quantization_supported(

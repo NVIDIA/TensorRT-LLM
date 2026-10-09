@@ -736,10 +736,11 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
   rollback must release the scheduler, TMA bindings, shared-slot mappings,
   and fabric allocations collectively. Forward execution must not retain
   activation tensors after their consumer has been enqueued.
-- Fused shared FC12 selection depends only on the final projection
-  quantization, hardware, and graph support. Per-iteration EPLB supplies an
-  optional SM budget when that backend exposes resource control. BF16 and
-  unsupported configurations keep the model's existing shared-MLP backend.
+- Per-iteration EPLB selects the fused shared FC12 kernel only when the routed
+  backend declares per-iteration support and the final projection
+  quantization, hardware, and graph mode support that kernel. Other runs keep
+  the model's existing shared-MLP backend. The active configuration supplies
+  the optional SM budget only to the fused kernel.
 
 ## Canonical Examples
 

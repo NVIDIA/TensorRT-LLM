@@ -696,6 +696,21 @@ def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
     assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
 
 
+@pytest.mark.parametrize(
+    ("supports_per_iteration_eplb", "expected"), [(False, False), (True, True)]
+)
+def test_deepseek_v4_shared_fc12_uses_backend_capability(supports_per_iteration_eplb, expected):
+    backend = SimpleNamespace(
+        capabilities=SimpleNamespace(supports_per_iteration_eplb=supports_per_iteration_eplb)
+    )
+
+    assert DeepseekV4MoE._shared_fc12_backend_supported(backend) is expected
+
+
+def test_deepseek_v4_shared_fc12_rejects_backend_without_capabilities():
+    assert not DeepseekV4MoE._shared_fc12_backend_supported(SimpleNamespace())
+
+
 def test_deepseek_v4_shared_fc12_ignores_up_only_layerwise_override():
     global_quant_config = QuantConfig(quant_algo=None)
     fp8_quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
