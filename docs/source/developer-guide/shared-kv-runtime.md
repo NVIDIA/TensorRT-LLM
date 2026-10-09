@@ -6,19 +6,21 @@ SPDX-License-Identifier: Apache-2.0
 # Shared KV runtime contracts
 
 The shared backend contract lives in
-`tensorrt_llm._torch.disaggregation.base.shared`. Its 13 symbols describe opaque
-content units, logical outcomes, backend access completion, routes and memory
-registration. The existing paired transfer contract remains in `base.backend`;
-paired-path convergence is a separate runtime milestone. Import from the intended
-module explicitly because several type names overlap.
+`tensorrt_llm._torch.disaggregation.base.shared`. Its symbols describe opaque
+content units, logical outcomes, cancellation requests, backend access
+completion, routes and memory registration. The existing paired transfer contract
+remains in `base.backend`; paired-path convergence is a separate runtime milestone.
+Import from the intended module explicitly because several type names overlap.
 
 ## Compatibility boundary
 
 `resource.shared.SharedRuntimeProfile` records explicit runtime assembly facts.
-Its contract revision is pinned to `147ed68276e7fb89d5de60002d4e793a78707a8c`;
-its backend revision identifies the actual package or build under test and is a
-separate value. Validate the profile before taking a staging hold, registering
-memory or exposing an extent.
+Its contract revision is pinned to
+`147ed68276e7fb89d5de60002d4e793a78707a8c+cancel-request-v1`. The suffix identifies
+the local cancellation extension to the base contract, not an upstream spec
+revision. Its backend revision identifies the actual package or build under test
+and is a separate value. Validate the profile before taking a staging hold,
+registering memory or exposing an extent.
 
 The first supported shape is native NIXL, `KVCacheManagerV2`, BF16 MHA written by
 TRTLLM in HND layout, TP=DP=PP=CP=1, manager-owned host staging and committed whole
@@ -26,7 +28,9 @@ blocks. Remapping, offload, compression, recurrent state, extra buffer roles and
 retry remain outside that shape. An unknown extra feature is rejected as well.
 These checks describe compatibility requirements; they neither enable runtime
 integration nor establish deployment qualification. Exact adapter qualification
-belongs to LC-MC-21 and runtime qualification to RI-09.
+belongs to LC-MC-15 for the native profile and LC-MC-17 for the separate
+Mooncake profile; runtime qualification belongs to RI-09. Mooncake remains
+unsupported until its RI-08D integration and profile qualification are complete.
 
 The assembly caller must obtain the cache dtype, writer/layout and feature facts
 from the actual engine configuration. A lender layout digest alone does not prove
@@ -62,3 +66,24 @@ cancelled outcome, request exit, and a timeout cannot authorize `Lease.release`.
 Keep leases and registration roots until physical access and local copies have
 ended; only then deregister memory and release the `PartsHold` on the manager's
 owner thread. `release` asserts that access ended; it does not stop a transfer.
+
+## Cancellation requests
+
+Call `request_cancel(attempt)` for any shared `Attempt`. An ordinary attempt
+returns `CancelDisposition.UNSUPPORTED`; providers can implement the optional
+`CancellableAttempt` protocol. Its nonblocking, idempotent method suppresses
+queued work where feasible and requests SDK cancellation where supported.
+Potentially blocking SDK work must run outside this call.
+
+`REQUESTED` acknowledges a best-effort request. It does not guarantee a
+`Cancelled` outcome or prove that memory access ended. Completion can win a
+race with cancellation, and the first terminal outcome stays unchanged.
+Cancellation cannot roll back already published content. Repeated calls must
+not start duplicate cancellation work.
+
+The runtime adapter commits its own logical cancellation independently and
+invokes the shared helper without waiting for SDK completion. Neither
+disposition resets retirement deadlines or permits early lease, registration,
+or staging release. Backend quiescence and local-copy completion still govern
+physical retirement. Store providers keep queue and per-row SDK details private
+behind this shared capability.

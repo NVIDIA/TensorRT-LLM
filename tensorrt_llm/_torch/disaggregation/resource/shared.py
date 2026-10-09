@@ -26,7 +26,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import Part, RegionView
 
 from ..base.shared import CacheExtent, Unit
 
-SHARED_CONTRACT_REVISION = "147ed68276e7fb89d5de60002d4e793a78707a8c"
+SHARED_CONTRACT_REVISION = "147ed68276e7fb89d5de60002d4e793a78707a8c+cancel-request-v1"
 STAGING_EXTENT_NAMESPACE = b"trtllm:shared-kv:staging:1"
 
 
