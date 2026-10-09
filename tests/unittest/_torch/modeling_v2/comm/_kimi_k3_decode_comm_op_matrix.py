@@ -38,9 +38,9 @@ Checks:
     with the tail reduced in torch and added before the built-in pre-attention step: the consumer's attention input,
     its outputs and the bank within TOL; the deferred chain captured and replayed equals eager bit for bit.
   * MoE tail tap: layer 23 or 24 as a tapped layer (its speculative metadata a stand-in) consuming layer 22's tail.
-    With the metadata's ``capture_view`` the sandwich tail stores the tap into the capture slot and the layer captures
-    nothing more; without it the layer captures the split path's tap (``_apply_attn_res``). The two taps within TOL,
-    every other output of the chain bit for bit the same.
+    With DFlash's metadata, whose capture slot the target's ``capture_view`` exposes, the sandwich tail stores the tap
+    into the capture slot and the layer captures nothing more; without it the layer captures the split path's tap
+    (``_apply_attn_res``). The two taps within TOL, every other output of the chain bit for bit the same.
   * decode MoE push: the MoE decode path with random MXFP4 routed experts (route A's layout: 224 local experts of
     intermediate 768, every rank its own EP shard) on the TP group's latent exchange, its latent all-reduce as the
     routed experts' push form plus comm/k3_latent_reduce (``push=True``) against the routed experts' all-reduce
@@ -558,22 +558,35 @@ def check_moe_tail_deferral():
 
 class _CaptureMetadata:
     """Stand-in for the speculative metadata a tapped layer captures into: ``maybe_capture_hidden_states`` records
-    each value it is handed, and with ``views`` the metadata also exposes ``capture_view``, slot 2 of a NaN-filled
-    ``[T, 5 x H]`` capture buffer, as DSpark's does."""
+    each value it is handed."""
 
-    SLOT = 2
-
-    def __init__(self, tokens, views):
-        self.buf = torch.full((tokens, 5 * H), float("nan"), dtype=torch.bfloat16, device="cuda")
+    def __init__(self):
         self.captured = []
-        if views:
-            self.capture_view = self.view
-
-    def view(self, layer_id, num_tokens):
-        return self.buf[:num_tokens, self.SLOT * H : (self.SLOT + 1) * H]
 
     def maybe_capture_hidden_states(self, layer_id, hidden_states, residual=None):
         self.captured.append(hidden_states.clone())
+
+
+def _view_capture_metadata(tokens, layer_id):
+    from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    metadata = DFlashSpecMetadata(
+        max_num_requests=tokens,
+        max_draft_len=1,
+        max_total_draft_tokens=1,
+        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+        layers_to_capture=[layer_id + d for d in (-2, -1, 0, 1, 2)],
+        hidden_size=H,
+        max_num_tokens=tokens,
+        dtype=torch.bfloat16,
+    )
+    metadata.captured_hidden_states.fill_(float("nan"))
+    metadata.captured = []
+    metadata.maybe_capture_hidden_states = lambda layer_id, hidden_states, residual=None: (
+        metadata.captured.append(hidden_states.clone())
+    )
+    return metadata
 
 
 def check_moe_tail_tap():
@@ -587,7 +600,7 @@ def check_moe_tail_tap():
             gr = _gen(seed * 13 + 5 + R.rank)
             core_c = ls.exact_bf16(gr, (tokens, K_IN), -4, 5, 1 / 8)
             pending = _pending(seed, tokens)
-            fused, split = _CaptureMetadata(tokens, True), _CaptureMetadata(tokens, False)
+            fused, split = _view_capture_metadata(tokens, consumer_idx - 1), _CaptureMetadata()
             got = _tail_chain(producer, consumer, case.x.clone(), case.bank.clone(), step, pending, True, core_c,
                               case.core, capture=(fused, consumer_idx - 1))  # fmt: skip
             got = [t.clone() for t in got]
@@ -595,7 +608,8 @@ def check_moe_tail_tap():
                                case.core, capture=(split, consumer_idx - 1))  # fmt: skip
             torch.cuda.synchronize()
             assert not fused.captured and len(split.captured) == 1, (consumer_idx, tokens)
-            tap, split_tap = fused.view(consumer_idx - 1, tokens), split.captured[0]
+            tap = T._spec_worker.capture_view(fused, consumer_idx - 1, tokens)
+            split_tap = split.captured[0]
             err = _err(tap, split_tap)
             differ = int((tap.view(torch.int16) != split_tap.view(torch.int16)).sum())
             if R.rank == 0:

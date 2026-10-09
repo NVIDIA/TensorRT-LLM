@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``ctx_rows_start``: the DFlash worker's start of the gen requests' page-table rows, and who receives it
-(host-side).
+"""``ctx_rows_start``: the Kimi K3 target's DFlash / DSpark worker's start of the gen requests' page-table rows, and
+who receives it (host-side).
 
-* ``DFlashWorker._ctx_rows_start`` is the number of context requests where the drafter reads the manager's block
+* ``KimiK3DFlashWorker._ctx_rows_start`` is the number of context requests where the drafter reads the manager's block
   table (keyed by batch position, so the gen requests' rows are one run), and None for the private arena (keyed by
   slot) or a step without gen requests.
 * ``dflash_ctx_rows_kwargs`` hands it only to a drafter whose ``dflash_forward`` takes it (the Kimi K3 target's
@@ -29,10 +29,13 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
     K3DSparkDrafter,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+    KimiK3DFlashWorker,
+    KimiK3DSparkWorker,
+    dflash_ctx_rows_kwargs,
+)
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM, MLADSparkForCausalLM
-from tensorrt_llm._torch.speculative.dflash import DFlashWorker, dflash_ctx_rows_kwargs
-from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -44,7 +47,7 @@ def _bare(cls):
     return obj
 
 
-@pytest.mark.parametrize("cls", [DFlashWorker, DSparkWorker])
+@pytest.mark.parametrize("cls", [KimiK3DFlashWorker, KimiK3DSparkWorker])
 @pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (0, 8), (3, 2), (5, 1)])
 def test_rows_start_where_the_manager_table_is_read(cls, num_contexts, num_gens):
     worker = _bare(cls)
@@ -52,7 +55,7 @@ def test_rows_start_where_the_manager_table_is_read(cls, num_contexts, num_gens)
     assert worker._ctx_rows_start(num_contexts, num_gens) == num_contexts
 
 
-@pytest.mark.parametrize("cls", [DFlashWorker, DSparkWorker])
+@pytest.mark.parametrize("cls", [KimiK3DFlashWorker, KimiK3DSparkWorker])
 def test_no_rows_start_for_the_private_arena_or_without_gen_requests(cls):
     worker = _bare(cls)
     worker._ctx_block_tables = None

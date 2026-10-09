@@ -78,8 +78,9 @@ weights are a predicted non-load, `weights.py`), and a step carrying multimodal 
 split. The causal LM is still the stock one-engine shell the built-in model builds on, which without that config
 builds no drafter and no worker. This target drops `tp16_moetp4ep4`'s KDA verify kernels and the per-token verify
 states they keep; the text model's speculative hidden-state taps stay as `tp16_moetp4ep4` has them and never fire.
-The DSpark drafter (`K3DSparkDrafter`, which `_build_draft_model` builds) also stays as `tp16_moetp4ep4` has it
-and is never built here; its decode GEMV sites are warmed with the others and never called.
+The DSpark drafter (`K3DSparkDrafter`) and the speculative worker (`spec_worker.py`), which `_own_spec_branch` puts in
+place of the shell's stock ones, also stay as `tp16_moetp4ep4` has them and are never built here; the drafter's decode
+GEMV sites are warmed with the others and never called.
 """
 # <<< route B
 
@@ -151,6 +152,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from . import decode_comm as _decode_comm
 from . import decode_gemv as _decode_gemv
 from . import decode_moe as _decode_moe
+from . import spec_worker as _spec_worker
 from . import weights as _weights
 
 if TYPE_CHECKING:
@@ -1594,8 +1596,7 @@ class KimiLinearDecoderLayer(nn.Module):
         # layer's capture slot, where the speculative metadata exposes that slot as a view (``capture_view``).
         tap_view = None
         if tail is not None and capture is not None:
-            view_of = getattr(capture[0], "capture_view", None)
-            tap_view = view_of(capture[1], prefix_sum.shape[0]) if view_of is not None else None
+            tap_view = _spec_worker.capture_view(capture[0], capture[1], prefix_sum.shape[0])
 
         if prenormed:
             assert num_snapshots == 0 and self.layer_idx % self.attn_res_block_size == 0
@@ -2451,8 +2452,8 @@ class K3DSparkDrafter(GQADSparkForCausalLM):
       whose norms or projections the fused all-reduces do not reproduce, keep the stock all-reduces and norms.
 
     Otherwise ``fc`` stays replicated, with the stock context projection, and the norms and residual adds are the
-    stock modules'. The worker that calls the drafter (the stock ``DSparkWorker``), the context k / v and the Markov
-    head stay upstream code.
+    stock modules'. The worker that calls the drafter is this target's ``KimiK3DSparkWorker`` (``spec_worker.py``);
+    the context k / v and the Markov head stay upstream code.
     """
 
     def __init__(
@@ -3121,6 +3122,7 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
             hidden_size=cfg.hidden_size,
             vocab_size=cfg.vocab_size,
         )
+        self._own_spec_branch(text)
         self._step_checked = False
         # >>> route B: no drafter to hand the LM head to
         # The LM head on gemm/k3_head_gemv at decode size, once cache_derived_state has built its state.
@@ -3132,22 +3134,37 @@ class ModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1(KimiLinearForCausalLM):
         model_config.pretrained_config = self.config
         model_config._frozen = True
 
-    def _build_draft_model(
-        self, model_config: ModelConfig, draft_config: Optional[ModelConfig]
-    ) -> Optional[nn.Module]:
-        """DSpark's drafter from a standalone GQA checkpoint is this target's `K3DSparkDrafter`; any other drafter
-        is the mode registry's."""
+    def _own_spec_branch(self, model_config: ModelConfig) -> None:
+        """Put this target's drafter and worker in place of the shell's stock ones: DSpark's drafter from a
+        standalone GQA checkpoint is `K3DSparkDrafter`, and the DFlash / standalone DSpark worker is
+        `spec_worker.py`'s. Under the engine's meta initialization the stock drafter it replaces holds no weights."""
         spec_config = model_config.spec_config
+        if spec_config is None:
+            return
+        mode = spec_config.spec_dec_mode
+        standalone_dspark = mode.is_dspark() and not draft_is_embedded_in_target(model_config)
         if (
-            spec_config.spec_dec_mode.is_dspark()
-            and draft_config is not None
-            and not draft_is_embedded_in_target(model_config)
-            and not is_mla(draft_config.pretrained_config)
+            standalone_dspark
+            and self.draft_config is not None
+            and not is_mla(self.draft_config.pretrained_config)
         ):
-            return K3DSparkDrafter(
-                draft_config, dflash_attention_backend=spec_config.attention_backend
+            drafter = K3DSparkDrafter(
+                self.draft_config, dflash_attention_backend=spec_config.attention_backend
             )
-        return super()._build_draft_model(model_config, draft_config)
+            if mode.is_parallel_draft():
+                drafter.logits_processor = self.logits_processor
+            self.epilogue[self.epilogue.index(self.draft_model)] = drafter
+            self.draft_model = drafter
+        if mode.is_dflash():
+            worker_cls = _spec_worker.KimiK3DFlashWorker
+        elif standalone_dspark:
+            worker_cls = _spec_worker.KimiK3DSparkWorker
+        else:
+            return
+        worker = worker_cls(spec_config, model_config.mapping, self.use_separate_draft_kv_cache)
+        worker.set_draft_model(self.draft_model)
+        self.epilogue[self.epilogue.index(self.spec_worker)] = worker
+        self.spec_worker = worker
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.load(self, weights)

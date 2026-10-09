@@ -15,8 +15,10 @@
 """The Kimi K3 target ``kimi_k3_mxfp4__sm_100__tp16_moetp4ep4`` and its speculative worker's decode kernels (host-side,
 fakes only).
 
-* ``_gate_spec_worker_kernels`` turns the DFlash / DSpark worker's ``k3_decode`` on only alongside the target's decode
-  path: the TP group's MNNVL decode state and the LM head on ``gemm/k3_head_gemv``.
+* ``_own_spec_branch`` puts the target's DSpark drafter and DFlash / DSpark worker in place of the shell's stock ones,
+  in their places in the epilogue.
+* ``_gate_spec_worker_kernels`` turns the target's DFlash / DSpark worker's ``k3_decode`` on only alongside the
+  target's decode path: the TP group's MNNVL decode state and the LM head on ``gemm/k3_head_gemv``.
 * ``K3LogitsProcessor.lm_head_shard`` hands the worker this rank's vocabulary shard of the head kernel's logits,
   without the gather.
 """
@@ -29,12 +31,19 @@ from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     decode_gemv,
+    spec_worker,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    modeling as target_modeling,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (  # noqa: E501
     ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4 as Target,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
-from tensorrt_llm._torch.speculative.dspark import DSparkWorker
+from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+K3DFlash = spec_worker.KimiK3DFlashWorker
+K3DSpark = spec_worker.KimiK3DSparkWorker
 
 pytestmark = pytest.mark.cpu_only
 
@@ -52,7 +61,68 @@ def _target(worker, gemvs=True, head_workspace=True):
     return SimpleNamespace(spec_worker=worker, model=SimpleNamespace(decode_gemvs=state))
 
 
-@pytest.mark.parametrize("cls", [DFlashWorker, DSparkWorker])
+_SPEC_BRANCHES = {
+    "dspark gqa": ("DSPARK", False, False, True, K3DSpark),
+    "dspark mla": ("DSPARK", False, True, False, K3DSpark),
+    "dspark embedded": ("DSPARK", True, False, False, None),
+    "dflash": ("DFLASH", False, False, False, K3DFlash),
+    "sa": ("SA", False, False, False, None),
+}
+
+
+@pytest.mark.parametrize("branch", list(_SPEC_BRANCHES))
+def test_own_spec_branch_replaces_the_stock_drafter_and_worker(monkeypatch, branch):
+    mode, embedded, mla, new_drafter, worker_cls = _SPEC_BRANCHES[branch]
+    built = []
+
+    class Drafter(nn.Module):
+        def __init__(self, draft_config, *, dflash_attention_backend):
+            super().__init__()
+            built.append((draft_config, dflash_attention_backend))
+
+    def fake_init(self, spec_config, mapping, use_separate_draft_kv_cache):
+        nn.Module.__init__(self)
+        self.init_args = (spec_config, mapping, use_separate_draft_kv_cache)
+
+    monkeypatch.setattr(target_modeling, "K3DSparkDrafter", Drafter)
+    for cls in (K3DFlash, K3DSpark):
+        monkeypatch.setattr(cls, "__init__", fake_init)
+        monkeypatch.setattr(cls, "set_draft_model", lambda self, d: setattr(self, "drafter", d))
+    spec_config = SimpleNamespace(
+        spec_dec_mode=getattr(SpeculativeDecodingMode, mode),
+        draft_is_embedded_in_target=embedded,
+        attention_backend="TRTLLM",
+    )
+    pretrained = (
+        SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64) if mla else SimpleNamespace()
+    )
+    model_config = SimpleNamespace(spec_config=spec_config, mapping=object())
+    stock_drafter, stock_worker, tail = nn.Module(), nn.Module(), object()
+    target = SimpleNamespace(
+        draft_config=SimpleNamespace(pretrained_config=pretrained),
+        draft_model=stock_drafter,
+        spec_worker=stock_worker,
+        epilogue=[stock_drafter, stock_worker, tail],
+        logits_processor=object(),
+        use_separate_draft_kv_cache=True,
+    )
+
+    Target._own_spec_branch(target, model_config)
+
+    assert built == ([(target.draft_config, "TRTLLM")] if new_drafter else [])
+    assert isinstance(target.draft_model, Drafter) == new_drafter
+    if new_drafter:
+        assert target.draft_model.logits_processor is target.logits_processor
+    if worker_cls is None:
+        assert target.spec_worker is stock_worker
+    else:
+        assert type(target.spec_worker) is worker_cls
+        assert target.spec_worker.init_args == (spec_config, model_config.mapping, True)
+        assert target.spec_worker.drafter is target.draft_model
+    assert target.epilogue == [target.draft_model, target.spec_worker, tail]
+
+
+@pytest.mark.parametrize("cls", [K3DFlash, K3DSpark])
 def test_worker_kernels_on_with_the_targets_decode_path(cls):
     worker = _worker(cls)
     assert Target._gate_spec_worker_kernels(_target(worker), comm=object())
@@ -70,7 +140,7 @@ def test_worker_kernels_on_with_the_targets_decode_path(cls):
     ],
 )
 def test_worker_kernels_off_without_the_targets_decode_path(comm, gemvs, head_workspace):
-    worker = _worker(DSparkWorker)
+    worker = _worker(K3DSpark)
     worker.k3_decode = True
     assert not Target._gate_spec_worker_kernels(_target(worker, gemvs, head_workspace), comm)
     assert worker.k3_decode is False
@@ -78,8 +148,8 @@ def test_worker_kernels_off_without_the_targets_decode_path(comm, gemvs, head_wo
 
 @pytest.mark.parametrize(
     "worker",
-    [None, SimpleNamespace()],
-    ids=["no speculative worker", "a worker without the kernels"],
+    [None, SimpleNamespace(), _worker(DFlashWorker)],
+    ids=["no speculative worker", "a worker without the kernels", "the stock DFlash worker"],
 )
 def test_no_worker_kernels_to_gate(worker):
     assert not Target._gate_spec_worker_kernels(_target(worker), comm=object())

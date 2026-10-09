@@ -12,14 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``DFlashSpecMetadata.capture_view``: a captured layer's slot of the capture buffer, which a kernel can write the tap
-into (host-side). The view shares the buffer's storage, so what is written through it is what ``get_hidden_states``
-hands the drafter, in that layer's columns only; a layer that is not captured, or metadata without a capture buffer,
-has no view."""
+"""The Kimi K3 target's ``spec_worker.capture_view``: a captured layer's slot of the DFlash capture buffer, which a
+kernel can write the tap into (host-side). The view shares the buffer's storage, so what is written through it is what
+``get_hidden_states`` hands the drafter, in that layer's columns only; a layer that is not captured, metadata without a
+capture buffer, or metadata that is not DFlash's has no view."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+    capture_view,
+)
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 
@@ -64,7 +69,7 @@ def test_capture_view_is_the_layers_slot(layer, slot):
     buffer.zero_()
     num_tokens = 5
 
-    view = metadata.capture_view(layer, num_tokens)
+    view = capture_view(metadata, layer, num_tokens)
 
     assert view.shape == (num_tokens, HIDDEN) and view.dtype == buffer.dtype
     assert view.untyped_storage().data_ptr() == buffer.untyped_storage().data_ptr()
@@ -82,11 +87,15 @@ def test_capture_view_is_the_layers_slot(layer, slot):
 def test_cuda_graph_metadata_views_the_shared_buffer():
     metadata = _metadata()
     graph = metadata.create_cuda_graph_metadata(4)
-    assert graph.capture_view(3, 4).data_ptr() == metadata.capture_view(3, 4).data_ptr()
+    assert capture_view(graph, 3, 4).data_ptr() == capture_view(metadata, 3, 4).data_ptr()
 
 
 def test_no_view_outside_the_captured_layers():
-    assert _metadata().capture_view(2, 4) is None
+    assert capture_view(_metadata(), 2, 4) is None
     uncaptured = _metadata(layers=None)
     assert uncaptured.captured_hidden_states is None
-    assert uncaptured.capture_view(1, 4) is None
+    assert capture_view(uncaptured, 1, 4) is None
+    assert (
+        capture_view(SimpleNamespace(captured_hidden_states=torch.zeros(4, HIDDEN)), 1, 4) is None
+    )
+    assert capture_view(None, 1, 4) is None

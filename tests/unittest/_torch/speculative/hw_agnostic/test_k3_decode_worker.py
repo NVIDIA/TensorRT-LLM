@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The DFlash / DSpark worker's Kimi K3 decode kernels behind ``k3_decode`` (host-side, fakes only).
+"""The Kimi K3 target's DFlash / DSpark worker's decode kernels behind ``k3_decode`` (host-side, fakes only).
 
 * Off by default: the target logits are the logits processor's, the draft logits the drafter's processor's, and no
   kernel predicate reads past the gate.
@@ -31,6 +31,10 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+    KimiK3DFlashWorker,
+    KimiK3DSparkWorker,
+)
 from tensorrt_llm._torch.cute_dsl_kernels.k3_ctx_kv import op as ctx_op
 from tensorrt_llm._torch.cute_dsl_kernels.k3_markov import op as markov_op
 from tensorrt_llm._torch.cute_dsl_kernels.k3_spec_accept import op as accept_op
@@ -75,7 +79,7 @@ def mnnvl(monkeypatch):
     return workspaces
 
 
-def _worker(cls=DFlashWorker, **attrs):
+def _worker(cls=KimiK3DFlashWorker, **attrs):
     """A worker without ``__init__`` (it needs flashinfer and a drafter): the attributes a test sets."""
     worker = cls.__new__(cls)
     nn.Module.__init__(worker)
@@ -153,10 +157,11 @@ def _accept_applies(case, monkeypatch):
 
 
 def test_k3_decode_is_off_by_default():
-    assert DFlashWorker.k3_decode is False
-    assert DSparkWorker.k3_decode is False
+    assert KimiK3DFlashWorker.k3_decode is False
+    assert KimiK3DSparkWorker.k3_decode is False
     assert _worker().k3_decode is False
-    assert _worker(DSparkWorker).k3_decode is False
+    assert _worker(KimiK3DSparkWorker).k3_decode is False
+    assert not hasattr(DFlashWorker, "k3_decode") and not hasattr(DSparkWorker, "k3_decode")
 
 
 def test_target_logits_are_the_logits_processors_when_off():
@@ -545,7 +550,7 @@ def markov_kernel(monkeypatch, mnnvl):
 
 def _markov_case():
     return SimpleNamespace(
-        worker=_worker(DSparkWorker, k3_decode=True, mapping=TP4),
+        worker=_worker(KimiK3DSparkWorker, k3_decode=True, mapping=TP4),
         drafter=_markov_drafter(),
         spec=SimpleNamespace(wants_advanced_draft_sampling=False, runtime_draft_len=K),
     )
@@ -606,7 +611,7 @@ def test_k3_markov_declines_a_shard_it_does_not_split(markov_kernel, monkeypatch
 
 
 def test_dspark_draft_logits_are_the_processors_when_off():
-    worker = _worker(DSparkWorker, mapping=TP4)
+    worker = _worker(KimiK3DSparkWorker, mapping=TP4)
     gathered = torch.zeros(NUM_GENS * K, VOCAB)
     calls = []
     drafter = SimpleNamespace(
@@ -676,12 +681,12 @@ def test_dspark_acceptance_is_kept_only_under_k3_decode(monkeypatch):
     )
     attn, spec = SimpleNamespace(num_contexts=0), object()
 
-    off = _worker(DSparkWorker)
+    off = _worker(KimiK3DSparkWorker)
     result = off.sample_and_accept_draft_tokens(None, attn, spec)
     assert result[0] is accepted and result[1] is num_accepted
     assert getattr(off, "_k3_acceptance", None) is None
 
-    on = _worker(DSparkWorker, k3_decode=True)
+    on = _worker(KimiK3DSparkWorker, k3_decode=True)
     on.sample_and_accept_draft_tokens(None, attn, spec)
     kept = on._k3_acceptance
     assert kept[0] is accepted and kept[1] is num_accepted and kept[2] == 0
@@ -692,7 +697,7 @@ def test_dspark_acceptance_is_kept_only_under_k3_decode(monkeypatch):
 def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
     """``k3_markov`` gets this rank's slice and the step's acceptance, folds a pending KV-length rewind, and its
     tokens and next_new_tokens are the step's drafts and next inputs."""
-    worker = _worker(DSparkWorker, k3_decode=True, mapping=TP4)
+    worker = _worker(KimiK3DSparkWorker, k3_decode=True, mapping=TP4)
     accepted = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
     num_accepted = torch.ones(NUM_GENS, dtype=torch.int32)
     spec = SimpleNamespace(
@@ -754,7 +759,7 @@ def test_k3_markov_step_state_is_released_after_next_new_tokens(monkeypatch, ker
     """Once ``_prepare_next_new_tokens`` has run, the worker holds nothing of the step: neither its acceptance,
     which carries the step's attention and spec metadata, nor ``k3_markov``'s outputs. Held, they would keep a
     captured step's graph pool and metadata alive after it."""
-    worker = _worker(DSparkWorker, k3_decode=True, mapping=TP4)
+    worker = _worker(KimiK3DSparkWorker, k3_decode=True, mapping=TP4)
     accepted = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
     num_accepted = torch.ones(NUM_GENS, dtype=torch.int32)
     spec = SimpleNamespace(
@@ -810,7 +815,7 @@ def test_dspark_drafts_from_the_base_sampler_without_the_kernel(monkeypatch):
         SpecWorkerBase, "sample_draft_tokens", lambda self, *args, **kwargs: sampled
     )
     monkeypatch.setattr(SpecWorkerBase, "_prepare_next_new_tokens", lambda self, *args: assembled)
-    worker = _worker(DSparkWorker)
+    worker = _worker(KimiK3DSparkWorker)
     spec = SimpleNamespace(wants_advanced_draft_sampling=False)
 
     assert worker.sample_draft_tokens(torch.zeros(NUM_GENS, K, VOCAB), spec, NUM_GENS) is sampled
