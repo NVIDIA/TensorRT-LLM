@@ -31,4 +31,5 @@ def attn_res_rmsnorm_fwd(
         output_rms_weight,
         rms_eps,
         output_rms_eps,
+        early_trigger=True,
     )

@@ -53,6 +53,7 @@ struct AttnResFwdParams
     int hiddenSize;                        // H
     float rmsEps;
     float outputRmsEps;
+    bool earlyTrigger = false;
 };
 
 //! Launches the fused attention-residual forward on the supplied stream.

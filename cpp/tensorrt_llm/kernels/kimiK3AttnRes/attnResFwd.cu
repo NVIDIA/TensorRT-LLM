@@ -1916,10 +1916,7 @@ static void launchAttnResDecodeRmsNorm(AttnResFwdParams const& params, cudaStrea
 
     auto const* layer_residual_add = FUSE_LAYER_ADD ? params.layerResidualAdd : nullptr;
     auto* updated_layer_residual = FUSE_LAYER_ADD ? params.updatedLayerResidual : nullptr;
-    // The dependent kernel launches (and streams its weights) while this one runs: it waits for
-    // this grid before reading the output.
-    constexpr bool early_trigger = true;
-    S1Handoff const handoff{early_trigger};
+    S1Handoff const handoff{params.earlyTrigger};
 
     if constexpr (N <= 4)
     {
