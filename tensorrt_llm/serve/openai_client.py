@@ -33,7 +33,7 @@ from typing import (
 
 import aiohttp
 import msgspec
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
@@ -90,6 +90,21 @@ def _metrics_phase(role: ServerRole) -> str:
     return "ctx" if role is ServerRole.CONTEXT else "gen"
 
 
+# The disagg server is a transparent relay: worker responses come from the
+# same trusted codebase, and a deployment may attach extra top-level fields to
+# them (orchestrator-side telemetry, token transports, ...). Validate the known
+# schema but keep unknown fields -- the protocol models are extra="forbid", so
+# validating worker output with them either 500s the request or silently strips
+# whatever the deployment attached. Strictness belongs at the request boundary,
+# not on the relay of our own workers' output.
+class RelayedCompletionResponse(CompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+class RelayedChatCompletionResponse(ChatCompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -100,13 +115,13 @@ class OpenAIClient(ABC):
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks, req_id
+                "v1/completions", request, RelayedCompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
                 "v1/chat/completions",
                 request,
-                ChatCompletionResponse,
+                RelayedChatCompletionResponse,
                 server,
                 hooks,
                 req_id,
@@ -321,10 +336,21 @@ class OpenAIHttpClient(OpenAIClient):
         for attempt in range(loop_max):
             if attempt > 0:
                 await self._router.renew_request(request, req_id=req_id)
-            # Regenerate disagg_request_id on retry to avoid ID collision on workers
+            # A context retry re-runs prefill, so it takes a fresh
+            # disagg_request_id: the worker may still hold the first attempt
+            # under the old one. A generation retry must keep its id. The
+            # context worker registered this request's KV send session under
+            # it when prefill finished; with a regenerated id the generation
+            # request asks for KV nobody holds and the context session waits
+            # for a requester that never comes, both until
+            # kv_transfer_timeout_ms.
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
-                if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
+                if (
+                    dp is not None
+                    and getattr(dp, "disagg_request_id", None) is not None
+                    and getattr(dp, "request_type", None) == "context_only"
+                ):
                     dp.disagg_request_id = await self._disagg_id_generator()
                     if hooks:
                         hooks.on_disagg_request_id(dp.disagg_request_id)
@@ -412,6 +438,19 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                # A 4xx from the worker is the request's own fault (malformed
+                # body, context length exceeded, ...) and will fail the same way
+                # every time, so retrying only burns another prefill attempt.
+                # It reaches this block only because the 4xx is re-raised above
+                # as an aiohttp.ClientResponseError -- a ClientError subclass --
+                # to carry the response body up; the retry budget here is meant
+                # for transport failures, not for server-side rejections.
+                if isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500:
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying, {e.status} is deterministic",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

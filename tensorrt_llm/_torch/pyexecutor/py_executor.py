@@ -127,6 +127,14 @@ if TYPE_CHECKING:
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
+# How long a drain=True control request waits on KV transfers that have left the
+# scheduler queues but are not yet pulled by the generation engine (see
+# _handle_control_request). Generous relative to a transfer, which is one RDMA of
+# a request's KV blocks, but finite: a lost transfer must not park a refit
+# forever. Override with TLLM_CONTROL_DRAIN_TRANSFER_TIMEOUT_S.
+_CONTROL_DRAIN_TRANSFER_TIMEOUT_S = float(
+    os.environ.get("TLLM_CONTROL_DRAIN_TRANSFER_TIMEOUT_S", "30"))
+
 
 class _ADPForwardIntent(IntEnum):
     # MAX reduction gives context precedence when ADP ranks have mixed work.
@@ -392,6 +400,16 @@ class PendingEncoderStep:
     future: Future[EncoderStepResult]
     result: Optional[EncoderStepResult] = None
 
+
+
+def _request_flag(request, name: str) -> bool:
+    """Read a request state predicate that is a nanobind read-only property on
+    the C++ ``LlmRequest`` (``is_generation_only_request`` etc.) but a plain
+    method on the Python wrapper; a missing attribute reads as False."""
+    value = getattr(request, name, False)
+    if callable(value):
+        value = value()
+    return bool(value)
 
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
@@ -965,6 +983,9 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        # Deadline for a drain=True control request that is only waiting on KV
+        # transfers; None whenever no such wait is in progress.
+        self._control_drain_transfer_deadline: Optional[float] = None
         self._active_control_id: Optional[str] = None
         self._sleep_wakeup_pending_aborts: Dict[str, str] = {}
         self._sleep_wakeup_pending_abort_lock = threading.Lock()
@@ -4784,11 +4805,24 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _num_inflight_kv_transfers(self) -> int:
+        """Context-only requests whose KV has not been pulled yet.
+
+        Zero on an aggregated engine (no transceiver, hence no transfer manager)
+        and on mocks that never build one, so callers can treat it as a plain
+        count without guarding.
+        """
+        manager = getattr(self, "async_transfer_manager", None)
+        if manager is None:
+            return 0
+        return len(manager.requests_in_transfer())
+
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
 
-        drain=True  (default): wait until ``active_requests`` and
-            ``waiting_queue`` are empty — exclusive engine access.
+        drain=True  (default): wait until ``active_requests``, ``waiting_queue``
+            and any KV transfers still in flight are done — exclusive engine
+            access with nothing holding KV built under the current weights.
         drain=False: as soon as a fetched batch contains a control request,
             fire the action first, then continue forwarding requests.
         """
@@ -4805,16 +4839,51 @@ class PyExecutor:
 
         pending = self.control_requests[0]
 
-        if pending.control_requires_drain and (
-                len(self.active_requests) != 0 or len(self.waiting_queue) != 0
-                or self._has_pending_connector_transfers()):
-            # drain=True: keep the sentinel parked until the engine drains.
-            return
+        # Under disaggregated serving a context-only request leaves both queues
+        # the moment its forward ends: start_transfer() frees its scheduler slot
+        # and parks it in AsyncTransferManager, keeping the KV blocks pinned
+        # until the generation engine pulls them. Draining only the two queues
+        # would therefore let a weight update land while that KV is still in
+        # flight, and the generation engine would decode weights-N KV under
+        # weights-N+1. Wait for the transfers as well.
+        #
+        # Bounded: a stuck or lost transfer must not park the control request
+        # forever -- a refit that never fires hangs the whole training loop,
+        # which is worse than the staleness this avoids. Past the deadline, warn
+        # and proceed.
+        transfers_in_flight = self._num_inflight_kv_transfers()
+        queues_busy = (len(self.active_requests) != 0
+                       or len(self.waiting_queue) != 0
+                       or self._has_pending_connector_transfers())
+        if pending.control_requires_drain and (queues_busy
+                                               or transfers_in_flight > 0):
+            if transfers_in_flight > 0 and not queues_busy:
+                deadline = getattr(self, "_control_drain_transfer_deadline",
+                                   None)
+                if deadline is None:
+                    deadline = time.time() + _CONTROL_DRAIN_TRANSFER_TIMEOUT_S
+                    self._control_drain_transfer_deadline = deadline
+                if time.time() < deadline:
+                    return
+                logger.warning(
+                    "[control_action] %d KV transfer(s) still in flight after "
+                    "%.0fs; firing the control request anyway. A generation "
+                    "engine may decode this KV under the updated weights.",
+                    transfers_in_flight,
+                    _CONTROL_DRAIN_TRANSFER_TIMEOUT_S,
+                )
+            else:
+                # Queues are still draining; restart the transfer deadline so it
+                # only measures time spent waiting on transfers alone.
+                self._control_drain_transfer_deadline = None
+                return
+        self._control_drain_transfer_deadline = None
 
         logger.debug(f"[control_action] firing control request "
                      f"drain={pending.control_requires_drain} "
                      f"active_requests={len(self.active_requests)} "
-                     f"waiting_queue={len(self.waiting_queue)}")
+                     f"waiting_queue={len(self.waiting_queue)} "
+                     f"kv_transfers_in_flight={transfers_in_flight}")
         # Quiesce the device before the action mutates GPU state. Under the
         # overlap scheduler a previous batch's forward/sample kernels may still
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
@@ -8832,6 +8901,112 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
+
+    # Request states in which the KV cache is owned by a disaggregated
+    # transfer rather than by the local scheduler.
+    _DISAGG_TRANSFER_BOUND_STATES = frozenset({
+        LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+        LlmRequestState.DISAGG_CONTEXT_COMPLETE,
+        LlmRequestState.DISAGG_GENERATION_INIT,
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    })
+
+    def _is_disagg_transfer_bound(self, request: LlmRequest) -> bool:
+        """True if ``request`` must not be terminated/paused by a KV recompute.
+
+        Blocks pinned by an asynchronous send (cache transceiver or KV
+        connector) are always bound. With a cache transceiver every
+        context-only request is treated as bound, deliberately broader than
+        necessary (a request still mid-prefill could be re-prefilled), so
+        that a context engine's recompute reduces to ``reset_prefix_cache``;
+        the cost is a few requests keeping old-weight KV, as with
+        ``recompute_kv=False``. Every generation-only request is bound as
+        well: pausing one would re-prefill its whole prompt on the decode
+        engine (the C++ ``pause`` path warns about exactly this), and under
+        load those paused requests are not rescheduled until the engine runs
+        dry, which stalls the client past its timeout. A generation-only
+        request therefore finishes its current turn on the cache it already
+        holds, as with ``recompute_kv=False``. Any other request in a
+        ``DISAGG_*`` transfer state is bound as a safety net; in practice
+        those states are only ever entered by context-only or
+        generation-only requests, so that branch is belt-and-braces.
+        """
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if (transfer_manager is not None and request.py_request_id
+                in transfer_manager.requests_in_transfer()):
+            return True
+        if getattr(self, "kv_cache_transceiver", None) is None:
+            return False
+        if _request_flag(request, "is_context_only_request"):
+            return True
+        if _request_flag(request, "is_generation_only_request"):
+            return True
+        return request.state in self._DISAGG_TRANSFER_BOUND_STATES
+
+    def recompute_active_requests(self) -> None:
+        """Discard live request caches so they are rebuilt with current weights.
+
+        This method is intended to run inside :meth:`control_action` after a
+        non-draining weight update. A prefix-cache reset alone is insufficient:
+        active requests still own KV and recurrent-state caches computed with
+        the previous weights, and completing those requests can register stale
+        blocks in the reuse pool after the reset.
+
+        Preserve already generated tokens by pausing each request. The normal
+        scheduler then treats those tokens as context and prefills them again
+        before decoding resumes.
+
+        Under PD disaggregation, context-only and generation-only requests
+        are left untouched (see :meth:`_is_disagg_transfer_bound`): a
+        context-only request that has finished its prefill still has to hand
+        its blocks to the cache transceiver (pausing it frees blocks the
+        transfer still references and the ctx executor loop dies in
+        ``_send_kv_async`` with ``unordered_map::at``), and a generation-only
+        request would have to re-prefill its whole prompt on the decode
+        engine, where it starves behind the running decodes. Both keep the
+        cache computed with the previous weights for the remainder of their
+        current turn, exactly as ``recompute_kv=False`` would treat every
+        request. The reuse-tree reset below drops the blocks released so far;
+        requests left untouched may still register their old-weight blocks
+        for reuse when they finish (inert on hybrid engines, whose release
+        path stores no attention blocks; a residual staleness hazard on
+        non-hybrid engines with block reuse). On a disaggregated engine the
+        recompute thus reduces to ``reset_prefix_cache``; aggregated engines
+        recompute every request as before.
+
+        Must run at a control-action boundary, with no in-flight batch left
+        on any rank, so that everything here is rank-local and issues no TP
+        collectives. Consuming an in-flight batch here instead would gather
+        on some attention-DP ranks only and deadlock the engine.
+        """
+        if self.dist.pp_size == 1 and self.previous_batch is not None:
+            raise RuntimeError(
+                "recompute_active_requests requires a quiescent executor (no "
+                "in-flight batch); call it from within control_action(), "
+                "which retires the in-flight batch on every rank first.")
+
+        requests_to_recompute = []
+        transfer_bound = []
+        for request in self.active_requests:
+            if self._is_disagg_transfer_bound(request):
+                transfer_bound.append(request)
+            else:
+                requests_to_recompute.append(request)
+        if transfer_bound:
+            logger.info(
+                "recompute_active_requests: leaving "
+                f"{len(transfer_bound)} disaggregated transfer-bound request(s) "
+                "untouched (their KV cache keeps the previous weights): "
+                f"{[r.py_request_id for r in transfer_bound[:8]]}")
+        self._terminate_requests(requests_to_recompute)
+        self._pause_requests(requests_to_recompute)
+
+        # free_resources() may register old-weight blocks for reuse. Clear the
+        # reuse tree after the recomputed requests have released their caches.
+        # Requests left untouched (disaggregated ctx-only / gen-only) may still
+        # register blocks when they finish later, see _is_disagg_transfer_bound.
+        self.reset_prefix_cache()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,
