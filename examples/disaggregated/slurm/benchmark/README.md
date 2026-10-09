@@ -13,9 +13,8 @@ The benchmarking process is orchestrated through a combination of Python scripts
    - `start_worker.sh`: Initializes context and generation workers
    - `start_server.sh`: Starts the disaggregated serving coordinator
    - `wait_server.sh`: Waits for server readiness before benchmarking
-   - `run_benchmark.sh` / `run_benchmark_nv_sa.sh`: Execute benchmark workloads
-   - `accuracy_eval.sh`: Runs accuracy evaluation using lm_eval
-   - `gen_server_config.py`: Generates server configuration from worker settings
+   - `run_benchmark.sh` / `run_benchmark_nv_sa.sh` / `run_benchmark_aiperf.sh`: Execute benchmark workloads
+   - `submit.py` invokes `lm_eval` directly when accuracy evaluation is enabled (no separate `accuracy_eval.sh`)
 
 ## Configuration (config.yaml)
 
@@ -220,12 +219,15 @@ Enable accuracy evaluation using the lm_eval framework:
 ```yaml
 accuracy:
   enable_accuracy_test: true
-  model: "local-completions"
-  tasks: "gsm8k,hellaswag,mmlu"  # Comma-separated task list
-  model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096"
+  tasks:
+    gsm8k:
+      model: "local-completions"
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
 ```
 
-Accuracy results will be saved in `<log_dir>/accuracy_eval/` after benchmark completion.
+`submit.py` launches one `lm_eval` command per task. Accuracy results are saved under `<log_dir>/accuracy_eval_<task>/` after benchmark completion.
 
 #### 2. NVIDIA Nsight Systems Profiling
 
