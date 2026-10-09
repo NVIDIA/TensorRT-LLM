@@ -173,6 +173,41 @@ def build_kv_cache_compression_tests(request, build_type):
     )
 
 
+@pytest.fixture(scope="session")
+def build_fmha_head104_tests(request: pytest.FixtureRequest,
+                             build_type: str) -> None:
+    """Build the packed-QKV numerical regression and its native library."""
+    cuda_arch = f"{request.param}-real"
+    _logger.info(f"Using CUDA arch: {cuda_arch}")
+    build_trt_llm(
+        build_type=build_type,
+        cuda_architectures=cuda_arch,
+        job_count=12,
+        use_ccache=True,
+        generator="Ninja",
+        nixl_root="/opt/nvidia/nvda_nixl",
+        skip_building_wheel=True,
+        configure_only=True,
+    )
+    build_dir = _cpp.find_build_dir(build_type)
+    _cpp.run_command(
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--config",
+            build_type,
+            "--parallel",
+            "12",
+            "--target",
+            "fmhaHead104Test",
+        ],
+        cwd=build_dir,
+        env=_os.environ,
+        timeout=2700,
+    )
+
+
 @pytest.fixture(scope="function", autouse=True)
 def keep_log_files(build_dir):
     """Backup previous cpp test results when run multiple ctest invocations."""

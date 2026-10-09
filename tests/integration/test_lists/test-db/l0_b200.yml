@@ -16,6 +16,7 @@ l0_b200:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[100]
+  - cpp/test_unit_tests.py::test_fmha_head104_unit_tests[100]
 - condition:
     ranges:
       system_gpu_count:
