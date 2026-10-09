@@ -3033,8 +3033,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 f"attention_backend='CUTEDSL' cannot serve this shape: batch={batch}, "
                 f"block_size={block_size}, page_size={page_size}, "
                 f"num_heads={self._num_heads}, dtype={dtype}. Use "
-                f"attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
-                f"to a divisor of 128 other than 1."
+                f"attention_backend='TRTLLM'."
             )
         self._cute_dsl_checked_shape = key
 
