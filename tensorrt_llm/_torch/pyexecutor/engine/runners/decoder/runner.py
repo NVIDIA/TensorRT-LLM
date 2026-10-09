@@ -115,6 +115,7 @@ from ..common import (
 )
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
+from .inputs import DecoderInputBuffers
 from .speculative import (
     create_spec_metadata,
     get_spec_managers,
@@ -310,8 +311,8 @@ class DecoderRunner(ScheduledModelRunner):
         self.attn_metadata = None
         self.spec_metadata = None
 
-        self.cache_indirection_attention = None
-        self._allocate_decoder_buffers()
+        self._buffers = DecoderInputBuffers()
+        self._buffers.allocate(self._config, self.use_beam_search)
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
@@ -374,60 +375,6 @@ class DecoderRunner(ScheduledModelRunner):
             attn_backend=self._config.attention_backend,
             cuda_graph_manager=cuda_graph_manager,
         )
-
-    def _allocate_decoder_buffers(self) -> None:
-        """Allocate the persistent buffers read by engine decoder execution.
-
-        CUDA graphs record these addresses, so they are allocated once here and
-        only ever sliced or written in place.
-        """
-        if self._config.is_spec_decode:
-            max_num_draft_tokens = self._config.max_draft_loop_tokens * self._config.max_batch_size
-            self.draft_tokens_cuda = torch.empty(
-                (max_num_draft_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.gather_ids_cuda = torch.empty(
-                (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.num_accepted_draft_tokens_cuda = torch.empty(
-                (self._config.max_batch_size,), dtype=torch.int, device="cuda"
-            )
-            self.previous_pos_indices_cuda = torch.empty(
-                (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.previous_pos_id_offsets_cuda = torch.zeros(
-                (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-            )
-            self.previous_kv_lens_offsets_cuda = torch.zeros(
-                (self._config.max_batch_size,), dtype=torch.int, device="cuda"
-            )
-        self.previous_batch_indices_cuda = torch.empty(
-            (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-        )
-        self.input_ids_cuda = torch.empty(
-            (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-        )
-        self.position_ids_cuda = torch.empty(
-            (self._config.max_num_tokens,), dtype=torch.int, device="cuda"
-        )
-        # Host counter of the steady-state generation prepare cache.
-        self._steady_gen_positions_pinned = torch.empty(
-            (self._config.max_num_tokens,), dtype=torch.int, pin_memory=prefer_pinned()
-        )
-        if self._config.use_mrope:
-            self.mrope_position_ids_cuda = torch.empty(
-                (3, 1, self._config.max_num_tokens), dtype=torch.int, device="cuda"
-            )
-        if self.use_beam_search:
-            self.cache_indirection_attention = torch.zeros(
-                (
-                    self._config.max_batch_size,
-                    self._config.max_beam_width,
-                    self._config.max_seq_len,
-                ),
-                device="cuda",
-                dtype=torch.int32,
-            )
 
     def _init_decoder_state(self) -> None:
         """Initialize the mutable state read only by engine decoder execution."""
@@ -2686,7 +2633,7 @@ class DecoderRunner(ScheduledModelRunner):
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
             mapping=self.mapping,
-            cache_indirection=self.cache_indirection_attention
+            cache_indirection=self._buffers.cache_indirection_attention
             if self._config.attention_backend.Metadata is TrtllmAttentionMetadata
             else None,
             kv_cache_manager=kv_cache_manager,
@@ -2752,12 +2699,12 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
                 if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] += (
-                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
                 else:
-                    inputs["position_ids"][0, num_ctx_tokens:] += self.previous_pos_id_offsets_cuda[
-                        :previous_batch_tokens
-                    ]
+                    inputs["position_ids"][0, num_ctx_tokens:] += (
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                    )
 
                 if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
                     if (
@@ -2768,17 +2715,17 @@ class DecoderRunner(ScheduledModelRunner):
                         # requests when extend_ctx returns True.
                         inputs["attn_metadata"].kv_lens_cuda[
                             num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] += self.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
+                        ] += self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
                     else:
                         inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] += (
-                            self.previous_kv_lens_offsets_cuda[:num_gen_requests]
+                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
                         )
                     inputs["attn_metadata"].on_update_kv_lens()
                 # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
                 # correction without coupling the engine to its metadata type.
                 elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):
                     inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
-                        self.previous_kv_lens_offsets_cuda,
+                        self._buffers.previous_kv_lens_offsets_cuda,
                         num_gen_requests,
                         self.get_runtime_tokens_per_gen_step(runtime_draft_len),
                         num_chunked_contexts=num_chunked_ctx_requests,
@@ -2804,7 +2751,7 @@ class DecoderRunner(ScheduledModelRunner):
                     # generic previous_kv_lens_offsets adjustment above,
                     # which is not ownership-aware.
                     md.helix_position_offsets[:helix_gen_tokens] += (
-                        self.previous_pos_id_offsets_cuda[:helix_gen_tokens]
+                        self._buffers.previous_pos_id_offsets_cuda[:helix_gen_tokens]
                     )
                 md.recompute_helix_spec_buffers(
                     helix_gen_tokens, self.get_runtime_tokens_per_gen_step(runtime_draft_len)
@@ -2834,12 +2781,12 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_batch_tokens = inputs["input_ids"].shape[0] - num_ctx_tokens
                 if inputs["position_ids"].ndim == 3:  # mrope: [3, 1, N]
                     inputs["position_ids"][:, :, num_ctx_tokens:] -= (
-                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
                 else:
-                    inputs["position_ids"][0, num_ctx_tokens:] -= self.previous_pos_id_offsets_cuda[
-                        :previous_batch_tokens
-                    ]
+                    inputs["position_ids"][0, num_ctx_tokens:] -= (
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                    )
 
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs["attn_metadata"], TrtllmAttentionMetadata):
@@ -2849,16 +2796,16 @@ class DecoderRunner(ScheduledModelRunner):
                     ):
                         inputs["attn_metadata"].kv_lens_cuda[
                             num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] -= self.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
+                        ] -= self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
                     else:
                         inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] -= (
-                            self.previous_kv_lens_offsets_cuda[:num_gen_requests]
+                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
                         )
                 # Restore the FlashInfer-specific logical KV lengths through the same optional hook
                 # used by `_preprocess_inputs`.
                 elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):
                     inputs["attn_metadata"].apply_spec_decode_kv_lens_offsets(
-                        self.previous_kv_lens_offsets_cuda,
+                        self._buffers.previous_kv_lens_offsets_cuda,
                         num_gen_requests,
                         self.get_runtime_tokens_per_gen_step(runtime_draft_len),
                         num_chunked_contexts=num_chunked_ctx_requests,
@@ -2874,7 +2821,7 @@ class DecoderRunner(ScheduledModelRunner):
                     # kv_lens) need no reversal: every consumer buffer is
                     # rewritten from host state at the next step's prepare.
                     inputs["attn_metadata"].helix_position_offsets[:previous_batch_tokens] -= (
-                        self.previous_pos_id_offsets_cuda[:previous_batch_tokens]
+                        self._buffers.previous_pos_id_offsets_cuda[:previous_batch_tokens]
                     )
 
     def _get_all_rank_num_tokens_and_spec_counts(
@@ -3070,7 +3017,7 @@ class DecoderRunner(ScheduledModelRunner):
         # KVCacheManager._stage_block_offsets_for_copy). The pinned buffer is
         # host-side bookkeeping only.
         use_mrope = cache["use_mrope"]
-        positions = self._steady_gen_positions_pinned[:num_requests]
+        positions = self._buffers.steady_gen_positions_pinned[:num_requests]
         positions.add_(1)
         if use_mrope:
             # Text-only batch on an mrope model: the recording pass broadcast
@@ -3078,20 +3025,20 @@ class DecoderRunner(ScheduledModelRunner):
             # which is what the model (and any captured CUDA graph) reads, so
             # advance it in place. position_ids_cuda is reseeded by the next
             # full pass.
-            self.mrope_position_ids_cuda[:, :, :num_requests].add_(1)
+            self._buffers.mrope_position_ids_cuda[:, :, :num_requests].add_(1)
         else:
-            self.position_ids_cuda[:num_requests].add_(1)
+            self._buffers.position_ids_cuda[:num_requests].add_(1)
         num_cached_tokens_per_seq = positions.tolist()
 
         # Gather this step's input tokens from the previous iteration's device
         # sample buffer; the seq-slot indices in previous_batch_indices_cuda
         # are unchanged since the last full pass.
-        previous_slots = self.previous_batch_indices_cuda[:num_requests]
+        previous_slots = self._buffers.previous_batch_indices_cuda[:num_requests]
         torch.index_select(
             new_tensors_device.new_tokens[0, :, : self._config.max_beam_width],
             0,
             previous_slots,
-            out=self.input_ids_cuda[: num_requests * self._config.max_beam_width].view(
+            out=self._buffers.input_ids_cuda[: num_requests * self._config.max_beam_width].view(
                 num_requests, self._config.max_beam_width
             ),
         )
@@ -3137,13 +3084,13 @@ class DecoderRunner(ScheduledModelRunner):
         )
         virtual_num_tokens = num_requests
         if attn_metadata.padded_num_tokens is not None:
-            self.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
+            self._buffers.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
             # Zero-fill the padding tail of whichever position layout the
             # model consumes, matching the full pass.
             if use_mrope:
-                self.mrope_position_ids_cuda[:, :, num_requests:padded_num_tokens].fill_(0)
+                self._buffers.mrope_position_ids_cuda[:, :, num_requests:padded_num_tokens].fill_(0)
             else:
-                self.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
+                self._buffers.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
 
         self.iter_states["num_ctx_requests"] = 0
@@ -3154,12 +3101,12 @@ class DecoderRunner(ScheduledModelRunner):
             self._record_cached_kv_tokens_per_req(num_cached_tokens_per_seq)
 
         if use_mrope:
-            final_position_ids = self.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
+            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
         else:
-            final_position_ids = self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
+            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
         inputs = {
             "attn_metadata": attn_metadata,
-            "input_ids": self.input_ids_cuda[:virtual_num_tokens],
+            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
             "position_ids": final_position_ids,
             "inputs_embeds": None,
             "multimodal_params": [],
@@ -3922,7 +3869,7 @@ class DecoderRunner(ScheduledModelRunner):
             previous_batch_indices_host = torch.tensor(
                 previous_batch_indices, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            previous_slots = self.previous_batch_indices_cuda[:previous_batch_len]
+            previous_slots = self._buffers.previous_batch_indices_cuda[:previous_batch_len]
             previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
             return previous_slots
 
@@ -3939,22 +3886,24 @@ class DecoderRunner(ScheduledModelRunner):
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
             input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         if num_draft_tokens > 0:
             draft_tokens = torch.tensor(draft_tokens, dtype=torch.int, pin_memory=prefer_pinned())
-            self.draft_tokens_cuda[: len(draft_tokens)].copy_(draft_tokens, non_blocking=True)
+            self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
+                draft_tokens, non_blocking=True
+            )
         if self._config.is_spec_decode and len(num_accepted_draft_tokens) > 0:
             num_accepted_draft_tokens = torch.tensor(
                 num_accepted_draft_tokens, dtype=torch.int, pin_memory=prefer_pinned()
             )
-            self.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
+            self._buffers.num_accepted_draft_tokens_cuda[: len(num_accepted_draft_tokens)].copy_(
                 num_accepted_draft_tokens, non_blocking=True
             )
         if next_draft_tokens_device is not None:
             # Initialize these two values to zeros
-            self.previous_pos_id_offsets_cuda *= 0
-            self.previous_kv_lens_offsets_cuda *= 0
+            self._buffers.previous_pos_id_offsets_cuda *= 0
+            self._buffers.previous_kv_lens_offsets_cuda *= 0
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
 
@@ -3965,14 +3914,14 @@ class DecoderRunner(ScheduledModelRunner):
                 new_tokens = new_tokens_device.transpose(0, 1)[
                     previous_slots, :runtime_tokens_per_gen_step
                 ].flatten()
-                self.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].copy_(
+                self._buffers.input_ids_cuda[num_tokens : num_tokens + previous_batch_tokens].copy_(
                     new_tokens, non_blocking=True
                 )
 
                 # previous draft tokens
                 previous_batch_draft_tokens = previous_batch_len * runtime_draft_token_buffer_width
                 if runtime_draft_token_buffer_width > 0:
-                    self.draft_tokens_cuda[
+                    self._buffers.draft_tokens_cuda[
                         num_draft_tokens : num_draft_tokens + previous_batch_draft_tokens
                     ].copy_(
                         next_draft_tokens_device[
@@ -3985,7 +3934,7 @@ class DecoderRunner(ScheduledModelRunner):
                 previous_pos_indices_host = torch.tensor(
                     previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
                 )
-                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
                     previous_pos_indices_host, non_blocking=True
                 )
 
@@ -3996,8 +3945,8 @@ class DecoderRunner(ScheduledModelRunner):
                 #      first step in the generation server of disaggregated serving.
                 #   2) 'requests that already have previous batch': previous iteration's requests.
                 #   3) 'dummy requests': pad dummy requests for CUDA graph or attention dp.
-                # Therefore, both of self.previous_pos_id_offsets_cuda and
-                # self.previous_kv_lens_offsets_cuda are also 3 segments.
+                # Therefore, both of self._buffers.previous_pos_id_offsets_cuda and
+                # self._buffers.previous_kv_lens_offsets_cuda are also 3 segments.
                 #   For 1) 'requests that do not have previous batch': disable overlap scheduler or
                 #          the first step in the generation server of disaggregated serving.
                 #       Set these requests' previous_pos_id_offsets and previous_kv_lens_offsets to
@@ -4010,16 +3959,18 @@ class DecoderRunner(ScheduledModelRunner):
                 #       Already set to '0' during initialization.
 
                 num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
-                self.previous_pos_id_offsets_cuda[
+                self._buffers.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len)
                     * runtime_tokens_per_gen_step : num_extend_reqeust_wo_dummy
                     * runtime_tokens_per_gen_step
                 ].copy_(
-                    new_tokens_lens_device[self.previous_pos_indices_cuda[0:previous_batch_tokens]],
+                    new_tokens_lens_device[
+                        self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens]
+                    ],
                     non_blocking=True,
                 )
 
-                self.previous_kv_lens_offsets_cuda[
+                self._buffers.previous_kv_lens_offsets_cuda[
                     num_extend_reqeust_wo_dummy - previous_batch_len : num_extend_reqeust_wo_dummy
                 ].copy_(kv_len_offsets_device[previous_slots], non_blocking=True)
 
@@ -4029,7 +3980,7 @@ class DecoderRunner(ScheduledModelRunner):
             new_tokens = new_tokens_device[
                 : max_draft_len + 1, seq_slots_device, : self._config.max_beam_width
             ]
-            self.input_ids_cuda[
+            self._buffers.input_ids_cuda[
                 num_tokens : num_tokens + previous_batch_len * self._config.max_beam_width
             ].copy_(new_tokens.flatten(), non_blocking=True)
 
@@ -4042,8 +3993,8 @@ class DecoderRunner(ScheduledModelRunner):
             # so we need to set the previous_pos_id_offsets and previous_kv_lens_offsets to zeros
             # to skip the value changes in _preprocess_inputs. Otherwise, there will be illegal memory access
             # when writing key/values to the KV cache.
-            self.previous_pos_id_offsets_cuda *= 0
-            self.previous_kv_lens_offsets_cuda *= 0
+            self._buffers.previous_pos_id_offsets_cuda *= 0
+            self._buffers.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = apply_position_id_offset(position_ids, model=self.model)
         host_position_ids = torch.tensor(position_ids, dtype=torch.int, pin_memory=prefer_pinned())
@@ -4056,10 +4007,12 @@ class DecoderRunner(ScheduledModelRunner):
             # data. Seed the full (3,1,N) buffer from scalar position_ids
             # (text-only tokens get the same value on all 3 axes), then
             # overwrite only the multimodal spans with their real MRoPE coords.
-            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids, non_blocking=True)
+            self._buffers.position_ids_cuda[:total_num_tokens].copy_(
+                host_position_ids, non_blocking=True
+            )
             # Broadcast [N] to [3,1,N]: default for text-only tokens.
-            self.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
-                self.position_ids_cuda[:total_num_tokens].view(1, 1, -1).expand(3, 1, -1),
+            self._buffers.mrope_position_ids_cuda[:, :, :total_num_tokens].copy_(
+                self._buffers.position_ids_cuda[:total_num_tokens].view(1, 1, -1).expand(3, 1, -1),
                 non_blocking=True,
             )
             # Overwrite multimodal spans with per-axis MRoPE positions.
@@ -4080,16 +4033,18 @@ class DecoderRunner(ScheduledModelRunner):
                 segment = segment.contiguous()
                 if segment.device.type == "cpu":
                     segment = maybe_pin_memory(segment)
-                self.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
+                self._buffers.mrope_position_ids_cuda[:, :, start_idx:end_idx].copy_(
                     segment[:, :, : end_idx - start_idx], non_blocking=True
                 )
-            final_position_ids = self.mrope_position_ids_cuda[:, :, :total_num_tokens]
+            final_position_ids = self._buffers.mrope_position_ids_cuda[:, :, :total_num_tokens]
         else:
-            self.position_ids_cuda[:total_num_tokens].copy_(host_position_ids, non_blocking=True)
-            final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
+            self._buffers.position_ids_cuda[:total_num_tokens].copy_(
+                host_position_ids, non_blocking=True
+            )
+            final_position_ids = self._buffers.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         if enable_spec_decode:
-            self.gather_ids_cuda[: len(gather_ids)].copy_(
+            self._buffers.gather_ids_cuda[: len(gather_ids)].copy_(
                 torch.tensor(gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
                 non_blocking=True,
             )
@@ -4127,7 +4082,7 @@ class DecoderRunner(ScheduledModelRunner):
                 gen_request_seq_slots_tensor = torch.tensor(
                     gen_request_seq_slots, dtype=torch.long, pin_memory=prefer_pinned()
                 ).to(device="cuda", non_blocking=True)
-                self.cache_indirection_attention[:num_generation_requests].copy_(
+                self._buffers.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor]
                 )
             if cache_indirection_buffer is not None or is_dummy:
@@ -4279,18 +4234,24 @@ class DecoderRunner(ScheduledModelRunner):
 
         virtual_num_tokens = total_num_tokens
         if attn_metadata.padded_num_tokens is not None:
-            self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+            self._buffers.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
             # Match the rank of the unpadded branch: MRoPE models always use
             # the (3,1,N) layout (see the seeding block above), so the padded
             # view must stay 3D as well to keep torch.compile guards stable.
             if self._config.use_mrope:
                 # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
-                self.mrope_position_ids_cuda[:, :, total_num_tokens:padded_num_tokens].fill_(0)
-                final_position_ids = self.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
+                self._buffers.mrope_position_ids_cuda[
+                    :, :, total_num_tokens:padded_num_tokens
+                ].fill_(0)
+                final_position_ids = self._buffers.mrope_position_ids_cuda[
+                    :, :, :virtual_num_tokens
+                ]
             else:
-                self.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-                final_position_ids = self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
+                self._buffers.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+                final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(
+                    0
+                )
 
         if self._config.enable_attention_dp:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
@@ -4298,7 +4259,7 @@ class DecoderRunner(ScheduledModelRunner):
         # Prepare inputs
         inputs = {
             "attn_metadata": attn_metadata,
-            "input_ids": self.input_ids_cuda[:virtual_num_tokens],
+            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
             "position_ids": final_position_ids,
             "inputs_embeds": None,
             "multimodal_params": multimodal_params_list,
@@ -4328,13 +4289,13 @@ class DecoderRunner(ScheduledModelRunner):
 
         if spec_metadata is not None:
             total_draft_lens = sum(draft_lens)
-            spec_metadata.draft_tokens = self.draft_tokens_cuda[:total_draft_lens]
+            spec_metadata.draft_tokens = self._buffers.draft_tokens_cuda[:total_draft_lens]
             spec_metadata.request_ids = request_ids
-            spec_metadata.gather_ids = self.gather_ids_cuda[: len(gather_ids)]
+            spec_metadata.gather_ids = self._buffers.gather_ids_cuda[: len(gather_ids)]
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host_position_ids
-            spec_metadata.num_accepted_draft_tokens = self.num_accepted_draft_tokens_cuda[
+            spec_metadata.num_accepted_draft_tokens = self._buffers.num_accepted_draft_tokens_cuda[
                 : len(num_accepted_draft_tokens)
             ]
             if context_prompt_lookahead is not None:
@@ -4422,7 +4383,7 @@ class DecoderRunner(ScheduledModelRunner):
                 and get_position_id_offset(self.model) == 0
                 and not getattr(kv_cache_manager, "kv_compression_manages_history", False)
             ):
-                self._steady_gen_positions_pinned[:_n_gen].copy_(
+                self._buffers.steady_gen_positions_pinned[:_n_gen].copy_(
                     torch.as_tensor(num_cached_tokens_snapshot, dtype=torch.int)
                 )
                 self._steady_gen_cache = {
@@ -4433,7 +4394,9 @@ class DecoderRunner(ScheduledModelRunner):
                     "use_mrope": _use_mrope,
                 }
 
-        gather_ids_device = self.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
+        gather_ids_device = (
+            self._buffers.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
+        )
         return inputs, gather_ids_device, runtime_draft_len
 
     @nvtx_range("_prepare_inputs")
@@ -4657,7 +4620,7 @@ class DecoderRunner(ScheduledModelRunner):
                     enable_spec_decode=enable_spec_decode,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
-                    draft_tokens_cuda=self.draft_tokens_cuda
+                    draft_tokens_cuda=self._buffers.draft_tokens_cuda
                     if self._config.is_spec_decode
                     else None,
                     new_tensors_device=new_tensors_device,
@@ -4783,7 +4746,7 @@ class DecoderRunner(ScheduledModelRunner):
                         and not self._config.disable_overlap_scheduler
                         and attn_metadata.kv_cache_manager is not None
                     ):
-                        position_id_offsets = self.previous_pos_id_offsets_cuda
+                        position_id_offsets = self._buffers.previous_pos_id_offsets_cuda
                     needs_capture = self.cuda_graph_runner.needs_capture(key)
                     if needs_capture:
 

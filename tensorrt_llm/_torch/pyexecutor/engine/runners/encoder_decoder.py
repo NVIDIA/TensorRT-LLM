@@ -1337,11 +1337,11 @@ class EncoderDecoderRunner(DecoderRunner):
         num_generation_requests = scheduled_requests.num_generation_requests
         generation_request_ids = request_ids[num_context_requests:]
         if num_context_tokens:
-            self.input_ids_cuda[:num_context_tokens].copy_(
+            self._buffers.input_ids_cuda[:num_context_tokens].copy_(
                 buffers["input_ids"][:num_context_tokens], non_blocking=True
             )
         if num_previous_batch_requests:
-            previous_slots = self.previous_batch_indices_cuda[:num_previous_batch_requests]
+            previous_slots = self._buffers.previous_batch_indices_cuda[:num_previous_batch_requests]
             staged_request_ids = generation_request_ids[:num_previous_batch_requests]
             # Sequence slots are stable for a request's lifetime, so the
             # device indices remain valid while this ordered batch does.
@@ -1357,18 +1357,18 @@ class EncoderDecoderRunner(DecoderRunner):
                 new_tokens_device[0, :, 0],
                 dim=0,
                 index=previous_slots,
-                out=self.input_ids_cuda[generation_begin:generation_end],
+                out=self._buffers.input_ids_cuda[generation_begin:generation_end],
             )
         else:
             self._encoder_decoder_staged_request_ids = None
         dummy_begin = num_context_tokens + num_previous_batch_requests
         if dummy_begin < total_num_tokens:
-            self.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
+            self._buffers.input_ids_cuda[dummy_begin:total_num_tokens].fill_(0)
 
-        self.position_ids_cuda[:total_num_tokens].copy_(
+        self._buffers.position_ids_cuda[:total_num_tokens].copy_(
             buffers["position_ids"][:total_num_tokens], non_blocking=True
         )
-        final_position_ids = self.position_ids_cuda[:total_num_tokens].unsqueeze(0)
+        final_position_ids = self._buffers.position_ids_cuda[:total_num_tokens].unsqueeze(0)
 
         sequence_lengths = buffers["sequence_lengths"][:num_sequences]
         attn_metadata._seq_lens = sequence_lengths
@@ -1446,14 +1446,14 @@ class EncoderDecoderRunner(DecoderRunner):
 
         virtual_num_tokens = total_num_tokens
         if attn_metadata.padded_num_tokens is not None:
-            self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
-            self.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+            self._buffers.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
+            self._buffers.position_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
-            final_position_ids = self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
+            final_position_ids = self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
 
         inputs = {
             "attn_metadata": attn_metadata,
-            "input_ids": self.input_ids_cuda[:virtual_num_tokens],
+            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
             "position_ids": final_position_ids,
             "inputs_embeds": None,
             "multimodal_params": [],

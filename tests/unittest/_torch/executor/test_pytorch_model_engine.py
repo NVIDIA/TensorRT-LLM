@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import \
+    DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import (
     _get_context_prompt_lookahead_token, _make_single_token_context_graph_batch)
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
@@ -1908,9 +1910,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             max_num_tokens=64,
             max_beam_width=2,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
-        decoder_only = ("input_ids_cuda", "position_ids_cuda",
-                        "previous_batch_indices_cuda",
-                        "cache_indirection_attention")
         for is_generation in (True, False):
             with self.subTest(is_generation=is_generation):
                 engine = DummyModelEngine(llm_args,
@@ -1922,13 +1921,15 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                     self.assertIsInstance(runner, DecoderRunner)
                     self.assertIsNotNone(engine.cuda_graph_runner)
                     self.assertEqual(
-                        tuple(runner.cache_indirection_attention.shape),
+                        tuple(
+                            runner._buffers.cache_indirection_attention.shape),
                         (4, 2, engine.max_seq_len))
                 else:
                     self.assertIsInstance(runner, PoolingRunner)
                     self.assertIsNone(engine.cuda_graph_runner)
-                for name in decoder_only:
-                    self.assertEqual(hasattr(runner, name), is_generation, name)
+                self.assertEqual(
+                    isinstance(runner._buffers, DecoderInputBuffers),
+                    is_generation)
 
     def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
         for mm_encoder_only, runner_name in ((False, "PoolingRunner"),
@@ -2087,11 +2088,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(
             attn_metadata.kv_cache_params.num_cached_tokens_per_seq, [3, 5])
         self.assertEqual(
-            model_engine._runner.previous_batch_indices_cuda[:1].cpu().tolist(),
-            [1])
+            model_engine._runner._buffers.previous_batch_indices_cuda[:1].cpu().
+            tolist(), [1])
         self.assertEqual(
-            model_engine._runner.previous_pos_id_offsets_cuda[:2].cpu().tolist(
-            ), [0, 1])
+            model_engine._runner._buffers.previous_pos_id_offsets_cuda[:2].cpu(
+            ).tolist(), [0, 1])
         self.assertEqual(attn_metadata.num_contexts, 0)
         self.assertEqual(runtime_draft_len, 0)
         self.assertEqual(spec_metadata.request_ids,
@@ -2642,13 +2643,11 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         max_num_tokens = 512
         model_engine._runner._config = replace(model_engine._runner._config,
                                                max_num_tokens=max_num_tokens)
-        model_engine._runner.input_ids_cuda = torch.zeros(max_num_tokens,
-                                                          dtype=torch.int32,
-                                                          device='cuda')
-        model_engine._runner.position_ids_cuda = torch.zeros(max_num_tokens,
-                                                             dtype=torch.int32,
-                                                             device='cuda')
-        model_engine._runner.previous_batch_indices_cuda = torch.zeros(
+        model_engine._runner._buffers.input_ids_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+        model_engine._runner._buffers.position_ids_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+        model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
             max_num_tokens, dtype=torch.int32, device='cuda')
 
         result, _, _ = model_engine._runner._prepare_tp_inputs(
@@ -2723,15 +2722,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         model_engine._runner._config = replace(model_engine._runner._config,
                                                max_num_tokens=max_num_tokens)
-        model_engine._runner.input_ids_cuda = torch.zeros(max_num_tokens,
-                                                          dtype=torch.int32,
-                                                          device='cuda')
-        model_engine._runner.position_ids_cuda = torch.zeros(max_num_tokens,
-                                                             dtype=torch.int32,
-                                                             device='cuda')
-        model_engine._runner.mrope_position_ids_cuda = torch.zeros(
+        model_engine._runner._buffers.input_ids_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+        model_engine._runner._buffers.position_ids_cuda = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device='cuda')
+        model_engine._runner._buffers.mrope_position_ids_cuda = torch.zeros(
             (3, 1, max_num_tokens), dtype=torch.int32, device='cuda')
-        model_engine._runner.previous_batch_indices_cuda = torch.zeros(
+        model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
             max_num_tokens, dtype=torch.int32, device='cuda')
         return model_engine, kv_cache_manager, attn_metadata
 
