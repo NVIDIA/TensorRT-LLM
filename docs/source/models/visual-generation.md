@@ -315,8 +315,9 @@ For models whose references change the compiled shape — a reference image is e
 | Field | Type | Meaning |
 |---|---|---|
 | `images` | list of `(height, width)` | One image reference per entry. |
-| `videos` | list of `(height, width, num_frames)` | One video reference per entry. |
+| `videos` | list of video specs | One video reference per entry: `size: (height, width)`, `num_frames`, optional `fps` (the rate the media carries, default the model's own clock — it is resampled, which changes the compiled shape) and optional `audio_seconds` (soundtrack duration). |
 | `audio` | list of float | One audio reference per entry, duration in seconds. |
+| `order` | list of str | Optional cross-modality order as `image:N` / `video:N` / `audio:N` entries (zero-based per modality), for models where reference order changes the compiled shape (MiniMax-H3 ref2va); defaults to images, then videos, then audio. |
 
 Warmup synthesizes dummy references of these sizes and runs them through the same preprocessing as real requests, so warmed shapes match request shapes exactly. Per-modality counts are validated against the model's accepted reference slots (e.g. MiniMax-H3 ref2va accepts at most 9 images, 3 videos and 3 audio references); invalid variants are skipped with a warning.
 
@@ -337,12 +338,16 @@ compilation_config:
 compilation_config:
   reference_variants:
     - images: [[768, 1344]]                   # one image reference
-    - images: [[1024, 1024]]                  # image + video + audio
-      videos: [[480, 832, 49]]
-      audio: [5.0]
+    - images: [[1024, 1024]]                  # image + video (+soundtrack), video first
+      videos:
+        - size: [480, 832]
+          num_frames: 49
+          fps: 30.0
+          audio_seconds: 2.0
+      order: ["video:0", "image:0"]
 ```
 
-Only the configured variants are warmed: a request whose reference composition matches no warmed variant still compiles on first use, and the executor logs the un-warmed shape.
+Only the resolved variants are warmed: a request whose reference composition matches no warmed variant still compiles on first use, and the executor logs the un-warmed shape.
 
 ### Step Caching
 

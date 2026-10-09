@@ -10,7 +10,12 @@ import pytest
 from pydantic import ValidationError
 
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
-from tensorrt_llm.visual_gen.args import CompilationConfig, ReferenceWarmupVariant, VisualGenArgs
+from tensorrt_llm.visual_gen.args import (
+    CompilationConfig,
+    ReferenceVideoSpec,
+    ReferenceWarmupVariant,
+    VisualGenArgs,
+)
 
 
 class TestCompilationConfig:
@@ -343,7 +348,9 @@ class TestWarmupExecution:
         assert not pipe.validate_reference_variant(
             ReferenceWarmupVariant(images=[(64, 64), (64, 64)])
         )
-        assert not pipe.validate_reference_variant(ReferenceWarmupVariant(videos=[(64, 64, 8)]))
+        assert not pipe.validate_reference_variant(
+            ReferenceWarmupVariant(videos=[ReferenceVideoSpec(size=(64, 64), num_frames=8)])
+        )
 
     def test_warmup_records_subclass_extra_keys(self):
         """warmup() records what warmup_cache_keys() reports, not the raw plan.

@@ -357,12 +357,41 @@ class MiniMaxH3Pipeline(BasePipeline):
     def validate_reference_variant(self, variant: ReferenceWarmupVariant) -> bool:
         if not super().validate_reference_variant(variant):
             return False
-        if self.workflow == "ref2va" and variant.audio and not (variant.images or variant.videos):
+        if self.workflow != "ref2va":
+            return True
+        total = len(variant.images) + len(variant.videos) + len(variant.audio)
+        if total > 12:
+            logger.warning(
+                f"Skipping reference warmup variant: MiniMax-H3 ref2va accepts at "
+                f"most 12 references in total, got {total}."
+            )
+            return False
+        if variant.audio and not (variant.images or variant.videos):
             logger.warning(
                 "Skipping reference warmup variant: MiniMax-H3 ref2va requires at "
                 "least one image or video reference alongside audio."
             )
             return False
+        if variant.order is not None:
+            expected = {
+                f"{kind}:{i}"
+                for kind, count in (
+                    ("image", len(variant.images)),
+                    ("video", len(variant.videos)),
+                    ("audio", len(variant.audio)),
+                )
+                for i in range(count)
+            }
+            try:
+                order = validate_reference_order(list(variant.order))
+            except ValueError:
+                order = None
+            if order is None or set(order) != expected:
+                logger.warning(
+                    "Skipping reference warmup variant: order must name every "
+                    "reference exactly once as 'image:N', 'video:N', 'audio:N'."
+                )
+                return False
         return True
 
     def reference_warmup_cache_key(
@@ -422,23 +451,46 @@ class MiniMaxH3Pipeline(BasePipeline):
             )
 
     def _synthesize_references(self, variant: ReferenceWarmupVariant) -> list:
-        """Build zero-valued ref2va references matching a warmup variant's sizes."""
-        references = []
-        for height, width in variant.images:
-            references.append(MiniMaxH3ImageReference(Image.new("RGB", (width, height))))
-        for height, width, frames in variant.videos:
-            references.append(
-                MiniMaxH3VideoReference(frames=np.zeros((frames, height, width, 3), dtype=np.uint8))
-            )
+        """Build zero-valued ref2va references matching a warmup variant.
+
+        Sizes, frame rates and soundtracks follow the variant so the synthesized
+        references normalize to the same packed shapes as the requests the
+        variant is meant to warm; ``variant.order`` gives the cross-modality
+        order (the request key retains it).
+        """
         sample_rate = self.audio_vae.config.sampling_rate
+        by_kind = {"image": [], "video": [], "audio": []}
+        for height, width in variant.images:
+            by_kind["image"].append(MiniMaxH3ImageReference(Image.new("RGB", (width, height))))
+        for spec in variant.videos:
+            height, width = spec.size
+            audio = (
+                torch.zeros(2, int(spec.audio_seconds * sample_rate))
+                if spec.audio_seconds is not None
+                else None
+            )
+            by_kind["video"].append(
+                MiniMaxH3VideoReference(
+                    frames=np.zeros((spec.num_frames, height, width, 3), dtype=np.uint8),
+                    fps=spec.fps if spec.fps is not None else float(MINIMAX_H3_FPS),
+                    audio=audio,
+                    sample_rate=sample_rate if audio is not None else None,
+                )
+            )
         for seconds in variant.audio:
-            references.append(
+            by_kind["audio"].append(
                 MiniMaxH3AudioReference(
                     audio=torch.zeros(2, int(seconds * sample_rate)),
                     sample_rate=sample_rate,
                 )
             )
-        return references
+        if variant.order is None:
+            return by_kind["image"] + by_kind["video"] + by_kind["audio"]
+        # Format and coverage were checked by validate_reference_variant().
+        return [
+            by_kind[kind][int(index)]
+            for kind, index in (entry.split(":") for entry in variant.order)
+        ]
 
     def _reference_key_entry(self, reference: MiniMaxH3Reference, num_frames: int) -> tuple:
         """Packed-shape signature of one decoded ref2va reference.

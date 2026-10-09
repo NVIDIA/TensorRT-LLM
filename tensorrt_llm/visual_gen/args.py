@@ -606,6 +606,30 @@ class CpuOffloadConfig(StrictBaseModel):
     )
 
 
+class ReferenceVideoSpec(StrictBaseModel):
+    """One video reference in a warmup variant."""
+
+    size: Tuple[int, int] = Field(
+        description="(height, width) of the video frames.",
+    )
+    num_frames: int = Field(
+        description="Number of frames the video carries.",
+    )
+    fps: Optional[float] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Frame rate the video carries; the model resamples onto its own clock, "
+            "which changes the compiled shape. If None, uses the model's own frame rate."
+        ),
+    )
+    audio_seconds: Optional[float] = Field(
+        default=None,
+        status="prototype",
+        description="Duration in seconds of the video's soundtrack, if it carries one.",
+    )
+
+
 class ReferenceWarmupVariant(StrictBaseModel):
     """One reference-carrying warmup variant.
 
@@ -623,15 +647,24 @@ class ReferenceWarmupVariant(StrictBaseModel):
         status="prototype",
         description="(height, width) of each image reference for this variant.",
     )
-    videos: List[Tuple[int, int, int]] = Field(
+    videos: List[ReferenceVideoSpec] = Field(
         default_factory=list,
         status="prototype",
-        description="(height, width, num_frames) of each video reference for this variant.",
+        description="Video references for this variant.",
     )
     audio: List[float] = Field(
         default_factory=list,
         status="prototype",
         description="Duration in seconds of each audio reference for this variant.",
+    )
+    order: Optional[List[str]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Cross-modality reference order as 'image:N', 'video:N', 'audio:N' "
+            "entries (zero-based per modality), for models where reference order "
+            "changes the compiled shape. If None, images then videos then audio."
+        ),
     )
 
 
