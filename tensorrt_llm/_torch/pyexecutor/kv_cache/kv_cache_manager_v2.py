@@ -3466,6 +3466,9 @@ class KVCacheManagerV2(BaseResourceManager):
     ) -> None:
         """Hook for recurrent-state managers; attention-only caches have no snapshots."""
 
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        """Hook for recurrent-state managers; attention-only caches have no snapshots."""
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 

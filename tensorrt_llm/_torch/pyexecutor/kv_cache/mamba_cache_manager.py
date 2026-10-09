@@ -3116,6 +3116,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
+        # Fork depths a paired draft probe found past this pool's capped claim.
+        self._context_fork_hints: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
@@ -3657,6 +3659,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
             self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
 
+        fork = self._context_fork_hints.pop(req.py_request_id, None)
+        if fork is not None and fork - reused > self.tokens_per_block:
+            # A paired claim stops the lookup at its depth, hiding a fork past
+            # it. One within a block of the reuse is not worth a snapshot.
+            divergence = max(divergence, fork)
+            num_lookup_tokens = max(num_lookup_tokens, req.prompt_len - 1)
+
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
             self._skip_branch_snapshot("no_divergence")
@@ -3680,6 +3689,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._branch_snapshot_points[req.py_request_id] = point
         self._apply_branch_snapshot_point(req, context_current_position=reused)
+
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        if self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
+            self._context_fork_hints[req.py_request_id] = fork
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
@@ -4360,6 +4373,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        self._context_fork_hints.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
