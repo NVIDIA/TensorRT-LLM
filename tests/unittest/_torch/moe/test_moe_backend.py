@@ -1658,7 +1658,10 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     )
     moe.quant_method = quant_method
     moe._rebalance_slots_active = 1
-    moe._rebalance_arena = MagicMock()
+    arena = MagicMock()
+    # ``unittest.mock`` blocks dynamically-created ``assert_*`` attributes.
+    arena.assert_identity = MagicMock()
+    moe._rebalance_arena = arena
     moe.layer_load_balancer = SimpleNamespace(bind_backend=MagicMock())
 
     moe.post_load_weights()
@@ -1732,6 +1735,7 @@ def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
         slot_count_per_rank=6,
     )
     arena = MagicMock(home_experts=4, helper_slots=2)
+    arena.assert_identity = MagicMock()
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
     moe.quant_method = SimpleNamespace(
