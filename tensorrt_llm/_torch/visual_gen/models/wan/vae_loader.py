@@ -29,7 +29,13 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .wan_vae import WanVAE, WanVAEConfig, _nvfp4_supported_sm_names, _supports_nvfp4_device
+from .wan_vae import (
+    WanVAE,
+    WanVAEConfig,
+    _nvfp4_supported_sm_names,
+    _prepare_wan_decoder_norm_silu,
+    _supports_nvfp4_device,
+)
 
 TRTLLM_USE_DIFFUSER_VAE_ENV = "TRTLLM_USE_DIFFUSER_VAE"
 _NVFP4_DYNAMIC_MIN_CHANNELS = 64
@@ -423,4 +429,8 @@ def load_wan_vae(
         )
         if n_static:
             raise RuntimeError("Load-time NVFP4 quantization unexpectedly produced static scales")
+    else:
+        # Automatic selection is limited to the ordinary BF16 checkpoint route.
+        # Existing NVFP4 and packed-checkpoint dequantization paths are unchanged.
+        _prepare_wan_decoder_norm_silu(wan_vae)
     return wan_vae
