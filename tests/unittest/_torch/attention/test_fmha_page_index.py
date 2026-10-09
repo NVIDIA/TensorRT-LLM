@@ -366,6 +366,7 @@ def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
     # backend must decline and let selection fall through.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -383,6 +384,7 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     # served by this backend. Real configs run tokens_per_block=64.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=tokens_per_block,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -391,10 +393,26 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     assert reason == ""
 
 
+@pytest.mark.parametrize("tokens_per_block", [32, 64])
+def test_mla_generation_declines_h96_for_flashinfer_trtllm_gen(
+    tokens_per_block: int,
+) -> None:
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        num_heads=96,
+        tokens_per_block=tokens_per_block,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert not supported
+    assert "num_heads=96" in reason
+
+
 def test_mla_generation_allows_other_supported_head_dims() -> None:
     # (320, 256) is unaffected at every page size.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=320,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=256,
         qk_rope_head_dim=64,
