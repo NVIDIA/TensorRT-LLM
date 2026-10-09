@@ -104,11 +104,14 @@ int runConcurrentFlows(
 
 // Bounce-enabled agent config: agentBufferSizeMb switches bounce on, and the expert knobs ride
 // bounceParams (dict > env > default) with thresholds tuned so a modest transfer engages bounce
-// (small regions -> recycling). sizeMb == 0 keeps bounce off (no knobs attached).
+// (small regions -> recycling). sizeMb == 0 keeps bounce off (no knobs attached). num_threads is
+// passed as the Python transceiver does (2 here to keep agent setup cheap; production defaults to 8),
+// and a bounce agent then picks split_batch_size=1 itself.
 kvc::BaseAgentConfig makeBounceConfig(
     std::string name, std::size_t arenaSizeMb = 2, char const* granularityBytes = "256")
 {
     kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    cfg.backendParams = {{"num_threads", "2"}};
     cfg.agentBufferSizeMb = arenaSizeMb;
     if (arenaSizeMb > 0)
     {
@@ -164,16 +167,28 @@ TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
     }
 }
 
-TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
+namespace
+{
+// One bounce transfer A -> B through submitTransferRequests, wired as production disagg does.
+// `backendParams` (if non-empty) replaces both agents' NIXL backend params.
+void runSubmitUsesBounce(std::string const& tag, bounce_test::BackendParams const& backendParams = {})
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
+    std::string const nameA = tag + "A";
+    std::string const nameB = tag + "B";
+    auto cfgA = makeBounceConfig(nameA, /*arenaSizeMb=*/1, /*granularityBytes=*/"4096");
+    auto cfgB = makeBounceConfig(nameB, /*arenaSizeMb=*/1, /*granularityBytes=*/"4096");
+    if (!backendParams.empty())
+    {
+        cfgA.backendParams = backendParams;
+        cfgB.backendParams = backendParams;
+    }
     std::string skipMsg;
-    auto a = tryMakeAgent(makeBounceConfig("bAgentA", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg);
-    auto b = a ? tryMakeAgent(makeBounceConfig("bAgentB", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg)
-               : nullptr;
+    auto a = tryMakeAgent(std::move(cfgA), skipMsg);
+    auto b = a ? tryMakeAgent(std::move(cfgB), skipMsg) : nullptr;
     if (!a || !b)
     {
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
@@ -185,19 +200,45 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     // bounce control endpoint rides inside that AgentDesc. B's reverse control path (GRANT/ACK back
     // to A) is self-bootstrapped from A's WANT (BounceReceiver::onWant) — exercising it
     // here is the whole point. (We deliberately do NOT touch the connection-info path.)
-    a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
+    a->loadRemoteAgent(nameB, b->getLocalAgentDesc());
 
     auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/7);
-    auto req = makeReq(bufs, "bAgentB");
+    auto req = makeReq(bufs, nameB.c_str());
     auto status = a->submitTransferRequests(req);
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
         << "bounce transfer via submitTransferRequests did not succeed";
+    EXPECT_EQ(a->getBounceSubmitCount(), 1u);
     EXPECT_TRUE(verifyXferBufs(bufs));
 
     a->shutdown();
     b->shutdown();
     freeXferBufs(bufs);
+}
+} // namespace
+
+TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
+{
+    runSubmitUsesBounce("bAgent");
+}
+
+// The production default (TRTLLM_NIXL_NUM_THREADS=8): chunk writes fan out over eight dedicated workers.
+TEST(BounceAgentE2E, SubmitTransferRequestsWithDefaultNixlThreads)
+{
+    runSubmitUsesBounce("b8ThrAgent", {{"num_threads", "8"}});
+}
+
+// An explicit split_batch_size is kept as given: chunk writes stay below it and run on NIXL's shared
+// worker.
+TEST(BounceAgentE2E, SubmitTransferRequestsWithExplicitSplitBatchSize)
+{
+    runSubmitUsesBounce("bSbsAgent", {{"num_threads", "2"}, {"split_batch_size", "1024"}});
+}
+
+// num_threads=0: NIXL's progress-thread engine without dedicated workers (split_batch_size is left alone).
+TEST(BounceAgentE2E, SubmitTransferRequestsWithoutNixlThreads)
+{
+    runSubmitUsesBounce("bNoThrAgent", {{"num_threads", "0"}});
 }
 
 namespace
@@ -206,6 +247,7 @@ namespace
 kvc::BaseAgentConfig makeLargeRequestConfig(std::string name)
 {
     kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    cfg.backendParams = {{"num_threads", "2"}};
     cfg.agentBufferSizeMb = 4;
     cfg.bounceParams = {
         {"min_descriptor_count", "4"},

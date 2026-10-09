@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bounce_test
@@ -48,6 +49,17 @@ namespace bounce_test
 
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
 namespace kvc = tensorrt_llm::executor::kv_cache;
+
+using BackendParams = std::unordered_map<std::string, std::string>;
+
+// NIXL UCX backend params that post every chunk write to one of NIXL's dedicated worker threads, as on
+// a production bounce agent (the Python transceiver passes num_threads, default 8, and bounce then sets
+// split_batch_size=1). Two threads keep agent setup cheap (each dedicated worker adds ~0.2 s); the E2E
+// tests cover 8. An empty map keeps the plugin defaults, where chunk writes run on the shared worker.
+inline BackendParams dedicatedWorkerBackendParams()
+{
+    return {{"num_threads", "2"}, {"split_batch_size", "1"}};
+}
 
 // A `seed`-distinct byte pattern so concurrent transfers can't masquerade as each other.
 inline unsigned char patSeed(std::uint32_t seed, std::size_t d, std::size_t i)
@@ -205,15 +217,17 @@ struct Node
 // agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies
 // arenaSizeBytes/arenaAllocationGranularityBytes/maxInflightChunksPerRequest etc., so callers
 // control the scheduler/arena sizing. `makeAgent` lets failure tests substitute a fault-injecting
-// NixlTransferAgent subclass.
+// NixlTransferAgent subclass. `backendParams` configures the agent's NIXL backend.
 inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig const& cfg, std::size_t maxDescs,
-    std::function<std::unique_ptr<kvc::NixlTransferAgent>(kvc::BaseAgentConfig const&)> const& makeAgent = nullptr)
+    std::function<std::unique_ptr<kvc::NixlTransferAgent>(kvc::BaseAgentConfig const&)> const& makeAgent = nullptr,
+    BackendParams const& backendParams = dedicatedWorkerBackendParams())
 {
     auto n = std::make_unique<Node>();
     n->name = name;
     try
     {
         kvc::BaseAgentConfig c{name, /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/true};
+        c.backendParams = backendParams;
         n->agent = makeAgent ? makeAgent(c) : std::make_unique<kvc::NixlTransferAgent>(c);
     }
     catch (std::exception const&)

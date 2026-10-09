@@ -41,7 +41,8 @@ namespace
 // NIXL nodes: a sender built from `senderCfg` and a receiver built from `receiverCfg` (asymmetric
 // configs let a test pin clamping/backpressure to one side). `tag` gives the two agents unique names.
 void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t descBytes,
-    b::BounceConfig const& senderCfg, b::BounceConfig const& receiverCfg, std::uint32_t seed)
+    b::BounceConfig const& senderCfg, b::BounceConfig const& receiverCfg, std::uint32_t seed,
+    bounce_test::BackendParams const& backendParams = bounce_test::dedicatedWorkerBackendParams())
 {
     if (!bounce_test::hasCuda())
     {
@@ -50,8 +51,8 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
     std::size_t const maxDescs
         = std::max<std::size_t>(1024ULL, std::max(senderCfg.maxChunkSizeBytes, receiverCfg.maxChunkSizeBytes) / 256ULL);
 
-    auto A = bounce_test::makeNode(tag + "A", senderCfg, maxDescs);
-    auto B = bounce_test::makeNode(tag + "B", receiverCfg, maxDescs);
+    auto A = bounce_test::makeNode(tag + "A", senderCfg, maxDescs, nullptr, backendParams);
+    auto B = bounce_test::makeNode(tag + "B", receiverCfg, maxDescs, nullptr, backendParams);
     if (!A || !B)
     {
         GTEST_SKIP() << "NIXL agent/backend unavailable";
@@ -72,7 +73,8 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
 // Thin wrapper: the same config on both ends, with maxChunkSizeBytes/maxInflightChunksPerRequest
 // chosen so the chunk count exceeds the in-flight limit (forcing credit recycling).
 void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t descBytes, std::size_t maxChunkSizeBytes,
-    std::uint32_t maxInflightChunksPerRequest)
+    std::uint32_t maxInflightChunksPerRequest,
+    bounce_test::BackendParams const& backendParams = bounce_test::dedicatedWorkerBackendParams())
 {
     b::BounceConfig cfg;
     cfg.maxChunkSizeBytes = maxChunkSizeBytes;
@@ -87,7 +89,7 @@ void runTransfer(std::string const& tag, std::uint32_t nDescs, std::uint32_t des
         arenaSizeBytes <<= 1;
     }
     cfg.arenaSizeBytes = arenaSizeBytes;
-    runTransfer(tag, nDescs, descBytes, cfg, cfg, /*seed=*/1);
+    runTransfer(tag, nDescs, descBytes, cfg, cfg, /*seed=*/1, backendParams);
 }
 } // namespace
 
@@ -101,6 +103,14 @@ TEST(BounceTransport, LargeTransferRecyclesCredits)
 {
     // Forty descriptors produce more chunks than the limit of two, forcing credit recycling.
     runTransfer("btLarge", /*nDescs=*/40, /*descBytes=*/700, /*maxChunkSizeBytes=*/4096, /*maxInflightChunks=*/2);
+}
+
+TEST(BounceTransport, LargeTransferOnSharedNixlWorker)
+{
+    // Plugin-default backend params (no num_threads, no split_batch_size): every chunk write runs on
+    // NIXL's shared UCX worker instead of a dedicated worker thread.
+    runTransfer("btShared", /*nDescs=*/40, /*descBytes=*/700, /*maxChunkSizeBytes=*/4096, /*maxInflightChunks=*/2,
+        /*backendParams=*/{});
 }
 
 TEST(BounceTransport, ManySmallDescs)
