@@ -2358,7 +2358,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'forkOwner', value: ''),
                                 string(name: 'postMergePipelineName', value: ''),
                                 string(name: 'postMergeBuildNumber', value: ''),
-                                string(name: 'scanMode', value: 'pre_merge'),
+                                string(name: 'scanMode', value: isNightlyRelease ? 'release' : 'pre_merge'),
                                 string(name: 'runSourceCodeScanning', value: 'true'),
                                 string(name: 'runContainerScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
@@ -2370,7 +2370,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             )
                             handleResult = handle.result
                         }
-                        if (handle.result == "UNSTABLE" && !isNightlyRelease) {
+                        if (handleResult == "UNSTABLE" && !isNightlyRelease) {
                             logger.log("OSS Compliance Check downstream job is UNSTABLE, ignoring")
                         } else if (handleResult != "SUCCESS") {
                             error "Downstream job did not succeed"
