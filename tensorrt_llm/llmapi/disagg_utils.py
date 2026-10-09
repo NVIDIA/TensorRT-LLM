@@ -8,15 +8,17 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
 from mpi4py.util import pkl5
+from pydantic import Field, TypeAdapter, ValidationError
 
 from .._utils import global_mpi_rank, global_mpi_size
 
 __all__ = [
+    'InternalRequestAuthKey',
     'ServerConfig',
     'parse_disagg_config_file',
     'extract_server_configs',
@@ -24,7 +26,11 @@ __all__ = [
     'get_usage_tokens_from_ctx',
     'rewrite_usage_info_from_ctx',
     'rewrite_usage_response_from_ctx',
+    'validate_internal_request_auth_key',
 ]
+
+InternalRequestAuthKey = Annotated[str, Field(strict=True, min_length=1)] | None
+_AUTH_KEY_ADAPTER = TypeAdapter(InternalRequestAuthKey)
 
 
 def validate_config_bool(value: Any, field_name: str) -> bool:
@@ -41,16 +47,19 @@ def validate_config_non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
-def _validate_internal_request_auth_key(value: Optional[str]) -> Optional[str]:
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ValueError("internal_request_auth_key must be a non-empty string")
-    return value
+def validate_internal_request_auth_key(value: object) -> str | None:
+    """Validate the serving auth key without including its value in errors."""
+    try:
+        return _AUTH_KEY_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise ValueError(
+            "internal_request_auth_key must be a non-empty string") from None
 
 
 def _extract_internal_request_auth_key(
         top_level_key: Optional[str], context_servers: dict,
         generation_servers: dict) -> Optional[str]:
-    top_level_key = _validate_internal_request_auth_key(top_level_key)
+    top_level_key = validate_internal_request_auth_key(top_level_key)
     section_keys = []
     for server_type, servers in (("context_servers", context_servers),
                                  ("generation_servers", generation_servers)):
@@ -58,7 +67,7 @@ def _extract_internal_request_auth_key(
         if section_key is None:
             continue
         section_keys.append(
-            (server_type, _validate_internal_request_auth_key(section_key)))
+            (server_type, validate_internal_request_auth_key(section_key)))
 
     for server_type, section_key in section_keys:
         if top_level_key is not None and section_key != top_level_key:
@@ -437,7 +446,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 def extract_router_config(server_cfg: dict) -> RouterConfig:
 
     args = server_cfg.pop("router", {})
-    router_type = args.pop("type", "round_robin")
+    router_type = args.pop("type", RouterConfig.type)
 
     if router_type == "kv_cache_aware" and "model_path" not in args:
         model_path = server_cfg.get("model")

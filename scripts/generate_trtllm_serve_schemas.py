@@ -99,7 +99,7 @@ def _nullable(schema: dict) -> dict:
 
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
-    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig
+    from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, TorchLlmArgs
 
     # Annotated fields are derived; config changes still require snapshot regeneration and CPU tests.
@@ -111,7 +111,7 @@ def generate_serve_schema() -> dict:
     properties.update(
         hf_revision=copy.deepcopy(properties["revision"]),
         allow_request_chat_template={"type": "boolean", "default": False},
-        internal_request_auth_key=_nullable({"type": "string", "minLength": 1}),
+        internal_request_auth_key=_schema_for(InternalRequestAuthKey),
         disagg_cluster=_nullable(_schema_for(DisaggClusterConfig, schema)),
     )
     # Update these input exceptions when serving merges or llm_args.py validators change normalization.
@@ -150,6 +150,7 @@ def generate_disagg_schema() -> dict:
         DISAGG_NODE_ID_BITS,
         ConditionalDisaggConfig,
         OtlpConfig,
+        RouterConfig,
         extract_ctx_gen_cfgs,
         extract_disagg_cfg,
     )
@@ -168,10 +169,10 @@ def generate_disagg_schema() -> dict:
     worker["properties"].pop("type")
     worker.pop("required", None)
     worker["properties"] = properties | worker["properties"]
-    # Keep the default aligned with extract_router_config(); router-specific keys stay open.
+    # YAML flattens router-specific args alongside the shared type field.
     worker["properties"]["router"] = {
         "type": "object",
-        "properties": {"type": {"type": "string", "default": "round_robin"}},
+        "properties": {"type": _schema_for(RouterConfig, schema)["properties"]["type"]},
         "additionalProperties": True,
     }
     worker["additionalProperties"] = False

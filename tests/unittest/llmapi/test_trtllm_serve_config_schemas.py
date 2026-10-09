@@ -20,6 +20,7 @@ import importlib.util
 import json
 import runpy
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -65,8 +66,6 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             {"hf_revision": "main", "allow_request_chat_template": True},
             True,
         ),
-        (generator.SERVE_SCHEMA, {"internal_request_auth_key": "example-key"}, True),
-        (generator.SERVE_SCHEMA, {"internal_request_auth_key": ""}, False),
         (
             generator.SERVE_SCHEMA,
             {"disagg_cluster": {"cluster_uri": "etcd://localhost:2379"}},
@@ -90,6 +89,12 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
         (generator.DISAGG_SCHEMA, {"context_servers": {"num_instnces": 1}}, False),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"router": {"type": 42}}}, False),
+        (
+            generator.DISAGG_SCHEMA,
+            {"generation_servers": {"router": {"type": "round_robin", "custom_arg": 1}}},
+            True,
+        ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
         (
             generator.DISAGG_SCHEMA,
@@ -119,7 +124,7 @@ def _assert_serving_fields_in_schema(source: str, function_name: str, properties
         if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
     config_names = {"llm_args", "llm_args_dict", "llm_args_extra_dict", "raw_llm_args_extra_dict"}
-    helpers = {"_pop_bool_config_option", "_pop_optional_str_config_option"}
+    helpers = {"_pop_bool_config_option"}
     fields = set()
     for node in ast.walk(function):
         mapping = key = None
@@ -174,7 +179,7 @@ def test_serving_yaml_fields_have_schema(
         'llm_args_dict.setdefault("new_serving_option", False)',
         'llm_args["new_serving_option"]',
         '_pop_bool_config_option(llm_args_extra_dict, "new_serving_option")',
-        '_pop_optional_str_config_option(llm_args_extra_dict, "new_serving_option")',
+        'validate_internal_request_auth_key(llm_args_extra_dict.pop("new_serving_option", None))',
     ],
 )
 def test_serving_field_guard_detects_new_fields(access: str) -> None:
@@ -241,6 +246,46 @@ def test_disagg_flat_fields_reuse_nested_schemas(
                 if section is not None:
                     config = {section: config}
                 assert validator.is_valid(config) == valid, config
+
+
+@pytest.mark.parametrize(
+    "value", [None, "example-key", " ", "", 123, False, [], {"key": "secret"}, b"secret"]
+)
+def test_auth_key_schema_matches_runtime(schemas: dict[str, dict], value: object) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import validate_internal_request_auth_key
+
+    valid = value is None or isinstance(value, str) and bool(value)
+    if valid:
+        assert validate_internal_request_auth_key(value) == value
+    else:
+        with pytest.raises(ValueError) as error:
+            validate_internal_request_auth_key(value)
+        assert str(error.value) == "internal_request_auth_key must be a non-empty string"
+        assert error.value.__suppress_context__
+
+    config = {"internal_request_auth_key": value}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid
+
+
+def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tensorrt_llm.llmapi import disagg_utils
+
+    @dataclass
+    class UpdatedRouterConfig(disagg_utils.RouterConfig):
+        type: str = "updated_default"
+
+    monkeypatch.setattr(disagg_utils, "RouterConfig", UpdatedRouterConfig)
+    schema = generator.generate_disagg_schema()
+    router_type = schema["$defs"]["DisaggServerBlock"]["properties"]["router"]["properties"]["type"]
+    assert router_type["default"] == UpdatedRouterConfig().type
+    for config in ({}, {"router": {}}):
+        assert disagg_utils.extract_router_config(config).type == router_type["default"]
+    assert disagg_utils.extract_router_config({"router": {"type": "explicit"}}).type == "explicit"
 
 
 def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:

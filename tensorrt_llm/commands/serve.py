@@ -57,12 +57,11 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              extract_disagg_cluster_config,
-                                              parse_disagg_config_file,
-                                              parse_metadata_server_config_file,
-                                              validate_config_bool)
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    extract_disagg_cluster_config, parse_disagg_config_file,
+    parse_metadata_server_config_file, validate_config_bool,
+    validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
@@ -150,16 +149,6 @@ def _apply_effective_telemetry_config(llm_args: dict,
 
 def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
-
-
-def _pop_optional_str_config_option(config: dict[str, Any],
-                                    key: str) -> Optional[str]:
-    value = config.pop(key, None)
-    if value is None:
-        return None
-    if isinstance(value, str) and value:
-        return value
-    raise ValueError(f"{key} must be a non-empty string")
 
 
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
@@ -1523,8 +1512,8 @@ def serve(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
-        internal_disagg_auth_key = _pop_optional_str_config_option(
-            llm_args_extra_dict, "internal_request_auth_key")
+        internal_disagg_auth_key = validate_internal_request_auth_key(
+            llm_args_extra_dict.pop("internal_request_auth_key", None))
         # Apply to the raw mapping first so a higher-precedence override can
         # replace an invalid YAML value before nested config construction.
         llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,
