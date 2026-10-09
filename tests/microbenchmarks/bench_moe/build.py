@@ -125,6 +125,8 @@ _SITU_PATHS = frozenset(
     {
         ("MEGAMOE_DEEPGEMM", QuantAlgo.W4A8_MXFP4_MXFP8),
         ("MEGAMOE_CUTEDSL", QuantAlgo.NVFP4),
+        ("CUTEDSL", QuantAlgo.NVFP4),
+        ("TRTLLM", QuantAlgo.NVFP4),
         ("TRTLLM", QuantAlgo.W4A8_MXFP4_MXFP8),
         ("CUTLASS", QuantAlgo.NVFP4),
     }

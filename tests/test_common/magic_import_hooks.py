@@ -185,13 +185,25 @@ def _is_pytest_basedir(directory: str) -> bool:
     return False
 
 
-def _under_exempt_tree(relative: str) -> bool:
-    """Whether a project-relative entry sits in one of _NON_TEST_TREES.
+def _environment_tree() -> str | None:
+    """Project-relative prefix of the environment running pytest, if it is inside the project.
+
+    That environment puts entries on sys.path itself: the ``bin`` directory of
+    the entry script that launched pytest, and the directories that installed
+    packages append to themselves. None of that is test code. A prefix that is
+    the project root would excuse everything, so it is not used.
+    """
+    relative = _project_relative(sys.prefix)
+    return None if relative in (None, ".") else relative
+
+
+def _under_exempt_tree(relative: str, trees: tuple[str, ...]) -> bool:
+    """Whether a project-relative entry sits in one of ``trees``.
 
     An entry covers the directory it names and everything below it, so a
     nested path such as a build directory matches its whole tree.
     """
-    for tree in _NON_TEST_TREES:
+    for tree in trees:
         prefix = tree.replace("/", os.sep)
         if relative == prefix or relative.startswith(prefix + os.sep):
             return True
@@ -237,14 +249,22 @@ def _check_sys_path(config) -> list[str]:
     """
     expected = _expected_entries(config)
     root = os.path.realpath(MagicFinder.project_root)
+    environment = _environment_tree()
+    exempt = _NON_TEST_TREES + ((environment,) if environment else ())
     unexpected = []
     for entry in sys.path:
         relative = _project_relative(entry)
         if relative is None or relative in expected:
             continue
-        if _under_exempt_tree(relative):
+        directory = os.path.join(root, relative)
+        # A relative entry naming no directory is a marker rather than a path,
+        # such as the one an editable install registers. An absolute path stays
+        # reportable even if its directory has since been removed.
+        if not os.path.isabs(entry) and not os.path.isdir(directory):
             continue
-        if _is_pytest_basedir(os.path.join(root, relative)):
+        if _under_exempt_tree(relative, exempt):
+            continue
+        if _is_pytest_basedir(directory):
             continue
         if relative not in unexpected:
             unexpected.append(relative)

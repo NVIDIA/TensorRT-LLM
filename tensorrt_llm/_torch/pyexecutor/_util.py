@@ -2330,6 +2330,42 @@ class KvCacheCreator:
         target_budget = total_budget - draft_budget
         return target_budget, draft_budget
 
+    def _bound_unsplit_v2_draft_by_tokens(
+        self,
+        total_budget: int,
+        target_kv_cache_config: KvCacheConfig,
+        draft_kv_cache_config: Optional[KvCacheConfig],
+    ) -> Optional[KvCacheConfig]:
+        """Backstop for a one-model V2 draft whose GPU budget cannot be split.
+
+        When the per-manager costs are unavailable the split returns the
+        configs unchanged, so the draft would read the target's whole
+        max_gpu_total_bytes and claim the budget a second time. Bound the draft
+        alone by the token capacity of that budget instead: its V2 quota
+        becomes min(max_gpu_total_bytes, max_tokens * draft bytes/token), as V1
+        does with a shared max_tokens. The target config is never touched, so a
+        successful split (which already sizes both managers) is unaffected.
+        """
+        if (not self._is_kv_cache_manager_v2
+                or self._draft_model_engine is not None
+                or not self._should_create_separate_draft_kv_cache()
+                or target_kv_cache_config.max_tokens is not None):
+            return draft_kv_cache_config
+        max_tokens = self._get_kv_size_per_token(
+            target_kv_cache_config).tokens_for_budget(total_budget)
+        # When every attention layer is windowed the per-token slope is 0 and
+        # tokens_for_budget returns 0. V2 treats an unset max_tokens as
+        # unbounded, so leave it unset rather than impose a cap of zero.
+        if max_tokens <= 0:
+            return draft_kv_cache_config
+        bounded = (draft_kv_cache_config if draft_kv_cache_config is not None
+                   else target_kv_cache_config).model_copy()
+        bounded.max_tokens = max_tokens
+        logger.info(
+            f"Cannot split KV cache max_gpu_total_bytes between target and "
+            f"draft; bounding the draft to max_tokens={max_tokens}.")
+        return bounded
+
     def _split_kv_cache_budget_for_draft(
         self,
         budget_attr: str,
@@ -2372,6 +2408,9 @@ class KvCacheCreator:
         cache_costs = self._get_target_and_draft_cache_costs(
             target_kv_cache_config, include_request_cost=True)
         if cache_costs is None:
+            if budget_attr == "max_gpu_total_bytes":
+                draft_kv_cache_config = self._bound_unsplit_v2_draft_by_tokens(
+                    total_budget, target_kv_cache_config, draft_kv_cache_config)
             return target_kv_cache_config, draft_kv_cache_config
         target_kv, draft_kv = cache_costs
 

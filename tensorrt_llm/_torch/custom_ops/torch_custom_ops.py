@@ -49,8 +49,8 @@ if IS_FLASHINFER_AVAILABLE:
 
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_2in_kernel, silu_and_mul_kernel
-from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
-                     deep_gemm_jit_warmup_buckets, fp4_scale_infer_shape,
+from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
+                     fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      get_power_of_2_num_tokens_buckets,
                      is_nvfp4_marlin_supported_sm, last_positive_power_of_2,
@@ -2196,9 +2196,12 @@ class fp8SwapABGemmRunner(TunableRunner):
 class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
     """Runs DeepGemm with pre-quantized FP8 activations and packed scales."""
 
+    # The same step-16 grid as the other two DeepGemm runners: a layout no
+    # bucket selects is compiled mid-inference instead, and DeepGemm forks
+    # nvcc while holding the GIL.
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, deep_gemm_gen_tuning_buckets), ),
+            0, 0, deep_gemm_jit_warmup_buckets), ),
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
