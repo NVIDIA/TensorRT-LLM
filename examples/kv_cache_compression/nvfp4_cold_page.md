@@ -313,6 +313,9 @@ intermediate widths are rejected. Inference without cold-page compression is unc
 | `false` | `0` | Single NVFP4 |
 | `true` | Either value | Original hot-cache precision |
 
+Compression may affect model accuracy. Choose the trade-off between accuracy
+and compression ratio that fits your workload and requirements.
+
 The indexer cache is always copied as it
 is, and the sliding-window, HCA, and compressor caches of the model are preserved
 losslessly in their own lifecycles.
