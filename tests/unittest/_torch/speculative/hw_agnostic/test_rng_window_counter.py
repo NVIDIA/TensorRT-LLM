@@ -21,12 +21,14 @@ import types
 from typing import Optional
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import UNSEEDED_OFFSET_BASE
 from tensorrt_llm._torch.speculative.interface import (
     _RNG_SLOT_SPAN,
     DEFAULT_SAMPLING_SEED,
     SpecMetadata,
+    SpecWorkerBase,
 )
 
 MAX_DRAFT_LEN = 3
@@ -232,3 +234,16 @@ def test_window_slots_do_not_overlap(is_tree: bool) -> None:
         assert used.isdisjoint(stretch), f"slot {slot} overlaps another row's draws"
         used |= stretch
     assert max(used) < window
+
+
+def test_block_rows_take_consecutive_slots() -> None:
+    """A block sampler's K rows per request start at ``slot`` and take one slot each."""
+    meta = types.SimpleNamespace(
+        request_seeds=torch.tensor([5, 7, 9]),
+        request_offsets=torch.tensor([0, 1000, BASE]),
+    )
+    seeds, offsets = SpecWorkerBase._rng_state_per_request(None, meta, 1, 3, repeat=3, slot=4)
+    assert seeds.tolist() == [7, 7, 7, 9, 9, 9]
+    assert offsets.tolist() == [
+        base + (4 + row) * _RNG_SLOT_SPAN for base in (1000, BASE) for row in range(3)
+    ]

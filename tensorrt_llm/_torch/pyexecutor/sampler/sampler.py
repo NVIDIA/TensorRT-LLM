@@ -1086,8 +1086,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # advancing it would move that request's Philox offset by an amount that
         # depends on concurrent load, breaking the guarantee _SeedManager exists
         # for -- that a seeded request's stream depends only on its own draws.
-        # The padded rows keep whatever the buffers already hold, since their
-        # tokens are discarded.
         live_slots_per_row = slots_per_row[:live_rows]
         row_seeds = self._seed_manager.take_row_seeds(live_slots_per_row, device=seeds_buf.device)
         seeds_buf[:live_rows].copy_(row_seeds.seed, non_blocking=True)
