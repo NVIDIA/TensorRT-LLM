@@ -2514,8 +2514,10 @@ class PyTorchModelEngine(ModelEngine):
         # variants, for free since alignment is independent of HAS_INITSTATES.
         # Resolved the same way the runtime does, so warmup can't prime the
         # alignment variant of a class the runtime never instantiates.
+        from ..jit_prefetch import warmup_jit_coverage_enabled
         metadata_cls = resolve_mamba_metadata_cls(self.model)
-        chunk_alignment = metadata_cls.prefill_chunk_alignment
+        chunk_alignment = (metadata_cls.prefill_chunk_alignment
+                           if warmup_jit_coverage_enabled() else None)
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,
         #  chunk_aligned)

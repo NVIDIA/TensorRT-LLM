@@ -117,6 +117,21 @@ def providers_enabled() -> bool:
     return os.environ.get(_PROVIDERS_ENV, "all") != "none"
 
 
+def warmup_jit_coverage_enabled() -> bool:
+    """Whether warmup adds shapes only to trigger JIT compilation.
+
+    Two warmup passes exist only for that: the 16-row DeepGEMM grid of the
+    FP8 swap-AB / block-scaling runners and the aligned/ragged split of the
+    Mamba-hybrid warmup batches. With prefetch on, the helpers compile those
+    variants instead, so both default to off. ``TLLM_WARMUP_JIT_COVERAGE``
+    overrides the default either way.
+    """
+    v = os.environ.get("TLLM_WARMUP_JIT_COVERAGE")
+    if v is not None:
+        return v == "1"
+    return not prefetch_enabled()
+
+
 def stats_enabled() -> bool:
     return prefetch_enabled() or os.environ.get(_STATS_ENV, "0") == "1"
 

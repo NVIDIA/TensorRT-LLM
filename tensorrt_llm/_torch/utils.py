@@ -449,9 +449,10 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     own (``block_m=16``: one wave, best last-wave utilization) that a step-128
     grid steps over, sampling 2304 and 2432.
     """
-    if os.environ.get("TLLM_DEEP_GEMM_JIT_WARMUP_STEP16", "1") == "0":
-        # Experiment switch: the coarser tuning grid, i.e. no DeepGemm JIT
-        # coverage beyond what tuning itself samples.
+    from .jit_prefetch import warmup_jit_coverage_enabled
+    if not warmup_jit_coverage_enabled():
+        # JIT prefetch compiles the layouts this grid exists for, so warmup
+        # keeps only the tuning grid.
         return deep_gemm_gen_tuning_buckets(max_m)
     # A worker whose M never leaves the low band -- a disagg GEN worker runs at
     # batch x MTP tokens -- must not be pulled up to the 4096 floor. Measured
