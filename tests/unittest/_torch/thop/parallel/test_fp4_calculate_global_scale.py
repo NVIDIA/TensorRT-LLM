@@ -46,8 +46,9 @@ class TestFP4CalculateGlobalScale(unittest.TestCase):
             [8, 8 * 64, 7168, torch.bfloat16, True],
             [16, 16 * 64, 7168, torch.bfloat16, True],
             [32, 32 * 64, 7168, torch.bfloat16, True],
-            # Hidden sizes above 8192 make each thread run more than one vector
-            # iteration in the per-token global-scale kernel.
+            # Above 8192 the per-token global-scale kernel needs more than one
+            # pass over the row, and with n not a multiple of 8192 the per-thread
+            # pass counts differ.
             [1, 64, 12288, torch.bfloat16, False],
             [1, 64, 16384, torch.bfloat16, False],
         ],
