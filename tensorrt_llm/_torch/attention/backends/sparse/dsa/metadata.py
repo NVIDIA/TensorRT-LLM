@@ -13,7 +13,6 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention.backends.interface import idempotent_kv_lens_hook
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.utils import maybe_compile
@@ -616,7 +615,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 "will JIT-compile lazily on first touch instead."
             )
 
-    @idempotent_kv_lens_hook
     def on_update_kv_lens(self, skip_indexer_schedule: bool = False) -> None:
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.

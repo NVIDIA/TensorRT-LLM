@@ -63,27 +63,6 @@ class AttentionInputType(IntEnum):
     generation_only = 2
 
 
-def idempotent_kv_lens_hook(fn):
-    """Mark an ``on_update_kv_lens`` override as a pure rebuild from the current lengths.
-
-    Contract: everything the hook writes is derived from the metadata's current
-    seq/kv lengths and block offsets, so calling it twice equals calling it once.
-    A caller about to call it again with nothing reading its results in between
-    may therefore drop the first call (see ``kv_lens_hook_is_idempotent``).
-    """
-    fn.__idempotent_kv_lens_hook__ = True
-    return fn
-
-
-def kv_lens_hook_is_idempotent(metadata: "AttentionMetadata") -> bool:
-    """Whether the ``on_update_kv_lens`` that ``metadata`` dispatches to carries the marker.
-
-    Read from the class: a subclass override without the marker is not idempotent.
-    """
-    return getattr(
-        type(metadata).on_update_kv_lens, "__idempotent_kv_lens_hook__", False)
-
-
 @dataclass(kw_only=True)
 class AttentionMetadata:
     """

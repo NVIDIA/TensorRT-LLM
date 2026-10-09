@@ -15,10 +15,7 @@ from typing import Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionMetadata,
-    kv_lens_hook_is_idempotent,
-)
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.compilation.backend import Backend
@@ -2725,11 +2722,9 @@ class DecoderRunner(ScheduledModelRunner):
             and hasattr(attn_meta, "kv_lens_cuda")
         )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        # An idempotent hook that the correction repeats right after, with
-        # nothing reading its results in between, is called once.
-        if attn_meta is not None and not (
-            has_kv_lens_correction and kv_lens_hook_is_idempotent(attn_meta)
-        ):
+        # With a correction, the call after it does this: every on_update_kv_lens rebuilds
+        # from the current lengths and nothing reads its outputs in between.
+        if attn_meta is not None and not has_kv_lens_correction:
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
