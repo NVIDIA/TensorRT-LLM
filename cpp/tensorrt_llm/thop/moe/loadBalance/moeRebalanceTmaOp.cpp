@@ -193,8 +193,8 @@ public:
         mHelperCount = helperCountValue;
     }
 
-    void bindGpuDirect(
-        torch::Tensor ids, torch::Tensor levels, torch::Tensor owners, torch::Tensor workspace, int64_t capacity)
+    void bindGpuDirect(torch::Tensor ids, torch::Tensor levels, torch::Tensor owners, torch::Tensor workspace,
+        torch::Tensor status, torch::Tensor gridSync, int64_t capacity)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireLive();
@@ -206,11 +206,15 @@ public:
         checkBoundTensor(levels, mDevice, mHelperCount, "levels");
         checkBoundTensor(owners, mDevice, mHelperCount, "owners");
         checkBoundTensor(workspace, mDevice, 2 + 6LL * capacityValue, "workspace");
+        checkBoundTensor(status, mDevice, 6, "status");
+        checkBoundTensor(gridSync, mDevice, 2, "grid_sync");
 
         c10::cuda::CUDAGuard const deviceGuard(ids.device());
-        checkTmaResult(megamoe_tma_copy_bind_gpu_direct(mState, reinterpret_cast<uint64_t>(ids.data_ptr()),
-                           reinterpret_cast<uint64_t>(levels.data_ptr()), reinterpret_cast<uint64_t>(owners.data_ptr()),
-                           reinterpret_cast<uint64_t>(workspace.data_ptr()), capacityValue),
+        checkTmaResult(
+            megamoe_tma_copy_bind_gpu_direct(mState, reinterpret_cast<uint64_t>(ids.data_ptr()),
+                reinterpret_cast<uint64_t>(levels.data_ptr()), reinterpret_cast<uint64_t>(owners.data_ptr()),
+                reinterpret_cast<uint64_t>(workspace.data_ptr()), reinterpret_cast<uint64_t>(status.data_ptr()),
+                reinterpret_cast<uint64_t>(gridSync.data_ptr()), capacityValue),
             "moe rebalance TMA GPU-direct bind");
 
         // The native state stores raw device addresses. Retaining the tensors in
@@ -219,6 +223,8 @@ public:
         mLevels = std::move(levels);
         mOwners = std::move(owners);
         mWorkspace = std::move(workspace);
+        mStatus = std::move(status);
+        mGridSync = std::move(gridSync);
         mBound = true;
     }
 
@@ -287,6 +293,8 @@ public:
             mLevels = torch::Tensor();
             mOwners = torch::Tensor();
             mWorkspace = torch::Tensor();
+            mStatus = torch::Tensor();
+            mGridSync = torch::Tensor();
             mConfigured = false;
             mBound = false;
         }
@@ -333,6 +341,8 @@ private:
     torch::Tensor mLevels;
     torch::Tensor mOwners;
     torch::Tensor mWorkspace;
+    torch::Tensor mStatus;
+    torch::Tensor mGridSync;
 };
 
 using MoeRebalanceTmaStatePtr = c10::intrusive_ptr<MoeRebalanceTmaState>;
@@ -356,10 +366,11 @@ void moeRebalanceTmaConfigureGpuPlan(MoeRebalanceTmaStatePtr const& state, int64
 }
 
 void moeRebalanceTmaBindGpuDirect(MoeRebalanceTmaStatePtr const& state, torch::Tensor ids, torch::Tensor levels,
-    torch::Tensor owners, torch::Tensor workspace, int64_t capacity)
+    torch::Tensor owners, torch::Tensor workspace, torch::Tensor status, torch::Tensor gridSync, int64_t capacity)
 {
     TORCH_CHECK(state, "moe rebalance TMA state is null");
-    state->bindGpuDirect(std::move(ids), std::move(levels), std::move(owners), std::move(workspace), capacity);
+    state->bindGpuDirect(std::move(ids), std::move(levels), std::move(owners), std::move(workspace), std::move(status),
+        std::move(gridSync), capacity);
 }
 
 int64_t moeRebalanceTmaSubmitGpuDirect(MoeRebalanceTmaStatePtr const& state, int64_t flagMc)
@@ -412,7 +423,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_rebalance_tma_bind_gpu_direct("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, Tensor ids, Tensor levels, Tensor owners, "
-        "Tensor workspace, int capacity) -> ()");
+        "Tensor workspace, Tensor status, Tensor grid_sync, int capacity) -> ()");
     m.def(
         "moe_rebalance_tma_submit_gpu_direct("
         "__torch__.torch.classes.trtllm.MoeRebalanceTmaState state, int flag_mc) -> int");

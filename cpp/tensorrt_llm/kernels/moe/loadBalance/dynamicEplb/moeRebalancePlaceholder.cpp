@@ -75,7 +75,8 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState*, Megamoe
     return unsupported();
 }
 
-extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState*, uint64_t, uint64_t, uint64_t, uint64_t, int)
+extern "C" int megamoe_tma_copy_bind_gpu_direct(
+    MegamoeTmaCopyState*, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, int)
 {
     return unsupported();
 }

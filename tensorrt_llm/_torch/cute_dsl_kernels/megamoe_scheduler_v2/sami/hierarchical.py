@@ -688,6 +688,8 @@ class HierarchicalSamiWeightBroadcast:
                 raise TypeError("scheduler lacks the copy handoff lifecycle")
             if gpu_direct:
                 workspace = getattr(scheduler, "plan_workspace", None)
+                status = getattr(scheduler, "status", None)
+                grid_sync = getattr(scheduler, "grid_sync", None)
                 capacity = getattr(scheduler, "max_broadcasts", None)
                 if type(capacity) is not int or capacity <= 0:
                     raise ValueError("GPU-direct requires the scheduler plan capacity")
@@ -695,6 +697,12 @@ class HierarchicalSamiWeightBroadcast:
                         workspace.device != scheduler_device or workspace.dtype != torch.int32 or
                         not workspace.is_contiguous() or tuple(workspace.shape) != (2 + 6 * capacity,)):
                     raise ValueError("GPU-direct requires the original CUDA scheduler plan workspace")
+                if (not isinstance(status, torch.Tensor) or status.device != scheduler_device or
+                        status.dtype != torch.int32 or not status.is_contiguous() or status.numel() < 6):
+                    raise ValueError("GPU-direct requires the CUDA scheduler status workspace")
+                if (not isinstance(grid_sync, torch.Tensor) or grid_sync.device != scheduler_device or
+                        grid_sync.dtype != torch.int32 or not grid_sync.is_contiguous() or grid_sync.numel() < 2):
+                    raise ValueError("GPU-direct requires the CUDA scheduler epoch workspace")
                 native_bind = (torch.ops.trtllm.moe_rebalance_tma_bind_gpu_direct
                                if self._thop_tma else
                                getattr(self.mod, "bind_gpu_direct", None))
@@ -705,12 +713,14 @@ class HierarchicalSamiWeightBroadcast:
                 if gpu_direct:
                     bind(handle)
                     if self._thop_tma:
-                        native_bind(self.ctx, *tensors[1:], workspace, capacity)
+                        native_bind(self.ctx, *tensors[1:], workspace, status, grid_sync, capacity)
                     else:
                         native_bind(
                             self.ctx,
                             *(int(tensor.data_ptr()) for tensor in tensors[1:]),
                             int(workspace.data_ptr()),
+                            int(status.data_ptr()),
+                            int(grid_sync.data_ptr()),
                             capacity,
                         )
                 else:

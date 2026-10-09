@@ -672,6 +672,17 @@ def test_deepseek_v4_shared_fc12_uses_final_projection_quantization(
     assert DeepseekV4MoE._shared_fc12_quantization_supported(gate_up_quant, down_quant) is expected
 
 
+@pytest.mark.parametrize(("helper_slots", "expected"), [(0, False), (3, True)])
+def test_deepseek_v4_shared_fc12_requires_active_rebalance(helper_slots, expected):
+    backend = SimpleNamespace(_rebalance_slots_active=helper_slots)
+
+    assert DeepseekV4MoE._shared_fc12_rebalance_enabled(backend) is expected
+
+
+def test_deepseek_v4_shared_fc12_rejects_backend_without_rebalance_state():
+    assert not DeepseekV4MoE._shared_fc12_rebalance_enabled(SimpleNamespace())
+
+
 def test_dynamic_eplb_auxiliary_sm_budget_tracks_largest_serial_kernel(
     monkeypatch,
 ):

@@ -26,7 +26,7 @@ extern "C"
 {
 #endif
 
-#define MEGAMOE_TMA_COPY_ABI_VERSION 5
+#define MEGAMOE_TMA_COPY_ABI_VERSION 6
 #define MEGAMOE_TMA_COPY_SLICE_BYTES 8192
 #define MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES 32
 #define MEGAMOE_TMA_COPY_SLOT_DATA_BYTES 8208
@@ -210,8 +210,8 @@ extern "C"
      * after the copy kernel has read them. The Python endpoint enforces this lease.
      */
     int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanConfig const* config);
-    int megamoe_tma_copy_bind_gpu_direct(
-        MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners, uint64_t workspace, int capacity);
+    int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners,
+        uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity);
     int megamoe_tma_copy_submit_gpu_direct(
         MegamoeTmaCopyState* state, uint64_t flag_mc, uint64_t generation, void* cuda_stream);
     /* Explicit diagnostic only: synchronizes last work and copies one small result. */

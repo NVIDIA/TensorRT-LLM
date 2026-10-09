@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -624,7 +625,7 @@ constexpr auto kSliceReciprocals = make_slice_reciprocals();
 struct GpuDirectStorage
 {
     MegamoeTmaGpuPlanConfig config;
-    int const *ids, *levels, *owners, *workspace;
+    int const *ids, *levels, *owners, *workspace, *status, *grid_sync;
     int capacity;
     uint64_t max_segments;
     int* scratch;
@@ -642,6 +643,24 @@ __global__ void tma_copy_gpu_direct_kernel(GpuDirectStorage direct, int warps, i
     auto* segments = direct.segments + index * direct.max_segments;
     auto* ranges = direct.ranges + index * direct.max_segments;
     auto* result = direct.results + index;
+    __shared__ int scheduler_plan_ready;
+    if (threadIdx.x == 0)
+    {
+        bool status_ok = true;
+        for (int field = 0; field < 6; ++field)
+            status_ok &= direct.status[field] == 0;
+        auto const plan_epoch = static_cast<std::uint32_t>(direct.workspace[0]);
+        auto const scheduler_epoch = static_cast<std::uint32_t>(direct.grid_sync[1]);
+        scheduler_plan_ready = status_ok && plan_epoch == scheduler_epoch;
+        if (!scheduler_plan_ready && blockIdx.x == 0)
+            printf("GPU-direct in-switch copy: stale or failed scheduler plan; no READY published\n");
+    }
+    __syncthreads();
+    if (!scheduler_plan_ready)
+    {
+        asm volatile("trap;" ::: "memory");
+        return;
+    }
     // HALO-Q's existing workspace: epoch, count, six capacity-strided fields.
     int const* fields = direct.workspace + 2;
     int const cap = direct.capacity;
@@ -1242,11 +1261,11 @@ extern "C" int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, M
     return cudaSuccess;
 }
 
-extern "C" int megamoe_tma_copy_bind_gpu_direct(
-    MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners, uint64_t workspace, int capacity)
+extern "C" int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels,
+    uint64_t owners, uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity)
 {
-    if (!state || !ids || !levels || !owners || !workspace || (ids | levels | owners | workspace) % alignof(int)
-        || capacity < 1 || capacity > 384)
+    if (!state || !ids || !levels || !owners || !workspace || !status || !grid_sync
+        || (ids | levels | owners | workspace | status | grid_sync) % alignof(int) || capacity < 1 || capacity > 384)
         return cudaErrorInvalidValue;
     std::lock_guard<std::mutex> lock(state->submit_mutex);
     if (!state->direct_configured || state->direct_bound || state->work_queued)
@@ -1257,7 +1276,7 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(
         return error;
     if (device != state->config.device)
         return cudaErrorInvalidDevice;
-    for (auto ptr : {ids, levels, owners, workspace})
+    for (auto ptr : {ids, levels, owners, workspace, status, grid_sync})
     {
         cudaPointerAttributes attr{};
         error = cudaPointerGetAttributes(&attr, reinterpret_cast<void*>(ptr));
@@ -1271,6 +1290,8 @@ extern "C" int megamoe_tma_copy_bind_gpu_direct(
     d.levels = reinterpret_cast<int const*>(levels);
     d.owners = reinterpret_cast<int const*>(owners);
     d.workspace = reinterpret_cast<int const*>(workspace);
+    d.status = reinterpret_cast<int const*>(status);
+    d.grid_sync = reinterpret_cast<int const*>(grid_sync);
     d.capacity = capacity;
     state->direct_bound = true;
     return cudaSuccess;
@@ -1306,6 +1327,8 @@ extern "C" int megamoe_tma_copy_submit_gpu_direct(
     state->last_stream = stream;
     state->work_queued = true;
     auto const& c = state->config;
+    // Keep this an ordinary same-stream launch: programmatic stream serialization
+    // could observe a stale matching modular epoch before HALO-Q publishes.
     tma_copy_gpu_direct_kernel<<<c.sms, c.threads_per_cta, c.dynamic_shared_bytes, stream>>>(
         state->direct, c.warps, c.total_slots, state->completed_ctas, flag_mc, generation);
     error = cudaGetLastError();

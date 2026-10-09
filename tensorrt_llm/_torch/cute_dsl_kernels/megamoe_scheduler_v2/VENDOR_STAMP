@@ -1,10 +1,9 @@
 upstream: https://gitlab-master.nvidia.com/jintaop/cutedsl_eplb_scheduler_copy
-commit: fa6e81ed048a2afc023fda717fbfcf15514b0684
-halo_q_only_commit: 812b7a560205070fd5642a7a88b0a4541e20ce81
+commit: 4f71c8bb46c4b4c262b71eb279172749b4dec4d1
 original_authors: Jintao Peng <jintaop@nvidia.com>; Ethan Zhang
 license: Apache-2.0
 source_tree_dirty: false
 kind: complete scheduler package
 downstream_modified: true
 manifest: VENDOR_MANIFEST.json
-Downstream changes and the HALO-Q-only follow-up are recorded in VENDOR_MANIFEST.json.
+Downstream THOP integration, native-cache hardening, and demo-launcher omission are recorded in VENDOR_MANIFEST.json.

@@ -417,8 +417,11 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
     fake_torch = SimpleNamespace(
         cuda=SimpleNamespace(is_initialized=lambda: initialized),
     )
+    process_queue = os.environ.get(_QUEUE)
+    test_environ = os.environ.copy()
+    test_environ.pop(_QUEUE, None)
+    monkeypatch.setattr(module, "os", SimpleNamespace(environ=test_environ))
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.delenv(_QUEUE, raising=False)
 
     def config(enabled=True, slots=4, active=None):
         if active is None:
@@ -437,29 +440,30 @@ def test_launch_queue_is_on_only_and_reaches_process_entrypoints(monkeypatch):
     assert configured == {"KEEP": "value", _QUEUE: "4x"}
     assert configured is not original
     assert original == {"KEEP": "value"}
-    assert os.environ[_QUEUE] == "4x"
+    assert test_environ[_QUEUE] == "4x"
     assert module.configure_moe_launch_queues(config(), configured) == configured
 
     for off in (None, config(enabled=False), config(slots=0)):
-        monkeypatch.delenv(_QUEUE, raising=False)
+        test_environ.pop(_QUEUE, None)
         before = {"KEEP": "value"}
         assert module.configure_moe_launch_queues(off, before) is before
-        assert _QUEUE not in os.environ
+        assert _QUEUE not in test_environ
 
     initialized = True
     before = {"KEEP": "value"}
     assert module.configure_moe_launch_queues(config(active=False), before) is before
-    assert _QUEUE not in os.environ
+    assert _QUEUE not in test_environ
 
     with pytest.raises(RuntimeError, match="before CUDA initialization"):
         module.configure_moe_launch_queues(config(), original)
     assert original == {"KEEP": "value"}
-    assert _QUEUE not in os.environ
+    assert _QUEUE not in test_environ
 
-    monkeypatch.setenv("TRTLLM_MOE_REBALANCE_DISABLE", "1")
+    test_environ["TRTLLM_MOE_REBALANCE_DISABLE"] = "1"
     disabled = {"TRTLLM_MOE_REBALANCE_DISABLE": "1"}
     assert module.configure_moe_launch_queues(config(active=False), disabled) is disabled
-    assert _QUEUE not in os.environ
+    assert _QUEUE not in test_environ
+    assert os.environ.get(_QUEUE) == process_queue
 
     entrypoints = (
         (
@@ -619,6 +623,59 @@ def test_halo_q_is_the_only_scheduler_planner():
     assert len(launch.args) == 26
 
 
+def test_dynamic_eplb_native_abi_versions_match_loaders():
+    halo_source = (
+        _TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler_v2/cuda_scheduler/csrc/"
+        "halo_q_scheduler.cu"
+    ).read_text()
+    native_loader = (_TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler_v2/native.py").read_text()
+    assert '"ABI_VERSION", 6' in halo_source
+    assert 'getattr(module, "ABI_VERSION", 0)) != 6' in native_loader
+
+    tma_headers = (
+        _ROOT / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h",
+        _TORCH_ROOT / "cute_dsl_kernels/megamoe_scheduler_v2/csrc/in_switch_copy/tma_copy.h",
+    )
+    assert all("MEGAMOE_TMA_COPY_ABI_VERSION 6" in path.read_text() for path in tma_headers)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (
+        "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.cu",
+        "tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/csrc/in_switch_copy/tma_copy.cu",
+    ),
+)
+def test_gpu_direct_tma_fails_closed_on_stale_scheduler_plan(relative):
+    source = (_ROOT / relative).read_text()
+    begin = source.index("__global__ void tma_copy_gpu_direct_kernel")
+    end = source.index("cudaError_t validate_descriptors", begin)
+    kernel = source[begin:end]
+
+    status_check = kernel.index("for (int field = 0; field < 6; ++field)")
+    epoch_check = min(
+        kernel.index(expression)
+        for expression in ("planEpoch == schedulerEpoch", "plan_epoch == scheduler_epoch")
+        if expression in kernel
+    )
+    rejection = min(
+        kernel.index(expression)
+        for expression in ("if (!schedulerPlanReady)", "if (!scheduler_plan_ready)")
+        if expression in kernel
+    )
+    build_plan = kernel.index("publish_plan_channel_warp<false>")
+    ready = kernel.index("finish_cta_and_notify")
+
+    assert status_check < epoch_check < rejection < build_plan < ready
+    assert 'asm volatile("trap;"' in kernel[rejection:build_plan]
+
+    submit_begin = source.index("megamoe_tma_copy_submit_gpu_direct")
+    submit = source[submit_begin:]
+    assert "tma_copy_gpu_direct_kernel<<<" in submit
+    assert "cudaLaunchAttributeProgrammaticStreamSerialization" not in submit
+    assert "cudaLaunchKernelEx" not in submit
+
+
 def test_direct_submit_orders_generations_and_defers_the_route_wait():
     trace = []
     state = SimpleNamespace(device=0, thread=7)
@@ -645,6 +702,7 @@ def test_direct_submit_orders_generations_and_defers_the_route_wait():
         setattr(group, name, 0)
     group._plan_part = None
     group._pending_release = None
+    group._closed = False
     group._owner_thread_id = None
     group._execution_stream_handle = None
     group.device = 0
@@ -801,6 +859,7 @@ def test_warmup_owner_handoff_drains_once_and_deduplicates_groups():
         group._stream_handle = 99
         group.copy_stream = SimpleNamespace(priority=-1)
         group._plan_part = None
+        group._closed = False
         group._generation = group._finished_generation = group.plan_calls = 3
         group._pending_release = (3, object())
         if bound:
@@ -945,8 +1004,10 @@ def test_on_autotune_uses_distinct_tactics_and_state_contract(monkeypatch):
     assert not backend.is_rebalance_active()
 
 
-def test_on_autotune_builds_balanced_powerlaw_input():
+def test_on_autotune_builds_balanced_powerlaw_input(request):
     torch = pytest.importorskip("torch")
+    original_num_threads = torch.get_num_threads()
+    request.addfinalizer(lambda: torch.set_num_threads(original_num_threads))
     torch.set_num_threads(4)
     helpers = _autotune_helpers(torch)
     kwargs = dict(

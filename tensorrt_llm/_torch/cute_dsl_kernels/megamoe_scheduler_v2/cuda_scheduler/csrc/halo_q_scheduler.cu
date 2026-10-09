@@ -29,6 +29,7 @@ constexpr int kMaxBroadcasts = kMaxExperts;
 constexpr int kHelperMaskWords = (kMaxBroadcasts + 31) / 32;
 constexpr int kMinGroup = 4;
 constexpr int kSymPayloadOffset = 64;
+using Epoch = std::uint32_t;
 
 enum PlanField
 {
@@ -58,46 +59,75 @@ __device__ __forceinline__ int imax(int a, int b)
     return a > b ? a : b;
 }
 
-__device__ __forceinline__ int fetch_add_release_device(int* address, int value)
+__device__ __forceinline__ Epoch fetch_add_acq_rel_device(int* address, Epoch value)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_device> atom(*address);
-    return atom.fetch_add(value, cuda::memory_order_release);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_device> atom(*value_address);
+    return atom.fetch_add(value, cuda::memory_order_acq_rel);
 }
 
-__device__ __forceinline__ int load_acquire_device(int* address)
+__device__ __forceinline__ Epoch load_acquire_device(int* address)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_device> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_device> atom(*value_address);
     return atom.load(cuda::memory_order_acquire);
 }
 
-__device__ __forceinline__ int load_relaxed_device(int* address)
+__device__ __forceinline__ Epoch load_relaxed_device(int* address)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_device> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_device> atom(*value_address);
     return atom.load(cuda::memory_order_relaxed);
 }
 
-__device__ __forceinline__ void store_release_device(int* address, int value)
+__device__ __forceinline__ void store_relaxed_device(int* address, Epoch value)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_device> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_device> atom(*value_address);
+    atom.store(value, cuda::memory_order_relaxed);
+}
+
+__device__ __forceinline__ void store_release_device(int* address, Epoch value)
+{
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_device> atom(*value_address);
     atom.store(value, cuda::memory_order_release);
 }
 
-__device__ __forceinline__ int load_acquire_system(int* address)
+__device__ __forceinline__ Epoch load_acquire_system(int* address)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_system> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_system> atom(*value_address);
     return atom.load(cuda::memory_order_acquire);
 }
 
-__device__ __forceinline__ int load_relaxed_system(int* address)
+__device__ __forceinline__ Epoch load_relaxed_system(int* address)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_system> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_system> atom(*value_address);
     return atom.load(cuda::memory_order_relaxed);
 }
 
-__device__ __forceinline__ void store_release_system(int* address, int value)
+__device__ __forceinline__ void store_release_system(int* address, Epoch value)
 {
-    cuda::atomic_ref<int, cuda::thread_scope_system> atom(*address);
+    auto* value_address = reinterpret_cast<Epoch*>(address);
+    cuda::atomic_ref<Epoch, cuda::thread_scope_system> atom(*value_address);
     atom.store(value, cuda::memory_order_release);
+}
+
+__device__ __forceinline__ bool epoch_before(Epoch observed, Epoch expected)
+{
+    // RFC-1982-style serial comparison: all arithmetic remains unsigned and
+    // is unambiguous while peers differ by fewer than half the epoch space.
+    return observed != expected && expected - observed < (Epoch{1} << 31);
+}
+
+__device__ __forceinline__ void record_status(int* address, Epoch epoch)
+{
+    // Zero is reserved for "never failed". Preserve a nonzero sticky error at
+    // the one modular epoch whose bit pattern is zero.
+    const Epoch value = epoch == 0 ? ~Epoch{0} : epoch;
+    atomicExch(reinterpret_cast<Epoch*>(address), value);
 }
 
 __device__ __forceinline__ int* plan_field(int* plan, int field)
@@ -140,9 +170,10 @@ __host__ __device__ __forceinline__ int broadcast_capacity(int ep, int experts, 
     return receive_bound < experts ? receive_bound : experts;
 }
 
-__device__ int grid_rendezvous(int* sync, int blocks, unsigned long long spin_cycles, int* status)
+__device__ bool grid_rendezvous(
+    int* sync, int blocks, unsigned long long spin_cycles, int* status, Epoch* completed_epoch)
 {
-    __shared__ int generation;
+    __shared__ Epoch generation;
     __shared__ int success;
     /* The block barrier orders every writer's stores before thread zero's
      * device-scope release advertises this CTA. */
@@ -150,28 +181,44 @@ __device__ int grid_rendezvous(int* sync, int blocks, unsigned long long spin_cy
     if (threadIdx.x == 0)
     {
         success = 1;
-        /* One monotonic counter is graph-replay safe and exactly mirrors the
-         * reset-free rendezvous. */
-        int old = fetch_add_release_device(sync, 1);
-        int target = (old / blocks + 1) * blocks;
-        generation = target / blocks;
-        unsigned long long start = clock64();
-        int observed = load_relaxed_device(sync);
-        while (observed < target)
+        const Epoch current = load_relaxed_device(sync + 1);
+        const Epoch target = current + 1;
+        generation = target;
+        const Epoch old = fetch_add_acq_rel_device(sync, 1);
+        if (old == static_cast<Epoch>(blocks - 1))
         {
-            if (clock64() - start > spin_cycles)
-            {
-                atomicExch(status + 1, generation);
-                success = 0;
-                break;
-            }
-            observed = load_relaxed_device(sync);
+            // The last CTA resets arrivals before publishing the next modular
+            // epoch. Stream ordering prevents a new launch from entering until
+            // every CTA in this launch has observed the release.
+            store_relaxed_device(sync, 0);
+            store_release_device(sync + 1, target);
         }
-        if (observed >= target)
-            (void) load_acquire_device(sync);
+        else if (old >= static_cast<Epoch>(blocks))
+        {
+            record_status(status + 1, target);
+            success = 0;
+        }
+        else
+        {
+            unsigned long long const start = clock64();
+            Epoch observed = load_relaxed_device(sync + 1);
+            while (epoch_before(observed, target))
+            {
+                if (clock64() - start > spin_cycles)
+                {
+                    record_status(status + 1, target);
+                    success = 0;
+                    break;
+                }
+                observed = load_relaxed_device(sync + 1);
+            }
+            if (!epoch_before(observed, target))
+                (void) load_acquire_device(sync + 1);
+        }
     }
     __syncthreads();
-    return success ? generation : -1;
+    *completed_epoch = generation;
+    return success != 0;
 }
 
 __device__ void local_histogram_pass(int const* routes, int* partial, int route_count, int expert_count, int ctas)
@@ -194,9 +241,9 @@ __device__ void local_histogram_pass(int const* routes, int* partial, int route_
     int const warp_span = ((cta_span + warps * 32 - 1) / (warps * 32)) * 32;
     int const begin = cta_begin + warp * warp_span;
     int const end = imin(cta_end, begin + warp_span);
-    /* Issue a small load group before consuming it to expose memory-level
-     * parallelism. The binning is unchanged, and atomicAdd regrouping is
-     * safe because integer addition commutes. */
+    /* `routes` is cold on every iteration because MegaMoE runs in between and
+     * evicts it. Issue four loads before consuming any. The binning is unchanged,
+     * and the atomicAdd regrouping is safe because integer addition commutes. */
     constexpr int kBatch = 4;
     for (int base_index = begin; base_index < end; base_index += 32 * kBatch)
     {
@@ -231,7 +278,7 @@ __device__ void local_histogram_pass(int const* routes, int* partial, int route_
 }
 
 /* Re-rank all local routes on the C-1 worker CTAs while CTA0 performs the
- * cross-rank exchange and planner.  route_aux[0] is a reset-free worker
+ * cross-rank exchange and planner.  route_aux[0:2] is a reusable worker
  * rendezvous; the following NWORK*(E+1) entries hold per-worker totals.
  * Per-warp cursors remain in this CTA's shared memory until materialization. */
 __device__ bool stable_worker_ordinal_pass(int const* routes, int* ordinal, int* route_aux, int* status,
@@ -274,7 +321,7 @@ __device__ bool stable_worker_ordinal_pass(int const* routes, int* ordinal, int*
     }
     __syncthreads();
 
-    int* worker_totals = route_aux + 1;
+    int* worker_totals = route_aux + 2;
     for (int bin = tid; bin < bins; bin += blockDim.x)
     {
         int total = 0;
@@ -285,7 +332,8 @@ __device__ bool stable_worker_ordinal_pass(int const* routes, int* ordinal, int*
 
     /* The first all-CTA rendezvous guarantees every worker is resident, so a
      * worker-only global barrier cannot wait on an unscheduled CTA. */
-    if (grid_rendezvous(route_aux, workers, spin_cycles, status) < 0)
+    Epoch worker_epoch;
+    if (!grid_rendezvous(route_aux, workers, spin_cycles, status, &worker_epoch))
         return false;
 
     for (int bin = tid; bin < bins; bin += blockDim.x)
@@ -307,15 +355,15 @@ __device__ bool stable_worker_ordinal_pass(int const* routes, int* ordinal, int*
 
 template <int FixedEp>
 __device__ bool exchange_counts(unsigned long long const* peer_bases, int const* partial, int* shared, int ep,
-    int expert_count, int local_rank, int ctas, int epoch, unsigned long long spin_cycles, int* status)
+    int expert_count, int local_rank, int ctas, Epoch epoch, unsigned long long spin_cycles, int* status)
 {
     int const exchange_ep = FixedEp > 0 ? FixedEp : ep;
     int const tid = threadIdx.x;
     __shared__ int wait_failed;
     if (tid == 0)
         wait_failed = 0;
-    /* Keep the simple accumulation loop; the compiler provides the required
-     * pipelining without explicit batching. */
+    /* Manual unrolling did not improve this loop; the compiler already
+     * pipelines the loads. */
     for (int expert = tid; expert < expert_count; expert += blockDim.x)
     {
         int count = 0;
@@ -335,8 +383,8 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     {
         int* peer = reinterpret_cast<int*>(peer_bases[destination]);
         int* row = peer + kSymPayloadOffset + (parity * exchange_ep + local_rank) * expert_count;
-        /* Keep scalar remote stores for the publication path; the local mirror
-         * copy below uses vector transfers when alignment permits. */
+        /* Wider stores do not improve the remote write path. The local mirror
+         * copy on the way back in remains vectorized below. */
         for (int expert = lane; expert < expert_count; expert += 32)
             row[expert] = shared[expert];
         /* Warp synchronization orders every lane's row stores before lane
@@ -352,18 +400,18 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
     if (tid < exchange_ep)
     {
         unsigned long long start = clock64();
-        int observed = load_relaxed_system(local + tid);
-        while (observed < epoch)
+        Epoch observed = load_relaxed_system(local + tid);
+        while (epoch_before(observed, epoch))
         {
             if (clock64() - start > spin_cycles)
             {
-                atomicExch(status + 0, epoch);
+                record_status(status + 0, epoch);
                 atomicExch(&wait_failed, 1);
                 break;
             }
             observed = load_relaxed_system(local + tid);
         }
-        if (observed >= epoch)
+        if (!epoch_before(observed, epoch))
             (void) load_acquire_system(local + tid);
     }
     __syncthreads();
@@ -371,7 +419,7 @@ __device__ bool exchange_counts(unsigned long long const* peer_bases, int const*
         return false;
     int const* payload = local + kSymPayloadOffset + parity * exchange_ep * expert_count;
     int const total = exchange_ep * expert_count;
-    /* Vectorize the local mirror copy when shape and alignment permit. */
+    /* Vectorize the aligned local mirror copy and retain a scalar fallback. */
     if ((total & 3) == 0 && (reinterpret_cast<uintptr_t>(payload) & 15) == 0)
     {
         int4 const* source = reinterpret_cast<int4 const*>(payload);
@@ -1219,8 +1267,7 @@ __device__ __forceinline__ void scheduler_tail_barrier()
 
 /* Build order[] and host_mask[] with one lane per broadcast.
  *
- * This replaces serial insertion-sort and mask-construction loops while
- * preserving the same stable order.
+ * Replaces a single-threaded O(k^2) insertion sort plus an O(k*g) mask loop.
  *
  * order[]:  lane b's position is the number of broadcasts that sort before it.
  *           The `j < lane` tiebreak makes this the same stable order the
@@ -1247,9 +1294,12 @@ __device__ __forceinline__ void halo_q_build_order_and_masks(int const* p_expert
         }
         return;
     }
-    /* Read p_expert cooperatively and distribute values with shuffles. All
-     * lanes must participate before inactive lanes return; inactive lanes
-     * carry INT_MAX and never contribute to a real comparison. */
+    /* The rank scan reads p_expert[j] for every j on every lane, and p_expert is
+     * global and cold. One coalesced read plus shuffles replaces it. The
+     * early `return` had to go first: a __shfl_sync under it would have an
+     * incomplete participating mask.  Only warp 0 calls this, so all 32 lanes
+     * are converged here.  Inactive lanes carry INT_MAX, are never the `other`
+     * of a real comparison because j < broadcasts, and write nothing. */
     bool const active = lane < broadcasts;
     int const mine = active ? p_expert[lane] : INT_MAX;
     int position = 0;
@@ -1292,8 +1342,12 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
             if (broadcasts >= 2)
             {
                 int const ring_size = plan_ep - 1;
-                /* Use two unconditional repair rounds. Phases with no required repair
-                 * are no-ops, so this preserves the conditional algorithm's result. */
+                /* EP8 used to scan after one round to decide which phases of
+                 * round two were needed. Two unconditional rounds, as used by
+                 * every other EP, give an identical result:
+                 * the scan only ever skipped phases it had proven need no
+                 * repair, and running such a phase is a no-op, since
+                 * halo_q_pair8 writes each quota back unchanged at delta 0. */
                 int const repair_rounds = 2;
                 for (int round = 0; round < repair_rounds; ++round)
                 {
@@ -1332,7 +1386,8 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
                 }
             }
         }
-        /* The unconditional repair rounds above replace the conditional scan. */
+        /* The EP8 28-pair repair scan lived here; `repair_rounds = 2` above
+         * replaces it.  See the comment there for why the two are equivalent. */
         return;
     }
     if (warp == 0)
@@ -1378,7 +1433,7 @@ __device__ void run_halo_q(int const* counts, int* quota, int* plan, int broadca
 }
 
 __device__ void color_and_publish_local(int* plan, int broadcasts, int ep, int helpers, int local_rank, int* used,
-    int* out_ids, int* out_levels, int* out_owners, int* status, int epoch)
+    int* out_ids, int* out_levels, int* out_owners, int* status, Epoch epoch)
 {
     int* p_expert = plan_field(plan, kPlanExpert);
     int* p_level = plan_field(plan, kPlanLevel);
@@ -1410,7 +1465,7 @@ __device__ void color_and_publish_local(int* plan, int broadcasts, int ep, int h
                 }
             if (helper < 0)
             {
-                atomicExch(status + 4, epoch);
+                record_status(status + 4, epoch);
                 helper = 0;
             }
             p_helper[b] = helper;
@@ -1430,7 +1485,7 @@ __device__ void color_and_publish_local(int* plan, int broadcasts, int ep, int h
             continue;
         int helper = p_helper[b];
         if (out_ids[helper] != -1)
-            atomicExch(status + 4, epoch);
+            record_status(status + 4, epoch);
         out_ids[helper] = p_expert[b];
         out_levels[helper] = p_level[b];
         out_owners[helper] = p_owner[b];
@@ -1505,24 +1560,24 @@ __device__ void prepare_worker_selected_experts(int* expert_lut, int const* plan
     __syncthreads();
 }
 
-__device__ bool wait_for_plan_epoch(int* marker, int epoch, unsigned long long spin_cycles, int* status, int* ready)
+__device__ bool wait_for_plan_epoch(int* marker, Epoch epoch, unsigned long long spin_cycles, int* status, int* ready)
 {
     if (threadIdx.x == 0)
     {
         *ready = 1;
         unsigned long long start = clock64();
-        int observed = load_relaxed_device(marker);
-        while (observed < epoch)
+        Epoch observed = load_relaxed_device(marker);
+        while (epoch_before(observed, epoch))
         {
             if (clock64() - start > spin_cycles)
             {
-                atomicExch(status + 2, epoch);
+                record_status(status + 2, epoch);
                 *ready = 0;
                 break;
             }
             observed = load_relaxed_device(marker);
         }
-        if (observed >= epoch)
+        if (!epoch_before(observed, epoch))
             (void) load_acquire_device(marker);
     }
     __syncthreads();
@@ -1548,7 +1603,7 @@ __device__ __forceinline__ int route_destination(int const* prefix, int ordinal,
  * route while CTA0 runs HALO-Q.  Selected route indices are compacted into
  * disjoint slices of route_aux; their ordinal values remain in output. */
 __device__ void pre_materialize_and_compact_worker_routes(int const* routes, int* output, int* route_aux, int* status,
-    int route_count, int experts, int worker, int workers, int epoch)
+    int route_count, int experts, int worker, int workers, Epoch epoch)
 {
     extern __shared__ int shared[];
     int const tid = threadIdx.x;
@@ -1557,7 +1612,7 @@ __device__ void pre_materialize_and_compact_worker_routes(int const* routes, int
     int const warps = blockDim.x >> 5;
     int const bins = experts + 1;
     int* expert_lut = worker_expert_lut(experts);
-    int* hot_indices = route_aux + 1 + workers * bins;
+    int* hot_indices = route_aux + 2 + workers * bins;
 
     int const worker_span = (route_count + workers - 1) / workers;
     int const worker_begin = worker * worker_span;
@@ -1582,7 +1637,7 @@ __device__ void pre_materialize_and_compact_worker_routes(int const* routes, int
         }
         else if (active && expert != -1)
         {
-            atomicExch(status + 3, epoch);
+            record_status(status + 3, epoch);
         }
         unsigned hot_mask = __ballot_sync(0xffffffffu, hot);
         if (hot)
@@ -1603,7 +1658,8 @@ __device__ void pre_materialize_and_compact_worker_routes(int const* routes, int
 /* The final epoch only has to resolve selected routes.  Stable ordinal
  * cursors remain in the per-warp shared histogram from the initial pass. */
 __device__ void materialize_worker_hot_routes(int const* routes, int* output, int const* route_prefix, int const* plan,
-    int* route_aux, int* status, int route_count, int ep, int experts, int helpers, int worker, int workers, int epoch)
+    int* route_aux, int* status, int route_count, int ep, int experts, int helpers, int worker, int workers,
+    Epoch epoch)
 {
     extern __shared__ int shared[];
     int const lane = threadIdx.x & 31;
@@ -1611,7 +1667,7 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
     int const warps = blockDim.x >> 5;
     int const bins = experts + 1;
     int* expert_lut = worker_expert_lut(experts);
-    int* hot_indices = route_aux + 1 + workers * bins;
+    int* hot_indices = route_aux + 2 + workers * bins;
     int const home = experts / ep;
     int const local_slots = home + helpers;
     int const* p_begin = plan + 2 + kPlanGroupBegin * kMaxBroadcasts;
@@ -1646,14 +1702,14 @@ __device__ void materialize_worker_hot_routes(int const* routes, int* output, in
         }
         else
         {
-            atomicExch(status + 5, epoch);
+            record_status(status + 5, epoch);
         }
         output[index] = slot;
     }
 }
 
 __device__ void materialize_worker_routes(int const* routes, int* output, int const* route_prefix, int const* plan,
-    int* status, int route_count, int ep, int experts, int helpers, int worker, int workers, int epoch)
+    int* status, int route_count, int ep, int experts, int helpers, int worker, int workers, Epoch epoch)
 {
     extern __shared__ int shared[];
     int const tid = threadIdx.x;
@@ -1702,13 +1758,13 @@ __device__ void materialize_worker_routes(int const* routes, int* output, int co
                 }
                 else
                 {
-                    atomicExch(status + 5, epoch);
+                    record_status(status + 5, epoch);
                 }
             }
         }
         else if (expert != -1)
         {
-            atomicExch(status + 3, epoch);
+            record_status(status + 3, epoch);
         }
         output[index] = slot;
     }
@@ -1738,8 +1794,9 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
          index += gridDim.x * blockDim.x)
         out_slots[index] = -1;
     local_histogram_pass(routes, partial, route_count, experts, ctas);
-    int const epoch = grid_rendezvous(grid_sync, ctas, spin_cycles, status);
-    if (epoch < 0)
+    Epoch epoch;
+    bool const rendezvous_ok = grid_rendezvous(grid_sync, ctas, spin_cycles, status, &epoch);
+    if (!rendezvous_ok)
         return;
 
     if (blockIdx.x == 0)
@@ -1839,9 +1896,13 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
         if (ctas > 1)
         {
             int const warp = threadIdx.x >> 5;
-            /* build_route_prefix is independent of warp 8's outputs. Defer their
-             * rendezvous until both paths reach their first shared consumer so
-             * prefix construction and coloring can overlap safely. */
+            /* build_route_prefix reads p_expert, counts and quota, none of
+             * which warp 8 touches -- warp 8 writes p_helper, out_ids/levels/
+             * owners and the recv_used scratch.  The first consumers of those
+             * are publish_plan_channel and the worker CTAs after the release
+             * below, so the rendezvous with warp 8 belongs after the prefix,
+             * not before it. This lets colouring overlap the prefix before the
+             * worker release. */
             if (warp == 0)
             {
                 build_route_prefix(counts, quota, route_prefix, plan, broadcasts, ep, experts, local_rank, 32);
@@ -1851,8 +1912,8 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
                 scheduler_tail_barrier();
             if (warp == 0)
             {
-                /* Release the worker CTAs here rather than after the channel
-                 * publish.  They gate on grid_sync+1 and consume route_prefix,
+                /* Release the 55 worker CTAs here rather than after the channel
+                 * publish.  They gate on grid_sync+2 and consume route_prefix,
                  * which is complete above; plan_channel is consumed only by the
                  * copy stack, which acquires on the channel's own epoch word
                  * written with store_release_system below.  Publishing after
@@ -1860,13 +1921,15 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
                  * actually determines when the kernel ends -- overlap the whole
                  * publish instead of waiting behind it. */
                 if (threadIdx.x == 0)
-                    store_release_device(grid_sync + 1, epoch);
+                    store_release_device(grid_sync + 2, epoch);
                 sami_copy::publish_plan_channel_warp(plan_channel, out_ids, out_levels, out_owners,
                     copy_placement_view(plan), helpers, ep, local_rank, experts, plan_abi_version, route_features);
                 __syncwarp();
             }
             return;
         }
+        if (threadIdx.x == 0)
+            store_release_device(plan + 0, epoch);
         __syncthreads();
         build_route_prefix(counts, quota, route_prefix, plan, broadcasts, ep, experts, local_rank, blockDim.x);
         __syncthreads();
@@ -1890,7 +1953,7 @@ __global__ __launch_bounds__(512, 1) void halo_q_scheduler_kernel(int const* rou
         prepare_worker_selected_experts(expert_lut, plan);
         pre_materialize_and_compact_worker_routes(
             routes, out_slots, route_aux, status, route_count, experts, worker, workers, epoch);
-        if (!wait_for_plan_epoch(grid_sync + 1, epoch, spin_cycles, status, &plan_ready))
+        if (!wait_for_plan_epoch(grid_sync + 2, epoch, spin_cycles, status, &plan_ready))
             return;
         materialize_worker_hot_routes(routes, out_slots, route_prefix, plan, route_aux, status, route_count, ep,
             experts, helpers, worker, workers, epoch);
@@ -2035,7 +2098,7 @@ PyMethodDef methods[] = {
 PyModuleDef module = {
     PyModuleDef_HEAD_INIT,
     "megamoe_halo_q_cuda",
-    "Pure-CUDA HALO-Q physical-slot scheduler.",
+    "Pure-CUDA legacy/HALO-Q physical-slot scheduler.",
     -1,
     methods,
 };
@@ -2047,7 +2110,7 @@ PyMODINIT_FUNC PyInit_megamoe_halo_q_cuda(void)
     PyObject* result = PyModule_Create(&module);
     if (!result)
         return nullptr;
-    PyModule_AddIntConstant(result, "ABI_VERSION", 5);
+    PyModule_AddIntConstant(result, "ABI_VERSION", 6);
     PyModule_AddIntConstant(result, "MAX_BROADCASTS", kMaxBroadcasts);
     return result;
 }

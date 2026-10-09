@@ -279,7 +279,7 @@ def _validate_sami(module: object) -> None:
 
 
 def _validate_halo_q(module: object) -> None:
-    if int(getattr(module, "ABI_VERSION", 0)) != 5:
+    if int(getattr(module, "ABI_VERSION", 0)) != 6:
         raise RuntimeError("pure-CUDA scheduler extension ABI mismatch")
 
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-Subject: Use a private per-user native build cache
+Subject: Use a private per-user native build cache.
 
 diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py
 --- a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/native.py

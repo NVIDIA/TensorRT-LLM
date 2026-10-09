@@ -16,6 +16,7 @@
 
 import dataclasses
 import importlib
+import inspect
 import itertools
 import logging
 import os
@@ -102,6 +103,11 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoECuteDsl,
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
+)
+from tensorrt_llm._torch.moe.fused_moe.mega_moe.rebalance_slot_scheduler_v2 import (
+    RebalanceSlotSchedulerGroupV2,
+    _V2LiveBankLeaseProvider,
+    apply_rebalance_scheduler,
 )
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     _reject_unsupported_activation,
@@ -1519,6 +1525,7 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
         transform_weights=MagicMock(),
         cache_derived_state=MagicMock(),
     )
+    moe._build_rebalance_scheduler_group = MagicMock()
     moe.quant_method = quant_method
 
     moe.post_load_weights()
@@ -1526,6 +1533,7 @@ def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
 
     quant_method.transform_weights.assert_called_once_with(moe)
     quant_method.cache_derived_state.assert_called_once_with(moe)
+    moe._build_rebalance_scheduler_group.assert_called_once_with()
     assert moe._weights_transformed is True
 
 
@@ -1568,6 +1576,112 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
         world_size=8,
         device_id=torch.device("cuda", 2),
     )
+
+def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
+    trace = []
+    completion_event = object()
+    outputs = SimpleNamespace(physical_slot_ids=[3, 4])
+    part = (outputs, 2)
+    copy_stream = object()
+
+    group = RebalanceSlotSchedulerGroupV2.__new__(RebalanceSlotSchedulerGroupV2)
+    group._check_owner = MagicMock()
+    group._plan_part = part
+    group._generation = 1
+    group._finished_generation = 0
+    group._scheduled_generation = 1
+    group._route_wait_generation = 0
+    group._pending_release = None
+    group.plan_calls = 0
+    group._consumer_done = completion_event
+    group._consumer_done_handle = 17
+    group._execution_stream_handle = 23
+    group.copy_stream = copy_stream
+    group.scheduler_stream = copy_stream
+
+    def wait_for_routes():
+        trace.append("wait_routes")
+        group._route_wait_generation = group._generation
+
+    def record_event(event_handle, stream_handle):
+        assert (event_handle, stream_handle) == (17, 23)
+        trace.append("record_consumer_done")
+
+    broadcaster = SimpleNamespace(
+        release_generation_after=MagicMock(
+            side_effect=lambda generation, event: trace.append("release_generation")
+        ),
+        mark_collective_reuse_safe=MagicMock(
+            side_effect=lambda authority, generation: trace.append("prove_reuse")
+        ),
+    )
+    group.wait_for_routes = wait_for_routes
+    group._record_event = record_event
+    group.broadcaster = broadcaster
+
+    group.discard_plan(part)
+
+    assert group._plan_part is None
+    assert group.plan_calls == 1
+    assert group._finished_generation == 1
+    assert group._pending_release == (1, completion_event)
+    assert trace == ["wait_routes", "record_consumer_done", "release_generation"]
+
+    # The next schedule advances this counter before proving that generation 1
+    # can be reused. Exercise the real lease check to show cleanup left a valid
+    # transition rather than a permanently poisoned group.
+    group._scheduled_generation = 2
+    lease = _V2LiveBankLeaseProvider(group)
+    lease.prove(1)
+
+    assert lease.proved_generation == 1
+    assert trace[-1] == "prove_reuse"
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_rebalance_shared_hook_failure_preserves_original_error(cleanup_fails):
+    class HookError(RuntimeError):
+        pass
+
+    part = object()
+    cleanup_error = RuntimeError("cleanup failed") if cleanup_fails else None
+    group = SimpleNamespace(
+        plan_schedule=MagicMock(return_value=part),
+        discard_plan=MagicMock(side_effect=cleanup_error),
+    )
+    backend = SimpleNamespace(
+        _rebalance_slots_active=2,
+        _rebalance_scheduler_group=group,
+        is_rebalance_active=lambda: True,
+    )
+    original = HookError("shared failed")
+
+    def fail_shared():
+        raise original
+
+    moe = SimpleNamespace(
+        backend=backend,
+        layer_load_balancer=None,
+        _rebalance_plan_gap_hook=fail_shared,
+    )
+
+    with pytest.raises(HookError) as raised:
+        apply_rebalance_scheduler(moe, object())
+
+    assert raised.value is original
+    group.discard_plan.assert_called_once_with(part)
+    assert moe._rebalance_plan_gap_hook is None
+    if cleanup_fails:
+        assert backend._rebalance_plan_ran is True
+        assert "requires teardown" in original.__notes__[-1]
+    else:
+        assert backend._rebalance_plan_ran is False
+        assert "safely released" in original.__notes__[-1]
+
+
+def test_rebalance_scheduler_group_has_no_unused_process_group_argument():
+    parameters = inspect.signature(RebalanceSlotSchedulerGroupV2.__init__).parameters
+    assert "ep_process_group" not in parameters
 
 
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
@@ -2123,10 +2237,13 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     assert {t[-1] for t in prefill} == {(2, 4)}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
-    for num_tokens in (64, 4096, 16384):
-        megamoe_op.validate_megamoe_tactic(
-            megamoe_op.default_megamoe_tactic(num_tokens), sm_version=sm_version
-        )
+    default_tactics = [
+        megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
+    ]
+    assert all(len(tactic) == 11 for tactic in default_tactics)
+    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    for tactic in default_tactics:
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
         for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
             megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)

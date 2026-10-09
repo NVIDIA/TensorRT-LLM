@@ -123,7 +123,6 @@ class RebalanceSlotSchedulerGroupV2:
         topk: int,
         max_tokens_per_rank: int,
         layer_idx: Optional[int],
-        ep_process_group: Any = None,
     ) -> None:
         from cuda.bindings import driver
 
@@ -418,6 +417,11 @@ class RebalanceSlotSchedulerGroupV2:
     ) -> Tuple[torch.Tensor, int]:
         return self.plan_finish(self.plan_schedule(logical_expert_ids), defer_wait=defer_wait)
 
+    def discard_plan(self, part: Tuple[Any, int]) -> None:
+        """Release an enqueued generation that has no MegaMoE consumer."""
+        self.plan_finish(part, defer_wait=False)
+        self.finish()
+
     def finish(self, completion_event: torch.cuda.Event | None = None) -> None:
         """Queue the previous consumer wait before any next-generation producer."""
         self._check_owner()
@@ -461,8 +465,6 @@ def build_rebalance_slot_scheduler_group_v2(backend: Any) -> RebalanceSlotSchedu
         topk=int(backend.routing_method.experts_per_token),
         device=int(backend.mapping.local_rank),
         layer_idx=getattr(backend, "layer_idx", None),
-        # Reuse: COPY waits for the consumer event, then the next HALO-Q EP exchange.
-        ep_process_group=getattr(backend, "_ep_pg", None),
     )
 
 
@@ -540,14 +542,20 @@ def apply_rebalance_scheduler(
         try:
             gap_hook()
         except BaseException as error:  # noqa: BLE001
+            try:
+                group.discard_plan(part)
+                backend._rebalance_plan_ran = False
+                cleanup_note = "the unused rebalance generation was safely released."
+            except BaseException as cleanup_error:  # noqa: BLE001
+                cleanup_note = (
+                    "rebalance generation cleanup failed and the group requires teardown: "
+                    f"{cleanup_error!r}"
+                )
             notes = getattr(error, "__notes__", None)
             if type(notes) is not list:
                 notes = []
                 error.__notes__ = notes
-            notes.append(
-                "Shared-expert hook failed after HALO-Q/TMA enqueue; "
-                "the unpaired rebalance generation cannot be reused."
-            )
+            notes.append("Shared-expert hook failed after HALO-Q/TMA enqueue; " + cleanup_note)
             raise
         physical_slot_ids, generation = group.plan_finish(part, defer_wait=True)
     backend._rebalance_generation = int(generation)

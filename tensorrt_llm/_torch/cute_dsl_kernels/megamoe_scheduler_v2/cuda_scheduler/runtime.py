@@ -248,14 +248,14 @@ class CudaPhysicalSlotScheduler:
         if config.ctas > 1:
             route_aux_ints = max(
                 route_aux_ints,
-                1 + (config.ctas - 1) * bins + config.route_count,
+                2 + (config.ctas - 1) * bins + config.route_count,
             )
         self.route_aux = torch.zeros(
             route_aux_ints,
             dtype=torch.int32,
             device=scheduler_device,
         )
-        # Two reset-free arrival counters followed by their completion epochs.
+        # The main barrier uses [arrival, epoch]; word 2 publishes route readiness.
         self.grid_sync = torch.zeros(4, dtype=torch.int32, device=scheduler_device)
         # Each expert is broadcast at most once. The private plan's fixed
         # field stride is bounded by E, independently of requested slot capacity.
@@ -431,7 +431,7 @@ class CudaPhysicalSlotScheduler:
             elif handle != self._launch_stream_handle:
                 raise RuntimeError(
                     "CUDA scheduler uses one static stream because its workspace "
-                    "and reset-free generations are shared"
+                    "and reusable barrier epochs are shared"
                 )
             self._launch_op(
                 self.logical_expert_ids,
@@ -515,7 +515,7 @@ class CudaPhysicalSlotScheduler:
             elif stream_handle != self._launch_stream_handle:
                 raise RuntimeError(
                     "CUDA scheduler uses one static stream because its workspace "
-                    "and reset-free generations are shared"
+                    "and reusable barrier epochs are shared"
                 )
             self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
             if self._plan_channel_bound:
@@ -566,14 +566,14 @@ class CudaPhysicalSlotScheduler:
     def check_status(self) -> None:
         """Raise if any generation faulted since the last `reset_status()`.
 
-        Each flag holds the generation that wrote it, not a bare 1, so the
-        failing generation is named and a stale flag from an earlier generation
-        is not mistaken for a fresh one. Generations are 1-based, so 0 means
-        never set. That is what lets the per-generation status clear be removed
-        from the submission path.
+        Each flag holds the unsigned modular epoch that wrote it, not a bare 1.
+        Zero means never set; an error at wrapped epoch zero stores UINT32_MAX.
+        That lets the per-generation status clear stay out of the submission path.
         """
         torch.cuda.synchronize(self.device)
-        flags = self.status[:6].tolist()  # one D2H, not six
+        flags = [
+            flag & 0xFFFFFFFF for flag in self.status[:6].tolist()
+        ]  # one D2H, not six
         labels = (
             "cross-rank histogram rendezvous timeout",
             "CTA grid barrier timeout",

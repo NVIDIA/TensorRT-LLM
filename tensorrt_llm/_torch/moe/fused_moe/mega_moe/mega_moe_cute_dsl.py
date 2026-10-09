@@ -1273,7 +1273,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self.create_weights()
         self.transform_weights()
         self.cache_derived_state()
-        self._build_rebalance_scheduler_group()
 
     def set_rebalance_warmup(self, value: bool) -> None:
         """Set whether ordinary serving-time rebalance is suppressed."""

@@ -445,6 +445,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             1,
             1,
             (1, 1),
+            _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
         )
     if num_tokens <= 8192:
         return (
@@ -458,6 +459,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             1,
             4,
             (1, 1),
+            _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
         )
     # Use the atomic work distributor for the upper token bucket.
     return (
@@ -471,6 +473,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
         None,
         8,
         (2, 4),
+        _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
     )
 
 

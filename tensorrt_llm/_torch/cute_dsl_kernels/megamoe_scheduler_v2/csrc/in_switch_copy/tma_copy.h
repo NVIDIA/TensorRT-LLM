@@ -10,7 +10,7 @@ extern "C"
 {
 #endif
 
-#define MEGAMOE_TMA_COPY_ABI_VERSION 5
+#define MEGAMOE_TMA_COPY_ABI_VERSION 6
 #define MEGAMOE_TMA_COPY_SLICE_BYTES 8192
 #define MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES 32
 #define MEGAMOE_TMA_COPY_SLOT_DATA_BYTES 8208
@@ -154,7 +154,7 @@ extern "C"
      * Explicit counts above eight are rejected; READY stays in this same kernel.
      * warps=0 selects seven communication warps; explicit requests are 1..32.
      * Runtime geometry requires at least two 8 KiB slots per warp and respects
-     * the active kernel and device limits.
+     * the target's kernel and device thread limits.
      * All whole shared-memory slots are divided near-equally among warps, reserving
      * an mbarrier/phase record for every slot. Two banks use ALL allocated slots.
      * Excessive runtime warp counts return cudaErrorInvalidConfiguration.
@@ -194,8 +194,8 @@ extern "C"
      * after the copy kernel has read them. The Python endpoint enforces this lease.
      */
     int megamoe_tma_copy_configure_gpu_plan(MegamoeTmaCopyState* state, MegamoeTmaGpuPlanConfig const* config);
-    int megamoe_tma_copy_bind_gpu_direct(
-        MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners, uint64_t workspace, int capacity);
+    int megamoe_tma_copy_bind_gpu_direct(MegamoeTmaCopyState* state, uint64_t ids, uint64_t levels, uint64_t owners,
+        uint64_t workspace, uint64_t status, uint64_t grid_sync, int capacity);
     int megamoe_tma_copy_submit_gpu_direct(
         MegamoeTmaCopyState* state, uint64_t flag_mc, uint64_t generation, void* cuda_stream);
     /* Explicit diagnostic only: synchronizes last work and copies one small result. */

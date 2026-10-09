@@ -1,18 +1,9 @@
-"""Fabric-backed one-process-per-rank launcher for the CUDA schedulers."""
+"""CUDA fabric allocation shared across expert-parallel processes."""
 
 from __future__ import annotations
 
-import os
-
 import torch
-import torch.distributed as dist
 from cuda.bindings import driver as cuda
-
-from .runtime import (
-    CudaPhysicalSlotScheduler,
-    CudaSchedulerConfig,
-    symmetric_buffer_ints,
-)
 
 
 def _check(result: object) -> object:
@@ -128,99 +119,4 @@ class FabricSymmetricBuffer:
             self._closed = True
 
 
-class DistributedCudaScheduler:
-    """One rank of a simultaneous EP-wide pure-CUDA scheduler group."""
-
-    def __init__(
-        self,
-        config: CudaSchedulerConfig,
-        *,
-        rank: int,
-        world: int,
-        local_rank: int,
-        warmup_iterations: int = 5,
-    ) -> None:
-        if config.ep_size != world:
-            raise ValueError("config.ep_size must equal distributed world size")
-        self.rank = rank
-        self.world = world
-        self.device = local_rank
-        torch.cuda.set_device(local_rank)
-        rank_config = CudaSchedulerConfig(
-            **{**config.__dict__, "local_rank": rank}
-        )
-        self.cfg = rank_config
-        self.scheduler = CudaPhysicalSlotScheduler(
-            rank_config, device=f"cuda:{local_rank}"
-        )
-        self.planner = self.scheduler
-
-        nbytes = 4 * symmetric_buffer_ints(
-            world, rank_config.logical_expert_count
-        )
-        self.symmetric = FabricSymmetricBuffer(nbytes, local_rank)
-        handles: list[bytes | None] = [None] * world
-        dist.all_gather_object(handles, self.symmetric.shareable)
-        bases = []
-        for peer, handle in enumerate(handles):
-            if handle is None:
-                raise RuntimeError("fabric handle exchange returned an incomplete EP")
-            bases.append(
-                self.symmetric.ptr
-                if peer == rank
-                else self.symmetric.import_peer(handle)
-            )
-        self.scheduler.connect_peer_bases(bases)
-        torch.cuda.synchronize(local_rank)
-        dist.barrier()
-        self.warmup(warmup_iterations)
-
-    def cpu_barrier(self) -> None:
-        torch.cuda.synchronize(self.device)
-        dist.barrier()
-
-    def warmup(self, iterations: int = 5) -> None:
-        if iterations < 0:
-            raise ValueError("warmup_iterations cannot be negative")
-        for _ in range(iterations):
-            self.cpu_barrier()
-            self.scheduler.launch()
-        self.cpu_barrier()
-        self.scheduler.status.zero_()
-        torch.cuda.synchronize(self.device)
-
-    def stage(self, local_routes: object, *, validate_values: bool = False) -> None:
-        routes = torch.as_tensor(
-            local_routes,
-            dtype=torch.int32,
-            device=f"cuda:{self.device}",
-        ).reshape(self.cfg.max_tokens_per_rank, self.cfg.topk)
-        self.scheduler.stage(routes, validate_values=validate_values)
-
-    def check_status(self) -> None:
-        self.scheduler.check_status()
-
-
-def init_from_env() -> tuple[int, int, int]:
-    """Bootstrap the Gloo control plane from torchrun or Slurm variables."""
-
-    rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", 0)))
-    world = int(os.environ.get("SLURM_NTASKS", os.environ.get("WORLD_SIZE", 1)))
-    local = int(os.environ.get("SLURM_LOCALID", os.environ.get("LOCAL_RANK", 0)))
-    if "MASTER_ADDR" not in os.environ:
-        nodes = os.environ.get("SLURM_NODELIST", "localhost")
-        first = nodes.split(",")[0]
-        if "[" in first:
-            head, tail = first.split("[", 1)
-            first = head + tail.split("-")[0].split(",")[0].rstrip("]")
-        os.environ["MASTER_ADDR"] = first
-    os.environ.setdefault("MASTER_PORT", "29578")
-    dist.init_process_group(backend="gloo", rank=rank, world_size=world)
-    return rank, world, local
-
-
-__all__ = [
-    "DistributedCudaScheduler",
-    "FabricSymmetricBuffer",
-    "init_from_env",
-]
+__all__ = ["FabricSymmetricBuffer"]

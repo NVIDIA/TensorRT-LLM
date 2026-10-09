@@ -653,21 +653,23 @@ static PyObject* sami_create(PyObject* self, PyObject* args, PyObject* kwds)
 static PyObject* sami_bind_gpu_direct(PyObject* self, PyObject* args)
 {
     PyObject* capsule;
-    unsigned long long ids, levels, owners, workspace;
+    unsigned long long ids, levels, owners, workspace, status, grid_sync;
     int capacity;
-    if (!PyArg_ParseTuple(args, "OKKKKi", &capsule, &ids, &levels, &owners, &workspace, &capacity))
+    if (!PyArg_ParseTuple(
+            args, "OKKKKKKi", &capsule, &ids, &levels, &owners, &workspace, &status, &grid_sync, &capacity))
         return NULL;
     hierarchical_ctx* c = (hierarchical_ctx*) PyCapsule_GetPointer(capsule, "sami_hierarchical_ctx");
     if (!c)
         return NULL;
-    if (!c->plan_on_device || !ids || !levels || !owners || !workspace || ((ids | levels | owners | workspace) & 3)
-        || capacity <= 0)
+    if (!c->plan_on_device || !ids || !levels || !owners || !workspace || !status || !grid_sync
+        || ((ids | levels | owners | workspace | status | grid_sync) & 3) || capacity <= 0)
     {
         PyErr_SetString(PyExc_ValueError, "invalid TMA GPU-direct binding");
         return NULL;
     }
     int rc;
-    Py_BEGIN_ALLOW_THREADS rc = megamoe_tma_copy_bind_gpu_direct(c->tma, ids, levels, owners, workspace, capacity);
+    Py_BEGIN_ALLOW_THREADS rc
+        = megamoe_tma_copy_bind_gpu_direct(c->tma, ids, levels, owners, workspace, status, grid_sync, capacity);
     Py_END_ALLOW_THREADS if (rc)
     {
         PyErr_Format(PyExc_RuntimeError, "TMA GPU-direct binding failed: %s", megamoe_tma_copy_error_string(rc));

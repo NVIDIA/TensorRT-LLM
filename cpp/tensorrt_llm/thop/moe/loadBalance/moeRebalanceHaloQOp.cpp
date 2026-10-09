@@ -96,7 +96,7 @@ void moeRebalanceHaloQ(torch::Tensor const& routes, torch::Tensor& outSlots, tor
     std::int64_t routeAuxElements = static_cast<std::int64_t>(ctas) * (threads / 32) * bins;
     if (ctas > 1)
     {
-        routeAuxElements = std::max(routeAuxElements, 1 + static_cast<std::int64_t>(ctas - 1) * bins + routeCapacity);
+        routeAuxElements = std::max(routeAuxElements, 2 + static_cast<std::int64_t>(ctas - 1) * bins + routeCapacity);
     }
     checkCudaTensor(routeAux, device, torch::kInt32, routeAuxElements, "route_aux");
     checkCudaTensor(gridSync, device, torch::kInt32, 4, "grid_sync");

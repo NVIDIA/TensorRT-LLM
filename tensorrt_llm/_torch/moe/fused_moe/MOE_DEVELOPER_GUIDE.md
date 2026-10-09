@@ -713,6 +713,35 @@ expert bias, and the NVFP4 TMA-WS runner already applies `SwigluBiasAdaptor`.
   weight tensors registered by its quantization method, with the constraint
   `num_slots % ep_size == 0`. `TrtllmCutedslMegaMoeNvfp4Impl` publishes `capabilities.supports_eplb=True` on its descriptor, and its quantization method declares `eplb_support_status = SUPPORTED` and registers the four MegaMoE-format derived params (`mega_fc{1,2}_weight{,_sf}`) and the per-expert `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- Dynamic rebalance uses `MoeConfig.backend=MEGAMOE_CUTEDSL` with
+  `rebalance.enabled=true` and a positive `helper_slots_per_rank`. The disabled
+  environment override is part of the same active-state predicate used by
+  validation, source identity, launch-queue setup, and runtime construction.
+- Active rebalance requires `CUDA_SCALE_LAUNCH_QUEUES=4x` before CUDA context
+  initialization. TensorRT-LLM applies the setting before `TorchLlmArgs`
+  validation and CUDA initialization/device probes, and propagates it to MPI,
+  direct, and Ray workers. Applications that initialize CUDA before TensorRT-LLM
+  must set it at process startup.
+- HALO-Q and the in-switch TMA copy run on the higher-priority copy stream.
+  The main stream may enqueue shared-expert work and input quantization before
+  it waits for the plan at the first routed-expert use. A single CPU submitter
+  owns both streams; the path does not require a CUDA green context or a
+  steady-state host wait.
+- HALO-Q and TMA follow the native-operator path under
+  `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
+  `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original
+  contiguous CUDA `int32` route tensor; do not restore route staging, tail
+  fills, or a host-generated copy plan.
+- Rebalance resources are model-scoped. Worker shutdown and construction
+  rollback must release the scheduler, TMA bindings, shared-slot mappings,
+  and fabric allocations collectively. Forward execution must not retain
+  activation tensors after their consumer has been enqueued.
+- Active rebalance selects the complete fused shared FC12 kernel only when
+  the final projection quantization supports that implementation. Disabled,
+  BF16, and unsupported configurations keep the model's existing shared-MLP
+  backend. SM reservation is an optional launch budget for kernels that expose
+  such a control; backend selection and quantization selection remain
+  independent of it.
 
 ## Canonical Examples
 
@@ -766,5 +795,5 @@ The `XXFusedMoE` names remain supported as module-level aliases — `DeepGemmFus
 - **Schedulers MUST NOT write `moe.repeat_idx`** — `repeat_idx` is wrapper state advanced once per `forward_impl` regardless of chunk count
 - **Do NOT allocate symmetric memory from `run_moe` in `FUSED_COMM` backends** — Symmetric-memory rendezvous is a build-time collective and is unsafe under PP / layer-skip or CUDA graph capture; allocate from `create_weights()` after `ConfigurableMoE` has synchronized EPLB-derived attributes. See `mega_moe/mega_moe_deepgemm.py` for the DG pattern and `mega_moe/mega_moe_cute_dsl.py:_alloc_symm_provider` for the NVSHMEM-equivalent provider.
 - **Do NOT add a new `FUSED_COMM` backend without a zero-token `quantize_input` regression test** — `FusedCommMoEScheduler` calls `quantize_input` for every chunk (including zero-token chunks) so each backend must return its own empty-tensor layout.
-- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the 10-field tactic pattern (with legacy 8-field compatibility) (mma_tiler/cluster_shape as `list[int]`, `epi_flag_batch` as a nested `(int, int)` tuple, the rest as `bool`/`int`/`str`; `_unpack_tactic` is the single source of truth for the field order). The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
+- **Do NOT use a dataclass for an autotuner tactic without a tested `__repr__` round-trip** — `AutoTuner` serializes tactic values through `json.dumps`/`json.loads` and `eval(repr(tactic))`; a plain dataclass fails the `eval(repr(...))` check. Prefer a JSON-friendly **tuple of primitives or lists of primitives** (lists are JSON-friendly; tuples round-trip via `eval(repr(...))`). See the tactic-representation comment block in `tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py` for the canonical 11-field tactic pattern (with legacy 10- and 8-field compatibility), including token-back READY granularity; `_unpack_tactic` is the single source of truth for field order and compatibility defaults. The fallback tactic is the token-aware `default_megamoe_tactic(num_tokens)` helper, selected by `Sm100MegaMoENvfp4Runner.forward(tactic=-1)`, not a separate `fallback_tactic()` method.
 - **Use `distributed_tuning_strategy=DistributedTuningStrategy.MERGE` on a multi-rank `FUSED_COMM` backend's `TuningConfig`** — Every EP rank must converge on the same compiled tactic for every chunk, otherwise the in-kernel NVLink dispatch barrier deadlocks. `PARALLEL` can profile different tactics on different ranks and is unsafe for fused collectives. Reference: `Sm100MegaMoENvfp4Runner.get_tuning_config`.

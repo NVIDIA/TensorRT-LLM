@@ -33,28 +33,16 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
      if type(ep) is not int or not MIN_EP <= ep <= MAX_EP or ep % 2:
          raise ValueError("plan channel requires even EP in [2,32]")
      if type(helpers) is not int or helpers <= 0:
-@@ -47,7 +45,7 @@
-     topk: int = 6,
-     threads: int = 512,
- ) -> int:
--    """Return the measured pure-CUDA CTA policy without importing CuTe."""
-+    """Return the bounded pure-CUDA CTA policy without importing CuTe."""
+@@ -76,7 +74,7 @@
  
-     for name, value in {
-         "ep_size": ep_size,
-@@ -61,9 +59,8 @@
-         raise ValueError("the pure-CUDA scheduler currently requires threads=512")
-     routes = max_tokens_per_rank * topk
-     if ep_size == 8:
--        # The latency-oriented EP8 policy uses at most 32 CTAs. At the
--        # acceptance shape (T=8192, K=6), this fixes the grid at 32 while
--        # leaving at least 120 of GB200's 152 SMs unoccupied.
-+        # Bound scheduler occupancy so independent same-stream work retains
-+        # launch capacity.
-         workers = min(31, max(1, (routes + 3 * threads - 1) // (3 * threads)))
-         return 1 + workers
-     target_rounds = max(3, (96 + (ep_size + 6) // 2) // (ep_size + 6))
-@@ -91,7 +88,6 @@
+ 
+ def symmetric_buffer_ints(ep_size: int, expert_count: int) -> int:
+-    # Peer publication markers plus two parity-selected count slabs.
++    # Two reset-free arrival generations plus a local epoch and two count slabs.
+     return 64 + 2 * ep_size * expert_count
+ 
+ 
+@@ -90,7 +88,6 @@
      local_rank: int = 0
      threads: int = 512
      ctas: int | None = None
@@ -62,7 +50,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
      enable_pdl: bool = True
  
      def __post_init__(self) -> None:
-@@ -170,11 +166,6 @@
+@@ -169,11 +166,6 @@
              raise ValueError("the pure-CUDA scheduler currently requires threads=512")
          if not 1 <= self.ctas <= MAX_CTAS:
              raise ValueError(f"ctas must be in [1,{MAX_CTAS}]")
@@ -74,7 +62,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
          if type(self.enable_pdl) is not bool:
              raise ValueError("enable_pdl must be bool")
  
-@@ -246,7 +237,6 @@
+@@ -245,7 +237,6 @@
          # Everything the kernel takes between `routes` and `stream` is fixed for
          # the endpoint's lifetime.  Cache it so a submission does not rebuild 13
          # data_ptr() calls and ~11 config lookups every generation.
@@ -82,7 +70,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
          self.partial = torch.zeros(
              config.ctas * config.logical_expert_count,
              dtype=torch.int32,
-@@ -295,9 +285,6 @@
+@@ -294,9 +285,6 @@
              device=scheduler_device,
          )
          self._connected = config.ep_size == 1
@@ -92,7 +80,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
          self._plan_channel_lock = threading.Lock()
          self._plan_channel_ptr = 0
          self._plan_channel_abi_version = 0
-@@ -372,7 +359,7 @@
+@@ -371,7 +359,7 @@
              words = _plan_channel_word_count(
                  abi_version=abi_version, channel_words=channel_words,
                  route_features=route_features, ep=self.cfg.ep_size,
@@ -101,7 +89,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
              )
              if self._plan_channel_bound:
                  raise RuntimeError("plan channel binding is single-assignment")
-@@ -387,7 +374,6 @@
+@@ -386,7 +374,6 @@
              self._plan_channel_abi_version = abi_version
              self._plan_channel_words = words
              self._plan_channel_route_features = route_features
@@ -109,7 +97,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
              self._plan_channel_stream_handle = handle
              self._plan_channel_bound = True
  
-@@ -410,7 +396,6 @@
+@@ -409,7 +396,6 @@
              self._plan_channel_abi_version = 0
              self._plan_channel_words = 0
              self._plan_channel_route_features = 0
@@ -117,9 +105,9 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
              self._plan_channel_stream_handle = handle
              self._plan_channel_bound = True
              self._gpu_direct_bound = True
-@@ -448,45 +433,54 @@
+@@ -447,45 +433,54 @@
                      "CUDA scheduler uses one static stream because its workspace "
-                     "and reset-free generations are shared"
+                     "and reusable barrier epochs are shared"
                  )
 -            if self._static_launch_args is None:
 -                self._static_launch_args = self._build_static_launch_args()
@@ -207,7 +195,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
  
      def submit(
          self, routes: torch.Tensor, stream_handle: int, *,
-@@ -510,20 +504,22 @@
+@@ -509,20 +504,22 @@
          with changing pointers/lengths use eager submit; stage()+launch() remains
          available for a fixed-capacity graph input buffer.
          """
@@ -229,7 +217,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
 +            elif stream_handle != self._launch_stream_handle:
 +                raise RuntimeError(
 +                    "CUDA scheduler uses one static stream because its workspace "
-+                    "and reset-free generations are shared"
++                    "and reusable barrier epochs are shared"
 +                )
 +            self._submit_routes(routes, stream_handle, valid_tokens=valid_tokens)
 +            if self._plan_channel_bound:
@@ -239,7 +227,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
          return self.outputs
  
      def _submit_routes(
-@@ -543,17 +539,10 @@
+@@ -542,17 +539,10 @@
              valid_tokens = routes.shape[0]
          if type(valid_tokens) is not int or not 0 <= valid_tokens <= routes.shape[0]:
              raise ValueError("valid_tokens must be an int in [0,T]")
@@ -260,6 +248,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/cuda_sche
          )
  
      def run(
+
 diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
 --- a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
 +++ b/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hierarchical.py
@@ -311,7 +300,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
          tma_kwargs = {}
          if copy_backend == "tma":
              tma_kwargs = dict(tma_sm_count=tma_sm_count or 0, tma_warps=tma_warps or 0,
-@@ -450,34 +454,66 @@
+@@ -450,34 +454,72 @@
          for index, pointer in enumerate(self.arena.group_destination_ptrs):
              self._destination_table[index] = pointer
          self._group_sizes = _i32_array(self.arena.group_sizes)
@@ -345,36 +334,42 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
 -        self.mod.set_loc_hint(self.ctx, device, device)
 -        if int(self.mod.current_gen(self.ctx)) != 1:
 +        if self._thop_tma:
-+            self.ctx = torch.ops.trtllm.moe_rebalance_tma_create(
++            ctx = torch.ops.trtllm.moe_rebalance_tma_create(
 +                helper_count * planes, tma_sm_count or 0, tma_warps or 0
 +            )
-+            target_count = sum(world // size for size in self.arena.group_sizes[1:])
-+            torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
-+                self.ctx, world, rank, helper_count, planes,
-+                global_expert_count, self.home_count, plan_stride,
-+                len(self.arena.group_sizes), target_count, 6, plan_words, 0,
-+                {"plan": 0, "source": 1, "scatter": 2}[tma_route],
-+                round(100 * self.tma_source_load_factor),
-+                list(self.arena.group_sizes),
-+                list(self.arena.base.scatter_source_ptrs),
-+                list(self.arena.group_destination_ptrs), [],
-+                [plane.nbytes for plane in bundle.planes],
-+            )
-+            config_names = (
-+                "abi_version", "device", "device_sm_count", "sms", "warps",
-+                "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
-+                "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
-+                "device_optin_shared_bytes", "device_shared_bytes_per_sm",
-+                "max_active_ctas_per_sm", "compute_major", "compute_minor",
-+                "total_slots", "max_slots_per_warp", "extra_slot_warps",
-+                "max_warps", "max_segments",
-+            )
-+            self.tma_config = dict(zip(
-+                config_names, torch.ops.trtllm.moe_rebalance_tma_config(self.ctx)
-+            ))
-+            current_generation = torch.ops.trtllm.moe_rebalance_tma_current_gen(
-+                self.ctx
-+            )
++            try:
++                target_count = sum(world // size for size in self.arena.group_sizes[1:])
++                torch.ops.trtllm.moe_rebalance_tma_configure_gpu_plan(
++                    ctx, world, rank, helper_count, planes,
++                    global_expert_count, self.home_count, plan_stride,
++                    len(self.arena.group_sizes), target_count, 6, plan_words, 0,
++                    {"plan": 0, "source": 1, "scatter": 2}[tma_route],
++                    round(100 * self.tma_source_load_factor),
++                    list(self.arena.group_sizes),
++                    list(self.arena.base.scatter_source_ptrs),
++                    list(self.arena.group_destination_ptrs), [],
++                    [plane.nbytes for plane in bundle.planes],
++                )
++                config_names = (
++                    "abi_version", "device", "device_sm_count", "sms", "warps",
++                    "threads_per_cta", "slots_per_warp", "bank0_slots_per_warp",
++                    "bank1_slots_per_warp", "slice_bytes", "dynamic_shared_bytes",
++                    "device_optin_shared_bytes", "device_shared_bytes_per_sm",
++                    "max_active_ctas_per_sm", "compute_major", "compute_minor",
++                    "total_slots", "max_slots_per_warp", "extra_slot_warps",
++                    "max_warps", "max_segments",
++                )
++                tma_config = dict(zip(
++                    config_names, torch.ops.trtllm.moe_rebalance_tma_config(ctx)
++                ))
++                current_generation = torch.ops.trtllm.moe_rebalance_tma_current_gen(ctx)
++                if int(current_generation) != 1:
++                    raise RuntimeError("hierarchical SAMI context is not fresh")
++            except BaseException:
++                torch.ops.trtllm.moe_rebalance_tma_destroy(ctx)
++                raise
++            self.ctx = ctx
++            self.tma_config = tma_config
 +        else:
 +            self.ctx = self.mod.create(
 +                world=world,
@@ -400,14 +395,14 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
 +            )
 +            self.mod.set_loc_hint(self.ctx, device, device)
 +            current_generation = self.mod.current_gen(self.ctx)
-+        if int(current_generation) != 1:
++        if not self._thop_tma and int(current_generation) != 1:
              raise RuntimeError("hierarchical SAMI context is not fresh")
  
          self._lock = threading.Lock()
-@@ -653,15 +689,24 @@
-                         workspace.device != scheduler_device or workspace.dtype != torch.int32 or
-                         not workspace.is_contiguous() or tuple(workspace.shape) != (2 + 6 * capacity,)):
-                     raise ValueError("GPU-direct requires the original CUDA scheduler plan workspace")
+@@ -661,16 +703,26 @@
+                 if (not isinstance(grid_sync, torch.Tensor) or grid_sync.device != scheduler_device or
+                         grid_sync.dtype != torch.int32 or not grid_sync.is_contiguous() or grid_sync.numel() < 2):
+                     raise ValueError("GPU-direct requires the CUDA scheduler epoch workspace")
 -                native_bind = getattr(self.mod, "bind_gpu_direct", None)
 +                native_bind = (torch.ops.trtllm.moe_rebalance_tma_bind_gpu_direct
 +                               if self._thop_tma else
@@ -419,20 +414,23 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
                  if gpu_direct:
                      bind(handle)
 -                    native_bind(self.ctx, *(int(tensor.data_ptr()) for tensor in tensors[1:]),
--                                int(workspace.data_ptr()), capacity)
+-                                int(workspace.data_ptr()), int(status.data_ptr()),
+-                                int(grid_sync.data_ptr()), capacity)
 +                    if self._thop_tma:
-+                        native_bind(self.ctx, *tensors[1:], workspace, capacity)
++                        native_bind(self.ctx, *tensors[1:], workspace, status, grid_sync, capacity)
 +                    else:
 +                        native_bind(
 +                            self.ctx,
 +                            *(int(tensor.data_ptr()) for tensor in tensors[1:]),
 +                            int(workspace.data_ptr()),
++                            int(status.data_ptr()),
++                            int(grid_sync.data_ptr()),
 +                            capacity,
 +                        )
                  else:
                      bind(self.plan_channel.dev_ptr, handle,
                           abi_version=self.plan_channel.ABI_VERSION,
-@@ -808,32 +853,12 @@
+@@ -817,31 +869,12 @@
          correctness barrier, so widening it costs only how long a genuine hang
          takes to surface.
  
@@ -440,16 +438,15 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
 -        generation gets a much larger one. Reason: the first forward of an S>0
 -        arm compiles the M = H + S MegaMoE shape *inside* this rendezvous --
 -        ``_prime_ladder`` warms only the S=0 shape, as its own comment states.
--        That JIT runs for seconds (the autotuner alone reports ~4.4 s for a
--        single op), so ranks reach ``submit()`` seconds apart on frame 1 and a
--        steady-state bound fires on whichever arrive first. Observed at EP8 on
--        VR200 before this was handled: ranks 2,3,4,5 raised
+-        That JIT can make ranks reach ``submit()`` far apart on frame 1, so a
+-        steady-state bound may fire on whichever ranks arrive first. Before the
+-        wider first-generation bound, this surfaced as
 -
 -            TimeoutError: hierarchical scheduler plan publication timed out
 -
--        on the very first forward, and the surviving ranks then hung in the
--        collective. Startup skew, not a lost peer -- so the fix belongs in the
--        default, not in something the caller has to know to set.
+-        on the first forward while the surviving ranks waited in the collective.
+-        Startup skew is not a lost peer, so the fix belongs in the default rather
+-        than in something the caller has to know to set.
 -
 -        Steady-state generations keep the tight bound, which is what makes a
 -        real lost peer surface quickly. ``MEGAMOE_SAMI_PLAN_TIMEOUT_NS`` raises
@@ -471,7 +468,7 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
          """
  
          if timeout_ns is None:
-@@ -854,7 +879,22 @@
+@@ -862,7 +895,22 @@
                  raise RuntimeError("outputs are not from the bound CUDA scheduler")
              self._require_live_bank_reusable()
              try:
@@ -495,7 +492,27 @@ diff --git a/tensorrt_llm/_torch/cute_dsl_kernels/megamoe_scheduler_v2/sami/hier
                      commands = int(
                          self.mod.submit(
                              self.ctx,
-@@ -896,7 +936,11 @@
+@@ -897,6 +945,19 @@
+             self._generation += 1
+             return ticket
+ 
++    def close(self) -> None:
++        """Release the native copy context after all device work is drained."""
++        with self._lock, torch.cuda.device(self.device):
++            if self.ctx is None:
++                return
++            if self._thop_tma:
++                torch.ops.trtllm.moe_rebalance_tma_destroy(self.ctx)
++            # Non-THOP contexts are PyCapsules whose destructor owns cleanup.
++            self.ctx = None
++            self._scheduler = None
++            self._outputs = None
++            self._stream_owner = None
++
+     def last_mode_counts(self) -> tuple[int, int, int]:
+         """Return diagnostic ``(direct_slots, scatter_slots, commands)``.
+ 
+@@ -904,7 +965,11 @@
          This opt-in diagnostic must stay outside the submission/timing path.
          """
  

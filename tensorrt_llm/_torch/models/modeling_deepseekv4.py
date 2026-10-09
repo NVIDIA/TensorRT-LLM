@@ -1611,6 +1611,7 @@ class DeepseekV4MoE(nn.Module):
         use_fused_fc12 = (
             descriptor is not None
             and descriptor.impl_id == "trtllm.cutedsl.mega_moe.nvfp4"
+            and self._shared_fc12_rebalance_enabled(rebalance_backend)
             and get_sm_version() == 107
             and self._shared_fc12_quantization_supported(gate_up_quant_config, down_quant_config)
             and not model_config.use_cuda_graph
@@ -1751,6 +1752,11 @@ class DeepseekV4MoE(nn.Module):
         )
         down_quant_config = resolve_projection(f"{base_name}.down_proj")
         return gate_up_quant_config, down_quant_config
+
+    @staticmethod
+    def _shared_fc12_rebalance_enabled(rebalance_backend) -> bool:
+        """Keep the fused shared kernel inside the opt-in rebalance path."""
+        return getattr(rebalance_backend, "_rebalance_slots_active", 0) > 0
 
     @staticmethod
     def _shared_fc12_quantization_supported(
