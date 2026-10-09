@@ -2555,10 +2555,6 @@ class KvCacheCreator:
             f"target={target_budget / GB:.2f} GiB ({target_kv}), "
             f"draft={draft_budget / GB:.2f} GiB ({draft_kv})")
 
-        if budget_attr == "max_gpu_total_bytes":
-            self._warn_if_admitted_concurrency_outruns_graph_capture(
-                target_budget, draft_budget, target_kv, draft_kv)
-
         split_target_kv_cache_config = target_kv_cache_config.model_copy()
         setattr(split_target_kv_cache_config, budget_attr, target_budget)
         if draft_kv_cache_config is None:
