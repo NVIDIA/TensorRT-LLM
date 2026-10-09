@@ -5084,6 +5084,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        """Hook for recurrent-state managers; the attention-only base ignores the hint."""
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 
