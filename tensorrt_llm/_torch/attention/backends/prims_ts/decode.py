@@ -1669,7 +1669,7 @@ def _get_compiled_decode(
     counter_fake = fake_compact(Int32, counter_shape, 4)
     attention_sinks_fake = fake_compact(Float32, (1,), 4)
     softmax_stats_fake = (
-        fake_compact(Float32, (*out_shape[:-1], 2), 4)
+        fake_compact(Float32, out_shape[:-1] + (2,), 4)
         if cfg.store_softmax_stats
         else None
     )
@@ -1770,9 +1770,9 @@ def get_prims_ts_batch_decode_workspace_size(
     This sizing helper validates that every cumulative-offset delta is positive
     and no larger than the bound. If ``device`` is omitted, it is inferred from
     ``qo_indptr`` for a packed launch.
-    ``store_softmax_stats`` must match the launch flag: exporting statistics
-    may require additional per-split scratch, but the caller-owned final
-    statistics buffer is not included in this size.
+    ``store_softmax_stats`` must also match the plan: enabled standalone
+    reducers reserve an additional FP32 maximum and denominator per split and
+    output row.
     """
 
     if not isinstance(store_softmax_stats, bool):
@@ -2551,10 +2551,6 @@ class BatchDecodePagedTSWrapper:
         allocated when omitted, initialized during planning, retained by the
         frozen plan state, and never reset by ``run``.
 
-        ``store_softmax_stats=True`` compiles final statistics stores and
-        requires a caller-owned ``softmax_stats`` buffer on every run. False
-        preserves the original scratch layout and compiles out the stores.
-
         Parameters
         ----------
         device : int, str, or torch.device
@@ -2603,7 +2599,8 @@ class BatchDecodePagedTSWrapper:
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
         store_softmax_stats : bool
-            Compile merge-compatible softmax statistics. Defaults to False.
+            Compile export of merge-compatible softmax statistics. Defaults
+            to ``False``; the corresponding buffer belongs to each ``run``.
         """
 
         if not isinstance(packed_query, bool):
@@ -2819,6 +2816,10 @@ class BatchDecodePagedTSWrapper:
         plans require ``qo_indptr`` to be omitted. Per-run metadata tensors may
         change identity between ordered runs.
 
+        ``softmax_stats`` must not overlap inputs, output, metadata, or workspace;
+        retain its address during graph replay. Its presence must agree with
+        ``store_softmax_stats`` in either validation mode.
+
         Parameters
         ----------
         q : torch.Tensor
@@ -2843,17 +2844,17 @@ class BatchDecodePagedTSWrapper:
             Value/output scaling factor. Defaults to ``1.0``.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
+        softmax_stats : torch.Tensor, optional
+            Contiguous FP32 output ``[*out.shape[:-1], 2]`` on the query device.
+            Stores the scaled token-logit maximum in natural-log units and
+            ``sum(exp(logit - maximum))``, with internal FP8 probability
+            scaling removed. Where supported, attention sinks contribute once
+            to the denominator, not the maximum. Required exactly when the
+            plan enables ``store_softmax_stats``. Empty rows store ``(-inf, 0)``.
         validate : bool
             Run explicit structural, value, and alias validation. Disable only
             when the caller guarantees the complete runtime contract. Sequence
             length ownership is enforced in either mode. Defaults to ``True``.
-        softmax_stats : torch.Tensor, optional
-            Required exactly when the plan enables ``store_softmax_stats``,
-            including with ``validate=False``. Contiguous FP32 CUDA storage
-            shaped ``[*q.shape[:-1], 2]``, containing the scaled natural-log
-            maximum and unscaled denominator. Must not overlap any input,
-            output, metadata, or workspace; retain its address during graph
-            replay. The buffer is not allocated by run().
 
         Returns
         -------
@@ -3017,12 +3018,6 @@ def batch_decode_with_paged_kv_cache(
     either bind a stable runtime ``seq_lens`` tensor or let the plan retain
     fixed sequence lengths before replay.
 
-    Set ``store_softmax_stats=True`` to write merge-compatible statistics into
-    caller-owned contiguous FP32 ``softmax_stats`` with shape
-    ``[*q.shape[:-1], 2]``. Each pair is the scaled natural-log maximum and
-    unscaled denominator. The buffer must be supplied exactly when enabled and
-    must not overlap inputs, output, metadata, or workspace.
-
     Parameters
     ----------
     q : torch.Tensor
@@ -3056,6 +3051,12 @@ def batch_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` or the query dtype.
+    store_softmax_stats : bool
+        Compile statistics export, disabled by default. Match workspace sizing.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned statistics buffer with the same contract as
+        :meth:`BatchDecodePagedTSWrapper.run`. Required exactly when
+        ``store_softmax_stats=True`` and disjoint from all other buffers.
 
     Returns
     -------

@@ -1919,11 +1919,11 @@ class BatchMLADecodePagedTSWrapper:
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         softmax_stats : torch.Tensor, optional
-            Caller-owned, contiguous FP32 ``[*query.shape[:-1], 2]`` buffer.
-            Stores the actual maximum scaled logit in natural-log units and
-            ``sum(exp(logit - max))`` without internal FP8 scaling. Required
-            exactly when ``store_softmax_stats=True``, even with ``validate=False``.
-            Must not overlap any input, output, or workspace; statistics-buffer
+            Contiguous FP32 buffer ``[*query.shape[:-1], 2]`` on the query device.
+            The last dimension stores the actual maximum scaled logit in natural-log
+            units and ``sum(exp(logit - max))``, without internal FP8 scaling.
+            Required exactly when the plan has ``store_softmax_stats=True``, even
+            with ``validate=False``. Must not alias inputs, output, or workspace;
             overlap is a caller precondition and is not checked.
         validate : bool
             Enable explicit runtime validation. Defaults to ``True``.
