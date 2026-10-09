@@ -2,7 +2,8 @@
 
 This example serves Muse Spark Open (816B-A42B) with TensorRT-LLM on a single
 4-GPU NVIDIA Blackwell node. It provides the validated aggregated serving
-configuration (TP4/EP4) and an opt-in speculative-decoding overlay.
+configuration (TP4/EP4); the opt-in speculative-decoding recipe is covered in
+the speculative-decoding deployment guide linked below.
 
 For the full walkthrough — model facts, key YAML options, multimodal token
 budgets, benchmarking, and troubleshooting — see the
@@ -19,7 +20,6 @@ validated on GB300 NVL (`SM103`) with 4 GPUs (TP4/EP4).
   runtime dependencies).
 - A complete Hugging Face-format Muse Spark Open checkpoint and tokenizer, e.g.
   `meta-models/Muse-Spark-Open-816B-A42B-NVFP4`
-  <!-- TODO(launch): replace with the final Hugging Face Hub id -->
   (`model_type: muse_spark`). The checkpoint ships the routed-expert weights
   pre-quantized to NVFP4; no additional quantization step is needed.
 
@@ -33,6 +33,7 @@ MODEL=/path/to/musespark-open-checkpoint
 trtllm-serve ${MODEL} \
     --host 0.0.0.0 --port 8000 \
     --config serve_config.yaml \
+    --custom_tokenizer musespark_open \
     --tool_parser musespark \
     --reasoning_parser musespark
 ```

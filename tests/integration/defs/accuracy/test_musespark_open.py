@@ -33,8 +33,9 @@ from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
 @pytest.mark.timeout(7200)
 class TestMuseSparkOpen(LlmapiAccuracyTestHarness):
-    # Placeholder id until the checkpoint's public Hugging Face id is
-    # announced; it only has to match the references/*.yaml key.
+    # Local reference key, deliberately not the Hub id
+    # (meta-models/Muse-Spark-Open-816B-A42B-NVFP4): it only has to match
+    # the references/*.yaml key.
     MODEL_NAME = "musespark_open"
     # Pre-release the NVFP4 checkpoint is staged outside llm-models and named
     # by MUSESPARK_REFERENCE_CKPT; the llm_models_root() path takes over
