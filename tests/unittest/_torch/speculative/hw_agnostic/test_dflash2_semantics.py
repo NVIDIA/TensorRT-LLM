@@ -703,10 +703,11 @@ CTX_LEN = 24
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dflash2: bool):
+def _tiny_config(dflash2: bool, dtype: torch.dtype = torch.bfloat16):
     from transformers import Qwen3Config
 
     config = dict(TINY)
+    config["torch_dtype"] = str(dtype).removeprefix("torch.")
     dflash_config = dict(RELEASED_DFLASH_CONFIG)
     if not dflash2:
         for key in ("conv_group_size", "conv_kernel_size", "selector_rank", "selector_top_k"):
@@ -762,10 +763,12 @@ def _tiny_weights(dflash2: bool, seed=7):
     return weights
 
 
-def _build_drafter(dflash2: bool, weights):
+def _build_drafter(dflash2: bool, weights, dtype: torch.dtype = torch.bfloat16):
     from tensorrt_llm._torch.model_config import ModelConfig
 
-    model_config = ModelConfig(pretrained_config=_tiny_config(dflash2), attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=_tiny_config(dflash2, dtype), attn_backend="TRTLLM"
+    )
     drafter = DFlashForCausalLM(model_config).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -872,7 +875,8 @@ def _oracle_block_decode(weights, captured, noise_embedding, dflash2):
 
 
 def _run_block_decode(drafter, captured, noise_embedding):
-    projected = drafter.project_target_hidden(captured.to("cuda", torch.bfloat16))
+    dtype = drafter.model.norm.weight.dtype
+    projected = drafter.project_target_hidden(captured.to("cuda", dtype))
     k, v = drafter.precompute_context_kv(projected, torch.arange(CTX_LEN, device="cuda"))
     num_layers = drafter._num_attn_layers
     pool_k = torch.zeros(
@@ -881,14 +885,14 @@ def _run_block_decode(drafter, captured, noise_embedding):
         CTX_LEN + BLOCK,
         drafter._num_kv_heads,
         drafter._head_dim,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda",
     )
     pool_v = torch.zeros_like(pool_k)
     pool_k[0, :, :CTX_LEN] = k.permute(1, 0, 2, 3)
     pool_v[0, :, :CTX_LEN] = v.permute(1, 0, 2, 3)
     out = drafter.dflash_forward(
-        noise_embedding=noise_embedding.to("cuda", torch.bfloat16).unsqueeze(0),
+        noise_embedding=noise_embedding.to("cuda", dtype).unsqueeze(0),
         query_positions=torch.arange(CTX_LEN, CTX_LEN + BLOCK, device="cuda").unsqueeze(0),
         num_ctx_per_req=torch.tensor([CTX_LEN], device="cuda"),
         ctx_k_cache=pool_k,
@@ -911,6 +915,68 @@ needs_gpu = pytest.mark.skipif(
     not torch.cuda.is_available() or not _has_flash_attn(),
     reason="tiny DFlash 2 block-decode parity needs CUDA + flash_attn",
 )
+
+
+@needs_gpu
+@torch.inference_mode()
+def test_dflash_fp16_fused_qk_norm_rope_matches_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FP16 DFlash selects the fused op with matching weights and projected QKV."""
+    weights = {name: value.to(torch.float16) for name, value in _tiny_weights(False).items()}
+    drafter = _build_drafter(False, weights, dtype=torch.float16)
+    attn = drafter.model.layers[0].self_attn
+    projected_qkv = []
+    attention_inputs = []
+    fused_calls = []
+    original_fused = attn.apply_qk_norm_rope
+    original_attention = drafter._dflash_flash_attention
+
+    def capture_projection(
+        _module: torch.nn.Module, _args: tuple[torch.Tensor, ...], output: torch.Tensor
+    ) -> None:
+        projected_qkv.append(output.clone())
+
+    def check_fused_inputs(
+        qkv: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        assert qkv.dtype == torch.float16
+        assert attn.q_norm.weight.dtype == qkv.dtype
+        assert attn.k_norm.weight.dtype == qkv.dtype
+        torch.testing.assert_close(qkv, projected_qkv[-1], rtol=0, atol=0)
+        torch.testing.assert_close(
+            positions, torch.arange(CTX_LEN, CTX_LEN + BLOCK, device="cuda", dtype=torch.int32)
+        )
+        fused_calls.append(positions.clone())
+        return original_fused(qkv, positions)
+
+    def capture_attention_inputs(**kwargs) -> torch.Tensor:
+        attention_inputs.append(
+            (kwargs["q"].clone(), kwargs["k_cache"].clone(), kwargs["v_cache"].clone())
+        )
+        return original_attention(**kwargs)
+
+    monkeypatch.setattr(attn, "apply_qk_norm_rope", check_fused_inputs)
+    monkeypatch.setattr(drafter, "_dflash_flash_attention", capture_attention_inputs)
+    generator = torch.Generator().manual_seed(42)
+    captured = torch.randn(CTX_LEN, TINY["hidden_size"] * NUM_CAPTURE, generator=generator) * 0.5
+    noise_embedding = torch.randn(BLOCK, TINY["hidden_size"], generator=generator) * 0.5
+
+    with attn.qkv_proj.register_forward_hook(capture_projection):
+        fused_output = _run_block_decode(drafter, captured, noise_embedding)
+        assert drafter._use_fused_qk_norm_rope
+        assert len(fused_calls) == 1
+        drafter._use_fused_qk_norm_rope = False
+        fallback_output = _run_block_decode(drafter, captured, noise_embedding)
+        assert len(fused_calls) == 1
+
+    torch.testing.assert_close(projected_qkv[0], projected_qkv[1], rtol=0, atol=0)
+    num_layers = TINY["num_hidden_layers"]
+    assert len(attention_inputs) == 2 * num_layers
+    fused_q, fused_k, fused_v = attention_inputs[0]
+    fallback_q, fallback_k, fallback_v = attention_inputs[num_layers]
+    torch.testing.assert_close(fused_q, fallback_q, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(fused_k, fallback_k, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(fused_v, fallback_v, rtol=0, atol=0)
+    torch.testing.assert_close(fused_output, fallback_output, rtol=1e-2, atol=1e-2)
 
 
 @needs_gpu
