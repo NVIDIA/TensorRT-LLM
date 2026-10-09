@@ -971,13 +971,15 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
         attn=attn,
         meta=meta,
         fwd=AttentionForwardArgs(
-            attention_mask=PredefinedAttentionMask.FULL, softmax_stats_tensor=stats
+            attention_mask=PredefinedAttentionMask.FULL,
+            softmax_stats_tensor=stats,
+            is_fused_qkv=False,
         ),
         workspace=workspace,
-        attention_input=q,
+        query_input=q,
         key_input=k,
         value_input=v,
-        context_buf=output,
+        output=output,
         sequence_lengths=torch.tensor([7, 2], dtype=torch.int32),
         batch_size=2,
         input_seq_length=3,
@@ -1003,6 +1005,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     )
     assert wrapper.run.call_args.args[3] is qo_indptr
     assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
+    assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, 6, 192)
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
     assert wrapper.run.call_args.kwargs["validate"] is False
@@ -2350,7 +2353,8 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
     else:
         q_size = (attn.num_heads + (2 * attn.num_kv_heads if is_fused_qkv else 0)) * attn.head_dim
     q = torch.arange(num_tokens * q_size, dtype=torch.float32).view(num_tokens, q_size)
-    k = torch.randn((num_tokens, attn.num_kv_heads * attn.head_dim)) if has_kv else None
+    num_kv_tokens = num_tokens + 7 if is_mla and has_kv else num_tokens
+    k = torch.randn((num_kv_tokens, attn.num_kv_heads * attn.head_dim)) if has_kv else None
     v = torch.randn_like(k) if k is not None else None
     out_head_size = (
         fmha.generation_out_head_size
@@ -2420,8 +2424,12 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
         torch.testing.assert_close(phase_input, q[token_slice])
         assert phase_input.data_ptr() == q[token_slice].data_ptr()
         if has_kv:
-            torch.testing.assert_close(params.key_input, k[token_slice])
-            torch.testing.assert_close(params.value_input, v[token_slice])
+            if is_mla:
+                assert params.key_input is k
+                assert params.value_input is v
+            else:
+                torch.testing.assert_close(params.key_input, k[token_slice])
+                torch.testing.assert_close(params.value_input, v[token_slice])
         else:
             assert params.key_input is None
             assert params.value_input is None

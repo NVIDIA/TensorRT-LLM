@@ -998,9 +998,9 @@ class PrimsTSFmha(PhasedFmha):
     def run_mla_context(self, params: FmhaParams) -> None:
         """Run expanded MLA, including cached-prefix and chunk-merge calls."""
         attn, meta, fwd = params.attn, params.meta, params.fwd
-        q, k, v = params.attention_input, params.key_input, params.value_input
+        q, k, v = params.query_input, params.key_input, params.value_input
         assert q is not None and k is not None and v is not None
-        assert params.context_buf is not None
+        assert params.output is not None
         layout, _ = self._mla_context_workspace_layout(q, k, params.batch_size)
         workspace = params.workspace.view(torch.uint8).view(-1)
         buffers = {
@@ -1073,7 +1073,7 @@ class PrimsTSFmha(PhasedFmha):
                 head_dim_vo=128,
                 q_dtype=q_processed.dtype,
                 kv_dtype=k_processed.dtype,
-                out_dtype=params.context_buf.dtype,
+                out_dtype=params.output.dtype,
                 packed=True,
                 mask_type=mask,
                 sm_scale=sm_scale,
@@ -1086,7 +1086,7 @@ class PrimsTSFmha(PhasedFmha):
             v_processed.view(-1, attn.num_heads, 128),
             qo_indptr,
             kv_indptr,
-            out=params.context_buf,
+            out=params.output,
             softmax_stats=stats,
             scale_softmax_log2=buffers["bmm1_scale"][1:] if fp8 else None,
             output_scale=buffers["bmm2_scale"] if fp8 else None,
