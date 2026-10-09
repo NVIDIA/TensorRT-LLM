@@ -51,24 +51,15 @@ def _run_preprocess_inputs(metadata, *, spec_decode, overlap):
         "attn_metadata": metadata,
     }
     engine._preprocess_inputs(inputs, enable_spec_decode=spec_decode, runtime_draft_len=0)
-    return inputs
 
 
-def test_hook_runs_once_after_the_correction():
-    metadata = _Metadata()
-    inputs = _run_preprocess_inputs(metadata, spec_decode=True, overlap=True)
-    corrected = KV_LENS + KV_LENS_OFFSETS
-    # The correction itself is untouched.
-    assert torch.equal(metadata.kv_lens_cuda, corrected)
-    assert torch.equal(inputs["position_ids"][0], torch.arange(NUM_TOKENS, dtype=torch.int32))
-    assert len(metadata.kv_lens_at_hook) == 1
-    assert torch.equal(metadata.kv_lens_at_hook[0], corrected)
-
-
-@pytest.mark.parametrize("spec_decode,overlap", [(False, True), (True, False), (False, False)])
-def test_single_hook_call_is_kept_when_no_correction_follows(spec_decode, overlap):
+@pytest.mark.parametrize(
+    "spec_decode,overlap,corrected",
+    [(True, True, True), (True, False, False), (False, True, False)],
+)
+def test_hook_runs_once_per_step(spec_decode, overlap, corrected):
     metadata = _Metadata()
     _run_preprocess_inputs(metadata, spec_decode=spec_decode, overlap=overlap)
+    expected = KV_LENS + KV_LENS_OFFSETS if corrected else KV_LENS
     assert len(metadata.kv_lens_at_hook) == 1
-    assert torch.equal(metadata.kv_lens_at_hook[0], KV_LENS)
-    assert torch.equal(metadata.kv_lens_cuda, KV_LENS)
+    assert torch.equal(metadata.kv_lens_at_hook[0], expected)

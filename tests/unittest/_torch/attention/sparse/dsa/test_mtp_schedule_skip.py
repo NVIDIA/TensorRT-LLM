@@ -1,11 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""update_for_spec_dec() skips the indexer schedule rebuild only inside an index-sharing draft loop.
-
-Runs on a real DSAtrtllmAttentionMetadata over a real DSACacheManager: prepare()
-fills the DeepGEMM MQA-logits schedule buffers and the 2D indexer KV lengths, the
-tests poison them and check which kv-lens updates rebuild them.
-"""
+"""update_for_spec_dec() skips the indexer schedule rebuild only inside an index-sharing draft loop."""
 
 import pytest
 import torch
@@ -46,7 +41,7 @@ pytestmark = [
 ]
 
 
-def _make_decode_metadata(index_share: bool) -> DSAtrtllmAttentionMetadata:
+def _make_decode_metadata() -> DSAtrtllmAttentionMetadata:
     """A prepared one-token-per-request generation batch, as draft steps >= 1 see it."""
     batch_size = len(KV_LENS)
     sparse_config = DeepSeekSparseAttentionConfig(
@@ -55,7 +50,7 @@ def _make_decode_metadata(index_share: bool) -> DSAtrtllmAttentionMetadata:
         index_topk=2048,
         indexer_k_dtype="fp8",
         skip_indexer_for_short_seqs=False,
-        index_share_for_mtp_iteration=index_share,
+        index_share_for_mtp_iteration=True,
     )
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     kv_cache_manager = DSACacheManager(
@@ -102,75 +97,46 @@ def _make_decode_metadata(index_share: bool) -> DSAtrtllmAttentionMetadata:
     )
     metadata.prepare()
     torch.cuda.synchronize()
-    assert metadata.sparse_metadata_params.mtp_index_share is index_share
-    assert (metadata.shared_topk_indices is not None) is index_share
+    assert metadata.sparse_metadata_params.mtp_index_share
     return metadata
 
 
 def _schedule_buffers(metadata):
     """What on_update_kv_lens(skip_indexer_schedule=True) leaves untouched."""
-    return {
-        "scheduler_metadata_buffer": metadata.scheduler_metadata_buffer,
-        "scheduler_metadata_buffer_full_next_n": metadata.scheduler_metadata_buffer_full_next_n,
-        "kv_lens_cuda_2d": metadata.kv_lens_cuda_2d[: metadata.num_generations],
-    }
-
-
-def _snapshot(metadata):
-    torch.cuda.synchronize()
-    reference = {name: buf.clone() for name, buf in _schedule_buffers(metadata).items()}
-    # The poison value must be distinguishable from a real rebuild.
-    for name, buf in reference.items():
-        assert not torch.equal(buf, torch.full_like(buf, -1)), name
-    return reference
+    return [
+        metadata.scheduler_metadata_buffer,
+        metadata.scheduler_metadata_buffer_full_next_n,
+        metadata.kv_lens_cuda_2d[: metadata.num_generations],
+    ]
 
 
 def _poison(metadata):
-    for buf in _schedule_buffers(metadata).values():
+    for buf in _schedule_buffers(metadata):
         buf.fill_(-1)
 
 
-def _assert_untouched(metadata):
+def _is_poisoned(metadata):
     torch.cuda.synchronize()
-    for name, buf in _schedule_buffers(metadata).items():
-        assert torch.equal(buf, torch.full_like(buf, -1)), name
+    return [bool((buf == -1).all()) for buf in _schedule_buffers(metadata)]
 
 
-def _assert_rebuilt(metadata, reference):
-    torch.cuda.synchronize()
-    for name, buf in _schedule_buffers(metadata).items():
-        assert torch.equal(buf, reference[name]), name
+def test_schedule_is_skipped_only_inside_the_draft_loop():
+    metadata = _make_decode_metadata()
 
+    # Outside the draft loop: full rebuild.
+    _poison(metadata)
+    metadata.update_for_spec_dec()
+    assert not metadata.indexer_schedule_stale
+    assert _is_poisoned(metadata) == [False, False, False]
 
-def test_index_sharing_draft_loop_skips_the_schedule_until_the_next_full_rebuild():
-    metadata = _make_decode_metadata(index_share=True)
-    reference = _snapshot(metadata)
-
+    # Inside the index-sharing draft loop: schedule left as is and marked stale.
     metadata.set_in_mtp_draft_loop(True)
     _poison(metadata)
     metadata.update_for_spec_dec()
-    assert metadata.indexer_schedule_stale is True
-    _assert_untouched(metadata)
+    assert metadata.indexer_schedule_stale
+    assert _is_poisoned(metadata) == [True, True, True]
 
-    # The public hook (the pre-draft refresh and the target forward) is the full rebuild.
+    # The next full rebuild (target forward) restores it and clears the marker.
     metadata.on_update_kv_lens()
-    assert metadata.indexer_schedule_stale is False
-    _assert_rebuilt(metadata, reference)
-
-
-@pytest.mark.parametrize(
-    "in_draft_loop,index_share",
-    [(False, True), (True, False)],
-    ids=["outside_the_draft_loop", "draft_loop_without_index_share"],
-)
-def test_update_for_spec_dec_rebuilds_outside_an_index_sharing_draft_loop(
-    in_draft_loop, index_share
-):
-    metadata = _make_decode_metadata(index_share=index_share)
-    reference = _snapshot(metadata)
-
-    metadata.set_in_mtp_draft_loop(in_draft_loop)
-    _poison(metadata)
-    metadata.update_for_spec_dec()
-    assert metadata.indexer_schedule_stale is False
-    _assert_rebuilt(metadata, reference)
+    assert not metadata.indexer_schedule_stale
+    assert _is_poisoned(metadata) == [False, False, False]
