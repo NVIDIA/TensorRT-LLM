@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
+#include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
@@ -1263,6 +1264,196 @@ void StorageManager::batchedMigrate(
     }
 }
 
+void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    if (requestingCache.storageManager() != this)
+    {
+        throw LogicError("Offload pages and requesting cache must belong to the same manager");
+    }
+    _migrateLockedSparsePages(
+        requestingCache.cudaStream(), kSparseHistoryLevel, pages, &requestingCache, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    _migrateLockedSparsePages(stream, kHotLevel, pages, nullptr, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel,
+    std::vector<SharedPtr<Page>> const& pages, KvCache const* offloadingCache,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    CacheLevel const srcLevel = dstLevel == kHotLevel ? kSparseHistoryLevel : kHotLevel;
+
+    struct MigrationBatch
+    {
+        std::vector<SharedPtr<Page>> srcPages;
+        std::vector<SharedPtr<UniqPageLock>> srcPageLocks;
+        std::vector<Slot> dstSlots;
+        std::vector<PageIndexPair> srcDstPageIndices;
+    };
+
+    std::map<LayerGroupId, MigrationBatch> batches;
+    std::set<Page*> seen;
+    std::set<CUstream> ownerStreams;
+    for (auto const& page : pages)
+    {
+        if (!page || page->manager != this)
+        {
+            throw LogicError("Sparse migration pages must belong to the same manager");
+        }
+        if (!seen.insert(page.get()).second)
+        {
+            continue;
+        }
+        auto holder = page->holder.lock();
+        auto lock = holder ? holder->uniqLock.lock() : nullptr;
+        if (!lock)
+        {
+            throw LogicError("Sparse migration requires a locked page");
+        }
+        if (offloadingCache)
+        {
+            lock->prepareSparseOffload(*offloadingCache);
+        }
+        else
+        {
+            lock->prepareSparsePromotion();
+        }
+        if (page->cacheLevel == dstLevel)
+        {
+            continue;
+        }
+        auto& batch = batches[getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)];
+        batch.srcPages.push_back(page);
+        for (auto const& owner : lock->owners())
+        {
+            ownerStreams.insert(owner.kvCache->cudaStream());
+        }
+        batch.srcPageLocks.push_back(std::move(lock));
+    }
+    if (batches.empty())
+    {
+        return;
+    }
+
+    TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(dstLevel), 0);
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        requirements[getPoolGroupIndex(dstLevel, layerGroup)] += slotCountValueFromSize(batch.srcPages.size());
+    }
+    prepareFreeSlots(dstLevel, requirements, migrationRecorder, dropRecorder);
+    auto releaseDestinations = FuncGuard(
+        [&]()
+        {
+            for (auto& [layerGroup, batch] : batches)
+            {
+                for (auto& slot : batch.dstSlots)
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        releaseSlot(layerGroup, dstLevel, std::move(slot));
+                    }
+                }
+            }
+        });
+    for (auto& [layerGroup, batch] : batches)
+    {
+        auto& pool = poolGroup(dstLevel, getPoolGroupIndex(dstLevel, layerGroup));
+        batch.dstSlots = pool.allocateMultiple(slotCountValueFromSize(batch.srcPages.size()));
+        batch.srcDstPageIndices.reserve(batch.srcPages.size());
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            batch.srcDstPageIndices.push_back({.dst = slotIdToPageIndexValue(batch.dstSlots[i].slotId()),
+                .src = slotIdToPageIndexValue(batch.srcPages[i]->slotId())});
+        }
+    }
+
+    auto const cudaStream = reinterpret_cast<CudaStream>(stream);
+    std::vector<CachedCudaEvent> ownerEvents;
+    ownerEvents.reserve(ownerStreams.size());
+    for (auto const ownerStream : ownerStreams)
+    {
+        ownerEvents.emplace_back(reinterpret_cast<CudaStream>(ownerStream));
+        ownerEvents.back().waitInStream(cudaStream);
+    }
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            batch.srcPages[i]->readyEvent.waitInStream(cudaStream);
+            batch.dstSlots[i].readyEvent.waitInStream(cudaStream);
+            for (auto const& event : batch.srcPageLocks[i]->finishEvents)
+            {
+                event.waitInStream(cudaStream);
+            }
+        }
+    }
+
+    // Install the fence even when a codec rejects after enqueueing only part of a batch.
+    CachedCudaEvent completion = CachedCudaEvent::makeNull();
+    auto fenceCopies = FuncGuard(
+        [&]()
+        {
+            completion = CachedCudaEvent(cudaStream);
+            for (auto& [layerGroup, batch] : batches)
+            {
+                for (size_t i = 0; i < batch.srcPages.size(); ++i)
+                {
+                    batch.dstSlots[i].readyEvent = completion;
+                    batch.srcPageLocks[i]->recordMigrationEvent(completion);
+                }
+            }
+        });
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        submitMigrationBatch(
+            dstLevel, srcLevel, layerGroup, batch.srcDstPageIndices.data(), batch.srcDstPageIndices.size(), stream);
+    }
+    fenceCopies.run();
+
+    // Subsequent readers on every owner's stream must observe the completed copy.
+    for (auto const ownerStream : ownerStreams)
+    {
+        completion.waitInStream(reinterpret_cast<CudaStream>(ownerStream));
+    }
+    for (auto const& [layerGroup, batch] : batches)
+    {
+        if (migrationRecorder)
+        {
+            migrationRecorder(batch.srcPages, batch.dstSlots, srcLevel, dstLevel);
+        }
+    }
+    for (auto& [layerGroup, batch] : batches)
+    {
+        for (size_t i = 0; i < batch.srcPages.size(); ++i)
+        {
+            Slot source = batch.srcPageLocks[i]->moveToCacheLevel(dstLevel, std::move(batch.dstSlots[i]));
+            releaseSlot(batch.srcPages[i]->lifeCycle, srcLevel, std::move(source));
+        }
+    }
+    if (mEventSink)
+    {
+        for (auto const& [layerGroup, batch] : batches)
+        {
+            for (auto const& page : batch.srcPages)
+            {
+                if (page->isCommitted())
+                {
+                    auto const& committed = static_cast<CommittedPage const&>(*page);
+                    auto const* block = committed.block;
+                    if (block && !block->isOrphan() && block->holdsPage(committed))
+                    {
+                        mEventSink->addCacheLevelUpdated(block->key, srcLevel, dstLevel, page->lifeCycle);
+                    }
+                }
+            }
+        }
+    }
+}
+
 int64_t StorageManager::prefetch(
     CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
@@ -1328,6 +1519,24 @@ int64_t StorageManager::prefetch(
     for (auto& [migrationPath, migrationPages] : migrationGroups)
     {
         CacheLevel const srcLevel = migrationPath.first;
+        if (dstLevel == kHotLevel && srcLevel == kSparseHistoryLevel)
+        {
+            std::vector<SharedPtr<Page>> lockedPages;
+            for (auto const& page : migrationPages)
+            {
+                if (page->status() == PageStatus::LOCKED)
+                {
+                    lockedPages.push_back(page);
+                }
+            }
+            if (!lockedPages.empty())
+            {
+                TemporaryCudaStream stream({});
+                auto scope = stream.enter();
+                promoteSparsePages(stream.get(), lockedPages);
+                std::erase_if(migrationPages, [](auto const& page) { return page->cacheLevel == kHotLevel; });
+            }
+        }
         _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
@@ -1656,7 +1865,7 @@ TypedVec<PoolGroupIndex, float> StorageManager::getRatioList(CacheLevel level) c
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
-    CacheLevel level, int tokensPerBlock, int historyLength, int capacity) const
+    CacheLevel level, int tokensPerBlock, int historyLength, int capacity, int beamWidth, int promptLength) const
 {
     if (capacity < historyLength)
     {
@@ -1665,6 +1874,10 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
     }
 
     int const numBlocks = divUp(capacity, tokensPerBlock);
+    int const effBeamWidth = std::max(1, beamWidth);
+    // Floors, so the block holding the prompt tail lands on the per-beam side —
+    // same boundary KvCache::_appendBeams() uses.
+    HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(std::max(promptLength, 0) / tokensPerBlock, numBlocks)};
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
     auto const ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifeCycles = mLifeCycles.getAll();
@@ -1675,12 +1888,17 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
         int numRequiredBlocks;
         if (ssmLcId.has_value() && lifeCycle == *ssmLcId)
         {
-            numRequiredBlocks = 1;
+            // One recurrent-state block per beam.
+            numRequiredBlocks = effBeamWidth;
         }
         else
         {
             auto const stale = getStaleRange(lifeCycles[lifeCycle], historyLength, tokensPerBlock);
-            numRequiredBlocks = std::max(numBlocks - stale.length(), 1);
+            int const nonStale = std::max(numBlocks - stale.length(), 1);
+            int const nonStaleShared
+                = std::min(sharedRange.length() - intersect(stale, sharedRange).length(), nonStale);
+            int const nonStaleBeam = nonStale - nonStaleShared;
+            numRequiredBlocks = std::max(nonStaleShared + effBeamWidth * nonStaleBeam, 1);
         }
         numBytes[lifeCycle] = static_cast<size_t>(numRequiredBlocks) * slotBytes;
     }
@@ -1825,8 +2043,14 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
     {
         if (ssmLcId.has_value() && lcIdx == *ssmLcId)
         {
-            // SSM: always 1 dedicated block per request, never shared.
-            numSlots[lcIdx] += slotCountValueFromSize(batch.kvCaches.size());
+            // SSM: one dedicated block per request per beam, never shared.
+            // _appendBeams() gives every beam its own recurrent-state slot.
+            size_t ssmBlocks = 0;
+            for (auto const& kv : batch.kvCaches)
+            {
+                ssmBlocks += static_cast<size_t>(std::max(1, kv.beamWidth));
+            }
+            numSlots[lcIdx] += slotCountValueFromSize(ssmBlocks);
             continue;
         }
         // Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
@@ -1847,17 +2071,33 @@ TypedVec<LifeCycleId, SlotCount> StorageManager::computeSlotsForBatch(
             int nonStale = totalBlocks - stale.length();
             int nonStaleSys = sysBlocks - intersect(stale, sysRange).length();
             int uniqueNonStale = std::max(0, nonStale - nonStaleSys);
+
+            // Split into the prefix the beams share and the tail each beam owns.
+            // The block holding the prompt tail is itself per-beam, so the
+            // boundary floors rather than rounds up — this matches
+            // _appendBeams()'s firstGenerationBlock exactly.
+            int const beamWidth = std::max(1, kv.beamWidth);
+            HalfOpenRange<BlockOrdinal> const sharedRange{0, std::min(kv.promptLength / tokensPerBlock, totalBlocks)};
+            int const nonStaleShared = sharedRange.length() - intersect(stale, sharedRange).length();
+            int const uniqueShared = std::min(std::max(0, nonStaleShared - nonStaleSys), uniqueNonStale);
+            int const uniqueBeam = uniqueNonStale - uniqueShared;
+
             if (swaScratchReuse.has_value())
             {
                 auto scratch = computeScratchRange(
                     lc, kv.historyLength, kv.capacity, tokensPerBlock, swaScratchReuse->maxRewindLen);
                 int numScratch = scratch.length();
+                // Scratch blocks are input blocks, so they sit in the per-beam
+                // tail; only a conservative remainder can reach the shared prefix.
+                int const scratchBeam = std::min(numScratch, uniqueBeam);
+                int const scratchShared = std::min(numScratch - scratchBeam, uniqueShared);
                 // Scratch blocks share coalesced slots: actual slots = ceil(numScratch * fracMax).
-                numSlots[lcIdx] += (uniqueNonStale - numScratch) + mSlotUtilFracMax[lcIdx].ceilMul(numScratch);
+                numSlots[lcIdx] += (uniqueShared - scratchShared) + mSlotUtilFracMax[lcIdx].ceilMul(scratchShared)
+                    + beamWidth * ((uniqueBeam - scratchBeam) + mSlotUtilFracMax[lcIdx].ceilMul(scratchBeam));
             }
             else
             {
-                numSlots[lcIdx] += uniqueNonStale;
+                numSlots[lcIdx] += uniqueShared + beamWidth * uniqueBeam;
             }
         }
     }

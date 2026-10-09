@@ -383,19 +383,29 @@ def test_the_pages_stay_until_the_last_of_several_leases_ends(kit, real_manager)
         assert kit.closed(kv)
 
 
-def next_owner_s_row_across_the_kept_close(kit, mgr):
+def next_owner_s_row_across_the_kept_close(kit, mgr, *, early_release=False, prompt=PROMPT):
     """``SOURCE`` is lent, freed, and its index slot taken by another request; then the lease ends
     and the kept cache closes. The new owner's host page table row before and after."""
-    request = kit.published(mgr, SOURCE, PROMPT)
+    request = kit.published(mgr, SOURCE, prompt)
     kv = kit.kv(mgr, request)
+    assert int(kv.beam_width) == 1, "prefill only allocated one physical beam"
     index = mgr.index_mapper.get_index(SOURCE)
+    if mgr.sparse_metadata_batch is not None:
+        assert kv.page_storage_row == index
     lender = attach_in_place(mgr)
-    lease = lender.lend_read(request, 0, END)
+    lease = lender.lend_read(request, 0, len(prompt))
+    if early_release:
+        mgr.release_index_slot(SOURCE)
     mgr.free_resources(request)
+    assert not kit.closed(kv), "the open lease must retain its cache"
+    if mgr.sparse_metadata_batch is not None:
+        assert kv.page_storage_row is None, "the freed cache still owns the batch row"
     others = kit.Requests(mgr)
     assert others.allocate(3)
     (other,) = others.held
     assert mgr.index_mapper.get_index(other.py_request_id) == index, "the slot is reused"
+    if mgr.sparse_metadata_batch is not None:
+        assert kit.kv(mgr, other).page_storage_row == index
     row = mgr.host_kv_cache_block_offsets[0, index * mgr.max_beam_width]
     before = row.clone()
     lease.release()
@@ -405,9 +415,28 @@ def next_owner_s_row_across_the_kept_close(kit, mgr):
     return before, after
 
 
-def test_a_lent_request_gives_up_its_index_slot_at_its_free(kit, real_manager):
+@pytest.mark.parametrize("max_beam_width", [1, 2])
+def test_a_lent_request_gives_up_its_index_slot_at_its_free(kit, real_manager, max_beam_width):
+    with real_manager(max_tokens=kit.POOL_TOKENS, max_beam_width=max_beam_width) as mgr:
+        # Beam-capable managers commit whole blocks only, including during prefill.
+        prompt = PROMPT if max_beam_width == 1 else PROMPT[:-1]
+        before, after = next_owner_s_row_across_the_kept_close(kit, mgr, prompt=prompt)
+    assert torch.equal(after, before), "closing the kept cache wrote into the next owner's row"
+
+
+@pytest.mark.parametrize("early_release", [False, True], ids=["free", "early_release"])
+def test_a_lent_request_detaches_its_batch_row_before_slot_reuse(kit, real_manager, early_release):
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import Batch
+
     with real_manager(max_tokens=kit.POOL_TOKENS) as mgr:
-        before, after = next_owner_s_row_across_the_kept_close(kit, mgr)
+        # Native batch membership is independent of sparse attention kernels.
+        index_mapper_capacity = mgr.index_mapper.size() + mgr.index_mapper.num_free_slots()
+        mgr.sparse_metadata_batch = Batch(
+            mgr.impl, index_mapper_capacity, mgr.max_blocks_per_seq, mgr.max_beam_width
+        )
+        before, after = next_owner_s_row_across_the_kept_close(
+            kit, mgr, early_release=early_release
+        )
     assert torch.equal(after, before), "closing the kept cache wrote into the next owner's row"
 
 

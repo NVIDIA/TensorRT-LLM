@@ -199,29 +199,24 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     if draft_block_offsets is None:
         return None
 
-    saved = {
-        'target_kv_cache_manager':
-        attn_metadata.kv_cache_manager,
-        'target_kv_cache_block_offsets':
-        attn_metadata.kv_cache_block_offsets,
-        'target_host_kv_cache_block_offsets':
-        attn_metadata.host_kv_cache_block_offsets,
-    }
+    # Marks that a swap happened and carries the backend's state for its
+    # restore hook; swap_for_draft records the originals on attn_metadata.
+    saved = {}
     if attn_metadata.enable_flash_mla:
         if (attn_metadata.draft_block_ids_per_seq is None
                 or attn_metadata.draft_kv_block_ids_per_seq is None):
             raise RuntimeError(
                 "FlashMLA separate draft KV cache requires dedicated draft block-ID buffers"
             )
-        saved['target_block_ids_per_seq'] = attn_metadata.block_ids_per_seq
-        saved[
-            'target_kv_block_ids_per_seq'] = attn_metadata.kv_block_ids_per_seq
-        attn_metadata.block_ids_per_seq = attn_metadata.draft_block_ids_per_seq
-        attn_metadata.kv_block_ids_per_seq = (
-            attn_metadata.draft_kv_block_ids_per_seq)
-    attn_metadata.kv_cache_manager = draft_kv_cache_manager
-    attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-    attn_metadata.host_kv_cache_block_offsets = (
+        attn_metadata.swap_for_draft('block_ids_per_seq',
+                                     attn_metadata.draft_block_ids_per_seq)
+        attn_metadata.swap_for_draft('kv_block_ids_per_seq',
+                                     attn_metadata.draft_kv_block_ids_per_seq)
+    attn_metadata.swap_for_draft('kv_cache_manager', draft_kv_cache_manager)
+    attn_metadata.swap_for_draft('kv_cache_block_offsets',
+                                 attn_metadata.draft_kv_cache_block_offsets)
+    attn_metadata.swap_for_draft(
+        'host_kv_cache_block_offsets',
         draft_kv_cache_manager.host_kv_cache_block_offsets)
     if attn_metadata.enable_flash_mla:
         attn_metadata.prepare_flash_mla()
@@ -238,16 +233,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     """Restore attention metadata after draft replay. No-op if saved_state is None."""
     if saved_state is None:
         return
-    attn_metadata.kv_cache_manager = saved_state['target_kv_cache_manager']
-    attn_metadata.kv_cache_block_offsets = (
-        saved_state['target_kv_cache_block_offsets'])
-    attn_metadata.host_kv_cache_block_offsets = (
-        saved_state['target_host_kv_cache_block_offsets'])
+    attn_metadata.restore_draft_swaps()
     if attn_metadata.enable_flash_mla:
-        attn_metadata.block_ids_per_seq = saved_state[
-            'target_block_ids_per_seq']
-        attn_metadata.kv_block_ids_per_seq = saved_state[
-            'target_kv_block_ids_per_seq']
         # Target and draft block-ID buffers are independent. Restoring only
         # needs to invalidate the scheduler metadata; refreshing the unchanged
         # target buffers would repeat request-specific H2D work.
@@ -547,6 +534,29 @@ class SpecMetadata:
     # Total runtime tokens per generation request for the current iteration,
     # Normally, it equals 1 + runtime_draft_len. But for PARD, it equals 2 * runtime_draft_len.
     runtime_tokens_per_gen_step: int = 1
+
+    # Ragged (per-request) verification split, set only when
+    # confidence-scheduled verification runs in ragged mode:
+    #
+    #   verify_lens  [num_gen]      positions verified per generation request
+    #   qo_indptr    [num_gen + 1]  exclusive prefix sum; request r owns
+    #                               [qo_indptr[r], qo_indptr[r + 1])
+    #
+    # Both stay None on every other path. Built by
+    # ``_torch/speculative/ragged_helpers.RaggedVerifyLayout``.
+    verify_lens: Optional[torch.Tensor] = None
+    qo_indptr: Optional[torch.Tensor] = None
+    # Host-side ``sum(verify_lens)`` (reading it off the tensor would sync).
+    # Equals the captured token bucket after ``RaggedVerifyLayout.fill_bucket``.
+    total_verify_tokens: Optional[int] = None
+
+    @property
+    def is_ragged_verify(self) -> bool:
+        """Whether this iteration uses per-request verify lengths.
+
+        This property implies that generation rows use the packed layout.
+        """
+        return self.verify_lens is not None
 
     # Auto-detected per step from populated sampling params:
     # True if every request is greedy (no temp/top_k/top_p/min_p) and we can take
@@ -1170,7 +1180,8 @@ class SpecMetadata:
         population. Does NOT allocate or fill GPU buffers, so it is safe to call
         before the CUDA graph key is built.
         """
-        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm._torch.pyexecutor.llm_request import (
+            LlmRequestState, get_request_tokens_per_gen_step)
         from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
             GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
@@ -1232,6 +1243,8 @@ class SpecMetadata:
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
+        ragged_verify = self.is_ragged_verify
+        default_generation_tokens = 1 + self.runtime_draft_len
 
         for request in requests:
             sampling_config = request.sampling_config
@@ -1240,8 +1253,16 @@ class SpecMetadata:
             tp_val = sampling_config.top_p
             mp_val = sampling_config.min_p
 
-            # Context requests have no draft tokens yet.
-            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            # Generation requests contribute one row per verified position,
+            # per-request under ragged verification: the buffers are indexed
+            # by flat token position, so a fixed stride would apply request
+            # r's sampling params to request r+1's tokens.
+            if request.state == LlmRequestState.GENERATION_IN_PROGRESS:
+                num_tokens = (get_request_tokens_per_gen_step(
+                    request, default_generation_tokens)
+                              if ragged_verify else default_generation_tokens)
+            else:
+                num_tokens = 1
 
             (
                 temp_val,
@@ -1559,6 +1580,34 @@ class AuxiliarySpeculativeStateHandler(Protocol):
         num_contexts: int,
     ) -> None:
         ...
+
+
+def _padded_gen_draft_tokens(spec_metadata: SpecMetadata, num_gens: int,
+                             runtime_draft_len: int) -> torch.Tensor:
+    """Unpack ragged-packed draft tokens into ``[num_gens, runtime_draft_len]``.
+
+    The overlap path packs draft tokens by each request's own window, so the
+    buffer holds ``sum(verify_lens) - num_gens`` entries rather than a
+    ``num_gens x runtime_draft_len`` rectangle. Acceptance is naturally
+    rectangular, so scatter back out; positions past a request's window are
+    padding and get masked by ``count_accepted_ragged``.
+    """
+    from .ragged_helpers import build_qo_indptr, scatter_ragged_to_padded
+
+    # verify_lens counts tokens (bonus position + drafts); the draft buffer
+    # only holds the drafts.
+    verify_lens = spec_metadata.verify_lens
+    total_verify_tokens = spec_metadata.total_verify_tokens
+    if verify_lens is None or total_verify_tokens is None:
+        raise RuntimeError("ragged verification metadata is incomplete")
+    draft_lens = verify_lens - 1
+    packed_len = total_verify_tokens - num_gens
+    return scatter_ragged_to_padded(
+        spec_metadata.draft_tokens[:packed_len],
+        verify_lens=draft_lens,
+        qo_indptr=build_qo_indptr(draft_lens),
+        max_len=runtime_draft_len,
+    ).to(torch.int32)
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1954,16 +2003,39 @@ class SpecWorkerBase(nn.Module, ABC):
         accepted_tokens[:num_contexts, 0] = target_tokens[:num_contexts]
 
         # Generation requests: verify draft tokens against target tokens
-        gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, runtime_draft_len + 1)
+        if spec_metadata is not None and spec_metadata.is_ragged_verify:
+            from .ragged_helpers import (count_accepted_ragged,
+                                         scatter_ragged_to_padded)
+            verify_lens = spec_metadata.verify_lens
+            total = spec_metadata.total_verify_tokens
+            qo_indptr = spec_metadata.qo_indptr
+            if verify_lens is None or total is None or qo_indptr is None:
+                raise RuntimeError("ragged verification metadata is incomplete")
+            gen_target_tokens = scatter_ragged_to_padded(
+                target_tokens[num_contexts:num_contexts + total],
+                verify_lens=verify_lens,
+                qo_indptr=qo_indptr,
+                max_len=runtime_draft_len + 1)
+            # verify_lens counts tokens (bonus position included), so a
+            # request drafted verify_lens - 1 positions. Masking past that is
+            # what stops a stale padded slot from comparing equal and crediting
+            # an acceptance the target never made.
+            num_accepted_tokens[num_contexts:] += count_accepted_ragged(
+                draft_tokens=draft_tokens,
+                target_tokens=gen_target_tokens[:, :runtime_draft_len],
+                verify_lens=verify_lens - 1)
+        else:
+            gen_target_tokens = target_tokens[num_contexts:].reshape(
+                num_gens, runtime_draft_len + 1)
+
+            # Compare draft tokens with target tokens using cumulative product
+            # Counts consecutive matches from the start
+            num_accepted_tokens[num_contexts:] += torch.cumprod((
+                draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
+                                                                dim=-1).sum(1)
+
         accepted_tokens[num_contexts:, :runtime_draft_len +
                         1] = gen_target_tokens
-
-        # Compare draft tokens with target tokens using cumulative product
-        # Counts consecutive matches from the start
-        num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
-            dim=-1).sum(1)
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
@@ -1972,6 +2044,14 @@ class SpecWorkerBase(nn.Module, ABC):
             runtime_draft_len,
             spec_metadata=spec_metadata)
 
+        if spec_metadata is not None and spec_metadata.is_ragged_verify:
+            # The synthetic-acceptance override caps at the batch-wide
+            # runtime_draft_len; under ragged a request may have verified
+            # fewer positions, and accepting past its window would commit
+            # tokens the target never produced.
+            num_accepted_tokens[num_contexts:] = torch.minimum(
+                num_accepted_tokens[num_contexts:],
+                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
 
     def _apply_occurrence_penalties(
@@ -1982,9 +2062,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         No-op unless the deploy enabled the penalties and some request in the batch
         actually uses one. ``logits`` must already be in the normalized
-        ``[ctx (1 row), gen (draft_len + 1 rows)]`` layout, i.e. after
-        ``_reshape_logits_for_accept`` -- which is what makes PARD's wider raw
-        layout fit the same mapping.
+        layout after ``_reshape_logits_for_accept``: one row per context plus
+        either ``draft_len + 1`` rows per generation request (uniform) or each
+        request's packed ``verify_lens`` rows (ragged). This is also what makes
+        PARD's wider raw layout fit the same mapping.
 
         Returns the logits acceptance should read: a penalized copy when the
         penalties apply, otherwise the caller's tensor unchanged.
@@ -1998,9 +2079,13 @@ class SpecWorkerBase(nn.Module, ABC):
         # captured; whether it changes anything is decided on device by
         # ``penalty_active``, which the replayed kernel re-reads every step.
         draft_len = draft_tokens.shape[1] if draft_tokens.dim() > 1 else 0
-        mapping = penalty_ops.build_row_mapping(spec_metadata, num_contexts,
-                                                batch_size, draft_len,
-                                                draft_tokens, logits.device)
+        mapping = penalty_ops.build_row_mapping(spec_metadata,
+                                                num_contexts,
+                                                batch_size,
+                                                draft_len,
+                                                draft_tokens,
+                                                logits.device,
+                                                num_logit_rows=logits.shape[0])
         if mapping is None:
             return logits
         row_slots, intra_tokens, intra_valid = mapping
@@ -2225,9 +2310,13 @@ class SpecWorkerBase(nn.Module, ABC):
             logits, temperatures, top_ks, top_ps)
 
     @staticmethod
-    def _zero_padding_rows(logits: torch.Tensor, spec_metadata,
-                           num_contexts: int, batch_size: int,
-                           rows_per_request: int) -> torch.Tensor:
+    def _zero_padding_rows(logits: torch.Tensor,
+                           spec_metadata,
+                           num_contexts: int,
+                           batch_size: int,
+                           rows_per_request: int,
+                           *,
+                           packed_verify: bool = False) -> torch.Tensor:
         """Zero the logits rows belonging to CUDA-graph padding requests.
 
         A padding request decodes from an uninitialized KV/hidden state, so its
@@ -2244,20 +2333,31 @@ class SpecWorkerBase(nn.Module, ABC):
         ``prepare_penalty_buffers`` are the two places that publish it.
 
         Args:
-            logits: ``[(batch_size - num_contexts) * rows_per_request, vocab]``;
-                returned unchanged if the row count does not match.
+            logits: ``[num_generation_tokens, vocab]``.
             rows_per_request: logits rows each request contributes.
+            packed_verify: use the ragged verification lengths for target logits;
+                draft-step logits retain their uniform layout.
         Returns:
             ``logits`` with the padding requests' rows zeroed.
         """
         slot_ids = getattr(spec_metadata, "batch_slot_ids", None)
         dummy_slot_row = getattr(spec_metadata, "dummy_slot_row", 0)
         num_gens = batch_size - num_contexts
-        if (slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0
-                or logits.shape[0] != num_gens * rows_per_request):
+        if slot_ids is None or dummy_slot_row <= 0 or num_gens <= 0:
             return logits
         is_padding = slot_ids[num_contexts:batch_size] == dummy_slot_row
-        if rows_per_request > 1:
+        if packed_verify and spec_metadata.is_ragged_verify:
+            lens = spec_metadata.verify_lens
+            if (lens is None or lens.dim() != 1 or lens.numel() != num_gens
+                    or spec_metadata.total_verify_tokens != logits.shape[0]):
+                raise ValueError(
+                    "ragged padding rows do not match the verification layout")
+            is_padding = torch.repeat_interleave(is_padding,
+                                                 lens.to(torch.long),
+                                                 output_size=logits.shape[0])
+        elif logits.shape[0] != num_gens * rows_per_request:
+            return logits
+        elif rows_per_request > 1:
             is_padding = is_padding.repeat_interleave(rows_per_request)
         return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
 
@@ -2337,6 +2437,12 @@ class SpecWorkerBase(nn.Module, ABC):
             return torch.zeros((num_gens, runtime_draft_len),
                                dtype=torch.int,
                                device=device)
+        if spec_metadata.is_ragged_verify:
+            # Packed by per-request windows, not a rectangle; a plain reshape
+            # can happen to divide and silently attribute one request's drafts
+            # to another.
+            return _padded_gen_draft_tokens(spec_metadata, num_gens,
+                                            runtime_draft_len)
         return spec_metadata.draft_tokens.reshape(num_gens, runtime_draft_len)
 
     def _reshape_logits_for_accept(self, logits, num_contexts, num_gens,
@@ -2393,9 +2499,21 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         if draft_tokens.dim() != 2 or draft_tokens.shape[0] != num_gens:
             return False
-        # logits must cover context rows (1 each) + gen rows (draft_len + 1 each).
+        # logits must cover context rows (1 each) + however many gen rows the
+        # target was actually given: under ragged verification that is
+        # `total_verify_tokens`, not `num_gens * (draft_len + 1)`.
         logits_rows = logits.shape[0] if logits.dim() > 1 else 1
-        if logits_rows < num_contexts + num_gens * (draft_len + 1):
+        if spec_metadata.is_ragged_verify:
+            # Fail closed on a half-built ragged layout: the branch below
+            # dereferences all three of these.
+            total_verify_tokens = spec_metadata.total_verify_tokens
+            if (total_verify_tokens is None or spec_metadata.verify_lens is None
+                    or spec_metadata.qo_indptr is None):
+                return False
+            required_gen_rows = int(total_verify_tokens)
+        else:
+            required_gen_rows = num_gens * (draft_len + 1)
+        if logits_rows < num_contexts + required_gen_rows:
             return False
         # Slot ids for the gen subset must exist (range safety is guaranteed by
         # construction).
@@ -2459,15 +2577,23 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # === Generation subset: rejection sampling on the gen slice ===
         if num_gens > 0:
-            num_gen_logits = num_gens * (runtime_draft_len + 1)
+            is_ragged = spec_metadata.is_ragged_verify
+            # The per-token sampling-parameter buffers are packed by the same
+            # per-request windows as the logits (see
+            # _scan_one_model_sampling), so one flat total covers both.
+            num_gen_logits = (spec_metadata.total_verify_tokens if is_ragged
+                              else num_gens * (runtime_draft_len + 1))
             gen_logits = logits[num_contexts:num_contexts + num_gen_logits]
             gen_start = num_contexts
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
-            gen_logits = self._zero_padding_rows(gen_logits, spec_metadata,
-                                                 num_contexts, batch_size,
-                                                 runtime_draft_len + 1)
+            gen_logits = self._zero_padding_rows(gen_logits,
+                                                 spec_metadata,
+                                                 num_contexts,
+                                                 batch_size,
+                                                 runtime_draft_len + 1,
+                                                 packed_verify=True)
             # The target distribution the acceptance test divides by. It must be
             # filtered exactly as the draft probs were (see advanced_sample_draft),
             # which is why both use the same backend selection on the same mode --
@@ -2477,9 +2603,19 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.top_ks[gen_start:gen_end],
                 spec_metadata.top_ps[gen_start:gen_end],
                 spec_metadata.min_ps[gen_start:gen_end])
-            target_probs = target_probs_flat.reshape(num_gens,
-                                                     runtime_draft_len + 1,
-                                                     vocab_size)
+            if is_ragged:
+                from .ragged_helpers import (fill_padded_rows_onehot,
+                                             scatter_ragged_to_padded)
+                target_probs = scatter_ragged_to_padded(
+                    target_probs_flat,
+                    verify_lens=spec_metadata.verify_lens,
+                    qo_indptr=spec_metadata.qo_indptr,
+                    max_len=runtime_draft_len + 1)
+                fill_padded_rows_onehot(target_probs,
+                                        verify_lens=spec_metadata.verify_lens)
+            else:
+                target_probs = target_probs_flat.reshape(
+                    num_gens, runtime_draft_len + 1, vocab_size)
 
             draft_vocab_size = draft_probs.shape[-1]
             assert draft_probs.shape[0] == num_gens, (
@@ -2527,6 +2663,19 @@ class SpecWorkerBase(nn.Module, ABC):
             else:
                 full_draft_probs = draft_probs
 
+            if is_ragged:
+                # Missing draft IDs are zero, so their proposal must be a
+                # point mass at target token 0. At the request-local bonus,
+                # acceptance emits 0 with probability q[0]; rejection samples
+                # q conditioned on a nonzero token. Together they sample q.
+                # Pad after d2t expansion, on private storage: target token 0
+                # need not have a draft mapping and must not leak into reused
+                # buffers.
+                full_draft_probs = full_draft_probs.clone()
+                draft_lens = spec_metadata.verify_lens - 1
+                fill_padded_rows_onehot(full_draft_probs,
+                                        verify_lens=draft_lens)
+
             full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
             # One entry per gen request; slot 0 of the step's offset window.
@@ -2558,6 +2707,15 @@ class SpecWorkerBase(nn.Module, ABC):
             num_contexts,
             runtime_draft_len,
             spec_metadata=spec_metadata)
+
+        if num_gens > 0 and spec_metadata.is_ragged_verify:
+            # The kernel walks the padded rectangle, so a request whose whole
+            # window was accepted keeps going into padding. verify_lens is the
+            # hard ceiling: accepting past it commits tokens the target never
+            # scored.
+            num_accepted_tokens[num_contexts:] = torch.minimum(
+                num_accepted_tokens[num_contexts:],
+                spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
 
     def _rng_state_per_request(
@@ -2990,7 +3148,7 @@ class SpecWorkerBase(nn.Module, ABC):
         if resource_manager is not None:
             target = resource_manager.get_resource_manager(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            get_view = getattr(target, "get_draft_subpage_view", None)
+            get_view = getattr(target, "get_draft_kv_cache_view", None)
             if get_view is not None:
                 return get_view()
         return None

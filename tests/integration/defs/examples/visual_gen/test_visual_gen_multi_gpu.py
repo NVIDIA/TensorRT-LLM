@@ -89,6 +89,11 @@ WAN_MULTI_GPU_REORDERED_WITHIN_BUILD_LPIPS_THRESHOLD = 0.30
 # trajectory), so this bound intentionally has large headroom and exists
 # only to catch outputs that are far from everything.
 WAN_MULTI_GPU_GOLDEN_BACKSTOP_LPIPS_THRESHOLD = 0.32
+# MiniMax-H3's iterative denoising amplifies the benign BF16 differences from
+# repartitioning attention heads.  The 384x384 L0 cases measured 0.117972 on
+# two GPUs and 0.203348 on four GPUs.  These topology-specific bounds keep
+# roughly 0.03-0.05 headroom while still rejecting visibly unrelated output.
+MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS = {2: 0.15, 4: 0.25}
 WAN22_MULTI_GPU_LPIPS_ATTENTION_BACKEND = "FA4"
 WAN22_MULTI_GPU_LPIPS_GOLDEN_VIDEO = "wan22_t2v_fa4_fully_eager_lpips_golden_video.mp4"
 # (variant name, parallel kwargs, within-build LPIPS bound) -- pick the bound
@@ -423,4 +428,76 @@ def test_wan22_t2v_lpips_against_golden_tp(
 ):
     _run_wan22_t2v_lpips_case(
         tmp_path, variant_name, parallel, wan22_within_build_reference, within_build_threshold
+    )
+
+
+@pytest.mark.parametrize(
+    "ulysses_size,vae_size,backend", [(2, 2, "VANILLA"), (4, 3, "VANILLA"), (2, 2, "FA4")]
+)
+def test_minimax_h3_ulysses_parallel_vae_lpips(tmp_path, ulysses_size, vae_size, backend):
+    """Compare real Ulysses + tiled VAE collectives with a fresh one-GPU baseline."""
+    from defs.examples.visual_gen.test_minimax_h3_e2e import (
+        MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD,
+        _mean_lpips_distance,
+        _minimax_h3_checkpoint_path,
+        _multi_resolution_log_stft_distance,
+    )
+
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+
+    if torch.cuda.device_count() < ulysses_size:
+        pytest.skip(f"Requires {ulysses_size} CUDA GPUs")
+    prompt = "A woman smiles and waves in a sunlit park, with birds chirping."
+    videos, audios = [], []
+    for size, decode_size in ((1, 1), (ulysses_size, 1), (ulysses_size, vae_size)):
+        args = VisualGenArgs(
+            model=_minimax_h3_checkpoint_path(),
+            parallel_config={"ulysses_size": size, "parallel_vae_size": decode_size},
+            attention_config={"backend": backend},
+            torch_compile_config={"enable": True},
+            cuda_graph_config={"enable": False},
+            compilation_config={"skip_warmup": True},
+        )
+        engine = VisualGen(model=args.model, args=args)
+        try:
+            output = engine.generate(
+                inputs=prompt,
+                params=VisualGenParams(
+                    height=384, width=384, num_frames=124, num_inference_steps=28, seed=42
+                ),
+            )
+            video = torch.as_tensor(output.video).cpu()
+            if video.ndim == 4:
+                video = video.unsqueeze(0)
+            assert video.shape == (1, 124, 384, 384, 3)
+            assert video.float().std() > 1
+            assert torch.isfinite(torch.as_tensor(output.audio)).all()
+            torch.save(
+                {"video": video, "audio": output.audio},
+                tmp_path / f"h3_ulysses{size}_vae{decode_size}.pt",
+            )
+            videos.append(video)
+            audios.append(torch.as_tensor(output.audio).cpu())
+        finally:
+            engine.shutdown()
+    torch.testing.assert_close(videos[2], videos[1])
+    torch.testing.assert_close(audios[2], audios[1])
+    for decode_size, audio in zip((1, vae_size), audios[1:]):
+        audio_score = _multi_resolution_log_stft_distance(audio, audios[0])
+        print(
+            f"H3 Ulysses={ulysses_size} + parallel_vae_size={decode_size} vs single GPU: "
+            f"audio log-STFT={audio_score:.6f}"
+        )
+        assert audio_score < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD, (
+            f"H3 parallelism changed audio: log-STFT={audio_score:.6f} "
+            f">= {MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD}"
+        )
+    reference = videos[0].permute(0, 1, 4, 2, 3).float().div(255)
+    score = _mean_lpips_distance(videos[2], reference)
+    print(
+        f"H3 Ulysses={ulysses_size} + parallel_vae_size={vae_size} vs single GPU: mean LPIPS={score:.6f}"
+    )
+    lpips_threshold = MINIMAX_H3_MULTI_GPU_LPIPS_THRESHOLDS[ulysses_size]
+    assert score < lpips_threshold, (
+        f"H3 parallelism changed output: mean LPIPS={score:.6f} >= {lpips_threshold}"
     )

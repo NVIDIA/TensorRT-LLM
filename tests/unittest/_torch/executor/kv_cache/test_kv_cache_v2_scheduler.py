@@ -22,11 +22,297 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("beam_admitted", [False, True])
+def test_generation_admits_decode_before_capacity_growth(
+    active: bool, admitted: bool, beam_admitted: bool
+) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    cache = Mock(is_active=active, capacity=8)
+    cache.enter_decode.return_value = admitted
+    cache.resume.return_value = admitted
+    cache.resize.return_value = True
+    manager.kv_cache_map = {1: cache}
+    manager._stream = Mock(cuda_stream=123)
+    manager._restore_page_index_bufs = Mock()
+    manager._ensure_generation_beam_width = Mock(return_value=beam_admitted)
+    manager._generation_draft_slots = Mock(return_value=0)
+    manager._allocated_draft_lens = {}
+    manager._has_cp_helix = False
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    req = Mock(py_request_id=1)
+
+    allocated = admitted and beam_admitted
+    assert manager.try_allocate_generation(req) == allocated
+    admission = call.enter_decode() if active else call.resume(123, is_decoding=True)
+    assert cache.mock_calls == [admission] + ([call.resize(9)] if allocated else [])
+    if admitted:
+        manager._ensure_generation_beam_width.assert_called_once_with(req, cache)
+    else:
+        manager._ensure_generation_beam_width.assert_not_called()
+    if not active and admitted:
+        manager._restore_page_index_bufs.assert_called_once_with(1, cache)
+    else:
+        manager._restore_page_index_bufs.assert_not_called()
+    assert manager._allocated_draft_lens == ({1: 0} if allocated else {})
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_resume_restores_page_buffers_and_sparse_metadata_row(sparse: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_index.return_value = 3
+    manager._set_page_index_bufs = Mock()
+    manager.sparse_metadata_batch = Mock() if sparse else None
+    cache = Mock()
+
+    manager._restore_page_index_bufs(7, cache)
+
+    manager._set_page_index_bufs.assert_called_once_with(7, cache)
+    if sparse:
+        manager.index_mapper.get_index.assert_called_once_with(7)
+        manager.sparse_metadata_batch.add.assert_called_once_with(cache, 3)
+
+
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    order = Mock()
+    manager._disagg_receive_ready = {}
+    manager.is_draft = is_draft
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.kv_connector_manager = Mock()
+    manager._prepare_draft_resources = order.prepare_draft
+    manager._run_kv_connector_hooks = order.connector
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
+    scheduled = Mock(context_requests=[])
+    manager.prepare_resources(scheduled)
+    prepare = call.prepare_draft(scheduled) if is_draft else call.connector(scheduled)
+    assert order.mock_calls == [prepare, call.record_read(123), call.publish(123)]
+
+
+def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    order = Mock()
+    manager.is_draft = False
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.kv_connector_manager = Mock()
+    manager._connector_reservations_enabled = Mock(return_value=True)
+    manager._accept_connector_prefix_reservations = order.accept
+    order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
+    scheduled = Mock()
+    manager.report_batch_to_connector(scheduled)
+    assert order.mock_calls == [
+        call.accept(scheduled),
+        call.report(scheduled, manager),
+        call.record_read(123),
+        call.publish(123),
+    ]
+
+
+@pytest.fixture
+def sparse_offset_manager() -> KVCacheManagerV2:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager._sparse_layer_group_ids = (1, 3)
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.tokens_per_block = 4
+    manager.kv_cache_map = {req_id: Mock(is_decoding=True, history_length=8) for req_id in (7, 8)}
+    for cache in manager.kv_cache_map.values():
+        cache.get_page_storage_snapshot.return_value = Mock(
+            cache_levels=[0, 0], eligible_history_blocks=0
+        )
+    manager._use_per_layer_page_tables = False
+    manager._copy_batch_block_offsets_per_layer = Mock()
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_copy_index.return_value = Mock(shape=(2,))
+    manager.host_kv_cache_block_offsets = Mock()
+    manager.index_scales = Mock()
+    manager.kv_offset = Mock()
+    return manager
+
+
+@pytest.mark.parametrize("per_layer", [False, True])
+@pytest.mark.parametrize(
+    "cache_levels",
+    [pytest.param([0, 0], id="gpu"), pytest.param([None, 0, None], id="invalid-slots")],
+)
+def test_sparse_gpu_resident_history_uses_dense_attention_offsets(
+    sparse_offset_manager: KVCacheManagerV2, cache_levels: list[int | None], per_layer: bool
+) -> None:
+    manager = sparse_offset_manager
+    manager._use_per_layer_page_tables = per_layer
+    manager.kv_cache_map[8].get_page_storage_snapshot.return_value.cache_levels = cache_levels
+    unscheduled_cache = Mock(is_decoding=True, history_length=8)
+    unscheduled_cache.get_page_storage_snapshot.return_value = Mock(cache_levels=[1, 1])
+    manager.kv_cache_map[9] = unscheduled_cache
+    destination = Mock()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        manager.copy_batch_block_offsets(destination, [7, 8], 1, 0, 2)
+        if per_layer:
+            manager._copy_batch_block_offsets_per_layer.assert_called_once_with(
+                destination, [7, 8], manager.index_mapper.get_copy_index.return_value, 0, 2
+            )
+            dense_copy.assert_not_called()
+        else:
+            dense_copy.assert_called_once_with(
+                manager.host_kv_cache_block_offsets,
+                destination,
+                manager.index_mapper.get_copy_index.return_value,
+                manager.index_scales,
+                manager.kv_offset,
+                123,
+            )
+            manager._copy_batch_block_offsets_per_layer.assert_not_called()
+    for req_id in (7, 8):
+        assert manager.kv_cache_map[req_id].get_page_storage_snapshot.call_args_list == [
+            call(1),
+            call(3),
+        ]
+    unscheduled_cache.get_page_storage_snapshot.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize(
+    ("cache_levels", "eligible_history_blocks"),
+    [
+        pytest.param([1, 1], 2, id="host"),
+        pytest.param([0, 1], 0, id="host-after-gpu"),
+        pytest.param([None, 1], 0, id="host-after-invalid-slot"),
+    ],
+)
+def test_sparse_host_indices_cannot_reach_dense_attention_offsets(
+    sparse_offset_manager: KVCacheManagerV2,
+    cache_levels: list[int | None],
+    eligible_history_blocks: int,
+) -> None:
+    manager = sparse_offset_manager
+    snapshots = {
+        1: Mock(cache_levels=[0, 0], eligible_history_blocks=0),
+        3: Mock(cache_levels=cache_levels, eligible_history_blocks=eligible_history_blocks),
+    }
+    manager.kv_cache_map[8].get_page_storage_snapshot.side_effect = snapshots.__getitem__
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="Offloaded sparse history"):
+            manager.copy_batch_block_offsets(Mock(), [7, 8], 1, 0, 2)
+        dense_copy.assert_not_called()
+    manager._copy_batch_block_offsets_per_layer.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+def test_sparse_dense_offsets_check_residency_after_publication(
+    sparse_offset_manager: KVCacheManagerV2,
+) -> None:
+    manager = sparse_offset_manager
+    snapshot = manager.kv_cache_map[8].get_page_storage_snapshot.return_value
+
+    def offload_history(stream: int) -> None:
+        snapshot.cache_levels = [1, 1]
+        snapshot.eligible_history_blocks = 2
+
+    manager.sparse_metadata_batch.publish.side_effect = offload_history
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="Offloaded sparse history"):
+            manager.copy_batch_block_offsets(Mock(), [7, 8], 1, 0, 2)
+        dense_copy.assert_not_called()
+    manager._copy_batch_block_offsets_per_layer.assert_not_called()
+    manager.sparse_metadata_batch.publish.assert_called_once_with(123)
+
+
+def test_sparse_publication_failure_stops_metadata_preparation() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager.sparse_metadata_batch = Mock()
+    manager.sparse_metadata_batch.publish.side_effect = RuntimeError("upload failed")
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        with pytest.raises(RuntimeError, match="upload failed"):
+            manager.copy_batch_block_offsets(Mock(), [7], 1, 0, 1)
+        dense_copy.assert_not_called()
+
+
+def test_dense_metadata_preparation_uses_existing_offsets() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager._stream = Mock(cuda_stream=123)
+    manager.max_copy_beam_width = 1
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager._use_per_layer_page_tables = False
+    manager.index_mapper = Mock()
+    manager.index_mapper.get_copy_index.return_value = Mock(shape=(1,))
+    manager.host_kv_cache_block_offsets = Mock()
+    manager.index_scales = Mock()
+    manager.kv_offset = Mock()
+    destination = Mock()
+    with patch(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+        "copy_batch_block_offsets_to_device"
+    ) as dense_copy:
+        manager.copy_batch_block_offsets(destination, [7], 1, 0, 1)
+        dense_copy.assert_called_once_with(
+            manager.host_kv_cache_block_offsets,
+            destination,
+            manager.index_mapper.get_copy_index.return_value,
+            manager.index_scales,
+            manager.kv_offset,
+            123,
+        )
+
+
+def test_sparse_index_slot_release_detaches_batch_before_reuse() -> None:
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = False
+    manager._stream = Mock(cuda_stream=123)
+    manager.max_beam_width = 2
+    manager.num_pools = 1
+    manager._early_freed_index_requests = set()
+    cache = Mock(beam_width=1)
+    manager.kv_cache_map = {7: cache}
+    manager.sparse_metadata_batch = Mock()
+    manager.index_mapper = Mock()
+    order = Mock()
+    order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
+    order.attach_mock(manager.sparse_metadata_batch.remove, "remove")
+    order.attach_mock(cache.set_base_page_index_buf, "detach_buffer")
+    order.attach_mock(manager.index_mapper.remove_sequence, "release_slot")
+    manager.release_index_slot(7)
+    assert order.mock_calls == [
+        call.record_read(123),
+        call.remove(cache),
+        call.detach_buffer(0, 0, None),
+        call.release_slot(7),
+    ]
+    assert manager._early_freed_index_requests == {7}
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +473,11 @@ def make_kv_cache_manager(
     mgr.enable_joint_kv_cache_reuse = enable_joint_kv_cache_reuse
     mgr.enable_block_reuse = enable_block_reuse
     mgr.num_extra_kv_tokens = 0
+    # Real scalars, not auto-created Mocks: tests bind the real
+    # prepare_context/_prepare_connector_prefix_reservation onto this mock,
+    # and both feed _spec_recompute_tail/is_draft into the reuse-claim cap.
+    mgr._spec_recompute_tail = 0
+    mgr.is_draft = False
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
     mgr.is_vswa = is_vswa
@@ -204,6 +495,9 @@ def make_kv_cache_manager(
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
+    # An unpaired draft pool is created-and-resumed through this during
+    # admission; a real manager answers False when either step fails.
+    mgr.admit_mirror.side_effect = lambda req: True
     mgr._resume_and_restore.return_value = True
 
     def create_kv_cache(request_id, *_args, **_kwargs):
@@ -830,6 +1124,143 @@ class TestKVCacheFailuresGen:
         # → gen1 self-evicts, victim is not in paused list from eviction
         assert ids(out.generation_requests) == [0]
         assert 99 not in ids(out.paused_requests)
+
+
+class TestUnpairedDraftAdmission:
+    """A draft pool the scheduler suspends but never used to re-admit.
+
+    ``_joint_draft_manager`` is None whenever joint KV cache reuse is off, and
+    for a hidden-state drafter it always is: ``draft_prompt_lookahead`` is
+    unestablished there, so ``_joint_reuse_supported`` refuses the pairing.
+    ``_suspend_request`` nonetheless suspends that pool on every eviction,
+    because it keys on ``draft_kv_cache_manager`` rather than on the pairing.
+
+    The asymmetry is the whole defect: nothing brought the mirror up, so it
+    reached the draft manager's ``prepare_resources`` suspended, and the only
+    thing that method can do there is raise -- the target is already prepared
+    and the request is already in the batch. These tests hold the admission on
+    the scheduler side, where a refusal is still a rollback.
+
+    "Admission", not "resume", because a mirror is equally unusable when it has
+    never been created: a fresh ``_KVCache`` is born SUSPENDED, so a
+    first-sight request's mirror needs its first resume just as much as an
+    evicted one does, and that resume can be refused under pool pressure.
+    """
+
+    def test_generation_admission_admits_an_unpaired_draft_mirror(self):
+        mgr = make_kv_cache_manager()  # joint reuse off
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == [0]
+        draft_mgr.admit_mirror.assert_called_once_with(req)
+        # An unpaired pool still sizes itself in prepare_resources, not here.
+        draft_mgr.try_allocate_generation.assert_not_called()
+
+    def test_a_refused_unpaired_admission_rolls_the_target_back(self):
+        """The refusal has to look like any other KV shortage, not like a crash."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == []
+        mgr.try_allocate_generation.assert_called_once_with(req)
+        mgr.revert_allocate_generation.assert_called_once_with(req)
+
+    def test_context_admission_admits_an_unpaired_draft_mirror(self):
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        req = make_ctx_request(0, context_remaining_length=100)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        draft_mgr.admit_mirror.assert_called_once_with(req)
+
+    def test_a_refused_unpaired_admission_keeps_the_context_request_unscheduled(self):
+        """The forward is what must not happen: an inactive mirror's page table
+        is stale, and the draft writes context K/V straight through it."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(mgr, max_num_tokens=1000, draft_kv_cache_manager=draft_mgr)
+        req = make_ctx_request(0, context_remaining_length=100)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        # Refused before the pool was grown for a chunk that will not run.
+        mgr.resize_context.assert_not_called()
+
+    def test_a_refused_admission_mid_chunking_suspends_the_target_cache(self):
+        """A non-first chunk reaches the admission with an ACTIVE target cache
+        (prepare_context just resumed it). Returning SKIP with that cache
+        active would pin its pages while the request waits on the draft pool,
+        and under pressure the requests whose completion would drain that pool
+        can then no longer grow their own target KV. Mirror the joint branch:
+        suspend both pools and let the retry resume them."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        mgr.suspend_request.assert_called_once_with(req)
+        draft_mgr.suspend_request.assert_called_once_with(req)
+
+    def test_a_refused_admission_on_a_first_chunk_is_rolled_back_not_suspended(self):
+        """First chunks are freed by _try_schedule_context (suspension alone
+        cannot release prefix-reuse holds when the last cache tier is full),
+        so the pair-preparation must not also suspend them."""
+        mgr = make_kv_cache_manager()
+        draft_mgr = make_kv_cache_manager()
+        draft_mgr.admit_mirror.side_effect = lambda req: False
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=1000,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_mgr,
+        )
+        req = make_ctx_request(0, context_remaining_length=100)
+        # A real prepare_context creates the kv_cache entry; the mocked one
+        # does not, so seed it for the rollback's membership check.
+        mgr.kv_cache_map[req.py_request_id]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == []
+        mgr.suspend_request.assert_not_called()
+        mgr.free_resources.assert_called_once_with(req)
+
+    def test_a_joint_draft_pool_is_left_to_its_own_admission(self):
+        """Pairing already resumes the draft cache inside its own calls; going
+        through the unpaired path as well would resume it twice."""
+        mgr = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_mgr = make_kv_cache_manager()
+        sched = make_scheduler(mgr, max_num_tokens=100, draft_kv_cache_manager=draft_mgr)
+        req = make_gen_request(0)
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.generation_requests) == [0]
+        draft_mgr.admit_mirror.assert_not_called()
+        draft_mgr.try_allocate_generation.assert_called_once_with(req)
 
 
 class TestKVCacheFailuresCtx:

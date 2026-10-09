@@ -68,8 +68,8 @@ class _Request:
     py_no_repeat_ngram_size: Any = None
     py_is_draft: bool = False
     py_logits_post_processors: Any = None
-    guided_decoding_params: Any = None
-    _py_embedding_bias_1d: Any = None
+    py_guided_decoding_params: Any = None
+    py_embedding_bias: Any = None
 
     def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
         return self.sampling_config.beam_width
@@ -131,9 +131,9 @@ class TestTierSelection:
             pytest.param(dict(py_min_length=50), id="min_length"),
             pytest.param(dict(py_bad_words=[[7]]), id="bad_words"),
             pytest.param(dict(py_no_repeat_ngram_size=3), id="no_repeat_ngram"),
-            pytest.param(dict(_py_embedding_bias_1d=object()), id="embedding_bias"),
+            pytest.param(dict(py_embedding_bias=object()), id="embedding_bias"),
             # Consume the logits after the forward returns.
-            pytest.param(dict(guided_decoding_params=object()), id="guided_decoding"),
+            pytest.param(dict(py_guided_decoding_params=object()), id="guided_decoding"),
             pytest.param(dict(py_logits_post_processors=[object()]), id="logits_processor"),
             # Shares this sampler but registers no hooks.
             pytest.param(dict(py_is_draft=True), id="draft"),

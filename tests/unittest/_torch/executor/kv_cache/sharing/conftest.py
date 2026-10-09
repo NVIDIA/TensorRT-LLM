@@ -79,6 +79,7 @@ def make_manager(
     enable_block_reuse: bool = True,
     swa_scratch_reuse: bool = False,
     max_batch_size: int = 4,
+    max_beam_width: int = 1,
     **kv_cache_config,
 ):
     """A small real ``KVCacheManagerV2`` on its own execution stream, FP16 unless ``dtype``; further
@@ -106,6 +107,7 @@ def make_manager(
             tokens_per_block=tokens_per_block,
             max_seq_len=MAX_SEQ_LEN,
             max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
             mapping=mapping,
             dtype=dtype or tensorrt_llm.bindings.DataType.HALF,
             vocab_size=32000,

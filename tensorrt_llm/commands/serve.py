@@ -21,7 +21,6 @@ import inspect
 import json
 import os
 import secrets
-import select
 import signal
 import socket
 import subprocess  # nosec B404
@@ -32,8 +31,7 @@ import uuid
 from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
-from typing import (TYPE_CHECKING, Any, Dict, NamedTuple, NoReturn, Optional,
-                    Sequence, Set)
+from typing import TYPE_CHECKING, Any, Dict, NoReturn, Optional, Sequence, Set
 
 import click
 import torch
@@ -65,12 +63,15 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               validate_config_bool)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
-from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr, split_mpi_env
+from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
                                                   resolve_auto_reasoning_parser)
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
+from tensorrt_llm.serve._frontend_processes import (
+    _init_multi_frontend_mode, _signal_frontend_ready,
+    _spawn_attached_frontends, _terminate_attached_frontends)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -488,163 +489,6 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
-class MultiFrontendMode(NamedTuple):
-    """This process's role under multi-frontend serving (prototype)."""
-    num_frontends: int
-    is_attached_frontend: bool
-
-    @property
-    def is_launcher(self) -> bool:
-        """Owns the engine and spawns/cleans the attached frontends."""
-        return self.num_frontends > 1 and not self.is_attached_frontend
-
-
-def _init_multi_frontend_mode(llm_args: dict,
-                              enabled: bool) -> MultiFrontendMode:
-    """Resolve this process's multi-frontend serving role.
-
-    num_serve_frontends=K runs K HTTP frontend processes against ONE
-    executor: the launcher (frontend 0) owns the engine and spawns K-1
-    attached frontends (classic IPC executor path only). enabled=False
-    entry points (e.g. disaggregated MPI workers) never honor the knob.
-    """
-    if not enabled:
-        if llm_args.pop("num_serve_frontends", 1) > 1:
-            logger.warning("num_serve_frontends is only supported on plain "
-                           "trtllm-serve; ignored on this entry point.")
-        return MultiFrontendMode(1, False)
-
-    mode = MultiFrontendMode(llm_args.get("num_serve_frontends", 1),
-                             os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
-    if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
-        raise ValueError(
-            "num_serve_frontends > 1 requires the default (classic IPC) "
-            "executor path, not orchestrator_type="
-            f"{llm_args.get('orchestrator_type')!r}")
-    return mode
-
-
-def _spawn_attached_frontends(llm, num_frontends: int) -> list:
-    """Spawn num_frontends - 1 attached serving frontend processes.
-
-    Each child re-execs this trtllm-serve command line with env vars
-    carrying the launcher executor's attach endpoints; its executor
-    attaches to the already-running worker instead of launching one (see
-    GenerationExecutor.create / GenerationExecutorFrontendProxy).
-
-    Blocks until every child signals READY over its inherited pipe: a
-    successful Popen only proves the process exists, while the frontend
-    can still fail during executor attach or server setup. Any child
-    failure (or a missed deadline) fails the whole group, terminating
-    the children already started, so num_serve_frontends=K never
-    silently degrades to fewer frontends.
-    """
-    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-
-    executor = getattr(llm, "_executor", None)
-    if not isinstance(executor, GenerationExecutorProxy) or (
-            attach_info := executor.multi_frontend_attach_info()) is None:
-        raise ValueError(
-            "num_serve_frontends > 1 requires the classic IPC executor "
-            f"proxy in multi-frontend mode, got {type(executor).__name__}")
-    # Carries the executor HMAC keys; the child deletes it from its env
-    # once consumed (GenerationExecutor.create).
-    attach_env = json.dumps(attach_info)
-
-    children, ready_fds = [], []
-    try:
-        for frontend_id in range(1, num_frontends):
-            # Strip MPI/SLURM identity vars: an inherited rank identity would
-            # make the child's mpi4py try to (re-)join the launcher's job.
-            env, _ = split_mpi_env()
-            env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_env
-            env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
-            env["TLLM_DISABLE_MPI"] = "1"
-            read_fd, write_fd = os.pipe()
-            ready_fds.append(read_fd)
-            env["TLLM_FRONTEND_READY_FD"] = str(write_fd)
-            try:
-                child = subprocess.Popen([sys.executable] + sys.argv,
-                                         env=env,
-                                         pass_fds=(write_fd, ))  # nosec B603
-            finally:
-                # The child now holds the only write end; its exit before
-                # READY surfaces as EOF on read_fd.
-                os.close(write_fd)
-            children.append(child)
-            logger.info(
-                f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
-            )
-        _wait_attached_frontends_ready(children, ready_fds)
-    except BaseException:
-        _terminate_attached_frontends(children)
-        raise
-    finally:
-        for fd in ready_fds:
-            os.close(fd)
-    return children
-
-
-def _wait_attached_frontends_ready(children: list, ready_fds: list) -> None:
-    """Block until every attached frontend writes its READY byte."""
-    timeout = float(os.getenv("TLLM_FRONTEND_READY_TIMEOUT", "300"))
-    deadline = time.monotonic() + timeout
-    pending = dict(zip(ready_fds, children))
-    while pending:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise RuntimeError(
-                f"{len(pending)} attached frontend(s) not ready within "
-                f"{timeout:.0f}s (TLLM_FRONTEND_READY_TIMEOUT)")
-        readable, _, _ = select.select(list(pending), [], [],
-                                       min(remaining, 1.0))
-        for fd in readable:
-            child = pending.pop(fd)
-            if os.read(fd, 1) != b"R":  # EOF: pipe closed without READY
-                return_code = child.poll()
-                if return_code is not None and return_code != 0:
-                    _report_observed_child_failure(return_code, "server",
-                                                   "model_initialization")
-                raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited before "
-                    "signaling READY")
-            logger.info(f"Attached frontend (pid {child.pid}) is ready")
-        for fd, child in list(pending.items()):
-            if child.poll() is not None:
-                if child.returncode != 0:
-                    _report_observed_child_failure(child.returncode, "server",
-                                                   "model_initialization")
-                raise RuntimeError(
-                    f"Attached frontend (pid {child.pid}) exited with code "
-                    f"{child.returncode} before signaling READY")
-
-
-def _signal_frontend_ready(multi_frontend: MultiFrontendMode) -> None:
-    """Report READY to the launcher over the inherited pipe.
-
-    Called once everything fallible in an attached frontend's startup
-    (port bind, executor attach, LLM and OpenAIServer construction,
-    middleware registration) has succeeded; the launcher blocks group
-    startup on this byte (see _wait_attached_frontends_ready).
-    """
-    ready_fd = os.environ.pop("TLLM_FRONTEND_READY_FD", None)
-    if not (multi_frontend.is_attached_frontend and ready_fd):
-        return
-    fd = int(ready_fd)
-    os.write(fd, b"R")
-    os.close(fd)
-
-
-def _terminate_attached_frontends(children: list) -> None:
-    for child in children:
-        child.terminate()
-    for child in children:
-        try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            child.kill()
-
-
 def launch_server(
         host: str,
         port: int,
@@ -742,7 +586,9 @@ def launch_server(
         try:
             if multi_frontend.is_launcher:
                 frontend_children = _spawn_attached_frontends(
-                    llm, multi_frontend.num_frontends)
+                    llm,
+                    multi_frontend.num_frontends,
+                    report_failure=_report_observed_child_failure)
 
             server = OpenAIServer(
                 generator=llm,
@@ -1147,13 +993,14 @@ def launch_visual_gen_server(
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
-@stability_option("--num_serve_frontends",
-                  type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-                  default=1,
-                  help="Number of HTTP frontend processes serving one "
-                  "executor; values > 1 share the serving port via "
-                  "SO_REUSEPORT (classic IPC executor path only).",
-                  status="prototype")
+@stability_option(
+    "--num_serve_frontends",
+    type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
+    default=1,
+    help="Number of HTTP or OpenEngine frontend processes serving one "
+    "executor; values > 1 share the serving port via "
+    "SO_REUSEPORT (classic IPC executor path only).",
+    status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1484,6 +1331,11 @@ def serve(
     parsed_config_overrides = _parse_config_overrides(config_overrides)
 
     def _serve_llm():
+        try:
+            from tensorrt_llm.usage.usage_lib import _mark_llm_startup
+            _mark_llm_startup()
+        except Exception:
+            pass
         nonlocal server_role, allow_request_chat_template
         llm_args, _ = get_llm_args(
             model=model,
@@ -1543,6 +1395,12 @@ def serve(
         llm_args = _apply_config_overrides(llm_args, parsed_config_overrides)
 
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
+        # Preserve requested settings for failures before entering the LLM constructor.
+        try:
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+            _capture_startup_context(requested=llm_args)
+        except Exception:
+            pass
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
@@ -1580,9 +1438,10 @@ def serve(
         if grpc:
             effective_num_serve_frontends = llm_args.get(
                 "num_serve_frontends", num_serve_frontends)
-            if effective_num_serve_frontends != 1:
+            if effective_num_serve_frontends != 1 and grpc_protocol != "openengine":
                 raise click.UsageError(
-                    "--num_serve_frontends must be 1 when --grpc is enabled.")
+                    "Multiple gRPC frontends require --grpc-protocol openengine."
+                )
 
             # gRPC mode: launch gRPC server instead of OpenAI HTTP server
             # Check for unsupported arguments that are silently ignored in gRPC mode
@@ -1634,10 +1493,12 @@ def serve(
                         "Restore the required gRPC runtime with `python -m pip "
                         "install \"grpcio>=1.67.1,<2\"`.") from error
 
-                launch_grpc_server(host,
-                                   port,
-                                   llm_args,
-                                   served_model_name=served_model_name)
+                launch_grpc_server(
+                    host,
+                    port,
+                    llm_args,
+                    served_model_name=served_model_name,
+                    report_failure=_report_observed_child_failure)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(

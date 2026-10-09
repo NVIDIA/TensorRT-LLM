@@ -381,6 +381,8 @@ class CutlassFusedMoE(MoEImplBase):
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
             16384 * self.num_slots // routing_method.get_experts_per_token(),
+            # A forward can never present more tokens than this.
+            default_moe_max_num_tokens,
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
@@ -1102,31 +1104,18 @@ class CutlassFusedMoE(MoEImplBase):
         *,
         enable_alltoall: bool,
     ) -> torch.Tensor:
-        """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
-        a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
-        original (global) token_selected_experts. CUDA-graph capturable.
-
-        ``enable_alltoall`` has no default because it picks the expert-id remap
-        below, and either default is silently wrong for half the callers: the
-        ids are local after an alltoall dispatch and global otherwise, so a
-        wrong guess shifts every id by ``slot_start`` without failing.
-        """
+        """Dequantize active NVFP4 slots before executing the BF16/FP16 MoE."""
         assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
 
         if output_dtype is None:
             output_dtype = x.dtype
 
-        # Same EP id convention as the FP8 path above: global ids (or
-        # ``local_n``-padded under alltoall). Clamp to local range so the
-        # active-mask scatter is in-bounds; non-local tokens collapse onto a
-        # boundary expert (1 extra dequant/rank). ``trtllm.fused_moe`` below
-        # still gets the original global ids -- it does its own remap.
+        # Dispatch preserves global slot IDs. Dequantization indexes local
+        # weights; clamp padding and non-local IDs to keep its scatter in bounds.
+        # The MoE kernel receives the global IDs and filters non-local work.
         local_n = self.expert_size_per_partition
-        if enable_alltoall:
-            local_ids = token_selected_experts.clamp(0, local_n - 1)
-        else:
-            local_ids = (token_selected_experts - self.slot_start).clamp(
-                0, local_n - 1)
+        local_ids = (token_selected_experts - self.slot_start).clamp(
+            0, local_n - 1)
 
         w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
             self, local_ids, output_dtype)

@@ -262,6 +262,7 @@ def make_manager(connector, num_extra_kv_tokens=0, is_draft=False):
     manager.kv_cache_map = {}
     manager.enable_block_reuse = True
     manager.conversation_manager = None
+    manager._spec_recompute_tail = 0
     manager._has_cp_helix = False
     manager._allocated_draft_lens = {}
     manager._request_stats_enabled_ids = set()

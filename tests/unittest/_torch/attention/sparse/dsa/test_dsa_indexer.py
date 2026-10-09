@@ -23,6 +23,7 @@ This file tests:
 """
 
 import builtins
+import functools
 import random
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
@@ -343,6 +344,7 @@ def test_kv_lens_row_reorder_threshold():
             num_generations=num_generations,
             num_sms=num_sms,
             max_draft_tokens=next_n - 1,
+            gen_token_stride=next_n,
             num_contexts=0,
             num_seqs=num_generations,
             kv_lens_cuda=kv_lens_cuda,
@@ -472,6 +474,8 @@ def test_shared_topk_lifecycle(monkeypatch):
     )
     metadata._create_kv_lens_2d_buffer = Mock()
     metadata.create_expanded_buffers = Mock()
+    metadata._ragged_num_rows = 0
+    metadata._attn_num_rows = 0
 
     with patch(
         "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.prefer_pinned",
@@ -545,6 +549,34 @@ def test_shared_topk_lifecycle(monkeypatch):
     metadata.on_update_kv_lens()
 
     assert metadata.shared_topk_indices is buffer
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_kv_len_update_refreshes_ragged_rows_only_when_enabled(enabled):
+    metadata = DSAtrtllmAttentionMetadata.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = None
+    metadata._num_tokens = 0
+    metadata._num_generations = 0
+    metadata.enable_ragged_verification = enabled
+    metadata._invalidate_pool_view_cache = Mock()
+    metadata._compute_kv_lens_row_reorder = Mock()
+    metadata.prepare_dense_topk_indices = Mock()
+    metadata.kv_lens_cuda = None
+    metadata.refresh_ragged_row_kv_lens = Mock()
+    metadata.refresh_token_major_gen_rows = Mock()
+
+    with (
+        patch.object(TrtllmAttentionMetadata, "on_update_kv_lens"),
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata._fused_dsa_meta_enabled",
+            return_value=False,
+        ),
+    ):
+        metadata.on_update_kv_lens()
+
+    expected_calls = int(enabled)
+    assert metadata.refresh_ragged_row_kv_lens.call_count == expected_calls
+    assert metadata.refresh_token_major_gen_rows.call_count == expected_calls
 
 
 def test_indexer_post_load_weights_caches_fused_weight():
@@ -4556,6 +4588,9 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         meta.host_kv_cache_block_offsets = torch.tensor([10, 20, 30])
         meta.draft_kv_cache_block_offsets = torch.tensor([100, 200, 300])
         meta.prepare_for_draft_forward.return_value = None
+        meta.draft_replay_swapped_attrs = {}
+        for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+            setattr(meta, helper, functools.partial(getattr(TrtllmAttentionMetadata, helper), meta))
         return meta
 
     @staticmethod
@@ -4588,7 +4623,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
-        assert saved["target_kv_cache_manager"] is original_kv_mgr
+        assert meta.draft_replay_swapped_attrs["kv_cache_manager"] is original_kv_mgr
         assert meta.kv_cache_manager is mgr
         assert "saved_backend_state" not in saved
         meta.prepare_for_draft_forward.assert_called_once_with()
