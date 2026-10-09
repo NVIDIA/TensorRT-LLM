@@ -79,7 +79,7 @@ def _create_llm(
     disable_overlap_scheduler: bool = False,
 ) -> LLM:
     cache_transceiver_cfg = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
+        backend="DEFAULT") if pd_disagg else None
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,  # Disable for output 1:1 matching check
         free_gpu_memory_fraction=0.2,
@@ -130,11 +130,9 @@ def _create_mm_disagg_llm(
         cache_transceiver_cfg = CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
-            max_tokens_in_buffer=10240,
         )
     else:
-        cache_transceiver_cfg = CacheTransceiverConfig(
-            backend="DEFAULT", max_tokens_in_buffer=10240)
+        cache_transceiver_cfg = CacheTransceiverConfig(backend="DEFAULT")
     return LLM(model=model_dir,
                kv_cache_config=kv_cache_config,
                trust_remote_code=True,

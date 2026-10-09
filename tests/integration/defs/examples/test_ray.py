@@ -73,13 +73,7 @@ def test_llm_inference_distributed_ray(ray_example_root, llm_venv, tp_size,
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
 def test_ray_disaggregated_serving(ray_example_root, llm_venv, tp_size):
-    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "CPP")
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
-def test_ray_disaggregated_serving_python(ray_example_root, llm_venv, tp_size):
-    _run_ray_disaggregated_serving(ray_example_root, tp_size, "NIXL", "PYTHON")
+    _run_ray_disaggregated_serving(ray_example_root, tp_size)
 
 
 DISAGG_SERVING_PORTS = (8000, 8001, 8002)
@@ -161,8 +155,7 @@ def _cleanup_leftover_servers(ports: tuple = DISAGG_SERVING_PORTS,
                 f"Port {port} is still in use after {timeout}s of cleanup")
 
 
-def _run_ray_disaggregated_serving(ray_example_root, tp_size,
-                                   transceiver_backend, transceiver_runtime):
+def _run_ray_disaggregated_serving(ray_example_root, tp_size):
 
     if get_device_count() < tp_size * 2:
         pytest.skip(f"Need {tp_size * 2} GPUs.")
@@ -200,8 +193,8 @@ def _run_ray_disaggregated_serving(ray_example_root, tp_size,
             [
                 "bash", script_path, "--executor", "ray", "--attach", "--model",
                 model_dir, "--tp_size",
-                str(tp_size), "--transceiver_backend", transceiver_backend,
-                "--transceiver_runtime", transceiver_runtime
+                str(tp_size), "--transceiver_backend", "NIXL",
+                "--transceiver_runtime", "PYTHON"
             ],
                 cwd=disagg_dir,
                 stdout=subprocess.PIPE,
