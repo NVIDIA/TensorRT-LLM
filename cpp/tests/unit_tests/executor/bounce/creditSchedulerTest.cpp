@@ -866,3 +866,35 @@ TEST(CreditScheduler, FourThreadsPerSenderCannotStarveLargeChunk)
 {
     expectLargeChunkProgressWithBoundedSenderConcurrency(/*numSenders=*/4, /*threadsPerSender=*/4);
 }
+
+TEST(CreditScheduler, UnprovedFlowNeverExpiresAndExplicitDrainReleasesOnlyItsRegions)
+{
+    auto s = makeSched(/*nRegions=*/2, /*maxInflightChunksPerRequest=*/2);
+    auto grants = s.onWant("lost", want(2));
+    ASSERT_EQ(grants.size(), 2u);
+    std::vector<std::uint64_t> deferred;
+    EXPECT_TRUE(s.quarantineFlow("lost", {grants[0].offset}, deferred).empty());
+    ASSERT_EQ(deferred.size(), 1u);
+    EXPECT_TRUE(s.hasUnprovenRemoteWrites());
+    EXPECT_TRUE(s.reapQuarantine().empty());
+    EXPECT_EQ(s.freeBytes(), 0u);
+    EXPECT_TRUE(s.onWant("next", want(2)).empty());
+    auto fromDrain = s.releaseQuarantinedFlow("lost");
+    ASSERT_EQ(fromDrain.size(), 1u);
+    EXPECT_EQ(fromDrain[0].offset, grants[1].offset);
+    auto fromScatter = s.freeOrphanRegion(deferred[0]);
+    ASSERT_EQ(fromScatter.size(), 1u);
+    EXPECT_EQ(fromScatter[0].offset, grants[0].offset);
+}
+
+TEST(CreditScheduler, ShutdownClosesGrantAdmissionBeforeCompletionReleasesRegions)
+{
+    auto s = makeSched(/*nRegions=*/1, /*maxInflightChunksPerRequest=*/1);
+    auto first = s.onWant("first", want(1));
+    ASSERT_EQ(first.size(), 1u);
+    EXPECT_TRUE(s.onWant("next", want(1)).empty());
+    s.closeGrantAdmission();
+    EXPECT_TRUE(s.onScatterDone("first", first[0].offset).empty());
+    EXPECT_TRUE(s.onWant("late", want(1)).empty());
+    EXPECT_EQ(freeRegions(s), 1u);
+}

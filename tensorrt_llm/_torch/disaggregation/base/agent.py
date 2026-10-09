@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -83,6 +98,14 @@ class RegMemoryDescs:
 
 
 class TransferStatus(ABC):
+    def is_quiesced(self) -> bool:
+        """Whether all memory access has stopped; failure alone is not proof."""
+        return False
+
+    def request_cancel(self) -> bool:
+        """Request asynchronous cancellation without implying physical completion."""
+        return False
+
     @abstractmethod
     def is_completed(self) -> bool: ...
 
@@ -181,3 +204,14 @@ else:
 
 def use_pure_python_transfer_agent() -> bool:
     return _use_pure_python_transfer_agent
+
+
+def supports_native_quiescence() -> bool:
+    """Require the native proof API, not the conservative Python defaults."""
+    return (
+        not use_pure_python_transfer_agent()
+        and _cpp_binding is not None
+        and all(
+            hasattr(_cpp_binding.TransferStatus, name) for name in ("is_quiesced", "request_cancel")
+        )
+    )

@@ -185,7 +185,7 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
         return nullptr;
     }
     n->arena = std::make_unique<b::BounceArena>(cfg.arenaSizeBytes, 0, /*allowFabric=*/false);
-    n->exec = std::make_unique<b::ExecPool>(cfg.maxInflightChunksPerRequest + 4, maxDescs, 0, cfg.useZeroCopyArguments);
+    n->exec = std::make_unique<b::ExecPool>(cfg.copyStreamCount, maxDescs, 0, cfg.useZeroCopyArguments);
     if (!n->agent->registerRegionImpl(n->arena->base(), n->arena->bytes(), /*deviceId=*/0))
     {
         return nullptr;

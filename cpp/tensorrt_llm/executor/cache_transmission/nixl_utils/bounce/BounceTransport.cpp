@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <utility>
@@ -49,6 +50,7 @@ char const* toString(BounceFailReason reason)
     case BounceFailReason::kWriteFailed: return "bounce: RDMA write failed";
     case BounceFailReason::kProtocolError: return "bounce: protocol error (GRANT mispair/plan overflow)";
     case BounceFailReason::kShutdown: return "bounce: transport shut down while pending";
+    case BounceFailReason::kCancelled: return "bounce: cancellation requested";
     case BounceFailReason::kPeerNack: return "bounce: receiver reported it cannot complete the chunk/request (NACK)";
     }
     return "bounce: unknown";
@@ -197,25 +199,51 @@ cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy)
 // BounceContext
 // ============================================================================
 
+bool BounceContext::addPeer(std::string const& peer, std::string const& endpoint)
+{
+    std::lock_guard<std::mutex> lock(peerMutex);
+    auto const it = peerEndpoints.find(peer);
+    if (it != peerEndpoints.end() && it->second != endpoint)
+    {
+        TLLM_LOG_ERROR("Bounce peer %s reused its lifetime identity with a different endpoint", peer.c_str());
+        return false;
+    }
+    if (!channel->addPeer(peer, endpoint))
+    {
+        return false;
+    }
+    peerEndpoints.emplace(peer, endpoint);
+    return true;
+}
+
 void BounceContext::sendGrants(std::vector<Grant> const& grants)
 {
-    if (grants.empty())
+    try
     {
-        return;
+        if (grants.empty())
+        {
+            return;
+        }
+        // grants are keyed by flow id ("peer<sep>rid"); split back to (agent name, rid) to address them.
+        std::unordered_map<std::string, std::vector<BounceCreditEntry>> byFlow;
+        for (auto const& g : grants)
+        {
+            // Carry OUR (receiver) device id so the sender writes the remote desc to the right GPU
+            // even if the two agents don't share a device index. `regionHandle` (our arena offset) is
+            // echoed back in DATA so we can locate + free the region.
+            byFlow[g.flow].push_back(BounceCreditEntry{g.addr, g.len, static_cast<std::uint32_t>(deviceId), g.offset});
+        }
+        for (auto const& [flow, creds] : byFlow)
+        {
+            auto [peer, rid] = splitKey(flow);
+            channel->sendTo(peer, encodeGrant(rid, creds));
+        }
     }
-    // grants are keyed by flow id ("peer<sep>rid"); split back to (agent name, rid) to address them.
-    std::unordered_map<std::string, std::vector<BounceCreditEntry>> byFlow;
-    for (auto const& g : grants)
+    catch (std::exception const& error)
     {
-        // Carry OUR (receiver) device id so the sender writes the remote desc to the right GPU
-        // even if the two agents don't share a device index. `regionHandle` (our arena offset) is
-        // echoed back in DATA so we can locate + free the region.
-        byFlow[g.flow].push_back(BounceCreditEntry{g.addr, g.len, static_cast<std::uint32_t>(deviceId), g.offset});
-    }
-    for (auto const& [flow, creds] : byFlow)
-    {
-        auto [peer, rid] = splitKey(flow);
-        channel->sendTo(peer, encodeGrant(rid, creds));
+        // Allocation ownership already changed. A lost control message can time out;
+        // replaying its completed allocation release could corrupt a new owner.
+        TLLM_LOG_WARNING("Bounce grant publication failed: %s", error.what());
     }
 }
 
@@ -282,7 +310,7 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     bool reversePathReady = false;
     try
     {
-        reversePathReady = mCtx.channel->addPeer(peer, endpoint);
+        reversePathReady = mCtx.addPeer(peer, endpoint);
     }
     catch (tensorrt_llm::common::TllmException const& e)
     {
@@ -295,16 +323,15 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
     auto const key = makeKey(peer, h.requestId);
     if (isCancelWant(chunkBytes))
     {
-        // Explicit cancel/abort (the sender failed or retracted): precisely free this flow's
-        // granted-but-unwritten regions now — otherwise they stay held until peer loss and a
-        // long-running receiver leaks up to one request's in-flight allocation cap per failed rid.
-        // Any region whose scatter is still running is deferred (flagged orphaned in mScattering,
-        // freed on completion).
-        // Immediate free (no quarantine) is safe HERE because a cancel is sender-initiated: the
-        // sender defers it until its last in-flight RDMA write reached a terminal state
-        // (mPendingCancel / drainOrphanLocal), so nothing can still be writing these regions.
+        // Empty WANT is a legacy cancellation signal, not a proof that DMA stopped.
+        closeFlow(key);
         reclaimAndFlagDeferred(
-            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.reclaimFlow(key, busy, deferred); });
+            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.quarantineFlow(key, busy, deferred); });
+        return;
+    }
+    if (mClosedFlows.count(key) != 0 || mCtx.shutdownRequested.load(std::memory_order_acquire))
+    {
+        mCtx.channel->sendTo(peer, encodeNack(h.requestId, 0, 0));
         return;
     }
     if (!reversePathReady)
@@ -363,7 +390,7 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
     // Drop a DATA whose region this flow no longer holds — it was cancelled/reclaimed (e.g. an empty
     // WANT raced ahead of this DATA), and the region may have been re-granted to another flow.
     // Scattering it would read a freed/re-owned region and corrupt that other flow's data.
-    if (!mCtx.scheduler.heldByFlow(key, h.regionHandle))
+    if (mClosedFlows.count(key) != 0 || !mCtx.scheduler.heldByFlow(key, h.regionHandle))
     {
         return;
     }
@@ -389,11 +416,74 @@ void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, s
         bounceRangeEnd(job.nvtxQueue);
         return;
     }
+    ++mOutstanding[key];
     {
         std::lock_guard<std::mutex> lk(mJobMu);
         mJobs.emplace_back(std::move(job));
     }
     mJobCv.notify_one();
+}
+
+void BounceReceiver::closeFlow(std::string const& key)
+{
+    constexpr std::size_t kMaxClosedFlows = 1048576;
+    if (mClosedFlows.count(key) == 0 && mClosedFlows.size() >= kMaxClosedFlows)
+    {
+        TLLM_LOG_ERROR("Bounce receiver exhausted its retained flow fences; terminating before unsafe reuse");
+        std::abort();
+    }
+    mClosedFlows.insert(key);
+}
+
+void BounceReceiver::onDrain(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
+{
+    std::vector<std::uint32_t> chunks;
+    std::string endpoint;
+    if (!decodeWant(blob, h, chunks, endpoint) || !chunks.empty())
+    {
+        return;
+    }
+    if (!mCtx.addPeer(peer, endpoint))
+    {
+        return; // a changed peer incarnation cannot attest an old flow's drain
+    }
+    auto const key = makeKey(peer, h.requestId);
+    closeFlow(key);
+    mDrainRequested.insert(key);
+    // DRAIN attests that no sender DMA can still touch these grants. Already queued
+    // scatters remain counted until their streams have physically finished.
+    reclaimAndFlagDeferred(
+        [&](auto const& busy, auto& deferred) { return mCtx.scheduler.reclaimFlow(key, busy, deferred); });
+    mCtx.sendGrants(mCtx.scheduler.releaseQuarantinedFlow(key));
+    maybeAcknowledgeDrain(key);
+}
+
+void BounceReceiver::maybeAcknowledgeDrain(std::string const& key)
+{
+    if (mDrainRequested.count(key) == 0 || mOutstanding.count(key) != 0)
+    {
+        return;
+    }
+    auto const [peer, rid] = splitKey(key);
+    mCtx.channel->sendTo(peer, encodeDrainAck(rid));
+}
+
+void BounceReceiver::beginShutdown()
+{
+    mCtx.scheduler.closeGrantAdmission();
+    for (auto const& key : mCtx.scheduler.flowKeys())
+    {
+        closeFlow(key);
+        auto const [peer, rid] = splitKey(key);
+        reclaimAndFlagDeferred(
+            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.quarantineFlow(key, busy, deferred); });
+        mCtx.channel->sendTo(peer, encodeNack(rid, 0, 0));
+    }
+}
+
+bool BounceReceiver::hasUnprovenAccess() const
+{
+    return !mScattering.empty() || mCtx.scheduler.hasUnprovenRemoteWrites();
 }
 
 std::unordered_set<std::uint64_t> BounceReceiver::scatteringRegions() const
@@ -434,6 +524,11 @@ bool BounceReceiver::drainScatterDone()
     BounceNvtxScope drainScope(kNvtxDoneDrain, "doneDrain n=%zu", done.size());
     for (auto& d : done)
     {
+        auto outstanding = mOutstanding.find(d.key);
+        if (outstanding != mOutstanding.end() && --outstanding->second == 0)
+        {
+            mOutstanding.erase(outstanding);
+        }
         // The ACK was already sent by the scatter worker itself (latency: it is on the sender's
         // ackWait critical path); only the region bookkeeping happens here, on the IO thread.
         // Worker finished reading this region. Was its flow reclaimed (peer gone / cancel) mid-scatter?
@@ -453,63 +548,23 @@ bool BounceReceiver::drainScatterDone()
         {
             mCtx.sendGrants(mCtx.scheduler.onScatterDone(d.key, d.offset));
         }
+        maybeAcknowledgeDrain(d.key);
     }
     return true;
 }
 
 void BounceReceiver::forget(std::string const& peer)
 {
-    // Reclaim every flow this peer was granted ("peer\x1f rid").
-    // (1) Drop this peer's not-yet-started scatter jobs — no point scattering for a gone peer; their
-    //     incoming regions are quarantined (or freed) by the reclaim below. A queued job whose
-    //     flow was ALREADY reclaimed (cancel / lease expiry flagged it orphaned in mScattering) sits
-    //     in the scheduler's orphan set; collect those offsets here and free them in (4), AFTER the
-    //     peer's flows are dropped — freeOrphanRegion runs schedule(), which would otherwise grant the
-    //     freed region straight back to a flow of the very peer being forgotten.
-    std::vector<std::uint64_t> orphanedOffsets;
+    auto const prefix = peer + kSep;
+    for (auto const& key : mCtx.scheduler.flowKeys())
     {
-        std::lock_guard<std::mutex> lk(mJobMu);
-        std::deque<ScatterJob> keep;
-        for (auto& j : mJobs)
+        if (key.compare(0, prefix.size(), prefix) != 0)
         {
-            if (j.peer == peer)
-            {
-                bounceRangeEnd(j.nvtxQueue); // job dropped, close its queue-wait span
-                auto it = mScattering.find(j.offset);
-                if (it != mScattering.end())
-                {
-                    if (it->second)
-                    {
-                        orphanedOffsets.push_back(j.offset);
-                    }
-                    mScattering.erase(it);
-                }
-            }
-            else
-            {
-                keep.push_back(std::move(j));
-            }
+            continue;
         }
-        mJobs.swap(keep);
-    }
-    // (2) Regions of this peer still scattering are reads already RUNNING in a worker — they must not
-    //     be re-granted until the worker finishes. reclaimByPrefix defers those; we flag them orphaned
-    //     in mScattering so drainScatterDone frees them via freeOrphanRegion on completion.
-    // (3) Every OTHER held region may STILL be RDMA-written by the peer: forget() is
-    //     receiver-initiated (invalidateRemoteAgent), so — unlike an explicit cancel — no
-    //     sender-side drain guarantees those writes ended, and a one-sided write cannot be aborted.
-    //     quarantineFor > 0 keeps them out of the arena until checkTimeouts()'s reapQuarantine.
-    reclaimAndFlagDeferred(
-        [&](auto const& busy, auto& deferred)
-        {
-            return mCtx.scheduler.reclaimByPrefix(
-                peer + kSep, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
-        });
-    // (4) Now that none of this peer's flows is in the ring, free the orphaned regions collected in
-    //     (1); the re-grants can only reach other peers.
-    for (auto const off : orphanedOffsets)
-    {
-        mCtx.sendGrants(mCtx.scheduler.freeOrphanRegion(off)); // mirrors drainScatterDone
+        closeFlow(key);
+        reclaimAndFlagDeferred(
+            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.quarantineFlow(key, busy, deferred); });
     }
 }
 
@@ -521,7 +576,7 @@ void BounceReceiver::checkTimeouts()
         return; // throttled: no need to scan on every ~1ms tick
     }
     // Drain time-box is otherwise only re-evaluated on scheduler events; a quiet system needs this
-    // regardless of whether the lease/quarantine sweeps below are enabled.
+    // regardless of whether the lease sweep below is enabled.
     mCtx.sendGrants(mCtx.scheduler.pollDrain());
     // Sweep granularity follows the smallest ENABLED timeout (a tenth of it, clamped to
     // [50ms, 1s]) instead of a fixed constant: the 60s/30s defaults yield a 1s sweep, while a
@@ -534,16 +589,16 @@ void BounceReceiver::checkTimeouts()
     }
     if (smallestMs <= 0)
     {
-        // Lease disabled AND quarantine disabled: nothing is ever quarantined (reclaims free
-        // immediately) and no flow can go stale — nothing to sweep for.
+        // No time-based scheduler sweeps are configured. Explicit DRAIN still governs release
+        // of regions pinned by cancellation or peer loss.
         mNextSweep = now + std::chrono::seconds(1);
         return;
     }
     mNextSweep = now
         + std::clamp(
             std::chrono::milliseconds(smallestMs / 10), std::chrono::milliseconds(50), std::chrono::milliseconds(1000));
-    // Quarantine over for any expired region: no write posted before its flow's lease expired can
-    // plausibly still be in flight, so it may re-enter circulation (and may grant a waiter).
+    // Service the scheduler's legacy timed quarantine API. This transport only populates
+    // permanent flow quarantine, which this call cannot release.
     mCtx.sendGrants(mCtx.scheduler.reapQuarantine());
     if (mCtx.cfg.receiverFlowTimeoutMs <= 0)
     {
@@ -556,20 +611,16 @@ void BounceReceiver::checkTimeouts()
     {
         // The flow's sender went silent after taking grants: it is dead or unreachable (a LIVE
         // sender either makes progress or abandons via requestTimeoutMs + cancel well before this
-        // lease expires). Reclaim the whole flow — regions a worker still reads defer as orphans,
-        // all others quarantine (the silent peer's NIC may still be writing them).
+        // lease expires). Fence the flow; active scatter regions remain owned until completion
+        // and all unknown-write regions stay quarantined until explicit DRAIN.
         auto const [peer, rid] = splitKey(flow);
         TLLM_LOG_WARNING(
             "BounceTransport(%s): flow lease expired (no progress within %d ms) peer=%s rid=%llu -> reclaiming "
-            "(regions quarantined for %d ms before reuse)",
-            mCtx.selfName.c_str(), mCtx.cfg.receiverFlowTimeoutMs, peer.c_str(), static_cast<unsigned long long>(rid),
-            mCtx.cfg.quarantineMs);
+            "(unknown-write regions retained until DRAIN)",
+            mCtx.selfName.c_str(), mCtx.cfg.receiverFlowTimeoutMs, peer.c_str(), static_cast<unsigned long long>(rid));
+        closeFlow(flow);
         reclaimAndFlagDeferred(
-            [&](auto const& busy, auto& deferred)
-            {
-                return mCtx.scheduler.reclaimFlow(
-                    flow, busy, deferred, std::chrono::milliseconds(std::max(0, mCtx.cfg.quarantineMs)));
-            });
+            [&](auto const& busy, auto& deferred) { return mCtx.scheduler.quarantineFlow(flow, busy, deferred); });
     }
 }
 
@@ -583,10 +634,12 @@ void BounceReceiver::recoverScatterJob(
         static_cast<int>(nackSent), static_cast<int>(donePushed));
     if (ctx != nullptr)
     {
-        // A scatter kernel may still be reading the region: drain the stream before the ScatterDone
-        // below lets the scheduler re-grant it. Best effort — the error (if any) is already logged.
-        (void) cudaStreamSynchronize(ctx->stream);
-        (void) cudaGetLastError();
+        if (cudaStreamSynchronize(ctx->stream) != cudaSuccess)
+        {
+            // Retain the context, region and outstanding claim. Shutdown's independent
+            // guard and the owning Python deadline contain an unprovable GPU failure.
+            return;
+        }
         mCtx.exec->release(ctx);
     }
     // An ACK that was attempted (delivered or not) must never be followed by a NACK: a duplicated or
@@ -663,7 +716,9 @@ void BounceReceiver::scatterWorkerLoop()
             }
             if (ctx == nullptr)
             {
-                break; // shutting down
+                std::lock_guard<std::mutex> lk(mDoneMu);
+                mDone.push_back(ScatterDone{job.key, job.offset});
+                continue; // never launched: cancellation is physical completion
             }
             auto const n = static_cast<std::uint32_t>(job.entries.size());
             // Validate every scatter SOURCE stays inside THIS flow's granted region before launching.
@@ -761,8 +816,8 @@ void BounceReceiver::scatterWorkerLoop()
                 }
             }
             cudaError_t syncErr = cudaSuccess;
-            if (launchErr == cudaSuccess)
             {
+                // Even a failed launch may follow queued asynchronous argument copies.
                 // Sync leg: the actual GPU wait (kernel queueing + run time on the exec stream).
                 BounceNvtxScope syncScope(kNvtxScatterSync, "scatterSync rid=%llu chunk=%u",
                     static_cast<unsigned long long>(job.rid), job.chunkIdx);
@@ -782,7 +837,15 @@ void BounceReceiver::scatterWorkerLoop()
                     mCtx.selfName.c_str(), static_cast<int>(srcInBounds), static_cast<int>(launchErr),
                     static_cast<int>(syncErr), static_cast<unsigned long long>(job.rid), job.chunkIdx);
             }
-            mCtx.exec->release(ctx); // kernel done (or failed) -> return the context
+            if (syncErr != cudaSuccess)
+            {
+                // No physical proof: keep the exec context and the flow claim rooted.
+                nackSent = true;
+                mCtx.channel->sendTo(job.peer, encodeNack(job.rid, job.chunkIdx, job.offset));
+                ctx = nullptr;
+                continue;
+            }
+            mCtx.exec->release(ctx); // stream is physically idle
             ctx = nullptr;           // released: the exception handler must not release it again
             // ACK straight from the worker (ControlChannel::sendTo is thread-safe): the data IS at its
             // final dst here, and skipping the done-queue -> IO-thread hop shaves its drain latency off
@@ -829,9 +892,14 @@ BounceSender::BounceSender(BounceContext& ctx)
 {
 }
 
-std::shared_future<BounceResult> BounceSender::submit(
-    TransferDescs const& srcDescs, TransferDescs const& dstDescs, std::string const& peer)
+std::shared_future<BounceResult> BounceSender::submit(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
+    std::string const& peer, std::shared_ptr<BounceRequestState> state)
+try
 {
+    if (!state)
+    {
+        state = std::make_shared<BounceRequestState>();
+    }
     auto promise = std::make_shared<std::promise<BounceResult>>();
     auto fut = promise->get_future().share();
     BounceTransferPlan plan;
@@ -851,12 +919,14 @@ std::shared_future<BounceResult> BounceSender::submit(
         // silently absorbed as a slow success. Whether to retry is the caller's decision.
         TLLM_LOG_WARNING(
             "BounceTransport(%s): plan build for peer %s rejected: %s", mCtx.selfName.c_str(), peer.c_str(), e.what());
+        state->quiesced.store(true, std::memory_order_release);
         promise->set_value({TransferState::kFAILURE, BounceFailReason::kPlanRejected});
         return fut;
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
     if (numChunks == 0)
     {
+        state->quiesced.store(true, std::memory_order_release);
         promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
         return fut;
     }
@@ -870,14 +940,26 @@ std::shared_future<BounceResult> BounceSender::submit(
     }
 
     std::uint64_t const rid = mNextRid.fetch_add(1, std::memory_order_relaxed);
+    if (rid == 0)
+    {
+        TLLM_LOG_ERROR("Bounce request identifier exhausted; terminating before identity reuse");
+        std::abort();
+    }
     std::uint64_t const planBytes = plan.totalBytes();
     {
         std::lock_guard<std::mutex> lk(mReqMu);
+        if (mCtx.shutdownRequested.load(std::memory_order_acquire))
+        {
+            state->quiesced.store(true, std::memory_order_release);
+            promise->set_value({TransferState::kFAILURE, BounceFailReason::kShutdown});
+            return fut;
+        }
         Request req;
         req.peer = peer;
         req.numChunks = numChunks;
         req.plan = std::move(plan);
         req.promise = promise;
+        req.physical = std::move(state);
         req.lastProgress = std::chrono::steady_clock::now();
         req.nvtxReq = bounceRangeStart(kNvtxRequest, "req rid=%llu chunks=%u bytes=%llu",
             static_cast<unsigned long long>(rid), numChunks, static_cast<unsigned long long>(planBytes));
@@ -885,10 +967,17 @@ std::shared_future<BounceResult> BounceSender::submit(
         req.nvtxGrantWait
             = bounceRangeStart(kNvtxGrantWait, "grantWait rid=%llu", static_cast<unsigned long long>(rid));
         mRequests.emplace(rid, std::move(req));
+        // Publication is ordered with failure/cancellation under mReqMu. A failed
+        // request must never publish a new WANT after its DRAIN was acknowledged.
+        try
+        {
+            mCtx.channel->sendTo(peer, encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()));
+        }
+        catch (std::exception const&)
+        {
+            failRequest(rid, mRequests.at(rid), BounceFailReason::kProtocolError);
+        }
     }
-    // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
-    // own control endpoint so the receiver can addPeer us and send GRANT/ACK back (self-bootstrap).
-    mCtx.channel->sendTo(peer, encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()));
     if (mCtx.cfg.enableEagerGather)
     {
         // Overlap the WANT->GRANT control round-trip with the gather: launch this request's first
@@ -907,6 +996,12 @@ std::shared_future<BounceResult> BounceSender::submit(
         }
     }
     return fut;
+}
+
+catch (std::bad_alloc const&)
+{
+    TLLM_LOG_ERROR("Bounce sender allocation failure after admission; terminating before memory reuse");
+    std::abort();
 }
 
 void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
@@ -1021,6 +1116,11 @@ void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 
 void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
 {
+    if (req.physical->cancelRequested.load(std::memory_order_acquire)
+        || mCtx.shutdownRequested.load(std::memory_order_acquire))
+    {
+        return;
+    }
     if (req.abandonReason != BounceFailReason::kNone)
     {
         // Abandoned (GRANT mispair / plan overflow): stop attaching credits and launching gathers.
@@ -1083,6 +1183,31 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             req.pendingCredits.pop_front();
             req.nextCredit += 1;
         }
+        Posted posted;
+        posted.chunkIdx = chunkIdx;
+        posted.localOffset = *localOff;
+        posted.ctx = ctx;
+        posted.hasCredit = haveCredit;
+        if (haveCredit)
+        {
+            posted.remoteHandle = credit.regionHandle;
+            posted.remoteAddr = credit.addr;
+            posted.remoteDevId = credit.devId;
+        }
+        posted.writeBytes = static_cast<std::uint32_t>(chunk.packedBytes);
+        posted.state = PostState::GatherFailed;
+        try
+        {
+            req.posted.push_back(std::move(posted));
+        }
+        catch (std::exception const&)
+        {
+            mCtx.exec->release(ctx);
+            mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
+            throw;
+        }
+        auto& p = req.posted.back();
+        ++req.nextPost;
         auto const nDesc = static_cast<std::uint32_t>(chunk.srcPtrs.size());
         // Covers plan-array prep + gather launch + event record (the synchronous launch cost;
         // the gather's GPU time is the async `gather` span ended in drainGatherReady).
@@ -1109,8 +1234,6 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
             TLLM_LOG_WARNING(
                 "BounceTransport(%s): rid=%llu chunk=%u plan entries %zu > exec capacity %zu; abandoning flow",
                 mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), chunkIdx, nTotal, maxEntries);
-            mCtx.exec->release(ctx);
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(*localOff));
             req.abandonReason = BounceFailReason::kProtocolError;
             // Abandon: pumpRequest ignores the request from now on; once its in-flight chunks
             // drain, lastProgress freezes and checkTimeouts fails it within one requestTimeoutMs.
@@ -1148,29 +1271,12 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 mCtx.selfName.c_str(), static_cast<int>(gatherErr), static_cast<int>(recordErr),
                 static_cast<unsigned long long>(rid), chunkIdx);
         }
-        Posted p;
-        p.chunkIdx = chunkIdx;
-        p.localOffset = *localOff;
-        p.ctx = ctx;
-        p.hasCredit = haveCredit;
-        if (haveCredit)
-        {
-            p.remoteHandle = credit.regionHandle;
-            p.remoteAddr = credit.addr;
-            p.remoteDevId = credit.devId;
-        }
-        p.writeBytes = static_cast<std::uint32_t>(chunk.packedBytes);
-        // Gather in flight; the write is issued later by drainGatherReady once the event signals. If
-        // the gather launch/record failed, go straight to GatherFailed so drainGatherReady fails the
-        // request without ever trusting the (un)recorded event.
         p.state = gatherFailed ? PostState::GatherFailed : PostState::Gathering;
         if (!gatherFailed)
         {
             p.nvtxGather = bounceRangeStart(kNvtxGather, "gather rid=%llu chunk=%u bytes=%llu",
                 static_cast<unsigned long long>(rid), chunkIdx, static_cast<unsigned long long>(chunk.packedBytes));
         }
-        req.posted.push_back(std::move(p));
-        req.nextPost += 1;
         req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk's gather launched
     }
     // Reconcile the pipeline-starvation NVTX spans after every pump pass (perf visibility only):
@@ -1217,6 +1323,10 @@ bool BounceSender::drainGatherReady()
     std::vector<std::uint64_t> toFail;
     for (auto& [rid, req] : mRequests)
     {
+        if (req.physical->cancelRequested.load(std::memory_order_acquire))
+        {
+            continue;
+        }
         for (auto& p : req.posted)
         {
             if (p.state == PostState::Writing || p.state == PostState::Sent)
@@ -1270,7 +1380,17 @@ bool BounceSender::drainGatherReady()
                     {MemoryDesc{reinterpret_cast<std::uintptr_t>(mCtx.arena->at(p.localOffset)), p.writeBytes,
                         static_cast<std::uint32_t>(mCtx.deviceId)}}};
                 TransferDescs const dst{MemoryType::kVRAM, {MemoryDesc{p.remoteAddr, p.writeBytes, p.remoteDevId}}};
-                p.xfer = mCtx.agent.postXferRequest(TransferOp::kWRITE, src, dst, req.peer, std::nullopt);
+                p.state = PostState::Writing;
+                try
+                {
+                    p.xfer = mCtx.agent.postXferRequest(TransferOp::kWRITE, src, dst, req.peer, std::nullopt);
+                }
+                catch (std::exception const&)
+                {
+                    req.abandonReason = BounceFailReason::kWriteFailed;
+                    toFail.push_back(rid);
+                    break; // an escaped submission with no handle cannot be proved stopped
+                }
             }
             p.state = PostState::Writing;
             didWork = true;
@@ -1304,7 +1424,16 @@ bool BounceSender::pollSenderHandles()
             }
             // wait(0) is one non-blocking status query: IN_PROGRESS / SUCCESS / FAILURE.
             // A failed post left p.xfer null -> report FAILURE.
-            TransferState const st = p.xfer != nullptr ? p.xfer->wait(0) : TransferState::kFAILURE;
+            TransferState st = TransferState::kFAILURE;
+            try
+            {
+                st = p.xfer != nullptr ? p.xfer->wait(0) : TransferState::kFAILURE;
+            }
+            catch (std::exception const&)
+            {
+                toFail.push_back(rid);
+                break;
+            }
             if (st == TransferState::kSUCCESS)
             {
                 // End the write span BEFORE building the DATA message so nixlWrite measures only the
@@ -1320,12 +1449,30 @@ bool BounceSender::pollSenderHandles()
                     BounceNvtxScope dataScope(kNvtxDataSend, "dataSend rid=%llu chunk=%u n=%u bytes=%zu",
                         static_cast<unsigned long long>(rid), p.chunkIdx, nRuns,
                         static_cast<std::size_t>(nRuns) * sizeof(BounceScatterRun));
-                    mCtx.channel->sendTo(
-                        req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
+                    try
+                    {
+                        mCtx.channel->sendTo(
+                            req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
+                    }
+                    catch (std::exception const&)
+                    {
+                        toFail.push_back(rid);
+                        break;
+                    }
                 }
-                if (!p.xfer->release())
+                bool released = false;
+                try
                 {
-                    // The write is terminal, so progress is safe; the status object keeps the
+                    released = p.xfer->release();
+                }
+                catch (std::exception const&)
+                {
+                    toFail.push_back(rid);
+                    break;
+                }
+                if (!released)
+                {
+                    // The write succeeded, so progress is safe; the status object keeps the
                     // handle and its destructor retries the backend release.
                     TLLM_LOG_WARNING("BounceTransport(%s): terminal write handle release deferred rid=%llu chunk=%u",
                         mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), p.chunkIdx);
@@ -1410,8 +1557,9 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
             bounceRangeEnd(pit->nvtxAckWait);
             // Return the gather-staging region to the shared arena; re-schedule may hand the freed
             // bytes to a waiting remote flow.
-            mCtx.sendGrants(mCtx.scheduler.releaseLocal(pit->localOffset));
+            auto const offset = pit->localOffset;
             req.posted.erase(pit);
+            mCtx.sendGrants(mCtx.scheduler.releaseLocal(offset));
             found = true;
             break;
         }
@@ -1435,6 +1583,7 @@ void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
         bounceRangeEnd(req.nvtxReq);
         try
         {
+            req.physical->quiesced.store(true, std::memory_order_release);
             req.promise->set_value({TransferState::kSUCCESS, BounceFailReason::kNone});
         }
         catch (...)
@@ -1482,123 +1631,64 @@ void BounceSender::checkTimeouts()
 
 bool BounceSender::drainOrphanLocal()
 {
-    if (mOrphanLocal.empty())
+    bool progress = false;
+    for (auto it = mOrphanLocal.begin(); it != mOrphanLocal.end();)
     {
-        return false;
-    }
-    bool didWork = false;
-    std::vector<OrphanLocal> keep;
-    keep.reserve(mOrphanLocal.size());
-    for (auto& o : mOrphanLocal)
-    {
-        if (o.xfer != nullptr && o.xfer->wait(0) == TransferState::kIN_PROGRESS)
-        {
-            // Warn once when an orphaned write outlives requestTimeoutMs: nothing gives up on it
-            // (the NIC may still read the region), but an operator should know the region is held.
-            auto const ageMs
-                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - o.since)
-                      .count();
-            if (!o.warned && ageMs >= mCtx.cfg.requestTimeoutMs)
-            {
-                o.warned = true;
-                TLLM_LOG_WARNING(
-                    "BounceTransport(%s): orphaned RDMA write rid=%llu region offset=%llu has not reached "
-                    "a terminal state after %lld ms; staging region held until it does",
-                    mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
-                    static_cast<unsigned long long>(o.offset), static_cast<long long>(ageMs));
-            }
-            keep.push_back(std::move(o)); // write still in flight -> the NIC may still read the region; wait
-            continue;
-        }
-        // Terminal (Done or Failed): the NIC is finished with the region (source AND the receiver's
-        // destination) -> recycle the local source now.
-        if (o.xfer != nullptr && !o.xfer->release())
-        {
-            // The write is terminal, so recycling is safe; only the backend handle remains retained
-            // (the status object's destructor retries the release).
-            TLLM_LOG_WARNING("BounceTransport(%s): terminal orphan handle release deferred rid=%llu",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid));
-        }
-        mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.offset));
-        didWork = true;
-    }
-    mOrphanLocal.swap(keep);
-    // Send any deferred cancel whose flow now has NO in-flight write left: the receiver may safely
-    // reclaim its regions (the writes have landed/failed, no more DMA targets them).
-    for (auto it = mPendingCancel.begin(); it != mPendingCancel.end();)
-    {
-        std::uint64_t const rid = it->first;
-        bool const stillInFlight = std::any_of(
-            mOrphanLocal.begin(), mOrphanLocal.end(), [rid](OrphanLocal const& o) { return o.rid == rid; });
-        if (stillInFlight)
+        if (it->xfer == nullptr || !it->xfer->isQuiesced())
         {
             ++it;
             continue;
         }
-        mCtx.channel->sendTo(it->second, encodeCancel(rid, mCtx.channel->localEndpoint()));
-        it = mPendingCancel.erase(it);
-        didWork = true;
+        auto orphan = std::move(*it);
+        it = mOrphanLocal.erase(it);
+        // Remove the owner before any release/publication can throw. Physical proof
+        // permits allocation reuse even when releasing a backend handle fails.
+        try
+        {
+            if (!orphan.xfer->release())
+            {
+                TLLM_LOG_WARNING("Bounce terminal RDMA handle release deferred rid=%llu",
+                    static_cast<unsigned long long>(orphan.rid));
+            }
+        }
+        catch (std::exception const& error)
+        {
+            TLLM_LOG_WARNING("Bounce terminal RDMA handle release failed: %s", error.what());
+        }
+        mCtx.sendGrants(mCtx.scheduler.releaseLocal(orphan.offset));
+        progress = true;
     }
-    return didWork;
+    return progress;
 }
 
 bool BounceSender::drainOrphanGather()
 {
-    if (mOrphanGather.empty())
+    bool progress = false;
+    for (auto it = mOrphanGather.begin(); it != mOrphanGather.end();)
     {
-        return false;
-    }
-    bool didWork = false;
-    std::vector<OrphanGather> keep;
-    keep.reserve(mOrphanGather.size());
-    for (auto& o : mOrphanGather)
-    {
-        // Non-blocking poll of the exec STREAM, not the event: a GatherFailed chunk may have a
-        // successfully launched kernel whose cudaEventRecord failed, so only the stream tells us when
-        // the region is no longer being written. A held ExecCtx stream carries only this chunk's work.
-        cudaError_t const st = cudaStreamQuery(o.ctx->stream);
-        if (st == cudaErrorNotReady)
+        // An event may never have been recorded. Only an idle stream proves that
+        // both source reads and staging/plan-buffer writes have stopped.
+        if (cudaStreamQuery(it->ctx->stream) != cudaSuccess)
         {
-            // Warn once when an orphaned gather outlives requestTimeoutMs: nothing gives up on it
-            // (the kernel may still write the region), but an operator should know the region is held.
-            // A never-completing gather keeps busy() true (0 ms poll with the 50 us backoff) until
-            // process exit.
-            auto const ageMs
-                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - o.since)
-                      .count();
-            if (!o.warned && ageMs >= mCtx.cfg.requestTimeoutMs)
-            {
-                o.warned = true;
-                TLLM_LOG_WARNING(
-                    "BounceTransport(%s): orphaned gather rid=%llu region offset=%llu has not completed after "
-                    "%lld ms; staging region held until it does",
-                    mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid),
-                    static_cast<unsigned long long>(o.localOffset), static_cast<long long>(ageMs));
-            }
-            keep.push_back(o); // kernel may still be writing the region -> wait
+            ++it;
             continue;
         }
-        if (st != cudaSuccess)
-        {
-            // A non-NotReady error here is most likely a sticky async kernel fault, which
-            // cudaGetLastError cannot clear (the clear only helps a non-sticky one): the WARNING is the
-            // signal. The region is recycled only because the request already failed — nothing
-            // consumes its content. For a sticky launch failure this WARNING duplicates the one
-            // pumpRequest already emitted (acceptable: this second one names the region).
-            (void) cudaGetLastError();
-            TLLM_LOG_WARNING("BounceTransport(%s): orphaned gather rid=%llu ended with CUDA error %s",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(o.rid), cudaGetErrorString(st));
-        }
-        mCtx.exec->release(o.ctx);
-        mCtx.sendGrants(mCtx.scheduler.releaseLocal(o.localOffset));
-        didWork = true;
+        auto const orphan = *it;
+        it = mOrphanGather.erase(it);
+        mCtx.exec->release(orphan.ctx);
+        mCtx.sendGrants(mCtx.scheduler.releaseLocal(orphan.localOffset));
+        progress = true;
     }
-    mOrphanGather.swap(keep);
-    return didWork;
+    return progress;
 }
 
 void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason reason)
 {
+    req.physical->cancelRequested.store(true, std::memory_order_release);
+    if (req.abandonReason == BounceFailReason::kNone)
+    {
+        req.abandonReason = reason;
+    }
     // An abandoned flow (GRANT mispair / plan overflow) reaches here through the timeout path;
     // report the specific abandon cause, not the generic timeout.
     if (req.abandonReason != BounceFailReason::kNone)
@@ -1614,7 +1704,7 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     // but only once nothing is still touching the region's memory, else recycling races a live DMA.
     // Nothing here blocks on the GPU or the NIC (this runs on the IO thread, commonly from onNack):
     //   - Writing: the RDMA write may still be reading the region as its source. Defer to mOrphanLocal;
-    //     drainOrphanLocal() releases the xfer + region once poll() is terminal.
+    //     drainOrphanLocal() releases the xfer + region only after isQuiesced() proves it stopped.
     //   - Gathering / GatherFailed: our gather kernel may still be WRITING the region (an abandoned
     //     gather would scribble a re-granted region — the write is not ordered against the new owner;
     //     GatherFailed includes "launch OK, event-record failed", so its event cannot be trusted but
@@ -1623,9 +1713,14 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
     //   - Gathered: gather done (event observed), ctx already returned -> recycle now.
     //   - Sent: write landed (poll==kDone), xfer already released in pollSenderHandles, NIC done
     //     reading -> recycle now.
-    bool deferredWrite = false;
-    for (auto& p : req.posted)
+    // Allocate every owner record before changing resource ownership.
+    mOrphanLocal.reserve(mOrphanLocal.size() + req.posted.size());
+    mOrphanGather.reserve(mOrphanGather.size() + req.posted.size());
+    mDrains.try_emplace(rid, Drain{req.peer, req.physical});
+    while (!req.posted.empty())
     {
+        auto p = std::move(req.posted.back());
+        req.posted.pop_back();
         // Close this chunk's NVTX spans (whichever leg it died in); 0 handles are no-ops.
         bounceRangeEnd(p.nvtxGather);
         bounceRangeEnd(p.nvtxWrite);
@@ -1634,7 +1729,6 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         {
             mOrphanLocal.push_back(
                 OrphanLocal{std::move(p.xfer), p.localOffset, rid, std::chrono::steady_clock::now(), false});
-            deferredWrite = true;
             continue;         // do NOT release xfer or recycle the region yet
         }
         if (p.ctx != nullptr) // Gathering or GatherFailed: the exec stream may still write the region
@@ -1645,18 +1739,6 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
             continue; // do NOT release ctx or recycle the region yet
         }
         mCtx.sendGrants(mCtx.scheduler.releaseLocal(p.localOffset));
-    }
-    // Retract the credit request so the receiver stops holding/granting for it. If any RDMA write is
-    // still in flight it is landing on the receiver's region; sending the cancel NOW would let the
-    // receiver reclaim+re-grant that region under the write -> corruption. Defer the cancel until the
-    // flow's writes drain (drainOrphanLocal sends it). With no in-flight write, send it immediately.
-    if (deferredWrite)
-    {
-        mPendingCancel[rid] = req.peer;
-    }
-    else
-    {
-        mCtx.channel->sendTo(req.peer, encodeCancel(rid, mCtx.channel->localEndpoint()));
     }
     bounceRangeEnd(req.nvtxGrantWait);
     bounceRangeEnd(req.nvtxCreditStarved);
@@ -1672,6 +1754,80 @@ void BounceSender::failRequest(std::uint64_t rid, Request& req, BounceFailReason
         // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
     }
     mRequests.erase(rid);
+}
+
+bool BounceSender::hasUnprovenAccess()
+{
+    std::lock_guard<std::mutex> lock(mReqMu);
+    return !mRequests.empty() || !mDrains.empty() || !mOrphanLocal.empty() || !mOrphanGather.empty();
+}
+
+void BounceSender::cancelAll()
+{
+    std::lock_guard<std::mutex> lk(mReqMu);
+    for (auto& [rid, request] : mRequests)
+    {
+        request.physical->cancelRequested.store(true, std::memory_order_release);
+    }
+}
+
+void BounceSender::onDrainAck(std::string const& peer, BounceMsgHeader const& h)
+{
+    std::lock_guard<std::mutex> lk(mReqMu);
+    auto it = mDrains.find(h.requestId);
+    if (it != mDrains.end() && it->second.peer == peer)
+    {
+        it->second.acknowledged = true;
+    }
+}
+
+bool BounceSender::progressDrains()
+{
+    std::lock_guard<std::mutex> lk(mReqMu);
+    std::vector<std::uint64_t> cancelled;
+    for (auto const& [rid, request] : mRequests)
+    {
+        if (request.physical->cancelRequested.load(std::memory_order_acquire))
+        {
+            cancelled.push_back(rid);
+        }
+    }
+    for (auto const rid : cancelled)
+    {
+        failRequest(rid, mRequests.at(rid), BounceFailReason::kCancelled);
+    }
+    bool progress = !cancelled.empty();
+    auto const now = std::chrono::steady_clock::now();
+    constexpr auto kDrainRetry = std::chrono::milliseconds(100);
+    for (auto it = mDrains.begin(); it != mDrains.end();)
+    {
+        auto const rid = it->first;
+        auto& drain = it->second;
+        if (mRequests.count(rid) != 0)
+        {
+            ++it;
+            continue; // failure cleanup has not yet transferred every physical owner
+        }
+        bool const writing = std::any_of(
+            mOrphanLocal.begin(), mOrphanLocal.end(), [rid](auto const& orphan) { return orphan.rid == rid; });
+        bool const gathering = std::any_of(
+            mOrphanGather.begin(), mOrphanGather.end(), [rid](auto const& orphan) { return orphan.rid == rid; });
+        if (!writing && !gathering && drain.acknowledged)
+        {
+            drain.physical->quiesced.store(true, std::memory_order_release);
+            it = mDrains.erase(it);
+            progress = true;
+            continue;
+        }
+        if (!writing && !drain.acknowledged && now >= drain.retryAt)
+        {
+            drain.retryAt = now + kDrainRetry;
+            mCtx.channel->sendTo(drain.peer, encodeDrain(rid, mCtx.channel->localEndpoint()));
+            progress = true;
+        }
+        ++it;
+    }
+    return progress;
 }
 
 void BounceSender::forget(std::string const& peer)
@@ -1698,132 +1854,20 @@ void BounceSender::forget(std::string const& peer)
 
 void BounceSender::failAll()
 {
-    // Fail any still-pending requests so no submit() future hangs, releasing their in-flight
-    // transfer handles first (same handle-leak fix as failRequest). Called after the device has been
-    // synced and the IO thread joined, so no lock contention — but keep mReqMu for consistency.
-    // cudaDeviceSynchronize covers only local kernels, NOT the NIC: TransferStatus::release() cannot
-    // reliably cancel a posted NIXL write (UCX's release issues ucp_request_cancel, which acts only on
-    // tag-matching receives, and returns success regardless; libfabric's release is a no-op), so an
-    // outbound write may still be READING the arena when ~NixlBounceState frees it. The only
-    // protection is to wait for those writes to reach a terminal state — bounded by a fixed
-    // kShutdownWriteDrainMs so a dead peer cannot hang teardown — and warn once if some are
-    // still in flight past the deadline. The once-retry of failed releases below is kept only as a
-    // cheap guard for other backends. This bounded wait runs while NixlTransferAgent::shutdown holds
-    // mLock, which is acceptable at teardown. It covers OUTBOUND writes only: inbound writes into
-    // regions we granted can neither be waited on nor revoked — deregistration invalidates the rkey and
-    // the process is exiting (the same exposure as KV-pool deregistration).
     std::lock_guard<std::mutex> lk(mReqMu);
+    if (!mOrphanLocal.empty() || !mOrphanGather.empty() || mCtx.scheduler.localHeldCount() != 0)
     {
-        std::vector<TransferStatus*> inFlight;
-        for (auto& [rid, req] : mRequests)
-        {
-            for (auto& p : req.posted)
-            {
-                if (p.state == PostState::Writing && p.xfer != nullptr)
-                {
-                    inFlight.push_back(p.xfer.get());
-                }
-            }
-        }
-        for (auto& o : mOrphanLocal)
-        {
-            if (o.xfer != nullptr)
-            {
-                inFlight.push_back(o.xfer.get());
-            }
-        }
-        // Fixed, independent of requestTimeoutMs: a dead peer's write never completes, so waiting
-        // longer buys nothing; on a live link a default 32 MiB chunk lands well within 5 s; and a tiny
-        // request_timeout_ms must not shorten a legitimate in-flight write.
-        constexpr int kShutdownWriteDrainMs = 5000;
-        auto const deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kShutdownWriteDrainMs);
-        while (!inFlight.empty())
-        {
-            inFlight.erase(std::remove_if(inFlight.begin(), inFlight.end(),
-                               [](TransferStatus* x) { return x->wait(0) != TransferState::kIN_PROGRESS; }),
-                inFlight.end());
-            if (inFlight.empty() || std::chrono::steady_clock::now() >= deadline)
-            {
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        if (!inFlight.empty())
-        {
-            TLLM_LOG_WARNING(
-                "BounceTransport(%s): %zu outbound writes still in flight at shutdown; arena teardown may race the NIC",
-                mCtx.selfName.c_str(), inFlight.size());
-        }
+        TLLM_LOG_ERROR("Bounce sender teardown reached unproved source access; terminating before memory reuse");
+        std::abort();
     }
-    std::vector<std::unique_ptr<TransferStatus>> releaseRetry;
-    for (auto& [rid, req] : mRequests)
+    for (auto& [rid, request] : mRequests)
     {
-        for (auto& p : req.posted)
-        {
-            bounceRangeEnd(p.nvtxGather);
-            bounceRangeEnd(p.nvtxWrite);
-            bounceRangeEnd(p.nvtxAckWait);
-            if (p.state == PostState::Writing && p.xfer != nullptr)
-            {
-                if (!p.xfer->release())
-                {
-                    releaseRetry.push_back(std::move(p.xfer));
-                }
-            }
-            if (p.ctx != nullptr)
-            {
-                mCtx.exec->release(p.ctx); // still-gathering chunk: return its borrowed exec context
-                p.ctx = nullptr;
-            }
-        }
-        bounceRangeEnd(req.nvtxGrantWait);
-        bounceRangeEnd(req.nvtxCreditStarved);
-        bounceRangeEnd(req.nvtxArenaStarved);
-        bounceRangeEnd(req.nvtxReq);
-        try
-        {
-            req.promise->set_value({TransferState::kFAILURE, BounceFailReason::kShutdown});
-        }
-        catch (...)
-        {
-            // set_value throws std::future_error ONLY if the promise is already satisfied — a benign
-            // double-resolve (a request resolves exactly once); intentionally ignored, not a failure.
-        }
+        request.promise->set_value({TransferState::kFAILURE, BounceFailReason::kShutdown});
     }
     mRequests.clear();
-    // Release the handles of deferred writes (waited on above) without recycling their regions or
-    // sending deferred control messages: no producer remains, and shutdown must not grant work
-    // against an arena being torn down.
-    for (auto& o : mOrphanLocal)
-    {
-        if (o.xfer != nullptr && !o.xfer->release())
-        {
-            releaseRetry.push_back(std::move(o.xfer));
-        }
-    }
-    mOrphanLocal.clear();
-    // Parked gathers: the caller's cudaDeviceSynchronize already drained every stream, so return the
-    // exec contexts unconditionally. Their regions are left to arena destruction like every other
-    // chunk's: the ring is torn down and grants are discarded, so recycling would be pointless.
-    for (auto const& o : mOrphanGather)
-    {
-        mCtx.exec->release(o.ctx);
-    }
-    mOrphanGather.clear();
-    // Retry failed releases once after all producers/futures have been stopped. A persistent
-    // backend failure gets a final bounded attempt from the status object's destructor.
-    for (auto& status : releaseRetry)
-    {
-        if (!status->release())
-        {
-            TLLM_LOG_WARNING(
-                "BounceTransport(%s): NIXL handle still retained after shutdown retry", mCtx.selfName.c_str());
-        }
-    }
-    // Deferred cancels aren't sent at shutdown: in-flight RDMA writes aren't drained by the device
-    // sync (they're NIXL, not CUDA-stream), so a cancel could still race a write. The receiver
-    // reclaims those regions via its own teardown / peer-loss path.
-    mPendingCancel.clear();
+    // Remote drain may remain unproved after local memory is safe. Retained statuses
+    // keep quiesced=false; transport destruction does not manufacture remote proof.
+    mDrains.clear();
 }
 
 // ============================================================================
@@ -1883,31 +1927,61 @@ BounceTransport::~BounceTransport()
 
 void BounceTransport::shutdown()
 {
+    std::lock_guard<std::mutex> shutdownLock(mShutdownMu);
     bool expected = false;
-    if (!mCtx.stop.compare_exchange_strong(expected, true))
+    if (!mCtx.shutdownRequested.compare_exchange_strong(expected, true))
     {
-        return;       // already shut down
+        return;
     }
-    mReceiver.wake(); // wake scatter workers so they observe stop
+
+    struct GuardState
+    {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{false};
+    };
+
+    auto guardState = std::make_shared<GuardState>();
+    // This guard precedes every join and CUDA wait. A stuck kernel/NIC must terminate
+    // the process before any arena or exec allocation can be destroyed underneath it.
+    std::thread guard(
+        [guardState]
+        {
+            std::unique_lock<std::mutex> lock(guardState->mutex);
+            if (!guardState->cv.wait_for(lock, std::chrono::seconds(5), [&] { return guardState->done; }))
+            {
+                TLLM_LOG_ERROR("Bounce shutdown could not prove physical quiescence; terminating before memory reuse");
+                std::abort();
+            }
+        });
+    while (!mCtx.shutdownQuiesced.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    mCtx.stop.store(true, std::memory_order_release);
+    mReceiver.wake();
     if (mIoThread.joinable())
     {
         mIoThread.join();
     }
     mReceiver.joinWorkers();
-    // Threads are joined, but in-flight gather/scatter kernels may still be queued on ExecPool
-    // streams referencing the arena. Drain the device BEFORE we release contexts and let the caller
-    // tear down ExecPool/BounceArena — otherwise ~ExecPool's cudaStreamDestroy + ~BounceArena's
-    // cudaFree could race a kernel still reading the arena. (Teardown-only; a full-device sync is
-    // acceptable here.) Warn-only (we're in teardown / a dtor path -> must not throw); the user
-    // should still see a GPU fault. shutdown() may run on a thread whose current device isn't ours.
-    TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
-    TLLM_CUDA_CHECK_WARN(cudaDeviceSynchronize());
+    if (cudaSetDevice(mCtx.deviceId) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+    {
+        TLLM_LOG_ERROR("Bounce shutdown could not synchronize CUDA; terminating before memory reuse");
+        std::abort();
+    }
     mSender.failAll();
+    {
+        std::lock_guard<std::mutex> lock(guardState->mutex);
+        guardState->done = true;
+    }
+    guardState->cv.notify_one();
+    guard.join();
 }
 
 bool BounceTransport::addPeer(std::string const& peer, std::string const& endpoint)
 {
-    return mCtx.channel->addPeer(peer, endpoint);
+    return mCtx.addPeer(peer, endpoint);
 }
 
 std::string BounceTransport::localHandshakeBlob() const
@@ -1929,10 +2003,9 @@ std::string BounceTransport::localHandshakeBlob() const
 
 bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string const& blob)
 {
-    // Treat registration as replacement, not an additive update. A peer may be reloaded under the
-    // same name with bounce disabled or with changed settings; clear the previously validated route
-    // first so any missing/malformed/incompatible replacement immediately falls back to NIXL.
-    mCtx.channel->removePeer(peer);
+    // Revalidate admission on every metadata load. Missing, malformed or incompatible metadata
+    // clears the bounce capability, while the immutable old control route remains available for
+    // outstanding drains. A new transport incarnation must have a fresh peer name.
     {
         std::lock_guard<std::mutex> lk(mPeerMu);
         mHandshakedPeers.erase(peer);
@@ -1960,11 +2033,9 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     // STRICT equality. maxChunkSizeBytes is compared on the effective (post-clamp) values both
     // sides advertise; each side already clamped its own value to its usable arena capacity, so
     // equality also guarantees our chunks always fit the peer's arena and its scatter scratch
-    // (sized for its own maxChunkSizeBytes). requestTimeoutMs must match because the receiver's
-    // lease (2x ITS value) must exceed the SENDER's timeout; the quarantine (1x) starts at lease expiry
-    // or at a receiver-side peer teardown (forgetPeer via reclaimByPrefix) and on the lease path needs
-    // no extra margin (see BounceConfig::deriveDependentTimeouts). Local-only knobs
-    // (worker/stream counts, the
+    // (sized for its own maxChunkSizeBytes). Matching requestTimeoutMs gives live senders time to
+    // initiate drain before the receiver lease (2x this value) fences the flow. Lease expiry never
+    // supplies physical completion evidence. Local-only knobs (worker/stream counts, the
     // zero-copy-argument path, granularity, arena size) intentionally do NOT have to match.
     if (handshake.wireVersion != kBounceVersion || handshake.controlKind != localControlKind
         || handshake.maxChunkSizeBytes != mCtx.cfg.maxChunkSizeBytes
@@ -1996,7 +2067,7 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     bool peerAdded = false;
     try
     {
-        peerAdded = mCtx.channel->addPeer(peer, handshake.endpoint);
+        peerAdded = mCtx.addPeer(peer, handshake.endpoint);
     }
     catch (std::exception const& e)
     {
@@ -2086,6 +2157,11 @@ void BounceTransport::ioLoop()
         {
             tick(peer, blob);
         }
+        catch (std::bad_alloc const&)
+        {
+            TLLM_LOG_ERROR("Bounce reactor allocation failure; terminating before memory reuse");
+            std::abort();
+        }
         catch (std::exception const& e)
         {
             TLLM_LOG_WARNING("BounceTransport(%s): IO tick failed: %s", mCtx.selfName.c_str(), e.what());
@@ -2103,6 +2179,11 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     // waiting on a control message), sleep up to 1ms so the IO thread doesn't busy-spin a core.
     // A request merely waiting for a GRANT (nothing posted yet) is NOT "busy", so a stalled /
     // unreachable peer won't spin a core until requestTimeoutMs. Both checks are IO-thread-only.
+    if (mCtx.shutdownRequested.load(std::memory_order_acquire))
+    {
+        mReceiver.beginShutdown();
+        mSender.cancelAll();
+    }
     bool const busy = mSender.busy() || mReceiver.busy();
     int const timeoutMs = busy ? 0 : 1;
     bool work = false;
@@ -2111,6 +2192,7 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
         dispatch(peer, blob);
         work = true;
     }
+    work |= mSender.progressDrains();
     work |= mSender.drainGatherReady(); // post writes for chunks whose gather kernel just finished
     work |= mSender.pollSenderHandles();
     work |= mReceiver.drainScatterDone();
@@ -2119,7 +2201,12 @@ void BounceTransport::tick(std::string& peer, std::string& blob)
     drainForgets();
     mSender.drainPendingPosts();         // retry credits parked when the arena was full (onAck freed regions)
     mSender.checkTimeouts();
-    mReceiver.checkTimeouts();           // expire grant leases of silent senders + free post-quarantine regions
+    mReceiver.checkTimeouts();           // fence expired flows; unknown writes remain quarantined
+    if (mCtx.shutdownRequested.load(std::memory_order_acquire) && !mSender.hasUnprovenAccess()
+        && !mReceiver.hasUnprovenAccess())
+    {
+        mCtx.shutdownQuiesced.store(true, std::memory_order_release);
+    }
     // Idle backoff: when there IS in-flight work (busy → 0ms poll) but nothing actually advanced
     // this pass — the classic case being a gather stalled behind unrelated model kernels (gather
     // event stays NotReady) — keep latency low for the first few spins, then sleep briefly so we
@@ -2151,6 +2238,8 @@ void BounceTransport::dispatch(std::string const& peer, std::string const& blob)
     }
     switch (static_cast<BounceMsgType>(h.msgType))
     {
+    case BounceMsgType::kDRAIN: mReceiver.onDrain(peer, h, blob); break;
+    case BounceMsgType::kDRAIN_ACK: mSender.onDrainAck(peer, h); break;
     case BounceMsgType::kWANT: mReceiver.onWant(peer, h, blob); break; // [R]
     case BounceMsgType::kGRANT: mSender.onGrant(peer, h, blob); break; // [S]
     case BounceMsgType::kDATA: mReceiver.onData(peer, h, blob); break; // [R]

@@ -130,7 +130,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
     return parsed * mult;
 }
 
-/// POD config for the bounce v2 pipeline. There is no `enabled` field: the on/off switch is
+/// POD config for the bounce pipeline. There is no `enabled` field: the on/off switch is
 /// CacheTransceiverConfig's agent_bounce_buffer_enable + kv_cache_bounce_size_mb (which the Python
 /// frontend folds into the agent's arena size in MiB: 0 = off, >0 = arena size), and at runtime
 /// "bounce on" simply means the owning agent built its bounce state (mBounce != nullptr).
@@ -163,24 +163,22 @@ struct BounceConfig
     // means no minimum.
     std::size_t minDescriptorCount{1024};                   // min_descriptor_count
     std::size_t maxAverageDescriptorSizeBytes{16ULL << 10}; // max_average_descriptor_size
-    int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 — the whole failure model
-                                 // (abandoned-flow resolution, receiver lease, quarantine) hangs off
-                                 // this timer, so applyParam rejects 0 (negatives already fail the
-                                 // strict unsigned parse) and keeps the current value.
+    int requestTimeoutMs{30000}; // request_timeout_ms; must be > 0 for logical failure detection
+                                 // and receiver lease fencing. Expiry initiates physical drain; it
+                                 // cannot itself establish quiescence or permit memory reuse.
     // Receiver-side lease on granted regions — DERIVED in deriveDependentTimeouts() as
     // 2 x requestTimeoutMs, not an independent knob (tests may still set the field directly). A
     // dead sender emits neither DATA nor a cancel, which is unobservable through the protocol
     // alone — so a flow whose grants see no progress (no GRANT sent, no DATA received) for this
-    // long is reclaimed and its regions quarantined (below) before reuse. The lease must EXCEED
+    // long is fenced and its regions retained until explicit physical drain. The lease must EXCEED
     // the peers' requestTimeoutMs (a live sender abandons + cancels first, so only
     // dead/unreachable peers ever hit this) — the 2x derivation relies on both ends running the
     // SAME request_timeout_ms, which the capability handshake enforces (strict equality; a
     // mismatched peer falls back to standard NIXL).
     int receiverFlowTimeoutMs{60000};
-    // How long a receiver-reclaimed, possibly-still-being-written region stays out of the arena
-    // before reuse — DERIVED in deriveDependentTimeouts() as requestTimeoutMs (equal to the peer's
-    // by the handshake). A one-sided RDMA write cannot be aborted, so time is the only barrier
-    // against re-granting a region a gone peer's NIC may still be writing.
+    // Legacy scheduler quarantine interval, retained for direct scheduler callers/tests and sweep
+    // cadence. The v3 transport uses permanent per-flow quarantine until DRAIN proves that all
+    // remote writes stopped; this interval never permits release of those regions.
     int quarantineMs{30000};
     bool disableFabricMemory{false}; // disable_fabric_memory
     // enable_eager_gather: launch a chunk's gather at submit() time, before the receiver's GRANT
@@ -195,8 +193,8 @@ struct BounceConfig
     bool useZeroCopyArguments{true};
 
     /// Re-derive the lease/quarantine values from the one user-visible timeout (see the field
-    /// comments): the lease must exceed the peers' request timeout, and time is the only write
-    /// barrier for a reclaimed region. The config layer guarantees requestTimeoutMs > 0 (applyParam
+    /// comments): the lease exceeds the peers' request timeout but is only a fencing deadline,
+    /// never a physical completion barrier. The config layer guarantees requestTimeoutMs > 0 (applyParam
     /// rejects 0); the > 0 guard below only matters for directly-constructed configs. Must be
     /// re-run whenever requestTimeoutMs changes: fromEnv() always calls it, fromParams() only when
     /// the dict actually provides request_timeout_ms — so a caller-tweaked receiverFlowTimeoutMs /

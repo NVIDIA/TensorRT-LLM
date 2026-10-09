@@ -8266,6 +8266,9 @@ class PyExecutor:
 
     def _free_request_resources(self, request: LlmRequest) -> None:
         """Release execution resources without removing response routing."""
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        if transceiver is not None:
+            transceiver.require_request_quiescence(request)
         self.resource_manager.free_resources(request)
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)

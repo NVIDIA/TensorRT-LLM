@@ -834,6 +834,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     # Everything the constructor can reach, not only what it reaches with these values: the
     # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
+        rank=0,
         cp_size=1,
         world_size=1,
         pp_size=1,
@@ -929,6 +930,7 @@ def test_transceiver_routes_bounce_capacity_to_one_implementation(
     expected_python_bounce,
     expected_buffer_size_mb: int,
 ) -> None:
+    monkeypatch.setenv("TRTLLM_DISAGG_NO_RETRY", "1")
     worker_config = _construct_worker_config(
         monkeypatch,
         _make_cache_config(

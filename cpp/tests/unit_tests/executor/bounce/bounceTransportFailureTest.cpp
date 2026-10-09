@@ -33,7 +33,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -46,9 +50,11 @@ namespace
 // statuses it hands out.
 struct XferControls
 {
-    std::atomic<bool> failWrites{false};     // every posted write polls as FAILURE
-    std::atomic<bool> allowTerminal{true};   // false -> posted writes stay IN_PROGRESS
-    std::atomic<bool> releaseSucceeds{true}; // false -> release() fails (handle retained)
+    std::atomic<bool> throwAfterPost{false};
+    std::atomic<bool> failWrites{false};       // every posted write polls as FAILURE
+    std::atomic<bool> physicallyStopped{true}; // independent physical proof for injected failures
+    std::atomic<bool> allowTerminal{true};     // false -> posted writes stay IN_PROGRESS
+    std::atomic<bool> releaseSucceeds{true};   // false -> release() fails (handle retained)
     std::atomic<std::uint64_t> postCount{0};
     std::atomic<std::uint64_t> releaseCount{0};
 };
@@ -66,6 +72,11 @@ public:
     [[nodiscard]] bool isCompleted() const override
     {
         return wait(0) != kvc::TransferState::kIN_PROGRESS;
+    }
+
+    [[nodiscard]] bool isQuiesced() const override
+    {
+        return mCtl->physicallyStopped.load(std::memory_order_acquire) && wait(0) != kvc::TransferState::kIN_PROGRESS;
     }
 
     [[nodiscard]] kvc::TransferState wait(int64_t) const override
@@ -114,6 +125,10 @@ public:
         kvc::TransferDescs const&, std::string const&, std::optional<kvc::SyncMessage> const&) override
     {
         mCtl->postCount.fetch_add(1, std::memory_order_relaxed);
+        if (mCtl->throwAfterPost.load(std::memory_order_acquire))
+        {
+            throw std::runtime_error("injected ambiguous backend admission");
+        }
         return std::make_unique<FakeXferStatus>(mCtl);
     }
 
@@ -173,6 +188,46 @@ bool pumpChannel(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, Fn&
     return false;
 }
 
+bool drainFlow(b::ZmqControlChannel& sender, std::string const& receiver, std::uint64_t rid)
+{
+    sender.sendTo(receiver, b::encodeDrain(rid, sender.localEndpoint()));
+    return pumpChannel(sender, std::chrono::seconds(5),
+        [rid](b::BounceMsgHeader const& header, std::string const&) {
+            return header.requestId == rid
+                && static_cast<b::BounceMsgType>(header.msgType) == b::BounceMsgType::kDRAIN_ACK;
+        });
+}
+
+bool acknowledgeDrain(b::ZmqControlChannel& receiver, std::string const& sender)
+{
+    return pumpChannel(receiver, std::chrono::seconds(5),
+        [&](b::BounceMsgHeader const& header, std::string const& blob)
+        {
+            if (static_cast<b::BounceMsgType>(header.msgType) != b::BounceMsgType::kDRAIN)
+            {
+                return false;
+            }
+            std::vector<std::uint32_t> chunks;
+            std::string endpoint;
+            if (!b::decodeWant(blob, header, chunks, endpoint) || !receiver.addPeer(sender, endpoint))
+            {
+                return false;
+            }
+            receiver.sendTo(sender, b::encodeDrainAck(header.requestId));
+            return true;
+        });
+}
+
+bool waitPhysical(std::shared_ptr<b::BounceRequestState> const& state)
+{
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!state->quiesced.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return state->quiesced.load(std::memory_order_acquire);
+}
+
 // Wait up to `budget` for a GRANT for `rid`, decoding its credits into `out`.
 bool waitGrant(b::ZmqControlChannel& ch, std::uint64_t rid, std::chrono::milliseconds budget,
     std::vector<b::BounceCreditEntry>& out)
@@ -213,6 +268,28 @@ int countAcks(b::ZmqControlChannel& ch, std::chrono::milliseconds budget, std::u
         });
     return n;
 }
+
+struct StreamGate
+{
+    std::atomic<bool> entered{false};
+    std::atomic<bool> open{false};
+
+    ~StreamGate()
+    {
+        open.store(true, std::memory_order_release);
+    }
+};
+
+void CUDART_CB waitAtGate(void* data)
+{
+    auto& gate = *static_cast<StreamGate*>(data);
+    gate.entered.store(true, std::memory_order_release);
+    while (!gate.open.load(std::memory_order_acquire))
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 } // namespace
 
 // A peer that never GRANTs must fail the request on requestTimeoutMs, not hang. The WANT is
@@ -237,6 +314,7 @@ TEST(BounceTransportFailure, NoGrantTimesOutNotHang)
     EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
     EXPECT_EQ(fut.get().reason, b::BounceFailReason::kNoProgressTimeout);
 
+    ASSERT_TRUE(acknowledgeDrain(ghost, "ngSolo"));
     t->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
@@ -371,7 +449,7 @@ TEST(BounceTransportFailure, DuplicateDataProducesOneScatterAndAck)
     }
 
     EXPECT_EQ(countAcks(sender, std::chrono::seconds(2), rid), 1);
-
+    ASSERT_TRUE(drainFlow(sender, "dupDataReceiver", sentinelRid));
     receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
@@ -405,6 +483,7 @@ TEST(BounceTransportFailure, DuplicateWantIsDroppedWithoutRegrant)
     std::vector<b::BounceCreditEntry> extra;
     EXPECT_FALSE(waitGrant(sender, rid, std::chrono::milliseconds(500), extra)) << "duplicate WANT was re-granted";
 
+    ASSERT_TRUE(drainFlow(sender, "dupWantReceiver", rid));
     receiver->tx->shutdown();
 }
 
@@ -441,14 +520,14 @@ TEST(BounceTransportFailure, MalformedWantChunkSizeIsRejectedNotWedged)
         std::vector<b::BounceCreditEntry> credits;
         ASSERT_TRUE(waitGrant(sender, rid, std::chrono::seconds(5), credits)) << "legit WANT starved, rid=" << rid;
         // Cancel to release the granted region and drop the flow from the ring.
-        sender.sendTo("badWantReceiver", b::encodeWant(rid, {}, sender.localEndpoint()));
+        sender.sendTo("badWantReceiver", b::encodeDrain(rid, sender.localEndpoint()));
     }
 
     // The receiver must still grant fresh legitimate demand — pre-fix the drain latch wedges this.
     sender.sendTo("badWantReceiver", b::encodeWant(/*rid=*/200, {256}, sender.localEndpoint()));
     std::vector<b::BounceCreditEntry> credits;
     EXPECT_TRUE(waitGrant(sender, 200, std::chrono::seconds(5), credits)) << "receiver wedged after zero-size WANT";
-    sender.sendTo("badWantReceiver", b::encodeWant(200, {}, sender.localEndpoint()));
+    sender.sendTo("badWantReceiver", b::encodeDrain(200, sender.localEndpoint()));
 
     // Oversized mode: pre-fix this grant monopolizes the whole arena, so the follow-up legitimate
     // WANT starves.
@@ -465,6 +544,7 @@ TEST(BounceTransportFailure, MalformedWantChunkSizeIsRejectedNotWedged)
     EXPECT_FALSE(waitGrant(sender, 1, std::chrono::milliseconds(200), badCredits)) << "zero-size WANT was granted";
     EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), badCredits)) << "oversized WANT was granted";
 
+    ASSERT_TRUE(drainFlow(sender, "badWantReceiver", 201));
     receiver->tx->shutdown();
 }
 
@@ -530,16 +610,15 @@ TEST(BounceTransportFailure, OversizedScatterRunListIsRejectedNotCounted)
     std::vector<b::BounceCreditEntry> credits2;
     EXPECT_TRUE(waitGrant(sender, 2, std::chrono::seconds(5), credits2)) << "region pinned by oversized run list";
 
+    ASSERT_TRUE(drainFlow(sender, "bigRunReceiver", 2));
     receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
 
-// A sender that takes a GRANT and then dies emits neither DATA nor a cancel, so nothing
-// event-driven can ever reclaim its region — the receiver's grant lease must. After
-// receiverFlowTimeoutMs of silence the flow is reclaimed and its region quarantined for
-// quarantineMs, after which it must serve the next waiting flow; a late DATA for the expired
-// grant must be dropped (no scatter, no ACK).
-TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
+// Lease expiry fences a silent sender but cannot prove its NIC stopped. Its region must remain
+// unavailable beyond the old timed quarantine, until an explicit DRAIN permits reuse. Late DATA
+// for the fenced flow must be dropped even after another flow acquires the same region.
+TEST(BounceTransportFailure, GrantLeaseExpiryRetainsRegionUntilExplicitDrain)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
@@ -565,8 +644,10 @@ TEST(BounceTransportFailure, GrantLeaseExpiryReclaimsSilentSendersRegion)
     std::vector<b::BounceCreditEntry> credit2;
     EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), credit2))
         << "region re-granted before lease expiry";
-    // ...but once the silent flow's lease expires and the quarantine passes, it must be.
-    ASSERT_TRUE(waitGrant(sender, 2, std::chrono::seconds(10), credit2)) << "silent sender's region never reclaimed";
+    // Time alone is not a DMA-completion proof, including after the old quarantine.
+    EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(1000), credit2));
+    sender.sendTo("glReceiver", b::encodeDrain(1, sender.localEndpoint()));
+    ASSERT_TRUE(waitGrant(sender, 2, std::chrono::seconds(5), credit2));
     ASSERT_EQ(credit2.size(), 1u);
     EXPECT_EQ(credit2.front().regionHandle, credit1.front().regionHandle); // the one region, recycled
 
@@ -690,77 +771,61 @@ TEST(BounceTransportFailure, CreditMispairAbandonIsTerminalAndIgnoresLaterGrants
     // The later valid GRANT must not have resurrected the abandoned flow into posting a write.
     EXPECT_EQ(ctl->postCount.load(std::memory_order_acquire), 0u) << "abandoned flow posted an RDMA write";
 
+    ASSERT_TRUE(acknowledgeDrain(peer, "mispairSender"));
     sender->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
 
 // shutdown() with an in-flight (stuck) request must resolve its future FAILURE, never leave wait() hanging.
-TEST(BounceTransportFailure, ShutdownFailsInflight)
+TEST(BounceTransportFailure, ShutdownWithoutRemoteProofFailsStop)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/0); // timeout disabled -> only shutdown can resolve it
-    auto t = bounce_test::makeNode("sdSolo", c, 1024);
-    if (!t)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-
-    auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
-    auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "nobody"); // stuck (no grant, no timeout)
-    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
-    t->tx->shutdown();
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready) << "shutdown left request hanging";
-    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
-
-    bounce_test::freeXferBufs(bufs);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            auto node = bounce_test::makeNode("shutdownUnproved", cfg(30000), 1024);
+            auto buffers = bounce_test::makeXferBufs(8, 256, 1);
+            auto future = node->tx->submit(buffers.srcDescs, buffers.dstDescs, "missingPeer");
+            // MPI installs a SIGABRT handler that converts abort into exit(1).
+            // Restore the signal only after fixture admission has succeeded.
+            std::signal(SIGABRT, SIG_DFL);
+            std::fprintf(stderr, "awaiting physical quiescence guard\n");
+            node->tx->shutdown();
+        },
+        ::testing::KilledBySignal(SIGABRT), "awaiting physical quiescence guard");
 }
 
-// Shutdown uses the status object's bounded release instead of polling forever. If the backend
-// cannot abort, the future still fails promptly; the release is attempted once in failAll and once
-// in its retry pass (the production NixlTransferStatus destructor makes a final attempt).
-TEST(BounceTransportFailure, ShutdownReleaseFailureDoesNotHangOrLoseHandle)
+TEST(BounceTransportFailure, AmbiguousSubmissionCannotReleaseSourceAtShutdown)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
-    auto c = cfg(/*timeoutMs=*/0);
-    capRegions(c, c.maxInflightChunksPerRequest);
-    b::ZmqControlChannel peer("shutdownReleasePeer");
-    auto ctl = std::make_shared<XferControls>();
-    ctl->allowTerminal.store(false, std::memory_order_release);
-    ctl->releaseSucceeds.store(false, std::memory_order_release);
-    auto sender = makeFakeNode("shutdownReleaseSender", c, ctl);
-    if (!sender)
-        GTEST_SKIP() << "NIXL agent/backend unavailable";
-    ASSERT_TRUE(sender->tx->addPeer("shutdownReleasePeer", peer.localEndpoint()));
-    ASSERT_TRUE(peer.addPeer("shutdownReleaseSender", sender->ch->localEndpoint()));
-
-    auto bufs = bounce_test::makeXferBufs(/*nDescs=*/1, /*descBytes=*/256, /*seed=*/5);
-    auto fut = sender->tx->submit(bufs.srcDescs, bufs.dstDescs, "shutdownReleasePeer");
-    b::BounceCreditEntry credit{/*addr=*/0, /*len=*/256, /*devId=*/0, /*regionHandle=*/91};
-    peer.sendTo("shutdownReleaseSender", b::encodeGrant(/*requestId=*/1, {credit}));
-
-    auto const postDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (std::chrono::steady_clock::now() < postDeadline && ctl->postCount.load(std::memory_order_acquire) == 0)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_EQ(ctl->postCount.load(std::memory_order_acquire), 1u);
-
-    auto const start = std::chrono::steady_clock::now();
-    sender->tx->shutdown();
-    // A write that never completes is drained for the fixed kShutdownWriteDrainMs (5 s) — intended
-    // teardown behaviour — so the bound only asserts "bounded, no hang", not "instant".
-    EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(10));
-    ASSERT_EQ(fut.wait_for(std::chrono::seconds(1)), std::future_status::ready);
-    EXPECT_EQ(fut.get().state, kvc::TransferState::kFAILURE);
-    EXPECT_EQ(fut.get().reason, b::BounceFailReason::kShutdown);
-    // failAll attempts the failed release exactly twice (initial + bounded retry), never spins.
-    EXPECT_EQ(ctl->releaseCount.load(std::memory_order_acquire), 2u);
-    bounce_test::freeXferBufs(bufs);
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            auto controls = std::make_shared<XferControls>();
+            controls->throwAfterPost.store(true);
+            auto sender = makeFakeNode("throwSender", cfg(30000), controls);
+            b::ZmqControlChannel peer("throwPeer");
+            sender->tx->addPeer("throwPeer", peer.localEndpoint());
+            peer.addPeer("throwSender", sender->ch->localEndpoint());
+            auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+            auto state = std::make_shared<b::BounceRequestState>();
+            auto future = sender->tx->submit(buffers.srcDescs, buffers.dstDescs, "throwPeer", state);
+            peer.sendTo("throwSender", b::encodeGrant(1, {{0, 256, 0, 1}}));
+            if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready || state->quiesced.load())
+            {
+                std::_Exit(2);
+            }
+            // MPI installs a SIGABRT handler that converts abort into exit(1).
+            // Restore the signal only after fixture admission has succeeded.
+            std::signal(SIGABRT, SIG_DFL);
+            std::fprintf(stderr, "awaiting physical quiescence guard\n");
+            sender->tx->shutdown();
+        },
+        ::testing::KilledBySignal(SIGABRT), "awaiting physical quiescence guard");
 }
 
-// forgetPeer() (the invalidateRemoteAgent path) must fail any in-flight request to the gone peer,
-// even with the request timeout disabled, modeling a peer that drops out mid-transfer.
 TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
 {
     if (!bounce_test::hasCuda())
@@ -770,6 +835,8 @@ TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
     if (!t)
         GTEST_SKIP() << "NIXL agent/backend unavailable";
 
+    b::ZmqControlChannel gone("gonePeer");
+    ASSERT_TRUE(t->tx->addPeer("gonePeer", gone.localEndpoint()));
     auto bufs = bounce_test::makeXferBufs(8, 256, /*seed=*/1);
     auto fut = t->tx->submit(bufs.srcDescs, bufs.dstDescs, "gonePeer");                   // stuck: never granted
     EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout); // still pending
@@ -780,6 +847,8 @@ TEST(BounceTransportFailure, ForgetPeerFailsInflightRequest)
 
     // forgetPeer for an unrelated/unknown peer must be a harmless no-op (no crash).
     t->tx->forgetPeer("someoneElse");
+    ASSERT_TRUE(t->tx->addPeer("gonePeer", gone.localEndpoint()));
+    ASSERT_TRUE(acknowledgeDrain(gone, "fpSolo"));
     t->tx->shutdown();
     bounce_test::freeXferBufs(bufs);
 }
@@ -802,7 +871,8 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     bounce_test::wirePair(*A, *B);
 
     auto bufs = bounce_test::makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/1);
-    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB");
+    auto physical = std::make_shared<b::BounceRequestState>();
+    auto fut = A->tx->submit(bufs.srcDescs, bufs.dstDescs, "fpB", physical);
     A->tx->forgetPeer("fpB"); // drop the peer (queued; applied on A's IO thread)
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready) << "request hung after forgetPeer";
     auto const res = fut.get();
@@ -812,15 +882,16 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     {
         EXPECT_EQ(res.reason, b::BounceFailReason::kPeerDropped);
     }
-    bounce_test::freeXferBufs(bufs);
 
-    // Recovery + no-leak: forgetPeer is a one-shot event; the scheduler/request reclaim is drained by
-    // the time fut resolved, so these new flows aren't reclaimed. forgetPeer ALSO drops the
+    // Logical failure may precede physical drain. Re-establish the original control route and
+    // wait for physical evidence before freeing buffers or testing recovery. forgetPeer drops the
     // control-channel DEALER to fpB synchronously (on this thread), so re-establish it with addPeer
     // before recovering — deterministic because forgetPeer's removePeer happens-before this addPeer
     // (no async removePeer can race/erase the freshly re-added dealer). NIXL metadata persists, so
     // only the dealer is re-added (no loadRemoteAgent / full re-wire).
     A->tx->addPeer("fpB", B->ch->localEndpoint());
+    ASSERT_TRUE(waitPhysical(physical));
+    bounce_test::freeXferBufs(bufs);
     for (int k = 0; k < 5; ++k)
     {
         auto rb
@@ -837,23 +908,16 @@ TEST(BounceTransportFailure, ForgetPeerInFlightRecovers)
     B->tx->shutdown();
 }
 
-// forget() must drop the gone peer's flows BEFORE freeing the orphaned regions of its queued (not yet
-// started) scatter jobs: freeOrphanRegion() runs schedule(), so with free-first the region is
-// granted straight back to a pending flow of the very peer being forgotten, and the reclaim that
-// follows then quarantines it (quarantineMs) instead of returning it to the arena. Setup: the
-// receiver's ExecPool is drained from the test so the single scatter worker spins in tryAcquire on
-// job A while job B stays queued (mScattering set for both); a cancel flags both regions orphaned; a
-// second WANT from the same peer is left pending (arena full); then forgetPeer. Correct order: the
-// pending flow is gone before region B is freed, so a second peer's WANT gets it at once. Old order:
-// region B goes to the forgotten peer's pending flow and is quarantined for 30 s, so the second peer
-// starves (and the forgotten peer sees a GRANT after forgetPeer).
+// Peer loss fences every pending flow before any queued or dequeued scatter can release a
+// region. Held execution contexts keep both scatters pending until explicitly released. Their
+// regions may then serve another peer, never a pending flow belonging to the forgotten peer.
 TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
 {
     if (!bounce_test::hasCuda())
         GTEST_SKIP() << "no CUDA device";
     auto c = cfg(/*timeoutMs=*/30000);
     c.scatterWorkerCount = 1;                     // exactly one job can be dequeued; the other must stay in mJobs
-    c.quarantineMs = 30000;                       // the old-order symptom: the mis-granted region is parked this long
+    c.quarantineMs = 30000;                       // elapsed time must not release unknown remote writes
     capRegions(c, c.maxInflightChunksPerRequest); // arena holds exactly TWO regions
     b::ZmqControlChannel gone("fgGone");
     b::ZmqControlChannel other("fgOther");
@@ -904,8 +968,8 @@ TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
 
     other.sendTo("fgReceiver", b::encodeWant(/*rid=*/10, {chunk}, other.localEndpoint()));
     std::vector<b::BounceCreditEntry> otherCredits;
-    EXPECT_TRUE(waitGrant(other, 10, std::chrono::seconds(2), otherCredits))
-        << "orphaned region not returned to the arena by forgetPeer (granted back to the forgotten peer?)";
+    EXPECT_FALSE(waitGrant(other, 10, std::chrono::milliseconds(200), otherCredits))
+        << "queued/dequeued scatter still owns both regions";
     std::vector<b::BounceCreditEntry> stray;
     EXPECT_FALSE(waitGrant(gone, 2, std::chrono::milliseconds(200), stray)) << "forgotten peer was granted a region";
 
@@ -913,6 +977,10 @@ TEST(BounceTransportFailure, ForgetPeerFreesOrphanedRegionsToOtherPeersOnly)
     {
         receiver->exec->release(ctx);
     }
+    ASSERT_TRUE(waitGrant(other, 10, std::chrono::seconds(5), otherCredits));
+    ASSERT_TRUE(drainFlow(gone, "fgReceiver", 1));
+    ASSERT_TRUE(drainFlow(gone, "fgReceiver", 2));
+    ASSERT_TRUE(drainFlow(other, "fgReceiver", 10));
     receiver->tx->shutdown();
     EXPECT_EQ(cudaFree(dst), cudaSuccess);
 }
@@ -1029,4 +1097,240 @@ TEST(BounceTransportFailure, ConcurrentMultiThreadedSubmit)
     {
         bounce_test::freeXferBufs(bb);
     }
+}
+
+TEST(BounceTransportFailure, DrainWaitsForDequeuedScatterAndRejectsLateData)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto config = cfg(30000);
+    config.copyStreamCount = 1;
+    config.scatterWorkerCount = 1;
+    auto receiver = bounce_test::makeNode("drainReceiver", config, 1024);
+    if (!receiver)
+        GTEST_SKIP() << "NIXL unavailable";
+    b::ZmqControlChannel sender("drainSender");
+    ASSERT_TRUE(sender.addPeer(receiver->name, receiver->ch->localEndpoint()));
+    auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+    auto* context = receiver->exec->tryAcquire();
+    ASSERT_NE(context, nullptr);
+    sender.sendTo(receiver->name, b::encodeWant(1, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credits));
+    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(credits[0].addr), 0x5A, 256), cudaSuccess);
+    auto const data = b::encodeData(
+        1, 0, 1, credits[0].regionHandle, {{0, reinterpret_cast<std::uintptr_t>(buffers.dst), 0, 0, 256, 1}});
+    sender.sendTo(receiver->name, data);
+    sender.sendTo(receiver->name, b::encodeDrain(1, sender.localEndpoint()));
+    EXPECT_FALSE(pumpChannel(sender, std::chrono::milliseconds(200),
+        [](auto const& h, auto const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDRAIN_ACK; }));
+    receiver->exec->release(context);
+    ASSERT_TRUE(drainFlow(sender, receiver->name, 1));
+    unsigned char value = 0;
+    ASSERT_EQ(cudaMemcpy(&value, buffers.dst, 1, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(value, 0x5A);
+    ASSERT_EQ(cudaMemset(buffers.dst, 0x7B, 256), cudaSuccess);
+    sender.sendTo(receiver->name, b::encodeWant(1, {256}, sender.localEndpoint()));
+    sender.sendTo(receiver->name, data);
+    ASSERT_TRUE(drainFlow(sender, receiver->name, 1));
+    ASSERT_EQ(cudaMemcpy(&value, buffers.dst, 1, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(value, 0x7B);
+    receiver->tx->shutdown();
+    bounce_test::freeXferBufs(buffers);
+}
+
+TEST(BounceTransportFailure, DrainWaitsForSubmittedCudaScatterWork)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto config = cfg(30000);
+    config.copyStreamCount = 1;
+    config.scatterWorkerCount = 1;
+    auto receiver = bounce_test::makeNode("cudaDrainReceiver", config, 1024);
+    if (!receiver)
+        GTEST_SKIP() << "NIXL unavailable";
+    b::ZmqControlChannel sender("cudaDrainSender");
+    ASSERT_TRUE(sender.addPeer(receiver->name, receiver->ch->localEndpoint()));
+    auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+    sender.sendTo(receiver->name, b::encodeWant(1, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credits));
+    ASSERT_EQ(cudaMemset(reinterpret_cast<void*>(credits[0].addr), 0x5A, 256), cudaSuccess);
+    StreamGate gate;
+    auto* context = receiver->exec->tryAcquire();
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(cudaLaunchHostFunc(context->stream, waitAtGate, &gate), cudaSuccess);
+    receiver->exec->release(context);
+    sender.sendTo(receiver->name,
+        b::encodeData(
+            1, 0, 1, credits[0].regionHandle, {{0, reinterpret_cast<std::uintptr_t>(buffers.dst), 0, 0, 256, 1}}));
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (receiver->exec->freeCount() != 0 && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(receiver->exec->freeCount(), 0u);
+    sender.sendTo(receiver->name, b::encodeDrain(1, sender.localEndpoint()));
+    EXPECT_FALSE(pumpChannel(sender, std::chrono::milliseconds(200),
+        [](auto const& h, auto const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDRAIN_ACK; }));
+    gate.open.store(true, std::memory_order_release);
+    ASSERT_TRUE(drainFlow(sender, receiver->name, 1));
+    unsigned char value = 0;
+    ASSERT_EQ(cudaMemcpy(&value, buffers.dst, 1, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(value, 0x5A);
+    ASSERT_EQ(cudaMemset(buffers.dst, 0x7B, 256), cudaSuccess);
+    sender.sendTo(receiver->name,
+        b::encodeData(
+            1, 0, 1, credits[0].regionHandle, {{0, reinterpret_cast<std::uintptr_t>(buffers.dst), 0, 0, 256, 1}}));
+    ASSERT_TRUE(drainFlow(sender, receiver->name, 1));
+    ASSERT_EQ(cudaMemcpy(&value, buffers.dst, 1, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(value, 0x7B);
+    receiver->tx->shutdown();
+    bounce_test::freeXferBufs(buffers);
+}
+
+TEST(BounceTransportFailure, RemoteDrainAckCannotRetireRunningSourceGather)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto config = cfg(30000);
+    config.copyStreamCount = 1;
+    auto sender = bounce_test::makeNode("gatherDrainSender", config, 1024);
+    if (!sender)
+        GTEST_SKIP() << "NIXL unavailable";
+    b::ZmqControlChannel receiver("gatherDrainPeer");
+    ASSERT_TRUE(sender->tx->addPeer("gatherDrainPeer", receiver.localEndpoint()));
+    auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+    StreamGate gate;
+    auto* context = sender->exec->tryAcquire();
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(cudaLaunchHostFunc(context->stream, waitAtGate, &gate), cudaSuccess);
+    sender->exec->release(context);
+    auto state = std::make_shared<b::BounceRequestState>();
+    auto future = sender->tx->submit(buffers.srcDescs, buffers.dstDescs, "gatherDrainPeer", state);
+    state->cancelRequested.store(true, std::memory_order_release);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(future.get().state, kvc::TransferState::kFAILURE);
+    ASSERT_TRUE(acknowledgeDrain(receiver, sender->name));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_FALSE(state->quiesced.load());
+    gate.open.store(true, std::memory_order_release);
+    ASSERT_TRUE(waitPhysical(state));
+    EXPECT_EQ(future.get().state, kvc::TransferState::kFAILURE);
+    sender->tx->shutdown();
+    bounce_test::freeXferBufs(buffers);
+}
+
+TEST(BounceTransportFailure, FailedRdmaNeedsProofAndDrainAcknowledgmentRetries)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto controls = std::make_shared<XferControls>();
+    controls->failWrites.store(true);
+    controls->physicallyStopped.store(false);
+    auto sender = makeFakeNode("proofSender", cfg(30000), controls);
+    if (!sender)
+        GTEST_SKIP() << "NIXL unavailable";
+    b::ZmqControlChannel receiver("proofReceiver");
+    ASSERT_TRUE(sender->tx->addPeer("proofReceiver", receiver.localEndpoint()));
+    ASSERT_TRUE(receiver.addPeer(sender->name, sender->ch->localEndpoint()));
+    auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+    auto state = std::make_shared<b::BounceRequestState>();
+    auto future = sender->tx->submit(buffers.srcDescs, buffers.dstDescs, "proofReceiver", state);
+    receiver.sendTo(sender->name, b::encodeGrant(1, {{0, 256, 0, 1}}));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_FALSE(state->quiesced.load());
+    EXPECT_FALSE(pumpChannel(receiver, std::chrono::milliseconds(200),
+        [](auto const& h, auto const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDRAIN; }));
+    EXPECT_EQ(controls->releaseCount.load(), 0u);
+    controls->physicallyStopped.store(true);
+    // Drop the first DRAIN, then drop the first ACK: each subsequent DRAIN is retryable.
+    ASSERT_TRUE(pumpChannel(receiver, std::chrono::seconds(5),
+        [](auto const& h, auto const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDRAIN; }));
+    ASSERT_TRUE(pumpChannel(receiver, std::chrono::seconds(5),
+        [](auto const& h, auto const&)
+        { return static_cast<b::BounceMsgType>(h.msgType) == b::BounceMsgType::kDRAIN; }));
+    EXPECT_FALSE(state->quiesced.load());
+    ASSERT_TRUE(acknowledgeDrain(receiver, sender->name));
+    ASSERT_TRUE(waitPhysical(state));
+    sender->tx->shutdown();
+    bounce_test::freeXferBufs(buffers);
+}
+
+TEST(BounceTransportFailure, ChangedEndpointDrainCannotReleaseOldIncarnation)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    auto config = cfg(30000);
+    capRegions(config, 1);
+    auto receiver = bounce_test::makeNode("identityReceiver", config, 1024);
+    if (!receiver)
+        GTEST_SKIP() << "NIXL unavailable";
+    b::ZmqControlChannel sender("identitySender");
+    b::ZmqControlChannel replacement("otherIncarnation");
+    ASSERT_TRUE(sender.addPeer(receiver->name, receiver->ch->localEndpoint()));
+    sender.sendTo(receiver->name, b::encodeWant(1, {256}, sender.localEndpoint()));
+    std::vector<b::BounceCreditEntry> credits;
+    ASSERT_TRUE(waitGrant(sender, 1, std::chrono::seconds(5), credits));
+    sender.sendTo(receiver->name, b::encodeDrain(1, replacement.localEndpoint()));
+    sender.sendTo(receiver->name, b::encodeWant(2, {256}, sender.localEndpoint()));
+    EXPECT_FALSE(waitGrant(sender, 2, std::chrono::milliseconds(200), credits));
+    sender.sendTo(receiver->name, b::encodeDrain(1, sender.localEndpoint()));
+    ASSERT_TRUE(waitGrant(sender, 2, std::chrono::seconds(5), credits));
+    ASSERT_TRUE(drainFlow(sender, receiver->name, 2));
+    receiver->tx->shutdown();
+}
+
+TEST(BounceTransportFailure, ShutdownGuardStartsBeforeWaitingForBlockedScatter)
+{
+    if (!bounce_test::hasCuda())
+        GTEST_SKIP() << "no CUDA device";
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            auto config = cfg(30000);
+            config.copyStreamCount = 1;
+            config.scatterWorkerCount = 1;
+            auto receiver = bounce_test::makeNode("blockedReceiver", config, 1024);
+            b::ZmqControlChannel sender("blockedSender");
+            sender.addPeer(receiver->name, receiver->ch->localEndpoint());
+            auto buffers = bounce_test::makeXferBufs(1, 256, 1);
+            sender.sendTo(receiver->name, b::encodeWant(1, {256}, sender.localEndpoint()));
+            std::vector<b::BounceCreditEntry> credits;
+            if (!waitGrant(sender, 1, std::chrono::seconds(5), credits))
+            {
+                std::_Exit(2);
+            }
+            StreamGate gate;
+            auto* context = receiver->exec->tryAcquire();
+            if (context == nullptr || cudaLaunchHostFunc(context->stream, waitAtGate, &gate) != cudaSuccess)
+            {
+                std::_Exit(2);
+            }
+            receiver->exec->release(context);
+            sender.sendTo(receiver->name,
+                b::encodeData(1, 0, 1, credits[0].regionHandle,
+                    {{0, reinterpret_cast<std::uintptr_t>(buffers.dst), 0, 0, 256, 1}}));
+            sender.sendTo(receiver->name, b::encodeDrain(1, sender.localEndpoint()));
+            auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while ((!gate.entered.load() || receiver->exec->freeCount() != 0)
+                && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!gate.entered.load() || receiver->exec->freeCount() != 0)
+            {
+                std::_Exit(2);
+            }
+            // MPI installs a SIGABRT handler that converts abort into exit(1).
+            // Restore the signal only after fixture admission has succeeded.
+            std::signal(SIGABRT, SIG_DFL);
+            std::fprintf(stderr, "awaiting physical quiescence guard\n");
+            receiver->tx->shutdown();
+        },
+        ::testing::KilledBySignal(SIGABRT), "awaiting physical quiescence guard");
 }
