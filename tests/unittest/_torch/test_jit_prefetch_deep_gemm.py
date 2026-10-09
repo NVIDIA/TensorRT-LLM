@@ -148,3 +148,89 @@ def test_moe_helper_cubin_serves_every_batch(tmp_path, g, n, k):
             timeout=900,
         )
         assert _entries(cache) == built, f"real op compiled another variant at m={m}"
+
+
+_REAL_INDEXER = textwrap.dedent("""
+    import sys, torch
+    from tensorrt_llm import deep_gemm
+    kind, next_n, heads, dim, block_kv = sys.argv[1], *map(int, sys.argv[2:6])
+    if kind == "mqa":
+        T, Tkv = 256, 4096
+        q = torch.randn(T, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.randn(Tkv, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv_sf = torch.ones(Tkv, device="cuda")
+        w = torch.randn(T, heads, device="cuda")
+        ks = torch.zeros(T, dtype=torch.int, device="cuda")
+        ke = torch.full((T,), Tkv, dtype=torch.int, device="cuda")
+        deep_gemm.fp8_mqa_logits(q, (kv, kv_sf), w, ks, ke, clean_logits=False)
+    else:
+        B, ctx = 8, 1000
+        nblk = (ctx + block_kv - 1) // block_kv
+        q = torch.randn(B, next_n, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.zeros(B * nblk, block_kv, 1, dim + 4, dtype=torch.uint8, device="cuda")
+        w = torch.randn(B * next_n, heads, device="cuda")
+        lens = torch.full((B, next_n), ctx, dtype=torch.int, device="cuda")
+        table = torch.arange(B * nblk, dtype=torch.int, device="cuda").view(B, nblk)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(lens, 64, deep_gemm.get_num_sms())
+        deep_gemm.fp8_paged_mqa_logits(q, kv, w, lens, table, sched, nblk * block_kv)
+    torch.cuda.synchronize()
+""")
+
+
+def _indexer_specs(kind, next_n, heads, dim, block_kv, num_sms):
+    if kind == "mqa":
+        return [json.dumps(dict(op="mqa_logits", num_heads=heads, head_dim=dim, is_fp4=False,
+                                is_mx_sf=False, compressed=False, logits="float32",
+                                weights="float32"), sort_keys=True)]  # fmt: skip
+    return [
+        json.dumps(
+            dict(
+                op="paged_mqa_logits",
+                next_n=next_n,
+                num_heads=heads,
+                head_dim=dim,
+                block_kv=block_kv,
+                is_fp4=False,
+                is_mx_sf=False,
+                is_varlen=False,
+                logits="float32",
+                weights="float32",
+            ),
+            sort_keys=True,
+        ),  # fmt: skip
+        json.dumps(
+            dict(op="paged_mqa_logits_metadata", next_n=next_n, is_varlen=False, num_sms=num_sms),
+            sort_keys=True,
+        ),  # fmt: skip
+    ]
+
+
+# DSA indexer shapes (64 index heads x 128 dims, 64-token indexer K pages):
+# prefill logits, then paged decode at next_n = 1 and the MTP verify width.
+@pytest.mark.skipif(not jdg.supports_indexer(), reason="needs the DSA compile-only entries")
+@pytest.mark.parametrize("kind,next_n", [("mqa", 1), ("paged", 1), ("paged", 4)])
+def test_indexer_helper_cubins_are_what_the_real_ops_load(tmp_path, kind, next_n):
+    heads, dim, block_kv = 64, 128, 64
+    cache = str(tmp_path / "dg")
+    specs = _indexer_specs(kind, next_n, heads, dim, block_kv, jdg.target()[2])
+    results = _helper_compile(cache, specs)
+    assert all(r["ok"] and r["built"] for r in results), results
+    built = _entries(cache)
+    assert len(built) == len(specs), built
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REAL_INDEXER,
+            kind,
+            str(next_n),
+            str(heads),
+            str(dim),
+            str(block_kv),
+        ],
+        env=env,
+        check=True,
+        timeout=900,
+    )
+    assert _entries(cache) == built, f"real op compiled {sorted(_entries(cache) - built)}"

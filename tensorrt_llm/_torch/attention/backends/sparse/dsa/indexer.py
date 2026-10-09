@@ -70,6 +70,11 @@ except ImportError:
 
 _DG_SCHEDULE_BLOCK_KV = 64
 
+# Compiled-in parameters of every DeepGEMM indexer-logits call this process has
+# made, read by the JIT prefetcher (jit_prefetch_deep_gemm.DsaIndexerProvider)
+# to compile the variants a later batch will need (the other next_n).
+DG_INDEXER_VARIANTS: set = set()
+
 
 def _pick_dsl_expand(
     next_n: int,
@@ -1396,6 +1401,18 @@ class Indexer(nn.Module):
         indexer_topk_prefill kernel); the torch topk fallback scans the full
         padded row and needs the fill.
         """
+        DG_INDEXER_VARIANTS.add(
+            (
+                "mqa",
+                self.n_heads,
+                self.head_dim,
+                self.use_fp4,
+                self.use_fp4,
+                False,
+                "float32",
+                str(weights.dtype).replace("torch.", ""),
+            )
+        )
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
             k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
@@ -1431,6 +1448,20 @@ class Indexer(nn.Module):
         q_scale: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Dispatch fp8_paged_mqa_logits vs fp8_fp4_paged_mqa_logits."""
+        DG_INDEXER_VARIANTS.add(
+            (
+                "paged",
+                q_decode.shape[1],
+                self.n_heads,
+                self.head_dim,
+                k_cache.shape[1],
+                self.use_fp4,
+                self.use_fp4,
+                False,
+                "float32",
+                str(weights_decode.dtype).replace("torch.", ""),
+            )
+        )
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale),

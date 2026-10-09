@@ -100,6 +100,13 @@ def supported() -> bool:
     )
 
 
+def supports_indexer() -> bool:
+    """The patched DeepGEMM also has the DSA indexer compile-only entries."""
+    from tensorrt_llm import deep_gemm
+
+    return supported() and hasattr(deep_gemm, "compile_only_paged_mqa_logits")
+
+
 def target() -> Tuple[int, int, int]:
     """(arch_major, arch_minor, num_sms) the helper must compile for.
 
@@ -149,6 +156,50 @@ class DeepGemmMoEProvider:
     def enumerate_specs(self):
         for g, n, k in self.shapes:
             yield moe_spec_for(g, 128, n, k, 1)
+
+
+def _spec(**kw) -> str:
+    return json.dumps(kw, sort_keys=True)
+
+
+class DsaIndexerProvider:
+    """DeepGEMM kernels of the DSA indexer (DeepSeek V3.2 / V4, GLM-5).
+
+    The prefill logits kernel has one variant per config; the paged decode
+    logits kernel and its scheduling-metadata kernel vary only with
+    ``next_n``: 1 for plain decode and MTP draft steps, ``1 + max_draft`` for
+    the MTP verify step. Batch size and context length are runtime arguments.
+    Each real call records its compiled-in values in
+    ``indexer.DG_INDEXER_VARIANTS``; this provider queues every variant those
+    imply, including the ``next_n`` the process has not run yet.
+    """
+
+    def __init__(self, max_draft_tokens: int, num_sms: int):
+        self.next_ns = sorted({1, 1 + max(0, int(max_draft_tokens))})
+        self.num_sms = int(num_sms)
+        self._done: set = set()
+
+    def pending_specs(self) -> List[str]:
+        from .attention.backends.sparse.dsa.indexer import DG_INDEXER_VARIANTS
+
+        specs = []
+        for v in list(DG_INDEXER_VARIANTS):
+            if v[0] == "mqa":
+                _, h, d, fp4, mx, comp, lg, w = v
+                specs.append(_spec(op="mqa_logits", num_heads=h, head_dim=d, is_fp4=fp4,
+                                   is_mx_sf=mx, compressed=comp, logits=lg, weights=w))  # fmt: skip
+            else:
+                _, _n, h, d, bkv, fp4, mx, varlen, lg, w = v
+                for n in self.next_ns:
+                    specs.append(_spec(op="paged_mqa_logits", next_n=n, num_heads=h, head_dim=d,
+                                       block_kv=bkv, is_fp4=fp4, is_mx_sf=mx, is_varlen=varlen,
+                                       logits=lg, weights=w))  # fmt: skip
+        for n in self.next_ns:
+            specs.append(_spec(op="paged_mqa_logits_metadata", next_n=n, is_varlen=False,
+                               num_sms=self.num_sms))  # fmt: skip
+        out = [s for s in specs if s not in self._done]
+        self._done.update(out)
+        return out
 
 
 class FP8LinearDeepGemmProvider:

@@ -515,6 +515,20 @@ class JitPrefetcher:
             # note_launch_done only runs while a launch observer is set.
             jdg.launch_observer = lambda m, n, k: None
 
+    def add_deep_gemm_specs(self, specs, label: str = "deep_gemm") -> int:
+        """Queue extra DeepGEMM requests (e.g. the DSA indexer kernels)."""
+        from . import jit_prefetch_deep_gemm as jdg
+
+        if self._dg is None and jdg.KIND not in self._queues:
+            return 0
+        n = 0
+        for spec in specs:
+            if self._submit(spec, spec, label, _PRIO_BATCH, kind=jdg.KIND):
+                n += 1
+        if n:
+            self._event(f"DeepGEMM: {n} {label} request(s) queued")
+        return n
+
     def enable_deep_gemm(self, provider, moe_provider=None) -> bool:
         """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
 

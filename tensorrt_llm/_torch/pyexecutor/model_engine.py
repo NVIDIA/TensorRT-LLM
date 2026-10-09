@@ -1480,8 +1480,19 @@ class PyTorchModelEngine(ModelEngine):
             dg_provider = jdg.FP8LinearDeepGemmProvider(
                 self.model, max_num_tokens=self.max_num_tokens)
             dg_moe = jdg.DeepGemmMoEProvider(self.model)
-            if dg_provider or dg_moe:
+            from ..attention.backends.sparse.dsa import indexer as dsa_indexer
+            has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)
+                       and jdg.supports_indexer())
+            if dg_provider or dg_moe or has_dsa:
                 prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+            if has_dsa:
+                spec_cfg = getattr(self, "spec_config", None)
+                max_draft = getattr(spec_cfg, "max_draft_len", 0) or 0
+                from tensorrt_llm import deep_gemm as _dg
+                self._jit_dsa_provider = jdg.DsaIndexerProvider(
+                    max_draft, _dg.get_num_sms())
+                prefetcher.add_deep_gemm_specs(
+                    self._jit_dsa_provider.pending_specs(), "dsa_indexer")
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
         if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
             from .. import jit_prefetch_cute_dsl as jcd

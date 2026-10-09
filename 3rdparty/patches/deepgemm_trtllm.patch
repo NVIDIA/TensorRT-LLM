@@ -1,3 +1,67 @@
+diff --git a/csrc/apis/attention.hpp b/csrc/apis/attention.hpp
+index 1abfd5c..6a10d9f 100644
+--- a/csrc/apis/attention.hpp
++++ b/csrc/apis/attention.hpp
+@@ -273,6 +273,40 @@ static torch::Tensor get_paged_mqa_logits_metadata(const torch::Tensor& context_
+     return schedule_metadata;
+ }
+ 
++// Compile-only entry points for the SM100 MQA-logits kernels (see the
++// matching *_compile_only in sm100_mqa_logits.hpp). Arguments are the values
++// the real ops derive from their tensors.
++static bool compile_only_paged_mqa_logits_metadata(const int& next_n, const bool& is_varlen,
++                                                   const int& num_sms) {
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    return sm100_paged_mqa_logits_metadata_compile_only(next_n, num_sms, true, is_varlen);
++}
++
++static bool compile_only_mqa_logits(const int& num_heads, const int& head_dim,
++                                    const bool& is_fp4, const bool& is_mx_sf,
++                                    const bool& compressed_logits,
++                                    const at::ScalarType& logits_dtype,
++                                    const at::ScalarType& weights_dtype) {
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    DG_HOST_ASSERT(weights_dtype != torch::kFloat16 and "the FP16-weight variant is not covered");
++    return sm100_mqa_logits_compile_only(num_heads, head_dim, is_mx_sf, compressed_logits,
++                                         is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn,
++                                         logits_dtype, weights_dtype);
++}
++
++static bool compile_only_paged_mqa_logits(const int& next_n, const int& num_heads,
++                                          const int& head_dim, const int& block_kv,
++                                          const bool& is_fp4, const bool& is_mx_sf,
++                                          const bool& is_varlen,
++                                          const at::ScalarType& logits_dtype,
++                                          const at::ScalarType& weights_dtype) {
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    return sm100_paged_mqa_logits_compile_only(next_n, num_heads, head_dim, block_kv, is_mx_sf,
++                                               true, is_varlen, 256, 16,
++                                               is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn,
++                                               logits_dtype, weights_dtype);
++}
++
+ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
+                                               const torch::Tensor& fused_kv_cache,
+                                               const torch::Tensor& weights,
+@@ -476,6 +510,18 @@ static void register_apis(pybind11::module_& m) {
+           py::arg("clean_logits") = true,
+           py::arg("max_seqlen_k") = 0,
+           py::arg("logits_dtype") = torch::kFloat32);
++    m.def("compile_only_paged_mqa_logits_metadata", &compile_only_paged_mqa_logits_metadata,
++          py::arg("next_n"), py::arg("is_varlen"), py::arg("num_sms"),
++          py::call_guard<py::gil_scoped_release>());
++    m.def("compile_only_mqa_logits", &compile_only_mqa_logits,
++          py::arg("num_heads"), py::arg("head_dim"), py::arg("is_fp4"), py::arg("is_mx_sf"),
++          py::arg("compressed_logits"), py::arg("logits_dtype"), py::arg("weights_dtype"),
++          py::call_guard<py::gil_scoped_release>());
++    m.def("compile_only_paged_mqa_logits", &compile_only_paged_mqa_logits,
++          py::arg("next_n"), py::arg("num_heads"), py::arg("head_dim"), py::arg("block_kv"),
++          py::arg("is_fp4"), py::arg("is_mx_sf"), py::arg("is_varlen"),
++          py::arg("logits_dtype"), py::arg("weights_dtype"),
++          py::call_guard<py::gil_scoped_release>());
+     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
+           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
+           py::arg("indices") = std::nullopt);
 diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
 index 902ae69..8f906f1 100644
 --- a/csrc/apis/gemm.hpp
@@ -351,8 +415,94 @@ index 9e4ba58..de11992 100644
  static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                       const torch::Tensor& b, const torch::Tensor& sfb,
                                                       const torch::Tensor& d,
+diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
+index c594d2b..3d2b68c 100644
+--- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
++++ b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
+@@ -487,4 +487,81 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
+     SM100PagedMQALogitsRuntime::launch(runtime, args);
+ }
+ 
++// Compile-only twins of the three SM100 MQA-logits kernels: generate the same
++// code the real ops do (every value printed into generate_impl is a scalar or
++// a dtype; tensors only reach tensor maps and launch arguments) and build it
++// into the on-disk cache without launching or loading it. Return true if the
++// variant compiled, false if it was already cached.
++static bool sm100_paged_mqa_logits_metadata_compile_only(const int& next_n, const int& num_sms,
++                                                         const bool& is_context_lens_2d,
++                                                         const bool& is_varlen) {
++    SM100PagedMQALogitsMetadataRuntime::Args args = {};
++    args.next_n = next_n;
++    args.is_context_lens_2d = is_context_lens_2d;
++    args.is_varlen = is_varlen;
++    args.split_kv = 256;
++    args.num_sms = num_sms;
++    return compiler->build_only("sm100_paged_mqa_logits_metadata",
++                                SM100PagedMQALogitsMetadataRuntime::generate(args));
++}
++
++static bool sm100_mqa_logits_compile_only(const int& num_heads, const int& head_dim,
++                                          const bool& is_mx_sf, const bool& is_compressed_logits,
++                                          const at::ScalarType& qk_dtype,
++                                          const at::ScalarType& logits_dtype,
++                                          const at::ScalarType& weights_dtype) {
++    const bool is_fp4 = qk_dtype == kPackedFP4;
++    DG_HOST_ASSERT(128 % num_heads == 0);
++    SM100MQALogitsRuntime::Args args = {};
++    args.num_heads = num_heads;
++    args.head_dim = head_dim;
++    args.is_mx_sf = is_mx_sf;
++    args.is_compressed_logits = is_compressed_logits;
++    args.num_q_stages = 3;
++    args.num_kv_stages = is_fp4 ? 10 : 5;
++    args.block_q = 128 / num_heads;
++    args.split_kv = 256;
++    args.qk_dtype = qk_dtype;
++    args.logits_dtype = logits_dtype;
++    args.weights_dtype = weights_dtype;
++    args.num_specialized_threads = 128;
++    args.num_math_threads = 2 * 128;
++    args.launch_args = LaunchArgs(device_runtime->get_num_sms(), 128 + 2 * 128, 0);
++    return compiler->build_only("sm100_mqa_logits", SM100MQALogitsRuntime::generate(args));
++}
++
++static bool sm100_paged_mqa_logits_compile_only(const int& tokens_per_request,
++                                                const int& num_heads, const int& head_dim,
++                                                const int& page_kv,
++                                                const bool& is_mx_sf,
++                                                const bool& is_context_lens_2d,
++                                                const bool& is_varlen,
++                                                const int& split_kv,
++                                                const int& splits_per_chunk,
++                                                const at::ScalarType& qk_dtype,
++                                                const at::ScalarType& logits_dtype,
++                                                const at::ScalarType& weights_dtype) {
++    const bool is_fp4 = qk_dtype == kPackedFP4;
++    DG_HOST_ASSERT(split_kv == 256 and 128 % num_heads == 0);
++    SM100PagedMQALogitsRuntime::Args args = {};
++    args.tokens_per_request = tokens_per_request;
++    args.num_heads = num_heads;
++    args.head_dim = head_dim;
++    args.page_kv = page_kv;
++    args.is_mx_sf = is_mx_sf;
++    args.is_context_lens_2d = is_context_lens_2d;
++    args.is_varlen = is_varlen;
++    args.num_q_stages = 3;
++    args.num_kv_stages = is_fp4 ? 10 : 5;
++    args.split_kv = split_kv;
++    args.splits_per_chunk = splits_per_chunk;
++    args.qk_dtype = qk_dtype;
++    args.logits_dtype = logits_dtype;
++    args.weights_dtype = weights_dtype;
++    args.num_specialized_threads = 128;
++    args.num_math_threads = 2 * 128;
++    return compiler->build_only("sm100_paged_mqa_logits", SM100PagedMQALogitsRuntime::generate(args));
++}
++
+ } // namespace deep_gemm
++
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index f5e52b2..32d8b60 100644
+index f5e52b2..e4220f7 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
 @@ -15,6 +15,7 @@ except ImportError:
@@ -372,6 +522,16 @@ index f5e52b2..32d8b60 100644
          fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
          fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
          m_grouped_fp8_fp4_gemm_nt_contiguous,
+@@ -60,6 +63,9 @@ try:
+         einsum,
+         fp8_einsum,
+         # Attention kernels
++        compile_only_mqa_logits,
++        compile_only_paged_mqa_logits,
++        compile_only_paged_mqa_logits_metadata,
+         fp8_fp4_mqa_logits,
+         get_paged_mqa_logits_metadata,
+         fp8_fp4_paged_mqa_logits,
 diff --git a/deep_gemm/include/deep_gemm/comm/barrier.cuh b/deep_gemm/include/deep_gemm/comm/barrier.cuh
 index 50b894e..cc2f65d 100644
 --- a/deep_gemm/include/deep_gemm/comm/barrier.cuh

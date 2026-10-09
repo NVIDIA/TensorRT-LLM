@@ -104,6 +104,23 @@ def main():
                     getattr(torch, s["b"]),
                     tuple(s["recipe"]),
                 )
+            elif s["op"] == "paged_mqa_logits_metadata":
+                built = dg.compile_only_paged_mqa_logits_metadata(
+                    int(s["next_n"]), bool(s["is_varlen"]), int(s["num_sms"])
+                )
+            elif s["op"] == "mqa_logits":
+                built = dg.compile_only_mqa_logits(
+                    int(s["num_heads"]), int(s["head_dim"]), bool(s["is_fp4"]),
+                    bool(s["is_mx_sf"]), bool(s["compressed"]),
+                    getattr(torch, s["logits"]), getattr(torch, s["weights"]),
+                )  # fmt: skip
+            elif s["op"] == "paged_mqa_logits":
+                built = dg.compile_only_paged_mqa_logits(
+                    int(s["next_n"]), int(s["num_heads"]), int(s["head_dim"]),
+                    int(s["block_kv"]), bool(s["is_fp4"]), bool(s["is_mx_sf"]),
+                    bool(s["is_varlen"]), getattr(torch, s["logits"]),
+                    getattr(torch, s["weights"]),
+                )  # fmt: skip
             else:
                 raise ValueError(f"unsupported op {s['op']}")
             resp = {"tag": tag, "ok": True, "s": time.time() - t0, "err": "", "built": bool(built)}
