@@ -25,8 +25,11 @@ _DETOKENIZE_EXTRA_KEY = "detokenize"
 
 def conversation_affinity_enabled(llm: Any) -> bool:
     """Whether TensorRT-LLM owns attention-DP placement for conversations."""
-    config = getattr(getattr(llm, "args", None), "attention_dp_config", None)
-    return getattr(config, "kv_cache_routing_conversation_affinity", False) is True
+    args = getattr(llm, "args", None)
+    config = getattr(args, "attention_dp_config", None)
+    return getattr(args, "enable_attention_dp", False) is True and (
+        getattr(config, "kv_cache_routing_conversation_affinity", False) is True
+    )
 
 
 def _top_n_candidates(selection: Any, name: str) -> int:
