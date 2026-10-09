@@ -227,9 +227,9 @@ def test_encoder_decoder_runner_releases_stage_before_decoder_graphs() -> None:
     runner = object.__new__(EncoderDecoderRunner)
     calls = Mock()
     runner._encoder_stage = calls.stage
-    runner._release_decoder_graphs = calls.decoder
 
-    runner.release_graphs()
+    with patch.object(DecoderRunner, "release_graphs", calls.decoder):
+        runner.release_graphs()
 
     assert calls.mock_calls == [
         call.stage.release_graphs(),

@@ -52,6 +52,7 @@ from tensorrt_llm._torch.speculative.interface import \
     INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import \
     SampleStateTensorsSpec
+from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.inputs.registry import (BaseMultimodalDummyInputsBuilder,
                                           BaseMultimodalInputProcessor)
@@ -1158,16 +1159,16 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         batch.generation_requests = [generation]
 
         with patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner._make_single_token_context_graph_batch"
-        ) as selector, patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
             actual_outputs = engine.forward(batch, resource_manager)
 
         self.assertEqual(actual_outputs, outputs)
         self.assertIsNot(actual_outputs, outputs)
-        selector.assert_not_called()
-        self.assertIs(runner.maybe_get_cuda_graph.call_args.args[0], batch)
+        lookup = runner.maybe_get_cuda_graph.call_args
+        self.assertIs(lookup.args[0], batch)
+        self.assertEqual(lookup.kwargs["promoted_context_request_ids"],
+                         frozenset())
         prepare_args = engine._runner._prepare_inputs.call_args.args
         self.assertIs(prepare_args[0], batch)
         self.assertIs(prepare_args[2], semantic_attn_metadata)
@@ -1205,34 +1206,47 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertIn("multimodal_embedding", multimodal_data)
 
     def test_breakable_graph_falls_back_for_context_logits(self) -> None:
-        engine, _, resource_manager, _, outputs = \
-            _make_forward_only_engine(None)
-        breakable_runner = Mock()
-        breakable_runner.is_capturing = False
-        breakable_runner.is_warming_up = False
-        breakable_runner.has_graph.return_value = True
-        breakable_runner.execute.return_value = outputs
-        engine._runner.breakable_cuda_graph_runner = breakable_runner
+        for return_context_logits in (True, False):
+            with self.subTest(return_context_logits=return_context_logits):
+                engine, _, resource_manager, _, outputs = \
+                    _make_forward_only_engine(None)
+                breakable_runner = Mock()
+                breakable_runner.is_capturing = False
+                breakable_runner.is_warming_up = False
+                breakable_runner.has_graph.return_value = True
+                breakable_runner.execute.return_value = outputs
+                engine._runner.breakable_cuda_graph_runner = breakable_runner
+                prepared = engine._runner._prepare_inputs.return_value
 
-        batch = ScheduledRequests()
-        batch.context_requests_last_chunk = [_make_request_stub(1)]
-        batch.context_requests_last_chunk[0].py_return_context_logits = True
+                def prepare_prefill_graph_batch(*args, **kwargs):
+                    set_per_request_prefill_cuda_graph_flag(True)
+                    return prepared
 
-        with patch(
-                "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
-                return_value=Mock()
-        ), patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
-                return_value=True):
-            actual_outputs = engine.forward(
-                batch,
-                resource_manager,
-            )
+                engine._runner._prepare_inputs.side_effect = \
+                    prepare_prefill_graph_batch
+                self.addCleanup(set_per_request_prefill_cuda_graph_flag, False)
 
-        self.assertEqual(actual_outputs, outputs)
-        self.assertIsNot(actual_outputs, outputs)
-        breakable_runner.execute.assert_not_called()
-        engine._runner._forward_step.assert_called_once()
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = [_make_request_stub(1)]
+                batch.context_requests_last_chunk[
+                    0].py_return_context_logits = return_context_logits
+
+                with patch(
+                        "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
+                        return_value=Mock()):
+                    actual_outputs = engine.forward(
+                        batch,
+                        resource_manager,
+                    )
+
+                self.assertEqual(actual_outputs, outputs)
+                self.assertIsNot(actual_outputs, outputs)
+                if return_context_logits:
+                    breakable_runner.execute.assert_not_called()
+                    engine._runner._forward_step.assert_called_once()
+                else:
+                    breakable_runner.execute.assert_called_once()
+                    engine._runner._forward_step.assert_not_called()
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
         key = KeyType(batch_size=1, draft_len=0, is_first_draft=False)
@@ -1242,16 +1256,15 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         batch.generation_requests = [generation]
 
         with patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner._make_single_token_context_graph_batch"
-        ) as selector, patch(
                 "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                 return_value=Mock()):
             engine.forward(batch, resource_manager)
 
-        selector.assert_not_called()
-        self.assertIs(runner.maybe_get_cuda_graph.call_args.args[0], batch)
-        self.assertFalse(
-            runner.maybe_get_cuda_graph.call_args.kwargs["use_lora_graph"])
+        lookup = runner.maybe_get_cuda_graph.call_args
+        self.assertIs(lookup.args[0], batch)
+        self.assertEqual(lookup.kwargs["promoted_context_request_ids"],
+                         frozenset())
+        self.assertFalse(lookup.kwargs["use_lora_graph"])
         self.assertIs(engine._runner._prepare_inputs.call_args.args[0], batch)
         self.assertEqual(engine._runner._prepare_inputs.call_args.args[-1],
                          frozenset())
@@ -1320,8 +1333,6 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 batch = ScheduledRequests()
                 batch.context_requests_last_chunk = [_make_request_stub(1)]
                 with patch(
-                        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner._make_single_token_context_graph_batch"
-                ) as selector, patch(
                         "tensorrt_llm._torch.pyexecutor.model_engine.torch.cuda.Event",
                         return_value=Mock()):
                     engine.forward(
@@ -1329,7 +1340,10 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                         resource_manager,
                     )
 
-                selector.assert_not_called()
+                lookup = runner.maybe_get_cuda_graph.call_args
+                self.assertIs(lookup.args[0], batch)
+                self.assertEqual(lookup.kwargs["promoted_context_request_ids"],
+                                 frozenset())
                 self.assertIs(engine._runner._prepare_inputs.call_args.args[0],
                               batch)
 
@@ -1896,8 +1910,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4]))
         decoder_only = ("input_ids_cuda", "position_ids_cuda",
                         "previous_batch_indices_cuda",
-                        "_steady_gen_positions_pinned", "_steady_gen_cache",
-                        "_prepare_inputs_event", "cache_indirection_attention")
+                        "cache_indirection_attention")
         for is_generation in (True, False):
             with self.subTest(is_generation=is_generation):
                 engine = DummyModelEngine(llm_args,
