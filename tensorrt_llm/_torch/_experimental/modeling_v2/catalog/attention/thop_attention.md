@@ -5,10 +5,13 @@ receipts:
 
 # thop_attention
 
-**Wraps** `tensorrt_llm.bindings.internal.thop.attention` (one call).
+**Wraps** `FallbackFmha.attention`, which builds native parameters and calls
+`AttentionOp.run_context`, `run_generation`, or `run_mla_generation` for
+the active phases. Native runners are cached by static configuration,
+device, and thread; batch tensors and workspace remain caller-owned.
 
-This is a pybind binding, not a `torch.ops` op; its inclusion in the catalog
-is an approved policy exception to the `torch.ops.trtllm.*` entry shape.
+This entry uses native bindings through the Python FMHA adapter; its inclusion
+in the catalog is an approved policy exception to the `torch.ops.trtllm.*` entry shape.
 
 ## Semantics
 
@@ -496,7 +499,7 @@ page-32), and the no-append flavor's chunked partial-pass pattern with
 `softmax_stats_tensor` — the sweep takes its one-shot cached-KV pattern.
 Every observable came back **bitwise identical** at both head counts: the
 `output` rows, the whole paged latent pool, the in-place-roped `q`/`k` of
-the fresh-prefill flavor, and the byte count the op resized `workspace_`
+the fresh-prefill flavor, and the byte count the op resized `workspace`
 to. The repeated `1536` is the run-to-run determinism control that makes
 those comparisons mean something. Kernel selection does not see it either:
 a process running only the two sweeps compiled exactly one decode kernel
@@ -505,8 +508,7 @@ values and one `...VarSeqQ8...` serving the four `H = 8` ones — where a
 real selection axis (the head count) compiles once per value; see *Notes*.
 
 `None` is **not** an accepted value on the MLA path even though the
-signature admits it: the C++ unwraps the optional unconditionally and the
-call raises `RuntimeError: bad optional access`. Pass the checkpoint's rank,
+signature admits it: the catalog wrapper raises `ValueError`. Pass the checkpoint's rank,
 or `0` when it has none.
 
 **Context phase — fresh prefill** (`attention_input_type=1`, separate
@@ -828,7 +830,7 @@ flavor (measured-wrong, see above, rather than untested).
 
 ```python
 def thop_attention(
-    q, k, v, output, output_sf, workspace_,
+    q, k, v, output, output_sf, workspace,
     sequence_length, host_past_key_value_lengths, host_total_kv_lens,
     context_lengths, host_context_lengths, host_request_types,
     max_context_q_len_override,
@@ -850,7 +852,7 @@ def thop_attention(
     helix_position_offsets, helix_is_inactive_rank, attention_chunk_size,
     softmax_stats_tensor, is_spec_decoding_enabled, use_spec_decoding,
     is_spec_dec_tree, spec_decoding_generation_lengths,
-    spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask,
+    spec_decoding_position_offsets, spec_decoding_packed_mask,
     spec_decoding_bl_tree_mask_offset, spec_decoding_bl_tree_mask,
     spec_bl_tree_first_sparse_mask_offset_kv,
     sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
@@ -987,7 +989,7 @@ here promises the next version reads them the same way.
 | Argument | Shape / value | Dtype | Device |
 |---|---|---|---|
 | `output_sf` | `None` (NVFP4-output path not certified) | — | — |
-| `workspace_` | persistent scratch tensor, any length (0 ok); the op grows it **in place** via `resize_()` when too small — 33 MB to 109 MB across the certified shapes. The MLA context requirement scales with tokens x heads and still sets the peak: 113 924 096 B for an `H = 128` context call over 545 tokens, against 52 579 072 B for the same call over 129 tokens and 100 024 320 B for the standard-configuration head-geometry sweep. The MLA **generation** call is well below that and, measured, does not grow with `predicted_tokens_per_seq`: 39 100 416 B at `H = 128`, page 32 for every `(G, P, L)` tried — `G` 2 and 4, `P` 1 and 4, `L` 50 and 500 — so a `P`-times-taller query block moves nothing here. Pass a plain resizable tensor, not a view; reuse it across calls to avoid re-allocation | int8 | CUDA |
+| `workspace` | persistent scratch tensor, any length (0 ok); the op grows it **in place** via `resize_()` when too small — 33 MB to 109 MB across the certified shapes. The MLA context requirement scales with tokens x heads and still sets the peak: 113 924 096 B for an `H = 128` context call over 545 tokens, against 52 579 072 B for the same call over 129 tokens and 100 024 320 B for the standard-configuration head-geometry sweep. The MLA **generation** call is well below that and, measured, does not grow with `predicted_tokens_per_seq`: 39 100 416 B at `H = 128`, page 32 for every `(G, P, L)` tried — `G` 2 and 4, `P` 1 and 4, `L` 50 and 500 — so a `P`-times-taller query block moves nothing here. Pass a plain resizable tensor, not a view; reuse it across calls to avoid re-allocation | int8 | CUDA |
 
 ### Batch state (the "prepared metadata" of this op — all int32)
 
@@ -1399,7 +1401,7 @@ plays for the registered-layer entry points.)
   unsatisfiable on a mixed one — see *Semantics*.
 - Every MLA call needs an int `q_lora_rank` — `0` for a checkpoint without
   a q-LoRA — even though the value is never read: `None` raises
-  `RuntimeError: bad optional access` (see *MLA q-LoRA rank*).
+  `ValueError` (see *MLA q-LoRA rank*).
 - MLA generation additionally requires, before the call: every generation
   sequence's full latent history `[0, L_g)` resident in the pool — the
   context call's append covers the prefill rows; this step's `P` rows at
@@ -1535,7 +1537,7 @@ plays for the registered-layer entry points.)
   `HVPerCta` segment at all. So a target sweeping `max_draft_len` should
   expect one decode JIT compile per `P` it runs, not one for the model.
 - First call logs "Attention workspace size is not enough" and resizes
-  `workspace_` in place — expected when starting from an empty tensor. The
+  `workspace` in place — expected when starting from an empty tensor. The
   size tracks the call's tokens x heads: ~33 MB standard, ~39 MB MLA and
   ~35 MB no-append MLA context at the 8/16/32-head shapes, but ~50 MB for an
   `H = 128` MLA context call over 129 tokens and ~109 MB over 545, which is

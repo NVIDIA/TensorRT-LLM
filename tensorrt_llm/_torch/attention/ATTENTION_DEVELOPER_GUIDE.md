@@ -418,6 +418,10 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+`FallbackFmha` and its `attention()` compatibility adapter own separate native
+`AttentionOp` caches, keyed by `StaticAttentionConfig`, CUDA device, and host thread.
+Streams are excluded so CUDA graph capture can reuse runners initialized during warmup.
+
 `TLLM_FMHA_LIBS` controls the ordered selection. Dense PrimTS is opt-in because
 it may add host overhead; use `TLLM_FMHA_LIBS=+prims_ts` to add it to the
 defaults or `TLLM_FMHA_LIBS=fallback` to force the fallback path. Generic
@@ -552,11 +556,10 @@ chunk alone: the cached prefix is dropped from attention and then overwritten
 by the chunk's write-back, which turns a missing kernel into a plausible wrong
 answer rather than an error.
 
-`get_attention_op` in `thop/attentionOp.cpp` therefore refuses a non-MLA,
+The `AttentionOp` constructor in `thop/attentionOp.cpp` therefore refuses a non-MLA,
 non-cross paged-context configuration whose initialization produced no context
 FMHA kernel. The check runs after `initialize()`, because only the initialized
-op reflects the exact Q/KV/output precision, mask type and page size, and
-outside `initialize()` itself, which is `noexcept`.
+op reflects the exact Q/KV/output precision, mask type and page size.
 
 The refusal has three distinct causes, each with its own message, and the
 distinction matters when triaging:

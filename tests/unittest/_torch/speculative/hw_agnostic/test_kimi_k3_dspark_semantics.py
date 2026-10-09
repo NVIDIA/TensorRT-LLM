@@ -1210,7 +1210,7 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
     so CuTe DSL's layout deduction refused to pick a leading dimension even though
     with both extents 1 the choice cannot change an address. Reachable whenever
     the draft pool is one page deep and a single request is resident -- a
-    first-draft-step shape, and since AUTO resolves to CUTEDSL, the default path.
+    first-draft-step shape when CUTEDSL is selected.
 
     The parity bound is the same one the batched test uses; a wrongly deduced
     axis would show up as a magnitude error, not a last-bit one.
@@ -1237,26 +1237,23 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
 
 
 @needs_cuda
-def test_mla_dspark_auto_backend_resolves_to_cutedsl():
-    """AUTO is the one-pass kernel, and it must reach the dispatch as such.
+def test_mla_dspark_auto_backend_resolves_to_trtllm():
+    """AUTO selects TRTLLM and must reach the paged decode dispatch as such.
 
     Asserting the dispatch and not just the field: every variant returns the
     same shape, so a default that resolved but never reached
     _mla_block_decode_variant would be silent.
     """
     from tensorrt_llm._torch.model_config import ModelConfig
-    from tensorrt_llm._torch.models.modeling_dspark import (
-        MLADSparkForCausalLM,
-        cute_dsl_mla_decode_unavailability_reason,
-    )
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
-    reason = cute_dsl_mla_decode_unavailability_reason()
+    reason = MLADSparkForCausalLM._attention_backend_unavailability_reason("TRTLLM")
     if reason is not None:
-        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+        pytest.skip(f"TRTLLM MLA decode unavailable: {reason}")
     model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="VANILLA")
     drafter = MLADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
-    assert drafter.dflash_attention_backend == "CUTEDSL"
-    assert drafter._mla_block_decode_variant(paged=True) == "cute_dsl"
+    assert drafter.dflash_attention_backend == "TRTLLM"
+    assert drafter._mla_block_decode_variant(paged=True) == "trtllm_gen"
 
 
 @needs_cuda

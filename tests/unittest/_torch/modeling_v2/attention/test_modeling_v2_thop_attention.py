@@ -414,7 +414,7 @@ class _PagedAttnEnv:
             v=None,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
             host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
@@ -482,7 +482,7 @@ class _PagedAttnEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -885,7 +885,7 @@ class _MultiLayerPagedAttnEnv:
             v=None,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
             host_total_kv_lens=torch.tensor(
@@ -956,7 +956,7 @@ class _MultiLayerPagedAttnEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -2993,7 +2993,7 @@ class _MlaPagedEnv:
             v=v,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(
                 kv_lens if host_past_lens is None else host_past_lens,
@@ -3065,7 +3065,7 @@ class _MlaPagedEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -5247,8 +5247,7 @@ def test_fp8_mla_mtp_decode_sees_a_torn_pool_h128() -> None:
 
 
 def test_mla_rejects_null_q_lora_rank() -> None:
-    """q_lora_rank must be an int on the MLA path: the C++ unwraps the
-    optional unconditionally, so None raises rather than defaulting."""
+    """The catalog requires an explicit int rank for MLA, including zero for no q-LoRA."""
     torch.manual_seed(309)
     h = MLA_NUM_HEADS_H32
     q, k, v, latent = _random_context_inputs(32, h)
@@ -5261,7 +5260,7 @@ def test_mla_rejects_null_q_lora_rank() -> None:
     env.add_request(0, 32)
     try:
         env.call_context([0], [32], q, k, v, latent)
-    except RuntimeError as exc:
-        assert "bad optional access" in str(exc), f"unexpected message: {exc}"
+    except ValueError as exc:
+        assert "q_lora_rank must be an int for MLA" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")

@@ -34,7 +34,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -182,11 +183,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
-    # C++ attention op requires a 2-D position_offsets tensor and reads
-    # sizes()[1] as the generation length / packed-mask row stride.
-    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
-    # Compact Hopper C++ row stride for 1D dynamic-tree offsets.
-    position_offsets_stride: int = 0
+    # Current query width of the compact prefix in a 1-D dynamic-tree offsets buffer.
+    spec_decoding_query_len: int = 0
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
@@ -280,19 +278,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
 
     @property
-    def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
-        """``spec_decoding_position_offsets`` reshaped to the 2D layout the C++
-        kernel expects."""
-        offsets = self.spec_decoding_position_offsets
-        if offsets is not None and offsets.dim() == 1:
-            if (self.spec_decoding_position_offsets_cpp is not None
-                    and not self.is_sm_version_trtllm_gen_kernel(
-                        sm=get_sm_version())):
-                return self.spec_decoding_position_offsets_cpp
-            return offsets.view(self.max_num_requests, -1)
-        return offsets
-
-    @property
     def max_context_length(self) -> int:
         """
         Upper bound for a single context window.
@@ -371,23 +356,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
-
-    def update_position_offsets_for_cpp(self, query_len: int) -> None:
-        """Refresh the C++ view of spec-dec position offsets."""
-        offsets = self.spec_decoding_position_offsets
-        if offsets is None or offsets.dim() != 1:
-            self.spec_decoding_position_offsets_cpp = offsets
-            self.position_offsets_stride = 0
-            return
-
-        if self.max_num_requests > 0 and query_len > 0:
-            self.position_offsets_stride = query_len
-            total = self.max_num_requests * query_len
-            self.spec_decoding_position_offsets_cpp = offsets[:total].view(
-                self.max_num_requests, query_len)
-        else:
-            self.spec_decoding_position_offsets_cpp = offsets
-            self.position_offsets_stride = 0
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -937,26 +905,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
                  self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
                  self.max_num_requests, self.prompt_lens_cuda_runtime,
-                 self.host_request_types_runtime)
+                 self.host_request_types_runtime, self._num_generations,
+                 self.max_num_sequences)
         try:
             self.kv_lens_cuda_runtime = view.sequence_length
             self.kv_lens_runtime = view.host_past_key_value_lengths
             self.prompt_lens_cpu_runtime = view.host_context_lengths
             self.kv_cache_block_offsets = view.kv_cache_block_offsets
-            # The op reserves its multi-CTA-KV counter as
-            # `num_heads * max_num_requests` and sizes its generation workspace
-            # from the same number. Under this presentation the batch dimension
-            # the kernels see is the ROW count, which is larger. Passing the
-            # static ceiling grows the reservation to cover it while keeping the
-            # op's (beam_width, max_num_requests, window) cache key constant.
-            # This is only a capacity input -- the op's own mMaxNumRequests is a
-            # JIT-warmup hint, and the per-step request count comes from the
-            # batch, not from here.
-            #
-            # The attention workspace is sized from the same number, so it
-            # grows with the row ceiling; that memory would otherwise hold
-            # KV cache.
+            # The multi-CTA-KV counter and generation workspace must cover
+            # token rows, which can outnumber requests. Use the static row
+            # ceiling so the allocation remains stable across steps.
             self.max_num_requests = view.max_num_rows
+            self.max_num_sequences = view.max_num_rows
+            # Phased FMHA reads this count directly. Its public setter calls
+            # on_update(), which would recompute the request count from seq_lens.
+            self._num_generations = view.num_rows - self.num_contexts
             # Every runtime view has to agree on batch_size with
             # kv_lens_cuda_runtime, and the op reads request_types over all of
             # num_seqs -- both are the row count here, not the request count.
@@ -967,7 +930,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
              self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
              self.max_num_requests, self.prompt_lens_cuda_runtime,
-             self.host_request_types_runtime) = saved
+             self.host_request_types_runtime, self._num_generations,
+             self.max_num_sequences) = saved
 
     def prepare(self) -> None:
         super().prepare()
@@ -1602,8 +1566,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
-            cpp_query_len = 0
-
             # Case 1: dynamic tree — copy per-request params from spec_tree_manager.
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
@@ -1646,7 +1608,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                             mask_src.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
-                cpp_query_len = n_dt
+                self.spec_decoding_query_len = n_dt
 
             # Case 2: linear tree
             else:
@@ -1664,8 +1626,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.max_num_requests, runtime_draft_token_buffer_width)
                 self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
                     self.max_num_requests, runtime_draft_token_buffer_width)
-
-            self.update_position_offsets_for_cpp(cpp_query_len)
+                self.spec_decoding_query_len = runtime_draft_token_buffer_width + 1
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
@@ -1769,8 +1730,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
-        self.position_embedding_type = int(
-            pos_embd_params.type) if pos_embd_params is not None else 0
+        self.position_embedding_type = (pos_embd_params.type
+                                        if pos_embd_params is not None else
+                                        PositionEmbeddingType.learned_absolute)
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1793,7 +1755,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
-        self._fmha_manager: FmhaManager
+        self._fmha_manager: Optional[FmhaManager] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1805,8 +1767,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
-        self.quant_mode = int(self.quant_config.layer_quant_mode)
-
+        self.quant_mode = self.quant_config.layer_quant_mode
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
@@ -2053,6 +2014,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        """Per-head width of the attention output for this phase.
+
+        Single source of truth for the output buffer `create_output` allocates and
+        the view a phased FMHA library takes over it; the two must not drift. MLA
+        generation writes the latent (plus the rope part when it is not appended in
+        place), while MLA context writes the already-projected V head.
+        """
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return (self.kv_lora_rank if self.rope_append else self.kv_lora_rank +
+                self.qk_rope_head_dim)
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -2066,13 +2042,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_tokens = q.size(0)
         if out_dtype is None:
             out_dtype = q.dtype
-        v_head_size = self.head_dim
-        if self.is_mla_enable:
-            if is_gen_only:
-                v_head_size = self.kv_lora_rank if self.rope_append else (
-                    self.kv_lora_rank + self.qk_rope_head_dim)
-            else:
-                v_head_size = self.v_head_dim
+        v_head_size = self.out_head_size(is_gen_only)
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -2099,8 +2069,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.theta
 
     @property
-    def rope_scale_type(self) -> int:
-        return int(self.rope_params.scale_type)
+    def rope_scale_type(self) -> RotaryScalingType:
+        return self.rope_params.scale_type
 
     @property
     def rope_scale(self) -> float:
@@ -2430,6 +2400,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
+        assert self._fmha_manager is not None
         # On a ragged generation step the attention op is handed
         # one row per query token so its `num_tokens % num_seqs == 0` check
         # passes with seq_len == 1. Keep the presentation scoped around both

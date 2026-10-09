@@ -2,18 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused attention core with fully explicit state: paged KV-cache append + masked FMHA.
 
-Wraps the pybind binding ``tensorrt_llm.bindings.internal.thop.attention``
-(approved policy exception to the ``torch.ops.trtllm.*`` entry shape): the
-same C++ attention op behind the TRTLLM backend, but every piece of batch
-state and layer config arrives as an explicit argument — no registered
-layers, no thread-local metadata.
+Wraps ``FallbackFmha.attention``, which dispatches to the native
+``AttentionOp`` context and generation methods. Every piece of batch state
+and layer config arrives as an explicit argument; native runners are cached
+by static configuration, device, and thread.
 """
 
 from typing import Optional
 
 import torch
 
-from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
 
 def thop_attention(
@@ -22,7 +21,7 @@ def thop_attention(
     v: Optional[torch.Tensor],
     output: torch.Tensor,
     output_sf: Optional[torch.Tensor],
-    workspace_: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
     sequence_length: torch.Tensor,
     host_past_key_value_lengths: torch.Tensor,
     host_total_kv_lens: torch.Tensor,
@@ -88,7 +87,7 @@ def thop_attention(
     use_spec_decoding: bool,
     is_spec_dec_tree: bool,
     spec_decoding_generation_lengths: Optional[torch.Tensor],
-    spec_decoding_position_offsets_for_cpp: Optional[torch.Tensor],
+    spec_decoding_position_offsets: Optional[torch.Tensor],
     spec_decoding_packed_mask: Optional[torch.Tensor],
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor],
     spec_decoding_bl_tree_mask: Optional[torch.Tensor],
@@ -140,6 +139,8 @@ def thop_attention(
     append + masked FMHA (standard), or the MLA context/generation phase
     selected by attention_input_type; writes rows [:num_tokens] of output.
     Returns None."""
+    if is_mla_enable and q_lora_rank is None:
+        raise ValueError("q_lora_rank must be an int for MLA; use 0 when there is no q-LoRA.")
     # num_heads must be an integer multiple of num_kv_heads. A context-only
     # call with a non-multiple returns without raising on sm_100 (observed at
     # 6q/4kv d128: only the first (num_heads // num_kv_heads) * num_kv_heads
@@ -161,13 +162,13 @@ def thop_attention(
             f"{tuple(attention_sinks.shape)} contiguous="
             f"{attention_sinks.is_contiguous()}"
         )
-    thop.attention(
+    FallbackFmha.attention(
         q=q,
         k=k,
         v=v,
         output=output,
         output_sf=output_sf,
-        workspace_=workspace_,
+        workspace=workspace,
         sequence_length=sequence_length,
         host_past_key_value_lengths=host_past_key_value_lengths,
         host_total_kv_lens=host_total_kv_lens,
@@ -233,7 +234,7 @@ def thop_attention(
         use_spec_decoding=use_spec_decoding,
         is_spec_dec_tree=is_spec_dec_tree,
         spec_decoding_generation_lengths=spec_decoding_generation_lengths,
-        spec_decoding_position_offsets_for_cpp=spec_decoding_position_offsets_for_cpp,
+        spec_decoding_position_offsets=spec_decoding_position_offsets,
         spec_decoding_packed_mask=spec_decoding_packed_mask,
         spec_decoding_bl_tree_mask_offset=spec_decoding_bl_tree_mask_offset,
         spec_decoding_bl_tree_mask=spec_decoding_bl_tree_mask,
