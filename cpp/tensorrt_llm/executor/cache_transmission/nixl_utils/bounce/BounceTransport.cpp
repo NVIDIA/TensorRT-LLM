@@ -674,8 +674,8 @@ void BounceReceiver::scatterWorkerLoop()
             // by this flow, so bounding to it prevents any cross-flow read. dstAddr is NOT bounded here
             // by decision: it is the receiver's own KV address round-tripped through the control plane;
             // the standard NIXL path would reject an out-of-region address via covers() (createXferReq
-            // -> populate), so bounce drops that check (accepted cost/benefit; the Python bounce does
-            // not validate it either). Only the SOURCE side is bounded to prevent cross-flow reads.
+            // -> populate), so bounce drops that check (accepted cost/benefit). Only the SOURCE side is
+            // bounded to prevent cross-flow reads.
             // Any bad entry -> skip launch, NACK, no ACK.
             // regionBytes==0 means the region wasn't allocated (stale) -> reject the whole job.
             std::uint64_t const arenaLo = mCtx.arena->baseAddr();
@@ -1940,9 +1940,9 @@ bool BounceTransport::registerPeerHandshake(std::string const& peer, std::string
     if (blob.empty())
     {
         TLLM_LOG_WARNING(
-            "BounceTransport(%s): peer %s does not advertise bounce (agent_bounce_buffer_enable off, bounce not "
-            "built, or bounce init failed on that side) -> standard NIXL for this peer; this agent's bounce arena "
-            "stays idle for it",
+            "BounceTransport(%s): peer %s does not advertise bounce -> standard NIXL for this peer; this agent's "
+            "bounce arena stays idle for it. On that side kv_cache_bounce_size_mb is 0 (or, on an older release, "
+            "agent_bounce_buffer_enable is off), bounce is not built, or bounce init failed",
             mCtx.selfName.c_str(), peer.c_str());
         return false;
     }
