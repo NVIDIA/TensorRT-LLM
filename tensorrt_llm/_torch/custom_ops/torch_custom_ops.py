@@ -47,6 +47,7 @@ if IS_FLASHINFER_AVAILABLE:
     from flashinfer import mxfp8_quantize as _flashinfer_mxfp8_quantize
     from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 
+from .. import jit_prefetch_deep_gemm
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
@@ -2177,6 +2178,11 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
+        observed = jit_prefetch_deep_gemm.launch_observer is not None
+        if observed:
+            t0 = jit_prefetch_deep_gemm.note_launch(input.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1))
         a, a_sf = _fp8_quantize_1x128_ue8m0(input, self.quant_tactic)
         output = torch.empty(
             (input.size(0), weight.size(0)),
@@ -2190,6 +2196,10 @@ class fp8SwapABGemmRunner(TunableRunner):
             output,
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
+        if observed:
+            jit_prefetch_deep_gemm.note_launch_done(input.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1), t0)
         return output
 
 

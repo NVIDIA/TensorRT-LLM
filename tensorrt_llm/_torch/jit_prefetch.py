@@ -341,6 +341,11 @@ class _Stats:
     replay_submitted: int = 0
     recorded: int = 0
     urgent: int = 0
+    dg_planned: int = 0
+    dg_unplanned: int = 0
+    dg_helper_built: int = 0
+    dg_executor_compiles: int = 0
+    dg_executor_compile_s: float = 0.0
     events: List[str] = field(default_factory=list)
 
 
@@ -364,11 +369,15 @@ class JitPrefetcher:
         self._record_fh = None
         self._recorded: set = set()
         self._replay: List[Tuple[str, str, str]] = []
+        self._replay_dg: List[str] = []
         self._tag = 0
         self._lock = threading.Lock()
         self._procs = []
         self._busy: Dict[int, threading.Event] = {}
         self._req_q = None
+        # kind -> queue; "triton" uses self._req_q
+        self._queues: Dict[str, Any] = {}
+        self._dg = None  # DeepGEMM provider (jit_prefetch_deep_gemm)
 
         self._executor_thread: Optional[int] = None
         self._ready: Dict[int, threading.Event] = {}
@@ -398,7 +407,6 @@ class JitPrefetcher:
 
     # -- helpers ----------------------------------------------------------
     def _start_helpers(self):
-        import subprocess
         import sys
 
         from triton import knobs
@@ -419,9 +427,19 @@ class JitPrefetcher:
         n = max(1, int(os.environ.get(_WORKERS_ENV, str(_default_workers()))))
         self._procs = []
         self._req_q = queue.PriorityQueue()
-        for i in range(n):
+        self._queues["triton"] = self._req_q
+        self._spawn("triton", [sys.executable, "-u", helper, pkg_root], env, n)
+        logger.info(
+            f"[JIT prefetch] rank {self.rank}: {n} helper process(es) compiling into {cache_dir}"
+        )
+
+    def _spawn(self, kind: str, argv: List[str], env: Dict[str, str], n: int) -> None:
+        import subprocess
+
+        q = self._queues[kind]
+        for _ in range(n):
             p = subprocess.Popen(
-                [sys.executable, "-u", helper, pkg_root],
+                argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=None,
@@ -432,11 +450,79 @@ class JitPrefetcher:
             )
             self._procs.append(p)
             self._ready[p.pid] = threading.Event()
-            threading.Thread(target=self._feed_loop, args=(p,), daemon=True).start()
+            threading.Thread(target=self._feed_loop, args=(p, q), daemon=True).start()
             threading.Thread(target=self._drain_loop, args=(p,), daemon=True).start()
-        logger.info(
-            f"[JIT prefetch] rank {self.rank}: {n} helper process(es) compiling into {cache_dir}"
+
+    def enable_deep_gemm(self, provider) -> bool:
+        """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
+
+        Helpers run ``jit_prefetch_dg_helper.py`` with no visible GPU; the
+        target arch and SM count are this rank's, so they compile exactly the
+        variants this rank's launches will look up in ``DG_JIT_CACHE_DIR``.
+        """
+        import sys
+
+        from . import jit_prefetch_deep_gemm as jdg
+
+        if not self.prefetch or self._dg is not None:
+            return False
+        if not jdg.supported():
+            jdg.log_unsupported_once("DeepGEMM lacks compile_only_fp8_fp4_gemm_nt or not SM100")
+            return False
+        major, minor, sms = jdg.target()
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
+        }
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1", DG_JIT_COMPILE_ONLY="1")
+        env.pop("PYTHONPATH", None)
+        helper = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_dg_helper.py"
         )
+        n = max(1, int(os.environ.get("TLLM_JIT_PREFETCH_DG_WORKERS", str(_default_workers()))))
+        self._queues[jdg.KIND] = queue.PriorityQueue()
+        self._spawn(
+            jdg.KIND,
+            [sys.executable, "-u", helper, jdg.package_dir(), str(major), str(minor), str(sms)],
+            env,
+            n,
+        )
+        self._dg = provider
+        seen_mnk: set = set()
+
+        def _observe(m, n, k, _seen=seen_mnk):
+            if (m, n, k) in _seen:
+                return
+            _seen.add((m, n, k))
+            spec = jdg.spec_for(m, n, k)
+            if spec not in self._spec_prio:
+                self.stats.dg_unplanned += 1
+                self._event(f"DeepGEMM launch not planned: m={m} n={n} k={k}")
+            self._record(jdg.KIND, "deep_gemm", spec)
+
+        def _done(m, n, k, dt):
+            if dt < jdg.COMPILE_HOST_S or threading.get_ident() != self._executor_thread:
+                return
+            self.stats.dg_executor_compiles += 1
+            self.stats.dg_executor_compile_s += dt
+            logger.info(
+                f"[JIT stats] rank {self.rank} DeepGEMM compile on executor "
+                f"m={m} n={n} k={k} {dt:.3f}s"
+            )
+
+        jdg.launch_observer = _observe
+        jdg.done_observer = _done
+        threading.Thread(
+            target=self._enumerate_dg, daemon=True, name="jit_prefetch_dg_enum"
+        ).start()
+        for spec in self._replay_dg:
+            self._submit(spec, spec, "deep_gemm", _PRIO_REPLAY, kind=jdg.KIND)
+        self._event(
+            f"DeepGEMM prefetch: {len(provider.shapes)} FP8 Linear shape(s), {n} helper(s), "
+            f"target sm_{major}{minor} x{sms} SMs, replaying {len(self._replay_dg)}"
+        )
+        return True
 
     def wait_ready(self, timeout_s: float = 60.0) -> float:
         """Block until every helper has imported Triton; return seconds waited.
@@ -452,10 +538,10 @@ class JitPrefetcher:
         self._event(f"helpers ready {n_ready}/{len(self._ready)} after {dt * 1e3:.0f} ms")
         return dt
 
-    def _feed_loop(self, proc):
+    def _feed_loop(self, proc, q):
         # One request in flight per helper, so work spreads across helpers.
         while True:
-            _prio, tag, spec = self._req_q.get()
+            _prio, tag, spec = q.get()
             self._busy.setdefault(proc.pid, threading.Event()).clear()
             try:
                 proc.stdin.write(json.dumps({"tag": tag, "spec": spec}) + "\n")
@@ -483,6 +569,8 @@ class JitPrefetcher:
                 if ev is not None:
                     ev.set()
                 self.stats.helper_s += dt
+                if r.get("built"):
+                    self.stats.dg_helper_built += 1
                 if ok:
                     self.stats.helper_ok += 1
                 else:
@@ -504,6 +592,29 @@ class JitPrefetcher:
         if self._executor_thread is None:
             self._executor_thread = threading.get_ident()
             self._event("executor thread bound; counting JIT from here")
+
+    def plan_deep_gemm(self, num_tokens: int) -> None:
+        """Queue the DeepGEMM variants a batch of ``num_tokens`` will run."""
+        if self._dg is None:
+            return
+        from . import jit_prefetch_deep_gemm as jdg
+
+        t0 = time.perf_counter()
+        for spec in self._dg.plan_tokens(num_tokens):
+            self.stats.dg_planned += 1
+            if self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND):
+                self._record(jdg.KIND, "deep_gemm", spec)
+        self.stats.plan_s += time.perf_counter() - t0
+
+    def _enumerate_dg(self) -> None:
+        """Queue every M window up to max_num_tokens, at background priority."""
+        from . import jit_prefetch_deep_gemm as jdg
+
+        n = 0
+        for spec in self._dg.enumerate_specs():
+            if self._submit(spec, spec, "deep_gemm", _PRIO_ENUM, kind=jdg.KIND):
+                n += 1
+        self._event(f"DeepGEMM enumeration: {n} requests queued")
 
     def plan(self, batch_ctx: Any) -> None:
         """Called once a batch is scheduled, before its inputs are prepared."""
@@ -560,7 +671,7 @@ class JitPrefetcher:
             if priority == _PRIO_BATCH:
                 self._event(f"submit {call.label}{'' if tuned else ' (untuned: all configs)'}")
 
-    def _submit(self, key: str, spec: str, label: str, priority: int) -> bool:
+    def _submit(self, key: str, spec: str, label: str, priority: int, kind: str = "triton") -> bool:
         """Queue one variant; False if it is already queued at this priority
         or a more urgent one.
 
@@ -582,7 +693,7 @@ class JitPrefetcher:
                 ev = threading.Event()
                 self._key_event[key] = ev
             self._tag_event[tag] = ev
-            self._key_spec[key] = (spec, label)
+            self._key_spec[key] = (spec, label, kind)
             self.stats.submitted += 1
             if priority == _PRIO_REPLAY:
                 self.stats.replay_submitted += 1
@@ -590,7 +701,7 @@ class JitPrefetcher:
                 self.stats.bg_submitted += 1
             elif priority == _PRIO_URGENT:
                 self.stats.urgent += 1
-        self._req_q.put((priority, tag, spec))
+        self._queues[kind].put((priority, tag, spec))
         return True
 
     def _enumerate_all(self) -> None:
@@ -684,7 +795,7 @@ class JitPrefetcher:
                 # executor waits for one compile, not for the queue to drain.
                 spec_label = me._key_spec.get(key)
                 if spec_label is not None:
-                    me._submit(key, spec_label[0], spec_label[1], _PRIO_URGENT)
+                    me._submit(key, spec_label[0], spec_label[1], _PRIO_URGENT, kind=spec_label[2])
                 t0 = time.perf_counter()
                 ev.wait(wait_timeout_s)
                 dt = time.perf_counter() - t0
@@ -758,6 +869,19 @@ class JitPrefetcher:
 
         knobs.autotuning.listener = listener
 
+    def _record(self, kind: str, name: str, spec: str) -> None:
+        """Append one non-Triton request to the record (Triton records itself
+        from ``jit_post_compile_hook``)."""
+        if self._record_fh is None or spec in self._recorded:
+            return
+        with self._lock:
+            if spec in self._recorded:
+                return
+            self._recorded.add(spec)
+            self._record_fh.write(json.dumps({"kind": kind, "name": name, "spec": spec}) + "\n")
+            self._record_fh.flush()
+            self.stats.recorded += 1
+
     def _open_record(self) -> None:
         """Open this rank's record file and load the variants to replay.
 
@@ -795,17 +919,25 @@ class JitPrefetcher:
                     try:
                         rec = json.loads(line)
                         spec = rec["spec"]
-                        key = json.loads(spec)["key"]
+                        kind = rec.get("kind", "triton")
+                        key = json.loads(spec)["key"] if kind == "triton" else spec
                     except (json.JSONDecodeError, KeyError, TypeError):
                         continue
-                    if spec not in self._recorded:
-                        self._recorded.add(spec)
+                    if spec in self._recorded:
+                        continue
+                    self._recorded.add(spec)
+                    if kind == "triton":
                         self._replay.append((key, spec, str(rec.get("name", "?"))))
+                    elif kind == "deep_gemm":
+                        self._replay_dg.append(spec)
         self._record_fh = open(path, mode)
         if mode == "w":
             self._record_fh.write(json.dumps(header) + "\n")
             self._record_fh.flush()
-        self._event(f"record {path}: {len(self._replay)} variants to replay")
+        self._event(
+            f"record {path}: {len(self._replay)} Triton + {len(self._replay_dg)} DeepGEMM "
+            "variants to replay"
+        )
 
     def _event(self, msg: str):
         line = f"[JIT stats] rank {self.rank} t={time.time():.3f} {msg}"
@@ -825,6 +957,9 @@ class JitPrefetcher:
             f" plan_s={s.plan_s:.3f} wait_n={s.wait_n} wait_s={s.wait_s:.3f}"
             f" bg_submitted={s.bg_submitted} replay_submitted={s.replay_submitted}"
             f" recorded={s.recorded} urgent={s.urgent} workers={len(self._procs)}"
+            f" dg_planned={s.dg_planned} dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
+            f" dg_executor_compiles={s.dg_executor_compiles}"
+            f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"
         )
 
     def shutdown(self):

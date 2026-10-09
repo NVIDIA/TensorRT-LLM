@@ -1472,6 +1472,12 @@ class PyTorchModelEngine(ModelEngine):
         if not providers_enabled():
             prefetcher.wait_ready()
             return
+        from .. import jit_prefetch_deep_gemm as jdg
+        if jdg.supported():
+            dg_provider = jdg.FP8LinearDeepGemmProvider(
+                self.model, max_num_tokens=self.max_num_tokens)
+            if dg_provider:
+                prefetcher.enable_deep_gemm(dg_provider)
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
@@ -1491,6 +1497,8 @@ class PyTorchModelEngine(ModelEngine):
         prefetcher.bind_executor_thread()
         if not prefetcher.prefetch:
             return
+        from .. import jit_prefetch_deep_gemm as jdg
+        prefetcher.plan_deep_gemm(jdg.batch_tokens(scheduled_requests))
         ctx = scheduled_requests.context_requests
         if not ctx:
             return
