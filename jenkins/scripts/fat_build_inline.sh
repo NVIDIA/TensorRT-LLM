@@ -78,6 +78,7 @@ pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
 # Keep this list in sync with the non-fat-sqsh install paths (slurm_install.sh and
 # the !isFatSqsh branch in L0_Test.groovy); anything they install must be baked in
 # here too, or fat-sqsh jobs run against a smaller environment than everyone else.
+# The one exception is install_mamba.sh, which the Ray jobs run themselves.
 echo "[fat_build] Installing requirements-grpc-smg.txt..."
 pip3 install --no-user --retries 10 -r TensorRT-LLM/src/requirements-grpc-smg.txt
 echo "[fat_build] Installing trtllm wheel..."

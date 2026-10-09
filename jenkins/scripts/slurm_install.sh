@@ -103,6 +103,12 @@ slurm_install_setup() {
             resourcePathNode=/tmp
             # The fat sqsh needs no download, so the netrc the job delivered is not read.
             remove_artifactory_netrc
+            # mamba-ssm and causal-conv1d are compiled here rather than baked into the fat
+            # sqsh, as on the agent path in L0_Test.groovy: only Ray jobs pay for the build,
+            # and other stages keep the same environment as the non-fat path.
+            if [[ $pytestCommand == *--run-ray* ]]; then
+                retry_command --timeout 2700 bash "$resourcePathNode/TensorRT-LLM/src/jenkins/scripts/install_mamba.sh"
+            fi
         else
             cd "$resourcePathNode"
             archive_path="$resourcePathNode/$tarName"
