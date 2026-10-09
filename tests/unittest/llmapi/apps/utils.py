@@ -47,15 +47,26 @@ async def logit_bias_effect_helper(client: Any,
     try:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(get_model_path(model_name))
-        paris_token_id = get_token_id(tokenizer, 'Paris')
+        # Byte-level BPE tokenizers (e.g. Qwen3) encode a word differently
+        # depending on whether it's preceded by a space: 'Paris' and ' Paris'
+        # are distinct tokens. The model generates the space-prefixed variant
+        # after "is", so both must be biased or the bias has no effect on
+        # what's actually generated.
+        paris_token_ids = {
+            get_token_id(tokenizer, 'Paris'),
+            get_token_id(tokenizer, ' Paris'),
+        }
     except ImportError as exc:
         pytest.skip(f'transformers not available: {exc}')
     except Exception as exc:
-        paris_token_id = 3681
-        print(f'[WARNING] Using fallback token id 3681 for "Paris": {exc}')
+        # Fallback ids for Qwen3's tokenizer: 'Paris' -> 59604, ' Paris' -> 12095.
+        paris_token_ids = {59604, 12095}
+        print(
+            f'[WARNING] Using fallback token ids {paris_token_ids} for "Paris": {exc}'
+        )
 
     # Test with strong positive bias for 'Paris'
-    logit_bias = {str(paris_token_id): 80}
+    logit_bias = {str(token_id): 80 for token_id in paris_token_ids}
 
     if api_type == 'completions':
         response = await client.completions.create(
@@ -84,7 +95,7 @@ async def logit_bias_effect_helper(client: Any,
     assert 'Paris' in output, f"Expected 'Paris' in output with positive logit bias, got: {output}"
 
     # Test with strong negative bias for 'Paris'
-    logit_bias = {str(paris_token_id): -80}
+    logit_bias = {str(token_id): -80 for token_id in paris_token_ids}
 
     if api_type == 'completions':
         response = await client.completions.create(

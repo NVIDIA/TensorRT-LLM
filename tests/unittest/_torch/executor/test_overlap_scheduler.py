@@ -19,7 +19,7 @@ def test_case():
 
 @pytest.fixture(scope="module")
 def model_path():
-    return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return llm_models_root() / "Qwen3/Qwen3-0.6B"
 
 
 def create_llm(model_dir,
