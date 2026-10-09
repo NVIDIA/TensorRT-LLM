@@ -157,8 +157,7 @@ def test_nvfp4_shared_draft_constructs_and_converts_heterogeneous_page_tables(
         # NVFP4 layer and the view-read draft layer may sit in other pools.
         assert uniform_subpages_per_slot(manager) == manager.get_kv_subpage_pool(0)[1]
 
-        # Cache views are resolved once at construction, outside inference mode:
-        # the warmup scrub zeroes the K/V views outside it.
+        # Views are resolved at construction: the warmup scrub zeroes K/V outside inference mode.
         with torch.inference_mode():
             kv_view = manager.get_buffers(0, "HND")
             scale_view = manager.get_block_scale_buffers(3, "HND")
