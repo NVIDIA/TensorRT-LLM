@@ -51,6 +51,7 @@ from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.metrics.batch_metrics import BatchMetrics
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
@@ -394,6 +395,8 @@ class PendingEncoderStep:
 
 
 class PyExecutor:
+    _batch_metrics: Optional[BatchMetrics] = None
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -566,6 +569,27 @@ class PyExecutor:
         # drain into the next emitted record, so sums over records stay exact.
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
+        self._batch_metrics = None
+        if self.llm_args.return_perf_metrics:
+            metrics_dir = os.getenv("PROMETHEUS_MULTIPROC_DIR", "")
+            if not os.path.isdir(metrics_dir):
+                logger.warning(
+                    "Scheduled batch metric disabled: PROMETHEUS_MULTIPROC_DIR "
+                    f"is unset or is not an accessible directory: {metrics_dir!r}"
+                )
+            else:
+                from prometheus_client import values
+                if not getattr(values.ValueClass, "_multiprocess", False):
+                    logger.warning(
+                        "Scheduled batch metric disabled: prometheus_client is "
+                        "not using recognized multiprocess storage. It may have "
+                        "been imported before PROMETHEUS_MULTIPROC_DIR was set. "
+                        "Set the directory before importing prometheus_client.")
+                else:
+                    self._batch_metrics = BatchMetrics(
+                        model_name=str(self.llm_args.model),
+                        engine_type=self.llm_args.backend or "unknown",
+                        rank=self.dist.rank)
         self.stream_interval = self.llm_args.stream_interval
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
@@ -1424,6 +1448,8 @@ class PyExecutor:
             # enforces, not this one.
             raise
         finally:
+            if self._batch_metrics is not None:
+                self._batch_metrics.reset()
             # Armed BEFORE cleanup: cleanup can block without bound on a
             # send handle wedged by the crash, and a kill placed only after
             # it would never fire.
@@ -2167,6 +2193,11 @@ class PyExecutor:
                 and not self.enable_attention_dp and not active_requests
                 and (self._pending_num_completed_requests > 0
                      or self._pending_num_new_active_requests > 0))
+
+    def _update_batch_metrics(self, scheduled_batch: ScheduledRequests) -> None:
+        if self._batch_metrics is not None:
+            self._batch_metrics.update(scheduled_batch,
+                                       filter_dummies=self.enable_attention_dp)
 
     @staticmethod
     def _is_stats_dummy_request(req) -> bool:
@@ -3007,6 +3038,8 @@ class PyExecutor:
                     # here keeps them in lockstep rather than breaking it.
                     can_queue = False
                 if not can_queue:
+                    if self._batch_metrics is not None:
+                        self._batch_metrics.reset()
                     self._revert_gen_alloc(scheduled_batch)
                 if not can_queue:
                     logger.debug(
@@ -3048,6 +3081,7 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    self._update_batch_metrics(scheduled_batch)
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if iter_stats is not None else None)
@@ -4577,6 +4611,8 @@ class PyExecutor:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
+                    if self._batch_metrics is not None:
+                        self._batch_metrics.reset()
                     self._revert_gen_alloc(scheduled_batch)
                 self._finalize_adp_dummy_allocation(can_queue)
 
@@ -4614,6 +4650,7 @@ class PyExecutor:
                             if hasattr(self.drafter, "guided_decoder"):
                                 self.guided_decoder.rollback_draft_tokens()
 
+                    self._update_batch_metrics(scheduled_batch)
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if iter_stats is not None else None)
@@ -5445,6 +5482,8 @@ class PyExecutor:
                         scheduled_batch)
 
                 if not can_queue:
+                    if self._batch_metrics is not None:
+                        self._batch_metrics.reset()
                     self._revert_gen_alloc(scheduled_batch)
                 self._finalize_adp_dummy_allocation(can_queue)
 
@@ -5503,6 +5542,7 @@ class PyExecutor:
                     else:
                         previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
+                    self._update_batch_metrics(scheduled_batch)
                     scheduled_batch_stats = (
                         self._collect_scheduled_batch_stats(scheduled_batch)
                         if iter_stats is not None else None)
@@ -5975,6 +6015,8 @@ class PyExecutor:
                 and not self.is_shutdown
                 and not self._has_pending_connector_transfers())
         if idle:
+            if self._batch_metrics is not None:
+                self._batch_metrics.reset()
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
