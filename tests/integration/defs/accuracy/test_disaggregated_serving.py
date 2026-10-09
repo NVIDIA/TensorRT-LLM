@@ -894,7 +894,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
-            "use_kv_cache_manager_v2": True,
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
@@ -1481,7 +1480,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.5,
-            "use_kv_cache_manager_v2": True,
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,

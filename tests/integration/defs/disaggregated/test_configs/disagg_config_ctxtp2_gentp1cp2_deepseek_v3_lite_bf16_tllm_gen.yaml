@@ -7,7 +7,6 @@ context_servers:
   num_instances: 1
   enable_chunked_prefill: false
   kv_cache_config:
-    use_kv_cache_manager_v2: true
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
@@ -27,7 +26,6 @@ generation_servers:
     cp_type: HELIX
     tokens_per_block: 32
   kv_cache_config:
-    use_kv_cache_manager_v2: true
     enable_block_reuse: false
     enable_partial_reuse: false
     tokens_per_block: 32
