@@ -121,7 +121,7 @@ def _get_num_cuda_graph_padding_dummy_slots(
 
     This is computed before ``ModelEngine`` exists and covers draft lengths
     reachable at every batch size, including the zero-length acceptance-rate
-    fallback. ``ModelEngine._compute_dynamic_draft_len_mapping`` is created
+    fallback. ``DecoderRunner._compute_dynamic_draft_len_mapping`` is created
     later and covers only configured CUDA-graph batch sizes, so it cannot size
     this persistent ID set.
     """

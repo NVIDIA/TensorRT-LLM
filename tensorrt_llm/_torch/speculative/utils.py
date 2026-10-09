@@ -966,16 +966,17 @@ def get_draft_len_for_batch_size(draft_len_schedule: Dict[int, int],
     return 0
 
 
-def get_static_draft_len(model_engine: "ModelEngine") -> int:
+def get_static_draft_len(spec_config: Optional["DecodingBaseConfig"]) -> int:
     """Return logical K for linear modes or total tree tokens for tree modes.
 
-    This selects the static maximum without applying a batch-size schedule or
-    changing engine state. PARD's physical buffer width is derived separately.
+    This selects the static maximum without applying a batch-size schedule.
+    PARD's physical buffer width is derived separately.
     """
-    spec_config = model_engine.spec_config
-    if spec_config is None or spec_config.is_linear_tree:
-        return model_engine.max_draft_len
-    return model_engine.max_total_draft_tokens
+    if spec_config is None:
+        return 0
+    if spec_config.is_linear_tree:
+        return spec_config.max_draft_len
+    return spec_config.tokens_per_gen_step - 1
 
 
 def resolve_draft_len(spec_config: Optional["DecodingBaseConfig"],
@@ -1055,6 +1056,6 @@ def update_draft_len(model_engine: "ModelEngine",
         model_engine.spec_config,
         scheduled_batch,
         max_draft_len=model_engine.max_draft_len,
-        static_draft_len=get_static_draft_len(model_engine),
+        static_draft_len=get_static_draft_len(model_engine.spec_config),
         draft_len=draft_len,
         speculation_permanently_disabled=speculation_permanently_disabled)
