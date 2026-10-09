@@ -80,6 +80,7 @@ class MultimodalKey(
 
     hash: str
     start_offset: int
+    uuid: str | None = None
 
 
 class BlockStored(KVCacheWireEvent):
@@ -540,7 +541,11 @@ class _StreamingEventSource:
                         mm_keys=(
                             [
                                 [
-                                    MultimodalKey(hash=bytes(key[0]).hex(), start_offset=key[1])
+                                    MultimodalKey(
+                                        hash=bytes(key[0]).hex(),
+                                        start_offset=key[1],
+                                        uuid=key[2] if len(key) >= 3 else None,
+                                    )
                                     for key in block_keys
                                 ]
                                 for block_keys in event.mm_keys

@@ -180,12 +180,13 @@ LayerGroupId = int
 LayerId = int
 LifeCycleId = int
 MemAddress = int
+MmItemContext = _cpp.MmItemContext
 PoolGroupIndex = int
 PoolIndex = int
 Priority = int
 SlidingWindowSize = Optional[int]
 TokenId = int
-TokenIdExt = Union[int, bytes]
+TokenIdExt = Union[int, bytes, MmItemContext]
 
 BAD_PAGE_INDEX = -1
 DEFAULT_BEAM_INDEX = 0
@@ -243,6 +244,7 @@ __all__ = [
     "LifeCycleId",
     "LogicError",
     "MemAddress",
+    "MmItemContext",
     "NDEBUG",
     "OutOfPagesError",
     "PageIndexConverter",
