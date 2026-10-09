@@ -570,14 +570,23 @@ class KimiKDALinearAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Project the block input into the ``[3D, T]`` the convolution needs.
 
+        The result is channel-major when the transposed GEMM can write it
+        directly, and otherwise a transposed view of token-major rows, which
+        the convolution and ``fused_kda_post_conv`` read through strides.
+
         Returns ``(packed_conv, onorm_g)``; ``onorm_g`` is None for
         configurations without a full-rank gate.
         """
         d = self.proj_size
         if self._qkvg_proj_weight is not None:
-            # Transposing the GEMM skips the repack the paths below still need.
             weight = self._qkvg_proj_weight
-            packed_conv = torch.mm(weight[: 3 * d], x2d.t())
+            # The transposed GEMM writes rows of T elements; cuBLAS's fast
+            # kernels need each row to start on a 16-byte boundary and fall
+            # back to a several-times-slower one otherwise.
+            if x2d.shape[0] * x2d.element_size() % 16 == 0:
+                packed_conv = torch.mm(weight[: 3 * d], x2d.t())
+            else:
+                packed_conv = torch.nn.functional.linear(x2d, weight[: 3 * d]).t()
             onorm_g = (
                 torch.nn.functional.linear(x, weight[3 * d : 4 * d])
                 if self.use_full_rank_gate
@@ -619,6 +628,14 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run KDA prefill for ``num_prefills`` packed context sequences.
+
+        ``x2d`` is ``[T, hidden]`` with sequence boundaries in ``cu_seqlens``.
+        Convolution windows in ``conv_pool`` and recurrent states in
+        ``ssm_pool`` are read and updated in place at ``slot_indices``.
+        Returns the gated core output before ``o_proj``, written into
+        ``output`` when one is given.
+        """
         chunk_indices = getattr(mamba_metadata, "kda_chunk_indices", None)
         varlen_is_aligned = getattr(mamba_metadata, "kda_varlen_is_aligned", None)
         single_sequence_length = getattr(mamba_metadata, "kda_single_sequence_length", None)
@@ -670,9 +687,11 @@ class KimiKDALinearAttention(nn.Module):
 
         # Reuse GDN's packed variable-length causal convolution. It reads
         # and writes the live [slots, 3D, W - 1] pool directly and honors
-        # has_initial_state for fresh versus continuation requests.
+        # has_initial_state for fresh versus continuation requests. It works in
+        # place on channel-major input and returns a new token-major tensor
+        # for a transposed view.
         assert self._packed_conv_weight is not None
-        causal_conv1d_fn(
+        packed_conv = causal_conv1d_fn(
             packed_conv,
             self._packed_conv_weight,
             query_start_loc=mamba_metadata.query_start_loc[: num_prefills + 1],
