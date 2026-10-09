@@ -264,9 +264,17 @@ class CoverageSelector:
                                             why,
                                         )
                                     impacted |= external_tests
-                            tests, bounded = self._qualname_impact(
+                            tests, bounded, limitation = self._qualname_impact(
                                 cf, consumer, dependencies, allow_caller_bound=True
                             )
+                            if limitation:
+                                return (
+                                    impacted,
+                                    sorted(no_data),
+                                    sorted(caller_bounded),
+                                    no_diff,
+                                    limitation,
+                                )
                             impacted |= tests
                             if not self.db.tests_touching_func(cf, consumer):
                                 no_data.add(f"{cf}::{consumer}")
@@ -281,12 +289,14 @@ class CoverageSelector:
                         return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
                     impacted |= tests
                     continue
-                tests, bounded = self._qualname_impact(
+                tests, bounded, limitation = self._qualname_impact(
                     cf,
                     qualname,
                     dependencies,
                     allow_caller_bound=qualname in dependencies.binding_consumers,
                 )
+                if limitation:
+                    return impacted, sorted(no_data), sorted(caller_bounded), no_diff, limitation
                 impacted |= tests
                 if not self.db.tests_touching_func(cf, qualname):
                     no_data.add(f"{cf}::{qualname}")
@@ -459,22 +469,24 @@ class CoverageSelector:
         dependencies: PythonChangeFacts,
         *,
         allow_caller_bound: bool = False,
-    ) -> tuple[set[str], bool]:
-        """Return a qualname's tests and whether local callers bounded a no-data symbol."""
+    ) -> tuple[set[str], bool, str | None]:
+        """Return tests, whether local callers bounded them, and any decline reason."""
         tests = self.db.tests_touching_func(cf, qualname)
         if tests:
-            return tests, False
+            return tests, False, None
         if allow_caller_bound:
-            caller_tests = self._caller_bound(
+            caller_tests, limitation = self._caller_bound(
                 cf,
                 qualname,
                 dependencies.callers,
                 dependencies.callable_escapes,
                 set(),
             )
+            if limitation:
+                return set(), False, limitation
             if caller_tests is not None:
-                return caller_tests, True
-        return self._no_data_fallback(cf), False
+                return caller_tests, True, None
+        return self._no_data_fallback(cf), False, None
 
     def _caller_bound(
         self,
@@ -483,10 +495,10 @@ class CoverageSelector:
         callers: dict[str, set[str]],
         caller_escapes: set[str],
         visiting: set[str],
-    ) -> set[str] | None:
+    ) -> tuple[set[str] | None, str | None]:
         """Resolve every local direct-caller branch to a qualname with DB rows."""
         if qualname in visiting or qualname in caller_escapes or not callers.get(qualname):
-            return None
+            return None, None
         visiting = visiting | {qualname}
         bound: set[str] = set()
         for caller in callers[qualname]:
@@ -494,11 +506,15 @@ class CoverageSelector:
             if tests:
                 bound |= tests
                 continue
-            transitive = self._caller_bound(cf, caller, callers, caller_escapes, visiting)
+            if self._external_reference_names(cf, {caller}):
+                return None, f"import-derived caller has external reference(s): {cf}::{caller}"
+            transitive, limitation = self._caller_bound(
+                cf, caller, callers, caller_escapes, visiting
+            )
             if transitive is None:
-                return None
+                return None, limitation
             bound |= transitive
-        return bound or None
+        return bound or None, None
 
     def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
         """File row set when it is wider than a closure's enclosing qualname's, else None."""

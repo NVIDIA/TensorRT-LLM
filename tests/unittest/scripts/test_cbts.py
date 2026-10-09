@@ -48,6 +48,7 @@ sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
 from blocks import Block, Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
+from coverage_tier import apply_coverage_tier  # noqa: E402
 from main import Selector, _combine_scopes  # noqa: E402
 from python_change_analysis import ImportTarget, analyze_python_changes  # noqa: E402
 from repository_reference import RepositoryReferenceIndex  # noqa: E402
@@ -856,7 +857,7 @@ def test_ambiguous_conditional_definition_remains_fail_closed(declaration: str) 
 
     analysis = _analyze(source, diff)
 
-    assert analysis.limitation
+    assert analysis.limitation == "ambiguous class/function declaration"
 
 
 def test_changed_condition_is_not_resolved_by_conditional_class_support() -> None:
@@ -1063,6 +1064,74 @@ def test_deleted_literal_anchored_to_unchanged_assignment_retains_old_consumer()
     assert analysis.binding_consumers == {"helper"}
 
 
+@pytest.mark.parametrize("declaration", ("def helper():", "async def helper():"))
+@pytest.mark.parametrize("decorator", ("", "@decorate\n"))
+def test_deleted_literal_adjacent_to_signature_retains_consumer(
+    declaration: str, decorator: str
+) -> None:
+    source = f"{decorator}{declaration}\n    return VALUE\n"
+    diff = "".join(
+        difflib.unified_diff(
+            ("VALUE = 521\n" + source).splitlines(keepends=True),
+            source.splitlines(keepends=True),
+        )
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize(
+    "deleted",
+    (
+        "initialize()\n",
+        "initialize(\n    1,\n)\n",
+        "VALUE = factory()\n",
+        "import sys as VALUE\n",
+        "from .helpers import VALUE\n",
+        "def removed():\n    return 1\n",
+        "class Removed:\n    VALUE = 1\n",
+    ),
+)
+def test_unsupported_deletion_adjacent_to_signature_remains_fail_closed(deleted: str) -> None:
+    source = "def helper():\n    return 0\n"
+    diff = "".join(
+        difflib.unified_diff(
+            (deleted + source).splitlines(keepends=True), source.splitlines(keepends=True)
+        )
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_class_attribute_adjacent_to_method_remains_fail_closed() -> None:
+    source = "class Example:\n    def helper(self):\n        return self.VALUE\n"
+    diff = (
+        "@@ -1,4 +1,3 @@\n class Example:\n-    VALUE = 521\n"
+        "     def helper(self):\n         return self.VALUE\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_literal_adjacent_to_signature_retains_pre_image_consumer() -> None:
+    source = "def helper():\n    return 0\n"
+    diff = "@@ -1,3 +1,2 @@\n-VALUE = 521\n def helper():\n-    return VALUE\n+    return 0\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
 @pytest.mark.parametrize("old_binding", ("VALUE = factory()", "import sys as VALUE"))
 def test_effectful_deletion_at_unchanged_assignment_remains_fail_closed(old_binding: str) -> None:
     source = "STABLE = 0.5\n"
@@ -1147,6 +1216,25 @@ def test_multiline_import_from_addition_resolves_consumer_and_new_target() -> No
     assert not analysis.old_import_targets
     assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
     assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_parenthesized_import_from_replacement_resolves_consumers_and_targets() -> None:
+    source = (
+        "from .helpers import (\n    new_helper,\n    stable,\n)\n\n"
+        "def consumer():\n    return new_helper()\n"
+    )
+    old_source = source.replace("new_helper", "old_helper")
+    diff = "".join(
+        difflib.unified_diff(old_source.splitlines(keepends=True), source.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"old_helper", "new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
 
 
 def test_new_import_from_statement_resolves_consumer_and_target() -> None:
@@ -1726,6 +1814,52 @@ def test_untrusted_type_checking_import_addition_remains_fail_closed(source: str
     assert analysis.limitation == "effectful module statement"
 
 
+@pytest.mark.parametrize("alias", ("typing", "t"))
+@pytest.mark.parametrize("rebound", (False, True))
+@pytest.mark.parametrize("has_else", (False, True))
+def test_typing_attribute_guard_requires_trusted_alias_and_no_else(
+    alias: str, rebound: bool, has_else: bool
+) -> None:
+    source = "import typing\n" if alias == "typing" else f"import typing as {alias}\n"
+    if rebound:
+        source += f"{alias} = fake()\n"
+    source += (
+        f"if {alias}.TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+    )
+    if has_else:
+        source += "else:\n    initialize()\n"
+    before = source.replace("    from .model import Model\n", "")
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), source.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(source, diff)
+
+    if rebound or has_else:
+        assert analysis.limitation == "effectful module statement"
+    else:
+        assert not analysis.limitation
+        assert not analysis.changed_bindings
+        assert not analysis.binding_consumers
+
+
+def test_type_checking_name_guard_with_else_remains_fail_closed() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+        "else:\n    initialize()\n"
+    )
+    diff = "@@ -2,0 +3 @@\n+    from .model import Model\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
+
+
 @pytest.mark.parametrize("body", ("", "# explanatory comment"))
 def test_added_module_noop_line_is_ignored(body: str) -> None:
     source = f"VALUE = 521\n{body}\n"
@@ -2042,6 +2176,47 @@ def test_local_shadow_does_not_create_binding_consumer() -> None:
     assert analysis.binding_consumers == set()
 
 
+@pytest.mark.parametrize("deleted_binding", (False, True))
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        "def consumer(VALUE):\n    return VALUE()\n",
+        "def consumer():\n    VALUE = lambda: 0\n    return VALUE()\n",
+        "def consumer():\n    import sys as VALUE\n    return VALUE()\n",
+    ),
+)
+def test_shadowed_direct_call_is_not_a_binding_consumer(
+    deleted_binding: bool, consumer: str
+) -> None:
+    before = "VALUE = 521\n\n" + consumer
+    after = "\n" + consumer if deleted_binding else before.replace("521", "522")
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(after, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert not analysis.binding_consumers
+
+
+@pytest.mark.parametrize("deleted_binding", (False, True))
+def test_explicit_global_direct_call_remains_a_binding_consumer(deleted_binding: bool) -> None:
+    before = "VALUE = 521\n\ndef consumer():\n    global VALUE\n    return VALUE()\n"
+    after = (
+        before.removeprefix("VALUE = 521\n") if deleted_binding else before.replace("521", "522")
+    )
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(after, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"consumer"}
+
+
 def test_comprehension_target_does_not_shadow_outer_iterable_load() -> None:
     source = "VALUE = (1, 2, 3)\n\ndef consumer():\n    return [VALUE for VALUE in VALUE]\n"
 
@@ -2139,6 +2314,39 @@ class _ExternalTestReferenceDB(_FakeDB):
         }
 
 
+def test_coverage_tier_uses_raw_diff_for_comment_only_core_change(tmp_path: Path) -> None:
+    path = "tensorrt_llm/example.py"
+    source_path = tmp_path / path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("# updated explanation\nVALUE = 521\n")
+    raw_diff = "@@ -1,2 +1,2 @@\n-# old explanation\n+# updated explanation\n VALUE = 521\n"
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(
+            yaml_stem="l0_a10",
+            block_index=0,
+            condition={},
+            tests=["test_caller", "test_unrelated"],
+        )
+    ]
+    stages = {
+        "A10-PyTorch-1": Stage(
+            name="A10-PyTorch-1",
+            yaml_stem="l0_a10",
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+    }
+    pr = PRInputs(changed_files=[path], diffs={path: ""}, raw_diffs={path: raw_diff})
+
+    result, note = apply_coverage_tier(pr, [], set(), stages, yaml_index, tmp_path, _FakeDB())
+
+    assert result is not None, note
+    assert result.removed == {("l0_a10", 0): {"test_caller", "test_unrelated"}}
+    assert result.dropped == {"A10-PyTorch-1"}
+
+
 def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     path = "tensorrt_llm/example.py"
     source = (
@@ -2158,6 +2366,53 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.impacted == {"A10-PyTorch": {"test_caller"}}
     assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
     assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+@pytest.mark.parametrize("reference_api", ("names", "paths"))
+def test_selector_rejects_external_transitive_no_data_caller(reference_api: str) -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 522\n\ndef helper():\n    return VALUE\n\n"
+        "def external():\n    return helper()\n\n"
+        "def caller():\n    return helper(), external()\n"
+    )
+    options = (
+        {"external_references": lambda _path, names: names & {"external"}}
+        if reference_api == "names"
+        else {
+            "external_reference_paths": lambda _path, names: {
+                name: {"tensorrt_llm/consumer.py"} for name in names & {"external"}
+            }
+        }
+    )
+    selector = CoverageSelector(_FakeDB(), REPO_ROOT, read_source=lambda _path: source, **options)
+
+    result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"})
+
+    assert not result.ok
+    assert "external" in result.reason
+
+
+def test_selector_uses_transitive_local_caller_rows_when_no_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 522\n\ndef helper():\n    return VALUE\n\n"
+        "def middle():\n    return helper()\n\n"
+        "def caller():\n    return middle()\n"
+    )
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
 
 

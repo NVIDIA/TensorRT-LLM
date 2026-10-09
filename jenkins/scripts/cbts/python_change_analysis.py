@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import textwrap
 from dataclasses import dataclass, field
 
 
@@ -1104,8 +1105,29 @@ def analyze_python_changes(
                     and _same_ast(function.returns, old_function.returns)
                     and function.type_comment == old_function.type_comment
                 ):
-                    # A deletion immediately before a declaration is anchored
-                    # to its unchanged signature in the post-image diff.
+                    deleted = deleted_lines.get(line)
+                    if deleted:
+                        try:
+                            deleted_tree = ast.parse(textwrap.dedent("\n".join(deleted)))
+                        except SyntaxError:
+                            return PythonChangeFacts(
+                                set(), set(), {}, "unresolved import replacement"
+                            )
+                        old_node = deleted_tree.body[0] if len(deleted_tree.body) == 1 else None
+                        old_names = (
+                            _module_binding_names(old_node, future_annotations)
+                            if old_node is not None and "." not in signature_qualname
+                            else None
+                        )
+                        if (
+                            old_names is None
+                            or isinstance(old_node, ast.Import)
+                            or old_names & module_bindings
+                        ):
+                            return PythonChangeFacts(
+                                set(), set(), {}, "unresolved import replacement"
+                            )
+                        deleted_binding_names.update(old_names)
                     continue
                 if not _safe_signature_addition(
                     function,
@@ -1329,7 +1351,7 @@ def analyze_python_changes(
         for fact in variants
         if (
             fact.nested_loaded
-            | fact.calls
+            | {name for name in fact.calls if name not in fact.bound or name in fact.globals}
             | {name for name in fact.loaded if name not in fact.bound or name in fact.globals}
         )
         & binding_names
@@ -1340,7 +1362,7 @@ def analyze_python_changes(
         for fact in variants
         if (
             fact.nested_loaded
-            | fact.calls
+            | {name for name in fact.calls if name not in fact.bound or name in fact.globals}
             | {name for name in fact.loaded if name not in fact.bound or name in fact.globals}
         )
         & deleted_binding_names
