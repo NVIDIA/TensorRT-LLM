@@ -647,7 +647,7 @@ class EncoderDecoderRunner(DecoderRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
         attn_metadata = self._metadata.set_up_attn(kv_cache_manager, draft_kv_cache_manager)
-        with self.no_cuda_graph():
+        with self._graphs.no_cuda_graph():
             projection_inputs, _, _ = self._prepare_inputs(
                 projection_batch,
                 kv_cache_manager,

@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import \
     setup_mm_encoder_attn_metadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import \
+    DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import \
     DecoderInputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
@@ -340,7 +342,6 @@ def _make_forward_only_engine(
     decoder._get_draft_kv_cache_manager = Mock(return_value=None)
     engine._runner = decoder
     decoder._lora = SimpleNamespace(cuda_graph_manager=None)
-    decoder._force_lora_graph_for_capture = None
     decoder._trtllm_gen_jit_warmup = False
 
     semantic_attn_metadata = Mock()
@@ -366,7 +367,6 @@ def _make_forward_only_engine(
     outputs = {"logits": object()}
     decoder._forward_step = Mock(return_value=outputs)
     decoder._execute_logit_post_processors = Mock()
-    decoder.breakable_cuda_graph_runner = None
 
     runner = Mock()
     runner.enabled = runner_enabled
@@ -379,7 +379,9 @@ def _make_forward_only_engine(
     runner.needs_capture.return_value = False
     runner.is_warmup_only = False
     runner.replay.return_value = outputs
-    decoder.cuda_graph_runner = runner
+    decoder._graphs = SimpleNamespace(cuda_graph_runner=runner,
+                                      breakable_cuda_graph_runner=None,
+                                      force_lora_graph_for_capture=None)
 
     resource_manager = Mock()
     peft_cache_manager = Mock(data_type=torch.bfloat16)
@@ -481,7 +483,7 @@ def _install_graph_runner_stub(runner: DecoderRunner,
         }
 
     stub.replay.side_effect = replay
-    runner.cuda_graph_runner = stub
+    runner._graphs.cuda_graph_runner = stub
     return stub
 
 
@@ -988,7 +990,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_lora_graph_variant_selection(self) -> None:
         engine = object.__new__(DecoderRunner)
         engine._lora = SimpleNamespace(cuda_graph_manager=object())
-        engine._force_lora_graph_for_capture = None
+        engine._graphs = SimpleNamespace(force_lora_graph_for_capture=None)
         engine._config = SimpleNamespace(cuda_graph_specialize_lora=True)
         request = _make_request_stub(7)
         batch = ScheduledRequests()
@@ -1003,7 +1005,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine._config.cuda_graph_specialize_lora = False
         self.assertTrue(engine._use_lora_cuda_graph(batch))
 
-        engine._force_lora_graph_for_capture = False
+        engine._graphs.force_lora_graph_for_capture = False
         self.assertFalse(engine._use_lora_cuda_graph(batch))
 
     def test_graph_lookup_forwards_promoted_context_ids(self) -> None:
@@ -1220,7 +1222,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
                 breakable_runner.is_warming_up = False
                 breakable_runner.has_graph.return_value = True
                 breakable_runner.execute.return_value = outputs
-                engine._runner.breakable_cuda_graph_runner = breakable_runner
+                engine._runner._graphs.breakable_cuda_graph_runner = breakable_runner
                 prepared = engine._runner._prepare_inputs.return_value
 
                 def prepare_prefill_graph_batch(*args, **kwargs):
@@ -1977,8 +1979,26 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         engine._runner = decoder
         engine._torch_compile_backend = None
         decoder._prepare_inputs_event = Mock()
-        decoder.cuda_graph_runner = Mock()
-        decoder.breakable_cuda_graph_runner = Mock()
+        decoder._graphs = DecoderCudaGraphs(
+            Mock(),
+            Mock(),
+            config=None,
+            mapping=None,
+            model=None,
+            sparse_attention_config=None,
+            metrics={},
+            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
+            dummy_requests=None,
+            agreement=None,
+            metadata=None,
+            get_runtime_tokens_per_gen_step=None,
+            dynamic_draft_len_mapping=None,
+            lora=None,
+            forward_warmup=None,
+            prepare_capture_batch=None,
+            capture_additional_graphs=None,
+            release_batch_context=None,
+        )
 
         engine.wait_for_input_copy()
         engine._release_cuda_graphs()

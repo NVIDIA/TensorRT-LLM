@@ -176,7 +176,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine.mapping = SimpleNamespace(cp_size=1)
         self.engine.sparse_attention_config = None
         self.engine._torch_compile_backend = None
-        self.engine.breakable_cuda_graph_runner = None
+        self.engine._graphs = SimpleNamespace(breakable_cuda_graph_runner=None)
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
@@ -235,7 +235,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         for target, name, value in [
             (self.engine._config, "is_spec_decode", True),
             (self.engine, "_torch_compile_backend", object()),
-            (self.engine, "breakable_cuda_graph_runner", object()),
+            (self.engine._graphs, "breakable_cuda_graph_runner", object()),
             (self.engine, "sparse_attention_config", object()),
         ]:
             with self.subTest(mode=name), patch.object(target, name, value):

@@ -446,7 +446,7 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderRu
         original_max_draft_len=0,
         enable_autotuner=False,
     )
-    engine.no_cuda_graph = contextlib.nullcontext
+    engine._graphs = SimpleNamespace(no_cuda_graph=contextlib.nullcontext)
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
     # default, i.e. no alignment rewrite.
