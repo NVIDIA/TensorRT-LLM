@@ -112,46 +112,10 @@ jenkins/scripts/cbts/
 ├── coverage_utils/        post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 └── tools/
     ├── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
-    ├── backtest.py        freeze current policy and replay a pinned cohort → decisions, provenance, hit/skip rates and comparisons
     ├── coverage_audit.py  report a touch DB's format, scale, untrusted rate and HEAD coverage gap
     ├── coverage_explain.py  explain one commit's decision case by case (delegates to CoverageSelector)
     └── report_cbts_decision.py  post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 ```
-
-After a CBTS selection optimization, replay the agreed cohort and coverage DB. The current
-import-analysis optimization target is the fixed **39 PRs** in
-`tools/cohorts/import_executed_39.json`, using build **3010**. Compare against the preceding
-39-PR result directory; do not refresh coverage or rerun 200 commits for each optimization:
-
-```bash
-python3 jenkins/scripts/cbts/tools/backtest.py \
-    --cohort jenkins/scripts/cbts/tools/cohorts/import_executed_39.json \
-    --coverage-db /path/to/cbts_touchmap.sqlite --coverage-meta /path/to/coverage.json \
-    --check-compatibility --compare /path/to/previous-39-pr-run \
-    --out /tmp/cbts-import-39-unique --jobs 4
-```
-
-For a newly requested broad evaluation, use the newest complete x86_64/SBSA coverage pair
-and all of the latest 200 first-parent commits:
-
-```bash
-git fetch upstream main
-python3 jenkins/scripts/cbts/tools/backtest.py --window 200 --check-compatibility \
-    --out /tmp/cbts-backtest-unique --jobs 4
-```
-
-The runner freezes working-tree CBTS code, including uncommitted edits, and uses each historical
-commit's own source, test-db, and stage inventory. `REPORT.md` and `summary.json` distinguish
-Tier-1/Tier-2 hits, effective narrowing, fallback, and errors. These are retrospective candidate
-decisions, not historical CI measurements; the latest DB can postdate the sampled change. Case
-counts are YAML entries per stage family, with the pre-merge multi-GPU label gate assumed closed.
-Residual patch compatibility is checked locally, but coverage pilot eligibility is not simulated.
-
-For before/after comparisons, keep the cohort and coverage DB fixed. Reuse a previous run's
-`manifest.json` with `--cohort`, its DB and `coverage.json` with `--coverage-db` and
-`--coverage-meta`, and the previous result directory with `--compare`. Use `--policy-ref HEAD`
-to evaluate the committed baseline when the optimization is still uncommitted. Always use a
-new output directory; errors remain in the denominator and produce a nonzero exit status.
 
 ## Lookup algorithms
 
