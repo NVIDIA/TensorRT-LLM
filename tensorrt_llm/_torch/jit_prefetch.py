@@ -373,6 +373,7 @@ class _Stats:
     dg_executor_compile_s: float = 0.0
     cd_loaded: int = 0
     cd_executor_compiles: int = 0
+    cd_executor_compile_s: float = 0.0
     events: List[str] = field(default_factory=list)
 
 
@@ -745,9 +746,9 @@ class JitPrefetcher:
                 self._event(f"WAIT for helper cute_dsl {dt * 1e3:.0f} ms")
             fn = jcd.load(spec, out_dir)
             if fn is None:
+                # The compile that follows is counted by the cute.compile wrapper.
                 if threading.get_ident() == self._executor_thread:
-                    self.stats.cd_executor_compiles += 1
-                    self._event(f"CuTe DSL compile on executor (not prefetched): {spec}")
+                    self._event(f"CuTe DSL variant not prefetched: {spec}")
                 self._record(jcd.KIND, "cute_dsl", spec)
             else:
                 self.stats.cd_loaded += 1
@@ -914,7 +915,54 @@ class JitPrefetcher:
         )
 
     # -- measurement hooks ------------------------------------------------
+    def _install_cute_dsl_counter(self) -> None:
+        """Count and time every ``cute.compile`` on the executor thread.
+
+        Wraps ``cutlass.cute.compile`` (and its ``compile[...]`` option form)
+        so the JIT stats cover CuTe DSL as well as Triton and DeepGEMM: one
+        ``CUTE_DSL compile on executor <fn> <s>`` event per compile, plus
+        ``cd_executor_compiles`` / ``cd_executor_compile_s`` in the summary.
+        """
+        try:
+            import cutlass.cute as cute
+        except ImportError:
+            return
+        orig = cute.compile
+        if getattr(orig, "_jitp_wrapped", False):
+            return
+        me = self
+
+        def _time(fn, call):
+            if threading.get_ident() != me._executor_thread:
+                return call()
+            t0 = time.perf_counter()
+            try:
+                return call()
+            finally:
+                dt = time.perf_counter() - t0
+                me.stats.cd_executor_compiles += 1
+                me.stats.cd_executor_compile_s += dt
+                name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", repr(fn))
+                me._event(f"CUTE_DSL compile on executor {name} {dt * 1e3:.0f} ms")
+
+        class _Compile:
+            _jitp_wrapped = True
+
+            def __call__(self, fn, *a, **kw):
+                return _time(fn, lambda: orig(fn, *a, **kw))
+
+            def __getitem__(self, opts):
+                inner = orig[opts]
+
+                def call(fn, *a, **kw):
+                    return _time(fn, lambda: inner(fn, *a, **kw))
+
+                return call
+
+        cute.compile = _Compile()
+
     def _install_hooks(self):
+        self._install_cute_dsl_counter()
         from triton import knobs
 
         stats = self.stats
@@ -1139,6 +1187,7 @@ class JitPrefetcher:
             f" dg_executor_compiles={s.dg_executor_compiles}"
             f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"
             f" cd_loaded={s.cd_loaded} cd_executor_compiles={s.cd_executor_compiles}"
+            f" cd_executor_compile_s={s.cd_executor_compile_s:.3f}"
         )
 
     def shutdown(self):
