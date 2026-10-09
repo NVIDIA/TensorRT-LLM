@@ -650,6 +650,7 @@ def _apply_attn_res_rmsnorm_fused(
         output_norm.weight.to(torch.bfloat16).contiguous(),
         float(norm.eps),
         _rms_norm_eps(output_norm),
+        early_trigger=True,
     )
     _note_attn_res_fusion("attn_res+norm", True, M, H, N)
     return output.reshape(M, H)
@@ -725,6 +726,7 @@ def _apply_attn_res_add_rmsnorm_fused(
         output_norm.weight.to(torch.bfloat16).contiguous(),
         float(norm.eps),
         _rms_norm_eps(output_norm),
+        early_trigger=True,
     )
     _note_attn_res_fusion("add+attn_res+norm", True, M, H, N)
     return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
