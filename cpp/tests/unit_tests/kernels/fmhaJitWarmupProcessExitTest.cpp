@@ -58,7 +58,7 @@ std::string gMainThreadExecPath;
 
     // "Empty barrier": nothing has been queued and the install path has never
     // been computed. This must not create a worker whose shutdown ordering
-    // depends on statics that do not exist yet.
+    // depends on static objects that do not exist yet.
     EXPECT_EQ(TllmGenFmhaKernel::drainAndVerifyAllJITWarmups(), 0);
     EXPECT_FALSE(asyncJITWarmupWorkerCreated().load());
 

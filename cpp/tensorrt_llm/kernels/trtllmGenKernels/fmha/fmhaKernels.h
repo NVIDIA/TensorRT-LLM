@@ -1521,7 +1521,7 @@ private:
         fmhaData.mOutputBuffers.partialOPtrD = fmhaData.mOutputBuffers.partialStatsPtrD + partialStatsBufferSize;
         fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD = nullptr; // Not available in params (would need to be added)
         fmhaData.mOutputBuffers.softmaxStatsD = params.softmaxStatsPtr;
-        fmhaData.mOutputBuffers.oDebugPtrD = nullptr; // Debug output not supported in TensorRT-LLM
+        fmhaData.mOutputBuffers.oDebugPtrD = nullptr;           // Debug output not supported in TensorRT-LLM
 
         // Print all primitive type variables in FmhaData for debugging
     }

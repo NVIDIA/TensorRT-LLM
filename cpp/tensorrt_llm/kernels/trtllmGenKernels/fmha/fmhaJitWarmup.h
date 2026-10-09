@@ -52,7 +52,7 @@ namespace kernels
 // Lifetime: the process-wide instance is leaked and shut down (drained, then
 // joined) through a std::atexit handler registered when the worker is first
 // created, so no sweep is still running during static destruction. The
-// ordering of that handler against other statics is not relied upon: every
+// ordering of that handler against other static objects is not relied upon: every
 // object a sweep reads is either leaked (the sweep registry, the export
 // library's interface and selection mutexes, the install-path string) or
 // constructed when the library is loaded (the export library's own globals),
