@@ -96,6 +96,7 @@ class OpenEngineServer:
         port: Port on which the server listens. Use zero to select a free port.
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
     def __init__(
@@ -107,6 +108,7 @@ class OpenEngineServer:
         *,
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
+        subagent_affinity_auth_key: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -116,7 +118,11 @@ class OpenEngineServer:
         self._server = grpc.aio.server(options=options)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
-            llm, model, kv_transfer_backend=kv_transfer_backend, frontend=frontend
+            llm,
+            model,
+            kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
+            subagent_affinity_auth_key=subagent_affinity_auth_key,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -195,6 +201,7 @@ def launch_server(
     served_model_name: str | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
     enable_load_metrics: bool = False,
+    subagent_affinity_auth_key: str | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
 
@@ -205,6 +212,7 @@ def launch_server(
         served_model_name: Model name accepted by Generate. Defaults to the model path.
         report_failure: Records a child exit before startup readiness.
         enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
     async def serve() -> None:
@@ -364,6 +372,7 @@ def launch_server(
                 model=model,
                 frontend=frontend,
                 instance_id=instance_id,
+                subagent_affinity_auth_key=subagent_affinity_auth_key,
             )
             _disable_gc_if_requested()
             await server.start()
