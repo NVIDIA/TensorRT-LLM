@@ -2745,7 +2745,6 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "agent_bounce_buffer_enable": True,
                 "kv_cache_bounce_size_mb": 512,
                 # Relax the admission gates for this short CI workload.
                 # The production defaults remain 1024 descriptors / 16 KiB.

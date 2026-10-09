@@ -67,11 +67,6 @@ environment:
   #   TRTLLM_WORKER_UCX_TLS=tcp,self,sm,cuda_copy,cuda_ipc to
   #   worker_env_var below; start_worker.sh re-exports it as UCX_TLS
   #   after the clear. Note that list excludes RDMA/verbs.
-  # - pairs with the workers'
-  #   kv_cache_bounce_size_mb (fabric-VMM bounce; measured
-  #   ~455 GB/s/GPU). The default gate of 96 blocks would silently skip
-  #   bounce for requests under 6144 tokens at tokens_per_block=64,
-  #   falling back to ~0.4 GB/s host-staged tcp.
   # - pyxis/enroot reset image-defined PATH at container start, so the
   #   in-place venv is injected via TRTLLM_PATH_PREPEND /
   #   TRTLLM_PYTHONPATH_PREPEND, which the harness scripts apply inside
@@ -103,17 +98,13 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON  # mandatory: C++ path throws for K3
       max_tokens_in_buffer: 8448
-      # Fabric-VMM bounce: needed for cross-node V2 transfers on clusters
-      # where inter-node cuda_ipc requires fabric allocations (else
-      # ~0.4 GB/s host-staged tcp); measured ~455 GB/s/GPU with
-      # (worker_env_var above).
-      # 1024 fits one full request payload (433 MiB KDA state + ~27 KB/token
-      # MLA latent = 649 MiB at 8k ISL); at 512 every 8k transfer falls back
-      # to the per-fragment tcp path.
+      # C++ transfer-agent bounce buffer; must match the ctx server. With
+      # default agent_bounce_params K3's head-matched writes are declined and
+      # use standard NIXL -- see ctx_config.yaml.
       kv_cache_bounce_size_mb: 1024
     trust_remote_code: true
-  # CTX: matched DEP16 (see ../disagg/ctx_config.yaml for the sizing
-  # rationale; hetero ctx/gen parallelism is not supported yet).
+  # CTX: matched DEP16 (see ../disagg/ctx_config.yaml; hetero ctx/gen
+  # parallelism is not supported yet).
   ctx:
     tensor_parallel_size: 16
     moe_expert_parallel_size: 16

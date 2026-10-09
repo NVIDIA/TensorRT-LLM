@@ -5,7 +5,9 @@
 # Default: CUDA graphs ON. Validated end-to-end: GSM8K 96.89 (in the
 # aggregated band) and 765/2138 out tok/s at c64/c256 — ~3x the eager
 # TPOT and above aggregated serving throughput despite the overlap
-# scheduler being off (a disagg requirement on the ctx side).
+# scheduler being off (a disagg requirement on the ctx side). Measured
+# with the former Python KV bounce buffer as the transfer path; not yet
+# re-measured on the current one (see ctx_config.yaml).
 # For strict token-parity debugging (attribution-clean SA-on/SA-off or
 # disagg-vs-agg comparisons), null out the cuda graph config to match
 # the SA config's eager regime, and place ctx and gen in SEPARATE NVL72
@@ -38,13 +40,7 @@ cache_transceiver_config:
   # throws for K3's MixedMambaHybridCacheManager.
   transceiver_runtime: PYTHON
   max_tokens_in_buffer: 8448
-  # Fabric-VMM bounce buffer (recv side); must match the ctx server.
-  # Without it, cross-node V2 pool-to-pool transfers fall back to
-  # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.
-  # Bounce engages automatically above TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES
-  # (default 2 MiB) — always true for K3 payloads.
-  # at tokens_per_block=64). See ctx_config.yaml.
-  # Sized to fit one full request payload (fixed 433 MiB KDA state +
-  # ~27 KB/token MLA latent; 649 MiB at 8k ISL) -- see ctx_config.yaml;
-  # at 512 every 8k transfer falls back to the per-fragment tcp path.
+  # C++ transfer-agent bounce buffer; must match the ctx server. With default
+  # agent_bounce_params K3's head-matched writes are declined and use standard
+  # NIXL -- see ctx_config.yaml.
   kv_cache_bounce_size_mb: 1024

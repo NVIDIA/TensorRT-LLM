@@ -66,7 +66,6 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     speculative_config: &id001
       decoding_type: Eagle
@@ -99,7 +98,6 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     speculative_config: *id001
     trust_remote_code: true
