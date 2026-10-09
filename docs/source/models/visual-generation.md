@@ -299,6 +299,51 @@ In addition to linear-layer quantization, VisualGen exposes multiple backend-spe
 
 VisualGen CUDA graphs capture transformer forward calls during denoising and replay them for later steps with compatible inputs. See [VisualGen CUDA Graphs](../features/visualgen-cuda-graph.md) for capture scope, graph keys, and sparse-attention phase behavior.
 
+### Warmup and Compiled Shapes
+
+At startup, each pipeline runs a warmup pass that compiles — and, when CUDA graphs are enabled, captures — the transformer for a set of shapes, so the first requests do not compile inside measured latency. The plan comes from `VisualGenArgs.compilation_config` (the `compilation_config:` block in a model's YAML config):
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `resolutions` | list of `(height, width)` | model defaults | Warmup shapes are the Cartesian product with `num_frames`. |
+| `num_frames` | list of int | model defaults | Use `[1]` for image models. |
+| `skip_warmup` | bool | `false` | Skip the warmup pass; every new shape compiles on first use. |
+| `reference_variants` | list of variants | model defaults | Reference-carrying variants warmed in addition to the plain pass at every shape; `[]` disables reference warmup. |
+
+For models whose references change the compiled shape — a reference image is encoded and its tokens join the transformer sequence (FLUX.2), or prepend condition rows (MiniMax-H3) — the plain pass alone does not cover reference-carrying requests. Each entry of `reference_variants` describes the references attached to one synthetic warmup request:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `images` | list of `(height, width)` | One image reference per entry. |
+| `videos` | list of `(height, width, num_frames)` | One video reference per entry. |
+| `audio` | list of float | One audio reference per entry, duration in seconds. |
+
+Warmup synthesizes dummy references of these sizes and runs them through the same preprocessing as real requests, so warmed shapes match request shapes exactly. Per-modality counts are validated against the model's accepted reference slots (e.g. MiniMax-H3 ref2va accepts at most 9 images, 3 videos and 3 audio references); invalid variants are skipped with a warning.
+
+A model serving only single-reference requests needs no configuration: the default variant already warms one reference at the output shape (FLUX.2, MiniMax-H3 ref2va) or both first/last-frame keyframe counts (MiniMax-H3 FL2VA). Configure `reference_variants` when serving multi-reference or mixed-modality requests:
+
+```yaml
+# FLUX.2: cover one- and two-reference image edits.
+compilation_config:
+  resolutions: [[1024, 1024]]
+  num_frames: [1]
+  reference_variants:
+    - images: [[1024, 1024]]                  # one reference
+    - images: [[1024, 1024], [720, 1280]]     # two references
+```
+
+```yaml
+# MiniMax-H3 ref2va: mixed image + video + audio conditioning.
+compilation_config:
+  reference_variants:
+    - images: [[768, 1344]]                   # one image reference
+    - images: [[1024, 1024]]                  # image + video + audio
+      videos: [[480, 832, 49]]
+      audio: [5.0]
+```
+
+Only the configured variants are warmed: a request whose reference composition matches no warmed variant still compiles on first use, and the executor logs the un-warmed shape.
+
 ### Step Caching
 
 Both caching backends are configured through `VisualGenArgs.cache_config`. The backend is selected by the `cache_backend` discriminator field.
