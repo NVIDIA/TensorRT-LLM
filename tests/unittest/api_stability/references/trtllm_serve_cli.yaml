@@ -56,7 +56,7 @@ commands:
         flags:
         - "--allow_request_chat_template"
       backend:
-        type: Choice(['_autodeploy', 'pytorch'])
+        type: Choice(['pytorch'])
         default: pytorch
         status: deprecated
         required: false
@@ -73,6 +73,15 @@ commands:
         is_flag: false
         flags:
         - "--chat_template"
+      config_overrides:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: true
+        is_flag: false
+        flags:
+        - "--set"
       context_parallel_size:
         type: int
         default: 1
@@ -147,15 +156,6 @@ commands:
         flags:
         - "--config"
         - "--extra_llm_api_options"
-      fail_fast_on_attention_window_too_large:
-        type: bool
-        default: true
-        status: deprecated
-        required: false
-        multiple: false
-        is_flag: true
-        flags:
-        - "--fail_fast_on_attention_window_too_large"
       free_gpu_memory_fraction:
         type: float
         default: 0.9
@@ -386,7 +386,7 @@ commands:
         flags:
         - "--post_processor_hook"
       reasoning_parser:
-        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
+        type: Choice(['auto', 'deepseek-r1', 'deepseek_v4', 'gemma4', 'k-exaone', 'kimi_k2', 'kimi_k25', 'kimi_k3', 'laguna', 'minimax_m2', 'minimax_m2_append_think', 'minimax_m3', 'nano-v3', 'nemotron-v3', 'poolside_v1', 'qwen3', 'qwen3_5'])
         default: null
         status: prototype
         required: false

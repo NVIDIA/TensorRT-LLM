@@ -383,9 +383,9 @@ class TestSADisaggGenInit:
             manager.shutdown()
 
     def test_disagg_gen_init_defers_to_generation_schedule(self):
-        """Ctx/gen spec split: init must NOT happen at _prepare_disagg_gen_init.
+        """Ctx/gen spec split: init must NOT happen at _prepare_disagg_gen_resources.
 
-        The executor's _prepare_disagg_gen_init routes DISAGG_GENERATION_INIT
+        The executor's _prepare_disagg_gen_resources routes DISAGG_GENERATION_INIT
         requests through prepare_resources as context_requests_last_chunk
         BEFORE the ctx server's first generated token has been appended
         (that happens later, in _prepare_disagg_gen_transmission_complete).
@@ -400,7 +400,7 @@ class TestSADisaggGenInit:
             prompt = [1, 2, 3, 4, 5]
             req = _FakeSARequest(11, prompt, generation_only=True)
 
-            # Phase 1: _prepare_disagg_gen_init — request arrives as a
+            # Phase 1: _prepare_disagg_gen_resources — request arrives as a
             # context_requests_last_chunk entry with prompt-only tokens.
             init_batch = ScheduledRequests()
             init_batch.context_requests_last_chunk = [req]

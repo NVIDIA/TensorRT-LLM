@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 namespace
@@ -38,6 +39,7 @@ namespace
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
+using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeHybridTieredConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
 
 TEST(KvCacheManagerV2StatsTest, StatsDeltaArithmetic)
@@ -121,6 +123,35 @@ TEST(KvCacheManagerV2StatsTest, PendingReuseSurvivesAllocationRollbackUntilClear
     EXPECT_EQ(iteration.iterPartialReusedBlocks, 1);
 
     pending.clear();
+    EXPECT_TRUE(pending.empty());
+}
+
+TEST(KvCacheManagerV2StatsTest, PendingReuseByLevelRidesAlongWithScalarCounts)
+{
+    PendingStats pending;
+    ReusedBlocksByLevel firstMatch;
+    firstMatch.full = {2, 0, 1};
+    firstMatch.partial = {0, 1, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/3, /*partialReusedBlocks=*/1, firstMatch));
+
+    // A second match on the same life cycle accumulates element-wise.
+    ReusedBlocksByLevel secondMatch;
+    secondMatch.full = {1, 4, 0};
+    secondMatch.partial = {0, 0, 0};
+    EXPECT_TRUE(pending.recordReuse(LifeCycleId{0}, /*fullReusedBlocks=*/5, /*partialReusedBlocks=*/0, secondMatch));
+
+    auto const& byLevel = pending.reusedBlocksByLevelByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(byLevel.full.raw(), (std::vector<int64_t>{3, 4, 1}));
+    EXPECT_EQ(byLevel.partial.raw(), (std::vector<int64_t>{0, 1, 0}));
+    // The by-level split must agree with the scalar counters it rides along with.
+    auto const& iteration = pending.iterationStatsByLifeCycle().at(LifeCycleId{0});
+    EXPECT_EQ(std::accumulate(byLevel.full.begin(), byLevel.full.end(), int64_t{0}), iteration.iterFullReusedBlocks);
+    EXPECT_EQ(
+        std::accumulate(byLevel.partial.begin(), byLevel.partial.end(), int64_t{0}), iteration.iterPartialReusedBlocks);
+
+    // Discarding the request drops the by-level split together with the scalar counters.
+    pending.clear();
+    EXPECT_TRUE(pending.reusedBlocksByLevelByLifeCycle().empty());
     EXPECT_TRUE(pending.empty());
 }
 
@@ -326,15 +357,13 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     }
 
     auto cache = manager->createKvCache();
-    std::vector<BatchedLockTarget> targets;
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{2}; ++ordinal)
     {
         auto const& page = firstPages[toSizeT(ordinal)];
         ASSERT_TRUE(page->scheduledForEviction());
         storage.excludeFromEviction(*page);
-        targets.push_back({page, kDefaultBeamIndex, ordinal, lifeCycle});
     }
-    storage.batchedMigrateToGpu(targets, *cache, migrationRecorder);
+    storage.batchedMigrate(kHotLevel, firstPages, migrationRecorder);
     EXPECT_EQ(onboarded, 2);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
     for (size_t index = 0; index < firstPages.size(); ++index)
@@ -358,7 +387,6 @@ TEST(KvCacheManagerV2StatsTest, MigrationAndLastTierDropRecordersReceiveExactPag
     auto secondPages = makeCommittedPages(std::move(temporarySlots[lifeCycle]));
     (void) secondPages;
     firstPages.clear();
-    targets.clear();
 
     auto finalSlots = storage.newGpuSlots(twoSlots, migrationRecorder, dropRecorder);
     EXPECT_EQ(offloaded, 6);
@@ -421,6 +449,169 @@ TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressSuspendResumeCounters)
     EXPECT_EQ(resumed, 0);
 
     cache->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+// Hybrid attention + SSM page-movement statistics.
+//
+// Iteration statistics are keyed by life cycle and must report recurrent (SSM) page
+// movement alongside attention movement, otherwise KDA recurrent-state offload, onboard
+// and drop are invisible to callers. The global cache-hit counters are the deliberate
+// exception: they stay attention-only.
+//
+// The tiers below give the attention life cycle 4 GPU and 2 host slots of 1 MiB, and the
+// SSM life cycle 1 GPU and 1 host slot of 2 MiB, so a second sequence evicts the first and
+// a second eviction round overflows the host pool.
+namespace
+{
+constexpr int kHybridBlocks = 3;
+constexpr CacheLevel kHybridHostLevel{1};
+
+int64_t slotBytesFor(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
+{
+    int64_t bytes = 0;
+    for (size_t const size : storage.slotSize(storage.getPoolGroupIndex(level, lifeCycle)))
+    {
+        bytes += static_cast<int64_t>(size);
+    }
+    return bytes;
+}
+
+std::vector<TokenIdExt> makeTokens(KvCacheManager const& manager, int firstToken)
+{
+    std::vector<TokenIdExt> tokens;
+    for (int offset = 0; offset < kHybridBlocks * manager.tokensPerBlock(); ++offset)
+    {
+        tokens.emplace_back(TokenId{firstToken + offset});
+    }
+    return tokens;
+}
+
+// Fill a sequence, park it, then start a second one that needs the same slots. Returns the
+// still-open second sequence so the caller can close it to trigger the onboard.
+std::pair<std::shared_ptr<KvCache>, std::shared_ptr<KvCache>> evictFirstSequence(
+    KvCacheManager& manager, cudaStream_t stream, int firstToken)
+{
+    auto const tokens = makeTokens(manager, firstToken);
+    auto first = manager.createKvCache();
+    EXPECT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    EXPECT_TRUE(first->resize(static_cast<int>(tokens.size())));
+    first->commit(toSpan(tokens));
+    first->suspend();
+
+    auto second = manager.createKvCache();
+    EXPECT_TRUE(second->resume(reinterpret_cast<CUstream>(stream)));
+    EXPECT_TRUE(second->resize(static_cast<int>(tokens.size())));
+    return {std::move(first), std::move(second)};
+}
+} // namespace
+
+TEST(KvCacheManagerV2StatsTest, OffloadAndOnboardAreRecordedForAttentionAndSsmLifeCycles)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeHybridTieredConfig());
+    auto& storage = manager->storage();
+    LifeCycleId const attention{0};
+    LifeCycleId const ssm{1};
+    ASSERT_TRUE(std::holds_alternative<AttnLifeCycle>(manager->lifeCycles().getLifeCycle(attention)));
+    ASSERT_FALSE(std::holds_alternative<AttnLifeCycle>(manager->lifeCycles().getLifeCycle(ssm)));
+
+    manager->getAndResetIterationStats();
+    auto [first, second] = evictFirstSequence(*manager, stream, 0);
+
+    auto const offload = manager->getAndResetIterationStats();
+    ASSERT_EQ(offload.size(), 2) << "both life cycles must report offload";
+    for (LifeCycleId const lifeCycle : {attention, ssm})
+    {
+        auto const& stats = offload.at(lifeCycle);
+        EXPECT_GT(stats.iterOffloadBlocks, 0) << "life cycle " << lifeCycle.value();
+        EXPECT_EQ(stats.iterOffloadBytes, stats.iterOffloadBlocks * slotBytesFor(storage, kHotLevel, lifeCycle));
+    }
+
+    second->close();
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+
+    auto const onboard = manager->getAndResetIterationStats();
+    ASSERT_EQ(onboard.size(), 2) << "both life cycles must report onboard";
+    for (LifeCycleId const lifeCycle : {attention, ssm})
+    {
+        auto const& stats = onboard.at(lifeCycle);
+        EXPECT_GT(stats.iterOnboardBlocks, 0) << "life cycle " << lifeCycle.value();
+        EXPECT_EQ(stats.iterOnboardBytes, stats.iterOnboardBlocks * slotBytesFor(storage, kHotLevel, lifeCycle));
+    }
+
+    first->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, SsmOnboardLeavesGlobalAllocCountersToAttention)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeHybridTieredConfig());
+    LifeCycleId const attention{0};
+    LifeCycleId const ssm{1};
+
+    manager->getAndResetIterationStats();
+    auto [first, second] = evictFirstSequence(*manager, stream, 0);
+    manager->getAndResetIterationStats();
+
+    second->close();
+    auto const allocTotalBefore = manager->getCommittedStats().allocTotalBlocks;
+    auto const allocNewBefore = manager->getCommittedStats().allocNewBlocks;
+    ASSERT_TRUE(first->resume(reinterpret_cast<CUstream>(stream)));
+    auto const allocTotalDelta = manager->getCommittedStats().allocTotalBlocks - allocTotalBefore;
+    auto const allocNewDelta = manager->getCommittedStats().allocNewBlocks - allocNewBefore;
+
+    auto const onboard = manager->getAndResetIterationStats();
+    ASSERT_EQ(onboard.size(), 2);
+    auto const attentionOnboard = onboard.at(attention).iterAllocTotalBlocks;
+    auto const ssmOnboard = onboard.at(ssm).iterAllocTotalBlocks;
+    // Both life cycles onboard, so a global delta equal to the attention share alone is
+    // only possible if the SSM share was excluded.
+    ASSERT_GT(attentionOnboard, 0);
+    ASSERT_GT(ssmOnboard, 0);
+    EXPECT_EQ(allocTotalDelta, attentionOnboard);
+    EXPECT_EQ(allocNewDelta, attentionOnboard);
+
+    first->close();
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
+TEST(KvCacheManagerV2StatsTest, HostDropIsRecordedForAttentionAndSsmLifeCycles)
+{
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    auto manager = std::make_shared<KvCacheManager>(makeHybridTieredConfig());
+    auto& storage = manager->storage();
+    LifeCycleId const attention{0};
+    LifeCycleId const ssm{1};
+
+    // First round fills the host pools.
+    auto [first, second] = evictFirstSequence(*manager, stream, 0);
+    second->close();
+    first->close();
+
+    // Second round uses disjoint tokens, so nothing is reused and the host pools overflow.
+    manager->getAndResetIterationStats();
+    auto [third, fourth] = evictFirstSequence(*manager, stream, 1000);
+
+    auto const dropped = manager->getAndResetIterationStats();
+    ASSERT_EQ(dropped.size(), 2) << "both life cycles must report host drops";
+    for (LifeCycleId const lifeCycle : {attention, ssm})
+    {
+        auto const& stats = dropped.at(lifeCycle);
+        EXPECT_GT(stats.iterHostDroppedBlocks, 0) << "life cycle " << lifeCycle.value();
+        EXPECT_EQ(stats.iterHostDroppedBytes,
+            stats.iterHostDroppedBlocks * slotBytesFor(storage, kHybridHostLevel, lifeCycle));
+    }
+
+    fourth->close();
+    third->close();
     EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 

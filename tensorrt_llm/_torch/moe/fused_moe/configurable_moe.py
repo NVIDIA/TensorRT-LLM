@@ -29,7 +29,7 @@ Design Principles:
 
 import copy
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Type, Union
+from typing import Callable, Dict, List, Optional, Type, Union
 
 import torch
 
@@ -49,13 +49,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .activation import install_activation_params
-from .communication import (
-    AllGatherReduceScatter,
-    Communication,
-    CommunicationFactory,
-    NVLinkTwoSided,
-)
-from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
+from .communication import AllGatherReduceScatter, Communication, CommunicationFactory
 from .moe_scheduler import MoEScheduler, create_moe_scheduler
 
 # Attributes that ConfigurableMoE owns (computed in MoE.__init__ from real
@@ -165,6 +159,7 @@ class ConfigurableMoE(MoE):
         override_quant_config: Optional["QuantConfig"] = None,
         moe_cls: Optional[Type] = None,
         communication_method: Optional[str] = None,
+        unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -212,6 +207,26 @@ class ConfigurableMoE(MoE):
 
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
+
+        # ========== Model-owned finalize for do_finalize=False ==========
+        # A model that needs a per-(token, expert) transform applied to each
+        # expert output before the top-k sum registers its finalize here, and
+        # ``ExternalCommMoEScheduler`` runs it on every ``do_finalize=False``
+        # forward -- on the dispatched rows, before any communication combine
+        # -- so the forward's return type depends only on this static config,
+        # never on which comm strategy was auto-selected. Signature:
+        #
+        #     fn(*, gemm2_output, expanded_idx_to_permuted_idx,
+        #        token_selected_slots, routing_weights, num_tokens)
+        #       -> [num_tokens, hidden_size]
+        #
+        # It must be computed from one ``(token, expert)`` row at a time, so
+        # that combining the per-rank finalized partials equals finalizing
+        # after the combine. ``validate_backend`` rejects every combination
+        # this contract cannot hold under (backend without the unfinalized
+        # triple, a combine that is not an unweighted row sum, router weights
+        # folded into the activations).
+        self.unfinalized_combine_fn = unfinalized_combine_fn
 
         # ========== Chunking Configuration ==========
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
@@ -469,10 +484,13 @@ class ConfigurableMoE(MoE):
         Extract quantization configuration from model_config
 
         """
-        if model_config.quant_config is None:
+        # Prefer the resolved per-module override (e.g. W4A8_AWQ for experts)
+        # over the global config which may be MIXED_PRECISION.
+        quant_config = getattr(self, "_override_quant_config", None) or model_config.quant_config
+        if quant_config is None:
             return None
 
-        quant_mode = model_config.quant_config.layer_quant_mode
+        quant_mode = quant_config.layer_quant_mode
         return {
             "has_fp8_qdq": quant_mode.has_fp8_qdq()
             if hasattr(quant_mode, "has_fp8_qdq")
@@ -693,6 +711,10 @@ class ConfigurableMoE(MoE):
           1. ``backend`` is not None.
           2. If EPLB is enabled, the backend must support routing
              separation (``backend._supports_load_balancer()``).
+          3. If ``unfinalized_combine_fn`` is registered, the combination
+             must be able to honor it: the backend returns the unfinalized
+             triple, the combine (if any) is an unweighted row sum, and the
+             routing weights are not folded into the activations.
 
         Backend-specific checks are delegated to
         ``backend.validate_configurable_moe(self)``; backends with extra
@@ -716,6 +738,36 @@ class ConfigurableMoE(MoE):
                 f"does not support load balancer. "
                 f"Either disable EPLB or use a backend that supports load balancer."
             )
+
+        if self.unfinalized_combine_fn is not None:
+            # Runs after ``self.comm`` is assigned, so the three refusals
+            # below cover the exact configuration the forwards will run with.
+            if not callable(self.unfinalized_combine_fn):
+                raise ValueError(
+                    f"unfinalized_combine_fn must be callable, got "
+                    f"{type(self.unfinalized_combine_fn).__name__}."
+                )
+            if not backend.supports_unfinalized_output():
+                raise ValueError(
+                    f"unfinalized_combine_fn is registered but backend "
+                    f"{backend.__class__.__name__} cannot return the unfinalized "
+                    "(gemm2_output, expert_weights, expanded_idx_to_permuted_idx) "
+                    "triple for do_finalize=False; there is nothing for the "
+                    "finalize to run on."
+                )
+            if self.comm is not None and not self.comm.supports_finalize_before_combine():
+                raise ValueError(
+                    f"unfinalized_combine_fn is registered but "
+                    f"{type(self.comm).__name__}.combine is not an unweighted row "
+                    "sum over a dense per-token tensor, so partials finalized "
+                    "before the combine would not reduce to the finalized result."
+                )
+            if self.apply_router_weight_on_input:
+                raise ValueError(
+                    "unfinalized_combine_fn needs the routing weights, but "
+                    "apply_router_weight_on_input folds them into the activations "
+                    "and leaves only placeholders. The two are not combinable."
+                )
 
         backend.validate_configurable_moe(self)
 
@@ -745,40 +797,7 @@ class ConfigurableMoE(MoE):
         # NVFP4TRTLLMGenFusedMoEBaseMethod applies to beta and clamp.
         if not self.backend._weights_created:
             install_activation_params(self.backend)
-        result = self.backend.create_weights()
-        self._resync_op_provider()
-        return result
-
-    def _resync_op_provider(self):
-        """Refresh the provider mirror after the backend saw its final config.
-
-        A backend may re-resolve which op provider it runs on from the quant
-        config installed just above (TRTLLMGenFusedMoE must: only FlashInfer
-        implements its BF16 kernels, so a layer left unquantized by layerwise
-        quantization moves providers here). The mirror taken in ``__init__``
-        feeds communication-strategy selection.
-
-        Only the mirror is updated. Rebuilding the strategy here would run a
-        collective -- NVLink strategies allocate MNNVL memory, and destroy() is
-        collective too -- in the middle of per-layer weight creation, which
-        deadlocked every rank. Provider and strategy can only actually disagree
-        for the NVLink two-sided pair; that combination is rejected loudly
-        rather than repaired silently, because a wrong alltoall kernel would be
-        a numerical error rather than a crash.
-        """
-        provider = getattr(self.backend, "use_flashinfer", False)
-        if provider == self.use_flashinfer:
-            return
-        self.use_flashinfer = provider
-        if isinstance(self.comm, (NVLinkTwoSided, NVLinkTwoSidedFlashinfer)):
-            raise NotImplementedError(
-                f"layer {self.layer_idx}: layerwise quantization moved this MoE "
-                f"onto the {'FlashInfer' if provider else 'native'} op provider "
-                f"after {type(self.comm).__name__} was selected for the other "
-                "one. The NVLink two-sided strategies are provider-specific, "
-                "and re-selecting one here would deadlock; choose the "
-                "communication method explicitly for this model instead."
-            )
+        return self.backend.create_weights()
 
     def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
         """

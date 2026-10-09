@@ -17,15 +17,9 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock
 
-try:
-    from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock
-
-    from tensorrt_llm._torch.visual_gen.modules.vae import ParallelVaeAttentionBlock
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from tensorrt_llm._torch.visual_gen.modules.vae import ParallelVaeAttentionBlock
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -65,8 +59,6 @@ def _distributed_worker(rank, world_size, test_fn, port):
 
 
 def _run(world_size: int, test_fn: Callable):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     # Spawn distributed workers via a helper that retries with a fresh master

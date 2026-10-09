@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_dgx_b200_m3_6gpu:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 6
+        lte: 6
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: pytorch
+  tests:
+  - accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce

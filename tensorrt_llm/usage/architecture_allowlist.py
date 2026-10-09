@@ -12,13 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Public architecture names that telemetry may report in plaintext.
+"""Public model architecture identifiers telemetry may report in plaintext.
 
-This checked-in allowlist is intentionally conservative. Add a name only after
-confirming that the architecture is publicly documented by TensorRT-LLM.
+An entry may be an architecture declared by a public model checkpoint or a
+registered TensorRT-LLM runtime architecture documented in the supported-models
+table. This privacy allowlist is intentionally conservative and is not limited
+to Hugging Face Transformers classes. Never add private, customer-specific, or
+arbitrary user-supplied names.
 """
 
-PUBLIC_HF_ARCHITECTURES = frozenset(
+PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
         "AfmoeForCausalLM",
         "BartForConditionalGeneration",
@@ -36,7 +39,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Exaone4ForCausalLM",
         "Exaone4_5_ForConditionalGeneration",
         "ExaoneForCausalLM",
-        "ExaoneMoEForCausalLM",
+        "ExaoneMoeForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Gemma3nForConditionalGeneration",
@@ -46,6 +49,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "Gemma4UnifiedForConditionalGeneration",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
         "GraniteForCausalLM",
@@ -82,6 +86,7 @@ PUBLIC_HF_ARCHITECTURES = frozenset(
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Nano_VL_V2",
+        "NemotronH_Omni_Reasoning_V3",
         "NemotronNASForCausalLM",
         "Olmo3ForCausalLM",
         "OpenELMForCausalLM",

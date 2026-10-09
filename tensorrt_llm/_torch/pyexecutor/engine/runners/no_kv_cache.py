@@ -3,7 +3,7 @@
 
 """Shared execution template for model families that do not use a KV cache."""
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,30 +13,34 @@ from torch import nn
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.vanilla import VanillaAttentionMetadata
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
 )
-from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
-from tensorrt_llm._torch.utils import set_per_request_prefill_cuda_graph_flag
+from tensorrt_llm._torch.utils import (
+    set_per_request_prefill_cuda_graph_flag,
+    with_model_extra_attrs,
+)
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
-from ..metadata import build_attention_metadata, update_spec_metadata
+from ..input_buffers import InputBuffers
+from ..lora import LoraParamBuilder
+from ..metadata import build_attention_metadata
 from .common import (
     apply_position_id_offset,
     get_all_rank_num_tokens,
     get_padding_params,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
-from .interface import PreparedInputs, RunnerConfig, RunnerDeps
+from .interface import PreparedInputs, RunnerConfig, ScheduledInputs, ScheduledModelRunner
 
 
 @dataclass(frozen=True)
@@ -47,26 +51,36 @@ class NoKVCacheRunnerConfig(RunnerConfig):
     prefill_cuda_graph_backend: PrefillCudaGraphBackend
     prefill_cuda_graph_num_tokens: list[int]
     mm_encoder_cache_enabled: bool
-    spec_config: DecodingBaseConfig | None
-    is_draft_model: bool
-    num_seq_slots: int | None
-    original_max_draft_len: int
-    original_max_total_draft_tokens: int
-    spec_dec_max_total_draft_tokens: int
 
 
-class NoKVCacheRunner(ABC):
+class NoKVCacheRunner(ScheduledModelRunner):
     """Common execution template for model families that do not use a KV cache."""
 
     def __init__(
         self,
         model: nn.Module,
-        deps: RunnerDeps,
         config: NoKVCacheRunnerConfig,
+        *,
+        mapping: Mapping,
+        dist: Distributed | None,
+        moe_load_balancer: MoeLoadBalancer | None,
     ) -> None:
         self._model = model
-        self._deps = deps
+        self._mapping = mapping
+        self._dist = dist
+        self._moe_load_balancer = moe_load_balancer
+        self._buffers = InputBuffers.allocate(
+            max_num_tokens=config.max_num_tokens,
+            max_batch_size=config.max_batch_size,
+            max_beam_width=config.max_beam_width,
+            max_seq_len=config.max_seq_len,
+            use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
+        )
         self._config = config
+        self._lora = LoraParamBuilder(
+            attn_backend=config.attention_backend,
+            cuda_graph_manager=None,
+        )
         self._attn_metadata: AttentionMetadata | None = None
 
     def setup_attn_metadata(self) -> AttentionMetadata:
@@ -80,81 +94,26 @@ class NoKVCacheRunner(ABC):
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
             attention_runtime_features=self._config.attention_runtime_features,
-            mapping=self._deps.mapping,
-            cache_indirection=self._deps.cache_indirection,
+            mapping=self._mapping,
+            cache_indirection=self._buffers.cache_indirection,
             kv_cache_manager=None,
         )
         self._attn_metadata.block_ids_per_seq = None
         self._attn_metadata.kv_block_ids_per_seq = None
         return self._attn_metadata
 
-    def setup_spec_metadata(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: ResourceManager,
-        attn_metadata: AttentionMetadata,
-        runtime_draft_len: int,
-    ) -> SpecMetadata | None:
-        runner_config = self._config
-        spec_config = runner_config.spec_config
-        if spec_config is None:
-            return None
-
-        spec_resource_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.SPEC_RESOURCE_MANAGER
-        )
-        spec_tree_manager = getattr(spec_resource_manager, "spec_tree_manager", None)
-        spec_metadata = get_spec_metadata(
-            spec_config,
-            self._model.config,
-            runner_config.max_batch_size,
-            max_num_tokens=runner_config.max_num_tokens,
-            spec_resource_manager=spec_resource_manager,
-            is_draft_model=runner_config.is_draft_model,
-            max_seq_len=runner_config.max_seq_len,
-            num_seq_slots=runner_config.num_seq_slots,
-        )
-        assert spec_metadata is not None
-        update_spec_metadata(
-            spec_metadata,
-            scheduled_requests,
-            attn_metadata,
-            spec_tree_manager=spec_tree_manager,
-            runtime_draft_len=runtime_draft_len,
-            runtime_tokens_per_gen_step=spec_config.get_runtime_tokens_per_gen_step(
-                runtime_draft_len
-            ),
-            is_draft_model=runner_config.is_draft_model,
-            attention_backend=runner_config.attention_backend,
-            original_max_draft_len=runner_config.original_max_draft_len,
-            original_max_total_draft_tokens=(runner_config.original_max_total_draft_tokens),
-            spec_dec_max_total_draft_tokens=(runner_config.spec_dec_max_total_draft_tokens),
-        )
-        return spec_metadata
-
     def prepare_inputs(
         self,
         scheduled_requests: ScheduledRequests,
         *,
         resource_manager: ResourceManager,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        runtime_draft_len: int,
     ) -> PreparedInputs:
         runner_config = self._config
         attn_metadata = self.setup_attn_metadata()
-        spec_metadata = self.setup_spec_metadata(
-            scheduled_requests,
-            resource_manager,
-            attn_metadata,
-            runtime_draft_len,
-        )
-        enable_spec_decode = runner_config.spec_config is not None
 
         sequence_lengths = []
         input_ids = []
-        gather_ids = []
         position_ids = []
-        draft_lens = []
         request_ids = []
         multimodal_params_list = []
 
@@ -165,13 +124,11 @@ class NoKVCacheRunner(ABC):
             context_start_idx = len(input_ids)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
-            if request.position_ids is None:
+            if request.py_position_ids is None:
                 position_ids.extend(range(len(prompt_tokens)))
             else:
-                position_ids.extend(request.position_ids)
-            gather_ids.append(len(input_ids) - 1)
+                position_ids.extend(request.py_position_ids)
             sequence_lengths.append(len(prompt_tokens))
-            draft_lens.append(0)
 
             # Multimodal
             if request.py_multimodal_data is not None:
@@ -221,7 +178,7 @@ class NoKVCacheRunner(ABC):
             dtype=torch.int,
             pin_memory=prefer_pinned(),
         )
-        self._deps.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+        self._buffers.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
         position_ids = apply_position_id_offset(position_ids, model=self._model)
         position_ids = torch.tensor(
@@ -229,16 +186,7 @@ class NoKVCacheRunner(ABC):
             dtype=torch.int,
             pin_memory=prefer_pinned(),
         )
-        self._deps.position_ids_cuda[:num_tokens].copy_(position_ids, non_blocking=True)
-        if enable_spec_decode:
-            self._deps.gather_ids_cuda[: len(gather_ids)].copy_(
-                torch.tensor(
-                    gather_ids,
-                    dtype=torch.int,
-                    pin_memory=prefer_pinned(),
-                ),
-                non_blocking=True,
-            )
+        self._buffers.position_ids_cuda[:num_tokens].copy_(position_ids, non_blocking=True)
 
         if not attn_metadata.is_cuda_graph:
             # No need to overwrite seq lens when using CUDA graphs -
@@ -258,15 +206,15 @@ class NoKVCacheRunner(ABC):
         attn_all_rank_num_tokens = get_all_rank_num_tokens(
             attn_metadata,
             enable_attention_dp=runner_config.enable_attention_dp,
-            mapping=self._deps.mapping,
-            dist=self._deps.dist,
+            mapping=self._mapping,
+            dist=self._dist,
         )
         padded_num_tokens, can_run_prefill_cuda_graph, attn_all_rank_num_tokens = (
             get_padding_params(
                 num_tokens,
                 attn_metadata.num_contexts,
                 attn_all_rank_num_tokens,
-                dist=self._deps.dist,
+                dist=self._dist,
                 enable_attention_dp=runner_config.enable_attention_dp,
                 prefill_cuda_graph_backend=runner_config.prefill_cuda_graph_backend,
                 prefill_cuda_graph_num_tokens=runner_config.prefill_cuda_graph_num_tokens,
@@ -282,8 +230,8 @@ class NoKVCacheRunner(ABC):
 
         virtual_num_tokens = num_tokens
         if attn_metadata.padded_num_tokens is not None:
-            self._deps.input_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
-            self._deps.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
+            self._buffers.input_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
+            self._buffers.position_ids_cuda[num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
 
         # This is for no-KV-cache attention, not for dummy attention.
@@ -299,18 +247,12 @@ class NoKVCacheRunner(ABC):
             attn_metadata.request_ids = request_ids
             attn_metadata.prepare()
 
-        lora_params = self._deps.lora.build(
-            scheduled_requests,
-            attn_metadata,
-            cuda_graph_lora_manager=cuda_graph_lora_manager,
-            enable_spec_decode=enable_spec_decode,
-            runtime_draft_len=runtime_draft_len,
-        )
+        lora_params = self._lora.build(scheduled_requests, attn_metadata)
 
         inputs = {
             "attn_metadata": attn_metadata,
-            "input_ids": self._deps.input_ids_cuda[:virtual_num_tokens],
-            "position_ids": self._deps.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
+            "input_ids": self._buffers.input_ids_cuda[:virtual_num_tokens],
+            "position_ids": self._buffers.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
             "inputs_embeds": None,
             "multimodal_params": multimodal_params_list,
             "resource_manager": resource_manager,
@@ -330,72 +272,45 @@ class NoKVCacheRunner(ABC):
         if bool(lora_params):
             inputs["lora_params"] = lora_params
 
-        if spec_metadata is not None:
-            total_draft_lens = sum(draft_lens)
-            spec_metadata.draft_tokens = self._deps.draft_tokens_cuda[:total_draft_lens]
-            spec_metadata.request_ids = request_ids
-            spec_metadata.gather_ids = self._deps.gather_ids_cuda[: len(gather_ids)]
-            spec_metadata.num_generations = len(scheduled_requests.generation_requests)
-            spec_metadata.num_tokens = num_tokens
-            spec_metadata.seq_lens = sequence_lengths
-            spec_metadata.prepare()
-            inputs["spec_metadata"] = spec_metadata
-
         # support attention dp
         if runner_config.enable_attention_dp:
-            assert self._deps.dist is not None, "attention DP requires a distributed communicator"
-            if spec_metadata is not None:
-                all_rank_num_tokens = self._deps.dist.tp_cp_allgather_int64(
-                    [
-                        attn_metadata.num_tokens,
-                        spec_metadata.num_tokens,
-                        len(sequence_lengths),
-                        spec_metadata.num_generations,
-                    ]
-                ).tolist()
-                attn_metadata.all_rank_num_tokens = [item[0] for item in all_rank_num_tokens]
-                set_spec_metadata_all_rank_num_tokens(
-                    spec_metadata,
-                    [item[1] for item in all_rank_num_tokens],
-                    [item[2] for item in all_rank_num_tokens],
-                    [item[3] for item in all_rank_num_tokens],
-                )
-            else:
-                all_rank_num_tokens = self._deps.dist.tp_cp_allgather_int64(
-                    [attn_metadata.num_tokens]
-                )[:, 0].tolist()
-                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+            assert self._dist is not None, "attention DP requires a distributed communicator"
+            all_rank_num_tokens = self._dist.tp_cp_allgather_int64([attn_metadata.num_tokens])
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens[:, 0].tolist()
 
         return PreparedInputs(inputs)
 
+    def _validate_resources(self, resource_manager: ResourceManager) -> None:
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        assert kv_cache_manager is None, (
+            "a no-KV-cache runner was initialized, but a KV cache manager was allocated"
+        )
+
     def warmup(self, resource_manager: ResourceManager) -> None:
-        return
+        """Validate the resources used by this runner before execution."""
+        self._validate_resources(resource_manager)
 
-    def capture_graphs(self, resource_manager: ResourceManager) -> None:
-        return
-
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self._model.extra_attrs)
     def forward(
         self,
-        scheduled_requests: ScheduledRequests,
+        inputs: ScheduledInputs,
         *,
         resource_manager: ResourceManager,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        runtime_draft_len: int,
-        moe_load_balancer: MoeLoadBalancer | None,
-        gather_context_logits: bool,
+        is_dummy: bool = False,
     ) -> dict[str, Any]:
-        prepared = self.prepare_inputs(
-            scheduled_requests,
-            resource_manager=resource_manager,
-            cuda_graph_lora_manager=cuda_graph_lora_manager,
-            runtime_draft_len=runtime_draft_len,
-        )
-        with MoeLoadBalancerIterContext(moe_load_balancer):
+        del is_dummy
+        batch = inputs.batch
+        self._validate_resources(resource_manager)
+        prepared = self.prepare_inputs(batch, resource_manager=resource_manager)
+        with MoeLoadBalancerIterContext(self._moe_load_balancer):
             return self._forward_step(
                 prepared.kwargs,
-                scheduled_requests,
+                batch,
                 gather_ids=prepared.gather_ids,
-                gather_context_logits=gather_context_logits,
+                gather_context_logits=inputs.gather_context_logits,
             )
 
     @abstractmethod

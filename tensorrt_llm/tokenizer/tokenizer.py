@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
 import os
 import pickle  # nosec B403
@@ -200,6 +201,27 @@ def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
                                                    **fast_kwargs)
 
 
+def _hf_remote_code_guard(trust_remote_code: bool):
+    """Return the remote-code lock, or a no-op when nothing can be written.
+
+    A tokenizer load reaches remote code even when the tokenizer class itself is
+    built in: ``AutoTokenizer.from_pretrained`` resolves that class through
+    ``AutoConfig.from_pretrained``, so a checkpoint whose config.json carries an
+    ``auto_map`` publishes its .py files into ``HF_MODULES_CACHE`` from here too,
+    not only from the model-config and input-processor paths.
+    ``hf_remote_code_lock`` documents why racing that publish breaks the import,
+    and asks every caller to share the one lock instead of defining its own.
+
+    The import is deferred to call time because a module-scope one would cycle:
+    ``_torch.model_config`` imports ``llmapi.llm_args``, which imports this
+    package back.
+    """
+    if not trust_remote_code:
+        return contextlib.nullcontext()
+    from tensorrt_llm._torch.model_config import hf_remote_code_lock
+    return hf_remote_code_lock()
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
 
@@ -296,21 +318,26 @@ class TransformersTokenizer(TokenizerBase):
     @classmethod
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         try:
-            tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
-                                                      **kwargs)
+            with _hf_remote_code_guard(kwargs.get('trust_remote_code', False)):
+                tokenizer = AutoTokenizer.from_pretrained(
+                    pretrained_model_dir, **kwargs)
         except Exception as e:
-            # Two transformers 5.x regressions for model_types not registered
-            # in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
-            # tokenizer.json directly and skips AutoConfig, so it sidesteps
-            # both:
+            # Three transformers 5.x regressions for model_types not
+            # registered in CONFIG_MAPPING_NAMES. PreTrainedTokenizerFast reads
+            # tokenizer.json directly and skips AutoConfig, so it sidesteps all
+            # three:
             #  - deepseek_v32: bare PreTrainedConfig fallback hits
             #    modeling_rope_utils → self.max_position_embeddings →
             #    AttributeError (PreTrainedConfig is now a dataclass with
             #    declared fields). See deepseek-ai/DeepSeek-V3#1207.
             #  - glm_moe_dsa: layer_types=['deepseek_sparse_attention', ...] is
             #    rejected by validate_layer_type (not in ALLOWED_LAYER_TYPES).
+            #  - nemotron_h: layers_block_type carries the transformers 5.13
+            #    vocabulary, rejected by validate_layers_block_type.
             msg = str(e)
-            if "max_position_embeddings" not in msg and "layer_types" not in msg:
+            if ("max_position_embeddings" not in msg
+                    and "layer_types" not in msg
+                    and "layers_block_type" not in msg):
                 raise
             tokenizer = _fallback_to_fast_tokenizer(pretrained_model_dir, e,
                                                     **kwargs)
@@ -730,6 +757,7 @@ def load_custom_tokenizer(
     model_dir: Union[str, Path],
     trust_remote_code: bool = True,
     use_fast: bool = True,
+    **kwargs,
 ) -> TokenizerBase:
     """Load a custom tokenizer class by import path or alias.
 
@@ -740,14 +768,27 @@ def load_custom_tokenizer(
         model_dir: The model directory to load the tokenizer from.
         trust_remote_code: Whether to trust remote code.
         use_fast: Whether to use the fast tokenizer.
+        **kwargs: Forwarded to the tokenizer class's `from_pretrained`
+            (e.g. `padding_side`).
 
     Returns:
         An instance of the custom tokenizer class.
 
     Raises:
-        ValueError: If the tokenizer cannot be loaded due to invalid identifier,
-            import failure, or missing class.
+        ValueError: If the identifier is neither a registered alias nor a
+            dotted import path, or if the tokenizer cannot be loaded due to
+            an import failure or a missing class.
     """
+    # A dotless identifier that is not a registered alias would otherwise
+    # be split as an import path and fail inside `rsplit` with an unhelpful
+    # "not enough values to unpack"; name the actual problem instead.
+    if (tokenizer_identifier not in TOKENIZER_ALIASES
+            and '.' not in tokenizer_identifier):
+        raise ValueError(
+            f"Failed to load custom tokenizer '{tokenizer_identifier}': "
+            f"unknown alias. Known aliases: {sorted(TOKENIZER_ALIASES)}. "
+            "Expected format: 'module.path.ClassName' or a recognized alias.")
+
     # Resolve aliases to full import paths
     import_path = TOKENIZER_ALIASES.get(tokenizer_identifier,
                                         tokenizer_identifier)
@@ -757,7 +798,10 @@ def load_custom_tokenizer(
         module = importlib.import_module(module_path)
         tokenizer_class = getattr(module, class_name)
         return tokenizer_class.from_pretrained(
-            model_dir, trust_remote_code=trust_remote_code, use_fast=use_fast)
+            model_dir,
+            trust_remote_code=trust_remote_code,
+            use_fast=use_fast,
+            **kwargs)
     except (ValueError, ImportError, AttributeError) as e:
         raise ValueError(
             f"Failed to load custom tokenizer '{tokenizer_identifier}': {e}. "

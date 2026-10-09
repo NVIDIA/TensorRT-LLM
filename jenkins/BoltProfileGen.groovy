@@ -84,6 +84,15 @@ PROMOTE       = (params.promote ?: "false").toString()
 // bundle -> bolted tarball on the cluster ("consume immediately after generating").
 // The merge job (slurm_merge.sh) runs apply_bolt.py when BOLT_APPLY=1.
 APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
+// publishBoltedCanonical: after merge (and, if applicable, promote), push the
+// just-BOLTed tarball back to the input artifactPath under the CANONICAL name so
+// downstream consumers of that build get BOLT transparently, preserving the
+// original as unbolted-<tarball>. Requires APPLY_PROFILES=true (the bolted tarball
+// is produced by the merge job's BOLT_APPLY=1 step) and PROMOTE=true (only the
+// postmerge producer repushes a canonical). Default OFF -- the rollout is flipped
+// on in a follow-up change -- so this is inert until then. Resolution mirrors the
+// other toggles: param, then env.
+PUBLISH_BOLTED_CANONICAL = (params.boltPublishCanonical ?: env.boltPublishCanonical ?: "false").toString() == "true"
 // Multiply each workload's client `iterations` (num_requests = concurrency *
 // iterations) to lengthen the measured serving window without editing the shared
 // perf-sanity configs. Default 64: the point where the aggregated workloads'
@@ -129,7 +138,8 @@ SLURM_NON_TERMINAL_STATES = [
 BOLT_WORKLOADS = [
     [name: "dsr1_agg_1k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_1k1k]"],
     [name: "dsr1_agg_8k1k_c2",     testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tp4_mtp3_8k1k]"],
-    [name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
+    // re-enable after TRTLLMINF-443
+    //[name: "dsr1_agg_1k1k_c1024",  testId: "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]"],
     // --- disagg (multi-node): OUT OF SCOPE for this PR, left commented out.
     //     Disagg gen-worker bring-up under BOLT instrumentation is still flaky
     //     (servers hang / a gen worker crashes at startup), and the fan-out is
@@ -372,8 +382,18 @@ def submitProfileGen(pipeline)
                 return 0
             }
         '''.stripIndent()
+        // If a prior run against THIS artifactPath already published the BOLTed build
+        // as canonical, publishBoltedCanonical preserved the original as
+        // unbolted-<tarball>. Prefer it so we profile/BOLT the un-BOLTed input rather
+        // than double-BOLTing. Inert for a fresh artifactPath (no unbolted- object),
+        // where canonical IS the un-BOLTed build.
+        def unboltedTarUrl = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}/unbolted-${BOLT_TARNAME}"
         def tarStage = """
             URL='${llmTarfile}'
+            if curl -fsI '${unboltedTarUrl}' >/dev/null 2>&1; then
+                echo '[INFO] found unbolted-${BOLT_TARNAME}; using it as the un-BOLTed input (avoids double-BOLT on reuse)'
+                URL='${unboltedTarUrl}'
+            fi
             DEST='${ws}/builds/${BOLT_TARNAME}'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
@@ -388,15 +408,19 @@ def submitProfileGen(pipeline)
         // then every later run just does a local lustre extract from the cached
         // .tar.xz (no WAN). The one-time fetch reuses fetch_verified().
         def llvmArch = (TARGET_ARCH == AARCH64_TRIPLE) ? "ARM64" : "X64"
-        def llvmVer  = "21.1.5"   // keep in sync with internal/slurm_merge.sh LLVM_BOLT_VERSION
-        def llvmTb   = "LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz"
         // Cache lives OUTSIDE the bolt-ci retention root (purged at depth 4 after 7
         // days) so the per-run workspace reaper can't delete it.
         def llvmCacheDir = "${scratch}/users/svc_tensorrt/bolt-cache/llvm"
+        // The pin is read from the extracted tree (this stage runs after "Bootstrap:
+        // extract tarball"), so the collect hook, the merge job and this bootstrap
+        // all resolve the same llvm-bolt from one file. Tarball name and cache key
+        // are therefore built shell-side, where the version is known.
         def llvmStage = """
-            LLVM_URL='https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/${llvmTb}'
+            . '${ws}/TensorRT-LLM/src/scripts/bolt/internal/llvm_bolt_version.sh'
+            LLVM_TB="LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz"
+            LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\${LLVM_TB}"
             LLVM_CACHE_DIR='${llvmCacheDir}'
-            LLVM_CACHE_TB='${llvmCacheDir}/${llvmTb}'
+            LLVM_CACHE_TB="${llvmCacheDir}/\${LLVM_TB}"
             LLVM_DIR='${ws}/builds/llvm'
             PARTS=16
         """.stripIndent() + boltFetchLib + '''
@@ -507,6 +531,26 @@ def submitProfileGen(pipeline)
             }
         } else {
             pipeline.echo("PROMOTE=false: skipping Artifactory promote of ${bundle}")
+        }
+
+        // Publish the freshly BOLTed build back to the input artifactPath under the
+        // CANONICAL name (unbolted-<tarball> preserved), so downstream consumers of
+        // that build get BOLT transparently. The merge job (APPLY_PROFILES=true)
+        // already produced ${outDir}/bolt-${BOLT_TARNAME} natively on the aarch64
+        // cluster node; without this it is reclaimed by the retention sweep below.
+        // Runs BEFORE that sweep. Coupled to PROMOTE so only the postmerge producer
+        // (which promotes the bundle) repushes a canonical -- a premerge
+        // generate-and-consume run (promote=false) never does, even with the toggle
+        // on. Gated off by default (PUBLISH_BOLTED_CANONICAL).
+        if (PUBLISH_BOLTED_CANONICAL && APPLY_PROFILES == "true" && PROMOTE == "true") {
+            stage("Publish BOLTed build as canonical") {
+                publishBoltedCanonical(pipeline, remote,
+                    "${outDir}/bolt-${BOLT_TARNAME}",       // bolted build from the merge job
+                    "${ws}/builds/${BOLT_TARNAME}",         // un-BOLTed input on the cluster
+                    "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}", BOLT_TARNAME)
+            }
+        } else if (!PUBLISH_BOLTED_CANONICAL) {
+            pipeline.echo("PUBLISH_BOLTED_CANONICAL=false: not repushing a BOLTed canonical tarball.")
         }
 
         // Retention: best-effort purge of workspaces older than 7 days so scratch
@@ -720,7 +764,13 @@ def promoteBundle(pipeline, remote, String bundle)
         cat > "${netrc}"
         chmod 600 "${netrc}"
         curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/${bundleName}"
-        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/latest.tar.gz"
+        # Matrix parameters label latest.tar.gz with the ref it now points at, so a
+        # consumer can resolve "which bundle is current" with a small metadata GET
+        # instead of downloading the bundle to read its manifest. Set in the SAME
+        # request as the upload, so the label and the bytes can never disagree --
+        # a separate pointer object would leave a window where they do.
+        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" \\
+             "${base}/latest.tar.gz;bolt.ref=${BOLT_REF};bolt.branch=${BRANCH};bolt.triple=${TRIPLE}"
     """.stripIndent()
     pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
@@ -729,7 +779,68 @@ def promoteBundle(pipeline, remote, String bundle)
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
             script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(promote, "${bundle}.promote.sh")))
     }
-    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
+    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz (bolt.ref=${BOLT_REF})")
+}
+
+// ---------------------------------------------------------------------------
+// Publish the just-BOLTed build under the CANONICAL name at the input artifactPath,
+// mirroring Build.groovy's premerge apply/consume convention: BOLT is the DEFAULT,
+// so canonical <tarName> becomes the BOLTed build and the original is preserved as
+// unbolted-<tarName>. The merge job (BOLT_APPLY=1) produced the bolted tarball
+// natively on the aarch64 cluster node into ${outDir}/bolt-<tarName>.
+//
+// Runs CLUSTER-SIDE (the frontend reaches Artifactory and the tarballs live on
+// scratch). Fails loudly if the bolted tarball is missing, and is idempotent on a
+// reused artifactPath: the unbolted- snapshot is skipped if it already exists, so a
+// re-run never overwrites the real unbolted with an already-BOLTed canonical.
+//
+// Credentials use the same stdin-fed netrc pattern as promoteBundle(): the secret
+// travels over ssh stdin (read by `cat > netrc`), never embedded in the base64'd
+// script, so it can't leak via the decoded remote command or `ps`.
+// ---------------------------------------------------------------------------
+def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unboltedLocal, String artifactBase, String tarName)
+{
+    def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+    def netrc = "${boltedLocal}.netrc"
+    def canonicalUrl = "${artifactBase}/${tarName}"
+    def unboltedUrl  = "${artifactBase}/unbolted-${tarName}"
+    pipeline.echo("Publishing BOLTed build as canonical ${canonicalUrl} (un-BOLTed preserved at ${unboltedUrl})")
+    // Remote side carries no secret: it reads the netrc from stdin. Clean up via
+    // trap, not a trailing rm, so a failed curl under `set -e` still removes the
+    // plaintext netrc; umask covers the window before chmod.
+    def publish = """
+        set -e
+        umask 077
+        trap 'rm -f "${netrc}"' EXIT
+        test -f "${boltedLocal}"   || { echo "[ERROR] bolted tarball missing: ${boltedLocal} (did the merge run with BOLT_APPLY=1?)" >&2; exit 1; }
+        test -f "${unboltedLocal}" || { echo "[ERROR] un-BOLTed tarball missing: ${unboltedLocal}" >&2; exit 1; }
+        cat > "${netrc}"
+        chmod 600 "${netrc}"
+        # 1) Preserve the un-BOLTed build as unbolted-${tarName}, unless already there.
+        #    A PUT-upload, NOT /api/copy: the target repo is virtual, so a server-side
+        #    copy returns 409. Idempotent via the existence check: on a re-run the
+        #    canonical is ALREADY the BOLTed build, and re-publishing would otherwise
+        #    overwrite the real unbolted with a bolted copy.
+        if curl -fsI --netrc-file "${netrc}" "${unboltedUrl}" >/dev/null 2>&1; then
+            echo "[INFO] unbolted-${tarName} already exists; skipping upload"
+        else
+            echo "[INFO] uploading un-BOLTed tarball -> unbolted-${tarName}"
+            curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
+                 --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
+                 -T "${unboltedLocal}" "${unboltedUrl}"
+        fi
+        # 2) Overwrite canonical ${tarName} with the BOLTed build (the release name).
+        curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
+             --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
+             -T "${boltedLocal}" "${canonicalUrl}"
+    """.stripIndent()
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
+            usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
+        def feed = "printf 'machine ${host} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
+        Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
+            script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(publish, "${boltedLocal}.publish.sh")))
+    }
+    pipeline.echo("Published. canonical = ${canonicalUrl}")
 }
 
 
@@ -797,6 +908,11 @@ pipeline {
             name: "applyProfiles",
             choices: ["true", "false"],
             description: "Re-BOLT the input tarball with the just-generated bundle in the merge job, as a same-commit check that the profiles apply. No extra GPU allocation."
+        )
+        choice(
+            name: "boltPublishCanonical",
+            choices: ["false", "true"],
+            description: "After merge (requires applyProfiles=true), push the BOLTed build back to the input artifactPath under the canonical name (original preserved as unbolted-<tarball>). Default false; the rollout is turned on in a follow-up change."
         )
         string(
             name: "slurmPlatform",

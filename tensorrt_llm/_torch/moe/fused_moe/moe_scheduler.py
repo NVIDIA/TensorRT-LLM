@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
@@ -350,8 +351,13 @@ class ExternalCommMoEScheduler(MoEScheduler):
         workspace: Optional[dict] = None,
         input_ids: Optional[torch.Tensor] = None,
         lora_params: Optional[Dict] = None,
+        row_offset: Optional[int] = 0,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
+
+        ``row_offset`` is the first forward row this chunk covers (Router Replay
+        capture); ``None`` disables capture for the chunk (DP empty-chunk
+        substitution re-runs chunk 0's rows, which are already captured).
 
         Flow:
           1. EPLB - Start wait GPU stage (first call only, dynamic only)
@@ -406,6 +412,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 used_fused_route_quant = True
 
             token_selected_experts = token_selected_experts.to(torch.int32)
+            if row_offset is not None:
+                route_capture = get_active_route_capture()
+                if route_capture is not None:  # R3: in-graph device-buffer capture
+                    route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
 
             assert token_selected_experts.shape[1] == moe.routing_method.experts_per_token
             assert token_selected_experts.shape == token_final_scales.shape
@@ -508,6 +518,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 should_update_eplb_after_dispatch = True
 
         # ========== Step 5: Quantization + dispatch (pre/post-quant adaptive ordering) ==========
+        use_deep_ep_direct_metadata = False
         if moe.comm is not None:
             # Debug: optional dummy AllReduce to break load-balancing artifacts
             if moe.enable_dummy_allreduce:
@@ -518,7 +529,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
             # through **kwargs, so the request does not need a comm-side test.
             if moe.backend.input_requirement.requires_sanitized_expert_ids:
                 dispatch_kwargs["enable_sanitize_expert_ids"] = True
+            if isinstance(moe.comm, DeepEPLowLatency):
+                use_deep_ep_direct_metadata = moe.backend.can_use_deep_ep_direct_metadata(
+                    supports_post_quant
+                )
+                dispatch_kwargs["use_direct_expert_metadata"] = use_deep_ep_direct_metadata
+                dispatch_kwargs["remove_adapter"] = use_deep_ep_direct_metadata
 
+            uses_internal_dispatch_quantization = moe.comm.uses_internal_dispatch_quantization()
             if supports_post_quant:
                 # Quantize -> Dispatch
                 if not used_fused_route_quant:
@@ -552,7 +570,8 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     use_dp_padding=use_dp_padding,
                     **dispatch_kwargs,
                 )
-                x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
+                if not uses_internal_dispatch_quantization:
+                    x, x_sf = moe.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No comm: just quantize
             if not used_fused_route_quant:
@@ -570,6 +589,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             output_dtype=output_dtype,
             all_rank_num_tokens=all_rank_num_tokens,
             lora_params=lora_params,
+            use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -580,6 +600,29 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 7: EPLB - Start CPU stage ==========
         moe._load_balancer_start_set_cpu_stage(is_last_call)
+
+        # ========== Step 7b: Model-owned finalize, before the combine ==========
+        # ``do_finalize=False`` means the backend hands back the unfinalized
+        # ``(gemm2_output, expert_weights, expanded_idx_to_permuted_idx)``
+        # triple. A registered ``unfinalized_combine_fn`` ALWAYS runs on it,
+        # with or without a comm strategy, so the forward's return type is a
+        # function of static config alone: call sites unpack either a triple
+        # or a dense tensor, and ``trtllm::moe_custom_op`` fixes the return
+        # type at trace time. Under a comm strategy the finalize must run here
+        # anyway -- no combine can carry the triple -- and the combine then
+        # reduces already-finalized partials, which is correct only because
+        # the finalize is computed from one ``(token, expert)`` row at a time.
+        # That is the contract a model accepts by registering the hook, and
+        # ``validate_backend`` rejected every configuration it cannot hold
+        # under at construction. A comm strategy with no registered hook is
+        # the one combination left to refuse at runtime, inside the helper.
+        if not do_finalize and (moe.unfinalized_combine_fn is not None or moe.comm is not None):
+            final_hidden_states = self._finalize_before_combine(
+                final_hidden_states,
+                token_selected_slots=token_selected_slots,
+                token_final_scales=token_final_scales,
+                output_dtype=output_dtype,
+            )
 
         # ========== Step 8: Communication combine ==========
         if moe.comm is not None:
@@ -599,6 +642,81 @@ class ExternalCommMoEScheduler(MoEScheduler):
         moe._load_balancer_done_set_cpu_stage(is_last_call)
 
         return final_hidden_states
+
+    def _finalize_before_combine(
+        self,
+        unfinalized: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]],
+        *,
+        token_selected_slots: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        output_dtype: Optional[torch.dtype],
+    ) -> torch.Tensor:
+        """Run the model's own finalize on the dispatched rows.
+
+        Turns the backend's unfinalized triple into the dense per-dispatched-row
+        tensor ``Communication.combine`` is typed for. The row count is the
+        dispatched one (``ep_size * max_tokens_per_rank``), taken from the routing
+        weights. The index map may flatten token and top-k dimensions, while a
+        quantized layout is free to reinterpret ``x``'s leading dimension.
+
+        ``token_selected_slots`` and ``token_final_scales`` must be the
+        POST-dispatch copies: under attention DP this rank holds rows for
+        tokens it does not own, and only the dispatched copies cover them.
+        """
+        moe = self.moe
+        finalize_fn = moe.unfinalized_combine_fn
+        if finalize_fn is None:
+            # Reached only with an active comm strategy: the registered-hook
+            # combinations were validated at construction, so this is the one
+            # refusal that stays at runtime (``do_finalize`` is a forward
+            # argument, not config).
+            raise NotImplementedError(
+                f"{type(moe.backend).__name__} was asked for do_finalize=False while "
+                f"{type(moe.comm).__name__} is active, but the model registered no "
+                "ConfigurableMoE.unfinalized_combine_fn. An unfinalized expert output "
+                "cannot cross a communication combine: every strategy takes a dense "
+                "per-token tensor. Either finalize in the backend (do_finalize=True) "
+                "or register a finalize the scheduler can run before the combine."
+            )
+        if not isinstance(unfinalized, (list, tuple)) or len(unfinalized) != 3:
+            raise NotImplementedError(
+                f"unfinalized_combine_fn is registered but {type(moe.backend).__name__} "
+                f"returned {type(unfinalized).__name__} for do_finalize=False instead of "
+                "the (gemm2_output, expert_weights, expanded_idx_to_permuted_idx) triple."
+            )
+        if token_final_scales is None:
+            raise NotImplementedError(
+                "unfinalized_combine_fn needs the dispatched routing weights, but "
+                "token_final_scales is None (apply_router_weight_on_input folds them "
+                "into the activations). The two are not combinable."
+            )
+        gemm2_output, _expert_weights, expanded_idx_to_permuted_idx = unfinalized
+        num_tokens = token_final_scales.shape[0]
+        assert expanded_idx_to_permuted_idx.numel() == token_final_scales.numel(), (
+            f"dispatched routing weights cover {token_final_scales.numel()} token-expert "
+            f"slots but the index map covers {expanded_idx_to_permuted_idx.numel()}"
+        )
+        combined = finalize_fn(
+            gemm2_output=gemm2_output,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            # A per-expert transform needs to know which expert (slot) each
+            # row came from; the index map alone cannot answer that.
+            token_selected_slots=token_selected_slots,
+            routing_weights=token_final_scales,
+            num_tokens=num_tokens,
+        )
+        # ``gemm2_output`` is hidden-padded for some kernels and the backend
+        # only slices it on its own finalize path, so the hook must hand back
+        # exactly the layer's hidden size for the combine to reduce.
+        assert combined.shape == (num_tokens, moe.hidden_size), (
+            f"unfinalized_combine_fn returned {tuple(combined.shape)}, expected "
+            f"({num_tokens}, {moe.hidden_size}); gemm2_output is hidden-padded "
+            "and the hook owns the slice."
+        )
+        # Cast BEFORE the combine, not after: the one-sided workspace's combine
+        # region is sized from (hidden_size, act_dtype), so handing it a wider
+        # payload than the model output dtype would overrun that region.
+        return combined if output_dtype is None else combined.to(output_dtype)
 
     def _forward_multiple_chunks(
         self,
@@ -696,11 +814,16 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Execute chunking with overlap ==========
         outputs_list = []
+        # Router Replay: chunk-local routing rows map to forward rows
+        # [row_offset, row_offset + chunk_size); substituted empty chunks
+        # (chunked_used False) recompute chunk 0 and must not be captured.
+        row_offset = 0
         for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
             zip(x_list, router_logits_list, input_ids_list)
         ):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
+            chunk_row_offset = row_offset if chunked_used[idx_chunk] else None
 
             if use_multi_stream:
                 # Alternate streams; each chunk fully owns its (forward + reducescatter).
@@ -719,6 +842,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                             workspace=workspace_0,
                             input_ids=input_ids_chunk,
                             lora_params=lora_params,
+                            row_offset=chunk_row_offset,
                         )
                 else:
                     outputs = self._forward_chunk_impl(
@@ -733,6 +857,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                         workspace=workspace_1,
                         input_ids=input_ids_chunk,
                         lora_params=lora_params,
+                        row_offset=chunk_row_offset,
                     )
             else:
                 outputs = self._forward_chunk_impl(
@@ -747,8 +872,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
                     workspace=workspace_0,
                     input_ids=input_ids_chunk,
                     lora_params=lora_params,
+                    row_offset=chunk_row_offset,
                 )
 
+            row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
                 outputs_list.append(outputs)
 
@@ -768,6 +895,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        do_finalize: bool,
     ) -> Tuple[Optional[torch.Tensor], bool]:
         """Decide the NVLinkOneSided combine payload buffer for this forward.
 
@@ -777,6 +905,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
         """
         moe = self.moe
         if not isinstance(moe.comm, NVLinkOneSided):
+            return None, False
+
+        if not do_finalize:
+            # The backend returns the unfinalized triple and writes nothing
+            # into the combine payload buffer, so the payload is NOT in the
+            # workspace however capable the backend is. Claiming otherwise
+            # makes moe_a2a_combine read an unwritten workspace region and
+            # reduce garbage silently, because the flag -- not the tensor
+            # argument -- is what combine() believes. The finalize that runs
+            # before the combine produces a fresh tensor, which has to be
+            # staged like any other caller-owned payload.
             return None, False
 
         if not moe.backend.supports_moe_output_in_alltoall_workspace():
@@ -809,6 +948,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         lora_params: Optional[Dict],
+        use_deep_ep_direct_metadata: bool = False,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -827,13 +967,20 @@ class ExternalCommMoEScheduler(MoEScheduler):
             lora_params=lora_params if moe.backend.capabilities.supports_moe_lora else None,
             router_logits=router_logits,
             all_rank_num_tokens=all_rank_num_tokens,
-            comm_plan=self._build_comm_plan(all_rank_num_tokens, output_dtype),
+            comm_plan=self._build_comm_plan(
+                all_rank_num_tokens,
+                output_dtype,
+                do_finalize,
+                use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
+            ),
         )
 
     def _build_comm_plan(
         self,
         all_rank_num_tokens: Optional[List[int]],
         output_dtype: Optional[torch.dtype],
+        do_finalize: bool,
+        use_deep_ep_direct_metadata: bool = False,
     ) -> MoECommPlan:
         """The comm-layer facts for this forward, derived once for every backend.
 
@@ -845,17 +992,29 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # arrive unswizzled. Backends use this to skip a re-swizzle.
         supports_post_quant = moe.comm is not None and moe.comm.supports_post_quant_dispatch()
         moe_output, payload_in_workspace = self._plan_onesided_workspace(
-            all_rank_num_tokens=all_rank_num_tokens, output_dtype=output_dtype
+            all_rank_num_tokens=all_rank_num_tokens,
+            output_dtype=output_dtype,
+            do_finalize=do_finalize,
         )
         if isinstance(moe.comm, NVLinkOneSided):
             # combine() still reads the flag off the strategy; the plan stays
             # the single place that decides its value.
             moe.comm.payload_in_workspace = payload_in_workspace
+        recv_expert_count = None
+        deep_ep_expert_capacity = None
+        if use_deep_ep_direct_metadata:
+            assert isinstance(moe.comm, DeepEPLowLatency)
+            recv_expert_count, deep_ep_expert_capacity = (
+                moe.comm.get_expert_major_dispatch_metadata()
+            )
         return MoECommPlan(
             input_sf_swizzled=not supports_post_quant,
             enable_alltoall=moe.enable_alltoall,
             moe_output=moe_output,
             payload_in_workspace=payload_in_workspace,
+            recv_expert_count=recv_expert_count,
+            deep_ep_expert_capacity=deep_ep_expert_capacity,
+            use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
         )
 
 
@@ -1061,6 +1220,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         """
         moe = self.moe
         outputs: List[torch.Tensor] = []
+        row_offset = 0  # Router Replay: first forward row of the current chunk
         for idx_chunk in range(num_chunks):
             is_first_call = idx_chunk == 0 and moe.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and moe.repeat_idx == moe.repeat_count - 1
@@ -1090,7 +1250,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 is_first_call=is_first_call,
                 is_last_call=is_last_call,
                 input_ids=input_ids_chunk,
+                row_offset=row_offset,
             )
+            row_offset += x_chunk.shape[0]
             outputs.append(out_chunk)
         return outputs
 
@@ -1105,8 +1267,12 @@ class FusedCommMoEScheduler(MoEScheduler):
         is_first_call: bool = True,
         is_last_call: bool = True,
         input_ids: Optional[torch.Tensor] = None,
+        row_offset: int = 0,
     ) -> torch.Tensor:
         """Run a single chunk through the fused-comm backend.
+
+        ``row_offset`` is the first (ADP-stripped) forward row of this chunk,
+        used by Router Replay capture to place chunk-local routing rows.
 
         Inputs are already ADP-stripped by the caller; ``x.shape[0]`` is
         the true unpadded per-rank token count for this chunk.
@@ -1159,6 +1325,9 @@ class FusedCommMoEScheduler(MoEScheduler):
                 router_logits_chunk_real, input_ids_chunk_real
             )
             token_selected_experts = token_selected_experts.to(torch.int32)
+            route_capture = get_active_route_capture()
+            if route_capture is not None:  # R3: in-graph device-buffer capture
+                route_capture.capture(moe.layer_idx, token_selected_experts, row_offset)
             token_final_scales = token_final_scales.to(torch.float32)
         else:
             device = x.device

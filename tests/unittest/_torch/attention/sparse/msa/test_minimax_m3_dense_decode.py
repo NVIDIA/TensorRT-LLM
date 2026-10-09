@@ -28,9 +28,11 @@ from typing import Dict, List
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.trtllm_gen_dense_decode import (
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_dense_decode import (
     dense_decode_unsupported_reason,
+    dense_decode_workspace_layout,
     minimax_m3_trtllm_gen_dense_decode,
+    split_dense_decode_workspace,
     subpage_block_table,
     uniform_subpages_per_slot,
     write_subpage_block_table,
@@ -40,13 +42,52 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 PAGE_SIZE = 32
 HEAD_DIM = 128
-# The bmm1 scale, spelled as run_msa_paged_gqa spells it at q_scaling 1.
+# The bmm1 scale, spelled as run_msa_prefill_gqa spells it at q_scaling 1.
 SM_SCALE = HEAD_DIM**-0.5
 
 
 def _is_sm100f() -> bool:
     major, minor = torch.cuda.get_device_capability()
     return major == 10 and minor in (0, 3)
+
+
+# --------------------------------------------------------------------------
+# Scratch layout
+# --------------------------------------------------------------------------
+
+
+def test_dense_decode_scratch_is_carved_out_of_one_buffer():
+    """Both halves of the scratch must fit the total the layout reported.
+
+    MsaDecodeFmha grows the shared attention workspace to that total and then
+    splits it, so an offset or a size that disagreed with it would hand the
+    kernel a view running off the end of the workspace.
+    """
+    layout = dense_decode_workspace_layout(
+        q_dtype=torch.bfloat16,
+        num_heads=8,
+        head_dim=HEAD_DIM,
+        num_kv_heads=1,
+        max_num_requests=4,
+        device=torch.device("cuda"),
+    )
+
+    assert layout.counter_offset >= layout.workspace_bytes
+    assert layout.total_bytes > layout.counter_offset
+
+    buffer = torch.full((layout.total_bytes,), 7, dtype=torch.int8, device="cuda")
+    workspace, counters = split_dense_decode_workspace(buffer, layout)
+
+    assert workspace.numel() == layout.workspace_bytes
+    assert counters.numel() == layout.total_bytes - layout.counter_offset
+    assert workspace.data_ptr() == buffer.data_ptr()
+    assert counters.data_ptr() == buffer.data_ptr() + layout.counter_offset
+    # Only the counters are cleared; the slab is the kernel's own to initialize.
+    assert int(counters.sum()) == 0
+    assert int(workspace[0]) == 7
+
+    with pytest.raises(ValueError, match="but this call needs"):
+        split_dense_decode_workspace(buffer[:-1], layout)
 
 
 # --------------------------------------------------------------------------

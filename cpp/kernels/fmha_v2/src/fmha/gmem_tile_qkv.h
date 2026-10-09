@@ -49,67 +49,37 @@ struct Gmem_tile_qkv
 {
 
     // The size of each LDG.
-    enum
-    {
-        BYTES_PER_LDG = 16
-    };
+    static constexpr int BYTES_PER_LDG = 16;
 
     // The size of a row in bytes.
-    enum
-    {
-        BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ROW = COLS * BITS_PER_ELEMENT / 8;
 
     // The number of threads to load a "row" of the matrix.
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The valid size of a row in bytes.
-    enum
-    {
-        VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8
-    };
+    static constexpr int VALID_BYTES_PER_ROW = VALID_COLS * BITS_PER_ELEMENT / 8;
 
     // The valid number of threads to load a "row" of the matrix.
-    enum
-    {
-        VALID_THREADS_PER_ROW = VALID_BYTES_PER_ROW / BYTES_PER_LDG
-    };
+    static constexpr int VALID_THREADS_PER_ROW = VALID_BYTES_PER_ROW / BYTES_PER_LDG;
 
     // The number of "rows" loaded per LDG.
-    enum
-    {
-        ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_LDG = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // The number of rows.
-    enum
-    {
-        ROWS = ROWS_
-    };
+    static constexpr int ROWS = ROWS_;
 
     // The number of LDGs needed to load a chunk of the Q matrix.
-    enum
-    {
-        LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE
-    };
+    static constexpr int LDGS = fmha::Div_up<ROWS, ROWS_PER_LDG>::VALUE;
 
     // The number of predicate registers.
-    enum
-    {
-        PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE
-    };
+    static constexpr int PRED_REGS = fmha::Compute_number_of_pred_regs<LDGS>::VALUE;
 
     // Make sure we use a single register to store predicates.
     static_assert(PRED_REGS == 1, "");
 
     // We do not use LDGSTS (for the moment).
-    enum
-    {
-        USE_LDGSTS = USE_LDGSTS_
-    };
+    static constexpr int USE_LDGSTS = USE_LDGSTS_;
 
     // Ctor.
     template <typename Params, typename Block_info>

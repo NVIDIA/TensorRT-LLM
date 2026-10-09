@@ -232,7 +232,7 @@ def get_cached_perfect_router_logits(num_tokens: int, num_experts: int,
 
 
 # The type of method in top-K routing, for use in torch custom op
-# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.h
+# Please keep this in sync with the counterpart defined in cpp/tensorrt_llm/kernels/moe/trtllmGen/runner.h
 class RoutingMethodType(IntEnum):
     # Default: Softmax -> TopK
     Default = 0,
@@ -292,6 +292,18 @@ class BaseMoeRoutingMethod(nn.Module):
     @property
     def routing_method_type(self) -> RoutingMethodType:
         return RoutingMethodType.Unspecified
+
+    @property
+    def resolution_routing_method_type(self) -> RoutingMethodType:
+        """Which routing algorithm this is, for resolution and eligibility.
+
+        Distinct from ``routing_method_type``, which is the encoding the C++
+        kernels are handed: a method whose algorithm no kernel implements has
+        to borrow a recognized value there, and a gate reading that value
+        cannot tell the borrower from the method it borrowed from. Override
+        only when the two answers differ.
+        """
+        return self.routing_method_type
 
 
 class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
@@ -595,6 +607,13 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
     def routing_method_type(self):
         # Return DeepSeekV3 because C++ MoE kernels don't recognize DeepSeek-V4 routing type
         return RoutingMethodType.DeepSeekV3
+
+    @property
+    def resolution_routing_method_type(self):
+        # Resolution is not the kernel and has a value for this algorithm, so
+        # it gets the real one: sqrtsoftplus scoring is not V3's, and a gate
+        # that fuses V3 routing must not claim to fuse this.
+        return RoutingMethodType.DeepSeekV4
 
 
 class MiniMaxM2MoeRoutingMethod(BaseMoeRoutingMethod):

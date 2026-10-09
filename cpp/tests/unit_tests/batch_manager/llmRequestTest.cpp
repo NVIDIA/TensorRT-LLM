@@ -109,7 +109,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             texec::Request execReq(inputTokens, maxNewTokens);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(2, 1000, 0, 32000);
+            llmReq.validate(2, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "exceeds maximum input");
     }
@@ -121,7 +121,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setSamplingConfig(texec::SamplingConfig(-1));
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 0, 32000);
+            llmReq.validate(500, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
     }
@@ -163,21 +163,9 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             execReq.setPromptTuningConfig(config);
             tb::LlmRequest llmReq(requestId, execReq);
 
-            llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
+            llmReq.validate(500, 1000, 1, std::nullopt, true);
         };
         lambdaErrMsgs.emplace_back(lambda, "Input token extra ids must be provided");
-    }
-
-    // Invalid endId
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(
-                inputTokens, maxNewTokens, false, texec::SamplingConfig(), texec::OutputConfig(), -2);
-            tb::LlmRequest llmReq(requestId, execReq);
-            llmReq.validate(500, 1000, 1, 32000);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "EndId (-2) is not within acceptable range [-1, 32000)");
     }
 
     for (auto& lambdaErrMsg : lambdaErrMsgs)
@@ -203,14 +191,14 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         // Validate output len truncation w/o draft tokens
         texec::Request execReq(inputTokens, maxNewTokens);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 0, 32000);
+        llmReq.validate(10, 60, 0);
         EXPECT_EQ(llmReq.mMaxNewTokens, 60 - inputTokens.size());
     }
     {
         // Validate output len truncation w draft tokens
         texec::Request execReq(inputTokens, maxNewTokens);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000);
+        llmReq.validate(10, 60, 2);
         EXPECT_EQ(llmReq.mMaxNewTokens, 60 - inputTokens.size() - 2);
     }
     {
@@ -223,7 +211,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
 
         EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
-        llmReq.validate(500, 1000, 1, 32000, std::nullopt, true);
+        llmReq.validate(500, 1000, 1, std::nullopt, true);
     }
     {
         using AdditionalModelOutput = texec::AdditionalModelOutput;
@@ -235,7 +223,7 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         outputConfig.additionalModelOutputs = additionalModelOutputs;
         execReq.setOutputConfig(outputConfig);
         tb::LlmRequest llmReq(requestId, execReq);
-        llmReq.validate(10, 60, 2, 32000, std::nullopt, false);
+        llmReq.validate(10, 60, 2, std::nullopt, false);
         auto const& additionalContextOutputs = llmReq.getAdditionalContextOutputs();
         EXPECT_EQ(additionalContextOutputs.count("context_gen_output"), 1);
         EXPECT_EQ(additionalContextOutputs.count("gen_output"), 0);
@@ -463,7 +451,7 @@ class ParamTest : public LlmRequestTest, public ::testing::WithParamInterface<Pa
 {
 };
 
-TEST_P(ParamTest, createResponse)
+TEST_P(ParamTest, createResult)
 {
     bool const streaming{std::get<0>(GetParam())};
     bool const excludeInputFromOutput{std::get<1>(GetParam())};
@@ -517,8 +505,8 @@ TEST_P(ParamTest, createResponse)
 
     for (auto& llmReq : llmRequests)
     {
-        auto response = llmReq->createResponse();
-        EXPECT_FALSE(response);
+        auto resultOpt = llmReq->createResult();
+        EXPECT_FALSE(resultOpt);
     }
 
     SizeType32 constexpr numIterations{5};
@@ -536,15 +524,14 @@ TEST_P(ParamTest, createResponse)
             }
 
             llmReq->setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
-            auto response = llmReq->createResponse();
-            EXPECT_TRUE(streaming == response.has_value());
+            auto resultOpt = llmReq->createResult();
+            EXPECT_TRUE(streaming == resultOpt.has_value());
 
             for (int beamIdx = 0; beamIdx < numReturnBeams; ++beamIdx)
             {
                 if (streaming)
                 {
-                    EXPECT_EQ(response.value().getRequestId(), requestId);
-                    auto result = response.value().getResult();
+                    auto const& result = resultOpt.value();
                     EXPECT_EQ(result.outputTokenIds.size(), numReturnBeams);
                     auto const& beamTokens = result.outputTokenIds.at(beamIdx);
                     if (returnAllGeneratedTokens)
@@ -564,8 +551,8 @@ TEST_P(ParamTest, createResponse)
                 }
             }
 
-            response = llmReq->createResponse();
-            EXPECT_FALSE(response);
+            resultOpt = llmReq->createResult();
+            EXPECT_FALSE(resultOpt);
         }
     }
 
@@ -584,21 +571,17 @@ TEST_P(ParamTest, createResponse)
     for (auto seqIdx = 0; seqIdx < numSequences; seqIdx++)
     {
         auto llmReq = llmRequests.at(seqIdx);
-        auto response = llmReq->createResponse();
+        auto resultOpt = llmReq->createResult();
 
         if (!streaming && llmRequests.at(seqIdx)->getState() != tb::LlmRequestState::kGENERATION_COMPLETE)
         {
-            EXPECT_FALSE(response);
+            EXPECT_FALSE(resultOpt);
             continue;
         }
 
-        EXPECT_TRUE(response) << "seqIdx " << seqIdx;
-        EXPECT_FALSE(response.value().hasError()) << "seqIdx " << seqIdx;
+        EXPECT_TRUE(resultOpt) << "seqIdx " << seqIdx;
 
-        // All response should have the same request id of the original request.
-        EXPECT_EQ(response.value().getRequestId(), requestId);
-
-        auto result = response.value().getResult();
+        auto const& result = resultOpt.value();
         EXPECT_EQ(result.outputTokenIds.size(), numReturnBeams);
 
         // Only the first sequence has finished.
@@ -661,11 +644,10 @@ TEST_P(ParamTest, createResponse)
 
         for (auto seqIdx = 1; seqIdx < numSequences; seqIdx++)
         {
-            auto response = llmRequests.at(seqIdx)->createResponse();
-            EXPECT_TRUE(response) << "seqIdx " << seqIdx;
-            EXPECT_FALSE(response.value().hasError()) << "seqIdx " << seqIdx;
+            auto resultOpt = llmRequests.at(seqIdx)->createResult();
+            EXPECT_TRUE(resultOpt) << "seqIdx " << seqIdx;
 
-            auto result = response.value().getResult();
+            auto const& result = resultOpt.value();
             // All sequences have finished.
             EXPECT_TRUE(result.isSequenceFinal) << "seqIdx " << seqIdx;
             EXPECT_TRUE(result.isFinal) << "seqIdx " << seqIdx;
@@ -703,12 +685,12 @@ TEST_F(LlmRequestTest, createResultDisaggContextComplete)
     // This is the regression case — without the fix, createResult() returns nullopt
     // because DISAGG_CONTEXT_COMPLETE was not handled by createResult's early guard
     // or its context-phase branch.
-    auto response = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
-    ASSERT_TRUE(response.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
-    EXPECT_TRUE(response->contextPhaseParams.has_value())
+    auto resultOpt = llmReq.createResult(/*useFastLogits=*/false, /*mpiWorldRank=*/0);
+    ASSERT_TRUE(resultOpt.has_value()) << "createResult() must not return nullopt for DISAGG_CONTEXT_COMPLETE";
+    EXPECT_TRUE(resultOpt->contextPhaseParams.has_value())
         << "contextPhaseParams must be populated for context-only DISAGG_CONTEXT_COMPLETE requests";
-    EXPECT_EQ(response->contextPhaseParams->getReqId(), requestId);
-    EXPECT_TRUE(response->isSequenceFinal);
+    EXPECT_EQ(resultOpt->contextPhaseParams->getReqId(), requestId);
+    EXPECT_TRUE(resultOpt->isSequenceFinal);
 }
 
 TEST_F(LlmRequestTest, generationOnlyRequestAdoptsContextPhaseDraftTokens)

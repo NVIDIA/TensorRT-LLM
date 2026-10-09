@@ -94,120 +94,67 @@ struct Smem_tile_hopper_gmma_row_a
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_A
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_A;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B
     // and SWIZZLE_64B format.
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
     // the number of rows per one row of K due the the limitation of leading dim size.
-    enum
-    {
-        NUM_ROWS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     static_assert(desc_mode != fmha::Gmma_descriptor_mode::SWIZZLE_64B || (Cta_tile::K * BYTES_PER_ELEMENT) == 64,
         "swizzle_64B row_a is valid if kblock=32\n");
 
     // Number of SMEM rows.
-    enum
-    {
-        NUM_ROWS
-        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? (Cta_tile::M * NUM_ROWS_PER_K) : (Cta_tile::M / 2)
-    };
+    static constexpr int NUM_ROWS
+        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? (Cta_tile::M * NUM_ROWS_PER_K) : (Cta_tile::M / 2);
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer.
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc.
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a row
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS;
 
     // The number of rows written with a single STS.
-    enum
-    {
-        ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // for swizzle_128B the xor factor is 8
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE
-        = Mma_tile::M_PER_GMMA_GROUP / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_ROW
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE
+        = Mma_tile::M_PER_GMMA_GROUP / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_ROW;
 
     // The number of STS per row.
-    enum
-    {
-        STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS;
 
     // For Hopper, STS_PER_ROW should be 1 (at least for now.)
     static_assert(STS_PER_ROW == 1, "");
@@ -315,120 +262,67 @@ struct Smem_tile_hopper_gmma_col_b
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B and
     // SWIZZLE_64B format
-    enum
-    {
-        BYTES_PER_COLUMN = 128
-    };
+    static constexpr int BYTES_PER_COLUMN = 128;
 
     static_assert(desc_mode != fmha::Gmma_descriptor_mode::SWIZZLE_64B || (Cta_tile::K * BYTES_PER_ELEMENT) == 64,
         "swizzle_64B col_b is valid if kblock=32\n");
 
     // the number of columns per one column of K due the the limitation of leading dim size
-    enum
-    {
-        NUM_COLS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_COLUMN - 1) / BYTES_PER_COLUMN
-    };
+    static constexpr int NUM_COLS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_COLUMN - 1) / BYTES_PER_COLUMN;
 
     // Number of SMEM columns.
-    enum
-    {
-        NUM_COLUMNS
-        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? Cta_tile::N * NUM_COLS_PER_K : Cta_tile::N / 2
-    };
+    static constexpr int NUM_COLUMNS
+        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? Cta_tile::N * NUM_COLS_PER_K : Cta_tile::N / 2;
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_COLUMNS * BYTES_PER_COLUMN
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_COLUMNS * BYTES_PER_COLUMN;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc.
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a column.
-    enum
-    {
-        THREADS_PER_COLUMN = BYTES_PER_COLUMN / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_COLUMN = BYTES_PER_COLUMN / BYTES_PER_STS;
 
     // The number of columns written with a single STS.
-    enum
-    {
-        COLUMNS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_COLUMN
-    };
+    static constexpr int COLUMNS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_COLUMN;
 
     // for swizzle_128B the xor factor is 8.
-    enum
-    {
-        COLUMNS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4
-    };
+    static constexpr int COLUMNS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE = Mma_tile::N_PER_GMMA_GROUP
-            / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_COLUMN
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE = Mma_tile::N_PER_GMMA_GROUP
+        / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_COLUMN;
 
     // The number of STS per column.
-    enum
-    {
-        STS_PER_COLUMN = BYTES_PER_COLUMN / THREADS_PER_COLUMN / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_COLUMN = BYTES_PER_COLUMN / THREADS_PER_COLUMN / BYTES_PER_STS;
 
     // For Hopper, STS_PER_COLUMN should be 1 (at least for now.)
     static_assert(STS_PER_COLUMN == 1, "");
@@ -537,121 +431,67 @@ struct Smem_tile_hopper_gmma_row_b
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B and
     // SWIZZLE_64B format
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
     // the number of rows per one row of N due the the limitation of leading dim size
-    enum
-    {
-        NUM_ROWS_PER_N = (Cta_tile::N * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_N = (Cta_tile::N * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     // the number of rows per one row of N_PER_GMMA_GROUP
-    enum
-    {
-        NUM_ROWS_PER_GMMA_GROUP_N = (Mma_tile::N_PER_GMMA_GROUP * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_GMMA_GROUP_N
+        = (Mma_tile::N_PER_GMMA_GROUP * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     // Number of SMEM rows
-    enum
-    {
-        NUM_ROWS = Cta_tile::K * NUM_ROWS_PER_N
-    };
+    static constexpr int NUM_ROWS = Cta_tile::K * NUM_ROWS_PER_N;
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a row
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS;
 
     // The number of rows written with a single STS.
-    enum
-    {
-        ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // for swizzle_128B the xor factor is 8
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = 8
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = 8;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE = Mma_tile::K_PER_GMMA_GROUP * NUM_ROWS_PER_GMMA_GROUP_N * BYTES_PER_ROW
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE
+        = Mma_tile::K_PER_GMMA_GROUP * NUM_ROWS_PER_GMMA_GROUP_N * BYTES_PER_ROW;
 
     // The number of STS per ROW.
-    enum
-    {
-        STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS;
 
     // For Hopper, STS_PER_ROW should be 1 (at least for now.)
     static_assert(STS_PER_ROW == 1, "");
@@ -823,135 +663,77 @@ struct Smem_tile_hopper_gmma_tma_row_a
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_A
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_A;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B
     // and SWIZZLE_64B format.
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
     // the number of rows per one row of K due the the limitation of leading dim size.
-    enum
-    {
-        NUM_ROWS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     static_assert(desc_mode != fmha::Gmma_descriptor_mode::SWIZZLE_64B || (Cta_tile::K * BYTES_PER_ELEMENT) == 64,
         "swizzle_64B row_a is valid if kblock=32\n");
 
     // Number of SMEM rows.
-    enum
-    {
-        NUM_ROWS
-        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? (Cta_tile::M * NUM_ROWS_PER_K) : (Cta_tile::M / 2)
-    };
+    static constexpr int NUM_ROWS
+        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? (Cta_tile::M * NUM_ROWS_PER_K) : (Cta_tile::M / 2);
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer.
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc.
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a row
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS;
 
     // The number of rows written with a single STS.
-    enum
-    {
-        ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // for swizzle_128B the xor factor is 8
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE
-        = Mma_tile::M_PER_GMMA_GROUP / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_ROW
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE
+        = Mma_tile::M_PER_GMMA_GROUP / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_ROW;
 
     // The number of STS per row.
-    enum
-    {
-        STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS;
 
     // For Hopper, STS_PER_ROW should be 1 (at least for now.)
     static_assert(STS_PER_ROW == 1, "");
 
     // Each smem barrier is of 8 bytes
-    enum
-    {
-        BYTES_PER_SMEM_BARRIER = 8
-    };
+    static constexpr int BYTES_PER_SMEM_BARRIER = 8;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY_SMEM_BARRIER = BYTES_PER_SMEM_BARRIER * BUFFERS_PER_TILE - BYTES_PER_SMEM_BARRIER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY_SMEM_BARRIER
+        = BYTES_PER_SMEM_BARRIER * BUFFERS_PER_TILE - BYTES_PER_SMEM_BARRIER;
 
     // Ctor.
     inline __device__ Smem_tile_hopper_gmma_tma_row_a(char* smem, char* smem_barrier)
@@ -1030,120 +812,67 @@ struct Smem_tile_hopper_gmma_tma_col_b
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B and
     // SWIZZLE_64B format
-    enum
-    {
-        BYTES_PER_COLUMN = 128
-    };
+    static constexpr int BYTES_PER_COLUMN = 128;
 
     static_assert(desc_mode != fmha::Gmma_descriptor_mode::SWIZZLE_64B || (Cta_tile::K * BYTES_PER_ELEMENT) == 64,
         "swizzle_64B col_b is valid if kblock=32\n");
 
     // the number of columns per one column of K due the the limitation of leading dim size
-    enum
-    {
-        NUM_COLS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_COLUMN - 1) / BYTES_PER_COLUMN
-    };
+    static constexpr int NUM_COLS_PER_K = (Cta_tile::K * BYTES_PER_ELEMENT + BYTES_PER_COLUMN - 1) / BYTES_PER_COLUMN;
 
     // Number of SMEM columns.
-    enum
-    {
-        NUM_COLUMNS
-        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? Cta_tile::N * NUM_COLS_PER_K : Cta_tile::N / 2
-    };
+    static constexpr int NUM_COLUMNS
+        = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? Cta_tile::N * NUM_COLS_PER_K : Cta_tile::N / 2;
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_COLUMNS * BYTES_PER_COLUMN
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_COLUMNS * BYTES_PER_COLUMN;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc.
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a column.
-    enum
-    {
-        THREADS_PER_COLUMN = BYTES_PER_COLUMN / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_COLUMN = BYTES_PER_COLUMN / BYTES_PER_STS;
 
     // The number of columns written with a single STS.
-    enum
-    {
-        COLUMNS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_COLUMN
-    };
+    static constexpr int COLUMNS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_COLUMN;
 
     // for swizzle_128B the xor factor is 8.
-    enum
-    {
-        COLUMNS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4
-    };
+    static constexpr int COLUMNS_PER_XOR_PATTERN = (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B) ? 8 : 4;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE = Mma_tile::N_PER_GMMA_GROUP
-            / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_COLUMN
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE = Mma_tile::N_PER_GMMA_GROUP
+        / (desc_mode == fmha::Gmma_descriptor_mode::SWIZZLE_128B ? 1 : 2) * BYTES_PER_COLUMN;
 
     // The number of STS per column.
-    enum
-    {
-        STS_PER_COLUMN = BYTES_PER_COLUMN / THREADS_PER_COLUMN / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_COLUMN = BYTES_PER_COLUMN / THREADS_PER_COLUMN / BYTES_PER_STS;
 
     // For Hopper, STS_PER_COLUMN should be 1 (at least for now.)
     static_assert(STS_PER_COLUMN == 1, "");
@@ -1206,121 +935,67 @@ struct Smem_tile_hopper_gmma_tma_row_b
     using Cta_tile_gmma = Cta_tile;
 
     // the size in bits of each element.
-    enum
-    {
-        BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B
-    };
+    static constexpr int BITS_PER_ELEMENT = Traits::BITS_PER_ELEMENT_B;
 
     // the size of bytes of each element.
-    enum
-    {
-        BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8
-    };
+    static constexpr int BYTES_PER_ELEMENT = BITS_PER_ELEMENT / 8;
 
     // The size in bytes of a single LDGSTS/STS.
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The number of elements per LDGSTS/STS.
-    enum
-    {
-        ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT
-    };
+    static constexpr int ELEMENTS_PER_STS = BYTES_PER_STS * 8 / BITS_PER_ELEMENT;
 
     // SMEM layout for GMMA has a leading dim of exact 128 Byte, at least for SWIZZLE_128B and
     // SWIZZLE_64B format
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
     // the number of rows per one row of N due the the limitation of leading dim size
-    enum
-    {
-        NUM_ROWS_PER_N = (Cta_tile::N * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_N = (Cta_tile::N * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     // the number of rows per one row of N_PER_GMMA_GROUP
-    enum
-    {
-        NUM_ROWS_PER_GMMA_GROUP_N = (Mma_tile::N_PER_GMMA_GROUP * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_GMMA_GROUP_N
+        = (Mma_tile::N_PER_GMMA_GROUP * BYTES_PER_ELEMENT + BYTES_PER_ROW - 1) / BYTES_PER_ROW;
 
     // Number of SMEM rows
-    enum
-    {
-        NUM_ROWS = Cta_tile::K * NUM_ROWS_PER_N
-    };
+    static constexpr int NUM_ROWS = Cta_tile::K * NUM_ROWS_PER_N;
 
     // The size of one buffer in bytes in shared memory.
-    enum
-    {
-        BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW
-    };
+    static constexpr int BYTES_PER_BUFFER = NUM_ROWS * BYTES_PER_ROW;
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // The number of buffers.
-    enum
-    {
-        BUFFERS_PER_TILE = BUFFERS_PER_TILE_
-    };
+    static constexpr int BUFFERS_PER_TILE = BUFFERS_PER_TILE_;
 
     // The size in bytes of total buffers.
-    enum
-    {
-        BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE
-    };
+    static constexpr int BYTES_PER_TILE = BYTES_PER_BUFFER * BUFFERS_PER_TILE;
 
     // The boundary for smem_read_offset and smem_write_offset increment.
-    enum
-    {
-        BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER
-    };
+    static constexpr int BYTES_PER_TILE_INC_BOUNDARY = BYTES_PER_TILE - BYTES_PER_BUFFER;
 
     // The number of threads needed to store a row
-    enum
-    {
-        THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int THREADS_PER_ROW = BYTES_PER_ROW / BYTES_PER_STS;
 
     // The number of rows written with a single STS.
-    enum
-    {
-        ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW
-    };
+    static constexpr int ROWS_PER_STS = Cta_tile::THREADS_PER_CTA / THREADS_PER_ROW;
 
     // for swizzle_128B the xor factor is 8
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = 8
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = 8;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
-    enum
-    {
-        GMMA_GROUP_SMEM_DISTANCE = Mma_tile::K_PER_GMMA_GROUP * NUM_ROWS_PER_GMMA_GROUP_N * BYTES_PER_ROW
-    };
+    static constexpr int GMMA_GROUP_SMEM_DISTANCE
+        = Mma_tile::K_PER_GMMA_GROUP * NUM_ROWS_PER_GMMA_GROUP_N * BYTES_PER_ROW;
 
     // The number of STS per ROW.
-    enum
-    {
-        STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS
-    };
+    static constexpr int STS_PER_ROW = BYTES_PER_ROW / THREADS_PER_ROW / BYTES_PER_STS;
 
     // For Hopper, STS_PER_ROW should be 1 (at least for now.)
     static_assert(STS_PER_ROW == 1, "");
@@ -1466,11 +1141,8 @@ struct Smem_tile_hopper_a
         Cta_tile, Traits::BITS_PER_ELEMENT_A, Traits::GMMA_M, Traits::GMMA_N, Traits::GMMA_K, GMMA_DESC_SIZE_PER_GROUP>;
 
     // the number of columns per one column of M_PER_GMMA_GROUP
-    enum
-    {
-        NUM_COLS_PER_GMMA_GROUP_M
-        = (Mma_tile::M_PER_GMMA_GROUP * Base::BITS_PER_ELEMENT / 8 + Base::BYTES_PER_ROW - 1) / Base::BYTES_PER_ROW
-    };
+    static constexpr int NUM_COLS_PER_GMMA_GROUP_M
+        = (Mma_tile::M_PER_GMMA_GROUP * Base::BITS_PER_ELEMENT / 8 + Base::BYTES_PER_ROW - 1) / Base::BYTES_PER_ROW;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
@@ -1484,16 +1156,11 @@ struct Smem_tile_hopper_a
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = Base::BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = Base::BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // Ctor.
     inline __device__ Smem_tile_hopper_a(void* smem, int tidx)
@@ -1575,11 +1242,8 @@ struct Smem_tile_hopper_b : public fmha::Smem_tile_without_skews<Cta_tile_,
         Cta_tile, Traits::BITS_PER_ELEMENT_B, Traits::GMMA_M, Traits::GMMA_N, Traits::GMMA_K, GMMA_DESC_SIZE_PER_GROUP>;
 
     // the number of rows per one row of N_PER_GMMA_GROUP
-    enum
-    {
-        NUM_ROWS_PER_GMMA_GROUP_N
-        = (Mma_tile::N_PER_GMMA_GROUP * Base::BITS_PER_ELEMENT / 8 + Base::BYTES_PER_ROW - 1) / Base::BYTES_PER_ROW
-    };
+    static constexpr int NUM_ROWS_PER_GMMA_GROUP_N
+        = (Mma_tile::N_PER_GMMA_GROUP * Base::BITS_PER_ELEMENT / 8 + Base::BYTES_PER_ROW - 1) / Base::BYTES_PER_ROW;
 
     // The distance in byte between different GMMA groups (might need multiple due to cta tile size)
     // each GMMA group is of size GMMA_M x GMMA_N x Kblock
@@ -1604,16 +1268,11 @@ struct Smem_tile_hopper_b : public fmha::Smem_tile_without_skews<Cta_tile_,
 
     // the size of one buffer in bytes in shared memory, without the 4 LSB.
     // this is needed to increment the GMMA desc to the next buffer
-    enum
-    {
-        BYTES_PER_BUFFER_NO_4LSB = Base::BYTES_PER_BUFFER / 16
-    };
+    static constexpr int BYTES_PER_BUFFER_NO_4LSB = Base::BYTES_PER_BUFFER / 16;
 
     // this is needed to decrement GMMA desc
-    enum
-    {
-        BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB
-    };
+    static constexpr int BYTES_PER_BUFFER_INC_BOUNDARY_NO_4LSB
+        = BYTES_PER_BUFFER_NO_4LSB * BUFFERS_PER_TILE_ - BYTES_PER_BUFFER_NO_4LSB;
 
     // Ctor.
     inline __device__ Smem_tile_hopper_b(void* smem, int tidx)
@@ -1989,80 +1648,44 @@ struct Transposer<Traits, Cta_tile, 128, UNROLL_N>
 
     static_assert(Cta_tile::K % 128 == 0);
 
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M,
-        WARPS_N = Cta_tile::WARPS_N,
-        WARPS_K = Cta_tile::WARPS_K,
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
-    enum
-    {
-        WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1),
-        WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2),
-    };
+    static constexpr int WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1);
+    static constexpr int WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2);
 
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
     // D=64 and 4 warps.
     // Per warp we load 32 rows x 16 columns with LDSM.Tx4, 128 rows per CTA.
-    enum
-    {
-        S = Cta_tile::K >= 128 ? 128 : Cta_tile::K
-    }; // The sequence length.
+    static constexpr int S = Cta_tile::K >= 128 ? 128 : Cta_tile::K; // The sequence length.
 
-    enum
-    {
-        D = Cta_tile::N >= 128 ? 128 : Cta_tile::N
-    }; // The head dimension.
+    static constexpr int D = Cta_tile::N >= 128 ? 128 : Cta_tile::N; // The head dimension.
 
     // static_assert(S % 128 == 0);
     static_assert(WARPS_4x1x1 || WARPS_4x1x2);
     static_assert(D % (BYTES_PER_LDS * WARPS_K) == 0);
 
-    enum
-    {
-        ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING = 128
-    }; // LDSMx4
+    static constexpr int ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING = 128; // LDSMx4
 
-    enum
-    {
-        ROW_PACKING = BYTES_PER_ROW / (D * sizeof(typename Traits::B_type))
-    };
+    static constexpr int ROW_PACKING = BYTES_PER_ROW / (D * sizeof(typename Traits::B_type));
 
-    enum
-    {
-        ROWS_PER_LDSM_PER_CTA = ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING / ROW_PACKING
-    };
+    static constexpr int ROWS_PER_LDSM_PER_CTA = ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING / ROW_PACKING;
 
-    enum
-    {
-        ROWS_PER_XOR_PATTERN = fmha::Rows_per_xor_pattern_ampere_b<Traits, S>::VALUE
-    };
+    static constexpr int ROWS_PER_XOR_PATTERN = fmha::Rows_per_xor_pattern_ampere_b<Traits, S>::VALUE;
 
     static_assert(ROWS_PER_XOR_PATTERN == 8);
 
     // The number of loads in K dimension.
-    enum
-    {
-        K = S / ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING
-    };
+    static constexpr int K = S / ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING;
 
     // static_assert(K * ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING == S);
     // static_assert(K == 3);
     //  The number of loads in the D dimension.
-    enum
-    {
-        N = D / (BYTES_PER_LDS * WARPS_K)
-    }; // 16 bytes per load
+    static constexpr int N = D / (BYTES_PER_LDS * WARPS_K); // 16 bytes per load
 
     static_assert(N * BYTES_PER_LDS * WARPS_K == D);
 
@@ -2288,35 +1911,20 @@ struct Transposer<Traits, Cta_tile, 64, UNROLL_N>
 
     static_assert(Cta_tile::K % 64 == 0);
 
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M,
-        WARPS_N = Cta_tile::WARPS_N,
-        WARPS_K = Cta_tile::WARPS_K,
-    };
+    static constexpr int WARPS_M = Cta_tile::WARPS_M;
+    static constexpr int WARPS_N = Cta_tile::WARPS_N;
+    static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
-    enum
-    {
-        WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1),
-        WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2),
-    };
+    static constexpr int WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1);
+    static constexpr int WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2);
 
-    enum
-    {
-        BYTES_PER_LDS = 16
-    };
+    static constexpr int BYTES_PER_LDS = 16;
 
     // D=64 and 4 warps.
     // Per warp we load 32 rows x 16 columns with LDSM.Tx4, 128 rows per CTA.
-    enum
-    {
-        S = Cta_tile::K >= 128 ? 128 : Cta_tile::K
-    }; // The sequence length.
+    static constexpr int S = Cta_tile::K >= 128 ? 128 : Cta_tile::K; // The sequence length.
 
-    enum
-    {
-        D = Cta_tile::N >= 128 ? 128 : Cta_tile::N
-    }; // The head dimension.
+    static constexpr int D = Cta_tile::N >= 128 ? 128 : Cta_tile::N; // The head dimension.
 
     static_assert(S % 64 == 0);
     static_assert(WARPS_4x1x1);
@@ -2325,37 +1933,20 @@ struct Transposer<Traits, Cta_tile, 64, UNROLL_N>
     static_assert(S == 64 && D == 128);
 
     // Two warps in S dim.
-    enum
-    {
-        ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING = 64
-    }; // LDSMx4
+    static constexpr int ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING = 64; // LDSMx4
 
-    enum
-    {
-        BYTES_PER_ROW = 128
-    };
+    static constexpr int BYTES_PER_ROW = 128;
 
-    enum
-    {
-        ROW_PACKING = Div_up<BYTES_PER_ROW, D * sizeof(typename Traits::B_type)>::VALUE
-    };
+    static constexpr int ROW_PACKING = Div_up<BYTES_PER_ROW, D * sizeof(typename Traits::B_type)>::VALUE;
 
-    enum
-    {
-        ROWS_PER_LDSM_PER_CTA = ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING / ROW_PACKING
-    }; // due to row_packing
+    static constexpr int ROWS_PER_LDSM_PER_CTA
+        = ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING / ROW_PACKING; // due to row_packing
 
     // The number of loads in K dimension.
-    enum
-    {
-        K = S / ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING
-    };
+    static constexpr int K = S / ROWS_PER_LDSM_PER_CTA_WITHOUT_PACKING;
 
     // The number of loads in the D dimension. Use two warps in D dim.
-    enum
-    {
-        N = D / 32
-    };
+    static constexpr int N = D / 32;
 
     uint4 regs_[UNROLL_N][K];
 
@@ -2551,10 +2142,7 @@ struct Smem_tile_v_gmma
     static_assert(sizeof(typename Traits::B_type) == 1);
 
     // K is the sequence length dimension (128 for GMMA)
-    enum
-    {
-        K_ = Cta_tile::K % 128 == 0 ? 128 : 64
-    };
+    static constexpr int K_ = Cta_tile::K % 128 == 0 ? 128 : 64;
 
     static_assert(Cta_tile::K % K_ == 0);
 
@@ -2573,17 +2161,11 @@ struct Smem_tile_v_gmma
     static_assert((Cta_tile::K % 128 == 0 && GMMA_DESC_MODE_V == fmha::Gmma_descriptor_mode::SWIZZLE_128B)
         || (Cta_tile::K % 64 == 0 && GMMA_DESC_MODE_V == fmha::Gmma_descriptor_mode::SWIZZLE_64B));
 
-    enum
-    {
-        NUM_KGROUPS = Cta_tile::K / Cta_tile_gmma_::K
-    };
+    static constexpr int NUM_KGROUPS = Cta_tile::K / Cta_tile_gmma_::K;
 
     static_assert(NUM_KGROUPS * Cta_tile_gmma_::K == Cta_tile::K);
 
-    enum
-    {
-        BYTES_PER_STS = 16
-    };
+    static constexpr int BYTES_PER_STS = 16;
 
     // The compute tile only requires static information from Smem_tile_v and accesses SMEM directly through GMMA.
     // Hence, we declare a SxD column major matrix in SMEM and have to make sure at runtime that the data is transposed.
@@ -2606,15 +2188,9 @@ struct Smem_tile_v_gmma
         static_assert(USE_TMA == false);
         static constexpr bool TRANSPOSE = true;
 
-        enum
-        {
-            NUM_KGROUPS = Cta_tile::K / Cta_tile_gmma_::K
-        };
+        static constexpr int NUM_KGROUPS = Cta_tile::K / Cta_tile_gmma_::K;
 
-        enum
-        {
-            ROWS_PER_XOR_PATTERN = fmha::Rows_per_xor_pattern_ampere_b<Traits, Cta_tile::N>::VALUE
-        };
+        static constexpr int ROWS_PER_XOR_PATTERN = fmha::Rows_per_xor_pattern_ampere_b<Traits, Cta_tile::N>::VALUE;
 
         using Descriptor = typename Base_::Gmma_descriptor;
 
@@ -2624,10 +2200,7 @@ struct Smem_tile_v_gmma
 
         using Store_type = typename Store_delegate::Store_type;
 
-        enum
-        {
-            S = Cta_tile::K
-        };
+        static constexpr int S = Cta_tile::K;
 
         // static_assert(Descriptor::BYTES_PER_LEADING_DIM == 128);
         // static_assert(Descriptor::STRIDE_BYTE_OFFSET == K_ * 8 / 16);  // 128 * 8 / 16
@@ -2648,22 +2221,13 @@ struct Smem_tile_v_gmma
         // static_assert(Store_delegate::BYTES_PER_ROW == 128);
 
         // Number of rows a warp loads per LDSMx4
-        enum
-        {
-            ROWS_PER_LDSM = 4 * 8
-        };
+        static constexpr int ROWS_PER_LDSM = 4 * 8;
 
-        enum
-        {
-            ROWS_PER_LDSM_PER_CTA = ROWS_PER_LDSM * Cta_tile::WARPS_M
-        };
+        static constexpr int ROWS_PER_LDSM_PER_CTA = ROWS_PER_LDSM * Cta_tile::WARPS_M;
 
         static_assert(Cta_tile::WARPS_M == 4);
 
-        enum
-        {
-            LDSMS = Cta_tile::K / ROWS_PER_LDSM_PER_CTA
-        };
+        static constexpr int LDSMS = Cta_tile::K / ROWS_PER_LDSM_PER_CTA;
 
         // TODO we're assigning all rows loaded by a warp group (128 per CTA) to the K dimension.
         // This only works for K a multiple of 128.
@@ -2672,28 +2236,16 @@ struct Smem_tile_v_gmma
 
         static_assert(LDSMS == S / 128);
 
-        enum
-        {
-            BYTES_PER_LDS = 16
-        };
+        static constexpr int BYTES_PER_LDS = 16;
 
-        enum
-        {
-            BYTES_PER_ROW = Store_delegate::BYTES_PER_ROW
-        };
+        static constexpr int BYTES_PER_ROW = Store_delegate::BYTES_PER_ROW;
 
-        enum
-        {
-            WARPS_M = Cta_tile::WARPS_M,
-            WARPS_N = Cta_tile::WARPS_N,
-            WARPS_K = Cta_tile::WARPS_K,
-        };
+        static constexpr int WARPS_M = Cta_tile::WARPS_M;
+        static constexpr int WARPS_N = Cta_tile::WARPS_N;
+        static constexpr int WARPS_K = Cta_tile::WARPS_K;
 
-        enum
-        {
-            WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1),
-            WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2),
-        };
+        static constexpr int WARPS_4x1x1 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 1);
+        static constexpr int WARPS_4x1x2 = (WARPS_M == 4 && WARPS_N == 1 && WARPS_K == 2);
 
         inline __device__ Base(void* smem, int tidx)
             : Base_(smem, tidx)

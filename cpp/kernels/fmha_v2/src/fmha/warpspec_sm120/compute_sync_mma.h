@@ -77,30 +77,15 @@ struct Compute
 
     using Softmax = fmha::Softmax<Traits_p, Cta_tile_p, Kernel_traits>;
 
-    enum
-    {
-        STEP_Q = Kernel_traits::STEP_Q
-    };
+    static constexpr int STEP_Q = Kernel_traits::STEP_Q;
 
-    enum
-    {
-        STEP_KV = Kernel_traits::STEP_KV
-    };
+    static constexpr int STEP_KV = Kernel_traits::STEP_KV;
 
-    enum
-    {
-        CAUSAL_MASK = Kernel_traits::CAUSAL_MASK
-    };
+    static constexpr int CAUSAL_MASK = Kernel_traits::CAUSAL_MASK;
 
-    enum
-    {
-        ENABLE_SKIP_SOFTMAX = Kernel_traits::ENABLE_SKIP_SOFTMAX
-    };
+    static constexpr int ENABLE_SKIP_SOFTMAX = Kernel_traits::ENABLE_SKIP_SOFTMAX;
 
-    enum
-    {
-        CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK
-    };
+    static constexpr int CHECK_NEG_INF = Kernel_traits::SLIDING_WINDOW_ATTENTION || Kernel_traits::CUSTOM_MASK;
 
     inline __device__ Compute() {}
 

@@ -86,7 +86,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     create_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
-from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -110,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
@@ -123,6 +124,18 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+
+def test_duplicate_layer_ids_preserve_all_moe_registrations() -> None:
+    model_config = ModelConfig(skip_create_weights_in_init=True)
+    moe_layers = [torch.nn.Module() for _ in range(3)]
+    for layer in moe_layers:
+        layer.layer_idx = 0
+        layer.layer_idx_str = "0"
+        MoE._register_layer(layer, model_config)
+
+    assert [layer.layer_idx_str for layer in moe_layers] == ["0", "0_0", "0_1"]
+    assert [ref() for ref in model_config.extra_attrs["moe_layers"].values()] == moe_layers
 
 
 def _ensure_dist_for_megamoe(moe_backend: str, rank: int, world_size: int) -> None:
@@ -591,15 +604,18 @@ def _test_moe_worker_impl(
                 (seq_len, num_experts), dtype=dtype_routing_logits, device="cuda"
             )
 
+        backend_type = MoeBackendType(moe_backend)
+
         # Determine swiglu_gptoss_style
         swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+        is_minimax_megamoe = backend_type == MoeBackendType.MEGAMOE_CUTEDSL and swiglu_gptoss_style
+        expert_bias = swiglu_gptoss_style and not is_minimax_megamoe
 
         # In EP mode, swiglu tensors must be sized per local experts
         # (C++ kernels check: swiglu_alpha.size(0) == num_experts_on_rank)
         num_local_experts = num_experts // mapping.moe_ep_size
 
         # Setup quantization
-        backend_type = MoeBackendType(moe_backend)
         quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
             quant_algo, x, backend_type
         )
@@ -609,12 +625,15 @@ def _test_moe_worker_impl(
             intermediate_size=intermediate_size,
             hidden_size=hidden_size,
             quant_config=quant_config,
-            bias=swiglu_gptoss_style,
+            bias=expert_bias,
             swiglu_gptoss_style=swiglu_gptoss_style,
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
             swiglu_limit=swiglu_limit if swiglu_gptoss_style else None,
             num_local_experts=num_local_experts,
+            activation_type=(
+                ActivationType.SwigluBias if is_minimax_megamoe else ActivationType.Swiglu
+            ),
         )
         ref_cls = quant_kwargs.pop("ref_cls", None)
         ref_module_kwargs = {}
@@ -659,7 +678,7 @@ def _test_moe_worker_impl(
                 routing_method=routing_method,
                 reduce_results=True,
                 model_config=model_cfg,
-                bias=swiglu_gptoss_style,
+                bias=expert_bias,
                 activation=(
                     SwigluBiasActivation(
                         gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
@@ -672,6 +691,9 @@ def _test_moe_worker_impl(
                 weight_loading_mode=weight_loading_mode,
             ) as fused_moe,
         ):
+            # Direct construction: no host post-init to allocate for us, and
+            # the branch below reads the backend's quant_method shapes.
+            fused_moe.create_weights()
             # W4A8_MXFP4_MXFP8 needs backend-layout-aware weights.  In
             # particular, MegaMoEDeepGemm and TRTLLMGen can have different
             # padded backend/ref tensor layouts, so create weights after the
@@ -1579,7 +1601,7 @@ def test_configurable_moe_single_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/trtllmGen/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value
@@ -1799,7 +1821,7 @@ def test_configurable_moe_multi_gpu(
     )
 
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
-    # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
+    # See: cpp/tensorrt_llm/thop/moe/trtllmGen/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
     if (
         moe_backend == MoeBackendType.TRTLLM.value
@@ -1824,6 +1846,164 @@ def test_configurable_moe_multi_gpu(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
     )
+
+
+# ============================================================================
+# unfinalized_combine_fn: numerical hook-vs-finalize check under a real comm
+# ============================================================================
+
+
+def _hook_vs_finalize_worker(mapping, model_config, seq_len):
+    try:
+        _hook_vs_finalize_worker_impl(mapping, model_config, seq_len)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _hook_vs_finalize_worker_impl(mapping, model_config, seq_len):
+    """``do_finalize=False`` + registered hook must equal ``do_finalize=True``.
+
+    The hook re-implements the kernel's own finalize (gather the permuted rows
+    through ``expanded_idx_to_permuted_idx``, weight, sum; non-local slots are
+    ``-1`` and contribute zeros), so running it on the dispatched rows and
+    letting the combine reduce the finalized partials has to reproduce the
+    in-kernel finalize up to accumulation order.
+    """
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+    dtype = torch.bfloat16
+
+    mapping.rank = mpi_rank()
+    all_rank_num_tokens = [seq_len] * mapping.world_size
+    torch.cuda.set_device(mapping.rank)
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        # Per-rank inputs: attention DP ranks hold different tokens.
+        torch.manual_seed(mapping.rank)
+        torch.cuda.manual_seed(mapping.rank)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.NVFP4, x, MoeBackendType.TRTLLM
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            bias=False,
+            swiglu_gptoss_style=False,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            swiglu_limit=None,
+            num_local_experts=num_experts // mapping.moe_ep_size,
+            activation_type=ActivationType.Swiglu,
+        )
+        quant_kwargs.pop("ref_cls", None)
+
+        model_cfg = _create_model_config(
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
+            moe_backend=MoeBackendType.TRTLLM.value,
+            enable_eplb=False,
+            num_slots=-1,
+            layer_updates_per_iter=-1,
+            max_num_tokens=max(256, seq_len),
+        )
+
+        def model_finalize(
+            *,
+            gemm2_output,
+            expanded_idx_to_permuted_idx,
+            token_selected_slots,
+            routing_weights,
+            num_tokens,
+        ):
+            del token_selected_slots  # an identity transform needs no expert id
+            rows = gemm2_output[..., :hidden_size].to(torch.float32)
+            idx = expanded_idx_to_permuted_idx.view(num_tokens, -1).to(torch.long)
+            weights = routing_weights.view(num_tokens, -1).to(torch.float32)
+            valid = idx >= 0
+            gathered = rows[idx.clamp(min=0)]
+            return (gathered * (weights * valid).unsqueeze(-1)).sum(dim=1)
+
+        with create_moe(
+            routing_method=routing_method,
+            reduce_results=False,  # the backend's unfinalized path asserts this
+            model_config=model_cfg,
+            weight_loading_mode=getattr(
+                quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+            ),
+            unfinalized_combine_fn=model_finalize,
+        ) as fused_moe:
+            fused_moe.create_weights()
+            weights = quantize_util.create_weights(**quant_kwargs)
+            fused_moe.load_weights([weights])
+            fused_moe.post_load_weights()
+            fused_moe.cuda(f"cuda:{mapping.rank}")
+
+            assert fused_moe.comm is not None, (
+                "the point of this test is the finalize-before-combine path; "
+                "without a comm strategy it validates nothing"
+            )
+
+            with torch.inference_mode():
+                finalized = fused_moe.forward(
+                    x,
+                    router_logits,
+                    do_finalize=True,
+                    output_dtype=dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+                hooked = fused_moe.forward(
+                    x,
+                    router_logits,
+                    do_finalize=False,
+                    output_dtype=dtype,
+                    all_rank_num_tokens=all_rank_num_tokens,
+                )
+            torch.cuda.synchronize()
+
+            assert hooked.shape == finalized.shape
+            # Same expert outputs on both passes; the two finalizes differ only
+            # in accumulation order and the hook's FP32 math vs the kernel's.
+            torch.testing.assert_close(hooked.float(), finalized.float(), rtol=5e-2, atol=5e-2)
+
+
+def _hook_vs_finalize_entry(comm_method_type, *worker_args):
+    os.environ["TRTLLM_FORCE_COMM_METHOD"] = comm_method_type
+    try:
+        return _hook_vs_finalize_worker(*worker_args)
+    finally:
+        _reset_moe_comm_state()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
+@pytest.mark.threadleak(enabled=False)  # module-scoped MPIPoolExecutor persists by design
+def test_unfinalized_combine_fn_matches_in_kernel_finalize_multi_gpu(moe_multi_gpu_executor):
+    if get_sm_version() < 100:
+        pytest.skip("TRTLLM-Gen NVFP4 (the backend that returns the triple) needs Blackwell")
+
+    world_size = 4
+    mapping = _create_mapping_for_parallel_mode(world_size, "DEP")
+    model_config = MoeModelConfig(8, 2, 512, 512)
+    results = moe_multi_gpu_executor.map(
+        _hook_vs_finalize_entry,
+        *zip(*[("ALLGATHER", mapping, model_config, 4)] * world_size),
+    )
+    for r in results:
+        assert r is None
 
 
 # ============================================================================

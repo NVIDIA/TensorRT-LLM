@@ -694,7 +694,9 @@ def create_mma_task(
     """Create the one-warp MMA compute task."""
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
-    src = _src_resources(gmem_qkv, smem_q, smem_kv, work_queue=work_queue)
+    # Only paged MMA schedules read request coordinates from global metadata.
+    qkv_resources = [gmem_qkv] if smem_q.cfg.use_paged_kv else []
+    src = _src_resources(*qkv_resources, smem_q, smem_kv, work_queue=work_queue)
 
     if (
         smem_q.cfg.single_qkv_instance
@@ -702,7 +704,7 @@ def create_mma_task(
         and tmem_p0 is not None
     ):
         split_src = _src_resources(
-            gmem_qkv, smem_q, smem_kv, tmem_p0, work_queue=work_queue
+            *qkv_resources, smem_q, smem_kv, tmem_p0, work_queue=work_queue
         )
         num_head_dim_stages_k = smem_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_kv.cfg.num_head_dim_stages_v

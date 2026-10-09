@@ -18,9 +18,11 @@ from .common import (
     get_position_id_offset,
     get_top_level_model,
     prepare_multimodal_indices,
-    set_spec_metadata_all_rank_num_tokens,
     ship_multimodal_indices,
 )
+from .decoder import DecoderRunner
+from .encoder import EncoderRunner
+from .encoder_decoder import EncoderDecoderRunner
 from .mm_encoder import MultimodalEncoderRunner
 from .pooling import PoolingRunner
 
@@ -33,9 +35,11 @@ __all__ = [
     "get_padding_params",
     "get_position_id_offset",
     "get_top_level_model",
+    "DecoderRunner",
+    "EncoderDecoderRunner",
+    "EncoderRunner",
     "prepare_multimodal_indices",
     "resolve_runner_type",
-    "set_spec_metadata_all_rank_num_tokens",
     "ship_multimodal_indices",
 ]
 
@@ -43,10 +47,10 @@ __all__ = [
 def resolve_runner_type(
     model: nn.Module,
     llm_args: TorchLlmArgs,
-) -> type[ModelRunner] | None:
+) -> type[ModelRunner]:
     """Resolve the startup runner class without constructing its dependencies."""
     if llm_args.encode_only and not llm_args.mm_encoder_only:
-        return None  # Encoder-only execution uses the existing encoder path.
+        return EncoderRunner
 
     if llm_args.mm_encoder_only:
         return MultimodalEncoderRunner
@@ -55,6 +59,6 @@ def resolve_runner_type(
         return PoolingRunner
 
     if model.model_config.is_encoder_decoder:
-        return None  # Encoder-decoder execution uses the existing engine path.
+        return EncoderDecoderRunner
 
-    return None  # Decoder execution uses the existing engine path.
+    return DecoderRunner

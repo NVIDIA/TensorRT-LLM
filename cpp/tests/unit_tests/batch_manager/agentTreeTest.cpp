@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -58,13 +58,31 @@ protected:
         tensorrt_llm::executor::SamplingConfig samplingConfig(1);
 
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
-            std::nullopt, false, std::nullopt, false, std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
-            std::nullopt, std::nullopt, std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
-            std::nullopt, 1, std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            agentHierarchy);
+            /*promptEmbeddingTable=*/std::nullopt,
+            /*promptVocabSize=*/std::nullopt,
+            /*multimodalHashes=*/std::nullopt,
+            /*multimodalPositions=*/std::nullopt,
+            /*multimodalLengths=*/std::nullopt,
+            /*multimodalUuids=*/std::nullopt,
+            /*loraTaskId=*/std::nullopt,
+            /*loraWeights=*/std::nullopt,
+            /*loraConfig=*/std::nullopt,
+            /*kvCacheRetentionConfig=*/std::nullopt,
+            /*returnLogProbs=*/false,
+            /*returnContextLogits=*/false,
+            /*returnGenerationLogits=*/false,
+            /*draftTokens=*/std::nullopt,
+            /*excludeInputFromOutput=*/false,
+            /*encoderInputTokens=*/std::nullopt,
+            /*returnEncoderOutput=*/false,
+            /*clientId=*/std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+            /*encoderInputFeatures=*/std::nullopt,
+            /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+            /*inputTokenExtraIds=*/std::nullopt,
+            /*returnPerfMetrics=*/false,
+            /*allottedTimeMs=*/std::nullopt,
+            /*contextPhaseParams=*/std::nullopt,
+            /*arrivalTime=*/std::nullopt, agentHierarchy);
     }
 
     LlmRequestPtr createAgentDeepResearchRequest(SizeType32 nodeId, SizeType32 requestId)

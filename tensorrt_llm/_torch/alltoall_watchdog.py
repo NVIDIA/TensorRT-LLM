@@ -47,7 +47,7 @@ UNKNOWN_COMPLETION_FLAG = -(2**63)
 _COMPLETION_FLAG_MASK = (1 << 32) - 1
 _COMPLETION_FLAG_HALF_RANGE = 1 << 31
 _ACTIVE_RANK_MASK_WORD_BITS = 64
-_ACTIVE_RANK_MASK_WORDS = 2
+_ACTIVE_RANK_MASK_WORDS = 4
 _ACTIVE_RANK_MASK_WORD_MASK = (1 << _ACTIVE_RANK_MASK_WORD_BITS) - 1
 _WORKSPACE_WATCHDOG_STATE_KEY = "alltoall_watchdog_shared_state"
 _WORKSPACE_WATCHDOG_STATE_INIT_LOCK = threading.Lock()
@@ -313,7 +313,7 @@ class AlltoAllWatchdogCoordinator:
 
         The returned tensor does not alias a caller-owned override, so it can
         safely represent the mask used by one dispatch/combine pair. When the
-        mask comes from ``health``, derive both fixed-width ABI words from one
+        mask comes from ``health``, derive all fixed-width ABI words from one
         atomic mask/generation snapshot.
         """
         if active_rank_mask is not None:

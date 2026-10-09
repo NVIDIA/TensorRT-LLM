@@ -58,9 +58,11 @@ from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
-from ..moe.fused_moe import create_moe
+from ..moe.fused_moe import SwigluActivation, create_moe
 from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.routing import MiniMaxM2MoeRoutingMethod
+from ..peft.lora.layer import LoraLayer
+from ..peft.lora.validation import has_moe_lora_targets
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, create_lm_head_tp_mapping
 from .modeling_speculative import SpecDecOneEngineForCausalLM, _slice_spec_position_ids
@@ -577,13 +579,14 @@ class Step3p7Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask=PredefinedAttentionMask.CAUSAL,
         attention_window_size: Optional[int] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Step3p7 attention with module-side QK-norm + RoPE + head gate.
 
         Bypasses the base ``Attention.forward`` to apply the per-head output
         gate (``sigmoid(g_proj(hidden))``) between the attention backend and
-        ``o_proj``. Helix CP, LoRA, and attention sinks are not plumbed here.
+        ``o_proj``. Helix CP and attention sinks are not plumbed here.
         """
         effective_window = (
             attention_window_size if attention_window_size is not None else self.sliding_window
@@ -605,7 +608,16 @@ class Step3p7Attention(Attention):
         if position_ids is not None and self.layer_idx >= num_text_layers:
             position_ids = position_ids.clamp_min(0)
 
-        qkv = self.qkv_proj(hidden_states)
+        if bool(lora_params):
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states)
         q, k, v = self.apply_rope(qkv, None, None, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -619,7 +631,7 @@ class Step3p7Attention(Attention):
             kwargs.get("attention_mask_data"),
             mrope_config=kwargs.get("mrope_config"),
             attention_sinks=None,
-            has_lora=False,
+            has_lora=bool(lora_params),
         )
 
         if self.use_head_wise_gate:
@@ -630,7 +642,11 @@ class Step3p7Attention(Attention):
             attn_output = attn_output * gate.unsqueeze(-1).sigmoid()
             attn_output = attn_output.view(*orig_shape)
 
-        return self.o_proj(attn_output)
+        return self.o_proj(
+            attn_output,
+            lora_params=lora_params,
+            layer_idx=self.layer_idx,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -669,13 +685,47 @@ class ClampedGatedMLP(GatedMLP):
         )
         self.swiglu_limit = swiglu_limit
 
-    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if self.swiglu_limit is None:
-            return super().forward(hidden_states, **kwargs)
-        gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
+            return super().forward(
+                hidden_states,
+                all_rank_num_tokens=all_rank_num_tokens,
+                final_all_reduce_params=final_all_reduce_params,
+                lora_params=lora_params,
+                **kwargs,
+            )
+        if bool(lora_params):
+            assert self.layer_idx is not None, "layer_idx is required for lora"
+            if self._uneven_tp_blocks_lora:
+                raise NotImplementedError(
+                    "LoRA is not supported with uneven TP for ClampedGatedMLP "
+                    "(intermediate_size not divisible by tp_size)."
+                )
+            gate_up = LoraLayer.forward_with_base(
+                lambda: self.gate_up_proj(hidden_states),
+                (self.splitted_gate_up_lora, self.fused_gate_up_lora),
+                hidden_states,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            gate_up = self.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
         gate = torch.nn.functional.silu(gate).clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        return self.down_proj(gate * up)
+        return self.down_proj(
+            gate * up,
+            all_reduce_params=final_all_reduce_params,
+            lora_params=lora_params,
+            layer_idx=self.layer_idx,
+        )
 
 
 class Step3p7MoE(nn.Module):
@@ -715,11 +765,12 @@ class Step3p7MoE(nn.Module):
         )
 
         self.router_bias = Step3p7RouterBiasHolder(self.num_experts)
+        # Keep routing weights normalized but unscaled. The common output scale
+        # in forward applies the checkpoint factor exactly once for every backend.
         routing_method = Step3p7MoeRoutingMethod(
             top_k=self.top_k,
             num_experts=self.num_experts,
             callable_router_bias=lambda: self.router_bias.router_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
         )
 
         (
@@ -727,6 +778,10 @@ class Step3p7MoE(nn.Module):
             self._use_python_clamp,
             self._python_path_reason,
         ) = _select_python_expert_path(model_config, text_config, layer_idx)
+        self._moe_lora_enabled = has_moe_lora_targets(model_config.lora_config)
+        # Routed-expert LoRA must execute in the fused backend. Otherwise the
+        # selected Python path owns expert execution and its dequantized weights.
+        self._use_python_experts = self._use_python_clamp and not self._moe_lora_enabled
 
         self.experts = create_moe(
             num_experts=self.num_experts,
@@ -739,9 +794,18 @@ class Step3p7MoE(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+            activation=SwigluActivation(
+                clamp=self._routed_swiglu_limit,
+                # Derive the backend mode from the expert dispatch decision.
+                # The Python path applies the same order directly and is kept
+                # fail-closed below if its weights cannot be materialized.
+                clamp_after_silu=(
+                    self._routed_swiglu_limit is not None and not self._use_python_experts
+                ),
+            ),
         )
 
-        if self._use_python_clamp:
+        if self._use_python_experts:
             self._allocate_clamp_buffers(text_config.torch_dtype)
 
         self.allreduce = None
@@ -784,11 +848,27 @@ class Step3p7MoE(nn.Module):
         self._clamp_down_proj.copy_(down.to(device=dev, dtype=dt))
         self._clamp_weights_loaded = True
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Initialize non-persistent clamp buffers for dummy model loading."""
+        if not self._use_python_experts:
+            return
+        for name in self._CLAMP_BUFFER_NAMES:
+            buffer = getattr(self, name)
+            generator = torch.Generator(device=buffer.device)
+            generator.manual_seed(seed)
+            buffer.uniform_(low, high, generator=generator)
+        self._clamp_weights_loaded = True
+
     def _clamp_weight_device(self) -> torch.device:
         dev = self._clamp_gate_proj.device
         if dev.type == "meta":
             return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         return dev
+
+    def _requires_python_clamp_weights(self) -> bool:
+        """Whether falling through to the configured backend would change semantics."""
+        limit = self._routed_swiglu_limit
+        return self._use_python_experts and limit is not None and limit > 0.0
 
     def _local_expert_ids(self) -> list[int]:
         ep_size = max(1, self.mapping.moe_ep_size)
@@ -806,7 +886,7 @@ class Step3p7MoE(nn.Module):
         ``Step3p7ForCausalLM._capture_bf16_clamp_weights`` runs earlier (from
         the raw HF tensors) and this method short-circuits.
         """
-        if not self._use_python_clamp or self._clamp_weights_loaded:
+        if not self._use_python_experts or self._clamp_weights_loaded:
             return
         # ``self.experts`` is a ConfigurableMoE wrapper; weights live on the backend.
         e = getattr(self.experts, "backend", None) or self.experts
@@ -884,25 +964,35 @@ class Step3p7MoE(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_size
         orig_shape = hidden_states.shape
         h = hidden_states.view(-1, self.hidden_size)
 
+        if self._requires_python_clamp_weights() and not self._clamp_weights_loaded:
+            raise RuntimeError(
+                f"Step3p7 layer {self.layer_idx} requires dequantized expert weights "
+                "for its post-SiLU Python clamp path, but they were not populated "
+                "during model loading."
+            )
+
         gate_input = h.to(torch.float32) if self.need_fp32_gate else h
         router_logits = self.gate(gate_input)
 
-        if self._use_python_clamp and self._clamp_weights_loaded:
-            # Python path's routing.apply already scales topk_weights.
-            return self._python_clamped_moe_forward(h, router_logits).view(orig_shape)
-
-        routed = self.experts(
-            h,
-            router_logits,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            use_dp_padding=False,
-        )
+        if self._use_python_experts and self._clamp_weights_loaded:
+            # The Python loop consumes the same unscaled routing weights as the
+            # separated CUTLASS path, then joins the common output scaling below.
+            routed = self._python_clamped_moe_forward(h, router_logits)
+        else:
+            routed = self.experts(
+                h,
+                router_logits,
+                all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
+                use_dp_padding=False,
+                lora_params=lora_params,
+            )
         # Step3p7 uses the generic MiniMax2 metadata with routeScale=1.0, so apply
         # ``routed_scaling_factor`` to the MoE output here (mathematically
         # equivalent to scaling each topk weight).
@@ -1010,6 +1100,7 @@ class Step3p7DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -1021,17 +1112,18 @@ class Step3p7DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.moe is not None:
-            routed = self.moe(hidden_states, attn_metadata)
-            shared = self.share_expert(hidden_states)
+            routed = self.moe(hidden_states, attn_metadata, lora_params=lora_params)
+            shared = self.share_expert(hidden_states, lora_params=lora_params)
             hidden_states = routed + shared
             if self.allreduce is not None:
                 hidden_states = self.allreduce(hidden_states)
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, lora_params=lora_params)
         return hidden_states, residual
 
 
@@ -1188,6 +1280,8 @@ class Step3p7MTP(nn.Module):
     a residual add.  ``shared_head.norm`` is applied by ``Step3p7MTPHead`` when
     draft logits are requested.
     """
+
+    uses_shared_lm_head = False
 
     def __init__(
         self,
@@ -1602,7 +1696,7 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         captured: List[int] = []
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None or not getattr(moe, "_use_python_clamp", False):
+            if moe is None or not getattr(moe, "_use_python_experts", False):
                 continue
             if getattr(moe, "_clamp_weights_loaded", False):
                 continue
@@ -1680,16 +1774,27 @@ class Step3p7ForCausalLM(SpecDecOneEngineForCausalLM[Step3p7TextModel, Pretraine
         # Must run after the backend materialises w3_w1/w2.
         for layer in self.model.layers:
             moe = getattr(layer, "moe", None)
-            if moe is None or not getattr(moe, "_use_python_clamp", False):
+            if moe is None or not getattr(moe, "_use_python_experts", False):
                 continue
             try:
                 moe.load_clamp_weights_from_fp8_experts()
             except (AttributeError, KeyError, RuntimeError, ValueError) as e:
+                if moe._requires_python_clamp_weights():
+                    raise RuntimeError(
+                        f"Step3p7 layer {moe.layer_idx} could not materialize the "
+                        "dequantized expert weights required by its post-SiLU "
+                        "Python clamp path."
+                    ) from e
                 _logger.warning(
                     "[Step3p7] failed to populate bf16 expert weights for layer %d (%s): %s. "
-                    "Forward will fall back to the FP8 backend without the Python path.",
+                    "Forward will use the configured backend.",
                     moe.layer_idx,
                     getattr(moe, "_python_path_reason", ""),
                     str(e)[:256],
+                )
+            if moe._requires_python_clamp_weights() and not moe._clamp_weights_loaded:
+                raise RuntimeError(
+                    f"Step3p7 layer {moe.layer_idx} did not materialize the dequantized "
+                    "expert weights required by its post-SiLU Python clamp path."
                 )
         return rc
