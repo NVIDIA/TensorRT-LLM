@@ -1,5 +1,5 @@
 {
-   "accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v1]": 573.8799655172414,
+   "accuracy/test_disaggregated_serving.py::TestDeepSeekR1::test_kv_cache_v2_nixl_python[cache_mgr_v2]": 573.8799655172414,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]": 320.08366666666666,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]": 187.5475185185185,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False]": 255.26407407407407,
@@ -14,7 +14,6 @@
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype": 636.0221666666666,
    "accuracy/test_disaggregated_serving.py::TestDeepSeekV4FlashDSpark::test_gsm8k_1p1d_dep4": 701.589537735849,
    "accuracy/test_disaggregated_serving.py::TestGPTOSS20B::test_beam_search": 421.82333928571427,
-   "accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v1]": 377.8972068965517,
    "accuracy/test_disaggregated_serving.py::TestGPTOSS::test_kv_cache_v2_nixl_python[cache_mgr_v2]": 363.0543666666666,
    "accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4": 852.6860873786408,
    "accuracy/test_disaggregated_serving.py::TestMiniMaxM3::test_nvfp4_eagle3_disagg_head_mismatched_bounce": 1182.4963636363636,
@@ -30,7 +29,7 @@
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2-overlap_on]": 311.7380588235294,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill": 388.24685999999997,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first": 239.22894545454545,
-   "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_kv_cache_v1": 175.61402727272727,
+   "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_gen_first_with_block_reuse": 175.61402727272727,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend": 284.7966597938144,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[no_reuse]": 483.7708275862069,
    "accuracy/test_disaggregated_serving.py::TestQwen3_8_Flash_Next::test_fp8_nixl_python[prefix_cache]": 548.7834128440367,
