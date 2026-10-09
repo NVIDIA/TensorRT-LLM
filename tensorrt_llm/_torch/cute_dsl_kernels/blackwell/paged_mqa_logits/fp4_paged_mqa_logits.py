@@ -56,8 +56,9 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -428,10 +429,26 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
     for i in cutlass.range_constexpr(4):
         offset = (i ^ (lane_idx >> 3)) * 32 + lane_idx
         values[i] = ld_shared_b32(smem_ptr + offset)
-    cute.arch.sync_warp()
+    # Explicit -1 (all-lanes mask): the wrapper default 0xFFFFFFFF triggers a
+    # noisy Int32-truncation DSLWarning on every compile; -1 is the same bits.
+    cute.arch.sync_warp(-1)
     for i in cutlass.range_constexpr(4):
         offset = lane_idx * 4 + (i ^ (lane_idx >> 3))
         st_shared_b32(smem_ptr + offset, values[i])
+
+
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (R100 sm_107 / R150 sm_109), which
+    natively supports FP4 next_n=4 (576/832-col TMEM). Blackwell (sm_100/sm_103,
+    512 cols) does not, so there next_n=4 is emulated by a caller-side 2+2 split.
+
+    TODO: how to robustly judge whether the target is Rubin? major==10 & minor>=7
+    is a heuristic (covers sm_107/sm_109); double check there isn't a canonical
+    Arch API for this -- Arch.is_family_of is suffix-sensitive (returns False for
+    the base sm_107/sm_109, True only for sm_107a/sm_109a).
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
 
 
 class FP4MQALogitsKernel:
@@ -455,6 +472,7 @@ class FP4MQALogitsKernel:
         num_heads: int = 64,
         head_dim: int = 128,
         next_n: int = 1,
+        num_next_n_atoms: int = 1,
         num_sms: int = 148,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
@@ -469,12 +487,25 @@ class FP4MQALogitsKernel:
         cand_cap: int = 5120,
         emit_cand_bucketed: bool = False,
         accept_cap: int = 8192,
+        use_relu_trick: bool = False,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
-        assert next_n in (1, 2, 3), (
-            f"FP4 supports next_n in {{1,2,3}}; got {next_n}. next_n=4 is out-of-scope (TMEM cap)."
+        # In-kernel atom split: the kernel's MMA/TMEM is sized by next_n_atom
+        # (= next_n // num_next_n_atoms), so the *atom* (not logical next_n) is
+        # what the arch TMEM cap gates -- an atom of <=4 needs Rubin (sm_107+,
+        # 576-col TMEM) and <=3 fits Blackwell. next_n itself may exceed the atom
+        # cap via the split (e.g. Blackwell next_n=4 as two atoms of 2).
+        assert next_n % num_next_n_atoms == 0, (
+            f"num_next_n_atoms={num_next_n_atoms} must divide next_n={next_n}"
+        )
+        _next_n_atom = next_n // num_next_n_atoms
+        _max_atom = 4 if _target_is_rubin() else 3
+        assert 1 <= _next_n_atom <= _max_atom, (
+            f"FP4 next_n_atom={_next_n_atom} (next_n={next_n} / "
+            f"num_next_n_atoms={num_next_n_atoms}) must be in 1..{_max_atom} "
+            f"(atom=4 requires Rubin sm_107+; Blackwell max is 3)."
         )
         assert epi_dtype in (
             cutlass.Float32,
@@ -487,6 +518,11 @@ class FP4MQALogitsKernel:
             cutlass.Float16,
         ), f"FP4 output_dtype must be fp32/bf16/fp16; got {output_dtype}"
         assert block_kv == 128, "FP4 compute tile (block_kv) hardcoded to 128"
+        # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
+        # (FMNMX), fp32 epilogue only. Opt-in: x + |x| overflows to inf
+        # for finite x >= 2^127, which the unbounded block scales and
+        # weights of the public API can reach.
+        self.use_relu_trick = use_relu_trick
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -498,8 +534,11 @@ class FP4MQALogitsKernel:
         )
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.next_n = next_n
-        self.N = next_n * num_heads
+        self.next_n = next_n  # logical next-token count (drives output row layout)
+        self.num_next_n_atoms = num_next_n_atoms
+        self.next_n_atom = _next_n_atom
+        # MMA/TMEM N tile is one atom; the logical next_n only drives out_row.
+        self.N = self.next_n_atom * num_heads
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
@@ -621,6 +660,24 @@ class FP4MQALogitsKernel:
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
+
+    def _atom_seq(self, qa):
+        """Native sequence (block_table / context_lens row) of a q_atom_idx.
+        num_next_n_atoms == 1 => identity."""
+        return qa // self.num_next_n_atoms
+
+    def _atom_ctx_len(self, qa, context_lens):
+        """Per-atom context length: atom i (= qa % num_atoms, 0 = oldest) sees
+        ctx shortened by (num_atoms-1-i)*next_n_atom so the split's staggered
+        causal limits match the unsplit next_n. num_atoms == 1 => ctx[qa]."""
+        na = self.num_next_n_atoms
+        return context_lens[qa // na] - (na - 1 - qa % na) * self.next_n_atom
+
+    def _atom_out_row_base(self, qa):
+        """Output row base for a q_atom_idx: seq*next_n + atom*next_n_atom (the
+        +t within the atom is added by the caller). num_atoms == 1 => qa*next_n."""
+        na = self.num_next_n_atoms
+        return (qa // na) * self.next_n + (qa % na) * self.next_n_atom
 
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
         self.a_dtype = a_dtype
@@ -752,13 +809,25 @@ class FP4MQALogitsKernel:
             + self.num_sfa_tmem_cols * self.num_groups
             + self.num_sfb_tmem_cols
         )
-        # TMEM allocator requires num_columns to be a power of two AND a
-        # multiple of 32, between 32 and 512. Round up to next valid value.
-        # Equivalent to utils.get_num_tmem_alloc_cols(..., rounding=True) but
-        # without needing a tmem tensor handle (we already have raw_total).
-        self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
-        assert self.num_tmem_alloc_cols_total <= 512, (
-            f"FP4 TMEM exceeds 512 cols: raw={raw_total}, "
+        # Arch-aware TMEM sizing. SM100 caps at 512 cols and requires a
+        # power-of-two, multiple-of-32 allocation. sm_107+ (Rubin, 576 cols /
+        # sm_109, 832) allow allocations >512 that are only multiple-of-32
+        # (non-power-of-two) via *exclusive* TMEM allocation; the DSL applies
+        # the exclusive flag automatically in alloc_tmem when arch + num_columns
+        # warrant it (see cute.arch.is_tmem_allocation_exclusive).
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        self.arch_str = f"sm_{arch.major}{arch.minor}"  # family key, e.g. "sm_107"
+        max_tmem_cols = get_max_tmem_alloc_cols(self.arch_str)
+        if raw_total <= 512:
+            # SM100 rule (also valid everywhere): round up to pow2, min 32.
+            self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
+        else:
+            # >512: exclusive alloc, 32-col aligned (no pow2 rounding).
+            self.num_tmem_alloc_cols_total = ((raw_total + 31) // 32) * 32
+        assert self.num_tmem_alloc_cols_total <= max_tmem_cols, (
+            f"FP4 TMEM {self.num_tmem_alloc_cols_total} cols (raw={raw_total}) "
+            f"exceeds {self.arch_str} capacity {max_tmem_cols} for "
+            f"next_n={self.next_n}: "
             f"acc={self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages}, "
             f"sfa_per_wg={self.num_sfa_tmem_cols} x{self.num_groups}, "
             f"sfb={self.num_sfb_tmem_cols}, "
@@ -1267,7 +1336,9 @@ class FP4MQALogitsKernel:
         # Note: zero-work CTAs get a stale current_num_kv (from the last batch
         # element), but it is never used because has_work will be False.
         start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
+        current_num_kv = (
+            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+        ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -1281,7 +1352,9 @@ class FP4MQALogitsKernel:
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
-        next_n = self.next_n
+        # Positions processed per kernel task = one atom (next_n_atom). The
+        # logical next_n only appears in the output row stride (_atom_out_row_base).
+        next_n = self.next_n_atom
         num_epi_subtiles = self.num_epi_subtiles
 
         # === Pipelines ===
@@ -1414,6 +1487,9 @@ class FP4MQALogitsKernel:
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
             is_two_cta=False,
+            # Arch-aware: sm_107 exposes 576 cols and needs exclusive alloc for
+            # >512 (next_n=4 -> 544). Defaults to sm_100 (512) otherwise.
+            arch=self.arch_str,
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1734,7 +1810,7 @@ class FP4MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1771,7 +1847,9 @@ class FP4MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1802,7 +1880,7 @@ class FP4MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1839,7 +1917,9 @@ class FP4MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -2008,7 +2088,7 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2140,7 +2220,7 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2186,7 +2266,10 @@ class FP4MQALogitsKernel:
                     # 2-byte weights (fp16 or bf16): next_n in {1,2,3} all fit
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # next_n=4 (Rubin only): 40 is the largest multiple-of-4 that
+                    # is fully spill-free on the direct kernel (measured via ncu:
+                    # 40 -> 0 local ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
@@ -2312,7 +2395,7 @@ class FP4MQALogitsKernel:
                                     self._flush_cand_window_bucketed(
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
-                            ctx_cur = mContextLens[q_idx]
+                            ctx_cur = self._atom_ctx_len(q_idx, mContextLens)
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional Math: OOB results
@@ -2430,10 +2513,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -2491,10 +2589,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -2516,12 +2629,17 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_relu_trick):
+                                # FP4 has no store-time scale (the SF is
+                                # baked into the accumulator by UMMA), so
+                                # the relu trick's / 2 lands here.
+                                result_t = result_t * cutlass.Float32(0.5)
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
                         else:
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = stored_t
                         if cutlass.const_expr(self.emit_block_meta):
                             # Meta reduction on the POST-conversion value so
@@ -2535,7 +2653,7 @@ class FP4MQALogitsKernel:
                             # tile*4 + warp; the GVR consumer folds the
                             # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
+                                out_row_m = self._atom_out_row_base(q_idx) + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
                                 mBlockMax[(out_row_m, rec_m)] = r_bmax
                             if cutlass.const_expr(self.emit_seed_counts):
@@ -2903,7 +3021,7 @@ class FP4MQALogitsKernel:
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
@@ -2913,7 +3031,7 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2960,7 +3078,10 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     MAX_NUM_W_IN_REG = 64
                 else:
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # next_n=4 (Rubin only): 40 is the largest multiple-of-4 that
+                    # is fully spill-free on the direct kernel (measured via ncu:
+                    # 40 -> 0 local ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 if cutlass.const_expr(self.emit_block_meta):
                     # Free ~8 registers for the meta accumulators/fragments;
                     # the epilogue's weight cache sits at the spill edge.
@@ -3085,7 +3206,7 @@ class FP4MQALogitsKernel:
                                     self._flush_cand_window_bucketed(
                                         mCand, mCandIdx, q_idx_old, cwbase, cwleft, meta_lane
                                     )
-                            ctx_cur = mContextLens[q_idx]
+                            ctx_cur = self._atom_ctx_len(q_idx, mContextLens)
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional Math
@@ -3197,10 +3318,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -3258,10 +3394,25 @@ class FP4MQALogitsKernel:
                                         ps0 = fma_bf16x2(pa01, pw01, ps0)
                                         ps1 = fma_bf16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -3283,12 +3434,17 @@ class FP4MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_relu_trick):
+                                # FP4 has no store-time scale (the SF is
+                                # baked into the accumulator by UMMA), so
+                                # the relu trick's / 2 lands here.
+                                result_t = result_t * cutlass.Float32(0.5)
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         stored_t = self.output_dtype(result_t)
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = stored_t
                         else:
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = stored_t
                         if cutlass.const_expr(self.emit_block_meta):
                             # Meta reduction on the POST-conversion value so
@@ -3302,7 +3458,7 @@ class FP4MQALogitsKernel:
                             # tile*4 + warp; the GVR consumer folds the
                             # 4 warp-partials per block.
                             if meta_lane == cutlass.Int32(0):
-                                out_row_m = q_idx * next_n + t
+                                out_row_m = self._atom_out_row_base(q_idx) + t
                                 rec_m = meta_kv_tile * cutlass.Int32(4) + meta_warp
                                 mBlockMax[(out_row_m, rec_m)] = r_bmax
                             if cutlass.const_expr(self.emit_seed_counts):
@@ -3670,7 +3826,7 @@ class FP4MQALogitsKernel:
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
@@ -3680,7 +3836,7 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)

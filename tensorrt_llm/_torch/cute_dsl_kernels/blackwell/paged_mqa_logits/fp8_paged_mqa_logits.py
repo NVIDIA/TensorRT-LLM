@@ -65,8 +65,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -177,6 +178,16 @@ def add_f16x2(
     )
 
 
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (R100 sm_107 / R150 sm_109).
+
+    major==10 & minor>=7 is a heuristic: Arch.is_family_of is suffix-sensitive
+    (False for the base sm_107/sm_109, True only for sm_107a/sm_109a).
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
+
+
 class FP8MQALogitsKernel:
     """FP8 paged MQA logits kernel for Blackwell (SM100).
 
@@ -192,6 +203,7 @@ class FP8MQALogitsKernel:
         num_heads: int = 64,
         head_dim: int = 128,
         next_n: int = 1,
+        num_next_n_atoms: int = 1,
         num_sms: int = 148,
         remove_kv_wait_in_epilogue: bool = False,
         early_tmem_copy: bool = False,
@@ -202,6 +214,8 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        use_relu_trick: bool = False,
+        use_flat_logits_view=None,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -217,11 +231,36 @@ class FP8MQALogitsKernel:
         self.smem_subpartition_opt = smem_subpartition_opt
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.next_n = next_n
-        self.N = next_n * num_heads
+        self.next_n = next_n  # logical next-token count (drives output row layout)
+        # In-kernel atom split: next_n is decomposed into num_next_n_atoms atoms
+        # of next_n_atom positions each (1 => direct). The MMA/TMEM N tile is
+        # sized by the per-atom next_n; the logical next_n still drives out_row.
+        assert next_n % num_next_n_atoms == 0, (
+            f"num_next_n_atoms={num_next_n_atoms} must divide next_n={next_n}"
+        )
+        self.num_next_n_atoms = num_next_n_atoms
+        self.next_n_atom = next_n // num_next_n_atoms
+        self.N = self.next_n_atom * num_heads
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        # relu(x) = (x + |x|) / 2 (FADD2 + abs) instead of max(x, 0)
+        # (FMNMX), fp32 epilogue only. Opt-in: x + |x| overflows to inf
+        # for finite x >= 2^127, which the unbounded block scales and
+        # weights of the public API can reach.
+        self.use_relu_trick = use_relu_trick
+        # Flat logits view + carried row offset: the store address is
+        # base + out_row*stride0 + kv_pos, but out_row only changes on a
+        # q-change, so recomputing the row term there leaves the hot path a
+        # single add. Auto-off on Rubin, where it regresses (the backend
+        # schedules the UMMA consumer-release late in the math loop).
+        # next_n>=4 measured slower on GB200 with this (scalar) epilogue:
+        # the per-t row multiply is paid 4x per task and is not amortised
+        # the way DKG's two-level task loop amortises it [job 3107812:
+        # 1.05x-1.28x slower at next_n=4, 0.93x-0.99x faster at next_n<=2].
+        if use_flat_logits_view is None:
+            use_flat_logits_view = not _target_is_rubin() and next_n < 4
+        self.use_flat_logits_view = use_flat_logits_view
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
         # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
@@ -246,9 +285,12 @@ class FP8MQALogitsKernel:
 
         self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
 
-        # TMEM: 512 columns total, each group needs N columns per UMMA stage
-        # max_umma_stages = 512 // (2 * N)
-        TMEM_COLS = 512
+        # TMEM columns (arch-aware): each group needs N columns per UMMA stage,
+        # so max_umma_stages = TMEM_COLS // (2 * N). Rubin exposes 576 (sm_107) /
+        # 832 (sm_109) vs Blackwell's 512, letting larger N still fit >= 2 UMMA
+        # stages (e.g. next_n=3 N=192 gets 2 stages on sm_109).
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        TMEM_COLS = get_max_tmem_alloc_cols(f"sm_{arch.major}{arch.minor}")
         if max_umma_pipeline:
             self.num_umma_stages = min(2, TMEM_COLS // (2 * self.N))
         else:
@@ -290,6 +332,24 @@ class FP8MQALogitsKernel:
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
+
+    def _atom_seq(self, qa):
+        """Native sequence (block_table / context_lens row) of a q_atom_idx.
+        num_next_n_atoms == 1 => identity."""
+        return qa // self.num_next_n_atoms
+
+    def _atom_ctx_len(self, qa, context_lens):
+        """Per-atom context length: atom i (= qa % num_atoms, 0 = oldest) sees
+        ctx shortened by (num_atoms-1-i)*next_n_atom so the split's staggered
+        causal limits match the unsplit next_n. num_atoms == 1 => ctx[qa]."""
+        na = self.num_next_n_atoms
+        return context_lens[qa // na] - (na - 1 - qa % na) * self.next_n_atom
+
+    def _atom_out_row_base(self, qa):
+        """Output row base for a q_atom_idx: seq*next_n + atom*next_n_atom (the
+        +t within the atom is added by the caller). num_atoms == 1 => qa*next_n."""
+        na = self.num_next_n_atoms
+        return (qa // na) * self.next_n + (qa % na) * self.next_n_atom
 
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
         self.a_dtype = a_dtype
@@ -577,18 +637,15 @@ class FP8MQALogitsKernel:
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
+        # In-kernel atom-split addressing lives in the self._atom_* methods
+        # (identity when num_next_n_atoms == 1). qa is a q_atom_idx in
+        # [0, batch*num_atoms): seq = qa//num_atoms is the native block_table /
+        # context_lens row, atom = qa%num_atoms (0 = oldest, shortest context).
         sm_idx = bidz
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
         end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
         end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (mContextLens[start_q_clamped] + self.block_kv - 1) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -601,7 +658,9 @@ class FP8MQALogitsKernel:
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
-        next_n = self.next_n
+        # Positions processed per kernel task = one atom (next_n_atom). The
+        # logical next_n only appears in the output row stride (_atom_out_row_base).
+        next_n = self.next_n_atom
         num_epi_subtiles = self.num_epi_subtiles
 
         # === Pipelines ===
@@ -891,24 +950,35 @@ class FP8MQALogitsKernel:
         )
 
         # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
-        end_kv_idx = end_kv_half * NUM_MATH_WG
+        # Consumers of the early schedule-metadata loads, placed at their
+        # real use site. Known codegen limitation (not worked around):
+        # the compiler does not keep these global loads and their
+        # consumers apart — regardless of source
+        # placement, the clamp+add+shift chain is hoisted right after its
+        # load, exposing the two L2 round-trips instead of hiding them
+        # under the independent mbarrier-init work. ptxas trades exposed
+        # load latency for shorter register lifetimes and re-solves to that
+        # optimum no matter the IR order; getting the sink from source needs
+        # a scheduling barrier (cfence) or a latency-aware cost model fix.
+        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA
+        # sentinel). Zero-work CTAs get a stale current_num_kv, never used
+        # because has_work will be False.
+        start_q_clamped = min(start_q, batch_size - 1)
+        current_num_kv = (
+            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
+        ) // self.block_kv
 
-        # Convert start to KV block units (matching DeepGEMM)
-        current_q_idx = start_q
-        current_kv_idx = start_kv_half * NUM_MATH_WG
-
-        # ===== COMMON SCHEDULER STATE (before warp branches) =====
-        # Each warp role independently maintains its own copy of these
-        # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
-        next_q_idx = current_q_idx
-        next_kv_idx = current_kv_idx
-        next_num_kv = current_num_kv
-        # Sentinel: no previous batch (matches DeepGEMM's q_idx = batch_size)
-        q_idx = batch_size
-        # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
-        # True if this CTA has work assigned (start != end in schedule_meta).
-        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
+        # ===== SCHEDULER STATE: sunk into each warp-role branch =====
+        # Each warp role derives its own scheduler-state copy (end_kv_idx,
+        # next_q_idx/next_kv_idx/next_num_kv, q_idx sentinel, has_work) from
+        # the early-loaded schedule metadata AFTER its warpgroup_reg_alloc/
+        # dealloc call. Deriving it here (before the branches) placed the
+        # loop-carried values under the shared prologue register budget,
+        # where the register pressure before the setmaxnreg
+        # reallocation forced ptxas to spill the kv cursor + bound pair
+        # to local memory; deriving per role eliminates
+        # the spill. The block is pure arithmetic on already-loaded values,
+        # so per-branch duplication is semantics-preserving.
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -918,6 +988,15 @@ class FP8MQALogitsKernel:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             # Matches DeepGEMM's TMA warp with kv_group_idx == 0
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
@@ -1000,7 +1079,7 @@ class FP8MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1037,7 +1116,9 @@ class FP8MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1045,6 +1126,15 @@ class FP8MQALogitsKernel:
             # TMA warp 1: loads KV + Scale for group 1 only
             # Matches DeepGEMM's TMA warp with kv_group_idx == 1
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
@@ -1069,7 +1159,7 @@ class FP8MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[(self._atom_seq(q_idx), base_phys + i)]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1106,7 +1196,9 @@ class FP8MQALogitsKernel:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                        next_num_kv = (
+                            self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
+                        ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1117,6 +1209,14 @@ class FP8MQALogitsKernel:
             # warp. KV0 barrier arriving does not guarantee Q SMEM
             # writes are visible.
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -1174,7 +1274,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1185,6 +1285,14 @@ class FP8MQALogitsKernel:
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
@@ -1240,13 +1348,23 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
+
+            # Per-role scheduler state (see comment above the branch chain).
+            # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
+            # scheduler words live under the 240-register math budget.
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
@@ -1286,6 +1404,23 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # The 2D alias keeps `mLogits` itself out of the gated store
+                # code: referencing a defined tensor from the untraced arm
+                # changes the loop-region captures, while an undefined name
+                # is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (the host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1300,6 +1435,8 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
@@ -1411,10 +1548,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -1451,10 +1603,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -1471,13 +1638,28 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                        # relu trick's / 2 folds into the store scale.
+                        scale_eff = scale_val
+                        if cutlass.const_expr(self.use_relu_trick):
+                            scale_eff = scale_val * cutlass.Float32(0.5)
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_off_t = out_row_off + t * logits_stride0 + kv_pos
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_flat[out_off_t] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_flat[out_off_t] = self.output_dtype(result_t * scale_eff)
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            out_row = self._atom_out_row_base(q_idx) + t
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * scale_eff
+                                )
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1486,7 +1668,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1521,6 +1703,23 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # The 2D alias keeps `mLogits` itself out of the gated store
+                # code: referencing a defined tensor from the untraced arm
+                # changes the loop-region captures, while an undefined name
+                # is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (the host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1535,6 +1734,8 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = self._atom_out_row_base(q_idx) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
@@ -1627,10 +1828,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     r0 = t * NUM_W_IN_REG + h_g
                                     w0 = w_cache[r0]
                                     w1 = w_cache[r0 + 1]
@@ -1667,10 +1883,25 @@ class FP8MQALogitsKernel:
                                     ps0 = fma_f16x2(pa01, pw01, ps0)
                                     ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
-                                    a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
-                                    a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        # relu(x) = (x + |x|) / 2: FADD2 with a free abs
+                                        # modifier, exact for finite x. The / 2 is folded
+                                        # into the store site.
+                                        x0 = acc_vec[n0]
+                                        x1 = acc_vec[n0 + 1]
+                                        x2 = acc_vec[n0 + 2]
+                                        x3 = acc_vec[n0 + 3]
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (x0, x1), (abs(x0), abs(x1)), rnd=_RND_RN
+                                        )
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (x2, x3), (abs(x2), abs(x3)), rnd=_RND_RN
+                                        )
+                                    else:
+                                        a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                                        a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                                        a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                                        a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
                                     w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                     w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
                                     w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
@@ -1687,13 +1918,28 @@ class FP8MQALogitsKernel:
                             result_t = sum_lo + sum_hi
                         else:
                             result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                        # relu trick's / 2 folds into the store scale.
+                        scale_eff = scale_val
+                        if cutlass.const_expr(self.use_relu_trick):
+                            scale_eff = scale_val * cutlass.Float32(0.5)
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_off_t = out_row_off + t * logits_stride0 + kv_pos
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_flat[out_off_t] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_flat[out_off_t] = self.output_dtype(result_t * scale_eff)
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(result_t * scale_val)
+                            out_row = self._atom_out_row_base(q_idx) + t
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * Float16(scale_val)
+                                )
+                            else:
+                                mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                    result_t * scale_eff
+                                )
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1702,7 +1948,7 @@ class FP8MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens) + block_kv_val - 1
                             ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
