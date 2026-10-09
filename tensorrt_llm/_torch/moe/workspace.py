@@ -49,6 +49,9 @@ class CutlassWorkspaceReclaimer:
         self._cached_runners: dict[
             tuple[int, torch.device, int], tuple[_WorkspaceMethods, torch.cuda.Stream]
         ] = {}
+        self._last_runner: _WorkspaceRunner | None = None
+        self._last_device_index: int | None = None
+        self._last_stream_id = 0
         self._num_tokens = 0
         self._warmup = False
         self._active = False
@@ -56,7 +59,16 @@ class CutlassWorkspaceReclaimer:
     def register(self, runner: _WorkspaceRunner, device: torch.device) -> None:
         # Query the raw stream on the input's explicit device. Constructing a
         # Stream and resolving the current device on every layer is expensive.
-        stream_id = torch._C._cuda_getCurrentRawStream(device.index)
+        device_index = device.index
+        stream_id = torch._C._cuda_getCurrentRawStream(device_index)
+        # Consecutive layers usually share a runner. Still check the stream,
+        # but avoid constructing and hashing the same key for every layer.
+        if (
+            runner is self._last_runner
+            and device_index == self._last_device_index
+            and stream_id == self._last_stream_id
+        ):
+            return
         key = (id(runner), device, stream_id)
         if key not in self._runners:
             cached = self._cached_runners.get(key)
@@ -66,6 +78,9 @@ class CutlassWorkspaceReclaimer:
             methods, stream = cached
             accepted = methods.begin_workspace_forward(self._owner, self._warmup, self._num_tokens)
             self._runners[key] = (methods if accepted else None, stream)
+        self._last_runner = runner
+        self._last_device_index = device_index
+        self._last_stream_id = stream_id
 
     @staticmethod
     def _finish(runner: _WorkspaceRunner, stream: torch.cuda.Stream, completed: bool) -> None:
@@ -91,6 +106,7 @@ class CutlassWorkspaceReclaimer:
         self._num_tokens = num_tokens
         self._warmup = warmup
         self._runners = {}
+        self._last_runner = None
         self._active = True
         token = _current_scope.set(self)
         completed = False
@@ -107,11 +123,18 @@ class CutlassWorkspaceReclaimer:
         finally:
             _current_scope.reset(token)
             self._active = False
+            self._last_runner = None
             runners, self._runners = self._runners, {}
-            with ExitStack() as stack:
-                for runner, stream in runners.values():
-                    if runner is not None:
-                        stack.callback(self._finish, runner, stream, completed)
+            if len(runners) == 1:
+                runner, stream = next(iter(runners.values()))
+                if runner is not None:
+                    self._finish(runner, stream, completed)
+            else:
+                # Finish every owner even when another owner's cleanup fails.
+                with ExitStack() as stack:
+                    for runner, stream in runners.values():
+                        if runner is not None:
+                            stack.callback(self._finish, runner, stream, completed)
 
 
 def register_cutlass_workspace(runner: _WorkspaceRunner, device: torch.device) -> None:

@@ -95,8 +95,9 @@ def test_unsupported_execution_does_not_register(
     runner.begin_workspace_forward.assert_not_called()
 
 
+@pytest.mark.parametrize("return_to_first", [False, True])
 def test_streams_have_independent_native_scopes(
-    cuda_scope: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+    cuda_scope: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, return_to_first: bool
 ) -> None:
     streams = [
         cuda_scope,
@@ -119,22 +120,28 @@ def test_streams_have_independent_native_scopes(
         register_cutlass_workspace(runner, current.device)
         current = streams[1]
         register_cutlass_workspace(runner, current.device)
+        if return_to_first:
+            current = streams[0]
+            register_cutlass_workspace(runner, current.device)
     assert runner.begin_workspace_forward.call_count == 2
     assert runner.finish_workspace_forward.call_count == 2
-    assert restored == [streams[0]]
+    assert restored == [streams[1] if return_to_first else streams[0]]
 
 
+@pytest.mark.parametrize("other_owner", [False, True])
 def test_cleanup_error_finishes_other_owners_and_scope_can_be_reused(
-    cuda_scope: SimpleNamespace,
+    cuda_scope: SimpleNamespace, other_owner: bool
 ) -> None:
     reclaimer = CutlassWorkspaceReclaimer()
     first, failing = Mock(), Mock()
     failing.finish_workspace_forward.side_effect = RuntimeError("cleanup failed")
     with pytest.raises(RuntimeError, match="cleanup failed"):
         with reclaimer.forward(warmup=False):
-            register_cutlass_workspace(first, cuda_scope.device)
+            if other_owner:
+                register_cutlass_workspace(first, cuda_scope.device)
             register_cutlass_workspace(failing, cuda_scope.device)
-    first.finish_workspace_forward.assert_called_once_with(True)
+    if other_owner:
+        first.finish_workspace_forward.assert_called_once_with(True)
     fresh = Mock()
     register_cutlass_workspace(fresh, cuda_scope.device)
     fresh.begin_workspace_forward.assert_not_called()
