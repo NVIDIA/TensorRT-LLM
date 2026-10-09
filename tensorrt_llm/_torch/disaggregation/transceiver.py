@@ -238,10 +238,6 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
     mappers move, never physical slot bytes: a coalesced pool carries one view per role class
     (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
     slot offsets no view transfers.
-
-    Bounce sizing (bounce/impl.py block_bytes_per_group) counts physical slot bytes once per
-    pool, ignored-role regions included; keep the two accountings in mind together when
-    changing either.
     """
     if page_table is None:
         return 0, 0
@@ -1286,7 +1282,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
-            # TODO: An idle bounce reservation is not handed back on the failure path.
             session = self._legacy_session(fetches)
             if session is not None:
                 self._recv_sessions[rid] = session

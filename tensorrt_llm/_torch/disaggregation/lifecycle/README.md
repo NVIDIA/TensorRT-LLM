@@ -5,9 +5,9 @@
 This internal package shares only deadline and retirement arbitration. Physical
 operation ownership, the six sender states, backend-status polling, receive
 cohorts, and `TransferNotSubmittedError` remain in `native/ownership.py`. Native
-sessions still order publication, submit transfers, translate protocol evidence,
-and synchronize local CUDA work. This package introduces no KV owner, allocator,
-public backend API, or supported configuration.
+sessions still order publication, submit transfers, and translate protocol
+evidence. This package introduces no KV owner, allocator, public backend API, or
+supported configuration.
 
 ## Binding responsibilities
 

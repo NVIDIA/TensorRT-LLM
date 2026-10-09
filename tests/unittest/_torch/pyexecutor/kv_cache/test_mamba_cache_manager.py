@@ -7442,11 +7442,9 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        MambaPolicy,
-        mamba_receiver_payload_bytes,
-    )
+    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_global_layer_ids
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -7467,7 +7465,12 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
         dst_group = next(g for g in dst_table.layer_groups if isinstance(g, MambaLayerGroup))
         for group in (src_group, dst_group):
             assert {pv.pool_role for pv in group.pool_views} == {MAMBA_CONV_ROLE, MAMBA_SSM_ROLE}
-        assert mamba_receiver_payload_bytes(src_table, dst_table, dst_slot) == sum(
+        # A generation slot receives each view's bytes for every layer the view covers: the conv
+        # and temporal state, without the replay caches.
+        assert sum(
+            len(get_pool_view_global_layer_ids(view, dst_group)) * view.bytes_per_layer
+            for view in dst_group.pool_views
+        ) == sum(
             gen.mamba_layer_cache(i).conv[dst_slot].numel() * 2
             + gen.mamba_layer_cache(i).temporal[dst_slot].numel() * 4
             for i in range(2)

@@ -2308,7 +2308,6 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
-        bounce_dst_base=None,
     )
     meta = transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2406,7 +2405,6 @@ def _helix_ring_write_meta(
         block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
         dst_start_token=None,
         slice_id=0,
-        bounce_dst_base=None,
     )
     return transfer_mod.Sender._build_kv_write_meta(
         SimpleNamespace(_registrar=registrar), task, req_info
@@ -2518,7 +2516,7 @@ def test_failed_write_build_reports_failure_to_the_receiver():
     endpoint, message = sender._send_task_queues[0].get_nowait()
     assert endpoint == "gen-endpoint"
     assert message[0] == transfer_mod.MessageType.KV_AGENT_RESULT
-    peer_rank, rid, slice_id, is_last, status, size = transfer_mod._KV_RESULT_PREFIX.unpack(
+    peer_rank, rid, slice_id, is_last, status, size = transfer_mod._KV_RESULT_FRAME.unpack(
         message[1]
     )
     assert (peer_rank, rid, slice_id, is_last, size) == (3, 42, 0, True, 0)
