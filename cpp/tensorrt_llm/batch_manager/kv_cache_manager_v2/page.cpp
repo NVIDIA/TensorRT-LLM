@@ -123,7 +123,84 @@ CommittedPage::CommittedPage(
     , block(blk.get())
     , numTokensInBlock(numTokensInBlock_)
 {
-    TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && numTokensInBlock_ <= static_cast<int>(blk->tokens.size()));
+    TLLM_CHECK_DEBUG(0 < numTokensInBlock_ && (!blk || numTokensInBlock_ <= static_cast<int>(blk->tokens.size())));
+}
+
+bool CommittedPage::claimSparseGpu(KvCache& kvCache)
+{
+    if (cacheLevel != kHotLevel)
+    {
+        return false;
+    }
+    auto const owner = mSparseGpuOwner.lock();
+    if (owner && owner.get() != &kvCache && !owner->isClosed())
+    {
+        return false;
+    }
+    mSparseGpuOwner = kvCache.shared_from_this();
+    return true;
+}
+
+SharedPtr<SparsePageBacking> CommittedPage::sparseBacking()
+{
+    auto backing = mSparseBacking;
+    if (!backing)
+    {
+        if (!block || !block->isFull() || numTokensInBlock != block->tokensPerBlock())
+        {
+            return nullptr;
+        }
+        backing = makeShared<SparsePageBacking>(block->sharedFromThis());
+        if (cacheLevel == kHotLevel)
+        {
+            mSparseBacking = backing;
+        }
+    }
+    if (cacheLevel == kSparseHistoryLevel && !backing->hostLock(lifeCycle))
+    {
+        backing->publishHost(hold()->pin());
+    }
+    return backing;
+}
+
+SparsePageBacking::SparsePageBacking(SharedPtr<Block> const& block)
+    : mBlock(block)
+{
+    TLLM_CHECK_DEBUG(block && block->isFull());
+}
+
+SharedPtr<UniqPageLock> SparsePageBacking::hostLock(LifeCycleId lifeCycle)
+{
+    if (!mHostLock)
+    {
+        auto const block = mBlock.lock();
+        auto* page = block ? block->getPage(lifeCycle) : nullptr;
+        if (page && page->cacheLevel == kSparseHistoryLevel && page->numTokensInBlock == block->tokensPerBlock())
+        {
+            publishHost(page->hold()->pin());
+        }
+    }
+    return mHostLock;
+}
+
+void SparsePageBacking::publishHost(SharedPtr<UniqPageLock> const& lock)
+{
+    auto const page = dynamicPointerCast<CommittedPage>(lock->page());
+    TLLM_CHECK_DEBUG(page && page->cacheLevel == kSparseHistoryLevel);
+    TLLM_CHECK_DEBUG(!mHostLock || mHostLock == lock);
+    mHostLock = lock;
+    page->mSparseBacking.reset();
+    page->mSparseGpuOwner.reset();
+    auto const block = mBlock.lock();
+    if (block && block->getPage(page->lifeCycle) != page.get())
+    {
+        auto* previous = block->unlinkPage(page->lifeCycle);
+        if (previous && previous->scheduledForEviction())
+        {
+            previous->manager->excludeFromEviction(*previous);
+        }
+        block->replacePage(page->lifeCycle, page.get());
+    }
 }
 
 CommittedPage::~CommittedPage()
@@ -202,19 +279,31 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, bool privateSparseCopy)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
     // in between must not lose a usable snapshot.
-    TLLM_CHECK_DEBUG_WITH_INFO(blk->canReplacePage(lifeCycle, numTokensInBlock),
+    TLLM_CHECK_DEBUG_WITH_INFO(privateSparseCopy || blk->canReplacePage(lifeCycle, numTokensInBlock),
         "Block slot for this lifecycle already has a page covering more tokens");
     TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
 
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    auto committed = makeShared<CommittedPage>(
+        manager, privateSparseCopy ? nullptr : blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    if (privateSparseCopy)
+    {
+        TLLM_CHECK_DEBUG(cacheLevel == kHotLevel && numTokensInBlock == blk->tokensPerBlock());
+        committed->mSparseBacking = blk->getPage(lifeCycle)->sparseBacking();
+        TLLM_CHECK_DEBUG(committed->mSparseBacking);
+    }
+    if (auto const* attention = std::get_if<AttnLifeCycle>(&manager->getLifeCycle(lifeCycle));
+        attention && attention->isSparse && cacheLevel == kHotLevel)
+    {
+        committed->claimSparseGpu(*kvCache);
+    }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -225,7 +314,10 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
     // Register in block storage.
-    blk->replacePage(lifeCycle, committed.get());
+    if (!privateSparseCopy)
+    {
+        blk->replacePage(lifeCycle, committed.get());
+    }
 
     return committed;
 }
@@ -259,8 +351,11 @@ PageHolder::~PageHolder()
                 // page with a larger recorded token count) is unreachable for reuse, so keeping it
                 // in the eviction LRU would just pin a slot until memory pressure hits.
                 auto* cp = static_cast<CommittedPage*>(page.get());
-                if (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp))
+                if (page->scheduledForEviction()
+                    && (cp->block == nullptr || cp->block->isOrphan() || !cp->block->holdsPage(*cp)))
+                {
                     manager->excludeFromEviction(*page);
+                }
             }
             else
             {
@@ -273,6 +368,11 @@ PageHolder::~PageHolder()
 
 SharedPageLock PageHolder::lock(
     KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
+{
+    return pin()->share(kvCache, beamIndex, ordinal, lc, skipWait);
+}
+
+SharedPtr<UniqPageLock> PageHolder::pin()
 {
     // Create or reuse UniqPageLock.
     auto ul = uniqLock.lock();
@@ -289,7 +389,7 @@ SharedPageLock PageHolder::lock(
         TLLM_CHECK_DEBUG(!page->scheduledForEviction());
     }
 
-    return ul->share(kvCache, beamIndex, ordinal, lc, skipWait);
+    return ul;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +412,9 @@ UniqPageLock::~UniqPageLock()
     KVCM2_POISON_ON_EXCEPT(
         [this]
         {
-            Page& p = *page();
+            // Holder teardown can unlink an orphaned page's last eviction reference.
+            auto const pageRef = page();
+            Page& p = *pageRef;
             TLLM_CHECK_DEBUG(p.cacheLevel == p.queryLockLevel() && !p.scheduledForEviction());
             TLLM_CHECK_DEBUG(mOwners.empty());
             // Set readyEvent to the merged finish events of all readers. For committed (read-only)
@@ -368,6 +470,10 @@ void UniqPageLock::prepareSparseOffload(KvCache const& requestingCache)
     bool requestingOwner = false;
     for (auto const& owner : mOwners)
     {
+        if (p.cacheLevel == kHotLevel && owner.kvCache != &requestingCache)
+        {
+            throw LogicError("Sparse GPU pages must be private to the offloading request");
+        }
         if (!owner.kvCache->isActive() || owner.lifeCycle != p.lifeCycle || owner.ordinal < BlockOrdinal{0}
             || owner.ordinal >= BlockOrdinal{owner.kvCache->historyLength() / owner.kvCache->tokensPerBlock()})
         {
@@ -409,6 +515,26 @@ Slot UniqPageLock::moveToSparseHistory(Slot&& hostSlot)
     return gpuSlot;
 }
 
+void UniqPageLock::reserveOwners(size_t count)
+{
+    mOwners.reserve(mOwners.size() + count);
+}
+
+void UniqPageLock::releaseSparseGpuSlot()
+{
+    auto& p = *page();
+    TLLM_CHECK_DEBUG(mOwners.empty() && p.cacheLevel == kHotLevel && !p.scheduledForEviction());
+    Slot slot;
+    slot.setSlot(p);
+    slot.readyEvent = mergeEvents(finishEvents);
+    p.manager->releaseSlot(p.lifeCycle, kHotLevel, std::move(slot));
+    if (auto const committed = dynamicPointerCast<CommittedPage>(page()))
+    {
+        committed->mSparseBacking.reset();
+        committed->mSparseGpuOwner.reset();
+    }
+}
+
 void UniqPageLock::removeOwner(LockOwner const& owner)
 {
     auto const it = std::find(mOwners.begin(), mOwners.end(), owner);
@@ -437,6 +563,13 @@ SharedPageLock::SharedPageLock(SharedPtr<UniqPageLock> ul, KvCache& kvCache, Bea
     : mUniqLock(std::move(ul))
     , mUser{&kvCache, beamIndex, ordinal, lc}
 {
+    auto const* attention = std::get_if<AttnLifeCycle>(&page()->manager->getLifeCycle(lc));
+    auto const committed = dynamicPointerCast<CommittedPage>(page());
+    if (attention && attention->isSparse && page()->cacheLevel == kHotLevel && committed
+        && !committed->claimSparseGpu(kvCache))
+    {
+        throw LogicError("Sparse GPU pages require a private request allocation");
+    }
     if (!skipWait)
     {
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
@@ -520,10 +653,12 @@ void SharedPageLock::releasePageIndex()
 // batchedLockPages
 // ---------------------------------------------------------------------------
 
-std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
+std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& requestedTargets)
 {
     auto* storeMgr = kvCache.storageManager();
     TLLM_CHECK_DEBUG(storeMgr);
+    auto targets = requestedTargets;
+    kvCache._prepareSparsePages(targets);
     // All pages must belong to the same storage manager.
     TLLM_CHECK_DEBUG(targets.empty()
         || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));

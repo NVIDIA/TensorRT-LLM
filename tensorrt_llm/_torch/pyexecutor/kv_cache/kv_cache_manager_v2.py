@@ -6285,8 +6285,8 @@ class KVCacheManagerV2(BaseResourceManager):
         max_blocks: Optional[int] = None,
     ):
         self._publish_sparse_metadata()
-        # Sparse history can remain on GPU while offload is deferred. Check all
-        # mapped pages after publication, which can retry the deferred offload.
+        # Dense attention offsets can address only GPU mappings. Sparse prefill
+        # has private GPU pages; complete sparse decode history resides on host.
         if self.sparse_metadata_batch is not None and any(
             level is not None and level != GPU_LEVEL
             for req_id in request_ids

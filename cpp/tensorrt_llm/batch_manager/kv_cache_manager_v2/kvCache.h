@@ -561,6 +561,7 @@ public:
 private:
     friend class KvCacheIntrospection;
     friend class UniqPageLock;
+    friend class StorageManager;
     friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
@@ -577,7 +578,12 @@ private:
     // Prefill and writable pages require GPU storage. Decode keeps cold sparse history on host.
     CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
 
-    // Offload GPU pages in the supplied complete-history range, validating every live owner's phase.
+    bool _isSparsePartialCopySource(Page const& page, BlockOrdinal ordinal) const;
+
+    void _prepareSparsePages(std::vector<BatchedLockTarget>& targets);
+    void _useSparseHostPage(SharedPtr<UniqPageLock> const& source, SharedPtr<UniqPageLock> const& host);
+
+    // Offload this request's GPU pages in the supplied complete-history range.
     // The candidate watermark is visible only under the exclusive API lock until offload succeeds.
     void _offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength);
     void _publishHistoryLength(int historyLength);

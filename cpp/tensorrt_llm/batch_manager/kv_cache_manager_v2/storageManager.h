@@ -40,6 +40,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Forward declarations.
 class Page;
+class CommittedPage;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
@@ -159,6 +160,11 @@ public:
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
+    //! Copy immutable sparse pages into request-private GPU allocations, retaining host backing.
+    std::vector<SharedPtr<CommittedPage>> copySparsePages(KvCache& requestingCache,
+        std::vector<SharedPtr<CommittedPage>> const& pages, MigrationRecorder const& migrationRecorder,
+        DropRecorder const& dropRecorder);
+
     // ---- Eviction ----------------------------------------------------------
 
     // Schedule a page for eviction (if evictable).
@@ -192,7 +198,7 @@ public:
     void batchedMigrate(
         CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
 
-    //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
+    //! Establish host backing for complete sparse pages and release the requesting cache's GPU copies.
     //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
     void offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
