@@ -786,7 +786,6 @@ def _make_cache_config(**overrides) -> SimpleNamespace:
         kv_transfer_poll_interval_ms=5_000,
         kv_transfer_sender_future_timeout_ms=1_000,
         kv_cache_bounce_size_mb=0,
-        agent_bounce_buffer_enable=False,
         agent_bounce_params=None,
         enable_pipelined_transfer=False,
     )
@@ -808,12 +807,6 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.create_cache_reuse_adapter",
         Mock(return_value=Mock()),
-    )
-    # Echo the routed size: None for 0 (off, mirroring the real helper), a sentinel
-    # carrying the size otherwise, so tests can assert which implementation got it.
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.disaggregation.transceiver.bounce_config_from_size",
-        Mock(side_effect=lambda size_mb: ("bounce", size_mb) if size_mb > 0 else None),
     )
     monkeypatch.setattr(
         "tensorrt_llm._torch.disaggregation.transceiver.torch.cuda.current_device",
@@ -911,33 +904,17 @@ def test_transceiver_wires_separate_sender_slice_and_overall_timeout(
     assert worker_config.rx_timeout_s == expected_timeout_s
 
 
-@pytest.mark.parametrize(
-    ("bounce_size_mb", "agent_enable", "expected_python_bounce", "expected_buffer_size_mb"),
-    [
-        # Shared capacity, Python implementation (default): per-region bounce on, agent off.
-        (384, False, ("bounce", 384), 0),
-        # Shared capacity, C++ agent implementation: the agent bounce buffer gets the size, Python off.
-        (384, True, None, 384),
-        # Size 0 keeps both implementations off.
-        (0, False, None, 0),
-    ],
-)
-def test_transceiver_routes_bounce_capacity_to_one_implementation(
-    monkeypatch,
-    bounce_size_mb: int,
-    agent_enable: bool,
-    expected_python_bounce,
-    expected_buffer_size_mb: int,
+@pytest.mark.parametrize("bounce_size_mb", [0, 384])
+def test_transceiver_routes_bounce_capacity_to_agent_buffer(
+    monkeypatch, bounce_size_mb: int
 ) -> None:
+    params = {"min_descriptor_count": "1"} if bounce_size_mb else None
     worker_config = _construct_worker_config(
         monkeypatch,
-        _make_cache_config(
-            kv_cache_bounce_size_mb=bounce_size_mb,
-            agent_bounce_buffer_enable=agent_enable,
-        ),
+        _make_cache_config(kv_cache_bounce_size_mb=bounce_size_mb, agent_bounce_params=params),
     )
-    assert worker_config.bounce == expected_python_bounce
-    assert worker_config.agent_buffer_size_mb == expected_buffer_size_mb
+    assert worker_config.agent_buffer_size_mb == bounce_size_mb
+    assert worker_config.agent_bounce_params == params
 
 
 def test_transceiver_rejects_unset_transfer_timeout() -> None:

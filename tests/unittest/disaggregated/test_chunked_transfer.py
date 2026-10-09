@@ -495,31 +495,11 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
-def test_pipelined_transfer_rejects_bounce_buffer():
-    """The Python bounce buffer stages whole requests rather than individual chunks."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+def test_pipelined_transfer_allows_bounce_buffer():
+    """The transfer-agent bounce buffer is compatible with per-chunk pipelined transfer.
 
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock()
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL",
-        enable_pipelined_transfer=True,
-        kv_cache_bounce_size_mb=1,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="not supported with the Python bounce buffer \\(kv_cache_bounce_size_mb=1",
-    ):
-        KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
-
-
-def test_pipelined_transfer_allows_agent_bounce_buffer():
-    """The C++ transfer-agent bounce is compatible with per-chunk pipelined transfer.
-
-    It stages each transfer request on its own below the Python layer, so a pipelined
-    chunk is just another request.
+    The C++ agent stages each transfer request on its own below the Python layer, so a
+    pipelined chunk is just another request.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -530,7 +510,6 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
         backend="NIXL",
         enable_pipelined_transfer=True,
         kv_cache_bounce_size_mb=1,
-        agent_bounce_buffer_enable=True,
     )
 
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
