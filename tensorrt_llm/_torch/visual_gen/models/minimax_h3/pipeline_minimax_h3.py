@@ -18,7 +18,6 @@
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
 import time
-import types
 from io import BytesIO
 from typing import Any, Optional
 
@@ -71,76 +70,21 @@ from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
-# Upper bound on spatial tiles decoded in one ViT decoder call (28 tiles at 768x1344 fit on one
-# B200; the bound keeps activation memory proportional to this many tiles, not the frame size).
-VAE_DECODE_MAX_TILES_PER_BATCH = 16
 
-
-def _batched_decode_clip(self: AutoencoderKLMiniMaxH3, z: torch.Tensor) -> torch.Tensor:
-    """``AutoencoderKLMiniMaxH3._decode_clip`` with all equal-size spatial tiles in one decoder call.
-
-    The ViT decoder treats batch entries independently (per-sample attention, per-token norms and projections), so
-    decoding the tiles of a clip as one batch computes the same values as the reference loop over tiles, and the
-    measured configurations are bit-identical; the tiles are split back out and stitched exactly as in the
-    reference. Falls back to the per-tile loop should the tile splitter ever produce unequal tiles.
-    """
-    if not self.use_tiling:
-        return self.decoder(self.post_quant_conv(z))
-    ratio = self.spatial_compression_ratio
-    height = z.shape[-2] * ratio
-    width = z.shape[-1] * ratio
-    y_indices, y_lengths, y_overlaps = self._split_tiles(
-        height, self.tile_sample_min_height, self.tile_sample_min_overlap_height
-    )
-    x_indices, x_lengths, x_overlaps = self._split_tiles(
-        width, self.tile_sample_min_width, self.tile_sample_min_overlap_width
-    )
-    tiles = [
-        z[
-            ...,
-            i_pos // ratio : i_pos // ratio + i_len // ratio,
-            j_pos // ratio : j_pos // ratio + j_len // ratio,
-        ]
-        for i_pos, i_len in zip(y_indices, y_lengths)
-        for j_pos, j_len in zip(x_indices, x_lengths)
-    ]
-    num_cols = len(x_indices)
-    if len({tuple(tile.shape) for tile in tiles}) == 1:
-        # Decode up to VAE_DECODE_MAX_TILES_PER_BATCH tiles per call: batching removes per-tile
-        # launch overhead, the cap keeps decoder intermediates bounded as tiling intends.
-        batch = z.shape[0]
-        decoded = []
-        for start in range(0, len(tiles), VAE_DECODE_MAX_TILES_PER_BATCH):
-            chunk = tiles[start : start + VAE_DECODE_MAX_TILES_PER_BATCH]
-            decoded.extend(
-                self.decoder(self.post_quant_conv(torch.cat(chunk, dim=0))).split(batch, dim=0)
-            )
-    else:
-        decoded = [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
-    rows = [list(decoded[r * num_cols : (r + 1) * num_cols]) for r in range(len(y_indices))]
-    return self._stitch_tiles(rows, y_overlaps, x_overlaps)
-
-
-def _prepare_vae_decoder(vae: AutoencoderKLMiniMaxH3) -> None:
+def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
     """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
 
     * Every ``nn.Linear`` of the ViT decoder is converted to fp16 in place: autocast casts weight and bias to fp16
       on every call, so converting once gives the same bits under autocast (norm weights and the ``scale1``/``scale2``
       gains stay fp32, as autocast leaves them). The decoder must therefore keep running under the fp16 autocast of
       ``_decode_video``; a decode outside it would run fp16 instead of the reference fp32 math.
-    * Equal-size spatial tiles of a clip are decoded as one batch (``_batched_decode_clip``), only when the VAE still
-      uses the stock Diffusers ``_decode_clip``; a subclass that overrides tiling (for example parallel tiled
-      decoding) keeps its own method.
+    * One tile is decoded eagerly to measure the decoder's memory footprint, so the VAE can size its batched tile
+      decode from the memory free at decode time (``TiledAutoencoderKLMiniMaxH3.calibrate_tile_decode_memory``).
     """
     for module in vae.decoder.modules():
         if isinstance(module, torch.nn.Linear):
             module.to(torch.float16)
-    if type(vae)._decode_clip is AutoencoderKLMiniMaxH3._decode_clip:
-        vae._decode_clip = types.MethodType(_batched_decode_clip, vae)
-    else:
-        logger.info(
-            f"{type(vae).__name__} overrides _decode_clip; keeping its tiling and skipping batched tile decode."
-        )
+    vae.calibrate_tile_decode_memory()
 
 
 def _component_skipped(
