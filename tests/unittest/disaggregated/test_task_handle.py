@@ -783,11 +783,14 @@ def test_queued_sender_abort_preserves_the_committed_cancellation(
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is by_peer
     sender._get_or_connect_thread_dealer.return_value.send.assert_called_once()
+    if queued_status is TaskStatus.INIT:
+        # The refusal keeps the failure the cancellation already recorded.
+        assert str(task._exception) == "TxSession 30 cancelled"
 
 
-def _deliverable_slice(monkeypatch, wait) -> tuple[Sender, TxSession, KVSendTask]:
-    """A wired sender whose worker delivery reaches a mocked backend, and a two-peer slice."""
-    sender, session = _sending_pieces()
+def _deliverable_slice(monkeypatch, wait, slices: int = 1) -> tuple[Sender, TxSession, KVSendTask]:
+    """A wired sender whose worker delivery reaches a mocked backend, and two-peer slices."""
+    sender, session = _sending_pieces(slices)
     sender._device_id = 0
     sender._bounce = None
     sender._registrar = SimpleNamespace(
@@ -796,38 +799,42 @@ def _deliverable_slice(monkeypatch, wait) -> tuple[Sender, TxSession, KVSendTask
     sender._agent = MagicMock()
     sender._agent.submit_transfer_requests.return_value.wait.side_effect = wait
     monkeypatch.setattr(Sender, "_make_agent_request", MagicMock(return_value=MagicMock()))
-    task = session.kv_tasks[0]
-    task.expected_transfers = 2
-    return sender, session, task
+    for task in session.kv_tasks:
+        task.expected_transfers = 2
+    return sender, session, session.kv_tasks[0]
 
 
-def _peer_write(task, peer_rank: int, meta_type: WriteMetaType = WriteMetaType.KV) -> WriteMeta:
+def _peer_write(
+    task, peer_rank: int, meta_type: WriteMetaType = WriteMetaType.KV, slice_id: int = 0
+) -> WriteMeta:
     """One peer's write of a two-peer slice, as the worker receives it."""
     return WriteMeta(
         task=task,
         expected_transfers=2,
         peer_name=f"gen{peer_rank}",
         peer_rank=peer_rank,
-        peer_endpoint="tcp://receiver:1234",
+        peer_endpoint=f"tcp://gen{peer_rank}",
         unique_rid=30,
         src_ptrs=np.array([0x1000], dtype=np.int64),
         dst_ptrs=np.array([0x2000], dtype=np.int64),
         sizes=np.array([0x100], dtype=np.int64),
         dst_device_id=0,
-        slice_id=0,
+        slice_id=slice_id,
         is_last_slice=True,
         meta_type=meta_type,
     )
 
 
-def test_peer_write_does_not_reopen_an_ended_slice(monkeypatch) -> None:
-    """A slice that another peer's write just failed stays failed.
+@pytest.mark.parametrize("failed_slice", [1, 0], ids=["same_slice", "other_slice"])
+def test_peer_write_is_refused_once_the_session_ends(monkeypatch, failed_slice: int) -> None:
+    """A write to slice 1 is refused when a failure lands right after its session check.
 
-    The failure lands right after this worker checked the session. The later write must not move
-    the slice back to TRANSFERRING: the failed peer never reports a completed transfer, so nothing
-    would end the slice and its pages would never be released.
+    The failure is another peer's write of the same slice, or of another slice, which ends the
+    session. Admitting the write anyway would let teardown, which sees a failed session with
+    nothing transferring, free the pages it reads.
     """
-    sender, session, task = _deliverable_slice(monkeypatch, wait=lambda: True)
+    sender, session, _ = _deliverable_slice(monkeypatch, wait=lambda: True, slices=2)
+    written, failed = session.kv_tasks[1], session.kv_tasks[failed_slice]
     session_status = TxSession.status
     reads = 0
 
@@ -835,23 +842,41 @@ def test_peer_write_does_not_reopen_an_ended_slice(monkeypatch) -> None:
         nonlocal reads
         reads += 1
         if reads == 1:
-            task.fail(RuntimeError("other peer's write failed"))
+            failed.fail(RuntimeError("other peer's write failed"))
             return SessionStatus.READY
         return session_status.fget(self)
 
     monkeypatch.setattr(TxSession, "status", property(status_then_other_peer_failure))
 
-    sender._deliver_kv_to_agent(_peer_write(task, peer_rank=1))
+    sender._deliver_kv_to_agent(_peer_write(written, peer_rank=1, slice_id=1))
 
-    assert task.status is TaskStatus.ERROR
-    assert "other peer's write failed" in str(task._exception)
     sender._agent.submit_transfer_requests.assert_not_called()
+    sender._get_or_connect_thread_dealer.assert_called_once_with("tcp://gen1")
     report = sender._get_or_connect_thread_dealer.return_value.send.call_args.args[0]
     assert _AGENT_RESULT_BY_CODE[_KV_RESULT_PREFIX.unpack(report[1])[4]] is AgentResult.FAILED
+    assert written.status is TaskStatus.ERROR
+    assert written.transferred_count == 0
+    assert "other peer's write failed" in str(failed._exception)
     assert session.status is SessionStatus.ERROR
+    # Teardown's check: a failed session with nothing transferring has no admitted write.
     assert session.has_failed()
     assert not session.has_transferring_tasks()
     assert session.wait_complete(blocking=False) is WaitResult.FAILED
+
+
+def test_aux_write_is_refused_once_the_session_failed(monkeypatch) -> None:
+    """An aux write delivered after the session failed must not read the aux slot teardown frees."""
+    sender, session, kv_task = _deliverable_slice(monkeypatch, wait=lambda: True)
+    aux_task = session.send_aux()
+    kv_task.fail(RuntimeError("peer 0 failed"))
+
+    sender._deliver_aux_to_agent(_peer_write(aux_task, peer_rank=1, meta_type=WriteMetaType.AUX))
+
+    sender._agent.submit_transfer_requests.assert_not_called()
+    report = sender._get_or_connect_thread_dealer.return_value.send.call_args.args[0]
+    assert (report[0], report[-1]) == (MessageType.AUX_AGENT_RESULT, b"FAILED")
+    assert aux_task._transfer_count == 0
+    assert not session.has_transferring_tasks()
 
 
 @pytest.mark.parametrize("write_kind", ["kv", "aux"])

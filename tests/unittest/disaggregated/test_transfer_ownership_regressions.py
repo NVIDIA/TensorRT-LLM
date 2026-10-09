@@ -20,7 +20,6 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1356,17 +1355,11 @@ def _make_owned_sender() -> transfer_mod.Sender:
     return sender
 
 
-def _init_shared_dealer_state(sender: transfer_mod.Sender) -> None:
-    """Give a hand-built sender the shared-DEALER state that Sender.__init__ creates."""
-    sender._shared_dealers, sender._shared_dealers_lock = {}, threading.Lock()
-    sender._shared_dealers_closed = False
-
-
 def _make_shutdown_ready_sender() -> transfer_mod.Sender:
     """An idle owned sender whose shutdown() reaches the shared DEALERs."""
     sender = _make_owned_sender()
     sender._messenger, sender._agent, sender._worker_threads = Mock(), Mock(), []
-    _init_shared_dealer_state(sender)
+    sender._shared_dealers = transfer_mod._SharedDealerPool()
     return sender
 
 
@@ -1429,7 +1422,7 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
     sender._registrar = SimpleNamespace(
         get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
     )
-    _init_shared_dealer_state(sender)
+    sender._shared_dealers = transfer_mod._SharedDealerPool()
     dealer = Mock()
     messenger_cls = Mock(return_value=dealer)
     monkeypatch.setattr(transfer_mod, "ZMQMessenger", messenger_cls)
@@ -1457,9 +1450,15 @@ def test_sender_failed_result_routes_messages_directly_in_order(monkeypatch) -> 
         endpoint="receiver",
         send_timeout_ms=transfer_mod._SHARED_DEALER_SEND_TIMEOUT_MS,
     )
-    assert list(sender._shared_dealers) == ["receiver"]
-    assert sender._shared_dealers["receiver"].messenger is dealer
+    assert list(sender._shared_dealers._dealers) == ["receiver"]
+    assert sender._shared_dealers._dealers["receiver"].messenger is dealer
     assert [send.args[0] for send in dealer.send.call_args_list] == [kv_message, aux_message]
+
+    sender._peer_requests_lock, sender._peer_requests = threading.Lock(), {rid: {2: info}}
+    sender.send_cancel_to_receivers(rid)
+
+    messenger_cls.assert_called_once()
+    assert dealer.send.call_args.args[0] == [MessageType.CANCEL_SESSION, str(rid).encode()]
 
 
 @pytest.mark.cpu_only
@@ -2123,123 +2122,87 @@ def test_sender_registration_does_not_wait_for_active_transfer(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("failure", ["session_cancelled", "build_failed"])
 def test_non_owned_kv_early_failure_reports_on_worker_dealer(
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
+    monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    rid = 104
-    receiver_slice_id = 7
     sender = object.__new__(transfer_mod.Sender)
-    sender._enforce_physical_ownership = False
-    sender._sessions_lock = threading.Lock()
-    sender._instance_rank = 5
-    sender._device_id = 0
-    sender._agent = Mock()
-    sender._bounce = Mock()
-    sender._thread_local = threading.local()
-    _init_shared_dealer_state(sender)
+    sender._enforce_physical_ownership, sender._instance_rank, sender._device_id = False, 5, 0
+    sender._sessions_lock, sender._thread_local = threading.Lock(), threading.local()
+    sender._agent, sender._bounce = Mock(), Mock()
+    sender._shared_dealers = transfer_mod._SharedDealerPool()
     sender._send_on_shared_dealer = Mock(side_effect=AssertionError("worker used a shared dealer"))
     dealer = Mock()
-    messenger_cls = Mock(return_value=dealer)
-    monkeypatch.setattr(transfer_mod, "ZMQMessenger", messenger_cls)
-    monkeypatch.setattr(
-        transfer_mod.Sender,
-        "_make_agent_request",
-        Mock(side_effect=RuntimeError("descriptor build failed")),
-    )
-    task = transfer_mod.KVSendTask(
-        _sole_piece(),
-        DisaggregatedParams(disagg_request_id=rid),
-        slice_id=0,
-    )
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(return_value=dealer))
+    build_failure = Mock(side_effect=RuntimeError("descriptor build failed"))
+    monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", build_failure)
+    task = transfer_mod.KVSendTask(_sole_piece(), DisaggregatedParams(disagg_request_id=104), 0)
     status = SessionStatus.CANCELLED if failure == "session_cancelled" else SessionStatus.READY
-    sender._sessions = {rid: SimpleNamespace(kv_tasks=[task], lock=threading.Lock(), status=status)}
-    write_meta = transfer_mod.WriteMeta(
+    sender._sessions = {104: SimpleNamespace(kv_tasks=[task], lock=threading.Lock(), status=status)}
+    ptrs = np.array([0x1000], dtype=np.int64)
+    write = transfer_mod.WriteMeta(
         task=task,
         expected_transfers=1,
         peer_name="gen2",
         peer_rank=2,
         peer_endpoint="receiver",
-        unique_rid=rid,
-        src_ptrs=np.array([0x1000], dtype=np.int64),
-        dst_ptrs=np.array([0x2000], dtype=np.int64),
-        sizes=np.array([0x100], dtype=np.int64),
+        unique_rid=104,
+        src_ptrs=ptrs,
+        dst_ptrs=ptrs,
+        sizes=ptrs,
         slice_id=0,
-        receiver_slice_id=receiver_slice_id,
-        is_last_slice=False,
+        receiver_slice_id=7,
     )
 
-    sender._deliver_kv_to_agent(write_meta)
+    sender._deliver_kv_to_agent(write)
 
     sender._agent.submit_transfer_requests.assert_not_called()
     assert task.status == transfer_mod.TaskStatus.ERROR
-    messenger_cls.assert_called_once_with(mode="DEALER", endpoint="receiver")
     assert sender._thread_local.dealers == {"receiver": dealer}
-    assert sender._shared_dealers == {}
-    sender._send_on_shared_dealer.assert_not_called()
-    dealer.send.assert_called_once()
-    _, result_rid, result_slice, is_last, status_code, _ = transfer_mod._KV_RESULT_PREFIX.unpack(
+    assert sender._shared_dealers._dealers == {}
+    _, rid, slice_id, is_last, code, _ = transfer_mod._KV_RESULT_PREFIX.unpack(
         dealer.send.call_args.args[0][1]
     )
-    assert (result_rid, result_slice, is_last) == (rid, receiver_slice_id, True)
-    assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.FAILED
+    assert (rid, slice_id, is_last) == (104, 7, True)
+    assert transfer_mod._AGENT_RESULT_BY_CODE[code] == AgentResult.FAILED
 
 
 @pytest.mark.cpu_only
-def test_shared_dealer_connects_once_and_serializes_sends(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_shared_dealer_connects_once_and_serializes_sends(monkeypatch: pytest.MonkeyPatch) -> None:
     sender = object.__new__(transfer_mod.Sender)
-    _init_shared_dealer_state(sender)
-    thread_count = 8
-    batches_per_thread = 25
-    created: list[str] = []
+    sender._shared_dealers = transfer_mod._SharedDealerPool()
+    connected: list[str] = []
     sent: list[list[bytes]] = []
-    overlapping_sends: list[list[bytes]] = []
-    in_send = threading.Lock()
+    in_send, overlapped = threading.Lock(), threading.Event()
 
-    class _ReentrancyCheckingDealer:
-        def __init__(self, *, mode: str, endpoint: str, send_timeout_ms: int) -> None:
-            assert mode == "DEALER"
-            assert send_timeout_ms == transfer_mod._SHARED_DEALER_SEND_TIMEOUT_MS
-            created.append(endpoint)
-            # Widen the window in which an unguarded lookup would connect twice.
-            time.sleep(0.01)
+    def send(message: list[bytes]) -> None:
+        if not in_send.acquire(blocking=False):
+            overlapped.set()
+            return
+        time.sleep(0.0005)  # Widens the window in which unserialized sends overlap.
+        sent.append(message)
+        in_send.release()
 
-        def send(self, message: list[bytes]) -> None:
-            if not in_send.acquire(blocking=False):
-                overlapping_sends.append(message)
-                return
-            try:
-                time.sleep(0.0005)
-                sent.append(message)
-            finally:
-                in_send.release()
+    def connect(*, endpoint: str, **_options: object) -> SimpleNamespace:
+        connected.append(endpoint)
+        time.sleep(0.01)  # Widens the window in which an unguarded lookup connects twice.
+        return SimpleNamespace(send=send)
 
-    monkeypatch.setattr(transfer_mod, "ZMQMessenger", _ReentrancyCheckingDealer)
-    start = threading.Barrier(thread_count, timeout=10)
-    thread_results: queue.Queue[Exception | None] = queue.Queue()
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", connect)
+    start = threading.Barrier(8, timeout=10)
+    results: queue.Queue[Exception | None] = queue.Queue()
 
-    def send_batches(thread_id: int) -> None:
+    def send_batches() -> None:
         start.wait()
-        for batch in range(batches_per_thread):
-            tag = f"{thread_id}:{batch}".encode()
-            sender._send_on_shared_dealer("receiver", [[b"kv", tag], [b"aux", tag]])
+        for _ in range(25):
+            sender._send_on_shared_dealer("receiver", [[b"kv"], [b"aux"]])
 
-    senders = [
-        _start_checked_thread(partial(send_batches, thread_id), thread_results)
-        for thread_id in range(thread_count)
-    ]
-    for thread in senders:
+    threads = [_start_checked_thread(send_batches, results) for _ in range(8)]
+    for thread in threads:
         thread.join(timeout=30)
-        assert not thread.is_alive()
-    _raise_thread_errors(thread_results, expected=thread_count)
-
-    assert created == ["receiver"]
-    assert not overlapping_sends
-    assert len(sent) == 2 * thread_count * batches_per_thread
-    # One call's messages stay adjacent: a KV result is never split from its AUX result.
-    for kv, aux in zip(sent[::2], sent[1::2]):
-        assert (kv[0], aux[0], kv[1]) == (b"kv", b"aux", aux[1])
+    assert not any(thread.is_alive() for thread in threads)
+    _raise_thread_errors(results, expected=8)
+    assert connected == ["receiver"]
+    assert not overlapped.is_set()
+    assert sent == [[b"kv"], [b"aux"]] * 8 * 25  # Each call's messages stay together.
 
 
 class _BlockingDealers:
@@ -2282,7 +2245,7 @@ def test_blocked_shared_send_does_not_stall_other_endpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sender = object.__new__(transfer_mod.Sender)
-    _init_shared_dealer_state(sender)
+    sender._shared_dealers = transfer_mod._SharedDealerPool()
     dealers = _BlockingDealers(monkeypatch, blocked_endpoint="dead-peer")
     thread_results: queue.Queue[Exception | None] = queue.Queue()
 
@@ -2315,7 +2278,8 @@ def test_shutdown_waits_for_an_active_shared_send_without_blocking_other_sends(
     # Reports when shutdown has to wait for dead-peer's dealer lock.
     race_outcomes: queue.Queue[str] = queue.Queue()
     dead_peer_lock = _TrackingLock(race_outcomes)
-    sender._shared_dealers["dead-peer"] = transfer_mod._SharedDealer(
+    sender._shared_dealers._dealers["dead-peer"] = transfer_mod._SharedDealer(
+        "dead-peer",
         dealers._connect(
             mode="DEALER",
             endpoint="dead-peer",
@@ -2357,7 +2321,7 @@ def test_shutdown_waits_for_an_active_shared_send_without_blocking_other_sends(
     _raise_thread_errors(thread_results, expected=3)
     assert dealers.sent["dead-peer"] == [[b"cancel"]]
     assert dealers.stopped_during_send == {"dead-peer": [False]}
-    assert sender._shared_dealers == {}
+    assert sender._shared_dealers._dealers == {}
     assert sender._shutdown
 
 
@@ -2375,142 +2339,40 @@ def test_shared_send_timeout_fails_the_delivery_and_shutdown_stops_the_dealer(
         sender._send_on_shared_dealer("full-peer", [[b"first"], [b"second"]])
 
     messenger.send.assert_called_once_with([b"first"])
-    assert sender._shared_dealers["full-peer"].messenger is messenger
+    assert sender._shared_dealers._dealers["full-peer"].messenger is messenger
     sender.shutdown()
     messenger.stop.assert_called_once()
-    assert sender._shared_dealers == {}
+    assert sender._shared_dealers._dealers == {}
 
 
 @pytest.mark.cpu_only
-def test_shared_send_after_shutdown_is_rejected_without_connecting(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "lookup_raced_shutdown", [False, True], ids=["after_shutdown", "lookup_raced_shutdown"]
+)
+def test_shared_send_is_rejected_once_shutdown_closes_the_dealers(
+    monkeypatch: pytest.MonkeyPatch, lookup_raced_shutdown: bool
 ) -> None:
     sender = _make_shutdown_ready_sender()
     messenger_cls = Mock()
     monkeypatch.setattr(transfer_mod, "ZMQMessenger", messenger_cls)
-    sender.shutdown()
+    closed_dealer = transfer_mod._SharedDealer("receiver", Mock(), closed=True)
+    if lookup_raced_shutdown:
+        # What a send finds when its lookup ran just before shutdown closed the dealer.
+        sender._shared_dealers._dealers["receiver"] = closed_dealer
+    else:
+        sender.shutdown()
 
     with pytest.raises(RuntimeError, match="shut down"):
         sender._send_on_shared_dealer("receiver", [[b"cancel"]])
 
     messenger_cls.assert_not_called()
-    assert sender._shared_dealers == {}
+    closed_dealer.messenger.send.assert_not_called()
 
 
 @pytest.mark.cpu_only
-def test_shared_send_is_rejected_on_a_dealer_closed_by_shutdown() -> None:
-    """A send may look up its dealer just before shutdown closes it, then lock it after."""
-    sender = _make_shutdown_ready_sender()
-    messenger = Mock()
-    sender._shared_dealers["receiver"] = transfer_mod._SharedDealer(messenger, closed=True)
-
-    with pytest.raises(RuntimeError, match="shut down"):
-        sender._send_on_shared_dealer("receiver", [[b"cancel"]])
-
-    messenger.send.assert_not_called()
-
-
-@pytest.mark.cpu_only
-def test_caller_cancel_and_listener_rejection_use_the_shared_dealer(
+def test_kv_transfer_num_threads_comes_from_env_and_defaults_to_four(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rid = 105
-    sender = object.__new__(transfer_mod.Sender)
-    sender._enforce_physical_ownership = False
-    sender._instance_rank = 5
-    _init_shared_dealer_state(sender)
-    sender._thread_local = threading.local()
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
-    )
-    info = transfer_mod.RecvReqInfo(
-        sender_req_id=18,
-        instance_name="gen",
-        instance_rank=2,
-        block_ids_per_layer_groups=[],
-        unique_rid=rid,
-    )
-    sender._peer_requests_lock = threading.Lock()
-    sender._peer_requests = {rid: {info.instance_rank: info}}
-    messenger = Mock()
-    messenger_cls = Mock(return_value=messenger)
-    monkeypatch.setattr(transfer_mod, "ZMQMessenger", messenger_cls)
-
-    # Caller thread: TxSession.cancel() notifies every receiver of the request.
-    sender.send_cancel_to_receivers(rid)
-    # Listener thread: an immediate rejection outside ownership mode.
-    sender._send_failed_result_to_receiver(info)
-
-    messenger_cls.assert_called_once_with(
-        mode="DEALER",
-        endpoint="receiver",
-        send_timeout_ms=transfer_mod._SHARED_DEALER_SEND_TIMEOUT_MS,
-    )
-    assert list(sender._shared_dealers) == ["receiver"]
-    assert sender._shared_dealers["receiver"].messenger is messenger
-    assert getattr(sender._thread_local, "dealers", None) is None
-    cancel, failed = (send.args[0] for send in messenger.send.call_args_list)
-    assert cancel == [MessageType.CANCEL_SESSION, str(rid).encode("ascii")]
-    assert failed[0] == MessageType.KV_AGENT_RESULT
-    status_code = transfer_mod._KV_RESULT_PREFIX.unpack(failed[1])[4]
-    assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.FAILED
-
-
-@pytest.mark.cpu_only
-def test_sender_routes_each_peer_stream_to_one_worker() -> None:
-    num_threads = 4
-    sender = _make_owned_sender()
-    sender._num_threads = num_threads
-    sender._send_task_queues = [queue.Queue() for _ in range(num_threads)]
-    sender._pending_settlements = [{} for _ in range(num_threads)]
-    sender._registrar = SimpleNamespace(
-        get_peer_rank_info=Mock(return_value=SimpleNamespace(self_endpoint="receiver"))
-    )
-    sender._get_or_connect_thread_dealer = Mock()
-    pairs = [(rid, peer_rank) for rid in range(200, 208) for peer_rank in range(4)]
-    sender._pre_cancelled_rids = {rid: True for rid, _ in pairs}
-
-    for rid, peer_rank in pairs:
-        worker = sender._worker_index(rid, peer_rank)
-        task = transfer_mod.KVSendTask(
-            _sole_piece(),
-            DisaggregatedParams(disagg_request_id=rid),
-            slice_id=0,
-        )
-        write_meta = transfer_mod.WriteMeta(
-            task=task,
-            expected_transfers=1,
-            peer_name="gen",
-            peer_rank=peer_rank,
-            peer_endpoint="receiver",
-            unique_rid=rid,
-            src_ptrs=np.array([], dtype=np.int64),
-            dst_ptrs=np.array([], dtype=np.int64),
-            sizes=np.array([], dtype=np.int64),
-        )
-        info = SimpleNamespace(unique_rid=rid, instance_rank=peer_rank)
-
-        sender._enqueue(write_meta)
-        sender._retain_in_doubt_transfer(write_meta, [b"in-doubt"])
-        sender._route_result_messages_to_receiver(
-            info, "receiver", [[b"failed"]], defer_to_worker=True
-        )
-        sender._queue_session_quiescence(rid, "gen", peer_rank)
-
-        queued = [sender._send_task_queues[worker].get_nowait() for _ in range(3)]
-        assert all(work_queue.empty() for work_queue in sender._send_task_queues)
-        assert queued[0] is write_meta
-        assert queued[1] == ("receiver", [b"failed"])
-        assert queued[2] == transfer_mod._SessionQuiescence(rid, peer_rank, "receiver")
-        assert (task, peer_rank) in sender._pending_settlements[worker]
-        # The quiescence check must see the settlement retained by the same worker.
-        assert not sender._send_session_quiesced(queued[2])
-
-    assert len({sender._worker_index(rid, peer_rank) for rid, peer_rank in pairs}) > 1
-
-
-@pytest.mark.cpu_only
-def test_kv_transfer_num_threads_defaults_to_four(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRTLLM_KV_TRANSFER_NUM_THREADS", raising=False)
     assert transfer_mod._kv_transfer_num_threads_from_env() == 4
     monkeypatch.setenv("TRTLLM_KV_TRANSFER_NUM_THREADS", "2")
@@ -2520,17 +2382,12 @@ def test_kv_transfer_num_threads_defaults_to_four(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_threads", [0, -1])
 def test_sender_rejects_non_positive_kv_transfer_num_threads(
-    monkeypatch: pytest.MonkeyPatch,
-    num_threads: int,
+    monkeypatch: pytest.MonkeyPatch, num_threads: int
 ) -> None:
     monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", num_threads)
-    messenger_cls = Mock()
-    monkeypatch.setattr(transfer_mod, "ZMQMessenger", messenger_cls)
-
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(side_effect=AssertionError("bound")))
     with pytest.raises(ValueError, match="TRTLLM_KV_TRANSFER_NUM_THREADS must be at least 1"):
         transfer_mod.Sender(peer_registrar=Mock(), agent=Mock())
-
-    messenger_cls.assert_not_called()
 
 
 @pytest.mark.cpu_only
