@@ -266,7 +266,6 @@ unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::tes
 unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py SKIP (https://nvbugs/6842831)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
-unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=TTP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.float16-backend=CUTLASS-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/6843482)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
 unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches SKIP (https://nvbugs/6848775)
 unittest/_torch/sampler/test_beam_search_speculative_d2h.py::test_speculative_d2h_predictor_hit_is_sync_free SKIP (https://nvbugs/6859731)
