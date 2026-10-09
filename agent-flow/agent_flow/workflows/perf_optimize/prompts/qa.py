@@ -1,6 +1,4 @@
 from ._common import (
-    BENCHMARK_FLAGS_REFERENCE,
-    DERIVED_METRICS_REFERENCE,
     EVIDENCE_DISCIPLINE,
     MEASUREMENT_PROTOCOL,
     ROADMAP_SPEC,
@@ -35,12 +33,10 @@ prominently, and trust **your** number.
    optional `accuracy` block) and `roadmap.yaml` (baseline,
    current_best, item statuses).
 2. **Independent benchmark**: launch `trtllm-serve` with the live tuning
-   config, poll to readiness, run the canonical benchmark at the
-   configured operating point(s) — one run per `benchmark.concurrency`
-   entry over one server launch when it is a list — with `--result-dir`
-   pointing at the verification directory named in your instructions
-   (curve mode: `<verification dir>/concurrency_<c>` per point), and
-   read the target metric from the result JSON(s).
+   config, poll to readiness, and run the configured benchmark exactly as
+   specified by the injected benchmark-driver section. Retain its outputs
+   in the verification directory when possible and read the exact target
+   metric from those outputs.
 3. **Sanity**: send a few completion requests and check the outputs are
    coherent (no truncation, garbage, or repetition blowups).
 4. **Accuracy — only if `task.yaml` has an `accuracy` block**: run
@@ -68,7 +64,7 @@ prominently, and trust **your** number.
   the roadmap's status fields — see the contract below).
 - `final_verification/verification_report.md` — **your primary output
   file** (exact path in your instructions).
-- `final_verification/` — your benchmark result JSON, accuracy output,
+- `final_verification/` — your benchmark outputs, accuracy output,
   `serve.log`, `serve.pid` land here.
 - `tuning/extra_llm_api_options.yaml` — the live tuning config the server
   must run with (see *The live tuning config* below). Read-only.
@@ -82,7 +78,7 @@ Use this structure. Section headers must match.
 # Final Verification
 
 ## Independent benchmark
-<The exact serve + benchmark commands, the result JSON, the target
+<The exact serve + benchmark commands, result artifacts, the target
 metric's value, and cumulative_improvement_pct vs baseline (show the
 arithmetic). In Pareto-curve mode: a per-point table
 `| concurrency | baseline | measured | gain % |` with a mean row, plus
@@ -113,9 +109,6 @@ and any accuracy caveat the report must carry.>
     + "\n"
     + TUNING_CONFIG_NOTE
     + "\n"
-    + BENCHMARK_FLAGS_REFERENCE
-    + "\n"
-    + DERIVED_METRICS_REFERENCE
     + """
 ## Recording progress — `append_qa_progress`
 
