@@ -226,10 +226,9 @@ private:
     /// Per-agent maps because different remote agents may have overlapping virtual addresses.
     std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 
-    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.agent_bounce_buffer_enable +
-    /// kv_cache_bounce_size_mb). Null unless
-    /// enabled & built; when null the agent behaves exactly as before. See the design overview at
-    /// the top of bounce/BounceTransport.h.
+    /// Bounce v2 transport (opt-in via CacheTransceiverConfig.kv_cache_bounce_size_mb > 0). Null
+    /// unless enabled & built; when null the agent behaves exactly as before. See the design overview
+    /// at the top of bounce/BounceTransport.h.
     std::unique_ptr<bounce::NixlBounceState> mBounce;
 
     /// Lazily create the bounce transport (ctor, before any metadata exchange) when enabled.
