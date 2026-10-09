@@ -710,6 +710,67 @@ def test_direct_inputs_are_not_retained_by_dtype_view_memo():
     assert reserved_sms.id == "reserved_sms"
 
 
+def test_gpu_direct_tma_fails_closed_on_stale_scheduler_plan():
+    source = (
+        _ROOT / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.cu"
+    ).read_text()
+    begin = source.index("__global__ void tma_copy_gpu_direct_kernel")
+    end = source.index("struct MegamoeTmaCopyState", begin)
+    kernel = source[begin:end]
+
+    status_check = kernel.index("statusOk &= direct.status[field] == 0")
+    epoch_check = kernel.index("schedulerPlanReady = statusOk && planEpoch == schedulerEpoch")
+    rejection = kernel.index("if (!schedulerPlanReady)")
+    trap = kernel.index('asm volatile("trap;"', rejection)
+    publish = kernel.index("publish_plan_channel_warp<false>")
+    build = kernel.index("megamoe_tma_build_gpu_plan")
+    ready = kernel.index("finish_cta_and_notify")
+
+    assert status_check < epoch_check < rejection <= trap < publish < build < ready
+
+    submit = source[source.index("megamoe_tma_copy_submit_gpu_direct") :]
+    assert "tma_copy_gpu_direct_kernel<<<" in submit
+    assert "cudaLaunchAttributeProgrammaticStreamSerialization" not in submit
+    assert "cudaLaunchKernelEx" not in submit
+
+
+def test_halo_q_rendezvous_resets_arrivals_and_wraps_epoch_safely():
+    source = (
+        _ROOT / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.cu"
+    ).read_text()
+    begin = source.index("__device__ bool grid_rendezvous")
+    end = source.index("__device__ void local_histogram_pass", begin)
+    rendezvous = source[begin:end]
+
+    assert "using Epoch = std::uint32_t;" in source
+    assert "return observed != expected && expected - observed < (Epoch{1} << 31);" in source
+    arrival = rendezvous.index("fetch_add_acq_rel_device(sync, 1)")
+    last_cta = rendezvous.index("old == static_cast<Epoch>(blocks - 1)")
+    reset = rendezvous.index("store_relaxed_device(sync, 0)")
+    publish = rendezvous.index("store_release_device(sync + 1, target)")
+    wait = rendezvous.index("while (epoch_before(observed, target))")
+    assert arrival < last_cta < reset < publish < wait
+
+    mask = (1 << 32) - 1
+
+    def epoch_before(observed: int, expected: int) -> bool:
+        delta = (expected - observed) & mask
+        return observed != expected and delta < (1 << 31)
+
+    epochs = (0xFFFFFFFE, 0xFFFFFFFF, 0x00000000, 0x00000001)
+    arrivals = 0
+    for observed, expected in zip(epochs, epochs[1:]):
+        for _ in range(128):
+            old = arrivals
+            arrivals += 1
+            if old == 127:
+                arrivals = 0
+        assert arrivals == 0
+        assert epoch_before(observed, expected)
+        assert not epoch_before(expected, observed)
+        assert not epoch_before(expected, expected)
+
+
 def test_direct_submit_orders_generations_and_defers_the_route_wait():
     trace = []
     state = SimpleNamespace(device=0, thread=7)
