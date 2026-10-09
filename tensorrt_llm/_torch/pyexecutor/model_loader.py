@@ -42,6 +42,7 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
 from ...llmapi.llm_args import LoadFormat
+from .._experimental.modeling_v2 import modeling_v2_resolve
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -451,6 +452,23 @@ def _resolve_checkpoint_io_policy(
     return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
 
 
+def _record_modeling_v2_decision(config: ModelConfig,
+                                 llm_args: TorchLlmArgs) -> None:
+    """Write the modeling_v2 decision for ``llm_args`` onto ``config``.
+
+    ``modeling_v2_resolve`` decides once per ``llm_args`` and returns that
+    same answer afterwards, so calling this from both config-loading sites
+    keeps them in agreement: whichever runs first decides.
+    """
+    target = modeling_v2_resolve(config, llm_args)
+    if target == config.modeling_v2_target:
+        return
+    frozen = config._frozen
+    config._frozen = False
+    config.modeling_v2_target = target
+    config._frozen = frozen
+
+
 def _construct_checkpoint_loader(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
@@ -787,6 +805,11 @@ class ModelLoader:
             config_kwargs['spec_config'] = llm_args.speculative_config
 
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        # Decide modeling_v2 here, before model defaults: a target's bounds
+        # read llm_args as configured, and the class whose defaults apply
+        # below has to be the class that will be built.
+        _record_modeling_v2_decision(config, llm_args)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
         original_kv_cache_manager_setting = (
@@ -1929,6 +1952,11 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+
+        # Normally decided already by `load_config_and_apply_defaults`, whose
+        # decision this reads back; a construction path that skipped that step
+        # decides here.
+        _record_modeling_v2_decision(config, self.llm_args)
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a

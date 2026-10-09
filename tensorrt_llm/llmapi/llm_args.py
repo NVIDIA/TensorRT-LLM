@@ -6415,6 +6415,27 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        default="off",
+        status="prototype",
+        description=
+        "Whether to build the model from a modeling_v2 target (experimental) "
+        "instead of the built-in implementation. 'off' never does. 'auto' "
+        "uses a target when one claims the checkpoint, GPU architecture and "
+        "parallel topology and the deployment is within that target's "
+        "certified bounds, and falls back to the built-in implementation "
+        "otherwise. 'require' raises instead of falling back, so a run that "
+        "asked for a target never silently measures something else.",
+        json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
+
+    # The modeling_v2 decision for this instance, made once by
+    # `modeling_v2_resolve` before model defaults are applied (its bounds read
+    # the arguments as configured) and carried to model construction on
+    # `ModelConfig.modeling_v2_target`. Not user-tunable: the switch is
+    # `modeling_v2` above.
+    _modeling_v2_resolved: bool = PrivateAttr(default=False)
+    _modeling_v2_target: Optional[str] = PrivateAttr(default=None)
+
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
         default="pytorch",

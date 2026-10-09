@@ -308,6 +308,13 @@ class ModelConfig(Generic[TConfig]):
     # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
     multimodal_config: MultimodalConfig | None = None
 
+    # The modeling_v2 target this instance builds: the synthetic architecture
+    # name a routing module returned, or None for the built-in implementation.
+    # The model loader sets it from the one decision `modeling_v2_resolve`
+    # makes per deployment; `AutoModelForCausalLM._resolve_class` reads it
+    # instead of deciding again.
+    modeling_v2_target: Optional[str] = None
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.

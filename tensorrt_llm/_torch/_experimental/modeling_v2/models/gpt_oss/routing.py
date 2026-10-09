@@ -2,17 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Where a GptOssForCausalLM config lands. Read this file and you know.
 
-One forward-reading decision tree per architecture family: the criteria are
-evaluated in the order a reader would ask them, and every branch that does not
-end in a target returns None (in ``auto`` the engine then uses the built-in
-GptOss implementation; in ``require`` it raises, quoting the trace below).
+One forward-reading decision tree per architecture family, in two stages.
+``route`` reads the configuration's identity and names a target;
+``within_bounds`` reads the deployment's LLM API arguments and says whether
+that target was certified for it. The criteria are evaluated in the order a
+reader would ask them, and every branch that does not end in an accepted
+target returns None or False (in ``auto`` the engine then uses the built-in
+GptOss implementation; in ``require`` it raises, quoting the trace).
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target.
@@ -57,3 +63,34 @@ def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
         return None
 
     return _TARGETS.get((ckpt, parallel))
+
+
+def within_bounds(
+    target: str, args: "TorchLlmArgs", ctx: ModelingV2Context, trace: Trace = NULL_TRACE
+) -> bool:
+    """Whether this deployment is one ``target`` was certified for.
+
+    ``route`` above says which target a checkpoint, GPU architecture and
+    parallel topology map to. This says whether the LLM API arguments the
+    deployment was configured with -- ``max_batch_size``, ``max_num_tokens``,
+    speculative decoding, CUDA graphs, anything a target's accuracy gate did
+    or did not exercise -- fall inside the envelope that gate measured.
+    Outside it, ``auto`` builds the built-in implementation and ``require``
+    raises quoting the trace. Criteria are written as
+    ``trace.check(label, value, ok)`` so ``explain`` replays them.
+
+    Bounds are evaluated on the arguments as the user configured them,
+    before model defaults. A value the engine derives later -- an inferred
+    ``max_seq_len``, a resolved MoE backend -- is not available here, and an
+    ``"auto"`` the target itself resolves through the model-class preference
+    hooks needs no bound: the target is the model class that decides it.
+
+    No target in this family bounds anything yet: every deployment the
+    identity stage routes here is accepted. The hook exists so that a bound
+    can be added where a reader will look for it, next to the identity tree.
+    """
+    if target not in TARGET_MODULES:
+        raise ValueError(
+            f"{target!r} is not a target of this routing module; targets: {sorted(TARGET_MODULES)}"
+        )
+    return True
