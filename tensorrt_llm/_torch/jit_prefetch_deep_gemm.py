@@ -65,6 +65,27 @@ def spec_for(m: int, n: int, k: int) -> str:
     )
 
 
+_MOE_OP = "m_grouped_fp8_fp4_gemm_nt_masked"
+
+
+def moe_spec_for(g: int, m: int, n: int, k: int, expected_m: int) -> str:
+    """Request for one masked grouped GEMM (DeepGEMM MoE, ``[G, M, K] @ [G, N, K].mT``)."""
+    return json.dumps(
+        {
+            "op": _MOE_OP,
+            "g": int(g),
+            "m": int(m),
+            "n": int(n),
+            "k": int(k),
+            "expected_m": int(expected_m),
+            "a": _A,
+            "b": _B,
+            "recipe": list(_RECIPE),
+        },
+        sort_keys=True,
+    )
+
+
 def supported() -> bool:
     """DeepGEMM is built with the compile-only entry point and runs on SM100."""
     try:
@@ -72,7 +93,11 @@ def supported() -> bool:
         from tensorrt_llm._utils import get_sm_version
     except ImportError:
         return False
-    return hasattr(deep_gemm, "compile_only_fp8_fp4_gemm_nt") and get_sm_version() in (100, 103)
+    return (
+        hasattr(deep_gemm, "compile_only_fp8_fp4_gemm_nt")
+        and hasattr(deep_gemm, "compile_only_m_grouped_fp8_fp4_gemm_nt_masked")
+        and get_sm_version() in (100, 103)
+    )
 
 
 def target() -> Tuple[int, int, int]:
@@ -93,6 +118,37 @@ def package_dir() -> str:
     import tensorrt_llm
 
     return os.path.dirname(os.path.abspath(tensorrt_llm.__file__))
+
+
+class DeepGemmMoEProvider:
+    """The masked grouped GEMMs of every DeepGEMM MoE layer.
+
+    On SM100 the masked grouped GEMM has a single layout candidate (swap-AB,
+    block M fixed by the contiguous-layout alignment, cluster N from N), and
+    M is not a compiled dimension, so the kernel depends on (G, N, K) only:
+    one request per weight shape covers every batch. ``M`` / ``expected_m``
+    in the request are placeholders the kernel does not depend on.
+    """
+
+    def __init__(self, model):
+        from .moe.fused_moe.fused_moe_deepgemm import DeepgemmCudaFp8BlockScalesImpl
+
+        shapes = set()
+        for mod in model.modules():
+            if not isinstance(mod, DeepgemmCudaFp8BlockScalesImpl):
+                continue
+            for name in ("w3_w1_weight", "w2_weight"):
+                w = getattr(mod, name, None)
+                if w is not None and w.dim() == 3:
+                    shapes.add(tuple(int(x) for x in w.shape))
+        self.shapes = sorted(shapes)
+
+    def __bool__(self):
+        return bool(self.shapes)
+
+    def enumerate_specs(self):
+        for g, n, k in self.shapes:
+            yield moe_spec_for(g, 128, n, k, 1)
 
 
 class FP8LinearDeepGemmProvider:
@@ -159,7 +215,8 @@ class FP8LinearDeepGemmProvider:
 
 # Set by JitPrefetcher.enable_deep_gemm: called with (m, n, k) for every real
 # FP8 swap-AB launch, so a shape no provider planned still reaches the record,
-# and with (m, n, k, host_seconds) after it. The launch is asynchronous, so a
+# and with (m, n, k, host_seconds) after it. The MoE masked grouped GEMM calls
+# only ``done_observer``, with m = -num_groups. The launch is asynchronous, so a
 # host time far above a launch's (~10 us) is a compile on the calling thread.
 launch_observer = None
 done_observer = None

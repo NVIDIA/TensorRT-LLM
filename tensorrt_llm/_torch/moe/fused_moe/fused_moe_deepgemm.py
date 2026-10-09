@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import Dict, Optional, Union
 
 import torch
@@ -21,6 +22,7 @@ import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch import jit_prefetch_deep_gemm
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.utils import (ActivationType, AuxStreamType,
@@ -735,11 +737,15 @@ def deepgemm_fp8_group_blockwise_gemm(
 
     # Transform SFA and SFB into compute-required layout
 
+    obs = jit_prefetch_deep_gemm.done_observer
+    t0 = time.perf_counter() if obs is not None else 0.0
     deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,
                                            masked_m,
                                            expected_m,
                                            disable_ue8m0_cast=True)
+    if obs is not None:
+        obs(-num_groups, n, k, time.perf_counter() - t0)
     return
 
 

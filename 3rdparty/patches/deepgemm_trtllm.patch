@@ -1,8 +1,8 @@
 diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
-index 902ae69..1c3153e 100644
+index 902ae69..8f906f1 100644
 --- a/csrc/apis/gemm.hpp
 +++ b/csrc/apis/gemm.hpp
-@@ -782,7 +782,37 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
+@@ -782,7 +782,60 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
      cublaslt_gemm_nt(a.transpose(0, 1), b, d, c);
  }
  
@@ -11,6 +11,23 @@ index 902ae69..1c3153e 100644
 +// arch-10 path of `fp8_fp4_gemm_nt` with int (UE8M0) scaling factors and
 +// K-major A and B, which is how TensorRT-LLM calls it. Returns True if it
 +// compiled, False if the variant was already in the cache.
++static bool compile_only_m_grouped_fp8_fp4_gemm_nt_masked(const int& num_groups, const int& m,
++                                                          const int& n, const int& k,
++                                                          const int& expected_m,
++                                                          const at::ScalarType& a_dtype,
++                                                          const at::ScalarType& b_dtype,
++                                                          const std::tuple<int, int, int>& recipe,
++                                                          const std::string& compiled_dims) {
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    DG_HOST_ASSERT(expected_m > 0 and m > 0 and n > 0 and k > 0 and num_groups > 0);
++    const auto gran_k = std::get<2>(recipe);
++    return sm100_m_grouped_fp8_fp4_gemm_masked_1d1d_compile_only(num_groups, m, n, k, expected_m,
++                                                                 a_dtype, b_dtype, torch::kBFloat16,
++                                                                 gran_k, gran_k,
++                                                                 cute::UMMA::Major::K, cute::UMMA::Major::K,
++                                                                 compiled_dims);
++}
++
 +static bool compile_only_fp8_fp4_gemm_nt(const int& m, const int& n, const int& k,
 +                                         const at::ScalarType& a_dtype,
 +                                         const at::ScalarType& b_dtype,
@@ -35,6 +52,12 @@ index 902ae69..1c3153e 100644
 +          py::arg("a_dtype"), py::arg("b_dtype"), py::arg("d_dtype"),
 +          py::arg("recipe") = std::make_tuple(1, 1, 128),
 +          py::arg("with_accumulation") = false,
++          py::arg("compiled_dims") = "nk",
++          py::call_guard<py::gil_scoped_release>());
++    m.def("compile_only_m_grouped_fp8_fp4_gemm_nt_masked", &compile_only_m_grouped_fp8_fp4_gemm_nt_masked,
++          py::arg("num_groups"), py::arg("m"), py::arg("n"), py::arg("k"), py::arg("expected_m"),
++          py::arg("a_dtype"), py::arg("b_dtype"),
++          py::arg("recipe") = std::make_tuple(1, 1, 128),
 +          py::arg("compiled_dims") = "nk",
 +          py::call_guard<py::gil_scoped_release>());
  
@@ -205,7 +228,7 @@ index d433558..72895df 100644
      }
  
 diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
-index 9e4ba58..e95b7e1 100644
+index 9e4ba58..de11992 100644
 --- a/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
 +++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp
 @@ -90,6 +90,54 @@ static void __instantiate_kernel() {{
@@ -280,8 +303,56 @@ index 9e4ba58..e95b7e1 100644
      const auto runtime = compiler->build("sm100_fp8_fp4_gemm_1d1d", code);
      SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
  }
+@@ -241,6 +288,47 @@ static void sm100_m_grouped_fp8_fp4_gemm_contiguous_1d1d(const torch::Tensor& a,
+     SM100FP8FP4Gemm1D1DRuntime::launch(runtime, args);
+ }
+ 
++// Compile the variant `sm100_m_grouped_fp8_fp4_gemm_masked_1d1d` would launch
++// for these shapes into the on-disk cache, without launching or loading it.
++// The generated code depends on the shapes and the heuristic's config only
++// (the masked-M tensor is a launch argument), so the cache key matches the
++// real op's. Returns true if it compiled, false if already cached.
++static bool sm100_m_grouped_fp8_fp4_gemm_masked_1d1d_compile_only(
++        const int& num_groups, const int& m, const int& n, const int& k,
++        const int& expected_m,
++        const at::ScalarType& a_dtype, const at::ScalarType& b_dtype, const at::ScalarType& cd_dtype,
++        const int& gran_k_a, const int& gran_k_b,
++        const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
++        const std::string& compiled_dims) {
++    const auto desc = GemmDesc {
++        .gemm_type = GemmType::MGroupedMasked,
++        .kernel_type = KernelType::Kernel1D1D,
++        .m = m, .n = n, .k = k, .num_groups = num_groups,
++        .a_dtype = a_dtype, .b_dtype = b_dtype, .cd_dtype = cd_dtype,
++        .major_a = major_a, .major_b = major_b,
++        .with_accumulation = false,
++        .num_sms = device_runtime->get_num_sms(),
++        .tc_util = device_runtime->get_tc_util(),
++        .compiled_dims = compiled_dims,
++        .expected_m = expected_m, .expected_n = n, .expected_k = k, .expected_num_groups = num_groups
++    };
++    const auto config = get_best_config<SM100ArchSpec>(desc);
++    SM100FP8FP4Gemm1D1DRuntime::Args args = {
++        .gemm_desc = desc,
++        .gemm_config = config,
++        .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
++                                  config.pipeline_config.smem_size,
++                                  config.layout.get_cluster_size()),
++        .epilogue_type = std::nullopt,
++        .gran_k_a = gran_k_a,
++        .gran_k_b = gran_k_b,
++        .k_alignment = gran_k_a,
++        .grouped_layout = nullptr,
++    };
++    const auto code = SM100FP8FP4Gemm1D1DRuntime::generate(args);
++    return compiler->build_only("sm100_m_grouped_fp8_fp4_gemm_masked_1d1d", code);
++}
++
+ static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                      const torch::Tensor& b, const torch::Tensor& sfb,
+                                                      const torch::Tensor& d,
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index f5e52b2..13f946a 100644
+index f5e52b2..32d8b60 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
 @@ -15,6 +15,7 @@ except ImportError:
@@ -292,11 +363,12 @@ index f5e52b2..13f946a 100644
      set_num_sms,
      get_num_sms,
      set_tc_util,
-@@ -35,6 +36,7 @@ try:
+@@ -35,6 +36,8 @@ try:
      # DeepGEMM Kernels
      from ._C import (
          # FP8 FP4 GEMMs
 +        compile_only_fp8_fp4_gemm_nt,
++        compile_only_m_grouped_fp8_fp4_gemm_nt_masked,
          fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
          fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
          m_grouped_fp8_fp4_gemm_nt_contiguous,

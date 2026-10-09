@@ -1479,8 +1479,9 @@ class PyTorchModelEngine(ModelEngine):
         if jdg.supported():
             dg_provider = jdg.FP8LinearDeepGemmProvider(
                 self.model, max_num_tokens=self.max_num_tokens)
-            if dg_provider:
-                prefetcher.enable_deep_gemm(dg_provider)
+            dg_moe = jdg.DeepGemmMoEProvider(self.model)
+            if dg_provider or dg_moe:
+                prefetcher.enable_deep_gemm(dg_provider, dg_moe)
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,

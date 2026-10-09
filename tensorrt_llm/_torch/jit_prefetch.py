@@ -388,6 +388,8 @@ class JitPrefetcher:
         self._spec_prio: Dict[str, int] = {}
         self._bg_started = False
         self._inflight: Dict[int, str] = {}
+        # tag -> (kind, spec) for non-Triton requests, to record what was built
+        self._tag_spec: Dict[int, Tuple[str, str]] = {}
         self._tag_event: Dict[int, threading.Event] = {}
         self._key_event: Dict[str, threading.Event] = {}
         self._key_spec: Dict[str, Tuple[str, str]] = {}
@@ -403,6 +405,7 @@ class JitPrefetcher:
         # kind -> queue; "triton" uses self._req_q
         self._queues: Dict[str, Any] = {}
         self._dg = None  # DeepGEMM provider (jit_prefetch_deep_gemm)
+        self._dg_moe = None
 
         self._executor_thread: Optional[int] = None
         self._ready: Dict[int, threading.Event] = {}
@@ -491,9 +494,15 @@ class JitPrefetcher:
                 return
             self.stats.dg_executor_compiles += 1
             self.stats.dg_executor_compile_s += dt
+            if m < 0:  # MoE masked grouped GEMM, m = -num_groups
+                self._record(jdg.KIND, "deep_gemm", jdg.moe_spec_for(-m, 128, n, k, 1))
+                what = f"moe g={-m}"
+            else:
+                self._record(jdg.KIND, "deep_gemm", jdg.spec_for(m, n, k))
+                what = f"m={m}"
             logger.info(
                 f"[JIT stats] rank {self.rank} DeepGEMM compile on executor "
-                f"m={m} n={n} k={k} {dt:.3f}s"
+                f"{what} n={n} k={k} {dt:.3f}s"
             )
 
         jdg.done_observer = _done
@@ -501,7 +510,7 @@ class JitPrefetcher:
             # note_launch_done only runs while a launch observer is set.
             jdg.launch_observer = lambda m, n, k: None
 
-    def enable_deep_gemm(self, provider) -> bool:
+    def enable_deep_gemm(self, provider, moe_provider=None) -> bool:
         """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
 
         Helpers run ``jit_prefetch_dg_helper.py`` with no visible GPU; the
@@ -537,6 +546,7 @@ class JitPrefetcher:
             n,
         )
         self._dg = provider
+        self._dg_moe = moe_provider
         seen_mnk: set = set()
 
         def _observe(m, n, k, _seen=seen_mnk):
@@ -547,7 +557,6 @@ class JitPrefetcher:
             if spec not in self._spec_prio:
                 self.stats.dg_unplanned += 1
                 self._event(f"DeepGEMM launch not planned: m={m} n={n} k={k}")
-            self._record(jdg.KIND, "deep_gemm", spec)
             ev = self._key_event.get(spec)
             if ev is not None and not ev.is_set():
                 # A helper has it queued or in progress: move it to the front
@@ -568,7 +577,8 @@ class JitPrefetcher:
         for spec in self._replay_dg:
             self._submit(spec, spec, "deep_gemm", _PRIO_REPLAY, kind=jdg.KIND)
         self._event(
-            f"DeepGEMM prefetch: {len(provider.shapes)} FP8 Linear shape(s), {n} helper(s), "
+            f"DeepGEMM prefetch: {len(provider.shapes)} FP8 Linear shape(s), "
+            f"{len(moe_provider.shapes) if moe_provider else 0} MoE shape(s), {n} helper(s), "
             f"target sm_{major}{minor} x{sms} SMs, replaying {len(self._replay_dg)}"
         )
         return True
@@ -614,6 +624,7 @@ class JitPrefetcher:
                 ev_busy.set()
             with self._lock:
                 label = self._inflight.pop(tag, "?")
+                kind_spec = self._tag_spec.pop(tag, None)
                 ev = self._tag_event.pop(tag, None)
                 if ev is not None:
                     ev.set()
@@ -625,6 +636,10 @@ class JitPrefetcher:
                 else:
                     self.stats.helper_fail += 1
                     logger.warning(f"[JIT prefetch] helper failed on {label}: {err}")
+            if ok and r.get("built") and kind_spec is not None:
+                # One line per kernel this process produced: most requests
+                # (each M of each shape) resolve to a kernel already on disk.
+                self._record(kind_spec[0], label, kind_spec[1])
             if ok and label == "deep_gemm" and not r.get("built"):
                 continue  # already on disk: most enumerated M share a layout
             self._event(f"helper {'done' if ok else 'FAIL'} {label} {dt * 1e3:.0f} ms")
@@ -653,8 +668,7 @@ class JitPrefetcher:
         t0 = time.perf_counter()
         for spec in self._dg.plan_tokens(num_tokens):
             self.stats.dg_planned += 1
-            if self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND):
-                self._record(jdg.KIND, "deep_gemm", spec)
+            self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND)
         self.stats.plan_s += time.perf_counter() - t0
 
     def _enumerate_dg(self) -> None:
@@ -662,6 +676,12 @@ class JitPrefetcher:
         from . import jit_prefetch_deep_gemm as jdg
 
         n = 0
+        # MoE first, at batch priority: one kernel per weight shape covers
+        # every batch, and the first MoE layer runs in the first forward.
+        if self._dg_moe:
+            for spec in self._dg_moe.enumerate_specs():
+                if self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND):
+                    n += 1
         world = int(os.environ.get("TLLM_JIT_PREFETCH_DG_WORLD", "0")) or _local_world()
         for spec in self._dg.enumerate_specs(self.rank, world):
             if self._submit(spec, spec, "deep_gemm", _PRIO_ENUM, kind=jdg.KIND):
@@ -740,6 +760,8 @@ class JitPrefetcher:
             self._tag += 1
             tag = self._tag
             self._inflight[tag] = label
+            if kind != "triton":
+                self._tag_spec[tag] = (kind, spec)
             ev = self._key_event.get(key)
             if ev is None or ev.is_set():
                 ev = threading.Event()

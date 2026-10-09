@@ -17,8 +17,10 @@
     jit_prefetch_dg_helper.py <deep_gemm package dir> <arch_major> <arch_minor> <num_sms>
 
 Reads one JSON request per stdin line, ``{"tag": int, "spec": str}``, where
-``spec`` is a JSON object ``{"op": "fp8_fp4_gemm_nt", "m", "n", "k", "a", "b",
-"d", "recipe"}`` (dtype names as in ``torch``). Compiles the variant with
+``spec`` is a JSON object, either ``{"op": "fp8_fp4_gemm_nt", "m", "n", "k",
+"a", "b", "d", "recipe"}`` or ``{"op": "m_grouped_fp8_fp4_gemm_nt_masked", "g",
+"m", "n", "k", "expected_m", "a", "b", "recipe"}`` (dtype names as in
+``torch``). Compiles the variant with
 DeepGEMM's compile-only entry point into ``DG_JIT_CACHE_DIR`` and writes
 ``{"tag": int, "ok": bool, "s": float, "err": str, "built": bool}``.
 
@@ -81,17 +83,29 @@ def main():
         t0 = time.time()
         try:
             s = json.loads(req["spec"])
-            if s["op"] != "fp8_fp4_gemm_nt":
+            if s["op"] == "fp8_fp4_gemm_nt":
+                built = dg.compile_only_fp8_fp4_gemm_nt(
+                    int(s["m"]),
+                    int(s["n"]),
+                    int(s["k"]),
+                    getattr(torch, s["a"]),
+                    getattr(torch, s["b"]),
+                    getattr(torch, s["d"]),
+                    tuple(s["recipe"]),
+                )
+            elif s["op"] == "m_grouped_fp8_fp4_gemm_nt_masked":
+                built = dg.compile_only_m_grouped_fp8_fp4_gemm_nt_masked(
+                    int(s["g"]),
+                    int(s["m"]),
+                    int(s["n"]),
+                    int(s["k"]),
+                    int(s["expected_m"]),
+                    getattr(torch, s["a"]),
+                    getattr(torch, s["b"]),
+                    tuple(s["recipe"]),
+                )
+            else:
                 raise ValueError(f"unsupported op {s['op']}")
-            built = dg.compile_only_fp8_fp4_gemm_nt(
-                int(s["m"]),
-                int(s["n"]),
-                int(s["k"]),
-                getattr(torch, s["a"]),
-                getattr(torch, s["b"]),
-                getattr(torch, s["d"]),
-                tuple(s["recipe"]),
-            )
             resp = {"tag": tag, "ok": True, "s": time.time() - t0, "err": "", "built": bool(built)}
         except Exception as e:  # noqa: BLE001 - report, never die
             resp = {

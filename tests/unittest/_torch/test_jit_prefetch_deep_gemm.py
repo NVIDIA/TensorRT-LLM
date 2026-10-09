@@ -53,6 +53,22 @@ _REAL = textwrap.dedent("""
 """)
 
 
+_REAL_MOE = textwrap.dedent("""
+    import sys, torch
+    from tensorrt_llm import deep_gemm
+    g, m, n, k, expected_m = map(int, sys.argv[1:6])
+    a = torch.randn(g, m, k, device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn(g, n, k, device="cuda").to(torch.float8_e4m3fn)
+    # FP32 scales; DeepGEMM casts them to packed UE8M0 itself on SM100.
+    sfa = torch.ones(g, m, (k + 127) // 128, device="cuda")
+    sfb = torch.ones(g, (n + 127) // 128, (k + 127) // 128, device="cuda")
+    d = torch.empty(g, m, n, device="cuda", dtype=torch.bfloat16)
+    masked_m = torch.full((g,), min(m, expected_m), device="cuda", dtype=torch.int32)
+    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m)
+    torch.cuda.synchronize()
+""")
+
+
 def _entries(cache):
     root = os.path.join(cache, "cache")
     return set(os.listdir(root)) if os.path.isdir(root) else set()
@@ -104,3 +120,24 @@ def test_provider_enumeration_windows():
     # One M per 16-row window up to max_num_tokens, which is included.
     assert ms[16:] == [32, 48, 64, 80, 96, 100]
     assert p.plan_tokens(37) and not p.plan_tokens(37)
+
+
+# A DeepSeek-V3-like expert slice (G experts per rank, gate+up / down), at
+# batch sizes far apart: one helper compile must serve all of them.
+@pytest.mark.parametrize("g,n,k", [(32, 4096, 7168), (32, 7168, 2048)])
+def test_moe_helper_cubin_serves_every_batch(tmp_path, g, n, k):
+    cache = str(tmp_path / "dg")
+    (r,) = _helper_compile(cache, [jdg.moe_spec_for(g, 128, n, k, 1)])
+    assert r["ok"] and r["built"], r
+    built = _entries(cache)
+    assert len(built) == 1, built
+
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    for m, expected_m in ((128, 3), (256, 40), (1024, 600)):
+        subprocess.run(
+            [sys.executable, "-c", _REAL_MOE, str(g), str(m), str(n), str(k), str(expected_m)],
+            env=env,
+            check=True,
+            timeout=900,
+        )
+        assert _entries(cache) == built, f"real op compiled another variant at m={m}"
