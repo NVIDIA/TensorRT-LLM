@@ -572,6 +572,8 @@ static KernelParams updateKernelParams(FmhaOptions_ const& options,
                          params.ptrCustomMaskOffsets,
                          params.ptrFirstSparseMaskOffsetsKv,
                          params.ptrSparseMlaTopKLens,
+                         params.ptrVariableWindowTokenStarts,
+                         params.ptrVariableWindowTokenEnds,
                          params.ptrSageAttnSfsQ,
                          params.ptrSageAttnSfsK,
                          params.ptrSageAttnSfsP,
@@ -626,6 +628,8 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
                                     int64_t const* customMaskOffsetsPtrD,
                                     int32_t const* firstSparseMaskOffsetsKvPtrD,
                                     int32_t const* sparseMlaTopKLensPtrD,
+                                    int32_t const* variableWindowTokenStartsD,
+                                    int32_t const* variableWindowTokenEndsD,
                                     float const* ptrSageAttnSfsQ,
                                     float const* ptrSageAttnSfsK,
                                     float const* ptrSageAttnSfsP,
@@ -857,7 +861,14 @@ static KernelParams setKernelParams(FmhaOptions_ const& options,
 #endif // TLLM_TEST
 #endif // TLLM_RUBIN_FEATURES
 
-  params.mAttentionWindowSize = options.mAttentionWindowSize;
+  // The sliding-window reaches forwarded to the kernel: query q attends to K in
+  // [q - leftSlidingWindow, q + rightSlidingWindow].
+  params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+  params.mRightSlidingWindow = options.mRightSlidingWindow;
+  // VariableWindow bounds are launch metadata: int32[sumSeqLensQ], indexed by
+  // cumSeqLensQ[b] + localQ. They are not part of the cubin cache key.
+  params.ptrVariableWindowTokenStarts = variableWindowTokenStartsD;
+  params.ptrVariableWindowTokenEnds = variableWindowTokenEndsD;
   if (options.mChunkedAttentionSize > 0) {
     // The chunked attention size is a power of 2 (verified in FmhaOptions.h).
     params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -977,6 +988,8 @@ static KernelParams setKernelParams(FmhaOptions_ const&,
                                     float const*,
                                     uint32_t const*,
                                     int64_t const*,
+                                    int32_t const*,
+                                    int32_t const*,
                                     int32_t const*,
                                     int32_t const*,
                                     float const*,

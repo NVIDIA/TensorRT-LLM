@@ -63,6 +63,15 @@ struct FmhaData {
     // attention.
     int32_t const* seqLensKvD;
 
+    // VariableWindow bounds for each Q token. Each start/end pair gives
+    // the inclusive K/V token range that the corresponding Q token may attend to.
+    // Example: start = 32 and end = 95 means that Q token may attend only to K/V tokens 32..95 in
+    // its batch. These positions are in the full per-batch K/V sequence, including cached/prefix
+    // tokens before the current Q chunk. Starts and ends must be nondecreasing within each sequence.
+    // Invalid bounds are caller error.
+    int32_t const* variableWindowTokenStartsD{nullptr};
+    int32_t const* variableWindowTokenEndsD{nullptr};
+
     // Start token index in the O scaling-factor tensor. Used for FP4 SF offset in generation when
     // inflight batching is enabled (TRT-LLM). Context uses 0.
     int32_t startTokenIdxSfO{0};
