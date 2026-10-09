@@ -48,8 +48,8 @@ if(NIXL_ROOT)
   # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
   # is fetched at the top level when NIXL or UCX is on. Activates the
   # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
-  # CacheTransceiverConfig (agent_bounce_buffer_enable +
-  # kv_cache_bounce_size_mb, Python (v2) transceiver only).
+  # CacheTransceiverConfig (kv_cache_bounce_size_mb > 0, Python (v2) transceiver
+  # only).
   # ------------------------------------------------------------------------
   find_package(PkgConfig)
   if(PKG_CONFIG_FOUND)
@@ -81,7 +81,7 @@ if(NIXL_ROOT)
   else()
     message(
       STATUS
-        "NIXL bounce v2: disabled - libzmq/pkg-config not found; an explicit agent_bounce_buffer_enable opt-in fails at agent construction (on a bounce build, runtime setup failures degrade to standard NIXL with a WARNING)"
+        "NIXL bounce v2: disabled - libzmq/pkg-config not found; kv_cache_bounce_size_mb > 0 will fail at startup with this build"
     )
   endif()
 
