@@ -286,7 +286,7 @@ l0_b200:
   # hw-agnostic and needs its own Blackwell run.
   - unittest/_torch/speculative/test_fused_sampling_op.py
   # One-model speculative decoding step-copy kernels and the engine's decode
-  # step that runs them (SM 100 family; they skip on other GPUs).
+  # step that runs them (SM 100; they skip on other GPUs).
   - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
   - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/thop/parallel TIMEOUT (90)
