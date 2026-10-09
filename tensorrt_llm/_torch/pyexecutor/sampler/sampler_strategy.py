@@ -165,6 +165,7 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     # --- resolving default values
     # NB: not greedy, hence temperature != 0 if specified
     temperature = temperature or 1.0
+    assert temperature > 0, f"a non-greedy strategy needs temperature > 0, got {temperature}"
 
     # Beam search does not rely on top_p, top_k or min_p, so we can return the strategy here
     if use_beam_search:

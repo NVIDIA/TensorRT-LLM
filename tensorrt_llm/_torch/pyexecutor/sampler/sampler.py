@@ -147,19 +147,14 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)  # type: ignore
 
 
-def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float]:
-    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p)``.
-
-    The fast tier admits no min_p strategy, so min_p stays at the neutral 0 that
-    ``_fast_min_ps`` is allocated with.
-    """
+def _fast_strategy_params(strategy: Strategy) -> tuple[float, int, float, float]:
+    """Flatten a fast-tier strategy into per-row ``(temperature, top_k, top_p, min_p)``."""
     if strategy == GREEDY:
         # Only padding dummies reach this: they carry no sampling params of
         # their own, and the graph samples their rows only to discard them.
         # Neutral filters keep them out of the way of the live rows.
-        return 1.0, 0, 1.0
-    temperature, top_k, top_p, _ = fused_row_params(strategy)
-    return temperature, top_k, top_p
+        return 1.0, 0, 1.0, 0.0
+    return fused_row_params(strategy)
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
@@ -775,16 +770,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
 
-    # Strategy tags the fast tier can sample, i.e. those expressible as
-    # per-row (temperature, top_k, top_p) for the fused kernel. "greedy"
+    # Strategy tags the fast tier can sample: every one the fused kernel takes
+    # per row as (temperature, top_k, top_p, min_p). "greedy"
     # is absent on purpose: greedy batches stay on the eager path. Capturing
     # argmax saves about as much launch overhead as staging for it costs (on
     # Qwen2-0.5B the two cancelled out), the eager stable-greedy path already
     # handles them, and expressing greedy rows as top_k=1 would drag them onto
     # the seeded sampling path for no gain.
-    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = frozenset(
-        {"temperature", "top_k", "top_p", "top_k_top_p"}
-    )
+    _FAST_STRATEGY_TAGS: Final[frozenset[str]] = FUSED_STRATEGY_KEYS
 
     @staticmethod
     def _request_rewrites_logits(request: LlmRequest) -> bool:
@@ -817,10 +810,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return bool(request.py_min_length) or check_stop_words_length(request)
 
     def _can_use_fast_path(self, requests: list[LlmRequest]) -> bool:
-        """Whether every request is plain temperature / top_k / top_p sampling.
+        """Whether every request is plain temperature / top_k / top_p / min_p sampling.
 
         Rejects anything the fast-tier kernel cannot express per row: beam search
-        and min_p (different strategy tags), top-p decay (its top_p is per-step
+        (a different strategy tag), top-p decay (its top_p is per-step
         state, not a fixed per-row value), and the feature handlers that rewrite
         logits or need extra outputs -- penalties, token bans, embedding bias,
         logprobs and speculation, none of which the fast path runs.
@@ -1038,12 +1031,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         temperatures_buf = self._fast_temperatures
         top_ks_buf = self._fast_top_ks
         top_ps_buf = self._fast_top_ps
+        min_ps_buf = self._fast_min_ps
         seeds_buf = self._fast_seeds
         offsets_buf = self._fast_offsets
         assert (
             temperatures_buf is not None
             and top_ks_buf is not None
             and top_ps_buf is not None
+            and min_ps_buf is not None
             and seeds_buf is not None
             and offsets_buf is not None
         ), "_ensure_fast_buffers must have allocated every fast-tier buffer"
@@ -1057,12 +1052,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         temperatures: list[float] = []
         top_ks: list[int] = []
         top_ps: list[float] = []
+        min_ps: list[float] = []
         for request, num_request_rows in zip(requests, rows_per_request, strict=True):
             strategy = _request_strategy(request, vocab_size=vocab_size)
-            temperature, top_k, top_p = _fast_strategy_params(strategy)
+            temperature, top_k, top_p, min_p = _fast_strategy_params(strategy)
             temperatures.extend([temperature] * num_request_rows)
             top_ks.extend([top_k] * num_request_rows)
             top_ps.extend([top_p] * num_request_rows)
+            min_ps.extend([min_p] * num_request_rows)
 
         pin = prefer_pinned()
         temperatures_buf[:num_rows].copy_(
@@ -1073,6 +1070,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
         top_ps_buf[:num_rows].copy_(
             torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
+        )
+        min_ps_buf[:num_rows].copy_(
+            torch.tensor(min_ps, dtype=torch.float32, pin_memory=pin), non_blocking=True
         )
 
         # Philox (seed, offset) per row, from the sampler's own seed manager so

@@ -52,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
 )
 from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import FinishReasonsHandler
 from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import (
+    UNSEEDED_OFFSET_BASE,
     fused_compute_probs_from_logits,
     fused_sample_from_logits_with_probs,
 )
@@ -3375,7 +3376,7 @@ class TestRequestSeed:
     def test_multi_row_offsets_do_not_overlap(self):
         """Speculative decoding draws several rows per request per step.
 
-        Those rows must be assigned distinct stretches of the request's stream,
+        Those rows must be assigned distinct offsets of the request's stream,
         and the next step must resume past all of them -- otherwise a request
         would replay the same random numbers across steps.
         """
@@ -3391,29 +3392,15 @@ class TestRequestSeed:
         assert first.seed.tolist() == [1234, 1234, 1234, 999]
         second = manager.take_row_seeds(rows, device=device)
 
-        # Each row reserves a stretch of the stream; the invariant is that no
-        # two stretches overlap, within a step or across steps. Asserted as a
-        # property rather than against OFFSET_STRIDE, so that a stride too small
-        # for the kernel's per-row consumption fails here instead of silently
-        # rescaling the expected values.
-        #
-        # The fused sampler draws up to 32 uniforms per row (kMaxRejectRounds),
-        # so a stride below that would replay random values. Only within a
-        # slot: distinct slots carry distinct seeds, so they are independent
-        # streams and may legitimately share offsets.
-        assert _SeedManager.OFFSET_STRIDE >= 32
-        per_slot: dict[int, set[int]] = {}
+        # Distinct slots carry distinct seeds, so they are independent streams
+        # and may share offsets; within a slot no offset may repeat.
+        per_slot: dict[int, list[int]] = {}
         for offsets in (first.offset.tolist(), second.offset.tolist()):
             for slot, off in zip(rows, offsets):
-                stretch = range(off, off + _SeedManager.OFFSET_STRIDE)
-                used = per_slot.setdefault(slot, set())
-                assert used.isdisjoint(stretch), (
-                    f"slot {slot} reuses offsets {off}..{off + _SeedManager.OFFSET_STRIDE - 1}; "
-                    "the stream is replayed"
-                )
-                used.update(stretch)
+                per_slot.setdefault(slot, []).append(off)
+        assert per_slot == {0: [0, 1, 2, 3, 4, 5], 1: [0, 1]}
 
-    def test_unseeded_rows_take_disjoint_stretches(self):
+    def test_unseeded_rows_take_distinct_offsets(self):
         manager = _SeedManager(max_num_sequences=4, global_seed=42)
         device = torch.device("cpu")
 
@@ -3421,8 +3408,9 @@ class TestRequestSeed:
         second = manager.take_row_seeds([2, 3], device=device)
 
         assert first.seed.tolist() + second.seed.tolist() == [42] * 5
-        stride = _SeedManager.OFFSET_STRIDE
-        assert first.offset.tolist() + second.offset.tolist() == [i * stride for i in range(5)]
+        assert first.offset.tolist() + second.offset.tolist() == [
+            UNSEEDED_OFFSET_BASE + i for i in range(5)
+        ]
 
     def test_unseeded_offsets_continue_across_mixed_batches(self):
         manager = _SeedManager(max_num_sequences=4, global_seed=42)
@@ -3435,9 +3423,20 @@ class TestRequestSeed:
         after = manager.take_row_seeds([1], device=device)
 
         assert mixed.seed.tolist() == [1234, 42]
-        stride = _SeedManager.OFFSET_STRIDE
         unseeded = before.offset.tolist() + mixed.offset.tolist()[1:] + after.offset.tolist()
-        assert unseeded == [0, stride, 2 * stride]
+        assert unseeded == [UNSEEDED_OFFSET_BASE + i for i in range(3)]
+
+    def test_user_seed_equal_to_global_seed_does_not_share_unseeded_streams(self):
+        manager = _SeedManager(max_num_sequences=4, global_seed=42)
+        manager._seeds[0] = 42
+        manager._slot_seeded[0] = True
+        device = torch.device("cpu")
+
+        for _ in range(4):
+            seeds = manager.take_row_seeds([0, 1], device=device)
+            assert seeds.seed.tolist() == [42, 42]
+            seeded_offset, unseeded_offset = seeds.offset.tolist()
+            assert seeded_offset < UNSEEDED_OFFSET_BASE <= unseeded_offset
 
 
 class TestTopPDecay:

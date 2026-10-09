@@ -26,7 +26,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 
 from ..llm_request import LlmRequest
-from .ops.custom import MAX_DRAWS_PER_ROW
+from .ops.custom import UNSEEDED_OFFSET_BASE
 from .sampler_common import RequestSeeds, request_random_seed
 
 __all__ = ["_SeedManager"]
@@ -46,13 +46,11 @@ class _SeedManager:
       slot. The counter restarts when a new request takes the slot, so the
       stream depends only on how far the request has decoded.
     - An unseeded request uses ``global_seed`` and an offset from a counter
-      shared by all unseeded rows, which only ever grows. Unseeded requests
-      therefore never replay each other's streams or their own earlier steps.
+      shared by all unseeded rows, which starts at ``UNSEEDED_OFFSET_BASE``
+      and only ever grows. Unseeded requests therefore never replay each
+      other's streams or their own earlier steps, nor the stream of a request
+      whose seed equals ``global_seed``.
     """
-
-    # Philox offset units reserved per row per sampling call, so consecutive
-    # stretches of a stream never overlap.
-    OFFSET_STRIDE = MAX_DRAWS_PER_ROW
 
     def __init__(self, *, max_num_sequences: int, global_seed: int):
         self._global_seed = global_seed
@@ -66,7 +64,7 @@ class _SeedManager:
         # user seed?
         self._slot_seeded: list[bool] = [False] * max_num_sequences
         # Offset of the next unseeded row.
-        self._unseeded_offset = 0
+        self._unseeded_offset = UNSEEDED_OFFSET_BASE
         # Whether the batch observed in the current step is a draft batch.
         self._batch_is_draft = False
 
@@ -114,24 +112,18 @@ class _SeedManager:
 
         ``slots_per_row`` gives the sequence slot of each logits row, already
         expanded per step (a request drawing N tokens this iteration occupies N
-        consecutive rows). Every row is given a stretch of ``OFFSET_STRIDE``
-        offset units that no earlier row of the same stream has used.
+        consecutive rows). Every row is given an offset that no earlier row of
+        the same stream has used.
         """
         num_rows = len(slots_per_row)
         # Calls without a seeded row are the common case; build them on the
         # device, without a per-row loop or a host-to-device copy.
         if self._batch_is_draft or not any(map(self._slot_seeded.__getitem__, slots_per_row)):
             start = self._unseeded_offset
-            self._unseeded_offset += num_rows * self.OFFSET_STRIDE
+            self._unseeded_offset += num_rows
             return RequestSeeds(
                 seed=torch.full((num_rows,), self._global_seed, dtype=torch.int64, device=device),
-                offset=torch.arange(
-                    start,
-                    self._unseeded_offset,
-                    self.OFFSET_STRIDE,
-                    dtype=torch.int64,
-                    device=device,
-                ),
+                offset=torch.arange(start, self._unseeded_offset, dtype=torch.int64, device=device),
             )
         seeds: list[int] = []
         offsets: list[int] = []
@@ -139,11 +131,11 @@ class _SeedManager:
             if self._batch_is_draft or not self._slot_seeded[slot]:
                 seeds.append(self._global_seed)
                 offsets.append(self._unseeded_offset)
-                self._unseeded_offset += self.OFFSET_STRIDE
+                self._unseeded_offset += 1
             else:
                 seeds.append(int(self._seeds[slot]))
                 offsets.append(int(self._offsets[slot]))
-                self._offsets[slot] += self.OFFSET_STRIDE
+                self._offsets[slot] += 1
         pin = prefer_pinned()
         return RequestSeeds(
             seed=torch.tensor(seeds, dtype=torch.int64, pin_memory=pin).to(

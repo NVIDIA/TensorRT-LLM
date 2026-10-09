@@ -586,6 +586,58 @@ def test_sampling_follows_the_filtered_distribution() -> None:
     assert tv < 0.05, f"total-variation distance {tv:.3f} between draws and the reported probs"
 
 
+def test_single_row_call_draws_the_per_row_stream() -> None:
+    """A one-row call is per-row: the row draws what it would beside other rows."""
+    dev = "cuda"
+    torch.manual_seed(0)
+    logits = torch.randn(1, 128, device=dev).expand(3, 128).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(3, device=dev, temperature=1.0, top_k=64)
+    for offset in range(8):
+        seeds = torch.tensor([1234, 42, 999], dtype=torch.int64, device=dev)
+        offsets = torch.tensor([offset, 1 << 62, offset], dtype=torch.int64, device=dev)
+        batched = fused.fused_sample_from_logits(
+            logits, temps, top_ks, top_ps, min_ps, seed=seeds, offset=offsets
+        )
+        alone = fused.fused_sample_from_logits(
+            logits[:1],
+            temps[:1],
+            top_ks[:1],
+            top_ps[:1],
+            min_ps[:1],
+            seed=seeds[:1],
+            offset=offsets[:1],
+        )
+        assert alone.item() == batched[0].item()
+
+
+def test_consecutive_per_row_offsets_draw_independent_streams() -> None:
+    """Per-row offsets one apart must not share draws: each names its own subsequence.
+
+    Rows without top-k take the rejection path, which draws several values per row, so
+    streams that overlapped would skew the sample away from the reported probs.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    vocab, draws = 64, 4096
+    logits = (torch.randn(1, vocab, device=dev) * 1.5).expand(draws, vocab).contiguous()
+    temps, top_ks, top_ps, min_ps = _params(draws, device=dev, temperature=1.0, top_p=0.9)
+    expected = fused.fused_compute_probs_from_logits(logits, temps, top_ks, top_ps, min_ps)[0]
+
+    tokens = fused.fused_sample_from_logits(
+        logits,
+        temps,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed=torch.full((draws,), 99, dtype=torch.int64, device=dev),
+        offset=torch.arange(draws, dtype=torch.int64, device=dev),
+    )
+
+    counts = torch.bincount(tokens.long(), minlength=vocab).float() / draws
+    tv = 0.5 * (counts - expected).abs().sum().item()
+    assert tv < 0.05, f"total-variation distance {tv:.3f} from the filtered distribution"
+
+
 # --- The tokens-only rejection path ------------------------------------------------
 #
 # ``fused_sample_from_logits`` (tokens, no probs) does not solve for the cutoff at

@@ -115,15 +115,13 @@ class TestTierSelection:
     def test_plain_temperature_top_k_top_p_is_fast(self, sampler):
         assert sampler.get_sample_type([make_request()]) is SampleType.FAST
 
-    @pytest.mark.parametrize(
-        "sampling",
-        [
-            pytest.param(dict(temperature=0.0), id="greedy"),
-            pytest.param(dict(temperature=0.8, min_p=0.05), id="min_p"),
-        ],
-    )
-    def test_sampling_params_outside_the_tier_are_full(self, sampler, sampling):
-        assert sampler.get_sample_type([make_request(sampling)]) is SampleType.FULL
+    def test_min_p_is_fast(self, sampler):
+        request = make_request(dict(temperature=0.8, min_p=0.05))
+        assert sampler.get_sample_type([request]) is SampleType.FAST
+
+    def test_greedy_is_full(self, sampler):
+        request = make_request(dict(temperature=0.0))
+        assert sampler.get_sample_type([request]) is SampleType.FULL
 
     @pytest.mark.parametrize(
         "attrs",
@@ -200,6 +198,20 @@ class TestStaging:
         assert sampler._in_graph_rows == 2
         assert sampler._in_graph_live_rows == 2
         assert sampler._in_graph_dest_indices[:2].tolist() == [3, 5]
+
+    def test_stages_per_row_filters(self, sampler):
+        batch = self._batch(
+            make_request(py_request_id=1, py_seq_slot=3),
+            make_request(
+                dict(temperature=0.7, top_p=0.8, min_p=0.05), py_request_id=2, py_seq_slot=5
+            ),
+        )
+        sampler.stage_in_graph_sampling(batch, SampleType.FAST)
+
+        assert sampler._fast_temperatures[:2].tolist() == pytest.approx([0.8, 0.7])
+        assert sampler._fast_top_ks[:2].tolist() == [50, 0]
+        assert sampler._fast_top_ps[:2].tolist() == pytest.approx([0.9, 0.8])
+        assert sampler._fast_min_ps[:2].tolist() == pytest.approx([0.0, 0.05])
 
     def test_full_stages_nothing(self, sampler):
         batch = self._batch(make_request(py_request_id=1, py_seq_slot=0))

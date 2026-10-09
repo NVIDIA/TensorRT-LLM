@@ -129,10 +129,31 @@ struct RowParams
     bool needMinP;
 };
 
+//! Philox subsequences from here up hold per-row streams. A shared seed/offset makes the row
+//! index the subsequence, which never reaches them.
+constexpr uint64_t kPerRowSubsequenceBase = 1ull << 63;
+
+//! Seeds one row's Philox stream (see FusedSamplingParams::perRowRng).
+__device__ inline void initRowRng(FusedSamplingParams const& p, int row, curandStatePhilox4_32_10_t* state)
+{
+    int const rngIdx = p.perRowRng ? row : 0;
+    uint64_t const seed = p.seed != nullptr ? p.seed[rngIdx] : 0ull;
+    uint64_t const offset = p.offset != nullptr ? p.offset[rngIdx] : 0ull;
+    if (p.perRowRng)
+    {
+        curand_init(seed, kPerRowSubsequenceBase | offset, 0ull, state);
+    }
+    else
+    {
+        curand_init(seed, static_cast<uint64_t>(row), offset, state);
+    }
+}
+
 __device__ inline RowParams loadRowParams(FusedSamplingParams const& p, int row)
 {
     RowParams r;
     float const temperature = p.temperatures != nullptr ? p.temperatures[row] : 1.0f;
+    // In-tree callers pass T > 0: a zero temperature is sampled greedily before it gets here.
     r.tempInv = temperature > 0.0f ? 1.0f / temperature : 1.0f / kTempEpsilon;
 
     // min_p is a fraction of the row maximum, so a value above 1 keeps nothing: keptMass
@@ -773,10 +794,7 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
 
             if (tid == 0)
             {
-                int const rngIdx = params.perRowRng ? row : 0;
-                uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-                uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
-                curand_init(seed, params.perRowRng ? 0ull : static_cast<uint64_t>(row), offset, &sRejectRng);
+                initRowRng(params, row, &sRejectRng);
                 // -1 admits every weight: w is an exp, so it is never negative.
                 sPivot = -1.0f;
                 sToken = -1;
@@ -1093,14 +1111,8 @@ __device__ void fusedSamplingBody(FusedSamplingParams const& params, FusedSampli
     {
         if (tid == 0)
         {
-            int const rngIdx = params.perRowRng ? row : 0;
-            uint64_t const seed = params.seed != nullptr ? params.seed[rngIdx] : 0ull;
-            uint64_t const offset = params.offset != nullptr ? params.offset[rngIdx] : 0ull;
             curandStatePhilox4_32_10_t state;
-            // A shared seed/offset separates rows by making the row index the subsequence.
-            // Per-row entries use subsequence 0, so a row's stream depends only on its own
-            // seed/offset, whatever position it takes in the batch.
-            curand_init(seed, params.perRowRng ? 0ull : static_cast<uint64_t>(row), offset, &state);
+            initRowRng(params, row, &state);
             sTarget = curand_uniform(&state) * keptMass;
             sToken = -1;
         }

@@ -460,6 +460,12 @@ DEFAULT_SAMPLING_SEED = 42
 # all unseeded requests. A string so it cannot collide with a slot id.
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 
+# Philox offsets between consecutive slots of an offset window. The fused
+# kernel needs only distinct offsets, but the flashinfer ops and the acceptance
+# kernels read a single offset and draw several values per row from it, so each
+# slot leaves them room before the next one starts.
+_RNG_SLOT_SPAN = 32
+
 
 @dataclass
 class SpecMetadata:
@@ -657,7 +663,9 @@ class SpecMetadata:
     # hence the same tokens whenever they also share a batch row. SlotManager
     # hands serial requests a fresh slot each time, so that is the common
     # low-concurrency case. The shared counter guarantees every unseeded
-    # request an offset window no earlier request has used.
+    # request an offset window no earlier request has used, and it counts from
+    # UNSEEDED_OFFSET_BASE so that a user seed equal to DEFAULT_SAMPLING_SEED
+    # does not replay those windows either.
     _rng_window_counter: dict = field(default_factory=dict)
     # seq_slot -> py_request_id mapping to track offset slot ownership.
     _rng_slot_owner: dict = field(default_factory=dict)
@@ -761,13 +769,12 @@ class SpecMetadata:
         """
         Hand each request the base of a fresh Philox offset window.
 
-        A window holds one ``MAX_DRAWS_PER_ROW``-wide slot per row the request
+        A window holds one ``_RNG_SLOT_SPAN``-wide slot per row the request
         samples in a step: its target rows first, then its draft steps, then
-        the acceptance kernel. The fused kernel gives every row with its own
-        (seed, offset) the same subsequence, so distinct slots are what keep
-        those rows' draws apart.
+        the acceptance kernel. Distinct slots are what keep those rows' draws
+        apart.
         """
-        window = (self.rng_accept_slot + 1) * fused_sampling.MAX_DRAWS_PER_ROW
+        window = (self.rng_accept_slot + 1) * _RNG_SLOT_SPAN
         offsets: list[int] = []
         for request, is_seeded in zip(requests, seeded):
             # Dummy/padding requests (no slot) never have their output kept;
@@ -781,11 +788,13 @@ class SpecMetadata:
                 if self._rng_slot_owner.get(key) != request.py_request_id:
                     self._rng_slot_owner[key] = request.py_request_id
                     self._rng_window_counter[key] = 0
+                base = 0
             else:
                 key = _UNSEEDED_RNG_WINDOW_KEY
+                base = fused_sampling.UNSEEDED_OFFSET_BASE
             step = self._rng_window_counter.get(key, 0)
             self._rng_window_counter[key] = step + 1
-            offsets.append(step * window)
+            offsets.append(base + step * window)
         return offsets
 
     def _populate_request_rng_state(
@@ -830,7 +839,7 @@ class SpecMetadata:
         for seed, offset, num_tokens in zip(request_seeds, request_offsets,
                                             num_tokens_per_request):
             flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset + row * fused_sampling.MAX_DRAWS_PER_ROW
+            flat_offsets.extend(offset + row * _RNG_SLOT_SPAN
                                 for row in range(num_tokens))
 
         # A batch wider than the buffers would silently truncate the copies
@@ -2587,15 +2596,14 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         seeds = spec_metadata.request_seeds[start:end]
         offsets = (spec_metadata.request_offsets[start:end] +
-                   slot * fused_sampling.MAX_DRAWS_PER_ROW)
+                   slot * _RNG_SLOT_SPAN)
         if repeat > 1:
             seeds = seeds.repeat_interleave(repeat)
             row_slots = torch.arange(repeat,
                                      dtype=torch.int64,
                                      device=offsets.device)
             offsets = (offsets.repeat_interleave(repeat) +
-                       row_slots.repeat(offsets.numel()) *
-                       fused_sampling.MAX_DRAWS_PER_ROW)
+                       row_slots.repeat(offsets.numel()) * _RNG_SLOT_SPAN)
         return seeds, offsets
 
     def _rng_state_per_token(

@@ -59,7 +59,7 @@ class SampleType(Enum):
 
     A batch is dispatched to the simplest tier its requests allow:
 
-    - ``FAST``: only temperature / top_p / top_k. Sampled inside the graph.
+    - ``FAST``: only temperature / top_p / top_k / min_p. Sampled inside the graph.
     - ``FULL``: every sampling feature. Sampled eagerly after the forward.
 
     There is deliberately no argmax tier: greedy sampling is two cheap kernels,

@@ -22,12 +22,17 @@ from typing import Optional
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import MAX_DRAWS_PER_ROW
-from tensorrt_llm._torch.speculative.interface import SpecMetadata
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import UNSEEDED_OFFSET_BASE
+from tensorrt_llm._torch.speculative.interface import (
+    _RNG_SLOT_SPAN,
+    DEFAULT_SAMPLING_SEED,
+    SpecMetadata,
+)
 
 MAX_DRAFT_LEN = 3
 # One slot per target row, per draft step and for the acceptance kernel.
-WINDOW = ((MAX_DRAFT_LEN + 1) + MAX_DRAFT_LEN + 1) * MAX_DRAWS_PER_ROW
+WINDOW = ((MAX_DRAFT_LEN + 1) + MAX_DRAFT_LEN + 1) * _RNG_SLOT_SPAN
+BASE = UNSEEDED_OFFSET_BASE
 
 
 def _meta(max_num_requests: int = 8) -> SpecMetadata:
@@ -115,7 +120,7 @@ def test_seeded_slot_reuse_reset_leaves_other_counters_alone() -> None:
     # shared unseeded counter must keep advancing where they left off.
     _offsets(meta, [_request(3)])
     assert _offsets(meta, [_request(0, seed=7, request_id=3), survivor]) == [0, WINDOW]
-    assert _offsets(meta, [_request(3)]) == [WINDOW]
+    assert _offsets(meta, [_request(3)]) == [BASE + WINDOW]
 
 
 # --- unseeded requests: one shared counter ------------------------------------
@@ -129,18 +134,32 @@ def test_unseeded_serial_requests_on_fresh_slots_get_distinct_windows() -> None:
     seen: list[int] = []
     for slot in range(meta.max_num_requests):
         seen.extend(_offsets(meta, [_request(slot)]))
-    assert seen == [i * WINDOW for i in range(meta.max_num_requests)]
+    assert seen == [BASE + i * WINDOW for i in range(meta.max_num_requests)]
 
 
 def test_unseeded_requests_in_one_batch_get_distinct_windows() -> None:
     meta = _meta()
-    assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [0, WINDOW, 2 * WINDOW]
+    assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [
+        BASE,
+        BASE + WINDOW,
+        BASE + 2 * WINDOW,
+    ]
     # Next pass continues from where the shared counter left off.
     assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [
-        3 * WINDOW,
-        4 * WINDOW,
-        5 * WINDOW,
+        BASE + 3 * WINDOW,
+        BASE + 4 * WINDOW,
+        BASE + 5 * WINDOW,
     ]
+
+
+def test_unseeded_windows_differ_from_a_default_seeded_request() -> None:
+    # Unseeded requests draw with DEFAULT_SAMPLING_SEED, which a user may also
+    # pass as their seed; the two must still not share a (seed, offset).
+    meta = _meta()
+    seeded = _request(0, seed=DEFAULT_SAMPLING_SEED, request_id=1)
+    for _ in range(4):
+        seeded_offset, unseeded_offset = _offsets(meta, [seeded, _request(1, request_id=2)])
+        assert seeded_offset < BASE <= unseeded_offset
 
 
 def test_unseeded_windows_never_repeat_across_slot_reuse() -> None:
@@ -181,9 +200,9 @@ def test_graph_copy_shares_the_counters() -> None:
     # Same for the shared unseeded counter: a context step runs eagerly and
     # the generation steps replay a graph, and neither may hand out a window
     # the other already did.
-    assert _offsets(meta, [_request(1)]) == [0]
-    assert _offsets(graph_meta, [_request(1)]) == [WINDOW]
-    assert _offsets(meta, [_request(1)]) == [2 * WINDOW]
+    assert _offsets(meta, [_request(1)]) == [BASE]
+    assert _offsets(graph_meta, [_request(1)]) == [BASE + WINDOW]
+    assert _offsets(meta, [_request(1)]) == [BASE + 2 * WINDOW]
 
 
 # --- the slots of one window --------------------------------------------------
@@ -209,7 +228,7 @@ def test_window_slots_do_not_overlap(is_tree: bool) -> None:
 
     used: set[int] = set()
     for slot in slots:
-        stretch = set(range(slot * MAX_DRAWS_PER_ROW, (slot + 1) * MAX_DRAWS_PER_ROW))
+        stretch = set(range(slot * _RNG_SLOT_SPAN, (slot + 1) * _RNG_SLOT_SPAN))
         assert used.isdisjoint(stretch), f"slot {slot} overlaps another row's draws"
         used |= stretch
     assert max(used) < window
