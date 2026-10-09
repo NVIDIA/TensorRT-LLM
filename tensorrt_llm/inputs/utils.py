@@ -3,7 +3,6 @@
 
 import asyncio
 import base64
-import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -24,10 +23,9 @@ from tensorrt_llm.inputs.chat_template_guard import \
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
 from tensorrt_llm.inputs.data import prompt_inputs
-from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY,
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, VideoMediaIO,
                                           _get_aiohttp_session,
                                           _load_and_convert_image,
-                                          _load_video_by_cv2,
                                           _normalize_file_uri,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
@@ -145,38 +143,22 @@ def load_video(video: str,
                format: str = "pt",
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
+    # Decode through `VideoMediaIO`, the loader `trtllm-serve` uses, so the
+    # same video gets the same source-byte anchor (`raw_bytes_hash`) and
+    # therefore the same multimodal hash offline and in serving.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix=".mp4") as tmp_file:
-            tmp_file.write(resp.content)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(resp.content)
     elif parsed_url.scheme in ("", "file"):
-        return _load_video_by_cv2(video,
-                                  num_frames,
-                                  fps,
-                                  format,
-                                  device,
-                                  extract_audio=extract_audio)
+        return video_io.load_file(video)
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
-        with tempfile.NamedTemporaryFile(delete=True,
-                                         suffix='.mp4') as tmp_file:
-            tmp_file.write(decoded_video)
-            tmp_file.flush()
-            return _load_video_by_cv2(tmp_file.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
+        return video_io.load_bytes(load_base64_video(video))
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -189,34 +171,22 @@ async def async_load_video(video: str,
                            extract_audio: bool = False) -> VideoData:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
+    # See `load_video`: share the serving decode path so hashes agree.
+    video_io = VideoMediaIO(num_frames=num_frames,
+                            fps=fps,
+                            format=format,
+                            device=device,
+                            extract_audio=extract_audio)
     parsed_url = urlparse(video)
-
-    def _load_from_bytes(data: bytes) -> VideoData:
-        with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
-            tmp.write(data)
-            tmp.flush()
-            return _load_video_by_cv2(tmp.name,
-                                      num_frames,
-                                      fps,
-                                      format,
-                                      device,
-                                      extract_audio=extract_audio)
-
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
         video_data = await _safe_aiohttp_get(video, session=session)
-        return await asyncio.to_thread(_load_from_bytes, video_data)
+        return await asyncio.to_thread(video_io.load_bytes, video_data)
     elif parsed_url.scheme == "data":
         decoded_video = await asyncio.to_thread(load_base64_video, video)
-        return await asyncio.to_thread(_load_from_bytes, decoded_video)
+        return await asyncio.to_thread(video_io.load_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
-        return await asyncio.to_thread(_load_video_by_cv2,
-                                       video,
-                                       num_frames,
-                                       fps,
-                                       format,
-                                       device,
-                                       extract_audio=extract_audio)
+        return await asyncio.to_thread(video_io.load_file, video)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
