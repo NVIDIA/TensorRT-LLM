@@ -370,6 +370,23 @@ def test_a_siblings_failure_does_not_reopen_a_delivered_piece():
     assert isinstance(handle.poll(), Delivered)
 
 
+@pytest.mark.parametrize("owns_transfers", [False, True])
+def test_a_failure_stands_when_completion_arrives_after_it(owns_transfers):
+    """A complete() after fail() leaves the task failed, with or without transfer ownership."""
+    task = KVRecvTask(
+        11, _sole_piece(), 0, DisaggregatedParams(disagg_request_id=11), aux_slot=None
+    )
+    task.expected_transfers = 1
+    if owns_transfers:
+        task.begin_publication()
+    task.status = TaskStatus.TRANSFERRING
+
+    task.fail(RuntimeError("the writer failed"))
+    task.complete()
+
+    assert task.status == TaskStatus.ERROR
+
+
 def test_a_latched_ending_still_tracks_whether_a_report_is_owed():
     """Only the ending is fixed; whether a writer still owes word keeps moving."""
     task = KVRecvTask(
