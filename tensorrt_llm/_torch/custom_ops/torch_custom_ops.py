@@ -2255,12 +2255,21 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
             device=activation.device,
             dtype=self.output_dtype,
         )
+        observed = jit_prefetch_deep_gemm.launch_observer is not None
+        if observed:
+            t0 = jit_prefetch_deep_gemm.note_launch(activation.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1))
         deep_gemm.fp8_gemm_nt(
             (activation, activation_scale),
             (weight, weight_scale),
             output,
             disable_ue8m0_cast=self.disable_ue8m0_cast,
         )
+        if observed:
+            jit_prefetch_deep_gemm.note_launch_done(activation.size(0),
+                                                    weight.size(0),
+                                                    weight.size(1), t0)
         return output
 
 
