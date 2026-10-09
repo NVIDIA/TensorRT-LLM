@@ -26,6 +26,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import load_atte
 from tensorrt_llm._torch.attention.backends.sparse.registry import get_sparse_attn_kv_cache_manager
 from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig, SparseAttentionConfig
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def _rotate(x, positions, cos_sin, inverse=False):
     values = x.float().clone()
@@ -256,6 +261,7 @@ def module_cache(request):
     manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 @pytest.mark.parametrize("module_cache", [1, 2], indirect=True)
@@ -481,12 +487,14 @@ def _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, impl
         assert len(preparation_calls) == token + 1
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("overlap", [False, True])
 def test_ratio2_module_partial_groups(monkeypatch, module_cache, overlap):
     _check_ratio2_module_partial_groups(monkeypatch, module_cache, overlap, "auto")
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
 def test_module_composed_flash_helper(monkeypatch, module_cache, implementation):
@@ -588,6 +596,7 @@ def _native_model(
     return model, weights
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 # Slicing is disabled under attention DP, so a nonzero rank proves full weights load;
@@ -615,6 +624,7 @@ def test_attention_dp_loads_full_projection_weights(rank, quantization):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch):
@@ -659,6 +669,7 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch):
         torch.testing.assert_close(actual_bytes, expected_bytes, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block", [32, 128])
 @torch.inference_mode()
@@ -704,6 +715,7 @@ def test_native_grouped_output_paths_and_replay(monkeypatch, block):
         assert error < 0.12
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_fused_native_index_q_and_graph(monkeypatch):
@@ -764,6 +776,7 @@ def test_fused_native_index_q_and_graph(monkeypatch):
     torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
@@ -820,6 +833,7 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     torch.cuda.synchronize()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("overlap", [False, True])
 @torch.inference_mode()
@@ -876,6 +890,7 @@ def test_native_module_fixed_context_graph(monkeypatch, module_cache, overlap):
     torch.cuda.synchronize()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("tokens", [17, 64])
 @torch.inference_mode()
@@ -894,6 +909,7 @@ def test_large_index_q_uses_unfused_native_path(monkeypatch, tokens):
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("width", [128, 512, 1280])
 @torch.inference_mode()
@@ -929,6 +945,7 @@ def test_rms_norm_native_single_rounding(monkeypatch, width):
     torch.testing.assert_close(norm(x), reference, atol=0, rtol=1 / 128)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("quantization,block", [("bf16", 32), ("mxfp8", 32), ("mxfp8", 128)])
 @torch.inference_mode()
@@ -1008,6 +1025,7 @@ def test_packed_output_inverse_rope_module_and_graph(
     torch.cuda.synchronize()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("quantization", ["bf16", "mxfp8"])
 @torch.inference_mode()
@@ -1267,6 +1285,7 @@ def _reference_bounded_output(model, hidden, positions, global_rows):
     return F.linear(latent, model.o_b_proj.weight)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_encoder_bounded_replay_preserves_global_and_truncates_swa(
@@ -1312,6 +1331,7 @@ def test_encoder_bounded_replay_preserves_global_and_truncates_swa(
     torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "ratio,cached,decoder", [(1, 5, False), (2, 4, False), (2, 5, False), (1, 5, True)]
@@ -1408,6 +1428,7 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_factory):
@@ -1488,6 +1509,7 @@ def test_bounded_replay_full_module_graph_changes_hit_position(replay_module_fac
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("strategy", [None, "NCCL"], ids=["default-auto", "explicit-nccl"])
 def test_tp_output_projection_uses_requested_allreduce_strategy(strategy):
@@ -1623,6 +1645,7 @@ def _reference(kv_score, ratio, dim):
     return torch.stack(outputs)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [2, 4, 128])
 @pytest.mark.parametrize("dim", [128, 512])
@@ -1694,6 +1717,7 @@ def test_native_chunked_compression(ratio, dim, decode_tail):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_ratio2_native_cuda_graph_changed_partial_state():
     dim, page_size = 512, 32
@@ -1727,6 +1751,7 @@ def test_ratio2_native_cuda_graph_changed_partial_state():
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_compressor_module_pre_rope_latent(ratio):
@@ -1891,6 +1916,7 @@ def test_dense_fp8_requantized_scale_blocks_preserve_tp_slices(block, name):
         torch.testing.assert_close(module.o_b_proj.weight, expanded[:, 128:])
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():

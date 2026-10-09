@@ -19,6 +19,10 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.evaluate import GSM8K
 from tensorrt_llm.scheduling_params import SchedulingParams
 
+from .conftest import skip_pre_blackwell
+
+pytestmark = skip_pre_blackwell
+
 
 @pytest.fixture(scope="module")
 def ced_llm():

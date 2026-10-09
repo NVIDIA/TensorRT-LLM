@@ -10,13 +10,17 @@ import torch
 from _deepseek_v41_test_utils import cache_case, capture_layers, explicit_global_production
 from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as shared_model_and_config
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
 cache_config = shared_cache_config
 model_and_config = shared_model_and_config
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    skip_pre_blackwell,
+]
 
 
 @pytest.mark.parametrize(

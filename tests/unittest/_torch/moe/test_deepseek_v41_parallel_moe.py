@@ -34,6 +34,7 @@ from _torch.moe.quantize_utils import MXFP4MXFP8QuantizeUtil
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4Gate
@@ -253,6 +254,7 @@ def _run_native_ep() -> None:
                     reference.check_accuracy(actual, expected)
 
 
+@skip_pre_blackwell
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
     "parallel_moe_executor",

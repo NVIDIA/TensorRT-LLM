@@ -19,6 +19,11 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def _layout() -> CSA2Layout:
     return CSA2Layout(
@@ -193,6 +198,7 @@ def test_fresh_fill_uses_physical_roles_and_preserves_relocated_committed_pages(
         assert torch.all(buffer[[10, 11]] == 0)  # newly materialized ordinals
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("guard", [False, True])
 def test_real_context_allocator_omits_decoder_swa(monkeypatch, guard: bool) -> None:
     if not torch.cuda.is_available():

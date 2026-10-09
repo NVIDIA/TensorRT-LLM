@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
@@ -17,6 +18,8 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = skip_pre_blackwell
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

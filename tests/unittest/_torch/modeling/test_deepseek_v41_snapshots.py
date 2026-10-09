@@ -7,6 +7,7 @@ import torch
 from _deepseek_v41_test_utils import cache_case, canonical_routing, enable_ced, global_bytes, run
 from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as global_model_and_config
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
@@ -17,6 +18,8 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy, _introspection
+
+pytestmark = skip_pre_blackwell
 
 cache_config = shared_cache_config
 

@@ -19,6 +19,11 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from . import test_metadata
 from .test_metadata import _prepare_decode_metadata
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -126,6 +131,7 @@ def _output_storage(query_count: int, page_capacity: int) -> tuple[torch.Tensor,
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "query_count,request_count,source_pages,page_capacity,pages_per_source_page",
@@ -232,6 +238,7 @@ def test_failed_prepare_clears_decode_deferral_state(
     assert not metadata._csa2_deferred_decode_outputs
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_selected_decode_prepare_controls_indexer_dispatch(

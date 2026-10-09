@@ -44,7 +44,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              ResourceManagerType
                                                              )
 # isort: on
-from utils.util import skip_ray
+from utils.util import skip_pre_blackwell_unittest, skip_ray
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -2599,6 +2599,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
         kv_cache_manager.shutdown()
 
+    @skip_pre_blackwell_unittest
     def test_ced_warmup_passes_dummy_context_requests(self) -> None:
         for warmup in (False, True):
             with self.subTest(warmup=warmup):
@@ -2608,6 +2609,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                 engine.model.model = SimpleNamespace(ced_kv_precompute=True,
                                                      decoder_replay_split=20)
                 engine._runner._config = replace(engine._runner._config,
+                                                 use_mrope=False,
                                                  disable_overlap_scheduler=True)
                 engine._runner.is_warmup = warmup
                 engine._runner.cuda_graph_runner = SimpleNamespace(
@@ -2635,6 +2637,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                         manager.free_resources(req)
                     manager.shutdown()
 
+    @skip_pre_blackwell_unittest
     def test_ced_inputs_preserve_physical_rows_and_token_sources(self) -> None:
         from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
 
@@ -2647,6 +2650,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                      decoder_replay_split=20)
                 engine._runner._config = replace(
                     engine._runner._config,
+                    use_mrope=False,
                     disable_overlap_scheduler=not overlap)
                 engine._runner.is_warmup = False
                 engine._runner.cuda_graph_runner = SimpleNamespace(

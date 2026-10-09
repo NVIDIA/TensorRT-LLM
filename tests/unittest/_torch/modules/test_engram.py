@@ -21,6 +21,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.models import modeling_deepseekv41 as v41
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
@@ -66,6 +67,7 @@ def _hashes(
     )[1].clone()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Engram FP8 execution requires CUDA")
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.no_grad()

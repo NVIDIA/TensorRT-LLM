@@ -29,8 +29,13 @@ from tensorrt_llm.mapping import Mapping
 
 from ._utils import _FakeMetadata, _page_metadata
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_pre_blackwell)])
 def test_decoder_swa_slots_skip_reclaimed_encoder_pages(device):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
 
@@ -161,6 +166,7 @@ def _swa(metadata, layer):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_manager_metadata_scratch_and_source_capacity(manager_requests):
@@ -207,6 +213,7 @@ def test_manager_metadata_scratch_and_source_capacity(manager_requests):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_swa_slots_resolve_once_per_forward(manager_requests, monkeypatch):
@@ -238,6 +245,7 @@ def test_swa_slots_resolve_once_per_forward(manager_requests, monkeypatch):
     assert len(launches) == 4
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_manager_partial_compression_graph_and_strided_publication(manager_requests):
@@ -318,6 +326,7 @@ def test_manager_partial_compression_graph_and_strided_publication(manager_reque
         assert torch.all(manager.get_index_pages(1) == 59)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_odd_prefix_reuse_compression_matches_fresh():
@@ -420,6 +429,7 @@ def test_odd_prefix_reuse_compression_matches_fresh():
         manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("start", [127, 128, 129])
 @pytest.mark.parametrize("accepted_drafts", [0, 1, 4])
@@ -542,6 +552,7 @@ def test_chain_rewind_preserves_compressor_and_swa(start, accepted_drafts):
         manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_temporal_prior_identity_rewind_and_replay(manager_requests):
@@ -592,6 +603,7 @@ def test_temporal_prior_identity_rewind_and_replay(manager_requests):
     assert torch.all(prepare(requests, [2, 2])[0] == -1)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
@@ -619,6 +631,7 @@ def test_retained_metadata_buffers_and_workspace_accounting(manager_requests):
     assert metadata.workspace_reservation_bytes(2, 4, 64, 32, 148) == expected
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_pageable_metadata_uploads_feed_captured_consumer(manager_requests):
@@ -670,6 +683,7 @@ def test_pageable_metadata_uploads_feed_captured_consumer(manager_requests):
     torch.testing.assert_close(snapshots.cpu(), expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_representable_draft_switch_restores_target_fields(manager_requests):
@@ -760,6 +774,7 @@ def test_representable_draft_switch_restores_target_fields(manager_requests):
         draft.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_speculative_contract_rejects_unrepresentable_paths():
     from types import SimpleNamespace
@@ -789,6 +804,7 @@ def test_speculative_contract_rejects_unrepresentable_paths():
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "manager_requests",
@@ -825,6 +841,7 @@ def test_batch_page_tables_match_per_request_converters(manager_requests):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
@@ -855,6 +872,7 @@ def test_temporal_prefill_seeds_first_decode(manager_requests, monkeypatch):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_graph_workspace_is_independent_of_context_gather_cap(manager_requests):
@@ -956,6 +974,7 @@ def _prepare_replay(metadata, prefixes, suffixes=None, *, decoder=False, ids=Non
     return ranges
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_owner_source_selection_and_one_shot_reset(replay_metadata):
@@ -992,6 +1011,7 @@ def test_owner_source_selection_and_one_shot_reset(replay_metadata):
     assert metadata.select_global_source(1, next_hidden) is next_hidden
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_replay_graph_updates_values_but_rejects_shape_or_mode_change(replay_metadata):
@@ -1022,6 +1042,7 @@ def test_replay_graph_updates_values_but_rejects_shape_or_mode_change(replay_met
         _prepare_replay(metadata, [7], decoder=True)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_replay_requires_first_window_row_to_be_physically_writable():
@@ -1149,6 +1170,7 @@ def test_routing_reset_detaches_shallow_clone():
     assert metadata.csa2_indices == {}
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_staging_excludes_out_of_capacity_rows() -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
@@ -1347,6 +1369,7 @@ def _assert_swa_cpu_reference(metadata, manager, requests, starts, lengths, floo
             torch.testing.assert_close(value.cpu(), expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_coalesced_uploads_mixed_dtypes_empty_values_and_slab_growth():
@@ -1397,6 +1420,7 @@ def test_swa_write_interval_validation_preserves_errors():
             check(torch.tensor(pages, dtype=torch.int32), [start], [length], [floor], full, 128)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("queries", [1, 2731, 8192])
 @torch.inference_mode()
@@ -1447,6 +1471,7 @@ def test_forward_swa_resolution_matches_cpu_reference(queries):
         manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("native", [False, True])
 @torch.inference_mode()
@@ -1579,6 +1604,8 @@ def test_swa_resolution_integer_outputs_and_graph(monkeypatch, native):
 def test_indexer_descriptors_expand_pages_and_mask_missing_pages():
     # Descriptor-only high physical IDs must never reach a native cache gather.
     for device in ("cpu", "cuda") if torch.cuda.is_available() else ("cpu",):
+        if device == "cuda" and torch.cuda.get_device_capability()[0] < 10:
+            continue
         for page_size, columns in ((64, 2), (128, 2), (128, 0)):
             factor = page_size // 64
             source = [[1 << 25, -1], [3, 5]]
@@ -1690,6 +1717,7 @@ def test_swa_table_backing_stays_fixed_across_publication_and_fallback(published
     assert eager.tolist() == rows(large) and first.tolist() == rows(small)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_swa_fresh_publication_reuses_tables_and_keeps_captured_backing(
@@ -1843,7 +1871,11 @@ def test_swa_layer_reference_matches_scalar_oracle(rows, window):
     [
         pytest.param("cpu", marks=pytest.mark.cpu_only),
         pytest.param(
-            "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+            "cuda",
+            marks=[
+                skip_pre_blackwell,
+                pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+            ],
         ),
     ],
 )
@@ -1898,6 +1930,7 @@ def test_swa_refresh_preserves_per_layer_page_domains(device: str) -> None:
         torch.testing.assert_close(visible.cpu(), expected_visible, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
@@ -1973,6 +2006,7 @@ def test_context_tile_cache_retains_latest_and_preserves_graph_and_dtype():
     assert len(protected) == 4
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_shared_context_domains_follow_owner_source_batch_and_replay(manager_requests):
@@ -2027,6 +2061,7 @@ def test_shared_context_domains_follow_owner_source_batch_and_replay(manager_req
     assert selected.workspace is not workspace and selected.workspace is not other_workspace
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_shared_context_covers_upward_live_endpoint_inside_published_pages(manager_requests):
@@ -2082,6 +2117,7 @@ def test_shared_context_covers_upward_live_endpoint_inside_published_pages(manag
 
 
 # Without SWA scratch the compressor-state pages come from the base page table.
+@skip_pre_blackwell
 @pytest.mark.parametrize("manager_requests", [{"scratch": False}], indirect=True)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
@@ -2113,6 +2149,7 @@ def test_compressor_readiness_uses_current_rows(manager_requests):
     prepare_source(2)  # A corrected mapping in the next prepare is observed.
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_first_decode_after_context_takes_full_prepare(manager_requests):
@@ -2157,6 +2194,7 @@ def _prepare_decode_metadata(metadata, requests, starts, *, deferred=False):
     assert not metadata._csa2_defer_decode_outputs
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_steady_decode_refreshes_page_tables_across_pages(manager_requests, monkeypatch):
@@ -2186,6 +2224,7 @@ def test_steady_decode_refreshes_page_tables_across_pages(manager_requests, monk
     assert refreshed == [128]
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch_size", [1, 2])
 @torch.inference_mode()
@@ -2318,6 +2357,7 @@ def test_decode_graph_defers_derived_uploads_and_refreshes_all_outputs(
         torch.testing.assert_close(tensor, expected[name], atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "fallback,manager_requests",

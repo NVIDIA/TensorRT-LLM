@@ -22,6 +22,11 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     unpack_rows,
 )
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def _inputs(main_count=73, dtype=torch.int64):
     torch.manual_seed(7401)
@@ -58,6 +63,7 @@ def _reference(q, swa, main, si, mi, sink, scale):
     return torch.einsum("qhk,qkd->qhd", probabilities, kv).bfloat16()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("main_count", [0, 73])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -69,6 +75,7 @@ def test_packed_attention_parity(main_count, dtype):
     torch.testing.assert_close(actual, _reference(*args), atol=0.016, rtol=0.016)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [16, 32, 64])
 @pytest.mark.parametrize("queries", [1, 8, 129])
@@ -88,6 +95,7 @@ def test_mixed_cache_head_and_batch_geometries(heads, queries, main_count):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_attention_graph_refresh():
     if torch.cuda.get_device_capability() != (10, 0):
@@ -106,6 +114,7 @@ def test_packed_attention_graph_refresh():
     assert torch.count_nonzero(output[0]) == 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_attention_multiple_tiles_per_split():
     if torch.cuda.get_device_capability() != (10, 0):
@@ -133,6 +142,7 @@ def _rope_inputs(heads):
     return (q, swa, main, si, mi, sink, scale), positions, cos_sin
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [16, 64])
 def test_packed_inverse_rope_native_parity(heads):
@@ -149,6 +159,7 @@ def test_packed_inverse_rope_native_parity(heads):
     torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.008)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_inverse_rope_graph_positions_and_bounds():
     if torch.cuda.get_device_capability() != (10, 0):
@@ -174,6 +185,7 @@ def test_packed_inverse_rope_graph_positions_and_bounds():
     torch.testing.assert_close(output[..., :448], attention[..., :448], atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_inverse_rope_rejects_invalid_geometry():
     from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import supports_packed_attention
@@ -243,6 +255,7 @@ def _expected(storage, pool, slots, x, cache_format):
     return expected
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "cache_format,dim",
@@ -271,6 +284,7 @@ def test_fused_store_exact_bytes(cache_format, dim):
     torch.testing.assert_close(storage, expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_fused_store_jobs_match_separate_launches():
@@ -346,6 +360,7 @@ def test_fused_store_jobs_match_separate_launches():
         torch.testing.assert_close(fused[name], separate[name], atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "cache_format,dim,norm", [("main", 512, False), ("index", 128, True), ("swa", 512, True)]
@@ -402,6 +417,7 @@ def test_fused_store_norm_rope(cache_format, dim, norm):
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
 @torch.inference_mode()
@@ -445,6 +461,7 @@ def _assert_bf16_decode(actual, expected):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "cache_format,dim,slot_dtype,rank",
@@ -491,6 +508,7 @@ def _fp8_python(code):
     return sign * (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
 def test_fused_gather_all_scale_bytes(cache_format, dim):
@@ -542,6 +560,7 @@ def test_fused_gather_all_scale_bytes(cache_format, dim):
     _assert_bf16_decode(actual, independent)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_format,dim", [("main", 512), ("index", 128), ("swa", 512)])
 def test_fused_gather_graph_refresh(cache_format, dim):
@@ -564,6 +583,7 @@ def test_fused_gather_graph_refresh(cache_format, dim):
         _assert_bf16_decode(actual, _gather_reference(pool, slots, dim, cache_format))
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_gather_empty_and_fallback(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import quantization
@@ -636,6 +656,7 @@ def test_fp4_midpoint_rounding_and_rope_tail():
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_quantization_cuda_graph_changed_values():
     x = torch.ones(4, 128, dtype=torch.bfloat16, device="cuda")
@@ -732,6 +753,7 @@ def _check_stage(metadata, expected):
     assert metadata.prepared_counter.item() == 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "queries,swa_width,main_width,empty_pool,extra_width",
@@ -768,6 +790,7 @@ def test_native_staging_exact(queries, swa_width, main_width, empty_pool, extra_
     assert bool(calls) == (metadata.num_sparse_topk <= 4096)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_staging_group_reuse_validates_each_layers_own_slots():
     """A reused compaction still decodes slots the compacting layer never resolved.
@@ -817,6 +840,7 @@ def test_staging_group_reuse_validates_each_layers_own_slots():
     assert torch.count_nonzero(metadata.extra_pool) == 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_staging_graph_refresh():
     _sm100()
@@ -843,6 +867,7 @@ def test_native_staging_graph_refresh():
     assert retained == metadata.get_workspace_bytes()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_staging_validation_and_fallback(monkeypatch):
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
@@ -874,6 +899,7 @@ def test_native_staging_validation_and_fallback(monkeypatch):
     assert metadata.prepared_counter.item() == 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cache_format,dim", [("index", 128), ("swa", 512)])
 @torch.inference_mode()
@@ -899,6 +925,7 @@ def test_fused_store_changed_row_counts(cache_format, dim):
         torch.testing.assert_close(storage, expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dequant,q_dequant", [(1.0, 1.0), (3.0, 2.0)])
 @torch.inference_mode()
@@ -996,6 +1023,7 @@ def _stage_scale_reference(inputs):
     return ceiling
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("case", ["random", "edges", "absent", "huge"])
 @pytest.mark.parametrize("minimum", [-126, 0])
@@ -1044,6 +1072,7 @@ def test_stage_kv_scale_derivation(case, minimum):
         assert 448.0 * scale >= ceiling > 224.0 * scale
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "amax,expected",
@@ -1080,6 +1109,7 @@ def test_stage_kv_scale_respects_q_headroom(amax, expected):
         assert expected * amax <= 448.0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_stage_kv_scale_rescues_saturated_rows():
@@ -1120,6 +1150,7 @@ def test_stage_kv_scale_rescues_saturated_rows():
     assert saturated > 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "amax,expected",
@@ -1157,6 +1188,7 @@ def test_stage_kv_scale_respects_q_resolution(amax, expected):
     assert amax == 0.0 or expected == 1.0 or amax / expected >= 1.0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_stage_kv_scale_rescues_context_rows():
@@ -1215,6 +1247,7 @@ def test_stage_kv_scale_rescues_context_rows():
     assert saturated > 0
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
@@ -1274,6 +1307,7 @@ def test_unfused_fp8_staging_matches_fused_bytes(monkeypatch):
         torch.testing.assert_close(unfused, fused_tensor, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.inference_mode()
@@ -1443,6 +1477,7 @@ def _glue():
     return kernel
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_owner_refresh_kernel_matches_reference():
@@ -1505,6 +1540,7 @@ def test_owner_refresh_kernel_matches_reference():
             torch.testing.assert_close(actual, reference_value, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("top_k", [4, 512])
 @torch.inference_mode()
@@ -1563,6 +1599,7 @@ def test_selection_glue_kernels_match_reference(top_k):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.inference_mode()
@@ -1740,6 +1777,7 @@ def test_shared_active_rows_heterogeneous_request_domains(dtype: torch.dtype) ->
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @torch.inference_mode()
