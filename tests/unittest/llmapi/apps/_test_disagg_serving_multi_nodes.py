@@ -119,6 +119,10 @@ def worker(model_name: str, ctx_tp_pp_size: tuple, gen_tp_pp_size: tuple):
             "enable_block_reuse": False,
         },
         "disable_overlap_scheduler": True,
+        # Qwen3.5 reserves recurrent state for max_batch_size * pp_size
+        # sequences up front; the defaults do not fit on 80 GB GPUs.
+        "max_batch_size": 128,
+        "max_seq_len": 8192,
     }
     if is_ctx_node():
         print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")

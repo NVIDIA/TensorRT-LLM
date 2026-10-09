@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 from tensorrt_llm._torch.modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS, TopK, TopKImplementation
 
@@ -116,6 +117,103 @@ def test_cute_dsl_radix_preserves_compressed_mtp_fallback(monkeypatch) -> None:
     assert runtime_call.kwargs["compress_ratio"] == 4
     assert runtime_call.kwargs["radix_aux_indices"].data_ptr() == radix_indices.data_ptr()
     assert runtime_call.kwargs["radix_aux_logits"].data_ptr() == radix_values.data_ptr()
+
+
+@pytest.mark.parametrize("implementation", list(TopKImplementation))
+def test_ragged_decode_preserves_caller_radix_workspace(monkeypatch, implementation) -> None:
+    radix = Mock()
+    fallback_log = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.modules.top_k.logger.info_once", fallback_log)
+    monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", radix)
+    scores = torch.randn(3, 16)
+    output = torch.empty(3, 2, dtype=torch.int32)
+    logical = torch.tensor([16, 12], dtype=torch.int32)
+    scan = torch.tensor([4, 3], dtype=torch.int32)
+    row_kv_lens = torch.tensor([15, 16, 12], dtype=torch.int32)
+    indices = torch.empty(3, 10, 2, dtype=torch.int32)
+    values = torch.empty(3, 10, 2)
+    result = TopK(2, decode_implementation=implementation, compress_ratio=4)(
+        scores,
+        output,
+        is_prefill=False,
+        sequence_lengths=logical,
+        scan_lengths=scan,
+        row_kv_lens=row_kv_lens,
+        next_n=2,
+        radix_aux_indices=indices,
+        radix_aux_logits=values,
+    )
+    assert result is output
+    radix.assert_called_once()
+    call = radix.call_args
+    assert call.kwargs["radix_aux_indices"].data_ptr() == indices.data_ptr()
+    assert call.kwargs["radix_aux_logits"].data_ptr() == values.data_ptr()
+    assert call.kwargs["row_kv_lens"] is row_kv_lens
+    assert (call.kwargs["row_kv_lens"] // 4).tolist() == [3, 4, 3]
+    if implementation == TopKImplementation.CUDA_RADIX:
+        fallback_log.assert_not_called()
+    else:
+        fallback_log.assert_called_once_with(
+            "Ragged per-row KV lengths require CUDA radix decode Top-K; "
+            f"using it instead of {implementation.value}.",
+            key="ragged_decode_radix_fallback",
+        )
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_indexer_topk_decode_fake_accepts_optional_row_kv_lens(
+    ragged: bool, compiled: bool
+) -> None:
+    """Uniform and ragged decode must bind the fake in eager and compiled calls."""
+    decode = torch.ops.trtllm.indexer_topk_decode
+    if compiled:
+        decode = torch.compile(decode, backend="eager", fullgraph=True)
+    with FakeTensorMode():
+        scores = torch.empty(3, 16)
+        lengths = torch.empty(2, dtype=torch.int32)
+        output = torch.empty(3, 2, dtype=torch.int32)
+        row_kv_lens = torch.empty(3, dtype=torch.int32) if ragged else None
+        result = decode(
+            scores,
+            lengths,
+            output,
+            1,
+            2,
+            compress_ratio=4,
+            radix_aux_indices=torch.empty(3, 10, 2, dtype=torch.int32),
+            radix_aux_logits=torch.empty(3, 10, 2),
+            row_kv_lens=row_kv_lens,
+        )
+    assert result is None
+    assert output.shape == (3, 2) and output.dtype == torch.int32
+
+
+@pytest.mark.parametrize("implementation", list(TopKImplementation))
+def test_compiled_ragged_decode_uses_radix_without_logging(monkeypatch, implementation) -> None:
+    """Fallback logging must not introduce a graph break during fake propagation."""
+    fallback_log = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.modules.top_k.logger.info_once", fallback_log)
+    module = torch.compile(
+        TopK(2, decode_implementation=implementation, compress_ratio=4),
+        backend="eager",
+        fullgraph=True,
+    )
+    with FakeTensorMode():
+        output = torch.empty(3, 2, dtype=torch.int32)
+        result = module(
+            torch.empty(3, 16),
+            output,
+            is_prefill=False,
+            sequence_lengths=torch.empty(2, dtype=torch.int32),
+            scan_lengths=torch.empty(2, dtype=torch.int32),
+            row_kv_lens=torch.empty(3, dtype=torch.int32),
+            next_n=2,
+            radix_aux_indices=torch.empty(3, 10, 2, dtype=torch.int32),
+            radix_aux_logits=torch.empty(3, 10, 2),
+        )
+    assert result is output
+    fallback_log.assert_not_called()
 
 
 def test_gvr_uses_caller_prior_state(monkeypatch) -> None:
