@@ -1033,6 +1033,26 @@ class TestClaudeBackgroundWork:
 
         assert sdk_client.stopped == []
 
+    async def test_send_message_raises_on_a_continuation_error(self):
+        # A result that only ends the first turn must not mask a failure in
+        # the turn its background work wakes up.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Agent", {}, id="bg-1")]),
+                _task_started("t1", "local_agent"),
+                _make_result_message("launched, waiting"),
+                _task_notification("t1"),
+                AssistantMessage(
+                    content=[], model="test-model", parent_tool_use_id=None, error="billing_error"
+                ),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        with pytest.raises(RuntimeError, match="billing_error"):
+            [event async for event in client.send_message("optimize")]
+
     async def test_send_message_ends_at_result_without_session_state(self):
         sdk_client = FakeBackgroundSdkClient([_make_result_message("done")])
         client = ClaudeCodeClient(sdk_client)

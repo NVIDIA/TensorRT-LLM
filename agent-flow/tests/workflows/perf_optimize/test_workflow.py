@@ -12,8 +12,6 @@ import pytest
 import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
-from agent_flow.agent_runtime import AgentConfig
-from agent_flow.workflows.perf_analyze.prompts._common import BOUNDED_WAITS
 from agent_flow.workflows.perf_analyze.sol_methodology import SolMethodology
 from agent_flow.workflows.perf_optimize import cli as cli_module
 from agent_flow.workflows.perf_optimize import (
@@ -4666,11 +4664,3 @@ def test_multi_rank_driving_prompt_names_the_ranks_and_the_two_passes(tmp_path):
     assert "only these ranks are wrapped" in analyzer
     assert "Step 0 survey" in analyzer
     assert "straggler verdict" in analyzer
-
-
-def test_every_role_is_told_to_bound_its_waits():
-    layer = workflow_module._make_agent(
-        "role", "Role prompt.", AgentConfig(backend="claude-code", model="claude-test")
-    )
-
-    assert layer.config.system_prompt == f"Role prompt.\n\n{BOUNDED_WAITS}"

@@ -337,6 +337,7 @@ class ClaudeCodeClient(BackendClient):
                     yield _rate_limit_warning_from_event(sdk_message)
                 elif isinstance(sdk_message, AssistantMessage):
                     if sdk_message.error is not None:
+                        turn_open = True
                         raise RuntimeError(
                             f"Claude Code turn failed: {sdk_message.error}"
                             f"{_assistant_error_detail(sdk_message)}"
@@ -401,7 +402,15 @@ class ClaudeCodeClient(BackendClient):
                         permission_denials=list(sdk_message.permission_denials or []),
                     )
         except Exception:
-            if not got_result:
+            # Only an error after the run has settled is tolerated; one from a
+            # turn or background work still under way fails the request.
+            settled = (
+                got_result
+                and not turn_open
+                and session_state in (None, "idle")
+                and not any(_is_deferring(kind) for kind in live_tasks.values())
+            )
+            if not settled:
                 raise
 
         if pending_result is not None:

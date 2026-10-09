@@ -898,6 +898,14 @@ def test_lifecycle_confirms_the_port_freed_after_teardown():
     assert "that :8000 is free again" in block
 
 
+def test_lifecycle_bounds_every_wait():
+    """A waiter keyed only on a success string never exits when the job fails."""
+    block = _norm(SERVER_LIFECYCLE)
+    assert "Bound every wait" in block
+    assert "cover failure and termination" in block
+    assert "check your own script" in block
+
+
 # --------------------------------------------------------------------------- #
 # The nsys-timeline pipeline's own artifacts: the taxonomy it classifies with,
 # and the products the findings (and, downstream, the roadmap) are built from.

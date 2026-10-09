@@ -19,7 +19,7 @@ from .progress import (
     read_progress,
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
-from .prompts._common import BOUNDED_WAITS, profile_ranks_note
+from .prompts._common import profile_ranks_note
 from .roles import ROLES
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
@@ -110,7 +110,7 @@ def _make_agent(
     return AgentLayer(
         AgentLayerConfig(
             name=name,
-            system_prompt=f"{system_prompt}\n\n{BOUNDED_WAITS}",
+            system_prompt=system_prompt,
             backend=BackendConfig(
                 kind=agent_config.backend,
                 model=agent_config.model,

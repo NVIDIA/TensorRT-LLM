@@ -17,7 +17,7 @@ from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfi
 from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
-from agent_flow.workflows.perf_analyze.prompts._common import BOUNDED_WAITS, profile_ranks_note
+from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
     output_instruction,
@@ -104,7 +104,7 @@ def _make_agent(
     return AgentLayer(
         AgentLayerConfig(
             name=name,
-            system_prompt=f"{system_prompt}\n\n{BOUNDED_WAITS}",
+            system_prompt=system_prompt,
             backend=BackendConfig(
                 kind=agent_config.backend,
                 model=agent_config.model,

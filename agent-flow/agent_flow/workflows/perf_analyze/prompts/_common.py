@@ -76,6 +76,14 @@ your turn. **Do not end your turn to wait for a background poll to wake
 you** — nothing re-invokes you, so the stage would advance with your
 output file still empty and the whole run is wasted.
 
+Bound every wait: give each polling loop a deadline (expected duration
+plus a margin), and make its exit condition cover failure and termination
+too (e.g. `srun exit code`, `FATAL`), not only the success string. Do not
+leave unbounded `until ...; done` waiters running in the background. If a
+wait hits its deadline without success, check your own script (pattern,
+path, job id, command shape) against the actual log before assuming the
+job or cluster is slow.
+
 1. **Assert port 8000 is free — before launching anything.** The port is
    fixed, and a `trtllm-serve` from an earlier stage or an interrupted run
    is `setsid`-detached, so it *survives* a Ctrl-C and keeps answering on
@@ -193,22 +201,6 @@ output file still empty and the whole run is wasted.
 
 `nvidia-smi` (read-only) is a useful sanity check for how many GPUs are
 visible and whether memory is free between runs.
-"""
-
-
-BOUNDED_WAITS = """\
-## Waiting on jobs and servers
-
-- Bound every wait: give each polling loop a deadline (expected duration plus a
-  margin), and make its exit condition cover failure and termination too (e.g.
-  `srun exit code`, `FATAL`, the job's output being complete), not only the
-  success string.
-- Do not leave unbounded `until ...; done` waiters running in the background.
-  Prefer one bounded foreground poll per job, and stop any background waiter
-  you no longer need before you finish.
-- If a wait hits its deadline without success, first check your own script
-  (pattern, path, job id, command shape) against the actual log before assuming
-  the job or cluster is slow; fix it, then wait again.
 """
 
 
