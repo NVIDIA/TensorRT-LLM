@@ -1,5 +1,8 @@
 # Adapted from https://github.com/sgl-project/sglang/blob/083629c23564e1a64deaa052f1df5c5d914358d8/python/sglang/srt/function_call/base_format_detector.py
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +14,15 @@ from tensorrt_llm.logger import logger
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
 from .utils import find_common_prefix, is_complete_json, partial_json_loads
+
+# A tool name, optionally qualified by the groups it was declared under:
+# `apply_patch`, `functions.apply_patch`, `functions.collaboration.send_message`.
+_QUALIFIED_NAME = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$")
+
+# An opening or closing tag of the XML-ish tool-call markup, e.g. `<tool_call>`
+# or `</arg_value>`, which models sometimes emit unbalanced into a tool name.
+_MARKUP_TAG = re.compile(r"</?[A-Za-z_][A-Za-z0-9_-]*>")
 
 
 def warn_if_tool_call_unparsed(parser_name: str, tool_parser: "BaseToolParser",
@@ -59,6 +71,11 @@ class BaseToolParser(ABC):
     # JSON arguments) set this to True so the serving layer runs extraction
     # on the named-choice path instead of passing raw text through.
     extracts_forced_tool_calls: bool = False
+    # True when parse_streaming_increment plus finish deliver exactly the calls
+    # detect_and_parse finds, however the text is split into increments. A
+    # serving path may then take the streamed calls as final instead of
+    # re-parsing the whole text at the end of the stream.
+    streaming_matches_whole_parse: bool = False
 
     def __init__(self):
         # Streaming state management
@@ -102,6 +119,42 @@ class BaseToolParser(ABC):
             tool.function.name: i
             for i, tool in enumerate(tools) if tool.function.name
         }
+
+    @staticmethod
+    def resolve_tool_name(name: Optional[str],
+                          tool_indices: Dict[str, int]) -> Optional[str]:
+        """Map an emitted tool name onto a declared tool; None if none fits.
+
+        Recovers a group qualifier the declaration lacks (``functions.exec``
+        for ``exec``), a bare name for a qualified declaration (``exec`` for
+        ``functions.exec``, only when that tail is unambiguous), and markup
+        fused onto the name (``apply_patch</arg_value>``). A name that merely
+        mentions a declared tool inside prose is never mapped onto it.
+        """
+        if not name:
+            return None
+        if name in tool_indices:
+            return name
+
+        # Declared tools by their bare tail; an ambiguous tail maps nowhere.
+        by_tail: Dict[str, List[str]] = {}
+        for declared in tool_indices:
+            by_tail.setdefault(declared.rsplit(".", 1)[-1], []).append(declared)
+
+        # The raw name, then the name with markup removed. Anything that is not
+        # a dotted identifier after that is prose or code, not a mangled name.
+        for candidate in (name, _MARKUP_TAG.sub("", name).strip()):
+            if not _QUALIFIED_NAME.match(candidate):
+                continue
+            if candidate in tool_indices:
+                return candidate
+            tail = candidate.rsplit(".", 1)[-1]
+            if tail in tool_indices:
+                return tail
+            qualified = by_tail.get(tail)
+            if qualified is not None and len(qualified) == 1:
+                return qualified[0]
+        return None
 
     def parse_base_json(self, action: Any,
                         tools: List[Tool]) -> List[ToolCallItem]:

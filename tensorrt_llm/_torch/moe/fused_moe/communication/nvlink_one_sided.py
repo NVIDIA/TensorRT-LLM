@@ -785,6 +785,42 @@ class NVLinkOneSided(Communication):
         """
         return True
 
+    @classmethod
+    def _release_workspace(cls, workspace_key: Tuple[object, ...]) -> None:
+        """Release a shared workspace after its last communicator is destroyed."""
+        workspace_state = cls._WORKSPACES.get(workspace_key)
+        if workspace_state is None:
+            return
+
+        owns_cft = workspace_state.get("cft_initialized", False)
+        try:
+            if owns_cft:
+                # The C++ manager owns a logical endpoint bound to this
+                # allocation. Destroy it before dropping the final Python
+                # references to the MNNVL memory, otherwise the endpoint
+                # outlives its backing pages and a recycled virtual address
+                # could resolve to it.
+                torch.ops.trtllm.moe_a2a_cft_release(
+                    workspace_state["workspace"], workspace_state["ep_rank"]
+                )
+        finally:
+            # This workspace held the process-wide endpoints, so a later
+            # workspace may claim them. Clear the owner even when the release
+            # raised: the entry is dropped below either way.
+            if owns_cft:
+                cls._CFT_OWNER_SHAPE = None
+            # Drop the workspace whether or not the release succeeded. By the
+            # time we get here ``destroy`` has already decremented the refcount
+            # and unregistered the lifecycle, so nothing will call this again:
+            # leaving the entry behind would hand a later communicator an
+            # allocation whose endpoint state is unknown. The exception still
+            # propagates -- the caller learns the release failed, but not by
+            # inheriting a reusable half-released workspace.
+            cls._WORKSPACES.pop(workspace_key, None)
+            if cls._WORKSPACE is workspace_state:
+                cls._WORKSPACE = None
+            workspace_state.clear()
+
     def destroy(self):
         """Release this instance's reference after all ranks finish using the workspace."""
         if getattr(self, "_destroyed", False):
@@ -807,15 +843,8 @@ class NVLinkOneSided(Communication):
         if refcount > 0:
             NVLinkOneSided._WORKSPACE_REFCOUNTS[workspace_key] = refcount
         else:
-            if self._workspace_state.get("cft_initialized", False):
-                torch.ops.trtllm.moe_a2a_cft_destroy(self.workspace, self.ep_rank)
-                NVLinkOneSided._CFT_OWNER_SHAPE = None
             NVLinkOneSided._WORKSPACE_REFCOUNTS.pop(workspace_key, None)
-            workspace_state = NVLinkOneSided._WORKSPACES.pop(workspace_key, None)
-            if NVLinkOneSided._WORKSPACE is workspace_state:
-                NVLinkOneSided._WORKSPACE = None
-            if workspace_state is not None:
-                workspace_state.clear()
+            NVLinkOneSided._release_workspace(workspace_key)
 
         self.mnnvl_mem = None
         self.workspace = None
