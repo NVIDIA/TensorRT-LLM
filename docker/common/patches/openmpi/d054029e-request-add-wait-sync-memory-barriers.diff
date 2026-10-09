@@ -1,0 +1,48 @@
+diff --git a/ompi/request/req_wait.c b/ompi/request/req_wait.c
+index 6172104a31..5fdce27faf 100644
+--- a/ompi/request/req_wait.c
++++ b/ompi/request/req_wait.c
+@@ -100,6 +100,7 @@ int ompi_request_default_wait_any(size_t count,
+
+ recheck:
+     WAIT_SYNC_INIT(&sync, 1);
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
+
+     num_requests_null_inactive = 0;
+     for (i = 0; i < count; i++) {
+@@ -233,6 +234,7 @@ int ompi_request_default_wait_all( size_t count,
+
+ recheck:
+     WAIT_SYNC_INIT(&sync, count);
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
+     rptr = requests;
+     for (i = 0; i < count; i++) {
+         void *_tmp_ptr = REQUEST_PENDING;
+@@ -458,6 +460,7 @@ int ompi_request_default_wait_some(size_t count,
+
+   recheck:
+     WAIT_SYNC_INIT(&sync, 1);
++    opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
+
+     *outcount = 0;
+
+diff --git a/ompi/request/request.h b/ompi/request/request.h
+index baf6fbe3fd..d86463a8d0 100644
+--- a/ompi/request/request.h
++++ b/ompi/request/request.h
+@@ -465,6 +465,7 @@ static inline void ompi_request_wait_completion(ompi_request_t *req)
+             _tmp_ptr = REQUEST_PENDING;
+
+             WAIT_SYNC_INIT(&sync, 1);
++            opal_atomic_wmb();  /* release: sync struct init must be visible before CAS publishes &sync */
+
+             if (OPAL_ATOMIC_COMPARE_EXCHANGE_STRONG_PTR(&req->req_complete, &_tmp_ptr, &sync)) {
+                 SYNC_WAIT(&sync);
+@@ -531,6 +532,7 @@ static inline int ompi_request_complete(ompi_request_t* request, bool with_signa
+
+             ompi_wait_sync_t *tmp_sync = (ompi_wait_sync_t *) OPAL_ATOMIC_SWAP_PTR(&request->req_complete,
+                                                                                     REQUEST_COMPLETED);
++            opal_atomic_rmb();  /* acquire: pair with wmb before CAS to see sync struct contents */
+             if( REQUEST_PENDING != tmp_sync ) {
+                 wait_sync_update(tmp_sync, 1, request->req_status.MPI_ERROR);
+             }
