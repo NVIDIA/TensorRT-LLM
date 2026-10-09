@@ -112,13 +112,10 @@ def _proxy_reference(
     logits = torch.cat((exact_logits, proxy_logits), dim=1) / math.sqrt(q.shape[-1])
     weights = torch.exp(logits - logits.amax(dim=1, keepdim=True))
     exact_weights, proxy_weights = weights.split((block_size, len(proxy_blocks)), dim=1)
-    # A proxy block stands for block_size identical tokens with its mean K and
-    # mean V, so its probability carries that mass in numerator and denominator.
-    proxy_weights = proxy_weights * block_size
     numerator = exact_weights @ v[0, exact_tokens, 0].float()
     numerator += proxy_weights @ v_summary[0, proxy_blocks, 0].float()
     denominator = exact_weights.sum(dim=1, keepdim=True)
-    denominator += proxy_weights.sum(dim=1, keepdim=True)
+    denominator += proxy_weights.sum(dim=1, keepdim=True) * block_size
     return (numerator / denominator).to(q.dtype)[None, :, None]
 
 
@@ -635,7 +632,7 @@ def test_real_gpu_proxy_adapter_replays_live_routes_and_summaries() -> None:
     k_blocks = k.float().view(1, 3, 64, 1, 128)
     v_blocks = v.float().view(1, 3, 64, 1, 128)
     initial_k_summary = k_blocks.mean(dim=2).to(k.dtype)
-    initial_v_summary = v_blocks.mean(dim=2).to(v.dtype)
+    initial_v_summary = v_blocks.sum(dim=2).to(v.dtype)
     live_k_summary = initial_k_summary.clone()
     live_v_summary = initial_v_summary.clone()
     live_exact_bits = torch.tensor([[[[1]]]], device="cuda", dtype=torch.uint32)

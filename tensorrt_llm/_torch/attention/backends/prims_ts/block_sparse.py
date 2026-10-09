@@ -21,8 +21,6 @@ an immutable revision. ``run()`` validates compact BSHD Q/K/V and caller-owned
 routing tensors, then enqueues route preparation followed by attention in one
 compiled adapter on the caller's CUDA stream. The one-shot entry point retains
 synchronous canonical-BSR inspection to derive its temporary plan capacity.
-A dense plan (``use_block_sparse=False``) keeps the tile selection but attends
-over the whole K/V sequence without route preparation.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
 kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
@@ -37,17 +35,10 @@ from typing import Literal
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+from flashinfer.api_logging import flashinfer_api
 
-from ._block_sparse.common import (
-    _num_sparse_pattern_heads,
-    _validate_contiguous_route_mode,
-    _validate_dense_contiguous_plan_inputs,
-)
-from ._block_sparse.config import (
-    _CAPACITY_UNSET,
-    _validate_block_sparse_static_profile,
-)
+from ._block_sparse.common import _validate_contiguous_route_mode
+from ._block_sparse.config import _validate_block_sparse_static_profile
 from ._block_sparse.inspection import (
     _inspect_block_sparse_bsr,
     _inspect_paged_block_sparse_metadata,
@@ -67,15 +58,13 @@ from ._block_sparse.runtime import (
     record_block_sparse_run_args as _record_block_sparse_run_args,
     validate_block_sparse_metadata as _validate_block_sparse_metadata,
     validate_block_sparse_run as _validate_block_sparse_run,
-    validate_paged_kv_storage as _validate_paged_kv_storage,
 )
 from .decode import (
     PagedKVCache,
+    _normalize_paged_kv_cache,
     _resolve_cuda_device,
-    _resolve_kv_dtypes,
-    _validate_runtime_device,
+    _validate_block_table_metadata,
 )
-from .sage import SageAttentionConfig, SageAttentionParams
 
 
 class _BlockSparseWrapperBase:
@@ -149,19 +138,14 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         kv_block_size: int,
         *,
         device: torch.device | str | int,
-        use_block_sparse: bool = True,
-        max_blocks_per_row: int | None = None,
-        use_kv_valid_bits: bool = False,
+        max_blocks_per_row: int,
+        use_kv_valid_bits: bool,
         sparse_format: Literal["bsr", "bitmask"] = "bsr",
         use_proxy_routes: bool = False,
         mask_type: Literal["dense", "causal"] = "dense",
-        share_pattern_across_kv_heads: bool = False,
         q_data_type: torch.dtype = torch.float16,
-        k_data_type: torch.dtype | None = None,
-        v_data_type: torch.dtype | None = None,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
-        sage_config: SageAttentionConfig | None = None,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -170,25 +154,17 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         semantic ``kv_block_size`` blocks. ``sparse_format="bsr"`` consumes
         canonical CSR-style rows, while ``"bitmask"`` consumes packed exact-
         block bits. Enabling proxy routes represents unselected blocks through
-        caller-provided K/V summaries (per-block means) and requires
+        caller-provided K/V summaries and currently requires
         ``mask_type="dense"``. Exact-only plans continue to support causal
         masking. ``use_kv_valid_bits`` selects whether every :meth:`run` must
         supply the shared batch token mask. Callers may pass different routing
         tensor identities and index extents to each run as long as they fit
         this declared capacity.
 
-        ``use_block_sparse=False`` plans dense attention over the whole K/V
-        sequence with the same Q-tile selection. Its route arguments must keep
-        their defaults, and :meth:`run` takes Q/K/V only.
-
-        ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
-        patterns. True uses a singleton head axis in BSR/bitmask inputs and
-        prepares each pattern once. K/V values still have every physical head.
-
         MHA, GQA, and MQA are supported with ``Hq / Hkv`` a power of two no
-        greater than 32 and ``D=128``. Without Sage attention, Q, K, V, and O
-        use one matching ``torch.float16`` or ``torch.bfloat16`` dtype.
-        Runtime tensor shapes are documented by :meth:`run`.
+        greater than 32 and ``D=128``. Q, K, V, and O use one matching
+        ``torch.float16`` or ``torch.bfloat16`` dtype. Runtime tensor shapes
+        are documented by :meth:`run`.
 
         ``q_block_size`` may be any positive signed-Int32 value for which a
         physical Q tile stays within one BSR row. Equivalently,
@@ -198,12 +174,14 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         multiple of 64. The Q tile groups complete Q-head groups and as many Q
         tokens as fit without crossing a semantic Q-block row, up to Q128;
         fine KV blocks cap this at a SWAPAB Q32 tile. Proxy routes reuse the
-        same Q-tile, KV-route, MMA geometry, and scheduler selection as exact
-        routes. Every run prepares its selected BSR or bitmask into
+        same Q-tile, KV-route, and MMA geometry as exact routes, but currently
+        use the direct scheduler because reusable planning cannot observe live
+        exact-route work. Every run prepares its selected BSR or bitmask into
         compact, profile-selected fixed-width route metadata, and the attention
         core consumes only that metadata. This remains true when every KV block
         is selected;
-        callers that know a pattern is dense should plan the dense mode.
+        callers that know a pattern is dense should choose the dense FMHA API
+        explicitly.
 
         Planning does not inspect routing values and does not synchronize the
         host. Reusable runs trust those values; assertion-enabled CuTe DSL
@@ -216,42 +194,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         One revision has one mutable route workspace, so its runs must be
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
-
-        ``k_data_type`` defaults to ``q_data_type`` and ``v_data_type`` to
-        ``k_data_type``. ``kv_data_type`` is a compatibility alias that sets
-        both K and V; explicit K/V dtypes must agree with it.
-
-        ``sage_config`` enables Sage attention on the Q64/KV256 and Q128/KV128
-        Keeps profiles: Q and K share ``torch.float8_e4m3fn`` or
-        ``torch.int8``, V is ``torch.float8_e4m3fn`` (so INT8 plans set
-        ``v_data_type``), and the output is ``torch.bfloat16`` (default) or
-        ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
-        :class:`SageAttentionParams`.
         """
 
-        if use_block_sparse:
-            if max_blocks_per_row is None:
-                raise ValueError(
-                    "max_blocks_per_row is required by a block-sparse plan"
-                )
-            _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
-        else:
-            _validate_dense_contiguous_plan_inputs(
-                (
-                    ("max_blocks_per_row", max_blocks_per_row, None),
-                    ("use_kv_valid_bits", use_kv_valid_bits, False),
-                    ("sparse_format", sparse_format, "bsr"),
-                    ("use_proxy_routes", use_proxy_routes, False),
-                    (
-                        "share_pattern_across_kv_heads",
-                        share_pattern_across_kv_heads,
-                        False,
-                    ),
-                )
-            )
-        k_data_type, v_data_type = _resolve_kv_dtypes(
-            q_data_type, k_data_type, v_data_type, kv_data_type
-        )
+        _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -262,22 +207,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
             use_kv_valid_bits=use_kv_valid_bits,
-            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             mask_type=mask_type,
             q_dtype=q_data_type,
-            kv_dtype=k_data_type,
-            v_dtype=v_data_type,
+            kv_dtype=kv_data_type,
             output_dtype=o_data_type,
-            max_blocks_per_row=(
-                max_blocks_per_row if use_block_sparse else _CAPACITY_UNSET
-            ),
-            sage=sage_config,
-            use_block_sparse=use_block_sparse,
+            max_blocks_per_row=max_blocks_per_row,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
         device, device_index = _resolve_cuda_device(device)
-        _validate_runtime_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             if torch.cuda.is_current_stream_capturing():
@@ -296,7 +234,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         # previously published revision intact and runnable.
         self._plan_state = candidate
 
-    @flashinfer_experimental_api
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -312,7 +250,6 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
         validate: bool = True,
-        sage: SageAttentionParams | None = None,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -324,14 +261,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
 
-        A dense plan rejects every routing argument below.
-
-        ``validate=True`` performs structural and plan-geometry validation
-        without reading tensor values; it is the safe public default.
-        ``validate=False`` treats every run argument as a trusted binding and
-        performs no explicit wrapper validation. K/V view selection, scale
-        forwarding, and optional output allocation are unavoidable in both
-        modes.
+        ``validate=True`` performs structural, plan-geometry, and alias
+        validation without reading tensor values; it is the safe public
+        default. ``validate=False`` treats every run argument as a trusted
+        binding and performs no explicit wrapper validation. K/V view
+        selection, scale forwarding, and optional output allocation are
+        unavoidable in both modes.
 
         A BSR plan consumes compact Int32 ``block_indptr`` with shape
         ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32
@@ -341,10 +276,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Bit ``r`` of word ``w`` selects block ``32 * w + r``; final-word
         padding bits are ignored. A proxy plan additionally consumes compact
         ``k_summary`` and ``v_summary`` with shape
-        ``[B, num_kv_blocks, Hkv, D]``. K and V summaries are block means; the
-        final partial block covers only its structural tokens. With Sage
-        attention, K summaries use the K dtype and ``k_summary_scale``, and V
-        summaries are E4M3 and share ``v_scale``.
+        ``[B, num_kv_blocks, Hkv, D]``. K summaries are block means and V
+        summaries are block sums; the final partial block covers only its
+        structural tokens.
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when
@@ -365,12 +299,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         k : torch.Tensor
             Compact key tensor ``[B, Skv, Hkv, D]`` matching the plan.
         v : torch.Tensor
-            Compact value tensor with the same shape and strides as ``k`` and
-            the planned V dtype.
+            Compact value tensor with the same shape, dtype, and strides as
+            ``k``.
         block_indptr : torch.Tensor, optional
             Contiguous Int32 BSR row offsets with shape
-            ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``, where Hpattern is one
-            when the plan shares patterns and Hkv otherwise. Required by BSR plans.
+            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``. Required by BSR plans.
         block_indices : torch.Tensor, optional
             Contiguous Int32 semantic KV-block IDs referenced by
             ``block_indptr``. Required by BSR plans.
@@ -379,7 +312,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         k_summary : torch.Tensor, optional
             Per-block mean K tensor required by proxy plans.
         v_summary : torch.Tensor, optional
-            Per-block mean V tensor required by proxy plans.
+            Per-block summed V tensor required by proxy plans.
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
             Supply it exactly when the plan enabled token validity bits.
@@ -387,14 +320,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype. Must not overlap any live input or plan-owned
-            buffer; storage overlap is not checked.
+            planned output dtype.
         validate : bool
-            Whether to validate tensor structure and plan geometry before
-            launching. Defaults to ``True``.
-        sage : SageAttentionParams, optional
-            Scale tensors of this run. Required by a Sage plan and rejected
-            otherwise.
+            Whether to validate tensor structure, plan geometry, and aliasing
+            before launching. Defaults to ``True``.
 
         Returns
         -------
@@ -422,13 +351,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
             out=out,
-            sage=sage,
         )
         run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_experimental_api
+@flashinfer_api
 def block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -442,17 +370,13 @@ def block_sparse_attention(
     k_summary: torch.Tensor | None = None,
     v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None = None,
-    use_block_sparse: bool = True,
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     mask_type: Literal["dense", "causal"] = "dense",
-    share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
-    sage: SageAttentionParams | None = None,
-    sage_config: SageAttentionConfig | None = None,
 ) -> torch.Tensor:
-    """Plan and run one compact-BSHD block-sparse or dense attention launch.
+    """Plan and run one compact-BSHD block-sparse attention launch.
 
     This one-shot form creates a capacity-only plan and passes the original
     routing tensors to :meth:`BlockSparseTSWrapper.run`. BSR inputs are
@@ -468,12 +392,10 @@ def block_sparse_attention(
     k : torch.Tensor
         Compact key tensor ``[B, Skv, Hkv, D]``.
     v : torch.Tensor
-        Compact value tensor with the same shape and strides as ``k``; its
-        dtype matches ``k`` except for the INT8 Sage recipe's E4M3 V.
+        Compact value tensor with the same shape, dtype, and strides as ``k``.
     block_indptr : torch.Tensor, optional
         Contiguous Int32 BSR row offsets with shape
-        ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
-        shared patterns and Hkv otherwise. Required in BSR mode.
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``. Required in BSR mode.
     block_indices : torch.Tensor, optional
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
         Required in BSR mode.
@@ -489,12 +411,9 @@ def block_sparse_attention(
     k_summary : torch.Tensor, optional
         Per-block mean K tensor required when proxy routes are enabled.
     v_summary : torch.Tensor, optional
-        Per-block mean V tensor required when proxy routes are enabled.
+        Per-block summed V tensor required when proxy routes are enabled.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
-    use_block_sparse : bool, optional
-        ``False`` runs dense attention over the whole K/V sequence; routing
-        arguments must then be ``None`` and route options keep their defaults.
     sparse_format : {"bsr", "bitmask"}, optional
         Runtime sparse representation. Defaults to ``"bsr"``.
     use_proxy_routes : bool, optional
@@ -506,18 +425,6 @@ def block_sparse_attention(
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
-        Must not overlap any live input; storage overlap is not checked.
-        Without ``out`` the output takes the Q dtype, or bfloat16 with
-        ``sage``.
-    sage : SageAttentionParams, optional
-        Scale tensors of a Sage launch; see :meth:`BlockSparseTSWrapper.run`.
-    sage_config : SageAttentionConfig, optional
-        The Sage recipe to plan. Defaults to :class:`SageAttentionConfig` with
-        ``v_mean`` set when ``sage.v_mean`` is present.
-
-    share_pattern_across_kv_heads : bool
-        False (default) uses one pattern per KV head. True requires a singleton
-        pattern-head axis and reuses those rows across all physical KV heads.
 
     Returns
     -------
@@ -525,10 +432,6 @@ def block_sparse_attention(
         The compact output tensor; identical to ``out`` when provided.
     """
 
-    if sage_config is not None and sage is None:
-        raise ValueError("sage_config requires the sage scale tensors of this call")
-    if sage is not None and sage_config is None:
-        sage_config = SageAttentionConfig(v_mean=sage.v_mean is not None)
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
@@ -555,52 +458,42 @@ def block_sparse_attention(
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         use_kv_valid_bits=use_kv_valid_bits,
-        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         mask_type=mask_type,
         q_dtype=q.dtype,
         kv_dtype=k.dtype,
-        v_dtype=v.dtype,
-        output_dtype=None if out is None else out.dtype,
-        sage=sage_config,
-        use_block_sparse=use_block_sparse,
+        output_dtype=q.dtype if out is None else out.dtype,
     )
     if use_proxy_routes and static.mask_type != "dense":
         raise ValueError("block-sparse proxy routes require mask_type='dense'")
     device, _ = _resolve_cuda_device(q.device)
-    _validate_runtime_device(device)
-    # A dense plan has no route capacity; its run rejects routing tensors.
-    max_blocks_per_row = None
-    if use_block_sparse:
-        _validate_block_sparse_metadata(
-            sparse_format=sparse_format,
-            block_indptr=block_indptr,
-            block_indices=block_indices,
-            exact_block_bits=exact_block_bits,
-            kv_valid_bits=kv_valid_bits,
-            device=device,
-            batch_size=static.batch_size,
-            seq_len_q=static.seq_len_q,
-            seq_len_kv=static.seq_len_kv,
-            num_kv_heads=_num_sparse_pattern_heads(
-                static.num_kv_heads, static.share_pattern_across_kv_heads
-            ),
-            q_block_size=static.q_block_size,
-            kv_block_size=static.kv_block_size,
-            use_kv_valid_bits=static.use_kv_valid_bits,
+    _validate_block_sparse_metadata(
+        sparse_format=sparse_format,
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=exact_block_bits,
+        kv_valid_bits=kv_valid_bits,
+        device=device,
+        batch_size=static.batch_size,
+        seq_len_q=static.seq_len_q,
+        seq_len_kv=static.seq_len_kv,
+        num_kv_heads=static.num_kv_heads,
+        q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
+        use_kv_valid_bits=static.use_kv_valid_bits,
+    )
+    if sparse_format == "bsr":
+        max_blocks_per_row = _inspect_block_sparse_bsr(
+            block_indptr,
+            block_indices,
+            static=static,
+            stream=torch.cuda.current_stream(device),
         )
-        if sparse_format == "bsr":
-            max_blocks_per_row = _inspect_block_sparse_bsr(
-                block_indptr,
-                block_indices,
-                static=static,
-                stream=torch.cuda.current_stream(device),
-            )
-        elif sparse_format == "bitmask":
-            max_blocks_per_row = (
-                static.seq_len_kv + static.kv_block_size - 1
-            ) // static.kv_block_size
-        else:
-            raise AssertionError(f"unsupported sparse format {sparse_format!r}")
+    elif sparse_format == "bitmask":
+        max_blocks_per_row = (
+            static.seq_len_kv + static.kv_block_size - 1
+        ) // static.kv_block_size
+    else:
+        raise AssertionError(f"unsupported sparse format {sparse_format!r}")
 
     wrapper = BlockSparseTSWrapper()
     wrapper.plan(
@@ -613,18 +506,14 @@ def block_sparse_attention(
         static.q_block_size,
         static.kv_block_size,
         device=device,
-        use_block_sparse=use_block_sparse,
         max_blocks_per_row=max_blocks_per_row,
         use_kv_valid_bits=static.use_kv_valid_bits,
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         mask_type=static.mask_type,
         q_data_type=static.q_dtype,
-        k_data_type=static.kv_dtype,
-        v_data_type=static.v_dtype,
+        kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
-        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
-        sage_config=sage_config,
     )
     return wrapper.run(
         q,
@@ -638,7 +527,6 @@ def block_sparse_attention(
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
         out=out,
-        sage=sage,
     )
 
 
@@ -662,22 +550,17 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         max_blocks_per_row: int,
         use_kv_valid_bits: bool,
         mask_type: Literal["dense", "causal"] = "dense",
-        share_pattern_across_kv_heads: bool = False,
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
     ) -> None:
         """Plan fixed-Q geometry and a maximum variable-K capacity.
 
-        ``share_pattern_across_kv_heads=True`` accepts a singleton pattern-head
-        axis and prepares each BSR row once for all KV heads. False (default)
-        retains separate patterns. Cache head count and Q layout do not change.
-
-        The plan stores no request metadata. Every run supplies a live fixed 2D
-        page table of physical page IDs, per-request K/V lengths, sparse routes,
-        and optional token bits. ``max_seq_len_kv`` fixes compilation and mask
-        capacity. Attention consumes caller-owned live lengths directly, without
-        a plan-owned copy or device-to-host validation.
+        The plan stores no request metadata. Every run supplies live page-table
+        offsets, page IDs, sequence lengths, sparse routes, and optional token
+        bits. ``max_seq_len_kv`` fixes compilation and mask capacity. Attention
+        consumes caller-owned live lengths directly, without a plan-owned copy
+        or device-to-host validation.
 
         ``q_block_size`` may be any positive signed-Int32 value satisfying
         ``q_block_size * (Hq / Hkv) % 8 == 0``. This row-purity condition keeps
@@ -697,7 +580,6 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             kv_block_size=kv_block_size,
             page_size=page_size,
             use_kv_valid_bits=use_kv_valid_bits,
-            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             mask_type=mask_type,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
@@ -706,7 +588,6 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         )
         assert static.page_size is not None
         device, device_index = _resolve_cuda_device(device)
-        _validate_runtime_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             if torch.cuda.is_current_stream_capturing():
@@ -721,7 +602,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             )
         self._plan_state = candidate
 
-    @flashinfer_experimental_api
+    @flashinfer_api
     def run(
         self,
         q: torch.Tensor,
@@ -743,12 +624,12 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         tuple whose members are ``[P, Hkv, page, D]`` with compact inner HND
         strides and arbitrary non-overlapping outer page strides.
 
-        ``validate=True`` performs structural and plan-geometry validation
-        without reading tensor values; it is the safe public default.
-        ``validate=False`` treats every run argument as a trusted binding and
-        performs no explicit wrapper validation. K/V view selection, scale
-        forwarding, and optional output allocation are unavoidable in both
-        modes.
+        ``validate=True`` performs structural, plan-geometry, and alias
+        validation without reading tensor values; it is the safe public
+        default. ``validate=False`` treats every run argument as a trusted
+        binding and performs no explicit wrapper validation. K/V view
+        selection, scale forwarding, and optional output allocation are
+        unavoidable in both modes.
 
         ``block_tables`` is Int32 ``[B, C]``, contiguous within each row but
         permitted to use a padded outer row stride; ``seq_lens_kv`` is compact
@@ -792,8 +673,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Values must satisfy the dense or causal bounds above.
         block_indptr : torch.Tensor
             Contiguous Int32 BSR row offsets with shape
-            ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
-            shared patterns and Hkv otherwise.
+            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
         block_indices : torch.Tensor
             Contiguous Int32 logical KV-block IDs referenced by
             ``block_indptr``.
@@ -805,11 +685,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype. Must not overlap any live input or plan-owned
-            buffer; storage overlap is not checked.
+            planned output dtype.
         validate : bool
-            Whether to validate tensor structure and plan geometry before
-            launching. Defaults to ``True``.
+            Whether to validate tensor structure, plan geometry, and aliasing
+            before launching. Defaults to ``True``.
 
         Returns
         -------
@@ -843,7 +722,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_experimental_api
+@flashinfer_api
 def block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
@@ -857,7 +736,6 @@ def block_sparse_attention_with_paged_kv_cache(
     max_seq_len_kv: int,
     kv_valid_bits: torch.Tensor | None = None,
     mask_type: Literal["dense", "causal"] = "dense",
-    share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -885,8 +763,7 @@ def block_sparse_attention_with_paged_kv_cache(
         Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
     block_indptr : torch.Tensor
         Contiguous Int32 BSR row offsets with shape
-        ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
-        shared patterns and Hkv otherwise.
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
     block_indices : torch.Tensor
         Contiguous Int32 logical KV-block IDs referenced by ``block_indptr``.
     q_block_size : int
@@ -907,11 +784,6 @@ def block_sparse_attention_with_paged_kv_cache(
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
-        Must not overlap any live input; storage overlap is not checked.
-
-    share_pattern_across_kv_heads : bool
-        False (default) uses one pattern per KV head. True requires a singleton
-        pattern-head axis and reuses those rows across all physical KV heads.
 
     Returns
     -------
@@ -928,21 +800,31 @@ def block_sparse_attention_with_paged_kv_cache(
 
     batch_size, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
     metadata_device, _ = _resolve_cuda_device(q.device)
-    _validate_runtime_device(metadata_device)
-    paged = _validate_paged_kv_storage(
-        _PagedKVStorage(
-            paged_kv_cache=paged_kv_cache,
-            block_tables=block_tables,
-            seq_lens_kv=seq_lens_kv,
-        ),
-        expected_device=q.device,
-        expected_batch_size=batch_size,
-        seq_len_kv=max_seq_len_kv,
+    table_device, table_batch_size, table_capacity = _validate_block_table_metadata(
+        block_tables, seq_lens_kv
     )
-    if paged.head_dim != head_dim:
+    if table_device != q.device:
+        raise ValueError(f"paged-KV metadata must be on {q.device}, got {table_device}")
+    if table_batch_size != batch_size:
+        raise ValueError(
+            "seq_lens_kv must have one entry per request: "
+            f"expected {batch_size}, got {table_batch_size}"
+        )
+
+    (
+        k_cache,
+        _,
+        num_physical_kv_pages,
+        num_kv_heads,
+        page_size,
+        runtime_head_dim,
+        _,
+        _,
+    ) = _normalize_paged_kv_cache(paged_kv_cache, expected_device=q.device)
+    if runtime_head_dim != head_dim:
         raise ValueError(
             "Q and paged K/V head dimensions must agree: "
-            f"expected {head_dim}, got {paged.head_dim}"
+            f"expected {head_dim}, got {runtime_head_dim}"
         )
 
     use_kv_valid_bits = kv_valid_bits is not None
@@ -951,18 +833,23 @@ def block_sparse_attention_with_paged_kv_cache(
         seq_len_q=seq_len_q,
         seq_len_kv=max_seq_len_kv,
         num_qo_heads=num_qo_heads,
-        num_kv_heads=paged.num_kv_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        page_size=paged.page_size,
+        page_size=page_size,
         use_kv_valid_bits=use_kv_valid_bits,
-        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         mask_type=mask_type,
         q_dtype=q.dtype,
-        kv_dtype=paged.k.dtype,
+        kv_dtype=k_cache.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
+    if table_capacity * page_size < static.seq_len_kv:
+        raise ValueError(
+            "block_tables must cover the planned K/V capacity: expected at "
+            f"least {(static.seq_len_kv + page_size - 1) // page_size} columns, "
+            f"got {table_capacity}"
+        )
     _validate_block_sparse_metadata(
         sparse_format="bsr",
         block_indptr=block_indptr,
@@ -973,9 +860,7 @@ def block_sparse_attention_with_paged_kv_cache(
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
-        num_kv_heads=_num_sparse_pattern_heads(
-            static.num_kv_heads, static.share_pattern_across_kv_heads
-        ),
+        num_kv_heads=static.num_kv_heads,
         q_block_size=static.q_block_size,
         kv_block_size=static.kv_block_size,
         use_kv_valid_bits=static.use_kv_valid_bits,
@@ -986,7 +871,7 @@ def block_sparse_attention_with_paged_kv_cache(
         block_tables,
         seq_lens_kv,
         static=static,
-        num_physical_kv_pages=paged.payload.num_physical_kv_pages,
+        num_physical_kv_pages=num_physical_kv_pages,
         stream=torch.cuda.current_stream(metadata_device),
     )
 
@@ -1009,7 +894,6 @@ def block_sparse_attention_with_paged_kv_cache(
         q_data_type=static.q_dtype,
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
-        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
     return wrapper.run(
         q,
