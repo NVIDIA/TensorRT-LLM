@@ -17,7 +17,7 @@
 
 import math
 from dataclasses import replace
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -356,13 +356,15 @@ def _host_batch(*, prefill=False):
     manager.compute_sliding_block_tables = Mock()
     for cache in manager.kv_cache_map.values():
         cache.history_length = 0
-    return SimpleNamespace(
+    metadata = SimpleNamespace(
         sparse_metadata_params=SimpleNamespace(enable_kv_cache_offload=True),
         sparse_offload_state=SimpleNamespace(prepared=True, is_prefill=False),
         kv_cache_manager=manager,
         request_ids=[20, 10],
         beam_width=1,
         max_draft_tokens=0,
+        enable_ragged_verification=False,
+        ragged_verify_lens=None,
         draft_kv_cache_manager=None,
         num_contexts=2 if prefill else 0,
         num_generations=0 if prefill else 2,
@@ -371,6 +373,10 @@ def _host_batch(*, prefill=False):
         prompt_lens=[8, 12],
         kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[0, 0]),
     )
+    metadata._validate_ragged_verification = MethodType(
+        DeepseekV4TrtllmAttentionMetadata._validate_ragged_verification, metadata
+    )
+    return metadata
 
 
 @pytest.mark.cpu_only

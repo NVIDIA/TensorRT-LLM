@@ -53,6 +53,59 @@ def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) 
     return int(max_ctx) + int(max_draft_len) + int(block_size) + 3
 
 
+def _publish_policy_window_output(
+    outputs: dict[str, torch.Tensor | bool],
+    verify_lens: Optional[torch.Tensor],
+    *,
+    num_contexts: int,
+    num_generations: int,
+    output_verify_lens: Optional[torch.Tensor],
+) -> None:
+    """Publish executed token windows in full output-row order.
+
+    ``verify_lens`` is generation-ordered, including graph-padding generations.
+    ``output_verify_lens`` is persistent int32 device storage sized at warmup.
+    Context rows have one anchor and no verified drafts. The sampler removes
+    skipped context rows and snapshots the remaining view through its D2H path.
+    """
+    batch_size = num_contexts + num_generations
+    if num_contexts < 0 or num_generations < 0:
+        raise ValueError("verification output row counts must be nonnegative")
+    for name in ("new_tokens", "new_tokens_lens", "next_draft_tokens", "next_new_tokens"):
+        if outputs[name].shape[0] != batch_size:
+            raise ValueError("verification output row counts must match every worker output")
+
+    if verify_lens is None:
+        outputs.pop("verify_lens", None)
+        outputs.pop("verify_lens_in_output_order", None)
+        outputs.pop("host_policy_windows_snapshot", None)
+        outputs["native_uniform_verify"] = True
+        return
+    if (
+        verify_lens.dim() != 1
+        or verify_lens.shape[0] != num_generations
+        or verify_lens.dtype != torch.int32
+        or verify_lens.device != outputs["new_tokens_lens"].device
+    ):
+        raise ValueError("verify_lens must contain exactly one int32 window per generation row")
+    if (
+        output_verify_lens is None
+        or output_verify_lens.dim() != 1
+        or output_verify_lens.shape[0] < batch_size
+        or output_verify_lens.dtype != torch.int32
+        or output_verify_lens.device != verify_lens.device
+    ):
+        raise ValueError("executed-window output storage must cover the full batch on device")
+
+    output_view = output_verify_lens[:batch_size]
+    output_view[:num_contexts].fill_(1)
+    output_view[num_contexts:].copy_(verify_lens)
+    outputs.pop("native_uniform_verify", None)
+    outputs.pop("host_policy_windows_snapshot", None)
+    outputs["verify_lens"] = output_view
+    outputs["verify_lens_in_output_order"] = True
+
+
 @dataclass
 class DSparkSpecMetadata(SpecMetadata):
     """Metadata for DSpark speculative decoding.
@@ -267,6 +320,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # Per-slot rolling captured-context KV windows, built lazily on the
         # first forward (fixed-size for slot-indexed reads/writes).
         self._win_inited = False
+        self._output_verify_lens: Optional[torch.Tensor] = None
         self._attention_warmup_attempted = False
         self._kv_windows: Optional[torch.Tensor] = None  # [max_batch, num_stages, win, hd]
         self._ctx_len: Optional[torch.Tensor] = None  # [max_batch] abs decode position
@@ -354,6 +408,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
 
         if not self._win_inited:
             max_batch = spec_metadata.max_num_requests
+            self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
@@ -819,13 +874,21 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._position_initialized.copy_(saved_position_initialized)
             self._kv_windows.copy_(saved_windows)
 
-        return {
+        outputs = {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        _publish_policy_window_output(
+            outputs,
+            spec_metadata.verify_lens,
+            num_contexts=num_contexts,
+            num_generations=num_gens,
+            output_verify_lens=self._output_verify_lens,
+        )
+        return outputs
 
 
 class DSparkWorker(DFlashWorker):

@@ -93,6 +93,10 @@ KVCacheEventManager = _cpp.KVCacheEventManager
 KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
 KVCacheManager = _cpp.KVCacheManager
 KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+StreamingBlockRemovedData = _cpp.StreamingBlockRemovedData
+StreamingBlockStoredData = _cpp.StreamingBlockStoredData
+StreamingEventSink = _cpp.StreamingEventSink
+StreamingEventStats = _cpp.StreamingEventStats
 IKvCacheColdPageCodec = _cpp.IKvCacheColdPageCodec
 create_default_kv_cache_cold_page_codec = _cpp.create_default_kv_cache_cold_page_codec
 # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
@@ -123,6 +127,7 @@ class _KVCacheManagerConfigFieldSpec:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    enable_partial_commit: bool = True
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
@@ -133,11 +138,15 @@ KVCacheStoredBlockData = _cpp.KVCacheStoredBlockData
 KVCacheStoredData = _cpp.KVCacheStoredData
 KVCacheUpdatedData = _cpp.KVCacheUpdatedData
 KvCacheStatus = _cpp.KvCacheStatus
+LogicError = _cpp.LogicError
 OutOfMemoryError = _cpp.OutOfMemoryError
 OutOfPagesError = _cpp.OutOfPagesError
 PageIndexConverter = _cpp.PageIndexConverter
 PageIndexMode = _cpp.PageIndexMode
 PageStatus = _cpp.PageStatus
+PageStorageSnapshot = _cpp.PageStorageSnapshot
+Batch = _cpp.Batch
+BatchDeviceArray = _cpp.BatchDeviceArray
 PlannedDropHandle = _cpp.PlannedDropHandle
 PoolDesc = _cpp.PoolDesc
 PoolGroupDesc = _cpp.PoolGroupDesc
@@ -232,6 +241,7 @@ __all__ = [
     "LayerGroupId",
     "LayerId",
     "LifeCycleId",
+    "LogicError",
     "MemAddress",
     "NDEBUG",
     "OutOfPagesError",
@@ -240,6 +250,9 @@ __all__ = [
     "PoolGroupPeakBlockStats",
     "PageIndexMode",
     "PageStatus",
+    "PageStorageSnapshot",
+    "Batch",
+    "BatchDeviceArray",
     "PoolDesc",
     "PoolGroupDesc",
     "PoolGroupIndex",
@@ -255,6 +268,10 @@ __all__ = [
     "SlotDesc",
     "SlotDescVariant",
     "SsmLayerConfig",
+    "StreamingBlockRemovedData",
+    "StreamingBlockStoredData",
+    "StreamingEventSink",
+    "StreamingEventStats",
     "SwaScratchReuseConfig",
     "TokenId",
     "TokenIdExt",

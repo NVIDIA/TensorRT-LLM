@@ -44,9 +44,17 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once after the first successful LLM initialization. Contains system info
-and the first successfully reported LLM's serving configuration. A process that
-fails earlier can send a terminal report without an initial report.
+Normally sent after the first successful LLM initialization with system information
+and serving configuration. If startup fails, it can instead be sent alongside the
+exit report with as much information as is available (**partial context**).
+These partial reports are marked with
+`llmApiConfigMetaJson.report_context == "pre_initialization_exit"` and do not
+indicate successful initialization.
+
+For dashboards, the top-level event parameter `llmInstancesCreated >= 1`
+confirms successful LLM initialization; partial reports have `llmInstancesCreated == 0`.
+Do not count initial reports alone as successful deployments. Treat a missing
+counter in older records as unknown, not zero.
 
 #### System fields
 
@@ -69,6 +77,10 @@ fails earlier can send a terminal report without an initial report.
 
 #### Parallelism fields
 
+In partial reports, `0` for `tensorParallelSize`, `pipelineParallelSize`, or
+`contextParallelSize` means unknown (not captured), not a real parallelism degree;
+exclude these sentinel values from parallelism averages and distributions.
+
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `tensorParallelSize` | PositiveInt | Tensor parallelism degree. | `8` |
@@ -83,7 +95,7 @@ fails earlier can send a terminal report without an initial report.
 |-------|------|-------------|---------|
 | `architectureClassName` | LongString | Public model architecture identifier when it appears in the checked-in allowlist; otherwise empty. The identifier may come from a public model checkpoint or a documented TensorRT-LLM runtime architecture. | `"LlamaForCausalLM"`, `"Qwen3ForTextEmbedding"`, `""` |
 | `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
-| `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
+| `backend` | ShortString | Execution backend. | `"pytorch"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
 | `kvCacheDtype` | ShortString | KV cache data type. Empty string if default. | `""`, `"fp8"`, `"auto"` |
@@ -116,12 +128,12 @@ The intended guarantee is only that the raw name is not transmitted while stable
 grouping remains possible; the hash must not be treated as anonymous or secret.
 
 Extraction uses the first `architectures` value from the pretrained
-configuration and also supports legacy singular values and nested engine
-configs. Encode-only models use the effective runtime configuration after
+configuration. Encode-only models use the effective runtime configuration after
 model overrides are applied, falling back to the checkpoint configuration if
 the runtime metadata is unavailable. Generation models use the checkpoint
 configuration; architecture overrides applied in their worker process are not
-currently reflected in telemetry. Invalid or empty values leave both fields empty.
+currently reflected in telemetry. If the list is absent or empty, the config
+class name is used. An invalid or empty first entry leaves both fields empty.
 The conservative allowlist is maintained manually. An identifier may be
 included when it is publicly documented by the upstream model provider or in
 TensorRT-LLM's supported-models table; custom names remain excluded until
@@ -266,7 +278,6 @@ The docs build renders the full table under **Developer Guide > Telemetry**.
 | `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
-| `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
 | `kv_cache_config.dtype` | KV cache dtype, captured through an explicit allowlist. |
 | `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
 | `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
