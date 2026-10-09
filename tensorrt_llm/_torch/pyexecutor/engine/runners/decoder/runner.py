@@ -42,13 +42,9 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    BaseMambaCacheManager,
-    MambaHybridCacheManager,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    BaseResourceManager,
     KVCacheManager,
     ResourceManager,
     ResourceManagerType,
@@ -98,7 +94,6 @@ from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
-from ...metadata import build_attention_metadata
 from ...model_call import ModelCaller
 from ...multimodal import MultimodalItemScheduler
 from ..common import (
@@ -116,8 +111,8 @@ from ..common import (
 from ..interface import ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .inputs import DecoderInputBuffers
+from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
 from .speculative import (
-    create_spec_metadata,
     get_spec_managers,
     set_spec_metadata_all_rank_num_tokens,
     update_spec_metadata,
@@ -132,11 +127,6 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
     if request.is_last_context_chunk:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
-
-
-def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
-    """Resolve the model-specific Mamba metadata class with a default."""
-    return getattr(model, "mamba_metadata_cls", None) or Mamba2Metadata
 
 
 def uses_full_generation_page_table(
@@ -301,23 +291,28 @@ class DecoderRunner(ScheduledModelRunner):
         # Stages (or clears) in-graph sampling state once the batch is settled.
         self._stage_in_graph_sampling = None
 
-        # This field is initialized lazily on the first forward pass.
-        # This is convenient because:
-        # 1) The attention metadata depends on the KV cache manager.
-        # 2) The KV cache manager depends on the model configuration.
-        # 3) The model configuration is not loaded until the model engine
-        # is initialized.
-        #
-        # NOTE: This can be simplified by decoupling the model config loading and
-        # the model engine.
-        self.attn_metadata = None
-        self.spec_metadata = None
-
         self._buffers = DecoderInputBuffers()
         self._buffers.allocate(self._config, self.use_beam_search)
+        self._metadata = DecoderMetadata(self._config, mapping, model, self._buffers)
         self._init_decoder_state()
         self.cuda_graph_runner = self._initialize_cuda_graph_runner()
         self.breakable_cuda_graph_runner = self._initialize_breakable_cuda_graph_runner()
+
+    @property
+    def attn_metadata(self) -> AttentionMetadata | None:
+        return self._metadata.attn_metadata
+
+    @attn_metadata.setter
+    def attn_metadata(self, value: AttentionMetadata | None) -> None:
+        self._metadata.attn_metadata = value
+
+    @property
+    def spec_metadata(self) -> SpecMetadata | None:
+        return self._metadata.spec_metadata
+
+    @spec_metadata.setter
+    def spec_metadata(self, value: SpecMetadata | None) -> None:
+        self._metadata.spec_metadata = value
 
     @property
     def max_beam_width(self) -> int:
@@ -795,7 +790,7 @@ class DecoderRunner(ScheduledModelRunner):
     def _freeze_eager_workspace_floor(self) -> None:
         if os.environ.get("TRTLLM_RECLAIM_WORKSPACE", "1") == "0":
             return
-        metadata = self.attn_metadata
+        metadata = self._metadata.attn_metadata
         if (
             self._config.is_spec_decode
             or self.mapping.cp_size != 1
@@ -999,7 +994,7 @@ class DecoderRunner(ScheduledModelRunner):
         kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
         if kv_cache_manager is None:
             return
-        self._set_up_attn_metadata(
+        self._metadata.set_up_attn(
             kv_cache_manager, self._get_draft_kv_cache_manager(resource_manager)
         )
 
@@ -1944,8 +1939,8 @@ class DecoderRunner(ScheduledModelRunner):
         # spec_metadata. Reset it so the first real iteration starts clean;
         # update_is_all_greedy_sample will refresh it on every iteration anyway.
         # This is a defensive guard.
-        if self.spec_metadata is not None:
-            self.spec_metadata.is_all_greedy_sample = True
+        if self._metadata.spec_metadata is not None:
+            self._metadata.spec_metadata.is_all_greedy_sample = True
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager):
         """Warm up and capture prefill CUDA graphs, timing each phase separately.
@@ -2451,48 +2446,6 @@ class DecoderRunner(ScheduledModelRunner):
     ) -> bool:
         """Allocate resources dummy requests need beyond the KV caches."""
         return True
-
-    def _set_up_attn_metadata(
-        self,
-        kv_cache_manager: KVCacheManager | KVCacheManagerV2,
-        draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
-    ):
-        if self.attn_metadata is not None:
-            # This assertion can be relaxed if needed: just create a new metadata
-            # object if it changes.
-            assert self.attn_metadata.kv_cache_manager is kv_cache_manager
-            return self.attn_metadata
-
-        config = self.model.model_config.pretrained_config
-        self.attn_metadata = build_attention_metadata(
-            self.model.model_config,
-            max_batch_size=self._config.max_batch_size,
-            max_num_tokens=self._config.max_num_tokens,
-            max_beam_width=self._config.max_beam_width,
-            attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
-            mapping=self.mapping,
-            cache_indirection=self._buffers.cache_indirection_attention
-            if self._config.attention_backend.Metadata is TrtllmAttentionMetadata
-            else None,
-            kv_cache_manager=kv_cache_manager,
-            draft_kv_cache_manager=draft_kv_cache_manager,
-        )
-        if isinstance(kv_cache_manager, BaseMambaCacheManager):
-            self.attn_metadata.mamba_chunk_size = getattr(
-                config, "chunk_size", self.attn_metadata.mamba_chunk_size
-            )
-        self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
-
-        return self.attn_metadata
-
-    def _set_up_spec_metadata(self, spec_resource_manager: BaseResourceManager | None):
-        if self.spec_metadata is not None:
-            return self.spec_metadata
-        self.spec_metadata = create_spec_metadata(
-            self._config, self.model.config, spec_resource_manager
-        )
-        return self.spec_metadata
 
     def _release_decoder_graphs(self) -> None:
         if hasattr(self, "cuda_graph_runner") and self.cuda_graph_runner is not None:
@@ -4365,12 +4318,12 @@ class DecoderRunner(ScheduledModelRunner):
         scheduled_requests = self._get_attention_dp_execution_batch(scheduled_requests)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager, draft_kv_cache_manager)
+        attn_metadata = self._metadata.set_up_attn(kv_cache_manager, draft_kv_cache_manager)
         if isinstance(attn_metadata, TrtllmAttentionMetadata):
             attn_metadata.trtllm_gen_jit_warmup = self._trtllm_gen_jit_warmup
         if enable_spec_decode:
             spec_resource_manager, spec_tree_manager = get_spec_managers(resource_manager)
-            spec_metadata = self._set_up_spec_metadata(spec_resource_manager)
+            spec_metadata = self._metadata.set_up_spec(spec_resource_manager)
             assert spec_metadata is not None
             update_spec_metadata(
                 spec_metadata,
@@ -4479,9 +4432,9 @@ class DecoderRunner(ScheduledModelRunner):
                 execution_requests = padded_graph_requests
                 execution_promoted_context_ids = promoted_context_request_ids
             else:
-                attn_metadata = self.attn_metadata
+                attn_metadata = self._metadata.attn_metadata
                 if enable_spec_decode:
-                    spec_metadata = self.spec_metadata
+                    spec_metadata = self._metadata.spec_metadata
                 else:
                     spec_metadata = None
                 execution_requests = scheduled_requests

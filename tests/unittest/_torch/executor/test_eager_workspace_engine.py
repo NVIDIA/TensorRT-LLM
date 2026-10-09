@@ -180,7 +180,7 @@ class TestEagerWorkspaceEngine(unittest.TestCase):
         self.engine._is_warmup = False
         self.metadata = object.__new__(TrtllmAttentionMetadata)
         self.metadata.workspace = torch.empty(4096, dtype=torch.int8)
-        self.engine.attn_metadata = self.metadata
+        self.engine._metadata = SimpleNamespace(attn_metadata=self.metadata)
         self.engine.model = SimpleNamespace(
             model_config=SimpleNamespace(extra_attrs={}), forward=Mock(return_value=42)
         )
