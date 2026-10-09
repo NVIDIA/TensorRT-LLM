@@ -60,6 +60,13 @@ using TileScheduler = tk::TileScheduler;
 
 using trtllm::gen::ceilDiv;
 
+// The exported FmhaOptions.h calls isAnySlidingWindowMask, which KernelConfigBase.h only defines outside
+// TLLM_FMHA_TRTLLM_COMPAT. Forward to TRT-LLM's usesSlidingWindowMask for the aliased enum.
+inline bool isAnySlidingWindowMask(AttentionMaskType maskType)
+{
+    return tk::usesSlidingWindowMask(maskType);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Check macros: streaming-style (matching trtllm-gen calling convention).
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -156,6 +163,8 @@ template <> inline std::string toString(AttentionMaskType e) {
     return "Custom";
   case AttentionMaskType::SlidingWindowCustom:
     return "SlidingWindowCustom";
+  case AttentionMaskType::VariableWindow:
+    return "VariableWindow";
   default:
     return "";
   }

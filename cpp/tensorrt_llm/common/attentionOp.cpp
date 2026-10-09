@@ -1208,10 +1208,9 @@ int AttentionOp::mlaGeneration(
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.
         tllmRunnerParams.mSumOfSeqLensKv = int(batch_beam * tllmRunnerParams.mMaxSeqLenKv);
 
-        // The attention window size.
-        tllmRunnerParams.mAttentionWindowSize = generation_params.cyclic_attention_window_size;
-        // The chunked attention size.
-        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mLeftSlidingWindow = -1;
+        tllmRunnerParams.mRightSlidingWindow = -1;
+        tllmRunnerParams.mChunkedAttentionSize = 0;
 
         // The scaleQ that will be applied to the BMM1 output.
         tllmRunnerParams.mScaleQ = mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim))
