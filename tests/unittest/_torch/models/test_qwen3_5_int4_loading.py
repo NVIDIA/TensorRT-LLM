@@ -27,7 +27,8 @@ from tensorrt_llm.quantization import QuantAlgo
 
 
 @pytest.mark.skipif(get_sm_version() < 80, reason="W4A16 AWQ requires Ampere or newer")
-def test_int4_mapper_to_gdn_tp2(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("has_pre_quant_scale", [False, True])
+def test_int4_mapper_to_gdn_tp2(monkeypatch: pytest.MonkeyPatch, has_pre_quant_scale: bool) -> None:
     """Load mapper output through real GDN projections and check each TP rank's outputs."""
     hidden_size, tp_size = 256, 2
     # The unused embedding/MLP collectives must not allocate multi-GPU workspaces.
@@ -60,6 +61,10 @@ def test_int4_mapper_to_gdn_tp2(monkeypatch: pytest.MonkeyPatch) -> None:
         weights[f"{prefix}.in_proj_qkv.{suffix}"] = torch.cat(
             [weights.pop(f"{prefix}.in_proj_{name}.{suffix}") for name in ("q", "k", "v")]
         )
+    input_scale = torch.tensor([0.5, 2.0], dtype=torch.bfloat16).repeat_interleave(128)
+    if has_pre_quant_scale:
+        for name in ("qkv", "z"):
+            weights[f"{prefix}.in_proj_{name}.pre_quant_scale"] = input_scale.clone()
     x = torch.randint(-2, 3, (3, hidden_size), generator=generator).to("cuda", torch.bfloat16)
 
     # Projection forwards have no collectives, so both real TP mappings run on one GPU.
@@ -111,11 +116,14 @@ def test_int4_mapper_to_gdn_tp2(monkeypatch: pytest.MonkeyPatch) -> None:
             )
             linear.post_load_weights()
             linear.cuda()
+            reference_input = x
+            if has_pre_quant_scale and projection == "qkvz":
+                reference_input = x * input_scale.cuda()
             expected = torch.cat(
                 [
-                    torch.nn.functional.linear(x.float(), reference_weights[name].cuda()).chunk(
-                        tp_size, dim=-1
-                    )[rank]
+                    torch.nn.functional.linear(
+                        reference_input.float(), reference_weights[name].cuda()
+                    ).chunk(tp_size, dim=-1)[rank]
                     for name in names
                 ],
                 dim=-1,

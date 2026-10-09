@@ -23,6 +23,19 @@ from tensorrt_llm.quantization import QuantAlgo
 _FP8_2D_BLOCK_SIZE = 128
 
 
+def _check_packed_int4(
+    tensors: dict[str, torch.Tensor], keys: set[str], rows: tuple[int, ...], prefix: str
+) -> tuple[int, ...]:
+    """Validate packed projection storage and return physical row counts."""
+    if not all(tensors[key].dtype in (torch.uint8, torch.int8) for key in keys):
+        raise ValueError(f"Cannot fuse packed INT4 and unpacked weights for {prefix}")
+    if len({tensors[key].dtype for key in keys}) != 1:
+        raise ValueError(f"Packed INT4 projections must have the same storage dtype for {prefix}")
+    if any(row % 2 != 0 for row in rows):
+        raise ValueError(f"INT4 projection dimensions must be even for {prefix}")
+    return tuple(row // 2 for row in rows)
+
+
 @register_mapper("HF", "Qwen3_5ForConditionalGeneration")
 @register_mapper("HF", "QwenImageBenchForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5MoeForCausalLM")
@@ -520,6 +533,39 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         expected_ba = config.linear_num_value_heads
 
         for (prefix, suffix), tensors in grouped_weights.items():
+            if dense_layout and suffix == "pre_quant_scale":
+                # Input scales are shared by fused projections, not concatenated by output row.
+                for projection, keys in (
+                    ("qkvz", ("qkv", "z") if "qkv" in tensors else ("q", "k", "v", "z")),
+                    ("ba", ("b", "a")),
+                ):
+                    if not set(keys) & tensors.keys():
+                        continue
+                    if missing := set(keys) - tensors.keys():
+                        raise ValueError(
+                            f"Cannot fuse {prefix}.in_proj_{projection}.pre_quant_scale: "
+                            f"missing scales for {sorted(missing)}"
+                        )
+                    scales = [
+                        tensors[key]
+                        if isinstance(tensors[key], torch.Tensor)
+                        else tensors[key][...]
+                        for key in keys
+                    ]
+                    if any(scale.shape != (config.hidden_size,) for scale in scales):
+                        raise ValueError(
+                            f"Expected pre_quant_scale shape ({config.hidden_size},) for {prefix}"
+                        )
+                    if not all(torch.equal(scales[0], scale) for scale in scales[1:]):
+                        raise ValueError(
+                            f"Cannot fuse {prefix}.in_proj_{projection}: pre_quant_scale vectors "
+                            "must be identical; export with shared input scales"
+                        )
+                    packed_name = f"{prefix}.in_proj_{projection}.{suffix}"
+                    if packed_name in packed_weights:
+                        raise ValueError(f"Packed projection {packed_name} already exists")
+                    packed_weights[packed_name] = scales[0]
+                continue
             # `weight_scale_inv` (loaded by FP8BlockScalesLinearMethod) is the
             # only suffix stored in 2D-block format [ceil(out/block_size), ceil(in/block_size)];
             # INT4 weights pack two output channels per byte; their scales and
@@ -540,20 +586,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     and suffix == "weight"
                     and any(tensors[key].dtype in (torch.uint8, torch.int8) for key in qkvz_keys)
                 ):
-                    if not all(
-                        tensors[key].dtype in (torch.uint8, torch.int8) for key in qkvz_keys
-                    ):
-                        raise ValueError(
-                            f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
-                        )
-                    if len({tensors[key].dtype for key in qkvz_keys}) != 1:
-                        raise ValueError(
-                            f"Packed INT4 projections must have the same storage dtype for {prefix}"
-                        )
-                    if row_q % 2 != 0 or row_v % 2 != 0:
-                        raise ValueError(f"INT4 projection dimensions must be even for {prefix}")
-                    row_q //= 2
-                    row_v //= 2
+                    row_q, row_v = _check_packed_int4(tensors, qkvz_keys, (row_q, row_v), prefix)
                 if "qkv" in tensors:
                     missing = {"qkv", "z"} - tensors.keys()
                     assert not missing, (
@@ -598,21 +631,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     if dense_layout and any(
                         tensors[key].dtype in (torch.uint8, torch.int8) for key in ba_keys
                     ):
-                        if not all(
-                            tensors[key].dtype in (torch.uint8, torch.int8) for key in ba_keys
-                        ):
-                            raise ValueError(
-                                f"Cannot fuse packed INT4 and unpacked weights for {prefix}"
-                            )
-                        if len({tensors[key].dtype for key in ba_keys}) != 1:
-                            raise ValueError(
-                                f"Packed INT4 projections must have the same storage dtype for {prefix}"
-                            )
-                        if row_ba % 2 != 0:
-                            raise ValueError(
-                                f"INT4 projection dimensions must be even for {prefix}"
-                            )
-                        row_ba //= 2
+                        (row_ba,) = _check_packed_int4(tensors, ba_keys, (row_ba,), prefix)
                     assert tensors["b"].shape[0] == row_ba
                     assert tensors["a"].shape[0] == row_ba
 

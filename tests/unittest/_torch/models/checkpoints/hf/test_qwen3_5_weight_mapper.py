@@ -194,24 +194,32 @@ def _make_int4_weights(
 
 
 @pytest.mark.parametrize(
-    "tp_size,split_qkv,quantize_ba,storage_dtype,head_dim",
+    "tp_size,split_qkv,quantize_ba,storage_dtype,head_dim,has_pre_quant_scale",
     [
         # Cover both checkpoint layouts and gate formats in the TP1 and TP2 paths.
-        (1, False, False, torch.uint8, 4),
-        pytest.param(1, False, True, torch.uint8, 128, id="qwen35-27b"),
-        (1, True, False, torch.uint8, 4),
-        (1, True, True, torch.uint8, 4),
-        (2, False, False, torch.uint8, 4),
-        (2, False, True, torch.uint8, 4),
-        (2, True, False, torch.uint8, 4),
-        (2, True, True, torch.uint8, 4),
+        (1, False, False, torch.uint8, 4, False),
+        pytest.param(1, False, True, torch.uint8, 128, False, id="qwen35-27b"),
+        (1, True, False, torch.uint8, 4, False),
+        (1, True, True, torch.uint8, 4, False),
+        (2, False, False, torch.uint8, 4, False),
+        (2, False, True, torch.uint8, 4, False),
+        (2, True, False, torch.uint8, 4, False),
+        (2, True, True, torch.uint8, 4, False),
+        # Shared activation scales in both checkpoint layouts.
+        (2, False, True, torch.uint8, 4, True),
+        (2, True, True, torch.uint8, 4, True),
         # Signed storage in both layouts; TP8 gives three packed gate rows per rank.
-        (2, True, True, torch.int8, 4),
-        (8, False, True, torch.int8, 4),
+        (2, True, True, torch.int8, 4, False),
+        (8, False, True, torch.int8, 4, False),
     ],
 )
 def test_int4_projections_preserve_values_and_scales(
-    tp_size: int, split_qkv: bool, quantize_ba: bool, storage_dtype: torch.dtype, head_dim: int
+    tp_size: int,
+    split_qkv: bool,
+    quantize_ba: bool,
+    storage_dtype: torch.dtype,
+    head_dim: int,
+    has_pre_quant_scale: bool,
 ) -> None:
     mapper, weights, logical_weights, scales = _make_int4_weights(split_qkv, quantize_ba, head_dim)
     if head_dim == 128:
@@ -221,11 +229,28 @@ def test_int4_projections_preserve_values_and_scales(
         for name, value in weights.items()
     }
     mapper.config.mapping.tp_size = tp_size
+    input_scales = {"qkvz": torch.linspace(0.5, 1.5, 256), "ba": torch.linspace(1.0, 2.0, 256)}
+    if has_pre_quant_scale:
+        mapper.config.pretrained_config.hidden_size = 256
+        for name in list(weights):
+            if name.endswith(".weight"):
+                projection = "ba" if ".in_proj_b." in name or ".in_proj_a." in name else "qkvz"
+                weights[name.removesuffix("weight") + "pre_quant_scale"] = input_scales[
+                    projection
+                ].clone()
     out = mapper.preprocess_weights(weights)
     activation = torch.randn(3, 256, generator=torch.Generator().manual_seed(17))
 
     for projection, components in (("qkvz", ("q", "k", "v", "z")), ("ba", ("b", "a"))):
         quantized = projection == "qkvz" or quantize_ba
+        scale_key = f"{_ATTN_PREFIX}.in_proj_{projection}.pre_quant_scale"
+        if has_pre_quant_scale:
+            torch.testing.assert_close(out[scale_key], input_scales[projection])
+            fused_input = activation * out[scale_key]
+            reference_input = activation * input_scales[projection]
+        else:
+            assert scale_key not in out
+            fused_input = reference_input = activation
         packed_weight = out[f"{_ATTN_PREFIX}.in_proj_{projection}.weight"]
         if quantized:
             assert packed_weight.dtype == storage_dtype
@@ -255,8 +280,27 @@ def test_int4_projections_preserve_values_and_scales(
                 dequantized = logical_weights[name].float()
                 if quantized:
                     dequantized = dequantized * scales[name].repeat_interleave(128, dim=1)
-                references.append((activation @ dequantized.T).chunk(tp_size, dim=1)[rank])
-            torch.testing.assert_close(activation @ shard.T, torch.cat(references, dim=1))
+                references.append((reference_input @ dequantized.T).chunk(tp_size, dim=1)[rank])
+            torch.testing.assert_close(fused_input @ shard.T, torch.cat(references, dim=1))
+
+
+@pytest.mark.parametrize("projection", ["z", "a"])
+@pytest.mark.parametrize("invalid", ["different", "missing", "shape"])
+def test_int4_rejects_incompatible_pre_quant_scales(projection: str, invalid: str) -> None:
+    """A fused Linear cannot apply different input scales to its components."""
+    mapper, weights, _, _ = _make_int4_weights()
+    mapper.config.pretrained_config.hidden_size = 256
+    for name in ("qkv", "z", "b", "a"):
+        weights[f"{_ATTN_PREFIX}.in_proj_{name}.pre_quant_scale"] = torch.ones(256)
+    key = f"{_ATTN_PREFIX}.in_proj_{projection}.pre_quant_scale"
+    if invalid == "missing":
+        del weights[key]
+    elif invalid == "shape":
+        weights[key] = torch.ones(1, 256)
+    else:
+        weights[key][0] = 2
+    with pytest.raises(ValueError, match="pre_quant_scale"):
+        mapper.preprocess_weights(weights)
 
 
 def test_int4_rejects_non_byte_aligned_tp_shards() -> None:
