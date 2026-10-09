@@ -145,6 +145,7 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
+  causalLayoutOp.cpp
   rotateRowsOp.cpp
   scatterKvSlotsOp.cpp)
 
