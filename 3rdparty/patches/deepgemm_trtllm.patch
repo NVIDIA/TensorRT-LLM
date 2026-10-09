@@ -416,7 +416,7 @@ index 9e4ba58..de11992 100644
                                                       const torch::Tensor& b, const torch::Tensor& sfb,
                                                       const torch::Tensor& d,
 diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
-index c594d2b..3d2b68c 100644
+index c594d2b..0406005 100644
 --- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 +++ b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 @@ -487,4 +487,81 @@ static void sm100_paged_mqa_logits(const torch::Tensor& q,
@@ -431,7 +431,7 @@ index c594d2b..3d2b68c 100644
 +static bool sm100_paged_mqa_logits_metadata_compile_only(const int& next_n, const int& num_sms,
 +                                                         const bool& is_context_lens_2d,
 +                                                         const bool& is_varlen) {
-+    SM100PagedMQALogitsMetadataRuntime::Args args = {};
++    SM100PagedMQALogitsMetadataRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
 +    args.next_n = next_n;
 +    args.is_context_lens_2d = is_context_lens_2d;
 +    args.is_varlen = is_varlen;
@@ -448,7 +448,7 @@ index c594d2b..3d2b68c 100644
 +                                          const at::ScalarType& weights_dtype) {
 +    const bool is_fp4 = qk_dtype == kPackedFP4;
 +    DG_HOST_ASSERT(128 % num_heads == 0);
-+    SM100MQALogitsRuntime::Args args = {};
++    SM100MQALogitsRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
 +    args.num_heads = num_heads;
 +    args.head_dim = head_dim;
 +    args.is_mx_sf = is_mx_sf;
@@ -479,7 +479,7 @@ index c594d2b..3d2b68c 100644
 +                                                const at::ScalarType& weights_dtype) {
 +    const bool is_fp4 = qk_dtype == kPackedFP4;
 +    DG_HOST_ASSERT(split_kv == 256 and 128 % num_heads == 0);
-+    SM100PagedMQALogitsRuntime::Args args = {};
++    SM100PagedMQALogitsRuntime::Args args = { .launch_args = LaunchArgs(1, 1) };
 +    args.tokens_per_request = tokens_per_request;
 +    args.num_heads = num_heads;
 +    args.head_dim = head_dim;
