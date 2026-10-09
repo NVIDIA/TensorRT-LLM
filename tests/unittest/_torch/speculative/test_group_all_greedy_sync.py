@@ -36,6 +36,7 @@ def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
 def _fake_meta(group_all_greedy_sample=None):
     meta = types.SimpleNamespace(
         runtime_draft_len=2,
+        is_ragged_verify=False,
         dummy_slot_row=0,
         spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
