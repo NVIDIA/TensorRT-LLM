@@ -480,6 +480,7 @@ class PyExecutor:
         # related modules
         self.resource_manager = resource_manager
         self.model_engine = model_engine
+        self.vocab_size: int = self.model_engine.model.model_config.pretrained_config.vocab_size
         self._enable_adp_dummy_fixes = getattr(model_engine,
                                                "_enable_adp_dummy_fixes", False)
         self._enable_scheduler_aware_adp_dummy = getattr(
@@ -5625,6 +5626,14 @@ class PyExecutor:
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
 
+    def _validate_embedding_bias(self, request: LlmRequest) -> None:
+        embedding_bias = request.py_embedding_bias
+        if embedding_bias is not None:
+            for idx, val in embedding_bias:
+                if idx < 0 or idx >= self.vocab_size:
+                    raise ValueError(
+                        "Embedding bias index must be in [0, vocab_size - 1]")
+
     def _validate_request(self, request: LlmRequest):
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
@@ -5705,6 +5714,8 @@ class PyExecutor:
 
         # Check token ID ranges
         self._validate_token_id_range(request)
+
+        self._validate_embedding_bias(request)
 
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
