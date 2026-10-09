@@ -10,6 +10,11 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2FlashInfer, CSA2FlashMLA
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def _reference(q, swa, extra, swa_valid, extra_valid, sink):
     kv, valid = swa, swa_valid
@@ -132,6 +137,7 @@ def _decoded_reference(q, args, swa_valid, extra_valid, sink):
     return _reference(q, swa, main, swa_valid, extra_valid, sink)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [8, 64])
 @pytest.mark.parametrize("extra_width", [0, 17, 512])
@@ -178,6 +184,7 @@ def test_native_dual_pool(heads, extra_width, monkeypatch):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_trtllm_graph_replay_resets_sparse_state():
@@ -242,6 +249,7 @@ def test_trtllm_graph_replay_resets_sparse_state():
         assert large_frame.workspace.data_ptr() != workspace_ptr
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_standard_backend_multiple_tiles_and_reuse(monkeypatch):
@@ -366,6 +374,7 @@ def test_standard_backend_multiple_tiles_and_reuse(monkeypatch):
         manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_shared_metadata_resets_global_to_swa_inputs():
@@ -394,6 +403,7 @@ def test_shared_metadata_resets_global_to_swa_inputs():
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_cold_metadata_rejects_capture():
@@ -413,6 +423,7 @@ def test_cold_metadata_rejects_capture():
             attn.forward(q.flatten(1), None, None, metadata, forward_args=args)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("implementation", ["flash_mla", "flashinfer"])
 @pytest.mark.parametrize("context", [False, True])
@@ -450,6 +461,7 @@ def test_alternative_helper_dispatch(implementation, context, monkeypatch):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "option", ["custom_mask", "out_scale", "output_sf", "output_shape", "output_dtype"]
@@ -480,6 +492,7 @@ def test_alternative_backend_rejects_unsupported_options(option):
         _helper_forward(attn, q.flatten(1), metadata, args)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_alternative_helper_revalidates_output_scale():
@@ -498,6 +511,7 @@ def test_alternative_helper_revalidates_output_scale():
         _helper_forward(attn, q.flatten(1), metadata, args)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("extra_width", [0, 17, 512])
 @pytest.mark.parametrize("prefix", [0, 1024])
@@ -578,6 +592,7 @@ def test_native_context_preserves_real_query_groups(extra_width, prefix, tile_st
     torch.testing.assert_close(output, reference_generation, atol=0.03, rtol=0.03)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("extra_width", [0, 17])
 @torch.inference_mode()
@@ -642,6 +657,7 @@ def test_packed_helper_skips_bf16_staging(extra_width, monkeypatch):
         _helper_forward(attn, q.flatten(1), metadata, args)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "implementation,packed", [("trtllm", False), ("flashinfer", False), ("trtllm", True)]
@@ -659,6 +675,7 @@ def test_csa2_quant_update_rebuilds_local_provider_policy(implementation, packed
     assert all(type(provider) is FallbackFmha for provider in attn._fmha_manager.fmha_libs)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_backend_rejects_disabled_fallback(monkeypatch):
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
@@ -666,6 +683,7 @@ def test_native_backend_rejects_disabled_fallback(monkeypatch):
         _backend(32, compute_backend="trtllm")
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_context_graph_uses_fixed_generation_frame():
@@ -733,6 +751,7 @@ def test_context_graph_uses_fixed_generation_frame():
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("implementation,packed", [("flashinfer", False), ("trtllm", True)])
 @torch.inference_mode()
@@ -759,6 +778,7 @@ def test_segmented_mask_packing():
     assert CSA2FlashInfer.pack_query_masks(mask).tolist() == [133, 1, 2, 0]
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads,width,shared", [(8, 17, False), (64, 640, False), (64, 640, True)])
 @torch.inference_mode()
@@ -801,6 +821,7 @@ def test_flashinfer_bf16_and_graph(heads, width, shared):
         torch.testing.assert_close(output, reference(), atol=0.03, rtol=0.03)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_fixed_plan_ignores_dirty_workspace_padding(monkeypatch):
@@ -825,6 +846,7 @@ def test_fixed_plan_ignores_dirty_workspace_padding(monkeypatch):
     torch.testing.assert_close(result, torch.zeros_like(q), atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [8, 64])
 @torch.inference_mode()
@@ -844,6 +866,7 @@ def test_flash_mla_combined_pool_and_sink(heads):
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_flash_mla_cuda_graph_changes_selection():
@@ -865,6 +888,7 @@ def test_flash_mla_cuda_graph_changes_selection():
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_global_slot_graph_mapping_folds_visibility(monkeypatch):
@@ -909,6 +933,7 @@ def test_global_slot_graph_mapping_folds_visibility(monkeypatch):
         torch.testing.assert_close(slots, expected, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "phase,extra_width,heads",
@@ -1100,6 +1125,7 @@ def test_native_fp8_quantized_attention(phase, extra_width, heads, monkeypatch, 
             )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "phase,extra_width",
@@ -1196,6 +1222,7 @@ def test_native_fp8_staging_keeps_rows_beyond_the_e4m3_range(phase, extra_width)
     assert error / reference.float().abs().amax().item() < 0.03
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_kv_cache_dtype_selects_staging_without_changing_cache_formats():
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -1243,6 +1270,7 @@ def test_kv_cache_dtype_selects_staging_without_changing_cache_formats():
         _backend(64, use_packed=True, kv_cache_dtype="fp8", fp8_staging=True)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_library_backends_keep_bf16_staging_for_fp8_requests():
     from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -1257,6 +1285,7 @@ def test_library_backends_keep_bf16_staging_for_fp8_requests():
     assert not attn.has_fp8_kv_cache
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("kv_dtype", ["fp8", "fp8_ds_mla"])
 def test_default_staging_follows_the_backend_that_can_serve_it(kv_dtype):
@@ -1277,6 +1306,7 @@ def test_default_staging_follows_the_backend_that_can_serve_it(kv_dtype):
         assert not attn.has_fp8_kv_cache and attn.kv_cache_dtype == "auto"
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_fp8_rejects_incompatible_options():
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
@@ -1296,6 +1326,7 @@ def test_native_fp8_rejects_incompatible_options():
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "implementation,kv_dtype", [("trtllm", "auto"), ("trtllm", "fp8"), ("flashinfer", "auto")]

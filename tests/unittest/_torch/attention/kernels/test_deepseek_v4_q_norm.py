@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401
 
@@ -205,6 +206,7 @@ def test_deepseek_v4_q_norm_fused_fp8_matches_reference(
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("num_tokens", [1, 7, 129])
 @pytest.mark.parametrize("num_heads", [1, 16, 128])
 def test_deepseek_v4_q_norm_fused_fp8_without_the_norm(num_tokens, num_heads):

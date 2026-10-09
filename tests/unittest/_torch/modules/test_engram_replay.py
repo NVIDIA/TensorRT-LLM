@@ -10,6 +10,11 @@ import torch
 
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def provider(layer_ids=(0,)):
     # Non-identity compression plus a DEAD token catch raw-ID and padding seeds.
@@ -41,7 +46,7 @@ def hashes(p, ids, start, request_id=7):
 
 
 @pytest.mark.parametrize("start", [0, 1, 2, 3, 17])
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_pre_blackwell)])
 def test_recovery_input_seed_matches_full_history_with_dead_tokens(start, device):
     from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
     from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay
@@ -87,7 +92,7 @@ def test_recovery_input_seed_matches_full_history_with_dead_tokens(start, device
     torch.testing.assert_close(hashes(p, ids[start:], start), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_pre_blackwell)])
 def test_seeding_whole_mixed_batch_preserves_each_request(device):
     p = provider()
     a = torch.tensor([1, 2, 4, 5, 6, 7], device=device)
@@ -109,6 +114,7 @@ def test_seeding_whole_mixed_batch_preserves_each_request(device):
     torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graphs")
 def test_padded_graph_refresh_preserves_history_and_request_order():
     p = provider((0, 1))

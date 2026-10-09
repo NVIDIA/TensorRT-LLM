@@ -11,10 +11,19 @@ import torch
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
 from tensorrt_llm._torch.modules.engram import engram as engram_module
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 _DEVICES = [
     "cpu",
     pytest.param(
-        "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+        "cuda",
+        marks=[
+            skip_pre_blackwell,
+            pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ],
     ),
 ]
 _MULTIPLIERS = [17, 31, 47, 61]
@@ -114,6 +123,7 @@ def test_engram_history_uploads_refresh_recycled_rows(provider, device, masked):
     assert provider._history.shape[0] == 4
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_engram_history_uploads_refresh_captured_hashes(provider):
     device = torch.device("cuda")

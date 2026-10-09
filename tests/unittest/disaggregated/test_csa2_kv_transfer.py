@@ -19,6 +19,7 @@ from kv_transfer_harness import (
     run_kv_transfer_test,
 )
 from test_deepseek_v4_kv_transfer import _init_pool_data
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
@@ -32,6 +33,8 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
+pytestmark = skip_pre_blackwell
 
 
 def _managers(

@@ -23,6 +23,7 @@ import pytest
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams, AllReduceStrategy, allgather
@@ -141,6 +142,7 @@ def run_engram_shard_roundtrip(tp_size: int, tp_rank: int, num_heads: int):
     torch.testing.assert_close(combined, reference, atol=0.0, rtol=0.0)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("num_heads", HEAD_COUNTS, ids=lambda n: f"heads:{n}")
 @pytest.mark.parametrize("world_size", [4, 8], ids=lambda w: f"world:{w}")
 def test_engram_shard_roundtrip(world_size, num_heads):

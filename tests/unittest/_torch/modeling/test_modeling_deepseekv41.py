@@ -26,7 +26,7 @@ import torch
 from _torch.attention.sparse.csa2._utils import _FakeMetadata
 from torch import nn
 from transformers import AutoConfig
-from utils.util import skip_blackwell_geforce
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.configs import deepseek_v41 as v41_config
@@ -1436,6 +1436,7 @@ def test_context_only_checkpoint_filter_preserves_default_full_load():
 # --------------------------------------------------------------------------- #
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_release_census_closes_and_coverage_is_empty(
@@ -1497,6 +1498,7 @@ def test_release_census_closes_and_coverage_is_empty(
     assert unexpected == [] and unfed == []
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_context_only_release_census_covers_every_retained_parameter(
@@ -1527,6 +1529,7 @@ def test_context_only_release_census_covers_every_retained_parameter(
     assert "layers.20.attn.indexer.k_norm.weight" not in ignored
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_a_sink_the_walk_failed_to_deliver_is_not_silently_accepted(
@@ -1566,6 +1569,7 @@ def _quant_config(model):
     return text.quantization_config
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 @pytest.mark.parametrize(
@@ -1604,6 +1608,7 @@ def test_loader_refuses_a_wrong_built_in_block_extent(
         assert f"Elements per scale are {block}" in message
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 @pytest.mark.parametrize("block", [(128, 128), (1, 32), (64, 64)])
@@ -1628,6 +1633,7 @@ def test_loader_refuses_a_wrong_published_dense_block(
     assert f"expects on-disk block {block}" in message
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_the_built_in_dense_block_is_the_fallback_and_is_itself_checked(
@@ -1654,6 +1660,7 @@ def test_the_built_in_dense_block_is_the_fallback_and_is_itself_checked(
         _audited_loader(release_model, release_meta_weights, monkeypatch)
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 # Raw checkpoint names, not model names: the checkpoint ships DeepSeek's own
@@ -1671,6 +1678,7 @@ def test_loader_refuses_to_leave_a_parameter_unfilled(
     assert "no checkpoint tensor would fill" in str(excinfo.value)
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_loader_refuses_a_tensor_no_module_would_load(
@@ -1689,6 +1697,7 @@ def test_loader_refuses_a_tensor_no_module_would_load(
     assert "raw checkpoint tensors" in message
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_v41_every_fp8_consumer_receives_its_scale(
@@ -2806,6 +2815,7 @@ def _build_context_only_inventory_model(
     return DeepseekV41ForCausalLM(config)
 
 
+@skip_pre_blackwell
 @requires_cuda
 def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
     monkeypatch,
@@ -2866,6 +2876,7 @@ def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
     assert description["not_constructed"] == list(range(split, len(V41_TINY_RATIOS)))
 
 
+@skip_pre_blackwell
 @requires_cuda
 @pytest.mark.parametrize(
     "role,remote,bounded",
@@ -2927,6 +2938,7 @@ def _assert_v41_module_topology(model) -> None:
 # V4.1 omits V4's per-head query normalization.
 
 
+@skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(40000)
 @skip_blackwell_geforce
 def test_v41_attention_topology_has_no_per_head_query_norm() -> None:
@@ -2961,6 +2973,7 @@ def test_v41_attention_topology_has_no_per_head_query_norm() -> None:
     assert not issubclass(DeepseekV41Attention, DeepseekV4Attention)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("strategy", ["AUTO", "NCCL"])
 def test_attention_adapter_preserves_model_allreduce_strategy(strategy):
     from tensorrt_llm._torch.distributed import AllReduceStrategy
@@ -3142,6 +3155,7 @@ _EQUIVALENCE_STEMS = (
 )
 
 
+@skip_pre_blackwell
 @requires_release_checkpoint
 @requires_cuda
 @pytest.mark.parametrize("stem", _EQUIVALENCE_STEMS)

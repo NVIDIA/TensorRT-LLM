@@ -32,6 +32,11 @@ from tensorrt_llm.mapping import Mapping
 
 from ._utils import _prediction_reference, _run_indexer, _run_modes, _selection_state
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 def _reference_select_candidate_positions(
     scores: torch.Tensor,
@@ -159,6 +164,7 @@ def test_projection_free_lifecycle(layer_idx):
         indexer.pre_indexer_proj(None, None, None)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("per_query", [False, True])
 @pytest.mark.parametrize("heads", [2, 8, 32, 64])
@@ -201,6 +207,7 @@ def test_prepared_packed_selection(per_query, heads):
         )
 
 
+@skip_pre_blackwell
 def test_prepared_hierarchy_and_graph():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -268,6 +275,7 @@ def test_prepared_hierarchy_and_graph():
         torch.testing.assert_close(actual, expected)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [8, 32, 64])
 def test_prepared_bmm_fallback(monkeypatch, heads):
@@ -311,6 +319,7 @@ def test_prepared_bmm_fallback(monkeypatch, heads):
     torch.testing.assert_close(replayed, expected)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("use_fp4", [False, True])
 def test_prepared_default_row_local(use_fp4):
@@ -410,6 +419,7 @@ def test_short_sequence_skip_preserves_candidate_scores(monkeypatch, has_hook):
     )
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("implementation", ["dsl", "self_sampling"])
 @pytest.mark.parametrize("is_prefill", [False, True])
 def test_topk_opt_in_native_and_graph(implementation, is_prefill):
@@ -463,6 +473,7 @@ def test_topk_opt_in_native_and_graph(implementation, is_prefill):
             torch.testing.assert_close(output[row].long().sort().values, expected.sort().values)
 
 
+@skip_pre_blackwell
 def test_self_sampling_mqa_selection_and_graph():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Self-sampling GVR requires SM100")
@@ -546,7 +557,7 @@ def _publish_candidate_rows(indexer, scores, lengths):
     return results[0]
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=skip_pre_blackwell)])
 @pytest.mark.parametrize("width,block_size", [(32, 4), (30, 4), (33, 8), (64, 8), (17, 3)])
 @pytest.mark.parametrize("topk_blocks", [1, 2, 3, 5, 99])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -634,6 +645,7 @@ def test_candidate_selector_survives_warmup_and_draft_bounds():
         indexer._publish_candidates(torch.ones(1, 17), torch.tensor([17]), {}, 0, 1, 16)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_candidate_selector_keeps_captured_graphs_across_metadata_bounds():
     layout = CSA2Layout(
@@ -767,6 +779,7 @@ def _assert_selection(actual, scores, valid):
             assert bool((scores[row, selected] >= cutoff - 0.005).all())
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_cached_prefix_chunks_gather_once_and_preserve_offsets(monkeypatch):
@@ -828,6 +841,7 @@ def test_cached_prefix_chunks_gather_once_and_preserve_offsets(monkeypatch):
     _assert_selection(out, scores, torch.arange(80, device="cuda")[None] < visible[:, None])
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [1, 2])
 @torch.inference_mode()
@@ -948,6 +962,7 @@ def test_native_paged_owner_indexer_and_graph(monkeypatch, ratio):
         indexer(state, 1, 2)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("count", [5, 1])
 # chunk_size 2 makes the source and consumer layers split queries across ranks differently.
@@ -1129,6 +1144,7 @@ def _assert_state_selection(output, state, owner):
     _assert_selection(output, scores, valid)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_gathered_decode_graph_grows_past_warmup_prefix(monkeypatch):
@@ -1170,6 +1186,7 @@ def test_gathered_decode_graph_grows_past_warmup_prefix(monkeypatch):
     assert bool((manager.storage == 77).all())
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_paged_metadata_eager_growth_reuses_bounded_arena():
@@ -1208,6 +1225,7 @@ def test_paged_metadata_eager_growth_reuses_bounded_arena():
     assert len(metadata._csa2_indexer_workspaces) == 1
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_graph_switches_ratio_two_and_one_owner():
@@ -1257,6 +1275,7 @@ def test_native_graph_switches_ratio_two_and_one_owner():
     assert len(metadata._csa2_indexer_workspaces) == 1
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_paged_descriptors_refresh_when_the_manager_changes():
@@ -1278,6 +1297,7 @@ def test_paged_descriptors_refresh_when_the_manager_changes():
     assert metadata.csa2_indexer_block_table.tolist() == [[3, 2]]
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("heads", [2, 8, 16, 32, 64])
 @pytest.mark.parametrize("use_dsl", [False, True])
@@ -1427,6 +1447,7 @@ def _temporal_gvr_case(monkeypatch, emission, *, page_holes=False, candidate_sou
             assert bool(((candidates < 0) | (slots >= 0)).all())
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("emission", [False, True])
 @torch.inference_mode()
@@ -1434,6 +1455,7 @@ def test_temporal_gvr_prior_rewind_epoch_and_graph(monkeypatch, emission):
     _temporal_gvr_case(monkeypatch, emission)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("candidate_source", [False, True])
 @torch.inference_mode()
@@ -1441,6 +1463,7 @@ def test_emission_masks_page_holes_and_signed_scores(monkeypatch, candidate_sour
     _temporal_gvr_case(monkeypatch, True, page_holes=True, candidate_source=candidate_source)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_packed_query_state_avoids_requantization(monkeypatch):
@@ -1476,6 +1499,7 @@ def test_packed_query_state_avoids_requantization(monkeypatch):
     assert not calls
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", ["eager", "bounded_graph", "growing_graph"])
 @torch.inference_mode()
@@ -1523,6 +1547,7 @@ def test_decode_short_skip_respects_graph_admission(monkeypatch, mode):
     assert bool(calls) == (mode == "growing_graph")
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_short_candidate_source_still_computes_block_scores(monkeypatch):
@@ -1558,6 +1583,7 @@ def test_short_candidate_source_still_computes_block_scores(monkeypatch):
     _assert_state_selection(output, state, 0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("query_width", [3, 17])
 @torch.inference_mode()
@@ -1750,6 +1776,7 @@ def test_full_reuse_reindex_private_swa_and_shared_sink():
         _prediction_reference(layout, 1, q, q[:, 0], torch.zeros(1), batch)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_all_modes_cuda_graph_changed_routing():
     # Preserve the independent analytical oracle before exercising replay changes.
@@ -1964,6 +1991,7 @@ def _check_candidate_multiset(output, scores, candidates, tolerance):
         torch.testing.assert_close(actual, expected, atol=tolerance, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mixed", [False, True])
 @torch.inference_mode()
@@ -2010,6 +2038,7 @@ def test_candidate_decode_batched_exact_and_mixed(monkeypatch, mixed):
     torch.testing.assert_close(wider_scores, scores, atol=0, rtol=2**-7)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_candidate_decode_batched_graph_refresh(monkeypatch):
@@ -2046,6 +2075,7 @@ def test_candidate_decode_batched_graph_refresh(monkeypatch):
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("phase", ["decode", "prefill"])
 @torch.inference_mode()
@@ -2126,6 +2156,7 @@ def _candidate_prefill_run(indexer, state, monkeypatch, old):
     return (*result, shapes, gathers)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_candidate_shared_prefill_exact_and_mixed(monkeypatch):
@@ -2172,6 +2203,7 @@ def test_candidate_shared_prefill_tile_bounds(monkeypatch):
     assert indexer._candidate_prefill_tile_size(0) == 512
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "count,layout_name",
@@ -2282,6 +2314,7 @@ def test_query_pack_reuses_exact_index_quantizer(count, layout_name, monkeypatch
     torch.testing.assert_close(captured, pack_rows(query, "index"), atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_constant_rows_retained_only_for_captured_graphs():
     """Eager constants are transient; rows a graph captured stay alive across geometries."""
@@ -2375,6 +2408,7 @@ def test_publish_candidates_sparse_blocks(block_size, sparse_block):
         )
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block_size,topk_blocks", [(8, 4), (16, 3), (8, 99)])
 @torch.inference_mode()
@@ -2398,6 +2432,7 @@ def test_publish_candidates_sparse_blocks_cuda_matches_torch(block_size, topk_bl
         torch.testing.assert_close(value, reference, atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not _sparse_kernels_available(), reason="DeepGEMM sparse MQA on SM100")
 @torch.inference_mode()
 def test_sparse_candidate_paged_decode_and_graph(monkeypatch):

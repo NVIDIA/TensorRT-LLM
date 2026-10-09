@@ -222,7 +222,10 @@ def test_v4_target_top6_routing_keeps_fused_kernel(experts, monkeypatch):
     assert fused.call_args.args[9:] == (None, None)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires a GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
 def test_v41_draft_top3_routing_cuda_graph_replay():
     logits = torch.randn(17, 128, dtype=torch.bfloat16, device="cuda")
     routing = _draft_routing(torch.linspace(-1, 1, 128, device="cuda"))

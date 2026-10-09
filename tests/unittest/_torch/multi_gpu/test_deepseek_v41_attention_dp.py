@@ -941,6 +941,7 @@ def _run_dp_decoder_replay() -> None:
         set_per_request_prefill_cuda_graph_flag(previous_graph_flag)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("parallel_moe_executor", [pytest.param(2, id="world2")], indirect=True)
 def test_attention_dp_decoder_bounded_replay(parallel_moe_executor: MPIPoolExecutor | None) -> None:
     """Encoder recovery and decoder compaction preserve CSA2 and sharded MoE results."""

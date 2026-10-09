@@ -19,6 +19,7 @@ from _deepseek_v41_test_utils import (
 )
 from _deepseek_v41_test_utils import cache_config as shared_cache_config
 from _deepseek_v41_test_utils import model_and_config as global_model_and_config
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheRole
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
@@ -28,6 +29,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+
+pytestmark = skip_pre_blackwell
 
 cache_config = shared_cache_config
 

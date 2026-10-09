@@ -28,6 +28,7 @@ from _torch.moe.quantize_utils import FP8BlockScalesQuantizeUtil, MXFP4MXFP8Quan
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers import PretrainedConfig
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
@@ -279,6 +280,7 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
                     reference_routed.check_accuracy(misordered, expected)
 
 
+@skip_pre_blackwell
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize(
     "parallel_moe_executor,ep_size,attention_dp",

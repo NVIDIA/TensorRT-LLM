@@ -25,6 +25,11 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DSparkDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 
 @pytest.mark.parametrize("disk_bytes", [0, 1 << 30])
 @pytest.mark.parametrize("custom_codec", [False, True])
@@ -117,6 +122,7 @@ def allocate(manager, request_id, tokens, capacity):
     return cache
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("manager", ["", "nan"], indirect=True, ids=["unguarded", "guarded"])
 def test_warmup_cache_cleanup_preserves_swa_guards(manager) -> None:
     allocate(manager, 90, [], 129)
@@ -162,6 +168,7 @@ def test_warmup_cache_cleanup_preserves_swa_guards(manager) -> None:
     assert not manager.check_invalid_values_in_kv_cache()
 
 
+@skip_pre_blackwell
 def test_owner_views_and_lifecycle(manager):
     cache = allocate(manager, 10, [], 513)
     assert (
@@ -215,6 +222,7 @@ def test_owner_views_and_lifecycle(manager):
     assert manager.get_cache_indices(11, 1, CSA2CacheRole.GLOBAL)
 
 
+@skip_pre_blackwell
 def test_prefix_reuse_preserves_combined_records(manager):
     tokens = list(range(512))
     first = allocate(manager, 20, [], len(tokens))
@@ -245,6 +253,7 @@ def test_prefix_reuse_preserves_combined_records(manager):
     torch.testing.assert_close(pool[pages3[4]], torch.full_like(pool[pages3[4]], 19))
 
 
+@skip_pre_blackwell
 def test_partial_page_copy_on_write_and_state(manager):
     tokens = list(range(129))
     source = allocate(manager, 30, [], 129)
@@ -275,6 +284,7 @@ def test_partial_page_copy_on_write_and_state(manager):
     assert manager.get_cache_indices(31, 1, CSA2CacheRole.GLOBAL)[1] >= 0
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("enable_scratch", [False, True])
 def test_cache_manager_preserves_disabled_or_enabled_scratch_config(enable_scratch):
     if not torch.cuda.is_available():
@@ -312,6 +322,7 @@ def test_cache_manager_preserves_disabled_or_enabled_scratch_config(enable_scrat
         manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("fallback", ["scratch", "attention_dp", "disaggregated", "late_engram"])
 @pytest.mark.parametrize("partial_reuse", [False, True])
 def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_reuse):
@@ -518,6 +529,7 @@ def _spec_cleanup(manager):
     manager.shutdown()
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("block", [128, 256])
 def test_first_verification_step_tolerates_the_overlap_tail(block):
@@ -548,6 +560,7 @@ def test_first_verification_step_tolerates_the_overlap_tail(block):
         _spec_cleanup(manager)
 
 
+@skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("overlap", [False, True])
 def test_linear_verification_steps_stay_resolvable(overlap):

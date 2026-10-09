@@ -1669,6 +1669,7 @@ def _assert_coeffs_match_reference(module: mHC, x: torch.Tensor, what: str):
     torch.testing.assert_close(columns, torch.ones_like(columns), rtol=0, atol=1e-5)
 
 
+@skip_pre_blackwell
 @requires_cuda
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
 def test_coeffs_match_reference_transcription(num_tokens: int):
@@ -1677,6 +1678,7 @@ def test_coeffs_match_reference_transcription(num_tokens: int):
     _assert_coeffs_match_reference(module, _residual(num_tokens), f"synthetic/{num_tokens}")
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 @pytest.mark.parametrize("kind", ["attn", "ffn"])
@@ -1701,6 +1703,7 @@ def test_coeffs_match_reference_on_release_weights(kind: str, num_tokens: int):
     )
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_sinkhorn_asymmetry_and_iteration_count_on_release_weights():
@@ -1751,6 +1754,7 @@ def test_sinkhorn_asymmetry_and_iteration_count_on_release_weights():
         )
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 def test_post_mult_and_norm_eps_are_discriminated():
@@ -1809,6 +1813,7 @@ def test_post_mult_and_norm_eps_are_discriminated():
     )
 
 
+@skip_pre_blackwell
 @requires_cuda
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
 def test_lagged_reduces_to_pre_mapping(num_tokens: int):
@@ -1825,6 +1830,7 @@ def test_lagged_reduces_to_pre_mapping(num_tokens: int):
     _assert_bf16_within_one_ulp(layer_input, layer_input_ref, "layer_input")
 
 
+@skip_pre_blackwell
 @requires_cuda
 @requires_release_checkpoint
 @pytest.mark.parametrize("kind", ["attn", "ffn"])
@@ -1842,6 +1848,7 @@ def test_lagged_reduces_to_pre_mapping_on_release_weights(kind: str):
     _assert_bf16_within_one_ulp(layer_input, layer_input_ref, "layer_input")
 
 
+@skip_pre_blackwell
 @requires_cuda
 def test_lagged_consumes_the_external_pre():
     """``layer_input`` must depend on the supplied ``pre_mix``, not on the own one."""
@@ -1862,6 +1869,7 @@ def test_lagged_consumes_the_external_pre():
     )
 
 
+@skip_pre_blackwell
 @requires_cuda
 @pytest.mark.parametrize("num_tokens", [1, 17, 128])
 def test_fused_hc_lagged_matches_eager_composition(num_tokens: int):
@@ -1893,6 +1901,7 @@ def test_fused_hc_lagged_matches_eager_composition(num_tokens: int):
     torch.testing.assert_close(layer_input.float(), li_ref.float(), rtol=2e-2, atol=2e-2)
 
 
+@skip_pre_blackwell
 @requires_cuda
 def test_mixer_projection_kernel_matches_torch_fallback():
     """FMA kernel vs torch fallback, compared at tensor scale (mixed-sign dot products)."""
@@ -1926,6 +1935,7 @@ def _block(module_attn: mHC, module_ffn: mHC, x, pre_mix, sublayer, *, lagged: b
     return x, ffn_pre
 
 
+@skip_pre_blackwell
 @requires_cuda
 def test_lag_changes_the_block_output():
     """Lagged and unlagged block wiring must give different outputs."""

@@ -7,11 +7,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
 from tensorrt_llm._torch.modules.engram import engram as engram_module
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    skip_pre_blackwell,
+]
 
 
 @pytest.fixture

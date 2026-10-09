@@ -22,6 +22,11 @@ from _deepseek_v41_test_utils import model_and_config as global_model_and_config
 
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
 
+skip_pre_blackwell = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
+    reason="This test requires Blackwell or newer",
+)
+
 cache_config = shared_cache_config
 
 model_and_config = global_model_and_config
@@ -91,6 +96,7 @@ def independent_window_reference(model, metadata, ids, window=128, chunks=None):
     return model.logits_processor(hidden, model.lm_head, None, return_context_logits=True)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("recovering", [False, True])
 def test_prepared_encoder_replay_preserves_live_speculative_endpoints(
     cache_config, monkeypatch, recovering
@@ -174,6 +180,7 @@ def test_short_chunks_exclude_uninitialized_private_decoder_history(recovering):
         assert plan.swa_floors == [4872]
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("encoder_replay", [False, True])
 def test_dummy_forward_replays_with_or_without_requests(
     model_and_config, monkeypatch, encoder_replay
@@ -216,6 +223,7 @@ def test_dummy_forward_replays_with_or_without_requests(
         torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize("scratch", [False, True])
 @pytest.mark.parametrize("chunks", [(513,), (256, 257)])
 def test_full_context_outputs_preserve_full_prefill(model_and_config, monkeypatch, scratch, chunks):
@@ -264,6 +272,7 @@ def test_full_context_outputs_preserve_full_prefill(model_and_config, monkeypatc
         torch.testing.assert_close(outputs[1], outputs[0], atol=0.02, rtol=0.02)
 
 
+@skip_pre_blackwell
 def test_full_context_logits_after_truncated_peer(model_and_config, monkeypatch):
     model, config, sparse, dtype = model_and_config
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
@@ -330,6 +339,7 @@ def test_dspark_verification_retains_all_generation_rows(monkeypatch):
     assert plan.rows.tolist() == list(range(257, 519))
 
 
+@skip_pre_blackwell
 def test_final_window_mixed_batch_keeps_finished_context_and_generation(
     model_and_config, monkeypatch
 ):
@@ -356,6 +366,7 @@ def test_final_window_mixed_batch_keeps_finished_context_and_generation(
         torch.testing.assert_close(actual[1:], expected[1:], atol=0.02, rtol=0.02)
 
 
+@skip_pre_blackwell
 @pytest.mark.parametrize(
     "chunks", [(513,), (128, 128, 128, 128, 1), (127, 129, 127, 130), (1, 127)]
 )
