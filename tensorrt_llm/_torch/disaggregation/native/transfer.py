@@ -1243,7 +1243,9 @@ class Sender(SenderBase):
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
-                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+                            "_process_task_queue[%d]: delivering aux task to agent: %s",
+                            thread_idx,
+                            write_meta,
                         )
                         self._deliver_aux_to_agent(write_meta)
                     else:
