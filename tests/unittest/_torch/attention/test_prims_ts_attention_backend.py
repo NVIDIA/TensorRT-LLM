@@ -1373,15 +1373,32 @@ _CACHE_FREE_CASE = dict(
 )
 
 
-@pytest.mark.parametrize(("qk_dtype", "v_dtype"), [("bf16", "fp8"), ("fp8", "fp8")])
+@pytest.mark.parametrize(
+    ("qk_dtype", "v_dtype", "algorithm", "vc_repair_budget"),
+    [
+        ("bf16", "fp8", "primsts", 0.0),
+        ("fp8", "fp8", "primsts", 0.0),
+        ("bf16", "fp8", "vc_attention-qk16", 0.0),
+        ("bf16", "fp8", "vc_attention-qk16", 0.01),
+    ],
+)
 def test_prims_ts_cache_free_fp8_recipes(
-    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str
+    monkeypatch: pytest.MonkeyPatch,
+    qk_dtype: str,
+    v_dtype: str,
+    algorithm: str,
+    vc_repair_budget: float,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA."""
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
-    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype, algorithm="primsts")
+    recipe = QuantAttentionConfig(
+        qk_dtype=qk_dtype,
+        v_dtype=v_dtype,
+        algorithm=algorithm,
+        vc_repair_budget=vc_repair_budget,
+    )
     _build_trtllm_attention_with_recipe(monkeypatch, recipe)
     plans: list[dict] = []
     runs: list[dict] = []
@@ -1424,6 +1441,14 @@ def test_prims_ts_cache_free_fp8_recipes(
     def dequant_scale(x: torch.Tensor) -> torch.Tensor:
         return (x.float().abs().amax() / 448.0).reshape(1)
 
+    if algorithm == "vc_attention-qk16":
+        # The VC operands carry the V scale and tile means; no per-tensor scale is folded.
+        assert run_kwargs["vc"] is not None
+        assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
+        assert run_kwargs["output_scale"] is None
+        assert run_kwargs["scale_softmax_log2"] is None
+        torch.testing.assert_close(out, golden, atol=FP8_ATOL + BF16_ATOL, rtol=BF16_RTOL)
+        return
     # The quantize op returns BF16-rounded dequant scales.
     torch.testing.assert_close(
         run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0

@@ -57,7 +57,7 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..5dd3045f2355c1b6e81fd157661389e2bda363a3 100644
+index d1115ae3786e68cfc0f59a9c82cfffc4e2c8b58f..93587b56d0ee920783fc0337c88ed5a0bced98f5 100644
 --- a/context.py
 +++ b/context.py
 @@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
@@ -69,17 +69,17 @@ index dd9a29c3e36111a0de9a57c487068b6b5caa4ea2..5dd3045f2355c1b6e81fd157661389e2
 +now; their ``@flashinfer_experimental_api`` decorators do not register trace templates.
  """
  
- from dataclasses import dataclass
-@@ -46,7 +45,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
- 
- import torch
+ from dataclasses import dataclass, replace
+@@ -54,7 +53,7 @@ from .vc_attention import (
+     vc_scale_shapes,
+ )
  
 -from flashinfer.api_logging import flashinfer_experimental_api
 +from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
  
  if TYPE_CHECKING:
-@@ -488,7 +487,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -512,7 +511,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
