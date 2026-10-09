@@ -31,7 +31,6 @@ from tensorrt_llm._torch.speculative import SpecMetadata, get_num_extra_kv_token
 from tensorrt_llm._torch.speculative.dspark import DSparkSpecMetadata
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
-from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import helix_local_len, set_per_request_prefill_cuda_graph_flag
 from tensorrt_llm._utils import maybe_pin_memory, nvtx_range, prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
@@ -55,8 +54,9 @@ from ..common import (
     resolve_mrope_position_deltas_cache,
     ship_multimodal_indices,
 )
+from ..interface import PreparedInputs
 from .config import DecoderRunnerConfig
-from .speculative import set_spec_metadata_all_rank_num_tokens
+from .speculative import resolve_runtime_draft_len, set_spec_metadata_all_rank_num_tokens
 
 
 def uses_full_generation_page_table(
@@ -191,7 +191,7 @@ class DecoderInputPreparer:
         *,
         use_beam_search: bool,
         steady_gen_cache_supported: bool,
-        fast_path: Callable[..., tuple[dict[str, Any], torch.Tensor | None] | None],
+        fast_path: Callable[..., PreparedInputs | None],
         new_extra_inputs: Callable[[], ExtraInputsCollector],
         mm_item_scheduler: MultimodalItemScheduler | None = None,
     ) -> None:
@@ -391,7 +391,7 @@ class DecoderInputPreparer:
         attn_metadata: AttentionMetadata,
         new_tensors_device: SampleStateTensors,
         resource_manager: ResourceManager | None,
-    ):
+    ) -> PreparedInputs:
         """Prepare inputs for an unchanged generation-only batch.
 
         Every request advanced by exactly one committed token since the last
@@ -511,7 +511,7 @@ class DecoderInputPreparer:
             "multimodal_params": [],
             "resource_manager": resource_manager,
         }
-        return inputs, None
+        return PreparedInputs(inputs)
 
     def _build_multimodal_data_for_llm(
         self,
@@ -540,7 +540,7 @@ class DecoderInputPreparer:
         runtime_draft_len: int,
         is_dummy: bool,
         gather_context_logits: bool = False,
-    ) -> tuple[dict[str, Any], torch.Tensor | None, int]:
+    ) -> PreparedInputs:
         """
         Prepare inputs for Pytorch Model.
         """
@@ -577,16 +577,14 @@ class DecoderInputPreparer:
             enable_spec_decode=enable_spec_decode,
         )
         if fast_inputs is not None:
-            inputs, gather_ids = fast_inputs
-            return inputs, gather_ids, runtime_draft_len
+            return fast_inputs
 
         if not promoted_context_request_ids and self._can_use_steady_gen_fast_prepare(
             scheduled_requests, new_tokens_device, next_draft_tokens_device, spec_metadata, is_dummy
         ):
-            inputs, gather_ids = self._apply_steady_gen_fast_prepare(
+            return self._apply_steady_gen_fast_prepare(
                 kv_cache_manager, attn_metadata, new_tensors_device, resource_manager
             )
-            return inputs, gather_ids, runtime_draft_len
         # Any full pass invalidates the steady-state cache; it is re-recorded
         # at the end of this pass when the batch qualifies.
         self._steady_gen_cache = None
@@ -865,10 +863,7 @@ class DecoderInputPreparer:
                 f"{spec_config.decoding_type} does not support overlap scheduler"
             )
 
-        # For tree decoding, runtime_draft_len should match total tree
-        # tokens (not tree depth).  py_executor resets it every iteration.
-        if spec_config is not None and not spec_config.is_linear_tree:
-            runtime_draft_len = get_static_draft_len(spec_config)
+        runtime_draft_len = resolve_runtime_draft_len(spec_config, runtime_draft_len)
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -1778,7 +1773,7 @@ class DecoderInputPreparer:
         gather_ids_device = (
             self._buffers.gather_ids_cuda[: len(gather_ids)] if enable_spec_decode else None
         )
-        return inputs, gather_ids_device, runtime_draft_len
+        return PreparedInputs(inputs, gather_ids_device)
 
     @nvtx_range("_prepare_inputs")
     def prepare_inputs(
@@ -1798,7 +1793,7 @@ class DecoderInputPreparer:
         runtime_draft_len: int,
         is_dummy: bool,
         gather_context_logits: bool = False,
-    ) -> tuple[dict[str, Any], torch.Tensor | None, int]:
+    ) -> PreparedInputs:
         set_per_request_prefill_cuda_graph_flag(False)
         if self.mapping is not None and "cp_type" in self.mapping.cp_config:
             cp_type = self.mapping.cp_config["cp_type"]
@@ -1838,7 +1833,7 @@ class DecoderInputPreparer:
         if prepare_request_inputs is not None:
             prepare_request_inputs(scheduled_requests, attn_metadata, promoted_context_request_ids)
 
-        inputs, gather_ids, runtime_draft_len = self._prepare_tp_inputs(
+        prepared = self._prepare_tp_inputs(
             scheduled_requests,
             kv_cache_manager,
             attn_metadata,
@@ -1867,8 +1862,8 @@ class DecoderInputPreparer:
             or uses_private_decoder_cache(getattr(self.model, "model", None), kv_cache_manager)
             or any(encoder_replay_tokens(req) for req in scheduled_requests.context_requests)
         ):
-            inputs["context_requests"] = scheduled_requests.context_requests
-        return inputs, gather_ids, runtime_draft_len
+            prepared.kwargs["context_requests"] = scheduled_requests.context_requests
+        return prepared
 
     def _get_remote_tail_decode_rank_tokens(
         self, attn_metadata: AttentionMetadata, can_run_graph: bool

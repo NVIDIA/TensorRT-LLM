@@ -37,6 +37,8 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import \
     DecoderMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import \
     _make_single_token_context_graph_batch
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import \
+    PreparedInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
@@ -378,7 +380,7 @@ def _make_forward_only_engine(
     }
     decoder._inputs = SimpleNamespace(
         guided_decoder=None,
-        prepare_inputs=Mock(return_value=(prepared_inputs, None, 0)))
+        prepare_inputs=Mock(return_value=PreparedInputs(prepared_inputs)))
     outputs = {"logits": object()}
     decoder._forward_step = Mock(return_value=outputs)
     decoder._execute_logit_post_processors = Mock()
@@ -1132,7 +1134,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         self.assertEqual(
             semantic_attn_metadata.update_spec_dec_param.call_args.
             kwargs["num_contexts"], 1)
-        prepared_inputs = engine._runner._inputs.prepare_inputs.return_value[0]
+        prepared_inputs = engine._runner._inputs.prepare_inputs.return_value.kwargs
         runner.replay.assert_called_once_with(key,
                                               prepared_inputs,
                                               position_id_offsets=None)
@@ -1173,6 +1175,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine.enable_spec_decode = True
         engine._runner._config.spec_config = SimpleNamespace(
             is_linear_tree=False,
+            tokens_per_gen_step=8,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
         context = _make_request_stub(1)
         generation = _make_request_stub(2)
@@ -1379,13 +1382,12 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
             _make_forward_only_engine(None)
         engine.enable_spec_decode = True
         engine.runtime_draft_len = 2
+        # A non-linear tree widens the length to its total draft tokens after
+        # graph selection.
         engine._runner._config.spec_config = SimpleNamespace(
             is_linear_tree=False,
+            tokens_per_gen_step=8,
             get_runtime_tokens_per_gen_step=Mock(return_value=1))
-        prepared_inputs = engine._runner._inputs.prepare_inputs.return_value[0]
-        # Tree input preparation widens the length after graph selection.
-        engine._runner._inputs.prepare_inputs.return_value = (prepared_inputs,
-                                                              None, 7)
         batch = ScheduledRequests()
         batch.generation_requests = [_make_request_stub(2)]
 
@@ -2027,14 +2029,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         decoder.cuda_graph_runner.clear.assert_called_once_with()
         decoder.breakable_cuda_graph_runner.clear.assert_called_once_with()
 
-    def test_prepare_tp_inputs_fast_path_returns_call_draft_length(
-            self) -> None:
+    def test_prepare_tp_inputs_returns_steady_gen_fast_inputs(self) -> None:
         inputs = _input_preparer()
         inputs.guided_decoder = Mock()
         inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
-        prepared_inputs = {"prepared": True}
-        inputs._apply_steady_gen_fast_prepare = Mock(
-            return_value=(prepared_inputs, None))
+        fast_inputs = PreparedInputs({"prepared": True})
+        inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
         batch = ScheduledRequests()
         new_tokens = torch.zeros(1)
 
@@ -2047,7 +2047,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             runtime_draft_len=3,
             is_dummy=True)
 
-        self.assertEqual(result, (prepared_inputs, None, 3))
+        self.assertIs(result, fast_inputs)
         inputs.guided_decoder.add_batch.assert_called_once_with(
             batch, new_tokens=new_tokens, runtime_draft_len=3)
         inputs._can_use_steady_gen_fast_prepare.assert_called_once_with(
@@ -2117,7 +2117,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           device="cuda"),
         )
 
-        inputs, _, runtime_draft_len = model_engine._runner._inputs._prepare_tp_inputs(
+        prepared = model_engine._runner._inputs._prepare_tp_inputs(
             scheduled_requests=graph_batch,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
@@ -2130,6 +2130,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             is_dummy=False,
         )
 
+        inputs = prepared.kwargs
         self.assertEqual(inputs["input_ids"][:2].cpu().tolist(), [44, 777])
         self.assertEqual(inputs["position_ids"][0, :2].cpu().tolist(), [3, 4])
         self.assertEqual(attn_metadata.request_ids,
@@ -2143,7 +2144,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             model_engine._runner._buffers.previous_pos_id_offsets_cuda[:2].cpu(
             ).tolist(), [0, 1])
         self.assertEqual(attn_metadata.num_contexts, 0)
-        self.assertEqual(runtime_draft_len, 0)
         self.assertEqual(spec_metadata.request_ids,
                          [context.py_request_id, generation.py_request_id])
         self.assertFalse(generation.py_needs_onehot_draft_probs)
@@ -2699,13 +2699,13 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         model_engine._runner._buffers.previous_batch_indices_cuda = torch.zeros(
             max_num_tokens, dtype=torch.int32, device='cuda')
 
-        result, _, _ = model_engine._runner._inputs._prepare_tp_inputs(
+        result = model_engine._runner._inputs._prepare_tp_inputs(
             scheduled_requests=scheduled_requests,
             kv_cache_manager=kv_cache_manager,
             attn_metadata=attn_metadata,
             enable_spec_decode=False,
             runtime_draft_len=0,
-            is_dummy=False)
+            is_dummy=False).kwargs
 
         # Verify expected keys are present.
         self.assertIsNotNone(result)
@@ -2802,13 +2802,14 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                                token_nums=[257],
                                                is_gen=False))
                 try:
-                    inputs, _, _ = engine._runner._inputs.prepare_inputs(
+                    prepared = engine._runner._inputs.prepare_inputs(
                         scheduled,
                         manager,
                         metadata,
                         enable_spec_decode=False,
                         runtime_draft_len=0,
                         is_dummy=warmup)
+                    inputs = prepared.kwargs
                     self.assertEqual(inputs['context_requests'],
                                      scheduled.context_requests)
                     self.assertTrue(inputs['context_requests'][0].is_dummy)
@@ -2855,7 +2856,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                           dtype=torch.int32,
                                           device='cuda')
                 try:
-                    inputs, gather_ids, _ = engine._runner._inputs.prepare_inputs(
+                    prepared = engine._runner._inputs.prepare_inputs(
                         scheduled,
                         manager,
                         metadata,
@@ -2864,6 +2865,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                         enable_spec_decode=False,
                         runtime_draft_len=0,
                         is_dummy=False)
+                    inputs, gather_ids = prepared.kwargs, prepared.gather_ids
                     expected_context = list(range(3872, 5000)) if mixed else []
                     self.assertEqual(
                         inputs['input_ids'].cpu().tolist(),

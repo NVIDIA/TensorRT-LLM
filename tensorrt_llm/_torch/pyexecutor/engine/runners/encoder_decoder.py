@@ -48,7 +48,7 @@ from .common import (
 )
 from .decoder import DecoderRunner, DecoderRunnerConfig, ExtraInputsCollector
 from .encoder import EncoderConfigMixin, EncoderMixin, EncoderPreparedInputs
-from .interface import RunnerConfig, ScheduledInputs
+from .interface import PreparedInputs, RunnerConfig, ScheduledInputs
 
 
 @dataclass(frozen=True)
@@ -648,7 +648,7 @@ class EncoderDecoderRunner(DecoderRunner):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
         attn_metadata = self._metadata.set_up_attn(kv_cache_manager, draft_kv_cache_manager)
         with self._graphs.no_cuda_graph():
-            projection_inputs, _, _ = self._inputs.prepare_inputs(
+            projection_inputs = self._inputs.prepare_inputs(
                 projection_batch,
                 kv_cache_manager,
                 attn_metadata,
@@ -659,7 +659,7 @@ class EncoderDecoderRunner(DecoderRunner):
                 enable_spec_decode=enable_spec_decode,
                 runtime_draft_len=runtime_draft_len,
                 is_dummy=True,
-            )
+            ).kwargs
             self._populate_cross_kv_cache(projection_inputs)
         torch.cuda.synchronize()
 
@@ -827,7 +827,7 @@ class EncoderDecoderRunner(DecoderRunner):
         *,
         promoted_context_request_ids: frozenset[int],
         enable_spec_decode: bool,
-    ) -> tuple[dict[str, Any], torch.Tensor | None] | None:
+    ) -> PreparedInputs | None:
         if (
             not promoted_context_request_ids
             and type(attn_metadata) is TrtllmAttentionMetadata
@@ -1297,7 +1297,7 @@ class EncoderDecoderRunner(DecoderRunner):
         attn_metadata: AttentionMetadata,
         new_tokens_device: torch.Tensor,
         resource_manager: ResourceManager | None,
-    ):
+    ) -> PreparedInputs:
         """Prepare a simple BART batch with native collation and reused buffers."""
         buffers = self._acquire_encoder_decoder_host_buffers()
         position_id_offset = self._encoder_decoder_position_id_offset
@@ -1477,4 +1477,4 @@ class EncoderDecoderRunner(DecoderRunner):
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream())
         buffers["event"] = event
-        return inputs, None
+        return PreparedInputs(inputs)

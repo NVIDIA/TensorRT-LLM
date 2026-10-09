@@ -77,7 +77,7 @@ from ..common import (
     moe_a2a_steady_state_budget_for_capture,
     prepare_multimodal_indices,
 )
-from ..interface import ScheduledInputs, ScheduledModelRunner
+from ..interface import PreparedInputs, ScheduledInputs, ScheduledModelRunner
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .graphs import DecoderCudaGraphs
@@ -88,7 +88,7 @@ from .inputs import (
     ExtraInputsCollector,
 )
 from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
-from .speculative import get_spec_managers, update_spec_metadata
+from .speculative import get_spec_managers, resolve_runtime_draft_len, update_spec_metadata
 from .warmup import WarmupAgreement
 
 
@@ -1799,8 +1799,8 @@ class DecoderRunner(ScheduledModelRunner):
         *,
         promoted_context_request_ids: frozenset[int],
         enable_spec_decode: bool,
-    ) -> tuple[dict[str, Any], torch.Tensor | None] | None:
-        """Return ``(inputs, gather_ids)`` when a specialized path prepares the batch."""
+    ) -> PreparedInputs | None:
+        """Return the prepared inputs when a specialized path prepares the batch."""
         return None
 
     def _new_extra_inputs(self) -> "ExtraInputsCollector":
@@ -1870,8 +1870,8 @@ class DecoderRunner(ScheduledModelRunner):
         )
         graph_requests = scheduled_requests
         promoted_context_request_ids: frozenset[int] = frozenset()
-        # Non-linear tree input preparation expands runtime_draft_len to the
-        # total tree width after graph selection. Only linear-tree zero-draft
+        # Non-linear tree decoding expands runtime_draft_len to the total
+        # tree width after graph selection. Only linear-tree zero-draft
         # iterations can therefore safely reuse a zero-draft graph.
         can_promote_spec_decode = not enable_spec_decode or (
             runtime_draft_len == 0
@@ -1998,7 +1998,7 @@ class DecoderRunner(ScheduledModelRunner):
                 execution_promoted_context_ids,
                 enable_spec_decode=enable_spec_decode,
             ):
-                inputs, gather_ids, runtime_draft_len = self._inputs.prepare_inputs(
+                prepared = self._inputs.prepare_inputs(
                     execution_requests,
                     kv_cache_manager,
                     attn_metadata,
@@ -2014,6 +2014,10 @@ class DecoderRunner(ScheduledModelRunner):
                     is_dummy=is_dummy,
                     gather_context_logits=gather_context_logits,
                 )
+            inputs = prepared.kwargs
+            runtime_draft_len = resolve_runtime_draft_len(
+                self._config.spec_config if enable_spec_decode else None, runtime_draft_len
+            )
             if execution_promoted_context_ids:
                 self.iter_states["num_ctx_requests"] = scheduled_requests.num_context_requests
                 self.iter_states["num_ctx_tokens"] = sum(
@@ -2036,7 +2040,7 @@ class DecoderRunner(ScheduledModelRunner):
                             enable_spec_decode=enable_spec_decode,
                             runtime_draft_len=runtime_draft_len,
                             is_dummy=is_dummy,
-                            gather_ids=gather_ids,
+                            gather_ids=prepared.gather_ids,
                             gather_context_logits=gather_context_logits,
                         )
 
@@ -2074,7 +2078,7 @@ class DecoderRunner(ScheduledModelRunner):
                                     enable_spec_decode=enable_spec_decode,
                                     runtime_draft_len=runtime_draft_len,
                                     is_dummy=is_dummy,
-                                    gather_ids=gather_ids,
+                                    gather_ids=prepared.gather_ids,
                                     gather_context_logits=gather_context_logits,
                                 )
 

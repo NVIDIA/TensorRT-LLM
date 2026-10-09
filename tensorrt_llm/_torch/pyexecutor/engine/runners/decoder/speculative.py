@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
+from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm._torch.pyexecutor.resource_manager import BaseResourceManager, ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .config import DecoderRunnerConfig
 
@@ -27,6 +29,19 @@ def get_spec_managers(
         ResourceManagerType.SPEC_RESOURCE_MANAGER
     )
     return spec_resource_manager, getattr(spec_resource_manager, "spec_tree_manager", None)
+
+
+def resolve_runtime_draft_len(
+    spec_config: DecodingBaseConfig | None, runtime_draft_len: int
+) -> int:
+    """Return the draft length a decoder step prepares and runs with.
+
+    For tree decoding it matches the total tree tokens, not the tree depth;
+    py_executor resets it every iteration.
+    """
+    if spec_config is not None and not spec_config.is_linear_tree:
+        return get_static_draft_len(spec_config)
+    return runtime_draft_len
 
 
 def create_spec_metadata(
