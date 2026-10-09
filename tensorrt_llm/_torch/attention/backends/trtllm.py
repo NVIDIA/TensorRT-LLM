@@ -54,7 +54,10 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
+from .fmha.beam_shared_prefix import LIB_NAME as BEAM_SHARED_PREFIX_LIB
+from .fmha.beam_shared_prefix import plan_step as beam_shared_prefix_plan_step
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -1374,6 +1377,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                 int(manager.kv_offset[pool_id]),
                                 pool_block_offsets[:, 1],
                                 out=pool_block_offsets[:, 1])
+
+        # Per-step host planning of the opt-in wide-beam generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        if self.beam_width > 1 and is_fmha_lib_enabled(BEAM_SHARED_PREFIX_LIB):
+            beam_shared_prefix_plan_step(self)
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
