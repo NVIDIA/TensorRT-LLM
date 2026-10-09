@@ -56,15 +56,22 @@ _REAL = textwrap.dedent("""
 _REAL_MOE = textwrap.dedent("""
     import sys, torch
     from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
     g, m, n, k, expected_m = map(int, sys.argv[1:6])
     a = torch.randn(g, m, k, device="cuda").to(torch.float8_e4m3fn)
     b = torch.randn(g, n, k, device="cuda").to(torch.float8_e4m3fn)
-    # FP32 scales; DeepGEMM casts them to packed UE8M0 itself on SM100.
-    sfa = torch.ones(g, m, (k + 127) // 128, device="cuda")
-    sfb = torch.ones(g, (n + 127) // 128, (k + 127) // 128, device="cuda")
+    # Packed UE8M0 scales, as DeepGemmFusedMoE passes them: FP32 scales would
+    # make DeepGEMM JIT a separate SF-packing kernel the MoE path never runs.
+    sfa = transform_sf_into_required_layout(
+        torch.ones(g, m, (k + 127) // 128, device="cuda"), mn=m, k=k,
+        recipe=(1, 128, 128), num_groups=g, is_sfa=True)
+    sfb = transform_sf_into_required_layout(
+        torch.ones(g, (n + 127) // 128, (k + 127) // 128, device="cuda"), mn=n, k=k,
+        recipe=(1, 128, 128), num_groups=g, is_sfa=False)
     d = torch.empty(g, m, n, device="cuda", dtype=torch.bfloat16)
     masked_m = torch.full((g,), min(m, expected_m), device="cuda", dtype=torch.int32)
-    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m)
+    deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb), d, masked_m, expected_m,
+                                           disable_ue8m0_cast=True)
     torch.cuda.synchronize()
 """)
 

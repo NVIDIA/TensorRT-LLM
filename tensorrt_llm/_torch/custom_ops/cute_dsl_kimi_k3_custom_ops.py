@@ -157,6 +157,17 @@ def _cute_int_type(dtype):
 
 # ========== Fused K1+K2+K3 compilation cache ==========
 _fused_k123_cache = {}
+
+# Set by JitPrefetcher: (cache_key) -> compiled function exported by a CPU-only
+# helper, or None to compile here as usual.
+k123_loader = None
+
+
+def _jit_prefetch_load_k123(cache_key):
+    loader = k123_loader
+    return loader(cache_key) if loader is not None else None
+
+
 # id(cu_seqlens) -> bool. Skips per-call GPU->CPU sync on subsequent calls
 # when the same cu_seqlens tensor is reused (typical training/inference loop).
 _varlen_pure_cache = {}
@@ -793,7 +804,10 @@ def _launch_fused_k123_inv(
             use_beta_sigmoid=use_beta_sigmoid_in_kernel,
             varlen_pure=varlen_pure,
         )
-        _fused_k123_cache[cache_key] = cute.compile(host_fn, *ct_args)
+        loaded = _jit_prefetch_load_k123(cache_key)
+        _fused_k123_cache[cache_key] = (
+            loaded if loaded is not None else cute.compile(host_fn, *ct_args)
+        )
     k123_fn = _fused_k123_cache[cache_key]
     k123_fn(*ct_args)
 

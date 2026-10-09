@@ -371,6 +371,8 @@ class _Stats:
     dg_helper_built: int = 0
     dg_executor_compiles: int = 0
     dg_executor_compile_s: float = 0.0
+    cd_loaded: int = 0
+    cd_executor_compiles: int = 0
     events: List[str] = field(default_factory=list)
 
 
@@ -397,6 +399,7 @@ class JitPrefetcher:
         self._recorded: set = set()
         self._replay: List[Tuple[str, str, str]] = []
         self._replay_dg: List[str] = []
+        self._replay_cd: List[str] = []
         self._tag = 0
         self._lock = threading.Lock()
         self._procs = []
@@ -406,6 +409,8 @@ class JitPrefetcher:
         self._queues: Dict[str, Any] = {}
         self._dg = None  # DeepGEMM provider (jit_prefetch_deep_gemm)
         self._dg_moe = None
+        self._cd = None  # CuTe DSL KDA provider (jit_prefetch_cute_dsl)
+        self._cd_dir = None
 
         self._executor_thread: Optional[int] = None
         self._ready: Dict[int, threading.Event] = {}
@@ -670,6 +675,89 @@ class JitPrefetcher:
             self.stats.dg_planned += 1
             self._submit(spec, spec, "deep_gemm", _PRIO_BATCH, kind=jdg.KIND)
         self.stats.plan_s += time.perf_counter() - t0
+
+    def enable_cute_dsl(self, kda_provider) -> bool:
+        """Start CuTe DSL helpers and install the executor-side loader.
+
+        Helpers compile from fake tensors for this rank's arch and export
+        ``<dir>/<key>.o``; at the point the KDA op would call ``cute.compile``
+        the loader loads that file instead, waiting for an in-flight helper
+        compile of the same variant rather than compiling it again.
+        """
+        import sys
+
+        from . import jit_prefetch_cute_dsl as jcd
+        from .custom_ops import cute_dsl_kimi_k3_custom_ops as kda_ops
+
+        if not self.prefetch or self._cd is not None or not kda_provider:
+            return False
+        out_dir = os.environ.get("TLLM_JIT_CUTE_DSL_DIR") or os.path.join(
+            os.environ.get("TRITON_CACHE_DIR") or os.path.expanduser("~/.cache"),
+            "..",
+            "cute_dsl_aot",
+            jcd.gpu_arch(),
+        )
+        out_dir = os.path.abspath(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        self._cd_dir = out_dir
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_", "UCX_", "MPI_"))
+        }
+        env.update(CUDA_VISIBLE_DEVICES="", PYTHONNOUSERSITE="1")
+        helper = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "jit_prefetch_cute_dsl_helper.py"
+        )
+        # Each compile is seconds and the variant set is tiny: a few helpers.
+        n = max(1, int(os.environ.get("TLLM_JIT_PREFETCH_CD_WORKERS", "2")))
+        self._queues[jcd.KIND] = queue.PriorityQueue()
+        self._spawn(jcd.KIND, [sys.executable, "-u", helper, jcd.gpu_arch(), out_dir], env, n)
+        self._cd = kda_provider
+        wait_timeout_s = float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300"))
+
+        def _loader(cache_key):
+            spec = jcd.k123_spec_from_cache_key(cache_key)
+            if spec is None:
+                return None
+            ev = self._key_event.get(spec)
+            if ev is not None and not ev.is_set():
+                self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
+                t0 = time.perf_counter()
+                ev.wait(wait_timeout_s)
+                dt = time.perf_counter() - t0
+                self.stats.wait_n += 1
+                self.stats.wait_s += dt
+                self._event(f"WAIT for helper cute_dsl {dt * 1e3:.0f} ms")
+            fn = jcd.load(spec, out_dir)
+            if fn is None:
+                if threading.get_ident() == self._executor_thread:
+                    self.stats.cd_executor_compiles += 1
+                    self._event(f"CuTe DSL compile on executor (not prefetched): {spec}")
+                self._record(jcd.KIND, "cute_dsl", spec)
+            else:
+                self.stats.cd_loaded += 1
+            return fn
+
+        kda_ops.k123_loader = _loader
+        for spec in kda_provider.enumerate_specs() + self._replay_cd:
+            self._submit(spec, spec, "cute_dsl", _PRIO_BATCH, kind=jcd.KIND)
+        self._event(
+            f"CuTe DSL prefetch: {len(kda_provider.cfgs)} KDA config(s), {n} helper(s), "
+            f"{out_dir}, replaying {len(self._replay_cd)}"
+        )
+        return True
+
+    def plan_cute_dsl(self, ctx_chunk_lens) -> None:
+        """Move the K123 variant this batch needs to the front of the queue."""
+        if self._cd is None:
+            return
+        from . import jit_prefetch_cute_dsl as jcd
+
+        for spec in self._cd.plan(ctx_chunk_lens):
+            ev = self._key_event.get(spec)
+            if ev is not None and not ev.is_set():
+                self._submit(spec, spec, "cute_dsl", _PRIO_URGENT, kind=jcd.KIND)
 
     def _enumerate_dg(self) -> None:
         """Queue every M window up to max_num_tokens, at background priority."""
@@ -1004,6 +1092,8 @@ class JitPrefetcher:
                         self._replay.append((key, spec, str(rec.get("name", "?"))))
                     elif kind == "deep_gemm":
                         self._replay_dg.append(spec)
+                    elif kind == "cute_dsl":
+                        self._replay_cd.append(spec)
         self._record_fh = open(path, mode)
         if mode == "w":
             self._record_fh.write(json.dumps(header) + "\n")
@@ -1034,6 +1124,7 @@ class JitPrefetcher:
             f" dg_planned={s.dg_planned} dg_unplanned={s.dg_unplanned} dg_helper_built={s.dg_helper_built}"
             f" dg_executor_compiles={s.dg_executor_compiles}"
             f" dg_executor_compile_s={s.dg_executor_compile_s:.3f}"
+            f" cd_loaded={s.cd_loaded} cd_executor_compiles={s.cd_executor_compiles}"
         )
 
     def shutdown(self):

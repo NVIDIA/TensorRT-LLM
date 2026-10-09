@@ -1482,6 +1482,12 @@ class PyTorchModelEngine(ModelEngine):
             dg_moe = jdg.DeepGemmMoEProvider(self.model)
             if dg_provider or dg_moe:
                 prefetcher.enable_deep_gemm(dg_provider, dg_moe)
+        from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+        if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
+            from .. import jit_prefetch_cute_dsl as jcd
+            kda_provider = jcd.KdaPrefillProvider(self.model)
+            if kda_provider:
+                prefetcher.enable_cute_dsl(kda_provider)
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
@@ -1510,6 +1516,7 @@ class PyTorchModelEngine(ModelEngine):
         # later: per-request chunk length and whether any request has a cached
         # prefix (num_cached_tokens_per_seq > 0 -> HAS_INITSTATES).
         lens = [r.context_chunk_size for r in ctx]
+        prefetcher.plan_cute_dsl(lens)
         any_cached = any(r.context_current_position -
                          r.py_num_compressed_tokens > 0 for r in ctx)
         prefetcher.plan(
