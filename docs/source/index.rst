@@ -70,6 +70,7 @@ Welcome to TensorRT LLM's Documentation!
    features/disagg-serving.md
    features/subagent-routing.md
    features/embeddings.md
+   features/reranking.md
    features/kvcache.md
    features/kv-cache-compression.md
    features/long-sequence.md
