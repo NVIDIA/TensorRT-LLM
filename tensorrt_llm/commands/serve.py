@@ -1152,6 +1152,13 @@ def launch_visual_gen_server(
                   help="Protocol used when --grpc is enabled.",
                   status="prototype")
 @stability_option(
+    "--openengine-enable-load-metrics",
+    is_flag=True,
+    default=False,
+    help=
+    "Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.",
+    status="prototype")
+@stability_option(
     "--served_model_name",
     type=str,
     default=None,
@@ -1244,6 +1251,7 @@ def serve(
     middleware: tuple[str, ...],
     grpc: bool,
     grpc_protocol: str,
+    openengine_enable_load_metrics: bool,
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1257,6 +1265,11 @@ def serve(
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")
+    if openengine_enable_load_metrics and (not grpc
+                                           or grpc_protocol != "openengine"):
+        raise click.UsageError(
+            "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
+        )
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1456,7 +1469,8 @@ def serve(
                 allow_request_chat_template
                 if allow_request_chat_template else None,
                 "internal_request_auth_key":
-                internal_disagg_auth_key,
+                internal_disagg_auth_key
+                if grpc_protocol != "openengine" else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1498,6 +1512,8 @@ def serve(
                     port,
                     llm_args,
                     served_model_name=served_model_name,
+                    enable_load_metrics=openengine_enable_load_metrics,
+                    subagent_affinity_auth_key=internal_disagg_auth_key,
                     report_failure=_report_observed_child_failure)
         else:
             # Default: launch OpenAI HTTP server

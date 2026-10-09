@@ -5118,6 +5118,14 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return kv_cache_stats
 
+    def get_primary_block_counts(self) -> tuple[int, int]:
+        """Return used and total primary-tier blocks for routing-load sampling."""
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return (
+            sum(pool.total - pool.available for pool in stats),
+            sum(pool.total for pool in stats),
+        )
+
     def flush_iteration_events(self):
         event_manager = self.event_manager
         if event_manager is not None:
@@ -5353,10 +5361,8 @@ class KVCacheManagerV2(BaseResourceManager):
             req.paged_kv_block_ids = []
             if prepare_resource:
                 expected_prompt_length = token_num - 1 if is_gen else token_num
-                # Dummy/warmup request. ``stop_committing()`` below blocks all
-                # writes to the radix tree, so the choice of branch does not
-                # affect committed state. ``cache_salt`` is left defaulted
-                # to None to avoid coupling synthetic data to any salted branch.
+                # Dummy/warmup request. Its reuse scope must be separate from
+                # real requests because a real prefix may already be cached.
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -5393,7 +5399,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         is_dummy=req.is_dummy,
                         expected_prompt_length=expected_prompt_length,
                     )
-                    # Dummy path: see comment above, no salt.
+                    # Dummy path: use the same isolated reuse scope.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
@@ -6366,7 +6372,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.index_mapper.size(),
             )
             return None
-        salt_int = self._derive_reuse_salt(cache_salt)
+        # Synthetic requests use repeated token 1, which can match a real
+        # request's prefix before stop_committing() is called. Salt 0 gives
+        # them a separate reuse scope from ordinary unsalted requests.
+        salt_int = 0 if is_dummy else self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
         if (

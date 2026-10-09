@@ -23,7 +23,7 @@ The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyT
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority or data-parallel-rank metadata. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `Health` and `Abort`; its LoRA lifecycle and KV-event RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and routed strictly when conversation affinity is off. With conversation affinity on, TensorRT-LLM owns rank placement and OpenEngine ignores rank hints, matching Dynamo's in-process default; `ServerInfo.extra.trtllm_supports_dp_rank_targeting` is then false. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
 
 ### Disaggregated serving
 
@@ -47,6 +47,42 @@ arrives leaves its KV blocks held on the context worker until that process
 exits.
 
 OpenEngine and SMG are independent protocol integrations. This integration does not make a replacement or convergence decision between them.
+
+## KV event discovery and routing load
+
+KV events are captured by the native KVCM2 streaming sink and delivered directly over ZMQ. OpenEngine does not drain `LLM.get_kv_cache_events()` or forward event payloads. `GetKvEventSources` advertises the live and replay endpoints, topic, encoding, and attention-DP rank. `SubscribeKvEvents` returns `UNIMPLEMENTED`; its protocol definition is unchanged.
+
+Enable streaming in the server configuration:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  kv_events_config:
+    enable_kv_cache_events: true
+    endpoint: tcp://*:5557
+    replay_endpoint: tcp://*:5657
+```
+
+Enable load reporting independently with `--grpc --grpc-protocol openengine --openengine-enable-load-metrics`. Without that flag, `GetLoad` omits KV load fields. Event streaming internally samples per-rank capacity so `GetServerInfo` remains accurate after pool rebalance, but does not expose occupancy through `GetLoad`. Enabling load reporting does not enable event publishing. Clients discover enabled capabilities from the running server rather than duplicating these switches.
+
+For attention DP, each publisher binds `base_port + global_rank`. When event streaming is enabled, OpenEngine collects the live publisher descriptors at executor startup and advertises every rank, including remote nodes. Those hostnames and ports must be reachable from the subscriber. A missing publisher fails startup; an unavailable discovery snapshot fails the RPC rather than synthesizing socket addresses. PP and CP streaming remain unsupported. The extra placement collection is OpenEngine-only; native HTTP serving and OpenEngine with events disabled do not enable it.
+
+### Node-local discovery
+
+OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
+
+The serving ingress retains engine-wide `GetKvEventSources` discovery for existing clients. With event streaming enabled, one executor on each other hostname starts a bounded metadata-only listener at the configured OpenEngine port. Its `GetKvEventSources` returns only actual local publishers. It exposes neither inference nor engine-wide load; other RPCs are unimplemented. Metadata listeners stop with their executor, and bind errors fail startup collectively.
+
+Multinode deployments require a nonzero OpenEngine port and ingress placement on the engine-rank-zero host. Distinct nodes/pods must have distinct hostnames. Remote-ingress/Ray placement has not been validated. A node-local collector must not coexist with a leader-wide collector for the same sources. Engine incarnation changes require consumers to rediscover ownership; this metadata does not provide event replay or independent collector restart guarantees.
+
+Placement exchange occurs only during OpenEngine executor startup. Metadata RPCs read snapshots without GPU synchronization or runtime collectives. Event publishing and load sampling remain independently controlled, and native HTTP serving does not start these listeners.
+
+Events report full-block radix-cache residency; the streaming sink does not report live GPU-versus-cold-tier movement. Load snapshots independently report GPU block usage. The upstream sink emits signed 64-bit hashes from the first eight bytes of each V2 radix key, regardless of `kv_cache_event_hash_algo`. `ServerInfo.extra.trtllm_kv_event_hash_algo` advertises `v2_sha256_64` when streaming is enabled. These hashes identify blocks in event parent chains and removals. A router can derive its own request-compatible token hashes from the stored block `token_ids`, as Dynamo does.
+
+Consumers must track rank-local sequence numbers and resynchronize on gaps. Publisher queue drops and failed sends leave sequence gaps, but native capture overflow is logged without a wire gap. Replay retains only the configured number of batches; a slow replay client can lose its replay response and must retry. Replay is sent in bounded, nonblocking chunks so it cannot stall live publication. The upstream publisher emits no idle heartbeat, so source health cannot be inferred from silence alone. A reset or restart does not reconstruct already-resident cache contents, and recovery can temporarily under-report cache affinity.
+
+Direct ZMQ sockets are unauthenticated. Keep them on a trusted network and restrict access to intended subscribers.
 
 ## Transport security
 
@@ -113,3 +149,5 @@ The OpenEngine contributor community owns this adapter, its tests, protocol vers
 For token-only clients, send boolean `extra["detokenize"] = false`. Omitted detokenize retains normal text output. Forward the same stable `extra["conversation_id"]` on prefill and decode requests and across conversation turns.
 
 Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_conversation_affinity: true` when using attention DP; it is disabled by default. Per-conversation cache retention requires block reuse to be enabled and `kv_cache_config.block_reuse_config.policy: per_conversation` with KV cache manager v2; the default policy is `all_reusable`. Forwarding a conversation ID does not enable either setting. These extensions do not require KV-event discovery, publication, or routing-load snapshots.
+
+For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.

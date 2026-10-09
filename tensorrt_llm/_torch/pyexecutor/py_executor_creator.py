@@ -1295,10 +1295,21 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    with _startup_timer.phase("executor_start_worker",
-                              metrics=creation_metrics,
-                              metric_name="worker_start_seconds"):
-        py_executor.start_worker()
+    # Only the final executor advertises ready publishers.
+    events = llm_args.kv_cache_config.kv_events_config
+    if (llm_args._openengine_discovery is not None and events is not None
+            and events.enable_kv_cache_events and events.publisher == "zmq"):
+        from tensorrt_llm.grpc.openengine.node import initialize_node_discovery
+        initialize_node_discovery(py_executor)
+    try:
+        with _startup_timer.phase("executor_start_worker",
+                                  metrics=creation_metrics,
+                                  metric_name="worker_start_seconds"):
+            py_executor.start_worker()
+    except BaseException:
+        if py_executor._openengine_node_server is not None:
+            py_executor._openengine_node_server.close()
+        raise
 
     py_executor.metrics.update(initial_model_engine_metrics)
     _move_model_engine_metrics(py_executor, model_engine, "final",

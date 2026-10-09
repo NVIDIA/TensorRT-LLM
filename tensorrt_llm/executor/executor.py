@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import atexit
 import faulthandler
 import json
@@ -435,6 +438,14 @@ class GenerationExecutor(ABC):
         Returns:
             dict: Primary/GPU KV cache capacity.
         """
+        return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine node and KV publisher discovery metadata."""
+        return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a non-destructive primary/GPU KV cache load snapshot."""
         return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:

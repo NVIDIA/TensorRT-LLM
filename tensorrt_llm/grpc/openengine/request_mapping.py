@@ -23,6 +23,15 @@ _CONVERSATION_ID_EXTRA_KEY = "conversation_id"
 _DETOKENIZE_EXTRA_KEY = "detokenize"
 
 
+def conversation_affinity_enabled(llm: Any) -> bool:
+    """Whether TensorRT-LLM owns attention-DP placement for conversations."""
+    args = getattr(llm, "args", None)
+    config = getattr(args, "attention_dp_config", None)
+    return getattr(args, "enable_attention_dp", False) is True and (
+        getattr(config, "kv_cache_routing_conversation_affinity", False) is True
+    )
+
+
 def _top_n_candidates(selection: Any, name: str) -> int:
     kind = selection.WhichOneof("selection")
     if kind is None:
@@ -198,9 +207,14 @@ def conversation_params_from_request(
     return ConversationParams(conversation_id=conversation_id.string_value)
 
 
-def _trace_headers(context: grpc.aio.ServicerContext) -> Mapping[str, str] | None:
+def _metadata_from_context(
+    context: grpc.aio.ServicerContext,
+) -> tuple[Mapping[str, str] | None, int | None, dict[str, str]]:
+    """Extract tracing and strict attention-DP routing metadata."""
     headers: dict[str, str] = {}
+    affinity_headers: dict[str, str] = {}
     openengine_keys: set[str] = set()
+    target_dp_rank = None
     for item in context.invocation_metadata():
         key = item.key
         value = item.value
@@ -209,15 +223,25 @@ def _trace_headers(context: grpc.aio.ServicerContext) -> Mapping[str, str] | Non
                 raise ValueError(f"gRPC metadata key '{key}' must not be repeated")
             openengine_keys.add(key)
             if key == "openengine-routing-key":
-                if not value:
-                    raise ValueError("openengine-routing-key must be non-empty")
-            elif key in ("openengine-priority", "openengine-target-dp-rank"):
-                # Control advertises both as unsupported; the value is never
-                # read, so it is not worth parsing to decide the status code.
+                raise UnsupportedFeatureError("openengine-routing-key is not supported")
+            elif key == "openengine-priority":
+                raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
+            elif key == "openengine-target-dp-rank":
+                try:
+                    target_dp_rank = int(value)
+                except ValueError as error:
+                    raise ValueError("openengine-target-dp-rank must be an integer") from error
+                if target_dp_rank < 0:
+                    raise ValueError("openengine-target-dp-rank must be non-negative")
+            else:
                 raise UnsupportedFeatureError(f"gRPC metadata key '{key}' is not supported")
         elif key in ("traceparent", "tracestate"):
             headers[key] = value
-    return headers or None
+        elif key in ("x-trtllm-subagent-affinity-id", "x-trtllm-subagent-affinity-auth"):
+            if key in affinity_headers:
+                raise ValueError(f"gRPC metadata key '{key}' must not be repeated")
+            affinity_headers[key] = value
+    return headers or None, target_dp_rank, affinity_headers
 
 
 def _input_from_request(request: generation_pb2.GenerateRequest) -> str | dict[str, list[int]]:

@@ -11,6 +11,7 @@ import signal
 import socket
 import tempfile
 import threading
+import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -31,6 +32,7 @@ from tensorrt_llm.serve._frontend_processes import (
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
 from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .servicer import OpenEngineInferenceServicer
 
 __all__ = ["OpenEngineServer", "launch_server"]
@@ -52,11 +54,7 @@ _SERVER_OPTIONS = [
 ]
 
 
-def _format_bind_address(host: str, port: int) -> str:
-    """Format a host and port as a gRPC bind address."""
-    if ":" in host and not (host.startswith("[") and host.endswith("]")):
-        host = f"[{host}]"
-    return f"{host}:{port}"
+_format_bind_address = _format_host_port
 
 
 def _is_loopback(host: str) -> bool:
@@ -94,6 +92,7 @@ class OpenEngineServer:
         port: Port on which the server listens. Use zero to select a free port.
         llm: Initialized TensorRT-LLM LLM instance.
         model: Model name accepted by Generate requests.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
     """
 
     def __init__(
@@ -105,15 +104,21 @@ class OpenEngineServer:
         *,
         frontend: FrontendClient | None = None,
         instance_id: str | None = None,
+        subagent_affinity_auth_key: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
+        self._llm = llm
         options = list(_SERVER_OPTIONS)
         options.append(("grpc.so_reuseport", 1 if frontend is not None else 0))
         self._server = grpc.aio.server(options=options)
         kv_transfer_backend = _kv_transfer_backend(llm)
         inference = OpenEngineInferenceServicer(
-            llm, model, kv_transfer_backend=kv_transfer_backend, frontend=frontend
+            llm,
+            model,
+            kv_transfer_backend=kv_transfer_backend,
+            frontend=frontend,
+            subagent_affinity_auth_key=subagent_affinity_auth_key,
         )
         openengine_pb2_grpc.add_InferenceServicer_to_server(inference, self._server)
         # Control shares the inference servicer's in-flight request table so
@@ -148,6 +153,13 @@ class OpenEngineServer:
 
     async def start(self) -> None:
         """Start accepting OpenEngine requests."""
+        if events_config(self._llm) is not None:
+            capacity = await asyncio.to_thread(self._llm._executor.get_kv_cache_capacity)
+            if not capacity.get("kvEventsEnabled", False):
+                raise KvEventsUnavailableError(
+                    "KV events are configured but the loaded engine has no streaming publisher; "
+                    "set kv_cache_config.use_kv_cache_manager_v2: true and use a supported model"
+                )
         await self._server.start()
         address = _format_bind_address(self.host, self.port)
         logger.info(f"OpenEngine server started on {address}")
@@ -183,6 +195,8 @@ def launch_server(
     port: int,
     llm_args: dict[str, Any],
     served_model_name: str | None = None,
+    enable_load_metrics: bool = False,
+    subagent_affinity_auth_key: str | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
 ) -> None:
     """Launch the dedicated OpenEngine gRPC server.
@@ -192,6 +206,8 @@ def launch_server(
         port: Port on which the server listens.
         llm_args: Arguments for LLM initialization.
         served_model_name: Model name accepted by Generate. Defaults to the model path.
+        enable_load_metrics: Enable scheduler-owned routing-load snapshots, independently of KV events.
+        subagent_affinity_auth_key: Shared key for authenticated parent affinity hints.
         report_failure: Records a child exit before startup readiness.
     """
 
@@ -282,6 +298,14 @@ def launch_server(
                 fail(f"OpenEngine supervision failed: {error}")
 
         try:
+            llm_args["_enable_routing_load"] = enable_load_metrics
+            # A new incarnation fences every node's metadata after a restart.
+            # The executor starts node discovery only when streaming is enabled.
+            llm_args["_openengine_discovery"] = {
+                "engine_id": str(uuid.uuid4()),
+                "host": host,
+                "port": port,
+            }
             llm = PyTorchLLM(**llm_args)
             if stop_event.is_set():
                 if failure is not None:
@@ -342,6 +366,7 @@ def launch_server(
                 port=port,
                 llm=llm,
                 model=model,
+                subagent_affinity_auth_key=subagent_affinity_auth_key,
                 frontend=frontend,
                 instance_id=instance_id,
             )

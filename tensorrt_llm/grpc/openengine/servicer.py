@@ -13,7 +13,9 @@ import grpc
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.llmapi.llm import LLM
 from tensorrt_llm.logger import logger
+from tensorrt_llm.scheduling_params import SchedulingParams
 
+from .affinity import validate_parent_affinity
 from .bindings import error_pb2, generation_pb2, openengine_pb2_grpc
 from .coordinator import (
     CoordinationError,
@@ -27,7 +29,8 @@ from .errors import AbortFailedError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .request_mapping import (
     _input_from_request,
-    _trace_headers,
+    _metadata_from_context,
+    conversation_affinity_enabled,
     conversation_params_from_request,
     sampling_params_from_request,
 )
@@ -48,6 +51,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         llm: LLM,
         model: str,
         kv_transfer_backend: str = "",
+        subagent_affinity_auth_key: str | None = None,
         frontend: FrontendClient | None = None,
     ) -> None:
         self._frontend = frontend
@@ -58,6 +62,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         # context worker uses. The actual transfer is driven by opaque_state.
         self._kv_transfer_backend = kv_transfer_backend
         self._guided_backend = llm.args.guided_decoding_backend
+        self.subagent_affinity_auth_key = subagent_affinity_auth_key
         self._active_requests: dict[str, Any] = {}
 
     def active_request_count(self) -> int:
@@ -174,14 +179,59 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
 
             inputs = _input_from_request(request)
             sampling_params = sampling_params_from_request(request, self._guided_backend)
+            trace_headers, target_dp_rank, affinity_headers = _metadata_from_context(context)
             conversation_params = conversation_params_from_request(request)
-            trace_headers = _trace_headers(context)
+            disaggregated_params = disaggregated_params_from_request(request)
+            parent_affinity_id = validate_parent_affinity(
+                self.subagent_affinity_auth_key,
+                request,
+                None if conversation_params is None else conversation_params.conversation_id,
+                None if disaggregated_params is None else disaggregated_params.request_type,
+                affinity_headers,
+            )
+            if parent_affinity_id is not None and not conversation_affinity_enabled(self._llm):
+                raise UnsupportedFeatureError(
+                    "Subagent affinity requires conversation-aware attention DP"
+                )
+            # Match Dynamo's in-process default: the conversation router owns
+            # rank placement when affinity is enabled, even if Dynamo sent a hint.
+            if conversation_affinity_enabled(self._llm):
+                if target_dp_rank is not None and (
+                    conversation_params is None or not conversation_params.conversation_id.strip()
+                ):
+                    raise ValueError(
+                        "A stable conversation ID is required when conversation affinity replaces a DP-rank hint"
+                    )
+                target_dp_rank = None
+            if target_dp_rank is not None:
+                if sampling_params.n > 1:
+                    raise ValueError(
+                        "openengine-target-dp-rank does not support multiple output sequences"
+                    )
+                args = getattr(self._llm, "args", None)
+                dp_size = (
+                    max(1, int(getattr(args, "tensor_parallel_size", 1) or 1))
+                    if getattr(args, "enable_attention_dp", False)
+                    else 1
+                )
+                if target_dp_rank >= dp_size:
+                    raise ValueError(
+                        f"openengine-target-dp-rank must be in [0, {dp_size}), got {target_dp_rank}"
+                    )
+            scheduling_params = (
+                SchedulingParams(
+                    attention_dp_rank=target_dp_rank,
+                    attention_dp_relax=target_dp_rank is None,
+                    subagent_affinity_id=parent_affinity_id,
+                )
+                if target_dp_rank is not None or parent_affinity_id is not None
+                else None
+            )
             cache_salt = (
                 request.kv.cache_salt
                 if request.HasField("kv") and request.kv.HasField("cache_salt")
                 else None
             )
-            disaggregated_params = disaggregated_params_from_request(request)
         except UnsupportedFeatureError as error:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, str(error))
             return
@@ -211,6 +261,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                 sampling_params=sampling_params,
                 streaming=True,
                 trace_headers=trace_headers,
+                scheduling_params=scheduling_params,
                 conversation_params=conversation_params,
                 cache_salt=cache_salt,
                 priority=DEFAULT_REQUEST_PRIORITY,
