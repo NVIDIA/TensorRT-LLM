@@ -1149,7 +1149,7 @@ def _copy_swa_block_offsets_with_scratch_compiled(
         slot_id * scales[:, :, None, None]
         + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
     )
-    scratch_mask = scratch_mask_by_pool[pool_ids]
+    scratch_mask = scratch_mask_by_pool[pool_ids] & (base == BAD_PAGE_INDEX)
     converted = torch.where(scratch_mask, scratch_index, converted)
 
     output.copy_(converted.permute(0, 2, 1, 3))
@@ -3497,7 +3497,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
-        not shrunk (history outran pre-resize capacity); the caller drops any draft pool.
+        not shrunk; the caller drops any draft pool.
         """
         if self._connector_reservations_enabled():
             if self.kv_connector_manager.get_prefix_reservation(req) is not None:

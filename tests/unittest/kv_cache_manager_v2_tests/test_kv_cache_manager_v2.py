@@ -4284,6 +4284,72 @@ class TestScratchReuse(TestKVCacheManagerV2):
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
+    @parameterized.expand([(0, 0), (127, 32)])
+    def test_scratch_capacity_shrink_preserves_history(self, prefix_length: int, reserve: int):
+        self._prepare_scratch(
+            num_layers=8,
+            window_size=64,
+            tokens_per_block=32,
+            max_rewind_len=reserve,
+            gpu_quota=16 << 20,
+        )
+        prefix = [self.next_token() for _ in range(prefix_length)]
+        suffix = [self.next_token() for _ in range(512)]
+        kv = self.manager.create_kv_cache(None, prefix + suffix)
+        old_capacity = prefix_length + reserve
+        new_capacity = old_capacity + len(suffix)
+        group = LayerGroupId(0)
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv.resume(stream))
+            if prefix:
+                self.assertTrue(kv.resize(prefix_length))
+                self.engine.execute([Step(kv, prefix, [])], stream)
+                kv.commit(prefix)
+            self.assertTrue(kv.resize(old_capacity))
+            old_indices = list(kv.get_base_page_indices(group))
+            kv.commit_pending_stats()
+            for attempt in range(2):
+                self.assertTrue(kv.resize(new_capacity))
+                self.assertTrue(kv.has_scratch_slots)
+                if attempt == 1:
+                    # Written but uncommitted input leaves history unchanged.
+                    self.engine.execute([Step(kv, suffix, prefix)], stream)
+                with self.assertRaisesRegex(ValueError, "scratch blocks would remain"):
+                    kv.resize(old_capacity + 256)
+                with self.assertRaisesRegex(ValueError, "retained live block has no normal page"):
+                    kv.resize(old_capacity + 32)
+                # Advancing history still needs the rewind guarantee: scratch
+                # cannot preserve an arbitrary prefix of the executed chunk.
+                with self.assertRaisesRegex(
+                    (RuntimeError, AssertionError), "old_capacity - max_rewind_len"
+                ):
+                    kv.resize(old_capacity + 32, old_capacity + 32)
+                self.assertEqual(kv.capacity, new_capacity)
+                self.assertEqual(kv.history_length, prefix_length)
+                self.assertTrue(kv.resize(old_capacity))
+                self.assertEqual(kv.capacity, old_capacity)
+                self.assertEqual(kv.history_length, prefix_length)
+                self.assertFalse(kv.has_scratch_slots)
+                self.assertEqual(list(kv.get_base_page_indices(group)), old_indices)
+                canceled = kv.commit_pending_stats()
+                self.assertEqual(canceled.alloc_total_blocks, 0)
+                self.assertEqual(canceled.alloc_new_blocks, 0)
+                self.assertEqual(canceled.missed_blocks, 0)
+                self.engine.execute([Step(kv, [], prefix)], stream)
+                if attempt == 1 and reserve:
+                    self.engine.execute([Step(kv, [], prefix + suffix[:reserve])], stream)
+                kv.suspend()
+                self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(new_capacity))
+            self.engine.execute([Step(kv, suffix, prefix)], stream)
+            kv.commit(suffix)
+            self.assertGreater(kv.commit_pending_stats().alloc_total_blocks, 0)
+            self.engine.execute([Step(kv, [], prefix + suffix)], stream)
+            kv.stop_committing()
+        s.take_finish_event().synchronize()
+        kv.close()
+
     def test_excess_scratch_slot_waits_for_ready_event_on_new_stream(self):
         num_layers = 512
         self._prepare_scratch(

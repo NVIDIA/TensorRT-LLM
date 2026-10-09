@@ -197,9 +197,9 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
             auto& block = mBlocks[ord];
             for (BeamIndex bi{0}; bi < block.pages.size(); ++bi)
             {
-                bool isScratch = scratchRange.contains(ord);
-                TLLM_CHECK_DEBUG(isScratch == blockPageIsNull(block.pages[bi][lcId]));
-                if (!isScratch)
+                bool const hasNormalPage = !blockPageIsNull(block.pages[bi][lcId]);
+                TLLM_CHECK_DEBUG(hasNormalPage || scratchRange.contains(ord));
+                if (hasNormalPage)
                     result.push_back({ord, bi, lcId});
             }
         }
@@ -1289,6 +1289,43 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
     // Scratch reuse: enforce constraint.
     bool enableScratch = mEnableSwaScratchReuse;
+    if (enableScratch && newCap < mCapacity && newHist == mHistoryLength)
+    {
+        // No input tokens become history, so the rewind bound does not apply.
+        // Every retained input block must already have a normal page.
+        BlockOrdinal const newNumBlocks{divUp(newCap, mTokensPerBlock)};
+        auto const& lcs = mManager->lifeCycles();
+        for (auto const& [lcId, lc] : lcs)
+        {
+            if (std::holds_alternative<SsmLifeCycle>(lc))
+                continue;
+            if (_getScratchRange(lc, newHist, newCap))
+            {
+                throw std::invalid_argument("Cannot shrink SWA scratch capacity while scratch blocks would remain");
+            }
+            for (BlockOrdinal ord{divUp(newHist, mTokensPerBlock)}; ord < newNumBlocks; ++ord)
+            {
+                for (auto const& beamBlock : mBlocks[ord].pages)
+                {
+                    if (blockPageIsNull(beamBlock[lcId]))
+                    {
+                        throw std::invalid_argument(
+                            "Cannot shrink SWA scratch capacity: a retained live block has no normal page");
+                    }
+                }
+            }
+        }
+        _subtractPendingAllocationRange(newNumBlocks, mBlocks.size());
+        {
+            auto scope = recordEventScope();
+            _freeScratchSlots();
+            _decreaseCapacity(newNumBlocks);
+        }
+        mCapacity = newCap;
+        _refreshGenerationAllocReady();
+        TLLM_CHECK_DEBUG(_checkSanity());
+        return true;
+    }
     if (enableScratch && newCap != mCapacity)
     {
         int const maxRewindLen = _swaScratchMaxRewindLen();
@@ -2805,10 +2842,9 @@ bool KvCache::_checkSanity() const
                 auto const& staleRange = staleRanges[lc];
                 auto const& scratchRange = scratchRangesVec[lc];
 
-                if (scratchRange.contains(ordinal))
+                if (scratchRange.contains(ordinal) && blockPageIsNull(bp))
                 {
-                    // Scratch blocks have no per-block pages.
-                    TLLM_CHECK_DEBUG(blockPageIsNull(bp));
+                    continue;
                 }
                 else if (staleRange.beg <= ordinal && ordinal < staleRange.end)
                 {
