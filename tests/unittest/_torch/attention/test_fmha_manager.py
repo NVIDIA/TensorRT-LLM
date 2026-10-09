@@ -940,9 +940,6 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
         def __init__(self, attn: TrtllmAttention) -> None:
             super().__init__(attn, "old", events)
 
-        def release(self) -> None:
-            events.append(("release", "old"))
-
     class _NewFmha(FakeFmha):
         def __init__(self, attn: TrtllmAttention) -> None:
             quant_states_during_construction.append(attn.has_fp8_kv_cache)
@@ -951,7 +948,6 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     attn = TrtllmAttention.__new__(TrtllmAttention)
     attn.is_mla_enable = False
     attn.skip_correction_threshold = 0.0
-    attn._fmha_manager = None
     metadata = _make_metadata(num_contexts=0, num_generations=1)
     forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
     q = torch.empty((1, 4))
@@ -977,7 +973,7 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     assert attn._fmha_manager._cache == {}
     assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
     assert quant_states_during_construction == [True]
-    assert events == [("support", "old", None), ("release", "old")]
+    assert events == [("support", "old", None)]
 
 
 def test_a_new_manager_does_not_reuse_a_previous_selection() -> None:

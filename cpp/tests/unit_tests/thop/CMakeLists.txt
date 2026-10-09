@@ -14,14 +14,6 @@
 # the License.
 
 if(${BUILD_PYT})
-  add_gtest(attentionOpWorkspaceTest attentionOpWorkspaceTest.cpp)
-  target_include_directories(
-    attentionOpWorkspaceTest
-    PRIVATE ${PROJECT_BINARY_DIR}/tensorrt_llm/generated)
-  target_link_libraries(
-    attentionOpWorkspaceTest PRIVATE th_common ${Python3_LIBRARIES}
-                                     ${TORCH_LIBRARIES})
-
   add_gtest(thUtilsTest thUtilsTest.cpp)
   target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
                                            ${TORCH_LIBRARIES})

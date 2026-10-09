@@ -457,9 +457,6 @@ class Fmha(ABC):
     def __init__(self, attn: "TrtllmAttention"):
         self._attn_ref: weakref.ReferenceType["TrtllmAttention"] = weakref.ref(attn)
 
-    def release(self) -> None:
-        """Release implementation-owned resources before CUDA teardown."""
-
     @property
     def attn(self) -> "TrtllmAttention":
         attn = self._attn_ref()

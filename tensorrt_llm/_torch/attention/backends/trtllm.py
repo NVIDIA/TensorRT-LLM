@@ -1765,17 +1765,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
 
-    def release(self) -> None:
-        """Release implementation-owned resources before CUDA teardown."""
-        if self._fmha_manager is not None:
-            self._fmha_manager.release()
-
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
-        # The op's kernel selection is derived from the quantization mode.
-        self.release()
-
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(

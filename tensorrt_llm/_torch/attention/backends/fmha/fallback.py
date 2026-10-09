@@ -60,9 +60,6 @@ class _AttentionOpCache:
             self._ops[key] = op
         return op
 
-    def clear(self) -> None:
-        self._ops.clear()
-
 
 _FORWARD_ARG_NAMES = frozenset(field.name for field in fields(AttentionForwardArgs))
 _SPARSE_ARG_NAMES = frozenset(field.name for field in fields(SparseRuntimeParams))
@@ -126,8 +123,7 @@ class FallbackFmha(PhasedFmha):
     REQUIRES_PAGED_KV = False
     NEEDS_BLOCK_EXTENT = False
     # The flat compatibility entry point is a classmethod with no layer instance, so its
-    # runners hang off the class instead. Kept across calls and captures like the layer's
-    # own cache, and cleared before CUDA teardown by the atexit hook below.
+    # runners hang off the class instead, reused across calls and captures.
     _compat_attention_ops: ClassVar[_AttentionOpCache] = _AttentionOpCache()
     supports_skip_correction = True
     supports_workspace_reclamation = True
@@ -143,10 +139,6 @@ class FallbackFmha(PhasedFmha):
             params, skip_correction_threshold=self.attn.skip_correction_threshold
         )
         return self._attention_ops.get(config, _phase_query(params).device)
-
-    def release(self) -> None:
-        self._attention_ops.clear()
-        self._multi_ctas_kv_counter = None
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
