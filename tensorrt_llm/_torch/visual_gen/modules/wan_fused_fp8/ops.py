@@ -350,7 +350,11 @@ def ulysses_self_attention(qkv, norm_q_w, norm_k_w, cos, sin, num_heads, eps, in
 
 
 def self_attention(
-    attn, qkv: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
+    attn,
+    qkv: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+    timestep: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused FP8 self-attention for a packed-QKV Attention module."""
     mode, pg = sp_mode(attn)
@@ -370,4 +374,4 @@ def self_attention(
     # Attention2D / Ring: use the module's own backend.
     attn.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
     q, k, v = qkv.split([attn.local_q_dim, attn.local_kv_dim, attn.local_kv_dim], dim=-1)
-    return attn._attn_impl(q, k, v)
+    return attn._attn_impl(q, k, v, timestep=timestep)

@@ -96,6 +96,8 @@ class Attention(nn.Module):
 
         self.tp_size = self.mapping.tp_size if self.mapping else 1
         self.tp_rank = self.mapping.tp_rank if self.mapping else 0
+        # Set by WanBlock: fused FP8 path assumes Wan RoPE and dense attention.
+        self.allow_wan_fused_fp8 = False
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Backed by torch.ops.trtllm.fused_dit_qk_norm_rope which auto-dispatches:
@@ -711,7 +713,8 @@ class Attention(nn.Module):
     def _use_wan_fused_fp8_attn(self) -> bool:
         """Opt-in Wan fused FP8 self-attention (TRTLLM_WAN_FUSED_FP8_ATTN=1)."""
         return (
-            os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") == "1"
+            self.allow_wan_fused_fp8
+            and os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") == "1"
             and get_sm_version() == 107
             and self.head_dim == 128
             and self.local_num_attention_heads <= 64
@@ -746,8 +749,8 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
-            if seq_len == kv_seq_len and self._use_wan_fused_fp8_attn():
-                out = wan_fused_fp8_ops.self_attention(self, qkv, freqs_cos, freqs_sin)
+            if seq_len == kv_seq_len and not kwargs and self._use_wan_fused_fp8_attn():
+                out = wan_fused_fp8_ops.self_attention(self, qkv, freqs_cos, freqs_sin, timestep)
                 return self.to_out[0](out)
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)

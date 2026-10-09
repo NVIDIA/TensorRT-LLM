@@ -42,6 +42,7 @@ def eligible(block, x: torch.Tensor, temb: torch.Tensor) -> bool:
     )
     return bool(
         get_sm_version() == 107
+        and attn1.tp_size == 1
         and block._fused_ln_supported
         and not block._use_async_ulysses
         and block.add_k_proj is None
@@ -84,7 +85,7 @@ def _attn_args(attn, freqs_cos, freqs_sin):
 
 def _fused_attn_mode(attn):
     """sp_mode of attn, or "unsupported" when fused attention is off."""
-    if os.environ.get("TRTLLM_WAN_FUSED_FP8_ATTN", "0") != "1":
+    if not attn._use_wan_fused_fp8_attn():
         return "unsupported", None
     return fused_ops.sp_mode(attn)
 

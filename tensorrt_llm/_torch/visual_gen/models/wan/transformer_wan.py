@@ -360,6 +360,10 @@ class WanBlock(nn.Module):
             separate_qkv_is_self_attention=True,
             module_name=f"blocks.{_layer_idx}.attn1",
         )
+        # Opt-in fused FP8 self-attention: TP=1 and dense attention only.
+        self.attn1.allow_wan_fused_fp8 = (
+            tp_size == 1 and model_config.attention.sparse_attention_config is None
+        )
 
         # Cross-attention with separate Q, K, V
         self.attn2 = Attention(
