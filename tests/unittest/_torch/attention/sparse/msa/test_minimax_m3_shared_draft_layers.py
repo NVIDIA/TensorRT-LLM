@@ -42,7 +42,13 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    _DEVICE_PAGE_TABLE_ENV,
+    KVCacheManagerV2,
+    Role,
+    _BasePageTableMaterializer,
+)
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import (
@@ -51,7 +57,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MiniMaxM3SparseAttentionConfig,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, PageIndexMode
 
 DRAFT_LOCAL_LAYER = 60
 SCALE = 179  # sub-pages per M3 mega-slot: 3 dense x 2 + 57 sparse x 3 + draft x 2
@@ -234,6 +240,7 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     manager.dtype = DataType.FP8
     manager._draft_op_pools = ((1, 0),)
+    manager.num_pools = 1
     manager._draft_index_scales = torch.tensor([SCALE], dtype=torch.int32)
     manager._draft_kv_offsets = torch.tensor([1], dtype=torch.int32)
     manager.host_kv_cache_block_offsets = torch.zeros((1, 4, 2, 8), dtype=torch.int32)
@@ -260,6 +267,73 @@ def test_block_offset_copy_fills_the_virtual_pool_from_the_source_pool(monkeypat
     plain = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
     plain.copy_batch_block_offsets(dst, [7], 1, 0, 1)
     assert calls == [("base", [7], 1, None)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("setting", ["0", "1"], ids=["native", "forced_cc"])
+def test_shared_draft_page_tables_use_real_materialization(
+    monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    """Exercise base and virtual pool launches without allocating a model's KV cache."""
+    if setting == "0" and not prefer_pinned():
+        pytest.skip("native expansion requires GPU-addressable host memory")
+    monkeypatch.setenv(_DEVICE_PAGE_TABLE_ENV, setting)
+    pin = setting == "0"
+    host = torch.arange(32, dtype=torch.int32).reshape(1, 4, 8)
+    table = torch.full((1, 4, 2, 8), 777, dtype=torch.int32, pin_memory=pin)
+    table[:, :, 0] = host
+    table[0, 2, 0, -1] = BAD_PAGE_INDEX
+    stream = torch.cuda.current_stream()
+
+    def prepare_base(self, index_mapper_capacity: int) -> None:
+        # Only storage setup is stubbed. Both initialization of the draft
+        # materializers and all row gathers, H2D copies and kernels are real.
+        self.num_pools = 1
+        self._use_per_layer_page_tables = False
+        self.host_kv_cache_block_offsets = table
+        self._stream = stream
+        self.index_scales = torch.tensor([3], dtype=torch.int32, pin_memory=pin)
+        self.kv_offset = torch.tensor([1], dtype=torch.int32, pin_memory=pin)
+        self._page_table_materializer = _BasePageTableMaterializer(
+            table, stream, self.index_scales, self.kv_offset
+        )
+        self.kv_cache_pool_pointers = torch.tensor([[0, 0]], dtype=torch.int64)
+        self.kv_cache_pool_mapping = torch.tensor([[0, 0], [0, 1], [0, 2]], dtype=torch.int32)
+
+    monkeypatch.setattr(KVCacheManagerV2, "_prepare_page_table_tensor", prepare_base)
+    monkeypatch.setattr(
+        MiniMaxM3KVCacheManagerV2,
+        "_kv_slot_geometry",
+        lambda self, layer: (0, None, 4, 5 + 2 * layer, None),
+    )
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager._shared_draft_layer_ids = [1, 2]
+    manager.dtype = DataType.FP8
+    manager.layer_offsets = {0: 0, 1: 1, 2: 2}
+    manager.is_draft = False
+    manager.enable_swa_scratch_reuse = False
+    manager.tokens_per_block = 128
+    manager._prepare_page_table_tensor(4)
+    assert manager._draft_op_pools == ((1, 0), (2, 0))
+    assert len(manager._draft_page_table_materializers) == (2 if setting == "1" else 0)
+
+    # Reorder and shrink the batch between launches; retained staging must
+    # reread the live source instead of reusing the preceding batch's rows.
+    for request_ids in ([2, 0], [1]):
+        copy_idx = torch.tensor(request_ids, dtype=torch.int32, pin_memory=pin)
+        manager.index_mapper = SimpleNamespace(get_copy_index=lambda ids, nc, bw: copy_idx)
+        output = torch.full((3, 4, 2, 8), -12345, dtype=torch.int32, device="cuda")
+        manager.copy_batch_block_offsets(output, request_ids, 1, 0, len(request_ids))
+        stream.synchronize()
+        actual = output.cpu()
+        pages = table[0, request_ids, 0]
+        for pool, scale in enumerate((3, 7, 9)):
+            keys = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale)
+            values = torch.where(pages == BAD_PAGE_INDEX, 0, pages * scale + 1)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 0], keys)
+            torch.testing.assert_close(actual[pool, : len(request_ids), 1], values)
+        assert torch.all(actual[:, len(request_ids) :] == -12345)
+        table[:, :, 0, 0] += 10
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])
