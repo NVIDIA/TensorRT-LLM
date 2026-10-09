@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """End-to-end tests for the beam-history speculative D2H opt-in.
 
 This file covers the code paths gated behind
@@ -26,7 +25,7 @@ This file covers the code paths gated behind
 * the two stream-ordering contracts the path relies on: the side-stream
   copier keeping its sources alive until it has read them, and the
   fallback builder awaiting its own non-blocking copies before reading
-  them (handler-level tests, no LLM).
+  them.
 
 The dummy model from `test_beam_search_util` produces deterministic
 outputs, so we can compare runs token-for-token without depending on
@@ -321,18 +320,6 @@ def test_speculative_d2h_fallback_builder_runs_only_on_finishing_step(
     input_prompts: list[list[int]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The fallback builder is invoked once per request, on the step that ends it.
-
-    With the predictor pinned to a miss, every step hands `update_requests` a
-    fallback builder whose invocation takes a blocking snapshot of the
-    request's rows. `update_requests` must only invoke it once the host-side
-    finish reasons show every beam finished; invoking it on every step would
-    stall each step on a snapshot that then produces nothing.
-
-    No stop token and `end_id=-1`, so every request runs to its length budget
-    and all its beams finish on the same step. Each request's builder must
-    therefore run exactly once, and that run must produce a history.
-    """
     _always_miss, miss_state = _pinned_predictor(False)
     speculative_builder_orig = BeamSearchHandler._speculative_builder
     builder_results: list[bool] = []
@@ -593,7 +580,7 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
 
 
 # ---------------------------------------------------------------------------
-# Stream-ordering contracts of the two D2H paths (handler-level, no LLM).
+# Stream-ordering contracts of the two D2H paths
 #
 # Both tests open a deliberate race window with torch.cuda._sleep so that the
 # host-side work they issue afterwards runs while the GPU copies are still
@@ -604,19 +591,6 @@ def test_speculative_d2h_predictor_hit_is_sync_free(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_side_stream_copier_keeps_sources_alive_until_copied() -> None:
-    """The copier must keep a staged source's memory out of reuse until it has read it.
-
-    `prepare_cba_group_host` stages advanced-indexing gathers and drops them
-    right after; by the time `commit` issues the copies, the only reference
-    is the copier's own. The caching allocator frees a block to its
-    allocating stream, so without `record_stream(side_stream)` the next
-    same-sized main-stream allocation gets the block back while the
-    side-stream copy may not have started, and the host receives whatever
-    the new owner wrote.
-
-    Park the side stream behind a sleep so the copy cannot have started when
-    a same-sized tensor is allocated and filled on the main stream.
-    """
     numel = 4096
     side_stream = torch.cuda.Stream()
     copier = _SideStreamCopier(side_stream, torch.cuda.stream(side_stream))
@@ -657,8 +631,7 @@ def _recording_non_blocking_copy(src: torch.Tensor) -> torch.Tensor:
 
     Same non-blocking copy into pinned memory, but the destination is
     zero-filled first so a read that outruns the copy observes zeros rather
-    than whatever the pinned block last held. Zero is `should_stop == False`,
-    so an unsynchronized builder deterministically returns no history.
+    than whatever the pinned block last held.
     """
     dst = torch.zeros_like(src, device="cpu", pin_memory=True)
     dst.copy_(src, non_blocking=True)
@@ -667,17 +640,6 @@ def _recording_non_blocking_copy(src: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_speculative_fallback_builder_awaits_its_copies() -> None:
-    """The fallback builder must await its own D2H copies before reading them.
-
-    It runs inside `update_requests`, after the step's sampler event has
-    already been awaited, and issues fresh non-blocking copies; no later
-    event covers them, so the builder has to synchronize itself before the
-    `.item()` reads in `_prepare_beam_history_cba`.
-
-    Set up one request whose beams have all finished, park the current stream
-    behind a sleep, then invoke the builder: it must still return the history
-    the device state describes.
-    """
     num_beams = 3
     num_generated = 4
     pad = BEAM_SEARCH_PAD_TOKEN

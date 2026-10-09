@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Small sampling features that do not warrant a module of their own.
 
 Four groups, each self-contained and free of ``TorchSampler`` state:
@@ -72,7 +71,6 @@ __all__ = [
     "meet_stop_token_criteria",
     "scatter_new_tokens",
 ]
-
 
 # --------------------------------------------------------------------------
 # Step indexing
@@ -613,11 +611,8 @@ class _SideStreamCopier:
         self._side_stream.wait_stream(torch.cuda.current_stream())
         with self._side_stream_ctx:
             for dst, src in self._tasks:
-                # The sources are typically temporaries of the main stream
-                # (advanced-indexing gathers) that the caller drops right
-                # after staging. Without this, the caching allocator may hand
-                # their memory to the next main-stream allocation before the
-                # side-stream copy has read it.
+                # Prevent the caching allocator from giving this memory back to the main
+                # stream before the copy finishes.
                 src.record_stream(self._side_stream)
                 dst.copy_(src, non_blocking=True)
         self._tasks.clear()

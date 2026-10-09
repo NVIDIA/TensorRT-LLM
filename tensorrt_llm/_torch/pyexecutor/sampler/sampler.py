@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Sampler orchestration: the entry points the executor drives each step.
 
 Holds the :class:`Sampler` ABC and its ``SampleState`` types, the trivial
@@ -1592,10 +1591,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # this step's tokens instead and let the generation side own
                 # finalization.
                 # The builder only produces a history when every beam has
-                # finished, which is exactly the all-beams-finished prefix test
-                # below; checking it here first keeps the builder (and, in
-                # speculative-D2H mode, its blocking fallback snapshot) off
-                # every step that does not end the request.
+                # finished, checking it here first keeps the builder off
+                # for every step that does not end the request.
                 assert req.py_seq_slot is not None
                 request_finishing = bool(finished_beam_prefix_lengths) and (
                     finished_beam_prefix_lengths[req.py_seq_slot] >= req.py_beam_width
