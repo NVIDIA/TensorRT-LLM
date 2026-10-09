@@ -1488,6 +1488,12 @@ class PyTorchModelEngine(ModelEngine):
             kda_provider = jcd.KdaPrefillProvider(self.model)
             if kda_provider:
                 prefetcher.enable_cute_dsl(kda_provider)
+        from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
+        la_provider = LinearAttnProvider(self.model,
+                                         max_num_tokens=self.max_num_tokens)
+        if la_provider and prefetcher.register("linear_attn", la_provider):
+            logger.info(f"[JIT prefetch] GDN/KDA provider: "
+                        f"{len(la_provider.shapes)} distinct layer shape(s)")
         from ..modules.mamba.jit_prefetch import MambaSSDProvider
         provider = MambaSSDProvider(self.model,
                                     max_num_tokens=self.max_num_tokens,
@@ -1510,17 +1516,32 @@ class PyTorchModelEngine(ModelEngine):
         from .. import jit_prefetch_deep_gemm as jdg
         prefetcher.plan_deep_gemm(jdg.batch_tokens(scheduled_requests))
         ctx = scheduled_requests.context_requests
-        if not ctx:
+        gen = scheduled_requests.generation_requests
+        gen_tokens = sum(1 + len(getattr(r, "py_draft_tokens", None) or [])
+                         for r in gen)
+        # A generation-only batch at a captured size replays a CUDA graph and
+        # compiles nothing; eager ones (above the largest graph, or graphs
+        # disabled) are planned like any other batch.
+        if not ctx and self._jit_prefetch_gen_in_graph(len(gen)):
             return
         # The same facts _prepare_tp_inputs and Mamba2Metadata.prepare derive
         # later: per-request chunk length and whether any request has a cached
         # prefix (num_cached_tokens_per_seq > 0 -> HAS_INITSTATES).
         lens = [r.context_chunk_size for r in ctx]
-        prefetcher.plan_cute_dsl(lens)
+        if lens:
+            prefetcher.plan_cute_dsl(lens)
         any_cached = any(r.context_current_position -
                          r.py_num_compressed_tokens > 0 for r in ctx)
         prefetcher.plan(
-            SimpleNamespace(ctx_chunk_lens=lens, any_ctx_cached=any_cached))
+            SimpleNamespace(ctx_chunk_lens=lens,
+                            any_ctx_cached=any_cached,
+                            gen_tokens=gen_tokens))
+
+    def _jit_prefetch_gen_in_graph(self, num_gen: int) -> bool:
+        runner = getattr(self, "cuda_graph_runner", None)
+        sizes = getattr(runner, "supported_batch_sizes", None) or []
+        return bool(getattr(runner, "enabled", False)) and num_gen <= max(
+            sizes, default=0)
 
     def _warmup_scheduled(self, resource_manager: ResourceManager,
                           kv_cache_manager) -> None:
