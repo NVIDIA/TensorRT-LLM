@@ -567,13 +567,14 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             next_draft_tokens=self.store.next_draft_tokens,
         )
 
-        host_verify_lens = self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
         if self._async_worker_active():
             host_tensors = SampleStateTensorsSpec(
                 new_tokens=self._copy_to_host(self.store.new_tokens),
                 new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
                 next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
-                verify_lens=host_verify_lens,
+                verify_lens=(
+                    self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+                ),
             )
             sampler_event = self._record_sampler_event()
         else:
@@ -581,6 +582,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             # needs the stores, so the host copies run on the side stream.
             # update_requests syncs their event before reading them, and the
             # next step's store update waits for it on this stream.
+            host_verify_lens = (
+                self._copy_to_host(o_verify_lens) if o_verify_lens is not None else None
+            )
             with self._make_side_stream_copier() as copier:
                 host_tensors = SampleStateTensorsSpec(
                     new_tokens=copier.stage_copy_to_host(self.store.new_tokens),
