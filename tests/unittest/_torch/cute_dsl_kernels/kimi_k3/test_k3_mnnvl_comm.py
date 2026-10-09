@@ -133,7 +133,7 @@ def _stock_attn_res(mnnvl, input, prefix_sum, block_residual, res_weight, rms_we
     workspace = get_or_scale_allreduce_mnnvl_workspace(
         mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=one_shot_bytes
     )
-    normed, updated = torch.ops.trtllm.mnnvl_allreduce_attn_res(
+    normed, updated = _trtllm().mnnvl_allreduce_attn_res(
         input, prefix_sum, block_residual, res_weight, rms_weight, output_rms_weight, rms_eps, output_rms_eps,
         workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1), workspace["buffer_flags"],
     )  # fmt: skip
@@ -150,7 +150,7 @@ def _stock_allgather_split(mnnvl, input, bf16_columns):
     workspace = get_or_scale_allreduce_mnnvl_workspace(
         mnnvl.mapping, mnnvl.dtype, buffer_size_bytes=footprint
     )
-    bf16_out, fp32_out = torch.ops.trtllm.mnnvl_allgather_split(
+    bf16_out, fp32_out = _trtllm().mnnvl_allgather_split(
         input, bf16_columns, mnnvl.mapping.tp_size, workspace["uc_buffer"].view(mnnvl.dtype).view(3, -1),
         workspace["buffer_flags"],
     )  # fmt: skip
