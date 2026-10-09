@@ -83,6 +83,16 @@ _PROVIDERS_ENV = "TLLM_JIT_PREFETCH_PROVIDERS"
 _PRIO_URGENT, _PRIO_BATCH, _PRIO_REPLAY, _PRIO_ENUM = -1, 0, 1, 2
 
 
+def _local_world() -> int:
+    """Ranks on this node (they share a node-local JIT cache)."""
+    for var in ("OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_NTASKS_PER_NODE", "LOCAL_WORLD_SIZE"):
+        try:
+            return max(1, int(os.environ[var].split("(")[0]))
+        except (KeyError, ValueError):
+            continue
+    return 1
+
+
 def _default_workers() -> int:
     """Helpers per rank: the CPUs this process may use, shared among the
     ranks on the node, capped. Compiling is single-threaded per variant."""
@@ -453,6 +463,29 @@ class JitPrefetcher:
             threading.Thread(target=self._feed_loop, args=(p, q), daemon=True).start()
             threading.Thread(target=self._drain_loop, args=(p,), daemon=True).start()
 
+    def observe_deep_gemm(self) -> None:
+        """Count DeepGEMM FP8 GEMM compiles on the executor thread after warmup.
+
+        Independent of prefetch, so every arm of an experiment reports the
+        same counter.
+        """
+        from . import jit_prefetch_deep_gemm as jdg
+
+        def _done(m, n, k, dt):
+            if dt < jdg.COMPILE_HOST_S or threading.get_ident() != self._executor_thread:
+                return
+            self.stats.dg_executor_compiles += 1
+            self.stats.dg_executor_compile_s += dt
+            logger.info(
+                f"[JIT stats] rank {self.rank} DeepGEMM compile on executor "
+                f"m={m} n={n} k={k} {dt:.3f}s"
+            )
+
+        jdg.done_observer = _done
+        if jdg.launch_observer is None:
+            # note_launch_done only runs while a launch observer is set.
+            jdg.launch_observer = lambda m, n, k: None
+
     def enable_deep_gemm(self, provider) -> bool:
         """Start the DeepGEMM helpers and planning (needs the patched DeepGEMM).
 
@@ -500,19 +533,20 @@ class JitPrefetcher:
                 self.stats.dg_unplanned += 1
                 self._event(f"DeepGEMM launch not planned: m={m} n={n} k={k}")
             self._record(jdg.KIND, "deep_gemm", spec)
-
-        def _done(m, n, k, dt):
-            if dt < jdg.COMPILE_HOST_S or threading.get_ident() != self._executor_thread:
-                return
-            self.stats.dg_executor_compiles += 1
-            self.stats.dg_executor_compile_s += dt
-            logger.info(
-                f"[JIT stats] rank {self.rank} DeepGEMM compile on executor "
-                f"m={m} n={n} k={k} {dt:.3f}s"
-            )
+            ev = self._key_event.get(spec)
+            if ev is not None and not ev.is_set():
+                # A helper has it queued or in progress: move it to the front
+                # and wait for its cubin instead of compiling it again here.
+                self._submit(spec, spec, "deep_gemm", _PRIO_URGENT, kind=jdg.KIND)
+                t0 = time.perf_counter()
+                ev.wait(float(os.environ.get("TLLM_JIT_PREFETCH_WAIT_TIMEOUT_S", "300")))
+                dt = time.perf_counter() - t0
+                self.stats.wait_n += 1
+                self.stats.wait_s += dt
+                self._event(f"WAIT for helper deep_gemm m={m} n={n} k={k} {dt * 1e3:.0f} ms")
 
         jdg.launch_observer = _observe
-        jdg.done_observer = _done
+        self.observe_deep_gemm()
         threading.Thread(
             target=self._enumerate_dg, daemon=True, name="jit_prefetch_dg_enum"
         ).start()
@@ -576,6 +610,8 @@ class JitPrefetcher:
                 else:
                     self.stats.helper_fail += 1
                     logger.warning(f"[JIT prefetch] helper failed on {label}: {err}")
+            if ok and label == "deep_gemm" and not r.get("built"):
+                continue  # already on disk: most enumerated M share a layout
             self._event(f"helper {'done' if ok else 'FAIL'} {label} {dt * 1e3:.0f} ms")
 
     def register(self, name: str, provider: Callable[[Any], List[KernelCall]]):
@@ -611,7 +647,8 @@ class JitPrefetcher:
         from . import jit_prefetch_deep_gemm as jdg
 
         n = 0
-        for spec in self._dg.enumerate_specs():
+        world = int(os.environ.get("TLLM_JIT_PREFETCH_DG_WORLD", "0")) or _local_world()
+        for spec in self._dg.enumerate_specs(self.rank, world):
             if self._submit(spec, spec, "deep_gemm", _PRIO_ENUM, kind=jdg.KIND):
                 n += 1
         self._event(f"DeepGEMM enumeration: {n} requests queued")

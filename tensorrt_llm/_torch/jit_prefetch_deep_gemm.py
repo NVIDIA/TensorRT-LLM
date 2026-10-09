@@ -133,18 +133,24 @@ class FP8LinearDeepGemmProvider:
         self._seen_m.add(num_tokens)
         return self.specs_for_m(num_tokens)
 
-    def enumerate_specs(self):
-        """Background coverage: every M up to max_num_tokens, low M first.
+    def enumerate_specs(self, rank: int = 0, world: int = 1):
+        """Background coverage: every M up to max_num_tokens.
 
         DeepGEMM's layout depends on M only through ceil(M / block_m) and the
         candidate block_m are multiples of 16, so one M per window of 16 rows
         reaches every layout: 1..16 individually (the smallest blocks), then
-        every 16th M. Low M first: decode and small mixed batches come first.
+        every 16th M.
+
+        Every rank enumerates every M, so coverage never depends on how ranks
+        share ``DG_JIT_CACHE_DIR``. Ranks that do share one start at different
+        points of the list (``rank``/``world``), so they compile different
+        variants first and find the rest already on disk.
         """
         ms = list(range(1, 17)) + list(range(32, self.max_num_tokens + 1, 16))
         if self.max_num_tokens not in ms:
             ms.append(self.max_num_tokens)
-        for m in ms:
+        start = (len(ms) * (rank % max(1, world))) // max(1, world)
+        for m in ms[start:] + ms[:start]:
             if m in self._seen_m:
                 continue
             for s in self.specs_for_m(m):

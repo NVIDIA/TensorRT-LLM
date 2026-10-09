@@ -21,8 +21,9 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import (global_mpi_rank, maybe_pin_memory, nvtx_range,
-                                 prefer_pinned, release_gc)
+from tensorrt_llm._utils import (get_sm_version, global_mpi_rank,
+                                 maybe_pin_memory, nvtx_range, prefer_pinned,
+                                 release_gc)
 from tensorrt_llm.bindings.internal import \
     batch_manager as batch_manager_bindings
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
@@ -1467,6 +1468,8 @@ class PyTorchModelEngine(ModelEngine):
                                     providers_enabled)
         prefetcher = JitPrefetcher.init(rank=self.mapping.rank)
         self._jit_prefetcher = prefetcher
+        if prefetcher is not None and get_sm_version() in (100, 103):
+            prefetcher.observe_deep_gemm()
         if prefetcher is None or not prefetch_enabled():
             return
         if not providers_enabled():
