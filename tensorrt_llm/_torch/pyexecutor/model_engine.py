@@ -4769,7 +4769,8 @@ class PyTorchModelEngine(ModelEngine):
             self.guided_decoder.add_batch(
                 scheduled_requests,
                 new_tokens=new_tokens_device,
-                runtime_draft_len=self.runtime_draft_len)
+                runtime_draft_len=self.runtime_draft_len,
+                is_cuda_graph=maybe_graph)
 
         if (not promoted_context_request_ids
                 and type(attn_metadata) is TrtllmAttentionMetadata

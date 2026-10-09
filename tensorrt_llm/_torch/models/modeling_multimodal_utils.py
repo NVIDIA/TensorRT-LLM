@@ -28,6 +28,7 @@ from einops import rearrange
 from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
 
+from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
@@ -307,6 +308,8 @@ def get_multimodal_embeddings(
 
     # Step 2: Run encoder forward only on uncached parameters
     if uncached_multimodal_params:
+        # Encoders can hold the GIL while waiting on the device.
+        drain_captured_hostfuncs()
         kwargs = encoder_kwargs or {}
         encoder_embeddings = encoder_forward_fn(uncached_multimodal_params,
                                                 **kwargs)

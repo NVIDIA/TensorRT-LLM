@@ -28,14 +28,24 @@ CUDA graph is being captured (a host wait is illegal there, and the captured
 host nodes do not run until replay), and for the non-capturable decoder, which
 runs its build inline and enqueues no callback. They also pin that every
 worker-side guided-decoding path goes through the drained methods.
+
+Replayed graphs' host functions are drained before a multimodal encoder runs,
+and an eager forward with nothing constrained enqueues none.
 """
 
+from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from tensorrt_llm._torch import hostfunc
+from tensorrt_llm._torch.models import modeling_multimodal_utils
+from tensorrt_llm._torch.pyexecutor.guided_decoder import (
+    CapturableGuidedDecoder,
+    GuidedDecoder,
+    GuidedRequests,
+)
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 
@@ -72,6 +82,7 @@ def _decoder(cls):
     decoder.token_event = MagicMock(name="token_event")
     decoder.bitmask_event = MagicMock(name="bitmask_event")
     decoder.requests = []
+    decoder.active = True
     decoder.max_num_draft_tokens = 1
     for name in (
         "fetch_batch",
@@ -140,6 +151,100 @@ def test_no_drain_while_capturing_a_cuda_graph(method):
     _run(_call(decoder, method), capturing=True)
 
     decoder.bitmask_event.synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_inactive_forward_enqueues_nothing(method):
+    """An eager forward with no constrained request launches no host function."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.active = False
+
+    result = _run(_call(decoder, method), capturing=False)
+
+    for name in ("fetch_batch", "fetch_draft_batch", "fetch_accepted_batch", "build"):
+        getattr(decoder, name).assert_not_called()
+    decoder.bitmask_event.record.assert_not_called()
+    decoder.bitmask_event.synchronize.assert_not_called()
+    assert result in (None, [])
+
+
+@pytest.mark.parametrize(
+    "is_cuda_graph,constrained",
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_add_batch_activates_for_cuda_graphs_and_constrained_batches(is_cuda_graph, constrained):
+    """A graph replays the guided work it captured, whatever the batch holds."""
+    decoder = object.__new__(CapturableGuidedDecoder)
+    decoder.max_num_draft_tokens = 1
+    decoder.queue = Queue()
+    snapshot = MagicMock(name="guided_requests")
+    snapshot.valid_requests.side_effect = lambda: iter([object()] if constrained else [])
+
+    with patch.object(GuidedRequests, "from_scheduled_requests", return_value=snapshot):
+        decoder.add_batch(MagicMock(name="scheduled_requests"), is_cuda_graph=is_cuda_graph)
+
+    expected = is_cuda_graph or constrained
+    assert decoder.active == expected
+    assert decoder.queue.qsize() == int(expected)
+
+
+@pytest.mark.parametrize(
+    "captured,capturing,expect_sync",
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_drain_captured_hostfuncs(captured, capturing, expect_sync):
+    """Synchronize only when a graph holds host functions, and never inside capture."""
+    handles = {1} if captured else set()
+    with (
+        patch.object(hostfunc, "HOSTFUNC_USER_DATA_HANDLES", handles),
+        patch("torch.cuda.is_current_stream_capturing", return_value=capturing),
+        patch("torch.cuda.synchronize") as synchronize,
+    ):
+        hostfunc.drain_captured_hostfuncs()
+
+    assert synchronize.call_count == int(expect_sync)
+
+
+def _multimodal_param(embedding=None):
+    param = MagicMock(name="multimodal_param")
+    param.encoder_event = None
+    param.multimodal_runtime = None
+    param.multimodal_data = {} if embedding is None else {"multimodal_embedding": embedding}
+    return param
+
+
+def test_multimodal_encoder_runs_after_the_drain():
+    calls = []
+    param = _multimodal_param()
+
+    def encode(params):
+        calls.append("encode")
+        return torch.zeros(1, 4)
+
+    with (
+        patch.object(
+            modeling_multimodal_utils,
+            "drain_captured_hostfuncs",
+            side_effect=lambda: calls.append("drain"),
+        ),
+        patch.object(
+            modeling_multimodal_utils, "_get_uncached_multimodal_params", return_value=[param]
+        ),
+    ):
+        modeling_multimodal_utils.get_multimodal_embeddings(encode, [param])
+
+    assert calls == ["drain", "encode"]
+
+
+def test_no_drain_when_every_embedding_is_cached():
+    param = _multimodal_param(embedding=torch.zeros(1, 4))
+    with (
+        patch.object(modeling_multimodal_utils, "drain_captured_hostfuncs") as drain,
+        patch.object(modeling_multimodal_utils, "_get_uncached_multimodal_params", return_value=[]),
+    ):
+        modeling_multimodal_utils.get_multimodal_embeddings(MagicMock(name="encoder"), [param])
+
+    drain.assert_not_called()
 
 
 def test_no_drain_for_the_non_capturable_decoder():

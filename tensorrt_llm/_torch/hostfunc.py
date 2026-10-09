@@ -27,6 +27,17 @@ def launch_hostfunc(hostfunc, *args, **kwargs):
     return handle
 
 
+def drain_captured_hostfuncs() -> None:
+    """Wait for replayed CUDA graphs to run their host functions.
+
+    Each takes the GIL, so a GIL-holding call that waits on the device would
+    deadlock against one still pending.
+    """
+    if (HOSTFUNC_USER_DATA_HANDLES
+            and not torch.cuda.is_current_stream_capturing()):
+        torch.cuda.synchronize()
+
+
 def hostfunc(hostfunc):
 
     def wrapper(*args, **kwargs):
