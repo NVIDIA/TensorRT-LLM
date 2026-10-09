@@ -278,7 +278,7 @@ def get_kv_cache_manager_cls(
         # unvalidated. Disaggregated serving (TRTLLM-14815) routes through
         # the shared hybrid transceiver validation below: the Python NIXL
         # transceiver selects the Mixed manager, whose KDA recurrent/conv
-        # states transfer through the bounce buffer.
+        # states transfer as a STATE layer group with the KV blocks.
         # Helix x speculation bookkeeping (per-token verify groups on the
         # superblock ledger, py_helix_decode_group_index advancement) exists
         # only in KVCacheManagerV2. The V1-family hybrid managers account

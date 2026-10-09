@@ -93,7 +93,7 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
             backend_params[key] = str(value)
         backend_params["num_threads"] = str(num_threads)
         # C++ reads "num_workers" (not "num_threads") for progress threads, default 1.
-        # Env-gated so the default is unchanged (more threads can hurt the coalesced bounce WRITE).
+        # Env-gated so the default is unchanged.
         # Validate at the boundary: only a positive int reaches the backend.
         nixl_num_workers = os.environ.get("TRTLLM_NIXL_NUM_WORKERS")
         if nixl_num_workers is not None:

@@ -18,9 +18,8 @@
 Everything here forwards to the native ``_introspection`` submodule of the bindings. The
 indirection exists so callers import one Python path rather than reaching into
 ``tensorrt_llm.bindings`` directly, and so return values are normalised to plain Python
-containers. Most hooks are white-box helpers for tests and accuracy harnesses, but a few
-back production internals -- the stats report and the disaggregated bounce buffer -- so
-treat this as internal API rather than test-only scaffolding.
+containers. The hooks are white-box helpers for tests and accuracy harnesses; treat this
+as internal API rather than a stable surface.
 """
 
 from __future__ import annotations
@@ -44,20 +43,6 @@ def _cpp() -> Any:
             "which is missing from this build of tensorrt_llm.bindings"
         )
     return cpp_introspection
-
-
-#: CUDA virtual-memory primitives, forwarded rather than wrapped: they are classes the
-#: caller constructs, so there is nothing to normalise. Used by the native disaggregated
-#: bounce buffer to reserve one contiguous fabric region.
-_FORWARDED_TYPES = ("PooledPhysMemAllocator", "VirtMem")
-
-
-def __getattr__(name: str) -> Any:
-    # Resolved on first access, not at import, so importing this module never depends on
-    # the native submodule being present -- the same contract the hooks below follow.
-    if name in _FORWARDED_TYPES:
-        return getattr(_cpp(), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def poison_for_testing(reason: str) -> None:

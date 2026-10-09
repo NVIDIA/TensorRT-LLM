@@ -30,10 +30,8 @@ the payload the zero-copy path produces from the same regions. The stored bytes
 are therefore identical either way, so a pool written by one path is readable by
 the other, including by another engine sharing the pool.
 
-Copies go through `cudaMemcpyAsync` rather than the batched Triton kernel in
-`disaggregation/native/bounce/gather_scatter.py`. That kernel is the better tool
-for device-to-device gather, but here one side is host memory, which the copy
-engines move over the host link by DMA.
+Copies go through `cudaMemcpyAsync` rather than a batched device gather kernel:
+one side is host memory, which the copy engines move over the host link by DMA.
 """
 
 from typing import List, Optional, Sequence, Tuple

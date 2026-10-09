@@ -1286,12 +1286,10 @@ def run_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
-        # Keep the Python-native bounce layer disabled by default (size 0).
-        # Dedicated C++ bounce coverage enables the NIXL agent's bounce v2 via
-        # agent_bounce_buffer_enable + kv_cache_bounce_size_mb plus
+        # Bounce stays off by default (size 0). Dedicated C++ bounce coverage sets
+        # kv_cache_bounce_size_mb, which alone enables the C++ agent bounce, plus
         # agent_bounce_params, which exercises the config plumbing end-to-end.
         kv_cache_bounce_size_mb=64 if expect_cpp_bounce else 0,
-        agent_bounce_buffer_enable=expect_cpp_bounce,
         agent_bounce_params={
             "min_descriptor_count": "1",
             "max_average_descriptor_size": "1MB",
@@ -1487,11 +1485,6 @@ def run_transfer_test(
         # bounce v2 transport active, and at least one transfer must have been routed
         # through it (only KV senders submit WRITEs, so we assert on the total).
         if expect_cpp_bounce:
-            # The shared capacity must be routed to exactly one implementation: with
-            # agent_bounce_buffer_enable the Python-native bounce stays off.
-            assert all(tc._transfer_worker._config.bounce is None for tc in ctx_tcs + gen_tcs), (
-                "Python-native bounce must stay disabled when the C++ agent bounce is selected"
-            )
             agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
             assert all(getattr(agent, "bounce_enabled", False) for agent in agents), (
                 "C++ bounce v2 transport is not active on every NIXL agent"
@@ -2004,10 +1997,10 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
 
-    Bounce is enabled (agent_bounce_buffer_enable + kv_cache_bounce_size_mb) and tuned
-    (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test, covering
-    the config plumbing end-to-end; engagement is asserted programmatically there
-    (agent.bounce_enabled / bounce_submit_count).
+    Bounce is enabled (kv_cache_bounce_size_mb alone enables the C++ agent bounce) and
+    tuned (agent_bounce_params) via CacheTransceiverConfig inside run_transfer_test,
+    covering the config plumbing end-to-end; engagement is asserted programmatically
+    there (agent.bounce_enabled / bounce_submit_count).
     """
     # BindingsNixlTransferStatus.last_status_str() resolves this exact attribute on the C++
     # status; if the binding name drifts, failure details silently degrade to "<unavailable>".
