@@ -260,9 +260,9 @@ def _resolve_kimi_situ_betas(cfg: Any) -> tuple[float, float]:
             "Kimi K3 routed SiTu experts require activation_situ_linear_beta; "
             "None means an identity linear branch that the fused kernels cannot represent."
         )
-    if situ_beta <= 0 or situ_linear_beta <= 0:
+    if not (0 < situ_beta < float("inf") and 0 < situ_linear_beta < float("inf")):
         raise ValueError(
-            f"Kimi K3 SiTu betas must be positive; got {situ_beta} and {situ_linear_beta}."
+            f"Kimi K3 SiTu betas must be finite and positive; got {situ_beta} and {situ_linear_beta}."
         )
     return float(situ_beta), float(situ_linear_beta)
 
@@ -1190,7 +1190,12 @@ class KimiK3MoERuntime(nn.Module):
             # CUTLASS is absent on purpose: it is the fallback target, so
             # "degraded to CUTLASS" is not a thing that can happen to it.
             allow_backend_degradation=routed_moe_model_config.moe_backend
-            not in ("MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL", "CUTEDSL"),
+            not in (
+                "MEGAMOE_DEEPGEMM",
+                "MEGAMOE_CUTEDSL",
+                "CUTEDSL",
+                "CUTEDSL_FC12",
+            ),
         )
         self._check_trtllm_situ_quant(
             routed_moe_model_config.moe_backend, routed_quant_config.quant_algo
@@ -1403,13 +1408,15 @@ class KimiK3MoERuntime(nn.Module):
             "CUTLASS",
             "TRTLLM",
             "CUTEDSL",
+            "CUTEDSL_FC12",
             "MEGAMOE_DEEPGEMM",
             "MEGAMOE_CUTEDSL",
         }
         if model_config.moe_backend not in supported_backends:
             raise ValueError(
                 "Kimi K3 SiTU routed experts only support the CUTLASS, TRTLLM, "
-                "CUTEDSL, MEGAMOE_DEEPGEMM, and MEGAMOE_CUTEDSL backends; "
+                "CUTEDSL, CUTEDSL_FC12, MEGAMOE_DEEPGEMM, and "
+                "MEGAMOE_CUTEDSL backends; "
                 f"got {model_config.moe_backend!r}."
             )
         if model_config.moe_load_balancer is not None:

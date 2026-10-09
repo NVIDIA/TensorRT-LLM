@@ -18,7 +18,7 @@ This guide uses Slurm and the `trtllm-llmapi-launch` multi-node launcher. The co
   | TEP8 | attention-TP, EP8 | 213 GB | GB300-class per-GPU memory |
   | TEP16 | attention-TP, EP16 | 115 GB | validated on GB200 (`SM100`) |
 
-  DEP16 replicates the BF16 non-expert weights on every rank (114 GB per rank) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB per rank). TEP16 shards those non-expert weights instead, which is what brings it within `SM100` per-GPU memory; TEP8 does not fit because its 8-way expert share alone is 181 GB per rank. On B200 (`SM100`), Kimi K3 is functionally supported at the kernel and module level and covered by unit tests in CI. Other GPU architectures are not supported.
+  DEP16 replicates the BF16 non-expert weights on every rank (114 GB per rank) on top of the MXFP4 routed experts at 16-way expert parallelism (90 GB per rank). TEP16 shards those non-expert weights instead, which is what brings it within `SM100` per-GPU memory; TEP8 does not fit because its 8-way expert share alone is 181 GB per rank. On B200 (`SM100`), Kimi K3 is functionally supported at the kernel and module level and covered by unit tests in CI. Full-model deployments on other GPU architectures are not covered by this guide.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin (or an equivalent MPI launcher) to start one rank per GPU across the nodes.
 * High-speed inter-node interconnect (e.g., NVLink/InfiniBand) for the expert-parallel traffic.
 * Shared filesystem visible to all nodes for the repository, the model weights, and the configuration file.
@@ -34,7 +34,8 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 
 ## Feature Support Notes
 
-* **Blackwell only.** NVIDIA Blackwell GPUs are supported. The performance results in this guide were validated on NVIDIA GB300 NVL GPUs. Kimi K3 kernels and modules are also functional on B200 (`SM100`) and covered by unit tests in CI, and the TEP16 deployment is validated end-to-end on GB200 (`SM100`); DEP16 and TEP8 require GB300-class per-GPU memory (see Prerequisites). Support for other GPU architectures may be added in a future release.
+* **Full-model deployments in this guide use Blackwell.** The performance results were validated on NVIDIA GB300 NVL GPUs. Kimi K3 kernels and modules are also functional on B200 (`SM100`) and covered by unit tests in CI, and the TEP16 deployment is validated end-to-end on GB200 (`SM100`); DEP16 and TEP8 require GB300-class per-GPU memory (see Prerequisites).
+* **Rubin FC12 MoE kernel support.** On SM107, `CUTEDSL_FC12` supports SwiGLU and Kimi K3 SiTU for NVFP4 routed experts. This kernel/backend support does not validate the full Kimi K3 deployment on Rubin; the configurations and results below are for Blackwell.
 * **High-throughput and low-latency deployments are provided.** DEP16 (`enable_attention_dp: true`, `moe_expert_parallel_size: 16`) is the high-throughput deployment. TEP16 (`enable_attention_dp: false`, `moe_expert_parallel_size: 16`) is the low-latency deployment. An 8-GPU deployment, TEP8 (`enable_attention_dp: false`, `moe_expert_parallel_size: 8`), is also provided. Select the deployment and concurrency appropriate for your workload.
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
