@@ -54,14 +54,13 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              extract_disagg_cluster_config,
-                                              parse_disagg_config_file,
-                                              parse_metadata_server_config_file,
-                                              validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    extract_disagg_cluster_config, parse_disagg_config_file,
+    parse_metadata_server_config_file, validate_config_bool,
+    validate_internal_request_auth_key)
+from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs,
+                                          build_cli_config)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -153,16 +152,6 @@ def _pop_bool_config_option(config: dict[str, Any], key: str) -> bool:
     return validate_config_bool(config.pop(key, False), key)
 
 
-def _pop_optional_str_config_option(config: dict[str, Any],
-                                    key: str) -> Optional[str]:
-    value = config.pop(key, None)
-    if value is None:
-        return None
-    if isinstance(value, str) and value:
-        return value
-    raise ValueError(f"{key} must be a non-empty string")
-
-
 def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
     """Import and register middleware objects on a FastAPI app."""
     for middleware in middlewares:
@@ -209,10 +198,9 @@ def is_non_default_or_required(param_name, value, explicit_cli_keys):
     # LlmArgs fields built from CLI scalars whose names differ from the field
     # name (e.g. `--free_gpu_memory_fraction` constructs `kv_cache_config`).
     cli_derived_fields = {
-        "kv_cache_config": ("free_gpu_memory_fraction", "kv_cache_dtype"),
+        **SERVE_CLI_CONFIG_FIELDS,
         "build_config":
         ("max_batch_size", "max_num_tokens", "max_beam_width", "max_seq_len"),
-        "multimodal_config": ("video_pruning_rate", ),
     }
     if any(s in explicit_cli_keys
            for s in cli_derived_fields.get(param_name, ())):
@@ -325,8 +313,9 @@ def get_llm_args(
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
-        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
-                      dtype=kv_cache_dtype),
+        build_cli_config("kv_cache_config",
+                         free_gpu_memory_fraction=free_gpu_memory_fraction,
+                         kv_cache_dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
         "scheduler_config":
@@ -366,7 +355,8 @@ def get_llm_args(
         "otlp_traces_endpoint":
         otlp_traces_endpoint,
         "multimodal_config":
-        MultimodalConfig(video_pruning_rate=video_pruning_rate)
+        build_cli_config("multimodal_config",
+                         video_pruning_rate=video_pruning_rate)
         if video_pruning_rate is not None else None,
         "telemetry_config":
         _telemetry_config.TelemetryConfig(
@@ -1375,8 +1365,8 @@ def serve(
             llm_args_extra_dict, "allow_request_chat_template")
         allow_request_chat_template = (allow_request_chat_template
                                        or extra_allow_request_chat_template)
-        internal_disagg_auth_key = _pop_optional_str_config_option(
-            llm_args_extra_dict, "internal_request_auth_key")
+        internal_disagg_auth_key = validate_internal_request_auth_key(
+            llm_args_extra_dict.pop("internal_request_auth_key", None))
         # Apply to the raw mapping first so a higher-precedence override can
         # replace an invalid YAML value before nested config construction.
         llm_args_extra_dict = _apply_config_overrides(llm_args_extra_dict,

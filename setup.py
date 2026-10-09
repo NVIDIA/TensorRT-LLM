@@ -52,6 +52,14 @@ def parse_requirements(filename: os.PathLike):
 
 def sanity_check():
     tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
+    for config_kind in ("config", "disagg-config", "visual-gen-config"):
+        schema = tensorrt_llm_path / "schemas" / f"trtllm-serve-{config_kind}.schema.json"
+        if not schema.is_file():
+            raise ImportError(
+                f"Missing configuration schema: {schema}. Restore the checked-in "
+                "schema files, or regenerate them with "
+                "python3 scripts/generate_trtllm_serve_schemas.py "
+                "using a matching TensorRT-LLM build before packaging.")
     if not (tensorrt_llm_path / "bindings").exists():
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
@@ -202,6 +210,7 @@ package_data += [
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',
+    'schemas/*.json',
     'usage/schemas/*.json',
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
@@ -234,12 +243,13 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns telemetry schemas and the
+    Precompiled wheels own native bits. Source owns configuration/telemetry schemas and the
     OpenEngine contract. Skip those wheel files so Python-only edits layer over
     old wheels and tracked bindings from the current checkout remain authoritative.
     """
     filename = filename.replace("\\", "/")
-    if filename.startswith("tensorrt_llm/usage/schemas/"):
+    if filename.startswith(
+        ("tensorrt_llm/schemas/", "tensorrt_llm/usage/schemas/")):
         return filename.endswith(".json")
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",

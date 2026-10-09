@@ -80,6 +80,18 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
+# Serving input aliases are shared by runtime construction and editor schemas.
+SERVE_CONFIG_ALIASES = {"hf_revision": "revision"}
+SERVE_CLI_CONFIG_FIELDS = {
+    "kv_cache_config": {
+        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
+        "kv_cache_dtype": "dtype",
+    },
+    "multimodal_config": {
+        "video_pruning_rate": "video_pruning_rate"
+    },
+}
+
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
@@ -657,8 +669,10 @@ def validate_token_encoder_bucket_config(
 # For CudaGraphConfig's backward compatibility
 CudaGraphConfig = DecodeCudaGraphConfig
 
+CudaGraphConfigInput: TypeAlias = Union[DecodeCudaGraphConfig,
+                                        EncodeCudaGraphConfig]
 CudaGraphConfigType: TypeAlias = Annotated[
-    Union[DecodeCudaGraphConfig, EncodeCudaGraphConfig],
+    CudaGraphConfigInput,
     Field(discriminator="mode"),
 ]
 
@@ -5468,7 +5482,9 @@ class BaseLlmArgs(StrictBaseModel):
         description="Telemetry configuration (opt-out, usage context).",
         status="prototype")
 
-    @field_validator('env_overrides', mode='before')
+    @field_validator('env_overrides',
+                     mode='before',
+                     json_schema_input_type=Optional[Dict[str, Any]])
     @classmethod
     def coerce_env_overrides_to_str(cls, v):
         """Coerce env_overrides values to strings for os.environ compatibility."""
@@ -5909,7 +5925,9 @@ class TorchLlmArgs(BaseLlmArgs):
             "`encoder_cuda_graph_config` produce usable graph shapes."),
         status="prototype")
 
-    @field_validator('cuda_graph_config', mode='before')
+    @field_validator('cuda_graph_config',
+                     mode='before',
+                     json_schema_input_type=Optional[CudaGraphConfigInput])
     @classmethod
     def infer_cuda_graph_config_mode(cls, v):
         if isinstance(v, dict) and "mode" not in v:
@@ -5926,7 +5944,9 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Multimodal model configuration.",
         status="prototype")
 
-    @field_validator('multimodal_config', mode='before')
+    @field_validator('multimodal_config',
+                     mode='before',
+                     json_schema_input_type=Optional[MultimodalConfig])
     @classmethod
     def init_multimodal_config(cls, v):
         # The field is non-Optional, but callers (e.g. the multimodal
@@ -7301,6 +7321,16 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
 
+def build_cli_config(config_name: str, **values: Any) -> BaseModel:
+    """Construct a nested LLM config from its flat serving CLI options."""
+    config_type = TorchLlmArgs.model_fields[config_name].annotation
+    fields = SERVE_CLI_CONFIG_FIELDS[config_name]
+    return config_type(**{
+        fields[name]: value
+        for name, value in values.items()
+    })
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
@@ -7321,15 +7351,14 @@ def update_llm_args_with_extra_dict(
     # CLI scalar -> nested KvCacheConfig field. Callers add the CLI scalar
     # name to `explicit_cli_keys` to make it win over YAML's same-named
     # field inside `kv_cache_config:`.
-    cli_to_kv_cache_field = {
-        "free_gpu_memory_fraction": "free_gpu_memory_fraction",
-        "kv_cache_dtype": "dtype",
+    cli_to_kv_cache_field = SERVE_CLI_CONFIG_FIELDS["kv_cache_config"] | {
         "enable_block_reuse": "enable_block_reuse",
     }
     explicit_cli_keys = explicit_cli_keys or set()
 
-    if 'hf_revision' in llm_args_dict:
-        llm_args_dict.setdefault('revision', llm_args_dict.pop('hf_revision'))
+    for alias, name in SERVE_CONFIG_ALIASES.items():
+        if alias in llm_args_dict:
+            llm_args_dict.setdefault(name, llm_args_dict.pop(alias))
 
     # Deep merge kv_cache_config to prevent partial YAML kv_cache_config from replacing the complete kv_cache_config
     if 'kv_cache_config' in llm_args and 'kv_cache_config' in llm_args_dict:
@@ -7377,9 +7406,10 @@ def update_llm_args_with_extra_dict(
             if not isinstance(base_mm, dict):
                 base_mm = {}
             merged = dict(base_mm) | dict(yaml_mm)
-            if ("video_pruning_rate" in explicit_cli_keys
-                    and "video_pruning_rate" in base_mm):
-                merged["video_pruning_rate"] = base_mm["video_pruning_rate"]
+            for cli_name, field in SERVE_CLI_CONFIG_FIELDS[
+                    "multimodal_config"].items():
+                if cli_name in explicit_cli_keys and field in base_mm:
+                    merged[field] = base_mm[field]
             llm_args_dict['multimodal_config'] = merged
 
     # Drop YAML keys claimed by explicit CLI flags so the outer merge below
