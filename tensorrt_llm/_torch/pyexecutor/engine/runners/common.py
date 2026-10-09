@@ -4,6 +4,7 @@
 """Shared helpers used by multiple model-runner families."""
 
 import bisect
+import contextlib
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
@@ -57,34 +57,6 @@ def get_all_rank_ctx_requests(
         assert dist is not None, "attention DP requires a distributed communicator"
         return dist.tp_allgather_int64([num_ctx_requests])[:, 0].tolist()
     return None
-
-
-def set_spec_metadata_all_rank_num_tokens(
-    spec_metadata: SpecMetadata,
-    spec_all_rank_num_tokens: list[int],
-    all_rank_num_seqs: list[int],
-    all_rank_num_gens: list[int] | None = None,
-) -> None:
-    # Eagle3 / MTP-eagle one-model use subseq_all_rank_num_tokens for
-    # draft loop iterations i>0 (per-sequence counts, since each
-    # sequence contributes one token per iteration).
-    spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
-    spec_metadata.all_rank_num_seqs = all_rank_num_seqs
-    # DSpark can draft only after the target processes the current bonus token,
-    # because it consumes captured target-layer hidden states for that token.
-    # Prefill computes hidden states for prompt tokens; the first generated token
-    # is sampled from the last prompt logits and has not itself passed through the
-    # target layers. Thus context requests seed the rolling window but do not run
-    # the draft. On mixed steps, num_seqs therefore over-counts the draft MoE
-    # workload; gen-only per-rank counts keep the FUSED_COMM (DeepGEMM MegaMoE)
-    # chunk loop identical across EP ranks.
-    if all_rank_num_gens is not None:
-        spec_metadata.all_rank_num_gens = all_rank_num_gens
-    if (
-        spec_metadata.spec_dec_mode.is_mtp_eagle_one_model()
-        or spec_metadata.spec_dec_mode.is_eagle3_one_model()
-    ):
-        spec_metadata.subseq_all_rank_num_tokens = all_rank_num_seqs
 
 
 def get_padding_params(
@@ -234,3 +206,46 @@ def make_scheduled_inputs(
         enable_spec_decode=enable_spec_decode,
         runtime_draft_len=runtime_draft_len,
     )
+
+
+def resolve_mrope_position_deltas_cache(model: torch.nn.Module | None) -> torch.Tensor | None:
+    """The MRoPE delta cache held by ``model`` or by its draft model.
+
+    ``None`` for every model that does not keep one, which is also how
+    ``should_enable_overlap_headroom`` learns that the seat pool may be widened:
+    the cache is sized from ``max_num_tokens`` rather than from the seat pool.
+    """
+    cache = getattr(model, "mrope_position_deltas_cache", None)
+    if cache is None:
+        cache = getattr(getattr(model, "draft_model", None), "mrope_position_deltas_cache", None)
+    return cache
+
+
+@contextlib.contextmanager
+def moe_a2a_steady_state_budget_for_capture():
+    """Force the steady-state MoE all-to-all budget across CUDA-graph capture.
+
+    The budget is a kernel launch argument, so it is frozen into each captured
+    graph. Capture happens inside the warmup window, so without this a replay
+    would keep warmup's relaxed deadline for the life of the process.
+    """
+    set_moe_a2a_warmup(False)
+    try:
+        yield
+    finally:
+        set_moe_a2a_warmup(True)
+
+
+def set_moe_a2a_warmup(in_warmup: bool) -> None:
+    """Select the MoE all-to-all completion-flag budget for the current phase.
+
+    No-op when the op is unavailable (older bindings).
+    """
+    try:
+        torch.ops.trtllm.moe_a2a_set_warmup(in_warmup)
+        logger.info(f"moe_a2a completion-flag budget: in_warmup={in_warmup}")
+    except (AttributeError, RuntimeError) as e:
+        logger.warning(
+            f"moe_a2a_set_warmup unavailable, the all-to-all timeout "
+            f"budget was not switched: {type(e).__name__}: {e}"
+        )

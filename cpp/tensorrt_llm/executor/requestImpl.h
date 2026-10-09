@@ -52,13 +52,13 @@ public:
         std::optional<std::vector<SizeType32>> positionIds, std::optional<std::list<VecTokens>> badWords,
         std::optional<std::list<VecTokens>> stopWords, std::optional<Tensor> embeddingBias,
         std::optional<PromptTuningConfig> pTuningConfig, std::optional<MultimodalInput> multimodalInput,
-        std::optional<Tensor> multimodalEmbedding, std::optional<MropeConfig> mRopeConfig,
-        std::optional<LoraConfig> loraConfig, std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig,
-        std::optional<VecTokens> encoderInputTokenIds, std::optional<IdType> clientId, bool returnAllGeneratedTokens,
-        PriorityType priority, RequestType type, std::optional<ContextPhaseParams> contextPhaseParams,
-        std::optional<Tensor> encoderInputFeatures, std::optional<SizeType32> encoderOutputLength,
-        std::optional<GuidedDecodingParams> guidedDecodingParams, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<IdType> disaggRequestId, std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<MropeConfig> mRopeConfig, std::optional<LoraConfig> loraConfig,
+        std::optional<KvCacheRetentionConfig> kvCacheRetentionConfig, std::optional<VecTokens> encoderInputTokenIds,
+        std::optional<IdType> clientId, bool returnAllGeneratedTokens, PriorityType priority, RequestType type,
+        std::optional<ContextPhaseParams> contextPhaseParams, std::optional<Tensor> encoderInputFeatures,
+        std::optional<SizeType32> encoderOutputLength, std::optional<GuidedDecodingParams> guidedDecodingParams,
+        std::optional<MillisecondsType> allottedTimeMs, std::optional<IdType> disaggRequestId,
+        std::optional<std::string> cacheSalt = std::nullopt)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -71,7 +71,6 @@ public:
         , mEmbeddingBias(checkEmbeddingBias(std::move(embeddingBias)))
         , mPTuningConfig(std::move(pTuningConfig))
         , mMultimodalInput(std::move(multimodalInput))
-        , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeConfig(std::move(mRopeConfig))
         , mLoraConfig(std::move(loraConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
@@ -167,11 +166,6 @@ public:
     [[nodiscard]] std::optional<PromptTuningConfig> getPromptTuningConfig() const
     {
         return mPTuningConfig;
-    }
-
-    [[nodiscard]] std::optional<Tensor> getMultimodalEmbedding() const
-    {
-        return mMultimodalEmbedding;
     }
 
     [[nodiscard]] std::optional<MultimodalInput> getMultimodalInput() const
@@ -299,11 +293,6 @@ public:
         mPTuningConfig = pTuningConfig;
     }
 
-    void setMultimodalEmbedding(Tensor const& multimodalEmbedding)
-    {
-        mMultimodalEmbedding = multimodalEmbedding;
-    }
-
     void setMultimodalInput(MultimodalInput const& multimodalInput)
     {
         mMultimodalInput = multimodalInput;
@@ -420,7 +409,6 @@ private:
         lambda(mEmbeddingBias);
         lambda(mPTuningConfig);
         lambda(mMultimodalInput);
-        lambda(mMultimodalEmbedding);
         lambda(mMropeConfig);
         lambda(mLoraConfig);
         lambda(mKvCacheRetentionConfig);
@@ -450,7 +438,6 @@ private:
     std::optional<Tensor> mEmbeddingBias;
     std::optional<PromptTuningConfig> mPTuningConfig;
     std::optional<MultimodalInput> mMultimodalInput;
-    std::optional<Tensor> mMultimodalEmbedding;
     std::optional<MropeConfig> mMropeConfig;
     std::optional<LoraConfig> mLoraConfig;
     std::optional<KvCacheRetentionConfig> mKvCacheRetentionConfig;

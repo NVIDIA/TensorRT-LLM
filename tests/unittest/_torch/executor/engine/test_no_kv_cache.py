@@ -39,7 +39,7 @@ def _request(
     return SimpleNamespace(
         get_tokens=Mock(return_value=tokens),
         py_request_id=request_id,
-        position_ids=position_ids,
+        py_position_ids=position_ids,
         py_multimodal_data=multimodal_data,
         py_mm_item_order=None,
         py_seq_slot=request_id,
@@ -51,11 +51,8 @@ def _prepare(
     requests: list[SimpleNamespace],
     *,
     model: object | None = None,
-    spec_metadata: object | None = None,
     dist: object | None = None,
     enable_attention_dp: bool = False,
-    enable_spec_decode: bool = False,
-    generation_requests: list[object] | None = None,
     lora_params: dict | None = None,
 ) -> tuple[
     dict,
@@ -64,27 +61,21 @@ def _prepare(
     SimpleNamespace,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
 ]:
     monkeypatch.setattr(no_kv_cache_module, "prefer_pinned", lambda: False)
     monkeypatch.setattr(no_kv_cache_module, "VanillaAttentionMetadata", _AttentionMetadata)
     attn_metadata = _AttentionMetadata(sum(len(request.get_tokens(0)) for request in requests))
     scheduled_requests = SimpleNamespace(
         context_requests=requests,
-        generation_requests=generation_requests or [],
+        generation_requests=[],
         num_context_requests=len(requests),
     )
     input_ids_cuda = torch.full((16,), -1, dtype=torch.int)
     position_ids_cuda = torch.full((16,), -1, dtype=torch.int)
-    gather_ids_cuda = torch.full((8,), -1, dtype=torch.int)
-    draft_tokens_cuda = torch.empty(8, dtype=torch.int)
     lora = SimpleNamespace(build=Mock(return_value=lora_params))
     buffers = InputBuffers(
         input_ids_cuda=input_ids_cuda,
         position_ids_cuda=position_ids_cuda,
-        gather_ids_cuda=gather_ids_cuda,
-        draft_tokens_cuda=draft_tokens_cuda,
     )
     with (
         patch.object(InputBuffers, "allocate", return_value=buffers),
@@ -104,12 +95,6 @@ def _prepare(
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
                 prefill_cuda_graph_num_tokens=[],
                 mm_encoder_cache_enabled=True,
-                spec_config=object() if enable_spec_decode else None,
-                num_seq_slots=None,
-                original_max_draft_len=0,
-                original_max_total_draft_tokens=0,
-                spec_dec_max_total_draft_tokens=0,
-                max_draft_loop_tokens=0,
             ),
             mapping=SimpleNamespace(has_cp_helix=lambda: False),
             dist=dist,
@@ -121,15 +106,9 @@ def _prepare(
         "setup_attn_metadata",
         Mock(return_value=attn_metadata),
     )
-    monkeypatch.setattr(
-        runner,
-        "setup_spec_metadata",
-        Mock(return_value=spec_metadata),
-    )
     prepared = runner.prepare_inputs(
         scheduled_requests,
         resource_manager=SimpleNamespace(name="resources"),
-        runtime_draft_len=2,
     )
     return (
         prepared.kwargs,
@@ -138,8 +117,6 @@ def _prepare(
         lora,
         input_ids_cuda,
         position_ids_cuda,
-        gather_ids_cuda,
-        draft_tokens_cuda,
     )
 
 
@@ -162,8 +139,6 @@ def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
         lora,
         input_ids_cuda,
         position_ids_cuda,
-        _,
-        _,
     ) = _prepare(monkeypatch, [first, second])
 
     assert gather_ids is None
@@ -181,8 +156,6 @@ def test_no_kv_cache_runner_prepare_inputs_packs_context_requests(
     attn_metadata.prepare.assert_called_once_with()
     set_prefill_flag.assert_called_once_with(False)
     lora.build.assert_called_once()
-    assert lora.build.call_args.kwargs["enable_spec_decode"] is False
-    assert lora.build.call_args.kwargs["runtime_draft_len"] == 2
     torch.testing.assert_close(input_ids_cuda[:3], torch.tensor([11, 12, 21], dtype=torch.int))
     torch.testing.assert_close(position_ids_cuda[:3], torch.tensor([0, 1, 7], dtype=torch.int))
 
@@ -211,7 +184,7 @@ def test_no_kv_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     monkeypatch.setattr(no_kv_cache_module, "ship_multimodal_indices", ship_indices)
     model = SimpleNamespace(config=SimpleNamespace(vocab_size=100))
 
-    inputs, _, _, _, _, _, _, _ = _prepare(
+    inputs, _, _, _, _, _ = _prepare(
         monkeypatch,
         [request],
         model=model,
@@ -242,54 +215,21 @@ def test_no_kv_cache_runner_prepare_inputs_builds_and_ships_multimodal_inputs(
     )
 
 
-def test_no_kv_cache_runner_prepare_inputs_populates_spec_and_attention_dp_metadata(
+def test_no_kv_cache_runner_prepare_inputs_gathers_attention_dp_token_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec_metadata = SimpleNamespace(
-        prepare=Mock(),
-        spec_dec_mode=SimpleNamespace(
-            is_mtp_eagle_one_model=Mock(return_value=False),
-            is_eagle3_one_model=Mock(return_value=False),
-        ),
-    )
     dist = SimpleNamespace(
         tp_allgather_int64=Mock(return_value=torch.tensor([[2], [3]])),
-        tp_cp_allgather_int64=Mock(return_value=torch.tensor([[2, 2, 1, 1], [3, 3, 2, 1]])),
+        tp_cp_allgather_int64=Mock(return_value=torch.tensor([[2], [5]])),
     )
-    request = _request(4, [31, 32])
-    generation_request = object()
 
-    (
-        inputs,
-        _,
-        attn_metadata,
-        lora,
-        _,
-        _,
-        gather_ids_cuda,
-        _,
-    ) = _prepare(
+    _, _, attn_metadata, _, _, _ = _prepare(
         monkeypatch,
-        [request],
-        spec_metadata=spec_metadata,
+        [_request(4, [31, 32])],
         dist=dist,
         enable_attention_dp=True,
-        enable_spec_decode=True,
-        generation_requests=[generation_request],
     )
 
-    assert inputs["spec_metadata"] is spec_metadata
-    assert spec_metadata.draft_tokens.shape == (0,)
-    torch.testing.assert_close(spec_metadata.gather_ids, gather_ids_cuda[:1])
-    assert spec_metadata.request_ids == [4]
-    assert spec_metadata.num_generations == 1
-    assert spec_metadata.num_tokens == 2
-    assert spec_metadata.seq_lens == [2]
-    assert spec_metadata.all_rank_num_tokens == [2, 3]
-    assert spec_metadata.all_rank_num_seqs == [1, 2]
-    assert spec_metadata.all_rank_num_gens == [1, 1]
-    assert attn_metadata.all_rank_num_tokens == [2, 3]
-    spec_metadata.prepare.assert_called_once_with()
+    assert attn_metadata.all_rank_num_tokens == [2, 5]
     dist.tp_allgather_int64.assert_called_once_with([2])
-    dist.tp_cp_allgather_int64.assert_called_once_with([2, 2, 1, 1])
-    assert lora.build.call_args.kwargs["enable_spec_decode"] is True
+    dist.tp_cp_allgather_int64.assert_called_once_with([2])

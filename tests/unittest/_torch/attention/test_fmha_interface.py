@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import inspect
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
@@ -30,6 +31,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import TokenMajorGenView
 from tensorrt_llm._torch.attention.backends.sparse.params import (
     BlockSparseForwardInputs,
     SparseRuntimeParams,
@@ -488,6 +490,81 @@ def test_fallback_preserves_dsv4_epilogue_output_layout(
     assert calls[-1][1].seq_offset == int(input_type == AttentionInputType.generation_only)
 
 
+@pytest.mark.parametrize("num_contexts", [0, 1])
+def test_fallback_token_major_rows_scope_dispatch_and_workspace(
+    monkeypatch: pytest.MonkeyPatch, num_contexts: int
+) -> None:
+    monkeypatch.setattr(TrtllmAttentionMetadata, "_post_init_with_buffers", lambda *args: None)
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=4,
+        max_num_sequences=4,
+        max_num_tokens=9,
+        num_contexts=num_contexts,
+        workspace=torch.empty(0, dtype=torch.uint8),
+    )
+    metadata.max_seq_len = 32
+    metadata._seq_lens = torch.tensor([3] * num_contexts + [2, 4], dtype=torch.int32)
+    metadata.on_update()
+    metadata.kv_lens_runtime = torch.tensor([3] * num_contexts + [10, 20], dtype=torch.int32)
+    metadata.kv_lens_cuda_runtime = metadata.kv_lens_runtime
+    metadata.prompt_lens_cpu_runtime = metadata._seq_lens
+    metadata.prompt_lens_cuda_runtime = metadata._seq_lens
+    metadata.host_request_types_runtime = torch.tensor([0] * num_contexts + [1, 1])
+    metadata.kv_cache_block_offsets = torch.zeros(1, num_contexts + 2, 2, 1, dtype=torch.int32)
+    saved = vars(metadata).copy()
+    row_lengths = torch.tensor([3] * num_contexts + [9, 10, 17, 18, 19, 20], dtype=torch.int32)
+    row_prompts = torch.tensor([3] * num_contexts + [1] * 6, dtype=torch.int32)
+    view = TokenMajorGenView(
+        num_rows=num_contexts + 6,
+        sequence_length=row_lengths,
+        host_past_key_value_lengths=row_lengths,
+        host_context_lengths=row_prompts,
+        prompt_lens_cuda=row_prompts,
+        host_request_types=torch.tensor([0] * num_contexts + [1] * 6),
+        kv_cache_block_offsets=torch.zeros(1, num_contexts + 6, 2, 1, dtype=torch.int32),
+        max_num_rows=16,
+    )
+    attn = FakeAttention()
+    attn.is_mla_enable = True
+    attn.layer_idx = 0
+    attn.get_local_layer_idx = lambda _: 0
+    attn.attention_chunk_size = None
+    attn.rotary_inv_freq = attn.rotary_cos_sin = attn.rope_params = None
+    fmha = FallbackFmha(attn)
+    op = Mock()
+    op.get_attention_workspace_size.return_value = 0
+    monkeypatch.setattr(fmha, "attention_op", lambda params: op)
+    counter = Mock(return_value=torch.zeros(64, dtype=torch.uint8))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.fmha.fallback.get_multi_ctas_kv_counter", counter
+    )
+    for fail in (False, True):
+        op.run_mla_generation.side_effect = RuntimeError("dispatch failed") if fail else None
+        with pytest.raises(RuntimeError, match="dispatch failed") if fail else nullcontext():
+            with metadata.presented_token_major(view):
+                fmha.forward(
+                    torch.empty((6, 4), dtype=torch.bfloat16),
+                    None,
+                    None,
+                    metadata,
+                    AttentionForwardArgs(
+                        output=torch.empty((6, 4), dtype=torch.bfloat16),
+                        attention_input_type=AttentionInputType.generation_only,
+                    ),
+                )
+        params = op.run_mla_generation.call_args.args[0]
+        assert params.num_seqs == params.num_requests == 6
+        assert params.num_tokens == params.num_seqs
+        assert params.seq_offset == num_contexts
+        assert params.context_lengths.tolist() == [1] * 6
+        assert params.sequence_length.tolist() == [9, 10, 17, 18, 19, 20]
+        assert params.max_num_sequences == params.max_num_requests == view.max_num_rows
+        assert counter.call_args.args[-1] == view.max_num_rows
+        assert vars(metadata).keys() == saved.keys()
+        for name, value in saved.items():
+            assert getattr(metadata, name) is value, name
+
+
 @pytest.mark.parametrize("sm", [90, 100, 103, 120])
 def test_phased_position_offsets_view_tracks_query_width_without_copy(
     monkeypatch: pytest.MonkeyPatch, sm: int
@@ -590,6 +667,8 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn._fmha_manager.select.return_value = fmha
 
     metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.token_major_gen_view.return_value = None
+    metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
     metadata.enable_flash_mla = False
     metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
@@ -617,6 +696,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
 
     output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
 
+    metadata.presented_token_major.assert_called_once_with(None)
     attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
     fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
     assert not forward_args.is_fused_qkv
