@@ -572,7 +572,8 @@ class FusedMoEMethodBase(ABC):
 
         ``w1`` / ``w3`` / ``w2`` are the gate / up / down projections in
         nn.Linear orientation (``[E, N, K]`` for w1 and w3, ``[E, K, N]`` for
-        w2), one expert per leading index in ``expert_ids`` order, in the
+        w2; a non-gated MoE passes its whole ``[E, 2N, K]`` FC1 as ``w1`` and
+        no ``w3``), one expert per leading index in ``expert_ids`` order, in the
         destination's storage dtype or a same-width dtype that is reinterpreted
         (e.g. uint8 for e4m3). ``*_scale`` are the matching per-expert block
         scales, stacked the same way, in the layout ``load_quant_scales``
@@ -685,11 +686,16 @@ class FusedMoEMethodBase(ABC):
                                              TensorParallelMode.COLUMN,
                                              dst_w3_w1.device))
             if w1 is not None:
-                self._write_expert_stack(
-                    dst_w1, slots,
-                    self._shard_expert_stack(w1, module,
-                                             TensorParallelMode.COLUMN,
-                                             dst_w3_w1.device))
+                w1_shard = self._shard_expert_stack(w1, module,
+                                                    TensorParallelMode.COLUMN,
+                                                    dst_w3_w1.device)
+                if w3 is None and w1_shard.shape[1] == dst_w3_w1.shape[1]:
+                    # Non-gated MoE (e.g. Nemotron-H squared-ReLU): w1 is the
+                    # whole FC1 and there is no w3, as in
+                    # load_expert_w3_w1_weight.
+                    self._write_expert_stack(dst_w3_w1, slots, w1_shard)
+                else:
+                    self._write_expert_stack(dst_w1, slots, w1_shard)
         if w2 is not None:
             dst_w2 = module.w2_weight.data
             self._write_expert_stack(
@@ -6976,11 +6982,14 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
                                              TensorParallelMode.COLUMN,
                                              dst_u8.device).to(torch.uint8))
             if w1_scale is not None:
-                self._write_expert_stack(
-                    dst_w1_u8, slots,
-                    self._shard_expert_stack(w1_scale, module,
-                                             TensorParallelMode.COLUMN,
-                                             dst_u8.device).to(torch.uint8))
+                w1_sf = self._shard_expert_stack(w1_scale, module,
+                                                 TensorParallelMode.COLUMN,
+                                                 dst_u8.device).to(torch.uint8)
+                if w3_scale is None and w1_sf.shape[1] == dst_u8.shape[1]:
+                    # Non-gated MoE: w1 scales cover the whole FC1.
+                    self._write_expert_stack(dst_u8, slots, w1_sf)
+                else:
+                    self._write_expert_stack(dst_w1_u8, slots, w1_sf)
             module._mxfp8_w3_w1_sf_pending_slots.update(slots)
         if w2_scale is not None:
             dst_w2_u8 = module.w2_weight_scale.data.view(torch.uint8)

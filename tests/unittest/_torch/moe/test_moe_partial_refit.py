@@ -280,3 +280,41 @@ def test_vanilla_expert_stack_load_matches_single_shot(moe_backend):
     _rlhf_finalize(module)
     torch.cuda.synchronize()
     assert torch.equal(backend.w3_w1_weight.data, w3_w1_fresh), "repeated finalize re-transformed"
+
+
+def test_expert_stack_load_non_gated_fc1_fills_whole_slot():
+    """A non-gated MoE (Nemotron-H squared-ReLU) hands its whole [E, 2N, K] FC1
+    as w1 with no w3; the stack loader must fill the whole slot like
+    load_expert_w3_w1_weight does, not the bottom half."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.quantization import UnquantizedFusedMoEMethod
+
+    num_slots, two_n, k, inter = 4, 8, 6, 3
+    module = SimpleNamespace(
+        w3_w1_weight=SimpleNamespace(data=torch.zeros(num_slots, two_n, k)),
+        w2_weight=SimpleNamespace(data=torch.zeros(num_slots, k, inter)),
+        initial_local_expert_ids=[10, 11, 12, 13],
+        layer_load_balancer=None,
+        tp_size=1,
+        tp_rank=0,
+    )
+    method = UnquantizedFusedMoEMethod()
+    full_fc1 = torch.arange(2 * two_n * k, dtype=torch.float32).view(2, two_n, k) + 1
+    method.load_expert_stacks(module, [11, 12], w1=full_fc1)
+    assert torch.equal(module.w3_w1_weight.data[1:3], full_fc1)
+    assert torch.all(module.w3_w1_weight.data[0] == 0) and torch.all(
+        module.w3_w1_weight.data[3] == 0
+    )
+    assert module._weights_transformed is False
+
+    # Gated: half-width w1 lands in the bottom half, w3 in the top half.
+    module.w3_w1_weight.data.zero_()
+    gate = torch.ones(1, two_n // 2, k)
+    up = torch.full((1, two_n // 2, k), 2.0)
+    method.load_expert_stacks(module, [13], w1=gate, w3=up)
+    assert torch.all(module.w3_w1_weight.data[3, : two_n // 2] == 2.0)
+    assert torch.all(module.w3_w1_weight.data[3, two_n // 2 :] == 1.0)
+    # A mismatched width is an error, never a silent partial write.
+    with pytest.raises(ValueError, match="does not match"):
+        method.load_expert_stacks(module, [13], w1=torch.ones(1, two_n - 1, k))
