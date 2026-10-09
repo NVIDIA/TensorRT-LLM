@@ -18,6 +18,7 @@ from _torch.executor.kv_cache.test_kv_cache_v2_scheduler import (
 )
 
 from tensorrt_llm._torch.pyexecutor import py_executor as executor_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -505,12 +506,12 @@ def test_decode_graph_requirement_uses_token_count_collective(
     engine = SimpleNamespace(dist=dist)
     metadata = SimpleNamespace(num_tokens=16)
     if all(graph_flags):
-        assert DecoderRunner._get_remote_tail_decode_rank_tokens(
+        assert DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
             engine, metadata, bool(graph_flags[0])
         ) == [16, 16]
     else:
         with pytest.raises(RuntimeError, match="at least one rank missed its graph"):
-            DecoderRunner._get_remote_tail_decode_rank_tokens(
+            DecoderInputPreparer._get_remote_tail_decode_rank_tokens(
                 engine, metadata, bool(graph_flags[0])
             )
     dist.tp_allgather_int64.assert_called_once_with([16, graph_flags[0]])

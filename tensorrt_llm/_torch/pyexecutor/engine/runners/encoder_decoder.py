@@ -648,7 +648,7 @@ class EncoderDecoderRunner(DecoderRunner):
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(resource_manager)
         attn_metadata = self._metadata.set_up_attn(kv_cache_manager, draft_kv_cache_manager)
         with self._graphs.no_cuda_graph():
-            projection_inputs, _, _ = self._prepare_inputs(
+            projection_inputs, _, _ = self._inputs.prepare_inputs(
                 projection_batch,
                 kv_cache_manager,
                 attn_metadata,
@@ -1465,8 +1465,8 @@ class EncoderDecoderRunner(DecoderRunner):
         self.iter_states["num_ctx_tokens"] = num_context_tokens
         self.iter_states["num_generation_tokens"] = num_generation_requests
         self.iter_states["cached_kv_tokens"] = cached_kv_tokens
-        if self._log_cached_kv_tokens_per_req:
-            self._record_cached_kv_tokens_per_req(
+        if self._inputs.log_cached_kv_tokens_per_req:
+            self._inputs.record_cached_kv_tokens_per_req(
                 buffers["cached_token_lengths"][:num_sequences].tolist(),
                 (
                     (scheduled_requests.context_requests, 1),
