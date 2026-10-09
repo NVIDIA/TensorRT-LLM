@@ -36,7 +36,7 @@ global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
                                       max_tokens=256,
-                                      use_kv_cache_manager_v2=False)
+                                      use_kv_cache_manager_v2=True)
 
 
 def create_kv_cache_manager():
@@ -48,7 +48,8 @@ def create_kv_cache_manager():
     max_batch_size = 1
     mapping = Mapping()
     return KVCacheManager(
-        kv_cache_config=global_kvcache_config,
+        kv_cache_config=global_kvcache_config.model_copy(
+            update={"use_kv_cache_manager_v2": False}),
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
         SELF,
         num_layers=num_layers,
@@ -797,8 +798,10 @@ def test_mm_keys_in_stored_events():
     events = llm.get_kv_cache_events(5)
 
     # Find stored events and verify mm_keys and cache_salt fields
+    found_stored = False
     for event in events:
         if event and event["data"]["type"] == "stored":
+            found_stored = True
             blocks = event["data"]["blocks"]
             for block in blocks:
                 # mm_keys should always be present (empty list for text-only)
@@ -809,6 +812,8 @@ def test_mm_keys_in_stored_events():
                 # cache_salt should be present (None for unsalted requests)
                 assert "cache_salt" in block
                 assert block["cache_salt"] is None
+
+    assert found_stored, "No stored events found"
 
 
 def test_cache_salt_in_stored_events():
