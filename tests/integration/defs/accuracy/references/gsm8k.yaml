@@ -333,6 +333,10 @@ google/gemma-3n-E2B-it:
   - accuracy: 72.176
 google/gemma-4-E2B-it:
   - accuracy: 85.709
+swiss-ai/Apertus-8B-Instruct-2509:
+  - accuracy: 57.56
+swiss-ai/Apertus-v1.5-8B:
+  - accuracy: 77.56
 mistralai/Ministral-8B-Instruct-2410:
   - accuracy: 79.25
   - quant_algo: FP8
