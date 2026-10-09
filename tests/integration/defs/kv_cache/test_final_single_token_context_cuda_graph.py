@@ -348,7 +348,7 @@ def _generate_changed_final_token_cold_and_reused(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_final_token_reuse_cuda_graph(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -365,7 +365,7 @@ def test_final_token_reuse_cuda_graph(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_changed_final_token_reuse_cuda_graph(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -385,7 +385,7 @@ def test_changed_final_token_reuse_cuda_graph(
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_final_token_reuse_cuda_graph_tp2(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -423,7 +423,7 @@ def test_final_token_reuse_cuda_graph_tp2(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_context_logits_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -448,7 +448,7 @@ def test_context_logits_after_final_token_reuse(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_guided_decoding_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,
@@ -472,7 +472,7 @@ def test_guided_decoding_after_final_token_reuse(
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True], ids=["v2"])
 def test_zero_runtime_draft_speculation_after_final_token_reuse(
     use_kv_cache_manager_v2: bool,
     monkeypatch: pytest.MonkeyPatch,

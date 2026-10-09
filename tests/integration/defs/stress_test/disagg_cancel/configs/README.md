@@ -4,7 +4,7 @@ Per-marathon YAML files consumed by ``test_disagg_cancel_stress.py``.
 
 | File | Model | KV cache | Transceiver |
 |------|-------|----------|-------------|
-| `marathon_cpp_v1_deepseek.yaml` | `DeepSeek-V3-Lite/bf16` (MLA) | V1 | C++ |
+| `marathon_python_v2_deepseek.yaml` | `DeepSeek-V3-Lite/bf16` (MLA) | V2 | Python |
 
 Only configurations listed in `_MARATHON_CONFIGS` in
 `test_disagg_cancel_stress.py` are actually parametrized; the other
@@ -22,7 +22,7 @@ unchanged.
 The new `stress_config:` top-level block is consumed by
 `harness.py::StressConfig`. Field-level documentation lives in
 `StressConfig` itself (dataclass field docstrings) and the
-example values in `marathon_cpp_v1_deepseek.yaml`.
+example values in `marathon_python_v2_deepseek.yaml`.
 
 ## Harness modes
 
@@ -68,7 +68,7 @@ Additional marathon scenarios land as new YAMLs here, with **no
 Python changes** required beyond extending the parametrize list. To
 add a new config:
 
-1. Copy `marathon_cpp_v1_deepseek.yaml` as a template.
+1. Copy `marathon_python_v2_deepseek.yaml` as a template.
 2. Choose `stress_config.mode`, then adjust `model`,
    `kv_cache_manager`, `transceiver`, and any
    load-shape knobs (`base_concurrency`, `client_cancel_rate`,

@@ -190,15 +190,12 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
                 max_num_tokens=33024,
                 use_low_precision_moe_combine=True,
             ),
-            # The qualified K3 GPQA configuration used KV cache manager V1.
-            # Like K3 MMMU, GPQA leaves very long generations after shorter
-            # requests finish. V2 has stalled or deadlocked at this shape even
-            # with a host tier and additional cache capacity. Pin V1 until the
-            # V2 x KDA-hybrid long-generation path is qualified.
+            # Preserve the long-output KDA-hybrid shape that previously stalled
+            # under V2; this migration still needs that regression qualified.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
-                use_kv_cache_manager_v2=False,
+                use_kv_cache_manager_v2=True,
             ),
         ) as llm:
             # K3 stores its compressed-tensors quantization configuration in

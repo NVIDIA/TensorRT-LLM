@@ -58,7 +58,7 @@ tests/integration/defs/stress_test/disagg_cancel/
 ├── test_load_thread.py             (load_thread unit tests)
 └── configs/
     ├── README.md                   (YAML schema + how to add a config)
-    ├── marathon_cpp_v1_deepseek.yaml
+    ├── marathon_python_v2_deepseek.yaml
 ```
 
 Future additions:
@@ -73,7 +73,7 @@ Future additions:
 ## Mode Switch
 
 The active mode is controlled by
-`configs/marathon_cpp_v1_deepseek.yaml`:
+`configs/marathon_python_v2_deepseek.yaml`:
 
 ```yaml
 stress_config:
@@ -117,7 +117,7 @@ not define a file-specific cadence for `llm_function_stress.txt`.
 The registered entry is:
 
 ```text
-stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_cpp_v1_deepseek.yaml] TIMEOUT (45)
+stress_test/disagg_cancel/test_disagg_cancel_stress.py::test_disagg_cancellation_marathon[marathon_python_v2_deepseek.yaml] TIMEOUT (45)
 ```
 
 The integration test-list parser interprets `TIMEOUT (45)` in
@@ -274,7 +274,7 @@ When the regular guardrail fails:
 
 1. Confirm the YAML parses:
    ```bash
-   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_cpp_v1_deepseek.yaml')"
+   python -c "from harness import StressConfig; StressConfig.from_yaml_path('configs/marathon_python_v2_deepseek.yaml')"
    ```
 2. Check the `failure_reason` field in `collect_results()` output.
 3. Inspect the log tails printed by `disagg_test_utils.terminate()`

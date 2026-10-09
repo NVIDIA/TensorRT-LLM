@@ -444,10 +444,6 @@ def test_flashinfer_prefill():
     pytest.param(Scenario(num_layers=1, qo_len=32, kv_len=64, causal=False),
                  True,
                  id="v2_kv_cache-cross-diff-kv-len"),
-    pytest.param(Scenario(num_layers=1), False, id="v1_kv_cache-typical"),
-    pytest.param(Scenario(num_layers=1, causal=False),
-                 False,
-                 id="v1_kv_cache-non-causal"),
 ])
 def test_attention_backend(s: Scenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
@@ -602,13 +598,6 @@ def generate_causal_mask(seq_lens, qo_lens, batch_size, dtype):
                                kvcache_dtype=torch.float8_e4m3fn),
                  True,
                  id="v2_kv_cache-fp8-cross"),
-    pytest.param(PagedScenario(num_layers=4, num_generations=5),
-                 False,
-                 id="v1_kv_cache-fp16"),
-    pytest.param(PagedScenario(
-        num_layers=4, num_generations=5, kvcache_dtype=torch.float8_e4m3fn),
-                 False,
-                 id="v1_kv_cache-fp8"),
 ])
 def test_attention_backend_ifb(s: PagedScenario, use_kv_cache_manager_v2: bool):
     dtype = s.dtype
