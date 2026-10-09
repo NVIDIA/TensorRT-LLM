@@ -9,8 +9,8 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
-from tensorrt_llm.visual_gen.args import CompilationConfig, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, RoleSpec
+from tensorrt_llm.visual_gen.args import CompilationConfig, ReferenceWarmupVariant, VisualGenArgs
 
 
 class TestCompilationConfig:
@@ -288,6 +288,62 @@ class TestWarmupExecution:
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
         assert pipe._warmed_up_shapes == {(480, 832, 33)}
+
+    def test_warmup_runs_and_records_reference_variants(self):
+        """Configured reference variants are warmed per shape and their keys recorded."""
+
+        class RefStub(_BaseStubPipeline):
+            @property
+            def default_warmup_resolutions(self):
+                return [(480, 832)]
+
+            @property
+            def default_warmup_num_frames(self):
+                return [33]
+
+            @property
+            def ref_slot_specs(self):
+                return {
+                    "image_reference": RefSlotSpec(
+                        modality="image", roles=[RoleSpec(role="reference", min=0, max=None)]
+                    )
+                }
+
+            def reference_warmup_cache_key(self, height, width, num_frames, variant):
+                return (height, width, num_frames, len(variant.images))
+
+        variant = ReferenceWarmupVariant(images=[(480, 832), (720, 1280)])
+        cfg = CompilationConfig(
+            resolutions=[(480, 832)], num_frames=[33], reference_variants=[variant]
+        )
+        pipe = RefStub(cfg)
+        warmed_refs = []
+        pipe._run_reference_warmup = lambda h, w, f, s, v: warmed_refs.append((h, w, f, v))
+
+        pipe.warmup()
+
+        assert warmed_refs == [(480, 832, 33, variant)]
+        assert pipe._warmed_up_shapes == {(480, 832, 33), (480, 832, 33, 2)}
+
+    def test_reference_warmup_variant_validation(self):
+        """Variants a pipeline's ref_slot_specs cannot accept are skipped."""
+
+        class SingleRefStub(_BaseStubPipeline):
+            @property
+            def ref_slot_specs(self):
+                return {
+                    "image_reference": RefSlotSpec(
+                        modality="image", roles=[RoleSpec(role="reference", min=0, max=1)]
+                    )
+                }
+
+        pipe = SingleRefStub(CompilationConfig())
+
+        assert pipe.validate_reference_variant(ReferenceWarmupVariant(images=[(64, 64)]))
+        assert not pipe.validate_reference_variant(
+            ReferenceWarmupVariant(images=[(64, 64), (64, 64)])
+        )
+        assert not pipe.validate_reference_variant(ReferenceWarmupVariant(videos=[(64, 64, 8)]))
 
     def test_warmup_records_subclass_extra_keys(self):
         """warmup() records what warmup_cache_keys() reports, not the raw plan.

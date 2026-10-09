@@ -606,6 +606,35 @@ class CpuOffloadConfig(StrictBaseModel):
     )
 
 
+class ReferenceWarmupVariant(StrictBaseModel):
+    """One reference-carrying warmup variant.
+
+    The references attached to a single synthetic warmup request.
+
+    Warmup synthesizes dummy references of these sizes and runs them through
+    the pipeline's real preprocessing, so the recorded warmup keys match
+    request keys exactly. Sizes are raw input sizes (pixels, frames, seconds),
+    not processed latent sizes. Per-reference counts must stay within the
+    model's accepted reference slots (``ref_slot_specs``).
+    """
+
+    images: List[Tuple[int, int]] = Field(
+        default_factory=list,
+        status="prototype",
+        description="(height, width) of each image reference for this variant.",
+    )
+    videos: List[Tuple[int, int, int]] = Field(
+        default_factory=list,
+        status="prototype",
+        description="(height, width, num_frames) of each video reference for this variant.",
+    )
+    audio: List[float] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Duration in seconds of each audio reference for this variant.",
+    )
+
+
 class CompilationConfig(StrictBaseModel):
     """Configuration for torch.compile / CUDA graph warmup shapes.
 
@@ -640,6 +669,17 @@ class CompilationConfig(StrictBaseModel):
         False,
         status="prototype",
         description="Skip the post-load warmup pass (compile + capture).",
+    )
+    reference_variants: Optional[List[ReferenceWarmupVariant]] = Field(
+        default=None,
+        status="prototype",
+        description=(
+            "Reference-carrying warmup variants, warmed in addition to the plain "
+            "pass at each resolutions x num_frames shape. Needed when a model's "
+            "references change the compiled shape (e.g. FLUX.2 image references, "
+            "MiniMax-H3 ref2va image/video/audio references). If None, uses "
+            "model-specific defaults; if [], disables reference warmup."
+        ),
     )
 
 

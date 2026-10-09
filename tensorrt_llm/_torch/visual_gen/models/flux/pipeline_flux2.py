@@ -23,7 +23,7 @@ import os
 import time
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Any, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -48,6 +48,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, RefSlotSpec, R
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import ReferenceWarmupVariant
 
 from .transformer_flux2 import Flux2Transformer2DModel
 
@@ -230,28 +231,52 @@ class Flux2Pipeline(BasePipeline):
             num_frames=req.params.num_frames,
         )
 
-    def warmup_cache_keys(self, shapes: List[Tuple[int, int, int]]) -> Set[tuple]:
-        keys = super().warmup_cache_keys(shapes)
-        keys.update(
-            self.warmup_cache_key(
-                h,
-                w,
-                reference_shapes=(self._warmup_reference_shape(h, w),),
-                num_frames=f,
-            )
-            for h, w, f in shapes
-        )
-        return keys
+    def default_warmup_reference_variants(
+        self, height: int, width: int, num_frames: int
+    ) -> List[ReferenceWarmupVariant]:
+        """Warm one reference image at the output shape by default.
 
-    def _warmup_reference_shape(self, height: int, width: int) -> Tuple[int, int]:
-        """Apply the reference area limit and spatial alignment to a warmup shape."""
-        image = PIL.Image.new("RGB", (width, height))
-        image = self.image_processor._resize_if_exceeds_area(image)
-        reference_width, reference_height = image.size
+        FLUX.2 accepts an unbounded number of reference images, so coverage of
+        multi-reference edits must come from ``compilation.reference_variants``.
+        """
+        return [ReferenceWarmupVariant(images=[(height, width)])]
+
+    def _processed_reference_shapes(
+        self, images: List[Tuple[int, int]]
+    ) -> Tuple[Tuple[int, int], ...]:
+        """Apply the reference area limit and spatial alignment to raw image sizes.
+
+        Mirrors the sizing in :meth:`_preprocess_reference_images` so warmup keys
+        match request keys by construction.
+        """
         multiple_of = self.vae_scale_factor * 2
-        return (
-            (reference_height // multiple_of) * multiple_of,
-            (reference_width // multiple_of) * multiple_of,
+        shapes = []
+        for height, width in images:
+            image = PIL.Image.new("RGB", (width, height))
+            image = self.image_processor._resize_if_exceeds_area(image)
+            reference_width, reference_height = image.size
+            shapes.append(
+                (
+                    (reference_height // multiple_of) * multiple_of,
+                    (reference_width // multiple_of) * multiple_of,
+                )
+            )
+        return tuple(shapes)
+
+    def reference_warmup_cache_key(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        variant: ReferenceWarmupVariant,
+    ) -> Optional[tuple]:
+        if not variant.images:
+            return None
+        return self.warmup_cache_key(
+            height,
+            width,
+            reference_shapes=self._processed_reference_shapes(variant.images),
+            num_frames=num_frames,
         )
 
     def _init_transformer(self) -> None:
@@ -261,8 +286,8 @@ class Flux2Pipeline(BasePipeline):
             model_config=self.pipeline_config.model_configs["transformer"]
         )
 
-    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
-        forward_kwargs = dict(
+    def _warmup_forward_kwargs(self, height: int, width: int, steps: int) -> dict:
+        return dict(
             prompt="warmup",
             height=height,
             width=width,
@@ -271,22 +296,30 @@ class Flux2Pipeline(BasePipeline):
             seed=42,
             max_sequence_length=512,
         )
-        reference_height, reference_width = self._warmup_reference_shape(height, width)
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
-            self.forward(**forward_kwargs)
-            # Reference tokens change the transformer's compiled sequence shape.
+            self.forward(**self._warmup_forward_kwargs(height, width, steps))
+
+    def _run_reference_warmup(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        steps: int,
+        variant: ReferenceWarmupVariant,
+    ) -> None:
+        if not variant.images:
+            return
+        # Reference tokens change the transformer's compiled sequence shape.
+        condition_images = [
+            torch.zeros(1, 3, ref_h, ref_w, device=self.device, dtype=self.dtype)
+            for ref_h, ref_w in self._processed_reference_shapes(variant.images)
+        ]
+        with torch.no_grad():
             self.forward(
-                **forward_kwargs,
-                _condition_images=[
-                    torch.zeros(
-                        1,
-                        3,
-                        reference_height,
-                        reference_width,
-                        device=self.device,
-                        dtype=self.dtype,
-                    )
-                ],
+                **self._warmup_forward_kwargs(height, width, steps),
+                _condition_images=condition_images,
             )
 
     def _detect_text_encoder_type(self, checkpoint_dir: str) -> str:
