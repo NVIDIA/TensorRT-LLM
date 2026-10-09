@@ -1341,8 +1341,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         Refit moves no tensor, so the piecewise captures stay valid across it;
         recapturing them costs a full re-capture per refit and leaves PWCG cold
-        in between. This pins the cheap path -- reintroducing the recapture or
-        the torch.compiler.reset() fails here.
+        in between. This pins the cheap path -- reintroducing the recapture,
+        the torch.compiler.reset() or the gc.collect() fails here.
 
         Replaces test_piecewise_refit_recapture_preserves_padding_dummy_requests,
         which asserted the refit path recaptures. That path no longer exists.
@@ -1364,12 +1364,16 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         restore_core = (
             PyTorchModelEngine.restore_compiled_model_after_refit.__wrapped__)
 
-        with patch("torch.compiler.reset") as reset, patch("gc.collect"):
+        with patch("torch.compiler.reset") as reset, \
+                patch("gc.collect") as collect:
             restore_core(model_engine, resource_manager=object())
 
         model_engine._apply_torch_compile.assert_called_once()
         model_engine._capture_piecewise_cuda_graphs.assert_not_called()
         reset.assert_not_called()
+        # No full collection either: it ran for seconds inside the refit
+        # bubble and the replaced wrapper is freed by reference count.
+        collect.assert_not_called()
 
     def test_restore_after_refit_noop_when_torch_compile_disabled(self) -> None:
         """An eager engine must not be silently handed a compiled wrapper."""

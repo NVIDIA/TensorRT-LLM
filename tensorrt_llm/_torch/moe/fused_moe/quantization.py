@@ -273,6 +273,16 @@ def interleave_linear_and_gate(x: torch.Tensor,
     return x
 
 
+# Same-width integer dtype for reinterpreting storage whose own dtype lacks a
+# kernel (index_copy_ on float8).
+_INTEGER_DTYPE_OF_WIDTH = {
+    1: torch.uint8,
+    2: torch.int16,
+    4: torch.int32,
+    8: torch.int64,
+}
+
+
 class EplbSupportStatus(Enum):
     """EPLB support status for FusedMoEMethod classes."""
     SUPPORTED = auto()
@@ -526,6 +536,203 @@ class FusedMoEMethodBase(ABC):
                 ]
                 module._add_raw_shared_weights_for_unmap(unmap_weights)
                 maybe_pageout_mmapped_cpu_weights(unmap_weights)
+
+    # ------------------------------------------------------------------ #
+    # Whole-stack expert loading (refit fast path)
+    # ------------------------------------------------------------------ #
+    # ``load_expert_weights_to_dst`` addresses one expert at a time: per expert
+    # it looks the tensors up, shards them, writes the gate/up halves and the
+    # down projection, and ``load_quant_scales`` stages the scales the same
+    # way -- a dozen or two small host-side ops per expert. An RL refit that
+    # already holds this rank's experts as one ``[E_local, ...]`` stack
+    # (NeMo-RL's shard-to-shard refit) pays that for every local expert of
+    # every layer, seconds per refit on a 397B model. The stack path writes
+    # each projection with one copy into the slot range and arms the same
+    # deferred transforms, so ``process_weights_after_loading`` is unchanged.
+    #
+    # Largest transient one finalize batch may allocate (the gate/up interleave
+    # materializes its input once); refit runs next to a live KV cache.
+    FINALIZE_BATCH_BYTES = 256 << 20
+
+    def supports_expert_stack_loading(self) -> bool:
+        """Whether :meth:`load_expert_stacks` is implemented for this method."""
+        return False
+
+    def load_expert_stacks(self,
+                           module: torch.nn.Module,
+                           expert_ids,
+                           *,
+                           w1: Optional[torch.Tensor] = None,
+                           w3: Optional[torch.Tensor] = None,
+                           w2: Optional[torch.Tensor] = None,
+                           w1_scale: Optional[torch.Tensor] = None,
+                           w3_scale: Optional[torch.Tensor] = None,
+                           w2_scale: Optional[torch.Tensor] = None) -> None:
+        """Load ``[len(expert_ids), ...]`` projection stacks into their slots.
+
+        ``w1`` / ``w3`` / ``w2`` are the gate / up / down projections in
+        nn.Linear orientation (``[E, N, K]`` for w1 and w3, ``[E, K, N]`` for
+        w2; a non-gated MoE passes its whole ``[E, 2N, K]`` FC1 as ``w1`` and
+        no ``w3``), one expert per leading index in ``expert_ids`` order, in the
+        destination's storage dtype or a same-width dtype that is reinterpreted
+        (e.g. uint8 for e4m3). ``*_scale`` are the matching per-expert block
+        scales, stacked the same way, in the layout ``load_quant_scales``
+        accepts for one expert. Every stack is optional. ``expert_ids`` are
+        global expert ids that must all be stored on this rank. TP shards are
+        taken from the stacks exactly like ``load_expert_w3_w1_weight`` and
+        ``load_expert_w2_weight`` take them per expert, and the deferred
+        transforms (block-scale swizzle, gate/up interleave) are armed for the
+        written slots like the per-expert loader arms them, so a later
+        ``process_weights_after_loading`` applies them exactly once.
+        """
+        if not self.supports_expert_stack_loading():
+            raise NotImplementedError(
+                f"{type(self).__name__} does not load expert stacks; use "
+                "load_weights")
+        slots = self._expert_stack_slots(module, expert_ids)
+        if not slots:
+            return
+        self._load_expert_weight_stacks(module, slots, w1, w3, w2)
+        self._load_expert_scale_stacks(module, slots, w1_scale, w3_scale,
+                                       w2_scale)
+        self._after_expert_stacks_loaded(module,
+                                         slots,
+                                         fc1=w1 is not None or w3 is not None,
+                                         fc2=w2 is not None)
+        module._weights_transformed = False
+
+    @staticmethod
+    def _expert_stack_slots(module: torch.nn.Module, expert_ids) -> List[int]:
+        """Local slot of every expert in ``expert_ids`` (initial assignment)."""
+        if getattr(module, "layer_load_balancer", None) is not None:
+            raise NotImplementedError(
+                "expert stacks address the initial slot assignment; not "
+                "supported with an active expert load balancer")
+        position = {
+            int(expert_id): slot
+            for slot, expert_id in enumerate(module.initial_local_expert_ids)
+        }
+        slots = []
+        for expert_id in expert_ids:
+            slot = position.get(int(expert_id))
+            if slot is None:
+                raise ValueError(
+                    f"expert {int(expert_id)} is not stored on this rank "
+                    f"(local experts {list(module.initial_local_expert_ids)})")
+            slots.append(slot)
+        if len(set(slots)) != len(slots):
+            raise ValueError(f"duplicate expert ids in {list(expert_ids)}")
+        return slots
+
+    @staticmethod
+    def _shard_expert_stack(stack: torch.Tensor, module: torch.nn.Module,
+                            mode: Optional[TensorParallelMode],
+                            device: torch.device) -> torch.Tensor:
+        """Per-expert ``load_weight_shard`` on an ``[E, ...]`` stack."""
+        if stack.dim() != 3:
+            raise ValueError(
+                f"expert stack must be [E, rows, cols], got {tuple(stack.shape)}"
+            )
+        tp_size = module.tp_size
+        if mode is None or tp_size <= 1:
+            return stack.to(device)
+        split_dim = TensorParallelMode.split_dim(mode) + 1
+        width = stack.shape[split_dim]
+        if width == 1:
+            return stack.to(device)
+        slice_width = math.ceil(width / tp_size)
+        start = module.tp_rank * slice_width
+        end = min(start + slice_width, width)
+        return stack.narrow(split_dim, start, end - start).to(device)
+
+    @staticmethod
+    def _write_expert_stack(dst: torch.Tensor, slots: List[int],
+                            src: torch.Tensor) -> None:
+        """``dst[slots] = src`` in one copy (a narrow when the slots are a run)."""
+        if src.dtype != dst.dtype:
+            if src.element_size() == dst.element_size():
+                src = src.contiguous().view(dst.dtype)
+            else:
+                src = src.to(dst.dtype)
+        expected = (len(slots), ) + tuple(dst.shape[1:])
+        if tuple(src.shape) != expected:
+            raise ValueError(
+                f"expert stack shape {tuple(src.shape)} does not match the "
+                f"destination slots {expected}")
+        lo = slots[0]
+        if slots == list(range(lo, lo + len(slots))):
+            dst[lo:lo + len(slots)].copy_(src, non_blocking=True)
+        else:
+            # index_copy_ has no float8 kernel: scatter through a same-width
+            # integer view of both sides (a reinterpretation, not a copy).
+            index = torch.as_tensor(slots, dtype=torch.long, device=dst.device)
+            int_dtype = _INTEGER_DTYPE_OF_WIDTH[dst.element_size()]
+            dst.view(int_dtype).index_copy_(
+                0, index,
+                src.to(dst.device).contiguous().view(int_dtype))
+
+    def _load_expert_weight_stacks(self, module: torch.nn.Module,
+                                   slots: List[int], w1: Optional[torch.Tensor],
+                                   w3: Optional[torch.Tensor],
+                                   w2: Optional[torch.Tensor]) -> None:
+        dst_w3_w1 = module.w3_w1_weight.data
+        if w3 is not None or w1 is not None:
+            # Same halves as load_expert_w3_w1_weight: top = w3, bottom = w1.
+            dst_w3, dst_w1 = dst_w3_w1.chunk(2, dim=1)
+            if w3 is not None:
+                self._write_expert_stack(
+                    dst_w3, slots,
+                    self._shard_expert_stack(w3, module,
+                                             TensorParallelMode.COLUMN,
+                                             dst_w3_w1.device))
+            if w1 is not None:
+                w1_shard = self._shard_expert_stack(w1, module,
+                                                    TensorParallelMode.COLUMN,
+                                                    dst_w3_w1.device)
+                if w3 is None and w1_shard.shape[1] == dst_w3_w1.shape[1]:
+                    # Non-gated MoE (e.g. Nemotron-H squared-ReLU): w1 is the
+                    # whole FC1 and there is no w3, as in
+                    # load_expert_w3_w1_weight.
+                    self._write_expert_stack(dst_w3_w1, slots, w1_shard)
+                else:
+                    self._write_expert_stack(dst_w1, slots, w1_shard)
+        if w2 is not None:
+            dst_w2 = module.w2_weight.data
+            self._write_expert_stack(
+                dst_w2, slots,
+                self._shard_expert_stack(w2, module, TensorParallelMode.ROW,
+                                         dst_w2.device))
+
+    def _load_expert_scale_stacks(self, module: torch.nn.Module,
+                                  slots: List[int],
+                                  w1_scale: Optional[torch.Tensor],
+                                  w3_scale: Optional[torch.Tensor],
+                                  w2_scale: Optional[torch.Tensor]) -> None:
+        if w1_scale is not None or w3_scale is not None or w2_scale is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} takes no expert scale stacks")
+
+    def _after_expert_stacks_loaded(self, module: torch.nn.Module,
+                                    slots: List[int], *, fc1: bool,
+                                    fc2: bool) -> None:
+        """Arm the deferred transforms for the slots just written (none here)."""
+
+    @classmethod
+    def _slot_batches(cls, slots, per_slot_bytes: int):
+        """Contiguous ``[lo, hi)`` runs of ``slots``, each within the batch budget."""
+        max_slots = max(1, cls.FINALIZE_BATCH_BYTES // max(1, per_slot_bytes))
+        run_start = None
+        prev = None
+        for slot in sorted(slots):
+            if run_start is not None and (slot != prev + 1
+                                          or slot - run_start >= max_slots):
+                yield run_start, prev + 1
+                run_start = None
+            if run_start is None:
+                run_start = slot
+            prev = slot
+        if run_start is not None:
+            yield run_start, prev + 1
 
     def load_weights(self,
                      module: torch.nn.Module,
@@ -800,6 +1007,9 @@ class FusedMoEMethodBase(ABC):
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.SUPPORTED
 
+    def supports_expert_stack_loading(self) -> bool:
+        return True
+
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
         w3_w1_weight_shape = (module.expert_size_per_partition,
@@ -866,6 +1076,12 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
         if w1_weight is not None or w3_weight is not None:
             module._cute_dsl_interleave_pending = True
 
+    def _after_expert_stacks_loaded(self, module: torch.nn.Module,
+                                    slots: List[int], *, fc1: bool,
+                                    fc2: bool) -> None:
+        if fc1:
+            module._cute_dsl_interleave_pending = True
+
     @staticmethod
     def _interleave_w3_w1_weight(dst_w3_w1_weight: torch.Tensor):
         """Interleave gate/up weights for GEMM + SwiGLU fusion.
@@ -889,10 +1105,16 @@ class BF16CuteDslFusedMoEMethod(UnquantizedFusedMoEMethod):
         if not getattr(module, "_cute_dsl_interleave_pending", False):
             return
         module._cute_dsl_interleave_pending = False
-        if module.w3_w1_weight.numel() == 0:
+        weight = module.w3_w1_weight.data
+        if weight.numel() == 0:
             return
-        for expert_idx in range(module.w3_w1_weight.data.shape[0]):
-            self._interleave_w3_w1_weight(module.w3_w1_weight.data[expert_idx])
+        # Whole slot runs at a time (bounded by FINALIZE_BATCH_BYTES) rather
+        # than one expert per op; the result is identical per expert.
+        per_slot_bytes = weight[0].numel() * weight.element_size()
+        for lo, hi in self._slot_batches(range(weight.shape[0]),
+                                         per_slot_bytes):
+            block = weight[lo:hi]
+            block.copy_(interleave_linear_and_gate(block, group_size=32, dim=1))
 
     def _prepare_shared_weights_for_finalization(
             self, module: torch.nn.Module) -> None:
@@ -6739,26 +6961,69 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             if w2_sf is not None:
                 module._mxfp8_w2_sf_pending_slots.add(local_slot_id)
 
+    def supports_expert_stack_loading(self) -> bool:
+        return True
+
+    def _load_expert_scale_stacks(self, module: torch.nn.Module,
+                                  slots: List[int],
+                                  w1_scale: Optional[torch.Tensor],
+                                  w3_scale: Optional[torch.Tensor],
+                                  w2_scale: Optional[torch.Tensor]) -> None:
+        # Stage raw UE8M0 bytes through the uint8 view of the int32-packed
+        # storage and arm the slots, exactly as load_quant_scales does per
+        # expert; the swizzle stays deferred to process_weights_after_loading.
+        if w1_scale is not None or w3_scale is not None:
+            dst_u8 = module.w3_w1_weight_scale.data.view(torch.uint8)
+            dst_w3_u8, dst_w1_u8 = dst_u8.chunk(2, dim=1)
+            if w3_scale is not None:
+                self._write_expert_stack(
+                    dst_w3_u8, slots,
+                    self._shard_expert_stack(w3_scale, module,
+                                             TensorParallelMode.COLUMN,
+                                             dst_u8.device).to(torch.uint8))
+            if w1_scale is not None:
+                w1_sf = self._shard_expert_stack(w1_scale, module,
+                                                 TensorParallelMode.COLUMN,
+                                                 dst_u8.device).to(torch.uint8)
+                if w3_scale is None and w1_sf.shape[1] == dst_u8.shape[1]:
+                    # Non-gated MoE: w1 scales cover the whole FC1.
+                    self._write_expert_stack(dst_u8, slots, w1_sf)
+                else:
+                    self._write_expert_stack(dst_w1_u8, slots, w1_sf)
+            module._mxfp8_w3_w1_sf_pending_slots.update(slots)
+        if w2_scale is not None:
+            dst_w2_u8 = module.w2_weight_scale.data.view(torch.uint8)
+            self._write_expert_stack(
+                dst_w2_u8, slots,
+                self._shard_expert_stack(w2_scale, module,
+                                         TensorParallelMode.ROW,
+                                         dst_w2_u8.device).to(torch.uint8))
+            module._mxfp8_w2_sf_pending_slots.update(slots)
+
+    def _swizzle_slot_range(self, scale_data: torch.Tensor, lo: int,
+                            hi: int) -> None:
+        """Swizzle slots ``[lo, hi)`` into the CUTLASS Mxf8f6f4 layout.
+
+        ``block_scale_interleave`` treats the leading dim as independent
+        experts, so a run of slots is one op. It operates on the uint8 view;
+        the result is re-viewed back to int32 (same bytes, new dtype
+        interpretation matching what the MoE TMA descriptor reads).
+        """
+        block = scale_data[lo:hi]
+        swizzled = torch.ops.trtllm.block_scale_interleave(
+            block.view(torch.uint8))
+        block.copy_(swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(block.shape))
+
     def _swizzle_slot_scale(self, scale_data: torch.Tensor,
                             local_slot_id: int) -> None:
-        """Swizzle one slot's block scale into the CUTLASS Mxf8f6f4 layout.
-
-        The op operates on the uint8 view; the result is re-viewed back to
-        int32 (same bytes, new dtype interpretation matching what the MoE TMA
-        descriptor reads).
-        """
-        slot = scale_data[local_slot_id]
-        orig_int32_shape = slot.shape
-        swizzled = torch.ops.trtllm.block_scale_interleave(
-            slot.view(torch.uint8))
-        slot.copy_(
-            swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(orig_int32_shape))
+        """Swizzle one slot's block scale (see :meth:`_swizzle_slot_range`)."""
+        self._swizzle_slot_range(scale_data, local_slot_id, local_slot_id + 1)
 
     def process_weights_after_loading(self, module: torch.nn.Module):
         # Apply the deferred swizzle once per load/refit sequence. Draining the
         # pending sets keeps the RLHF finalize walk -- which invokes both
         # process_weights_after_loading and post_load_weights -- from
-        # double-swizzling.
+        # double-swizzling. Contiguous runs of pending slots go in one op.
         for pending_attr, scale_attr in (("_mxfp8_w3_w1_sf_pending_slots",
                                           "w3_w1_weight_scale"),
                                          ("_mxfp8_w2_sf_pending_slots",
@@ -6767,8 +7032,9 @@ class MXFP8CutlassFusedMoEMethod(FusedMoEMethodBase):
             if not pending:
                 continue
             scale_data = getattr(module, scale_attr).data
-            for local_slot_id in sorted(pending):
-                self._swizzle_slot_scale(scale_data, local_slot_id)
+            per_slot_bytes = scale_data[0].numel() * scale_data.element_size()
+            for lo, hi in self._slot_batches(pending, per_slot_bytes):
+                self._swizzle_slot_range(scale_data, lo, hi)
             pending.clear()
 
 
@@ -6833,6 +7099,22 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
         if (w1_weight is not None or w3_weight is not None) and expert_idx >= 0:
             module._cute_dsl_mxfp8_w3_w1_interleave_pending.add(expert_idx)
 
+    def _after_expert_stacks_loaded(self, module: torch.nn.Module,
+                                    slots: List[int], *, fc1: bool,
+                                    fc2: bool) -> None:
+        if fc1:
+            module._cute_dsl_mxfp8_w3_w1_interleave_pending.update(slots)
+
+    @classmethod
+    def _interleave_w3_w1_weight_range(cls, weight_data: torch.Tensor, lo: int,
+                                       hi: int) -> None:
+        """Interleave slots ``[lo, hi)`` of the [E, 2N, K] e4m3 FC1 weight in place."""
+        block = weight_data[lo:hi].view(torch.uint8)
+        block.copy_(
+            interleave_linear_and_gate(block,
+                                       group_size=cls.INTERLEAVE_GROUP_SIZE,
+                                       dim=1))
+
     @classmethod
     def _interleave_w3_w1_weight(cls, dst_w3_w1_weight: torch.Tensor) -> None:
         """Interleave one slot's [2N, K] e4m3 FC1 weight in place."""
@@ -6841,6 +7123,26 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
             interleave_linear_and_gate(w3_w1_u8,
                                        group_size=cls.INTERLEAVE_GROUP_SIZE,
                                        dim=0))
+
+    def _interleave_w3_w1_weight_scale_range(self, module: torch.nn.Module,
+                                             scale_data: torch.Tensor, lo: int,
+                                             hi: int) -> None:
+        """Interleave the swizzled FC1 block scales of slots ``[lo, hi)``.
+
+        Batched form of :meth:`_interleave_w3_w1_weight_scale`: unswizzle ->
+        interleave rows -> swizzle, with the slot run as the leading dim of
+        every step.
+        """
+        rows = module.expand_intermediate_size_per_partition
+        k = module.hidden_size
+        block = scale_data[lo:hi]
+        unswizzled = unswizzle_sf(block.view(torch.uint8), rows, k,
+                                  self.BLOCK_SIZE).view(hi - lo, rows,
+                                                        k // self.BLOCK_SIZE)
+        interleaved = interleave_linear_and_gate(
+            unswizzled, group_size=self.INTERLEAVE_GROUP_SIZE, dim=1)
+        swizzled = swizzle_sf(interleaved, rows, k, self.BLOCK_SIZE)
+        block.copy_(swizzled.view(self.BLOCK_SCALES_DTYPE).reshape(block.shape))
 
     def _interleave_w3_w1_weight_scale(
             self, module: torch.nn.Module,
@@ -6876,14 +7178,16 @@ class MXFP8CuteDslFusedMoEMethod(MXFP8CutlassFusedMoEMethod):
                                "_cute_dsl_mxfp8_w3_w1_interleave_pending", None)
         if weight_slots:
             weight_data = module.w3_w1_weight.data
-            for local_slot_id in sorted(weight_slots):
-                self._interleave_w3_w1_weight(weight_data[local_slot_id])
+            per_slot_bytes = weight_data[0].numel() * weight_data.element_size()
+            for lo, hi in self._slot_batches(weight_slots, per_slot_bytes):
+                self._interleave_w3_w1_weight_range(weight_data, lo, hi)
             weight_slots.clear()
         if scale_slots:
             scale_data = module.w3_w1_weight_scale.data
-            for local_slot_id in sorted(scale_slots):
-                self._interleave_w3_w1_weight_scale(module,
-                                                    scale_data[local_slot_id])
+            per_slot_bytes = scale_data[0].numel() * scale_data.element_size()
+            for lo, hi in self._slot_batches(scale_slots, per_slot_bytes):
+                self._interleave_w3_w1_weight_scale_range(
+                    module, scale_data, lo, hi)
 
 
 # Serializes the duplicate-check + slot-claim step of
