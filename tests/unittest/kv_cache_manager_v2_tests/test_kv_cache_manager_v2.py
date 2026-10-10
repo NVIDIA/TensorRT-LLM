@@ -517,6 +517,8 @@ class TestRetention(TestKVCacheManagerV2):
             first.get_page_priorities(0, -1)
         with self.assertRaises(IndexError):
             self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(-1))
+        with self.assertRaises(IndexError):
+            self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(1))
         first.close()
         time.sleep(0.04)
         self.manager.refresh_retention()

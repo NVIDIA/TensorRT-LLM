@@ -2522,14 +2522,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("refresh_retention", &kv::KvCacheManager::refreshRetention, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "prefetch_reuse",
-            [](kv::KvCacheManager& self, nb::object reuseScopeObj, nb::object inputTokens, kv::CacheLevel target)
+            [](kv::KvCacheManager& self, nb::object reuseScopeObj, nb::object inputTokens, int target)
             {
                 auto reuseScope = castReuseScope(std::move(reuseScopeObj));
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
                         nb::gil_scoped_release release;
-                        return self.prefetchReuse(std::move(reuseScope), view, target, knownNoDigest);
+                        return self.prefetchReuse(std::move(reuseScope), view, kv::CacheLevel{target}, knownNoDigest);
                     });
             },
             nb::arg("reuse_scope"), nb::arg("input_tokens"), nb::arg("target"))
