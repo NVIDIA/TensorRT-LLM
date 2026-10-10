@@ -74,13 +74,11 @@ protected:
             /*draftTokens=*/std::nullopt,
             /*excludeInputFromOutput=*/false,
             /*encoderInputTokens=*/std::nullopt,
-            /*returnEncoderOutput=*/false,
-            /*clientId=*/std::nullopt, tensorrt_llm::executor::Request::kDefaultPriority,
+            /*returnEncoderOutput=*/false, tensorrt_llm::executor::Request::kDefaultPriority,
             /*encoderInputFeatures=*/std::nullopt,
             /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             /*inputTokenExtraIds=*/std::nullopt,
             /*returnPerfMetrics=*/false,
-            /*allottedTimeMs=*/std::nullopt,
             /*contextPhaseParams=*/std::nullopt,
             /*arrivalTime=*/std::nullopt, agentHierarchy);
     }

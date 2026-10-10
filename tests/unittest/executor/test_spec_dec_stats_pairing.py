@@ -105,8 +105,7 @@ class TestAccumulator:
     def test_tree_drafting_clamps_totals_to_max_path_len(self):
         # Tree drafting verifies up to max_total_draft_tokens nodes but can
         # accept at most max_draft_len (the max path length) per step; the
-        # cumulative denominator counts paths, mirroring the C++
-        # updateNumTokensPerIteration clamp. Per-pos arrays keep the
+        # cumulative denominator counts paths. Per-pos arrays keep the
         # unclamped node count.
         request = _fake_request(verified=12, accepted=3, draft_buffer_len=12)
         _accumulate([request], max_draft_len=3)
