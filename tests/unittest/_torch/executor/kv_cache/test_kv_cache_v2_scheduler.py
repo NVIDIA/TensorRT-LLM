@@ -97,7 +97,7 @@ def test_sparse_metadata_publishes_after_preparation(is_draft: bool) -> None:
     manager.is_draft = is_draft
     manager._stream = Mock(cuda_stream=123)
     manager.sparse_metadata_batch = Mock()
-    manager.kv_connector_manager = Mock()
+    manager.kv_connector_manager = Mock(capacity_only=False)
     manager._prepare_draft_resources = order.prepare_draft
     manager._run_kv_connector_hooks = order.connector
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
