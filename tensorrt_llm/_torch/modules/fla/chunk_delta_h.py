@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_delta_h.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
 # -*- coding: utf-8 -*-
@@ -16,6 +18,26 @@ from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
 
+def _save_autotune_state(args: dict, reset_only: bool = False) -> None:
+    if reset_only or args["h0"] is None or args["h0_i"] is None:
+        return
+    cu_seqlens = args["cu_seqlens"]
+    num_seqs = (len(cu_seqlens) -
+                1 if cu_seqlens is not None else args["k"].shape[0])
+    indices = args["h0_i"][:num_seqs].to(torch.long)
+    # Only these slots are updated by the indexed kernel. The pool may be
+    # much larger than the active batch, so never clone the whole pool.
+    saved_state = args["h0"].index_select(0, indices)
+    args["_gdn_autotune_state"] = indices, saved_state
+
+
+def _restore_autotune_state(args: dict, exception: Exception | None) -> None:
+    saved = args.pop("_gdn_autotune_state", None)
+    if saved is not None:
+        indices, state = saved
+        args["h0"].index_copy_(0, indices, state)
+
+
 @triton.heuristics({
     "USE_G": lambda args: args["g"] is not None,
     "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -30,6 +52,8 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
         for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT", "USE_G"],
+    pre_hook=_save_autotune_state,
+    post_hook=_restore_autotune_state,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
