@@ -312,6 +312,28 @@ def test_partial_reservation_capability_is_rejected(manager, monkeypatch, missin
         manager.configure_prefix_reservations(True)
 
 
+@pytest.mark.parametrize("local_capacity_only", [False, True])
+def test_ranks_that_disagree_about_capacity_only_are_rejected(
+    manager, monkeypatch, local_capacity_only
+):
+    """A split would hang in the first collective capacity_only gates."""
+    manager._prefix_capability = None
+    manager.capacity_only = local_capacity_only
+    monkeypatch.setattr(connector, "mpi_allgather", lambda value: [value, (value[0], not value[1])])
+    with pytest.raises(ValueError, match="capacity_only must be the same on every rank"):
+        manager.configure_prefix_reservations(True)
+
+
+def test_capacity_only_agreed_on_every_rank_is_accepted(manager, monkeypatch):
+    manager._prefix_capability = None
+    manager.capacity_only = True
+    monkeypatch.setattr(connector, "mpi_allgather", lambda value: [value, value])
+    manager.configure_prefix_reservations(True)
+    # The protocol stays off for the role, but the capability still resolved.
+    assert manager._prefix_capability is True
+    assert manager.prefix_reservations_enabled is False
+
+
 def test_legacy_connectors_do_not_enable_reservations(manager, monkeypatch):
     manager._prefix_capability = None
     for name in ("reserve_prefix", "release_prefix_reservation"):
