@@ -4229,9 +4229,22 @@ def create_py_executor_instance(
     if isinstance(kv_cache_manager, BaseMambaCacheManager):
         mamba_cache_manager = kv_cache_manager
 
+    draft_transfer_manager = None
+    spec_config = model_engine.model.model_config.spec_config
+    if (spec_config is not None and spec_config.spec_dec_mode.is_dspark()
+            and not spec_config.draft_is_embedded_in_target):
+        candidate = resources.get(ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if isinstance(candidate, KVCacheManagerV2) and candidate.kv_factor == 1:
+            draft_transfer_manager = candidate
+
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        draft_kv_cache_manager=draft_transfer_manager)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else

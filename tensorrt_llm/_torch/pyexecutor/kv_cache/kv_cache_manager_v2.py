@@ -5504,6 +5504,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        draft_context_lengths = getattr(self, "_draft_context_lengths", None)
+        if draft_context_lengths is not None:
+            draft_context_lengths.pop(request.py_request_id, None)
         if self.kv_connector_manager is not None and not self.is_draft:
             self.kv_connector_manager.release_unstarted_prefix_loads(request)
             if self.kv_connector_manager.has_pending_load(request):

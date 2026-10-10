@@ -1247,6 +1247,17 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
             clear(slot)
+            received = getattr(self._ctx_kv_manager, "_draft_context_lengths", None)
+            if not reset and received is not None and req_id in received:
+                if self._ctx_block_tables is None:
+                    raise RuntimeError("Transferred draft context requires the managed KV pool.")
+                length = received.pop(req_id)
+                if length > self._max_ctx:
+                    raise RuntimeError("Transferred draft context exceeds the drafter capacity.")
+                if updates is None:
+                    self._write_ctx_len({slot: length})
+                else:
+                    updates[slot] = length
         return self._req_to_slot[req_id]
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
@@ -1417,6 +1428,9 @@ class DFlashWorker(SpecWorkerBase):
         )
         for i in range(num_contexts):
             req_id = spec_metadata.request_ids[i]
+            transferable = getattr(self._ctx_kv_manager, "_draft_context_lengths", None)
+            if transferable is not None:
+                transferable.pop(req_id, None)
             slen = int(attn_metadata._seq_lens[i])
             chunk_proj = ctx_proj[offset : offset + slen].detach()
             chunk_pos = position_ids[offset : offset + slen].long().detach()
@@ -1499,6 +1513,8 @@ class DFlashWorker(SpecWorkerBase):
                         torch.full((actual,), row, dtype=torch.long, device="cuda"),
                         local_pos,
                     )
+                    if self._ctx_block_tables is not None and transferable is not None:
+                        transferable[req_id] = end
                 else:  # VANILLA DFlash backend (FlashAttention)
                     self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
                     if chunk_v is not None:
@@ -1560,6 +1576,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Lazy init buffers and attach worker reference for prepare()
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        first_prepare = getattr(spec_metadata, "_dflash_worker", None) is None
         self._lazy_init_ctx_buffers(
             draft_model, spec_metadata, attn_metadata, draft_kv_cache_manager
         )
@@ -1568,6 +1585,14 @@ class DFlashWorker(SpecWorkerBase):
         # Returning False here means an empty batch -- the missing-offsets case
         # raises inside, with the metadata type in the message.
         self._refresh_ctx_block_tables(attn_metadata, batch_size)
+        if (
+            first_prepare
+            and num_gens > 0
+            and getattr(draft_kv_cache_manager, "_draft_context_lengths", None)
+        ):
+            # An eager decode worker may receive KV before its first forward
+            # has initialized the slot buffers used by metadata.prepare().
+            spec_metadata.prepare()
 
         # Save context lengths so both warmup and a failed forward can roll
         # back the in-place _ctx_len updates made during drafting.

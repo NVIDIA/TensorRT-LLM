@@ -77,7 +77,15 @@ from tensorrt_llm._torch.disaggregation.native.retirement import (
 )
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
-from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.draft_cache import (
+    DraftCacheInfo,
+    append_draft_page_table,
+    omit_draft_destinations,
+)
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
+    KVRegionExtractorV1,
+    build_page_table_from_manager,
+)
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -2815,6 +2823,7 @@ class KVRecvTask(_LogicalTask):
         # "unknown" and the task can never become write-verified.
         self.expected_write_bytes = expected_write_bytes
         self.verified_write_bytes = 0
+        self.draft_cache_transfer = False
 
         self._unique_rid = unique_rid
         self._chunk = chunk
@@ -3185,7 +3194,6 @@ class Receiver(ReceiverBase):
         logger.debug(
             f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
         )
-        receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
         try:
             peer_infos: RankInfo = self._get_sender_info(params)
@@ -3213,6 +3221,18 @@ class Receiver(ReceiverBase):
                     session.cancel_unpublished_task(task)
             task.fail(e)
             return
+
+        local_draft = getattr(self._registrar.self_rank_info, "draft_cache", None)
+        if local_draft is not None:
+            if peer_infos.draft_cache is None:
+                removed = omit_draft_destinations(
+                    task._chunk, self._registrar.self_extractor.page_table, local_draft
+                )
+                if task.expected_write_bytes is not None:
+                    task.expected_write_bytes -= removed
+            else:
+                task.draft_cache_transfer = True
+        receiver_req = self._build_recv_req_info(task)
 
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
@@ -3387,6 +3407,9 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                local_draft = getattr(self._registrar.self_rank_info, "draft_cache", None)
+                if local_draft is not None:
+                    local_draft.validate_peer(sender_info.draft_cache)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
@@ -3846,6 +3869,11 @@ class RxSession(RxSessionBase):
             if not self._kv_tasks:
                 return False
             return all(task.write_verified for task in self._kv_tasks)
+
+    def has_draft_cache_transfer(self) -> bool:
+        """Whether both peers included the standalone draft in this receive."""
+        with self.lock:
+            return any(task.draft_cache_transfer for task in self._kv_tasks)
 
     def dispatch_prepared_receive(self, task: KVRecvTask) -> None:
         try:
@@ -4510,6 +4538,7 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    draft_kv_cache_manager: Optional[KVCacheManager] = None
 
 
 class TransferWorker:
@@ -4535,6 +4564,28 @@ class TransferWorker:
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
+        draft = config.draft_kv_cache_manager
+        if draft is not None:
+            if kvm.mapping.pp_size != 1 or kvm.mapping.cp_size != 1:
+                raise ValueError("Standalone MLA draft transfer requires PP=1 and CP=1.")
+            if draft.kv_factor != 1 or any(heads != 1 for heads in draft.num_kv_heads_per_layer):
+                raise ValueError("Standalone draft transfer requires single-latent MLA storage.")
+            target_table = self._rank_info.page_table
+            first_draft_layer = 1 + max(
+                layer.global_layer_id
+                for group in target_table.layer_groups
+                for layer in group.local_layers
+            )
+            self._rank_info.draft_cache = DraftCacheInfo(
+                first_layer_group=len(target_table.layer_groups),
+                first_layer=first_draft_layer,
+                num_layers=draft.num_layers,
+                head_dim=draft.head_dim,
+                dtype=str(draft.dtype),
+            )
+            self._rank_info.page_table = append_draft_page_table(
+                target_table, build_page_table_from_manager(draft), first_draft_layer
+            )
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
@@ -4597,7 +4648,7 @@ class TransferWorker:
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
-        self._kv_extractor = KVRegionExtractorV1(kvm)
+        self._kv_extractor = KVRegionExtractorV1(self._rank_info.page_table)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
     def _setup_transfer_engine(self):
@@ -4703,6 +4754,10 @@ class TransferWorker:
     def page_table(self):
         assert self._rank_info is not None
         return self._rank_info.page_table
+
+    @property
+    def draft_cache_info(self) -> Optional[DraftCacheInfo]:
+        return self._rank_info.draft_cache
 
     def shutdown(self):
         if getattr(self, "_shutdown", False):
