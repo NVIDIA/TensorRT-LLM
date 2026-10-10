@@ -61,7 +61,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         capture_graph = self.is_cuda_graph
         # Each pipeline stage only has pools for its local layers.
         self.compress_ratio_set = (
-            {self.compress_ratios[layer] for layer in self.kv_cache_manager.pp_layers}
+            {
+                self.kv_cache_manager._compress_ratios[layer]
+                for layer in self.kv_cache_manager.pp_layers
+            }
             if self.mapping.pp_size > 1
             else set(self.compress_ratios)
         )

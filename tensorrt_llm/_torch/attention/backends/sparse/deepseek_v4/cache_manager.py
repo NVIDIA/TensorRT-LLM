@@ -51,6 +51,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BatchDesc,
     BufferConfig,
     BufferId,
+    CacheTier,
     CudaStream,
     DataRole,
     KVCacheDesc,
@@ -451,11 +452,14 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             }
             has_host_storage = True
             if sparse_groups:
-                host_groups = self.impl.get_life_cycle_pool_group_indices(1)
-                host_stats = self.impl.get_storage_statistics(1)
-                has_host_storage = all(
-                    host_stats[host_groups[group]].total > 0 for group in sparse_groups
-                )
+                if CacheTier.HOST_MEM not in self.impl.cache_tier_list:
+                    has_host_storage = False
+                else:
+                    host_groups = self.impl.get_life_cycle_pool_group_indices(1)
+                    host_stats = self.impl.get_storage_statistics(1)
+                    has_host_storage = all(
+                        host_stats[host_groups[group]].total > 0 for group in sparse_groups
+                    )
             if not Distributed.get(mapping).allreduce(int(has_host_storage), op=ReduceOp.MIN):
                 self.shutdown()
                 raise ValueError(

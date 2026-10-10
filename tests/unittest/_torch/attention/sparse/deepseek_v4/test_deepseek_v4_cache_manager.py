@@ -28,6 +28,9 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
     cache_manager as deepseek_v4_cache,
 )
+from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4 import (
+    metadata as deepseek_v4_metadata,
+)
 from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
@@ -67,6 +70,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
     BufferConfig,
+    CacheTier,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -672,6 +676,108 @@ def test_sparse_offload_validates_configuration_before_allocation(unsupported: s
 
     get_sm_version.assert_not_called()
     initialize_cache.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "cache_tiers",
+    [
+        [CacheTier.GPU_MEM],
+        [CacheTier.GPU_MEM, CacheTier.DISK],
+        [CacheTier.GPU_MEM, CacheTier.HOST_MEM],
+    ],
+)
+def test_sparse_offload_shuts_down_without_host_storage(cache_tiers: list[CacheTier]) -> None:
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=True, compress_ratios=[4]
+    )
+    impl = Mock(cache_tier_list=cache_tiers)
+    impl.get_layer_group_id.return_value = 0
+    impl.get_life_cycle_pool_group_indices.return_value = [0]
+    impl.get_storage_statistics.return_value = [SimpleNamespace(total=0)]
+    distributed = Mock()
+    distributed.allreduce.return_value = 0
+
+    def initialize_cache(manager: DeepseekV4CacheManager, *args, **kwargs) -> None:
+        manager.impl = impl
+        manager._layer_attn_to_layer_id = {(0, DeepseekV4AttentionType.COMPRESS): 0}
+
+    with (
+        patch.object(deepseek_v4_cache, "get_sm_version", return_value=100),
+        patch.object(KVCacheManagerV2, "__init__", new=initialize_cache),
+        patch.object(deepseek_v4_cache.Distributed, "get", return_value=distributed),
+        patch.object(DeepseekV4CacheManager, "shutdown") as shutdown,
+        pytest.raises(ValueError, match="host slots on every sparse rank"),
+    ):
+        DeepseekV4CacheManager(
+            kv_cache_config=KvCacheConfig(host_cache_size=1 << 20),
+            kv_cache_type=CacheTypeCpp.SELFKONLY,
+            num_layers=1,
+            max_batch_size=1,
+            tokens_per_block=128,
+            max_seq_len=256,
+            vocab_size=128,
+            mapping=Mapping(),
+            sparse_attn_config=sparse_config,
+        )
+
+    distributed.allreduce.assert_called_once_with(0, op=deepseek_v4_cache.ReduceOp.MIN)
+    shutdown.assert_called_once_with()
+    if CacheTier.HOST_MEM in cache_tiers:
+        impl.get_life_cycle_pool_group_indices.assert_called_once_with(1)
+        impl.get_storage_statistics.assert_called_once_with(1)
+    else:
+        impl.get_life_cycle_pool_group_indices.assert_not_called()
+        impl.get_storage_statistics.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "pp_size,pp_layers,expected_ratios",
+    [(1, [0, 1, 2, 3, 4], {1, 4, 128}), (2, [0, 1], {4, 128}), (2, [2, 3, 4], {1})],
+)
+def test_metadata_uses_pipeline_local_mtp_ratios(
+    pp_size: int, pp_layers: list[int], expected_ratios: set[int]
+) -> None:
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[4, 128, 1], enable_kv_cache_offload=False, index_topk=8
+    ).to_sparse_metadata_params()
+    metadata.compress_ratios = metadata.sparse_metadata_params.compress_ratios
+    metadata.mapping = Mapping(world_size=pp_size, pp_size=pp_size)
+    metadata.kv_cache_manager = SimpleNamespace(
+        pp_layers=pp_layers,
+        _compress_ratios=[4, 128, 1, 1, 1],
+        num_local_layers=len(pp_layers),
+        max_blocks_per_seq=2,
+        swa_pool_ptr=0,
+        compress_pool_ptrs={ratio: 0 for ratio in expected_ratios if ratio > 1},
+        get_buffers=Mock(return_value=torch.empty(1)),
+    )
+    metadata.max_num_sequences = 1
+    metadata.max_num_tokens = 4
+    metadata.max_seq_len = 256
+    metadata.max_draft_tokens = 3
+    metadata.sparse_mla_topk = 8
+    metadata.is_cuda_graph = False
+    metadata.cuda_graph_buffers = None
+
+    with (
+        patch.object(deepseek_v4_metadata.DSAtrtllmAttentionMetadata, "__post_init__"),
+        patch.object(deepseek_v4_metadata, "prefer_pinned", return_value=False),
+        patch.object(metadata, "_init_draft_sparse_buffers"),
+        patch.object(
+            metadata,
+            "get_empty",
+            side_effect=lambda buffers, shape, dtype, **kwargs: torch.empty(shape, dtype=dtype),
+        ),
+    ):
+        metadata.__post_init__()
+
+    assert metadata.compress_ratio_set == expected_ratios
+    assert set(metadata.compress_block_tables) == expected_ratios - {1}
+    assert metadata.sliding_block_tables.shape[0] == len(pp_layers)
+    assert metadata.sparse_offload_state is None
 
 
 @pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
