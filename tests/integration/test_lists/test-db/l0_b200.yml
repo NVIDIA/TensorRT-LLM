@@ -198,6 +198,12 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_forwards_situ_activation_as_one_carrier
   - unittest/_torch/moe/test_moe_backend.py::test_create_moe_backend_rejects_apply_router_weight_on_input_by_declaration
   - unittest/_torch/moe/test_moe_backend.py::test_apply_router_weight_on_input_support_is_not_inherited
+  # FP8 block-scale loaders and CUTLASS padding are not cpu_only, so only a GPU stage runs them.
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_loads_padded_non_gated_experts
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_keeps_aligned_gated_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_rejects_unaligned_moe_tp_shard
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_rejects_short_scale_grid
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_pads_fp8_block_scales_intermediate_on_single_moe_tp_rank
   # WideEP DeepEP-to-CuTeDSL metadata selection and adapter-free contracts.
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_count_native_runner_keeps_both_tactics_and_threads_counts
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens
