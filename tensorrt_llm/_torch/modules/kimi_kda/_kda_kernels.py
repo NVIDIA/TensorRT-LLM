@@ -68,20 +68,27 @@ def is_kda_optimized_supported() -> bool:
     return get_kda_sm_version() in (100, 103)
 
 
-@triton.jit(do_not_specialize=["num_tokens"])
+@triton.jit(do_not_specialize=["num_tokens", "outer_stride"])
 def _fused_kda_post_conv_kernel(
     packed_ptr,
     q_out_ptr,
     k_out_ptr,
     v_out_ptr,
     num_tokens,
+    outer_stride,
     l2_norm_eps,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
+    TOKEN_MAJOR: tl.constexpr,
 ):
-    """Normalize and transpose channel-major packed Q/K/V in one launch."""
+    """Normalize and transpose packed Q/K/V in one launch.
+
+    ``packed`` is ``[3 * NUM_HEADS * HEAD_DIM, num_tokens]`` with one unit
+    stride: along tokens (channel-major) or, with ``TOKEN_MAJOR``, along
+    features. ``outer_stride`` is the other stride.
+    """
     token_offsets = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     head_idx = tl.program_id(1)
     dim_offsets = tl.arange(0, BLOCK_DIM)
@@ -91,11 +98,17 @@ def _fused_kda_post_conv_kernel(
 
     feature_offsets = head_idx * HEAD_DIM + dim_offsets
     projection_size = NUM_HEADS * HEAD_DIM
-    num_tokens_i64 = num_tokens.to(tl.int64)
-    source_offsets = feature_offsets[None, :].to(tl.int64) * num_tokens_i64 + token_offsets[
-        :, None
-    ].to(tl.int64)
-    section_stride = projection_size * num_tokens_i64
+    outer_stride_i64 = outer_stride.to(tl.int64)
+    if TOKEN_MAJOR:
+        source_offsets = token_offsets[:, None].to(tl.int64) * outer_stride_i64 + feature_offsets[
+            None, :
+        ].to(tl.int64)
+        section_stride = projection_size
+    else:
+        source_offsets = feature_offsets[None, :].to(tl.int64) * outer_stride_i64 + token_offsets[
+            :, None
+        ].to(tl.int64)
+        section_stride = projection_size * outer_stride_i64
     output_offsets = (
         token_offsets[:, None].to(tl.int64) * projection_size + feature_offsets[None, :]
     )
@@ -126,11 +139,13 @@ def fused_kda_post_conv(
     head_dim: int,
     l2_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Convert packed channel-major convolution output to KDA Q/K/V.
+    """Convert packed convolution output to KDA Q/K/V.
 
-    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]``. The
-    returned tensors are contiguous ``[1, tokens, num_heads, head_dim]``;
-    Q and K are L2-normalized along the head dimension.
+    ``packed`` has shape ``[3 * num_heads * head_dim, tokens]`` and is either
+    channel-major (unit token stride) or a transposed view of token-major
+    rows (unit feature stride). The returned tensors are contiguous
+    ``[1, tokens, num_heads, head_dim]``; Q and K are L2-normalized along the
+    head dimension.
     """
     projection_size = num_heads * head_dim
     if packed.ndim != 2 or packed.shape[0] != 3 * projection_size:
@@ -138,10 +153,19 @@ def fused_kda_post_conv(
             "Packed KDA post-conv expected shape "
             f"[{3 * projection_size}, tokens], got {tuple(packed.shape)}"
         )
-    if not packed.is_contiguous():
-        raise ValueError("Packed KDA post-conv requires a contiguous tensor")
-
     num_tokens = packed.shape[1]
+    feature_stride, token_stride = packed.stride()
+    token_major = feature_stride == 1 and num_tokens > 1
+    if token_major:
+        outer_stride = token_stride
+    elif token_stride == 1 or num_tokens <= 1:
+        outer_stride = feature_stride
+    else:
+        raise ValueError(
+            "Packed KDA post-conv requires a unit stride along tokens or features, "
+            f"got strides {packed.stride()}"
+        )
+
     output_shape = (1, num_tokens, num_heads, head_dim)
     q_out = torch.empty(output_shape, dtype=packed.dtype, device=packed.device)
     k_out = torch.empty_like(q_out)
@@ -158,11 +182,13 @@ def fused_kda_post_conv(
         k_out,
         v_out,
         num_tokens,
+        outer_stride,
         l2_norm_eps,
         num_heads,
         head_dim,
         block_tokens,
         block_dim,
+        token_major,
         num_warps=8,
         num_stages=3,
     )
