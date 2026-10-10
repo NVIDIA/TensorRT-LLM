@@ -209,6 +209,7 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
     kv = SimpleNamespace(
         is_active=True,
         capacity=100,
+        history_length=0,
         resize=lambda cap, hist: resizes.append((cap, hist)) or True,
     )
     req = SimpleNamespace(

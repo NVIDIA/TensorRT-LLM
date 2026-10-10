@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -56,9 +57,10 @@ def _request(
     return request
 
 
-def _cache(*, capacity: int = 256, active: bool = True) -> MagicMock:
+def _cache(*, capacity: int = 256, active: bool = True, history_length: int = 0) -> MagicMock:
     cache = MagicMock()
     cache.capacity = capacity
+    cache.history_length = history_length
     cache.is_active = active
     cache.resize.return_value = True
     return cache
@@ -261,3 +263,124 @@ def test_disagg_gen_transition_prefers_context_drafts():
     )
 
     assert manager._effective_draft_len(request) == 2
+
+
+def test_update_resources_clamps_capacity_to_history_under_mtp_rewind() -> None:
+    """Reproduce #18661: rewind must not push capacity below history.
+
+    Schedule-time allocation can reserve fewer draft slots than SpecSampler's
+    runtime_draft_len (MTP pads after try_allocate and skips KV extension).
+    Falling back to py_rewind_len then yields capacity - rewind < history, and
+    the real kv_cache.resize raises "History length cannot exceed capacity".
+    """
+    manager = _manager(is_draft=False)
+    # Tight cache: capacity equals the post-step history we will commit.
+    # One rejected MTP draft wants to reclaim a slot that was never reserved.
+    request = _request(1, rewind=1, accepted_draft_tokens=0)
+    request.max_beam_num_tokens = 201  # history_length target = 200
+    cache = _cache(capacity=200)
+    manager.kv_cache_map[request.py_request_id] = cache
+    # No scheduler entry: fall back to runtime_draft_len == rewind + accepted.
+    assert request.py_request_id not in manager._allocated_draft_lens
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    # Without the clamp this would be resize(199, 200) and raise on a real cache.
+    cache.resize.assert_called_once_with(200, 200)
+
+
+def test_update_resources_clamps_for_unpaired_draft_manager() -> None:
+    """Unpaired draft/indexer pool (block reuse off) must keep the same contract."""
+    manager = _manager(is_draft=True, kv_reserve_draft_tokens=1)
+    request = _request(1, rewind=1, accepted_draft_tokens=0)
+    request.max_beam_num_tokens = 146001  # long chunked prefill + one gen token
+    # The draft slot was recorded but never grown, so an unclamped rewind
+    # would ask for 145999 against history 146000.
+    cache = _cache(capacity=146000)
+    manager.kv_cache_map[request.py_request_id] = cache
+    manager._allocated_draft_lens[request.py_request_id] = 1
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    cache.resize.assert_called_once_with(146000, 146000)
+
+
+@pytest.mark.parametrize("helix", [False, True], ids=["compression", "helix"])
+def test_update_resources_clamps_to_retained_history_when_delegated(helix: bool) -> None:
+    """resize(capacity, None) keeps the native history, so clamp against it."""
+    manager = _manager(is_draft=False, kv_compression_manages_history=not helix)
+    manager._has_cp_helix = helix
+    request = _request(1, rewind=1, accepted_draft_tokens=0)
+    cache = _cache(capacity=200, history_length=200)
+    manager.kv_cache_map[request.py_request_id] = cache
+
+    manager.update_resources(SimpleNamespace(generation_requests=[request]))
+
+    # Without the clamp this would be resize(199, None) against history 200.
+    cache.resize.assert_called_once_with(200, None)
+
+
+def _run_prepare_draft_generation(manager: KVCacheManagerV2, cache: MagicMock) -> None:
+    manager.num_extra_kv_tokens = 0
+    manager.max_total_draft_tokens = 1
+    req = SimpleNamespace(
+        py_request_id=7,
+        py_draft_tokens=[42],
+        is_last_context_chunk=False,
+        context_current_position=0,
+        context_chunk_size=0,
+        lora_task_id=None,
+        cache_salt=None,
+        is_dummy=False,
+        is_disagg_generation_transmission_complete=False,
+        context_phase_params=None,
+        py_disable_speculative_decoding=False,
+    )
+    manager.kv_cache_map[7] = cache
+
+    with (
+        patch.object(manager, "_mirror_draft_kv_cache", return_value=cache),
+        patch.object(manager, "_resume_and_restore", return_value=True),
+        patch.object(manager, "_ensure_generation_beam_width", return_value=True),
+        patch.object(kv_cache_v2_module, "request_context", return_value=nullcontext()),
+    ):
+        manager._prepare_draft_resources(
+            SimpleNamespace(context_requests=[], generation_requests=[req])
+        )
+
+
+def test_prepare_draft_resources_records_allocated_draft_slots() -> None:
+    """Unpaired draft prepare must record width for symmetric rewind."""
+    manager = _manager(is_draft=True, kv_reserve_draft_tokens=1)
+    manager.enable_joint_kv_cache_reuse = False
+    cache = _cache(capacity=100)
+
+    _run_prepare_draft_generation(manager, cache)
+
+    assert manager._allocated_draft_lens[7] == 1
+    cache.resize.assert_called_once_with(102)
+
+
+def test_unpaired_prepare_grows_despite_stale_record() -> None:
+    """A record left by a skipped (suspended) update is not this step's growth."""
+    manager = _manager(is_draft=True, kv_reserve_draft_tokens=1)
+    manager.enable_joint_kv_cache_reuse = False
+    manager._allocated_draft_lens[7] = 1
+    cache = _cache(capacity=100)
+
+    _run_prepare_draft_generation(manager, cache)
+
+    assert manager._allocated_draft_lens[7] == 1
+    cache.resize.assert_called_once_with(102)
+
+
+def test_paired_prepare_skips_scheduler_grown_request() -> None:
+    """Under joint reuse the scheduler already grew the draft pool this step."""
+    manager = _manager(is_draft=True, kv_reserve_draft_tokens=1)
+    manager.enable_joint_kv_cache_reuse = True
+    manager._allocated_draft_lens[7] = 1
+    cache = _cache(capacity=100)
+
+    _run_prepare_draft_generation(manager, cache)
+
+    cache.resize.assert_not_called()
