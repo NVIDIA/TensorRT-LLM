@@ -1,0 +1,549 @@
+# Regression-pattern registry — transferable failure modes as first-class
+# entries. A pattern is the recurring WAY perf regressed; cases are its
+# concrete instances. Match symptom signals → pattern → instance cases.
+#
+# Hybrid-registry contract (same as perf-optimization-casebook — keep by hand):
+#   - every id listed in a case's frontmatter `patterns:` must exist here;
+#   - every `instances:` entry here must resolve to an existing case file
+#     whose frontmatter lists this pattern back.
+# A pattern MAY have `instances: []` when its only known sightings are
+# unconfirmed entries in data/pending.yaml (named in notes) — promote them
+# to cases before adding them here.
+#
+# Provenance: a pattern's full commit/NVBug set is the union of its
+# instance cases' `commits:`/`nvbugs:` frontmatter (plus any pending
+# entries named in notes).
+#
+# Fields: id (stable, prefix `pattern-`), name (one-liner), regression_class /
+# signals (canonical terms from tags.yaml — the top-down hook), modules
+# (which `references/<module>/` dirs the instances live in today — descriptive,
+# not a constraint; ordered most-instances-first), instances (case ids),
+# notes (triage hint / scope caveat, optional).
+#
+# Patterns are the CROSS-MODULE axis. references/ is indexed by module (where
+# the fix landed); a pattern is the recurring mechanism, and a `modules:` list
+# with several entries is the useful case, not a filing error — it says this
+# failure mode has already recurred in code that has nothing else in common.
+# `pattern-host-work-on-hot-path` spans 12 of the 18 modules; that is the
+# single most useful fact in this file.
+
+patterns:
+  - id: pattern-host-work-on-hot-path
+    name: New or hidden host-side work lands on the per-request/per-step hot path
+    regression_class: [host-work-added]
+    signals: [host-time-increase, itl-increase, gpu-idle-between-steps, throughput-drop]
+    modules: [attention-fmha, runtime-and-serving, sampler, scheduler-and-executor, autotuner, communication, cuda-graph-and-compile, disagg-orchestrator, jit-and-warmup, kv-cache-manager, kv-cache-transceiver, tokenization]
+    instances:
+      - case-beam-search-host-handoff
+      - case-torchsampler-logprobs0-overhead
+      - case-kimi-tokenizer-slow-path-on-hot-path
+      - case-fmha-dispatcher-sm-count-query
+      - case-model-engine-per-request-attr-overhead
+      - case-png-encode-on-serving-hot-path
+      - case-dsa-indexer-host-overhead
+      - case-disagg-gen-retokenize-and-memcpy
+      - case-custom-op-dispatch-tax-ltx2
+      - case-mamba-hybrid-recurrent-state-d2h-syncs
+      - case-allreduce-host-overhead-small-model-tp
+      - case-canceled-req-ids-unbounded-growth
+      - case-piecewise-attention-torch-compile-host-overhead
+      - case-maybe-compile-recompiles-every-call
+      - case-nested-nvfp4-gemm-autotune-dispatch
+      - case-disagg-server-gc-pauses
+    notes: >
+      Triage: isolate a forward step in nsys and diff the host span vs the
+      previous build (perf-host-analysis). Frequent shapes: per-request
+      attribute/dict work in Python loops, driver queries per dispatch,
+      pure-Python codec/tokenizer swapped onto the orchestrator thread.
+      Four further shapes worth naming, all with instances here. (e) A
+      `@torch.compile`-decorated helper compiled or guard-checked PER CALL
+      instead of once — the `maybe_compile` pair
+      (`case-piecewise-attention-torch-compile-host-overhead`, and its own
+      regression `case-maybe-compile-recompiles-every-call`, where the fix's
+      wrapper called `torch.compile(f)(...)` inside the wrapper body). Read that
+      pair together: the second is the first's `prior-fix-side-effect`.
+      (f) An abstraction whose warmup-time decision is re-resolved on every
+      invocation (`case-nested-nvfp4-gemm-autotune-dispatch` — two levels of
+      autotuner cache lookup on the cached path). (g) An unbounded container
+      whose per-step scan grows with uptime
+      (`case-canceled-req-ids-unbounded-growth`) — this one produces a SLOPE
+      while perf CI measures LEVELS, so it reads as noise until a long run.
+      (h) Python GC pauses in a request-path component
+      (`case-disagg-server-gc-pauses`), which starve batching rather than slow
+      any kernel — check batch size before checking kernels.
+
+  - id: pattern-per-step-sync-added
+    name: A per-step host-device sync or over-scoped collective is introduced
+    regression_class: [sync-introduced]
+    signals: [gpu-idle-between-steps, ttft-increase, itl-increase]
+    modules: [sampler, attention-fmha, kv-cache-manager, kv-cache-transceiver]
+    instances:
+      - case-disagg-quorum-vote-world-scope
+      - case-dsa-indexer-host-overhead
+      - case-mamba-hybrid-recurrent-state-d2h-syncs
+      - case-sampler-stop-words-implicit-d2h-sync
+      - case-cc-blocking-d2h-copies-worker-thread
+    notes: >
+      Deadlock/correctness fixes that add votes/syncs are prime suspects —
+      check the scope (TP vs WORLD) and frequency (per-iteration?) of any
+      newly added collective or .item()/D2H on the step path.
+      Two amplifiers to know. The sync need not be written as a sync:
+      `torch.equal`, `bool(t)`, `if t:`, `.item()` and iterating a CUDA tensor
+      are all implicit D2H, and inside `sample_async` one of them collapsed the
+      overlap scheduler into a ~3x throughput loss
+      (`case-sampler-stop-words-implicit-d2h-sync`) — so an early-exit
+      "optimization" over device data is a defect, not a win. And a PLATFORM can
+      convert an existing async idiom into a per-step sync with no code change:
+      under confidential compute every D2H is blocking
+      (`case-cc-blocking-d2h-copies-worker-thread`), which is why a CC-only
+      regression finds nothing when bisected against non-CC baselines.
+
+  - id: pattern-fast-path-silent-fallback
+    name: A fast path is silently disabled and a generic/slow path runs instead
+    regression_class: [fast-path-fallback, cuda-graph-regression]
+    signals: [slower-kernel-in-trace, eager-fallback-in-log, throughput-drop, itl-increase]
+    modules: [cuda-graph-and-compile, kernel-fusion, model-definition, attention-fmha, communication, kv-cache-manager, moe, runtime-and-serving]
+    instances:
+      - case-piecewise-cudagraph-capture-coverage
+      - case-router-gemm-missing-instantiation
+      - case-flinear-bias-copy-sm100
+      - case-nemotronh-mnnvl-nccl-fallback
+      - case-ltx2-bf16-lora-restore
+      - case-dsmla-sparse-ctx-2cta-fallback
+      - case-mrope-graph-gate-text-only-eager
+      - case-mamba2-flashinfer-head-group-ratio-gate
+      - case-qwen35-ssm-cache-fp32-fallback
+      - case-qwen35-fused-ops-disabled-under-torch-compile
+      - case-nvle-only-treated-as-cc
+    notes: >
+      The fallback is silent by construction — the run is correct, just slow.
+      Two eligibility-guard shapes with instances here. A kernel gated on "am I
+      being compiled?" (`is_torch_compiling()`) disables itself in exactly the
+      configuration you enabled for latency
+      (`case-qwen35-fused-ops-disabled-under-torch-compile`); the fix is to
+      register it as a custom op so Dynamo need not see inside, never to keep the
+      guard. And one boolean answering two platform questions misroutes every
+      later consumer (`case-nvle-only-treated-as-cc`: NVLE-only machines paid
+      confidential-compute restrictions) — a capability predicate named for
+      feature X must be false when only feature Y is present. When a machine or
+      a mode is slower than its siblings for no visible reason, enumerate the
+      capability predicates before profiling kernels.
+      Triage: compare kernel names / collective algo in the trace against a
+      good run; grep logs for fallback warnings; audit eligibility guards
+      (dtype/arch/shape/capability checks) added or changed in the range.
+      The AutoDeploy SYMM_MEM→NCCL instance was removed on 2026-08-12: its only
+      bug, 6221450, is a functional bug (an L0 post-merge *accuracy* assertion
+      on `TestQwen3_5_397B_MoE::test_nvfp4`), and the slower allreduce was
+      noticed while root-causing that accuracy collapse rather than by a perf
+      bar. The fallback mechanism is identical to the surviving instances —
+      read `case-nemotronh-mnnvl-nccl-fallback` for the same shape with a
+      performance bug behind it.
+      Guards must fail closed on capability, open on perf.
+
+  - id: pattern-kernel-swap-regressed
+    name: A kernel replacement/optimization is itself slower on some shape/arch/dtype
+    regression_class: [kernel-swap-regressed]
+    signals: [slower-kernel-in-trace, throughput-drop, perf-ci-bar-failure]
+    modules: [attention-fmha, gemm-and-quantization, moe, spec-decode]
+    instances:
+      - case-moe-doactivation-optimization-side-effect
+      - case-cutedsl-argmax-revert
+      - case-fp8-pertensor-quant-slower-than-te
+      - case-trtllmgen-mla-decode-unwaived-slower
+    notes: >
+      An optimization for one dtype/shape regime can regress another
+      (grid-stride removal, binary bloat, generic-DSL kernel vs tuned op).
+      Verify a kernel swap on EVERY dtype/arch/shape regime it can serve;
+      keep the old path revertible behind selection.
+
+  - id: pattern-inactive-feature-guard-on-hot-path
+    name: A guard for an optional, inactive feature is evaluated unconditionally inside a hot device loop
+    regression_class: [kernel-swap-regressed, communication-regression]
+    signals: [itl-increase, perf-ci-bar-failure, throughput-drop]
+    modules: [moe]
+    instances:
+      - case-moe-a2a-rank-mask-hot-path
+    notes: >
+      The feature is "off" only in the sense that its runtime data is neutral
+      (an all-ones mask, an identity scale, a null-object pointer), so the
+      branch is still emitted and still evaluated once per token / top-k /
+      payload element. Nothing was replaced and no shape regressed
+      selectively, which is why a bisect lands on a feature PR that looks
+      perf-irrelevant. Triage: grep the culprit's kernel diff for predicates
+      added inside per-element loops and check whether the launch path already
+      has a template/SWITCH_BOOL specialization the flag should have used;
+      the fix is compile-time specialization, not a faster predicate.
+
+  - id: pattern-warmup-coverage-gap
+    name: JIT/compile/capture cost lands in measured or served iterations
+    regression_class: [warmup-jit-gap]
+    signals: [midrun-stall, itl-increase, perf-ci-bar-failure]
+    modules: [jit-and-warmup, measurement-and-test]
+    instances:
+      - case-trtllmgen-fmha-jit-warmup
+      - case-trtllmgen-fmha-densify-grid
+      - case-warmup-token-cap-revert
+      - case-mla-chunked-prefill-maybe-compiled-cat-warmup
+      - case-model-engine-warmup-orchestration-gaps
+      - case-multi-gpu-bench-warmup-too-few
+    notes: >
+      Four failure shapes, all present in this family. (d) A compiled op is
+      reachable only from a branch the warmup never enters — the MLA
+      chunked-prefill `maybe_compiled_cat` case, moved here from the instability
+      cookbook on 2026-08-12 because its bug 5823212 is a bisected regression
+      filed as a performance bug. It is the family's clearest example of the
+      first-use-recompile trap: a cost paid once per process reads as a
+      first-iter spike in a trace while moving the *mean* and not the variance,
+      so it belongs to regression triage, not instability triage.
+      (a) Warmup entirely
+      missing for a mode (`case-trtllmgen-fmha-jit-warmup`). (b) A warmup grid
+      too sparse, so a runtime shape misses it and JITs on the served path
+      (`case-trtllmgen-fmha-densify-grid` — the round-2 sequel to (a), read the
+      pair together). (c) The *cap-shrunk-grid* variant: a protective clamp on
+      warmup token count / batch size, added to stop an OOM or int32 overflow
+      at extreme shapes, silently shrinks the warmed grid below what real
+      traffic requests (`case-warmup-token-cap-revert`) — so a coverage gap can
+      be *introduced by a prior fix* rather than being a pre-existing hole.
+      The warmup shape grid must cover what the runtime can legitimately
+      request; when a clamp is unavoidable, clamp per-op rather than globally.
+      A fourth instance (Helix context-parallel warmup entirely missing,
+      PR #11460) was removed on 2026-08-12: its bug 5888410 is a functional
+      bug — TPOT from the iteration logs disagreed widely with TPOT from the
+      benchmark logs, i.e. two instruments disagreeing rather than a measured
+      slowdown. The missing-CP-warmup mechanism is real and is shape (a); read
+      #11460 directly if you are auditing context-parallel warmup.
+      Two further shapes, both with instances here. (e) Warmup gated on an
+      unrelated FEATURE flag rather than on "can we warm up?" — with
+      torch.compile off there was no general warmup at all, and the same routine
+      omitted the degenerate `(1, 0)` shape a ctx-only worker runs exclusively
+      (`case-model-engine-warmup-orchestration-gaps`). Name a warmup routine for
+      what it warms, not for the feature that motivated it, and make the shape
+      grid an explicit ORDERED list including the smallest legal shape — a
+      magnitude-sorted `set` hides which shapes are missing.
+      (f) A warmup count expressed in the wrong unit: `--warmup=N` requests
+      cannot cover a cost paid per RANK, so multi-GPU runs measured
+      partially-compiled models (`case-multi-gpu-bench-warmup-too-few`, which is
+      also a measurement artifact). Ask what the cold cost is paid *per* before
+      trusting a warmup constant.
+
+  - id: pattern-capacity-accounting-error
+    name: A size-estimate/budget bug shrinks KV-cache or batch capacity
+    regression_class: [capacity-accounting-error]
+    signals: [kv-capacity-drop, throughput-drop, memory-usage-increase]
+    modules: [kv-cache-manager]
+    instances:
+      - case-dsa-kcache-dtype-size-estimate
+      - case-max-utilization-reuse-token-budget
+    notes: >
+      The GPU does nothing wrong — the planner believes there is less (or
+      allocates more) memory than real. Triage: compare reported KV-block
+      counts / free-memory fractions across builds; audit dtype-size and
+      layer-count terms in estimators after any cache-layout change.
+      Two spec-decode instances were removed on 2026-08-12 — EAGLE3 draft KV
+      over-allocated by `max_draft_len×` (nvbug 6269778) and host KV budget
+      double-counted with offloading (nvbug 6035425) — because both are filed
+      as functional bugs. They are genuine capacity-accounting defects and the
+      mechanism belongs to this pattern; they simply were not filed as perf
+      bugs, and this cookbook records only performance-bug provenance. If you
+      are auditing spec-decode KV sizing, read those two bugs directly: the
+      surviving instances cover dtype-size and reuse-budget terms, not
+      draft-length or offload-layout terms.
+
+  - id: pattern-unaccounted-startup-residency
+    name: Memory resident before the capacity planner probes free memory shrinks the KV pool
+    regression_class: [memory-footprint-regression]
+    signals: [kv-capacity-drop, memory-usage-increase, throughput-drop, perf-ci-bar-failure]
+    modules: [gemm-and-quantization, jit-and-warmup, model-definition]
+    instances:
+      - case-deepgemm-pdl-import-time-cuda-context
+      - case-vlm-vision-tower-loaded-for-text-only-bench
+      - case-model-engine-warmup-orchestration-gaps
+    notes: >
+      The complement of pattern-capacity-accounting-error: there the estimator
+      is wrong, here the estimator is RIGHT and the memory is really gone. The
+      KV pool is sized from FREE GPU memory, so anything resident before the
+      probe comes off capacity 1:1 — an import-time CUDA context, an unused
+      encoder/tower, an adapter or draft model the config never invokes, a
+      workspace allocated before sizing. Two axes worth separating when
+      triaging: WHAT is resident (a component the workload never uses) and
+      WHEN it landed (before the probe). Per-step GPU time stays flat and only
+      workloads near a capacity threshold move, so a sub-GiB loss reads as a
+      large, arch- or variant-specific throughput regression and survives
+      bisection because the culprit's subject looks perf-irrelevant. Triage:
+      diff reported KV pool size / kv_cache_size and the outside-torch term
+      (`grep "Memory used after loading model weights (outside torch)"`)
+      across builds, then look for a NEW resident allocation before KV sizing
+      rather than an estimator bug. In MPI workers a context created before
+      `torch.cuda.set_device()` also lands on the wrong device.
+      A third WHEN worth auditing explicitly: memory allocated by an EARLIER
+      startup stage and never released before the next one probes free memory —
+      C++ MoE workspaces stayed resident into autotuner warmup
+      (`case-model-engine-warmup-orchestration-gaps`, defect 3). When warmup,
+      autotune and capacity sizing run as one sequence, audit what is resident
+      at each hand-off, not just at import time.
+
+  - id: pattern-default-change-regressed-tuned-workload
+    name: A changed default regresses workloads tuned against the old default
+    regression_class: [cuda-graph-regression, scheduler-batching-regression]
+    signals: [perf-ci-bar-failure, throughput-drop]
+    modules: [cuda-graph-and-compile]
+    instances:
+      - case-cudagraph-default-batch-sizes
+    notes: >
+      Defaults are part of the perf contract; changing one re-tunes everyone.
+      Pin explicit values for bar-tracked workloads when a default moves.
+
+  - id: pattern-padding-bucket-overshoot
+    name: Runtime pads up to a distant bucket, executing a far larger shape than the true size
+    regression_class: [cuda-graph-regression]
+    signals: [slower-kernel-in-trace, throughput-drop, ttft-increase, itl-increase]
+    modules: [cuda-graph-and-compile]
+    instances:
+      - case-piecewise-cudagraph-far-ceiling-append
+    notes: >
+      A pad-to-nearest-captured-size scheme is only as good as its bucket
+      spacing: one bucket far above its neighbour turns the whole gap below it
+      into worst-case work, which can be slower than running the true size
+      eagerly. Adding a bucket is NOT monotonically safe, so a coverage fix
+      that widens a bucket set must be measured on the gap it creates. Note
+      this is the mirror of pattern-default-change-regressed-tuned-workload:
+      pinning explicit values does NOT protect you, because the engine can
+      append to the list it was given. Triage: dump the EFFECTIVE bucket list
+      the engine keeps (capture_num_tokens, cuda_graph_config.batch_sizes)
+      rather than the configured one, look for a large ratio between adjacent
+      entries, and compare measured per-iteration device time against the
+      true-size eager cost — the signature is device time FLAT at the top
+      bucket instead of tracking true size.
+
+  - id: pattern-admission-throttle-misconfigured
+    name: An admission/fill throttle over-throttles a real workload regime
+    regression_class: [scheduler-batching-regression]
+    signals: [throughput-drop, gpu-idle-between-steps]
+    modules: [disagg-orchestrator]
+    instances:
+      - case-disagg-fill-throttle-slow-start
+    notes: >
+      Fixed caps sized for one concurrency regime stretch ramp-up at another;
+      prefer adaptive (slow-start) ramps over fixed per-iteration caps.
+
+  - id: pattern-delayed-first-token-emission
+    name: Pipelining/overlap machinery delays when the first token is emitted
+    regression_class: [scheduler-batching-regression]
+    signals: [ttft-increase]
+    modules: [scheduler-and-executor]
+    instances:
+      - case-overlap-scheduler-first-token-delay
+    notes: >
+      Overlap designs trade per-step latency for throughput; check where the
+      first-token response is enqueued relative to the overlapped step.
+
+  - id: pattern-measurement-not-product
+    name: The measurement/test config regressed, not the product
+    regression_class: [measurement-artifact]
+    signals: [perf-ci-bar-failure]
+    modules: [measurement-and-test, communication]
+    instances:
+      - case-perf-test-wrong-moe-backend
+      - case-perf-test-gpt-oss-20b-moe-backend-pin
+      - case-allreduce-host-overhead-small-model-tp
+      - case-perf-sanity-sampler-options-applied-to-all-cases
+      - case-multi-gpu-bench-warmup-too-few
+      - case-nixl-ctx-only-gap-not-reproduced-home-mount
+    notes: >
+      Before bisecting product code for a tripped bar, confirm the test
+      still selects the recommended backend/config and measures a regime
+      that is not noise-dominated (e.g. host-bound low concurrency).
+      Three more harness shapes, each with an instance here. A helper that
+      returns test-affecting configuration BY DEFAULT instead of empty applies it
+      to the whole suite — sampler options landed on every case, greedy or not
+      (`case-perf-sanity-sampler-options-applied-to-all-cases`), and the
+      signature is many unrelated cases moving together, so diff
+      `jenkins/scripts/perf/**` and `tests/integration/defs/perf/**` at the
+      commit under test BEFORE bisecting the engine. A warmup/knob constant in
+      the wrong unit measures a cold system
+      (`case-multi-gpu-bench-warmup-too-few`). And a container inheriting a
+      shared writable `$HOME` makes the number a property of the host's JIT-cache
+      state (`case-nixl-ctx-only-gap-not-reproduced-home-mount`) — where the
+      reported BASELINE, not the bad commit, turned out to be the unreproducible
+      datapoint. "Reported baseline not reproducible" is a valid terminal triage
+      outcome; re-measure the good commit before bisecting anything.
+      NEAR MISS — do not stop here: this pattern's hook is "no plausible
+      product commit in range", and its close cousin
+      pattern-startup-handshake-fd-not-inherited trips the same bar WITH a
+      product commit in range, just not a compute one. If the range contains
+      a launcher / IPC / process-bring-up change, check that pattern before
+      concluding the product is innocent.
+
+  - id: pattern-startup-handshake-fd-not-inherited
+    name: A startup handshake blocks forever because a file descriptor did not survive the launcher
+    regression_class: [measurement-artifact]
+    signals: [perf-ci-bar-failure, startup-time-increase, throughput-drop]
+    modules: [measurement-and-test]
+    instances:
+      - case-ipc-hmac-key-via-fd-breaks-bench
+    notes: >
+      The metric moves with no change to any compute path: the server never
+      reaches ready, and a truncated or absent run arrives at the QA
+      comparison as a percentage regression rather than as an error. Suspect
+      it when the range holds a change to how a handle/secret/socket reaches
+      a worker (fd number in an env var, inherited socket) and the launch
+      chain has an intervening process — Popen defaults to close_fds=True,
+      so an fd is dropped unless every hop passes pass_fds. A BLOCKING read
+      on the receiving end converts that into a silent hang instead of an
+      error; the same defect with a non-blocking read is diagnosed in days.
+      Ask "did the server ever become ready?" before "which kernel got
+      slower?".
+
+  - id: pattern-redundant-work-across-ranks
+    name: The same computation is duplicated on every rank instead of split
+    regression_class: [redundant-cross-rank-work]
+    signals: [ttft-increase, throughput-drop]
+    modules: [attention-fmha]
+    instances:
+      - case-dsa-indexer-tp-duplicated-prefill
+    notes: >
+      Wasted compute scales with world size. Check auxiliary/side
+      computations (indexers, routers, preprocessing) for per-rank
+      duplication under TP/DP.
+
+  - id: pattern-optimization-lost-in-port
+    name: A shipped perf fix is silently missing after a port/branch/refactor
+    regression_class: [optimization-lost-in-port]
+    signals: [host-time-increase, throughput-drop, perf-ci-bar-failure]
+    modules: [sampler]
+    instances:
+      - case-torchsampler-optimizations-lost-in-branch
+    notes: >
+      Release branches and rewrites can drop main-branch perf fixes; diff
+      the hot-path file against main when a branch regresses vs main.
+      The host-bound-concurrency instance was removed on 2026-08-12 (nvbug
+      6192201 is a functional bug — an L0 pre-merge *test failure* on
+      `test_perf_sanity.py::test_e2e`). "Measure a regime that is not
+      noise-dominated" survives as triage advice above precisely because it
+      cost a real investigation; it just no longer has a performance-bug case
+      to cite.
+
+  - id: pattern-variant-misroute
+    name: Config validation/normalization routes to a slower implementation variant
+    regression_class: [kernel-selection-regression]
+    signals: [acceptance-length-drop, itl-increase, throughput-drop]
+    modules: [attention-fmha]
+    instances:
+      - case-dsmla-sparse-ctx-2cta-fallback
+      - case-trtllmgen-mla-decode-unwaived-slower
+    notes: >
+      Normalizers that "promote" degenerate configs (e.g. topK=1 → dynamic
+      tree) can select a semantically-equivalent but slower worker/kernel.
+      That topK=1 → dynamic-tree example was this pattern's third instance
+      (EAGLE3, PR #15842) until 2026-08-12: nvbug 6394425 is a functional
+      bug, and per the NVBug the dynamic-tree path ignores
+      temperature/top_k/top_p and always takes `argmax(softmax(logits))` — a
+      sampling divergence, with the ~0.6× speed a side effect. It stays here
+      as the pattern's clearest *illustration* while no longer being a perf
+      precedent.
+
+  - id: pattern-pinned-dep-holds-kernel-perf
+    name: A pinned dependency holds back kernel performance until its bump is ported
+    regression_class: [dependency-regression]
+    signals: [throughput-drop, slower-kernel-in-trace, perf-ci-bar-failure]
+    modules: [moe]
+    instances:
+      - case-triton-kernels-36-uplift-and-routing-port
+    notes: >
+      The mirror image of pattern-fusion-pattern-drift: there a dep bump BREAKS
+      something, here NOT bumping is the deficit — the product is slower than the
+      dependency can make it, and there is no culprit commit to bisect to, so the
+      bug reads as "below expectation" rather than as a regression. The cost of
+      the bump is an API port: the newer library deleted the entry points the
+      integration used, and the callers had to be rewritten
+      (`case-triton-kernels-36-uplift-and-routing-port` — `routing()` and
+      friends). Triage: `python -c "import <lib>; print(<lib>.__version__)"` inside
+      the container and compare against upstream's current release, then check
+      whether the fast kernels the release notes advertise are reachable from the
+      integration at all. Watch for the anti-guard: waiving the tests that the
+      port broke (this instance shipped 7 SKIPs) records the debt as a passing
+      suite. A waive added in the same PR as a dep bump is a defect marker, not a
+      guard.
+
+  - id: pattern-unneeded-buffer-initialization
+    name: A shared allocator zero-fills or copies into buffers every consumer overwrites
+    regression_class: [redundant-device-work]
+    signals: [slower-kernel-in-trace, ttft-increase, throughput-drop]
+    modules: [runtime-and-serving]
+    instances:
+      - case-buffer-pool-zero-fill-fillfunctor
+    notes: >
+      Distinct from pattern-host-work-on-hot-path: nothing here is host-bound —
+      the GPU is genuinely busy producing a result nobody reads. `torch.zeros` is
+      the safe-looking default, so the fill hides in an allocator rather than in
+      any model op, and shows up in a trace as large unattributable `FillFunctor`
+      / elementwise kernels sized to a workspace (43% of a context block in the
+      instance). Two triage notes. The bug will often be filed as a REGRESSION
+      because an unfamiliar large kernel appeared in a profile — confirm a bisect
+      exists before believing that. And the change is symmetric and untested in
+      both directions: `zeros`→`empty` is a silent win, `empty`→`zeros` a silent
+      loss, and NO test fails either way, so a reviewer's instinct that `empty` is
+      unsafe is exactly how it regresses back. If a consumer needs zeros, zero it
+      in the consumer, not in the shared allocator.
+
+  - id: pattern-selection-heuristic-too-coarse
+    name: A selection heuristic keys on one dimension of a multi-dimensional crossover
+    regression_class: [kernel-selection-regression, communication-regression]
+    signals: [slower-kernel-in-trace, throughput-drop, itl-increase]
+    modules: [communication]
+    instances:
+      - case-allreduce-strategy-lut
+    notes: >
+      Close cousin of pattern-variant-misroute — there config NORMALIZATION picks
+      the wrong variant, here the SELECTION HEURISTIC itself is under-specified:
+      AllReduce AUTO decided from token count alone while the real crossover also
+      depends on hidden_size, the attached fusion op and the SM generation, so it
+      picked a one-shot kernel where NCCL was faster on A100/H100. Because the
+      heuristic is deterministic it is wrong REPRODUCIBLY, which reads as a
+      product regression rather than a tuning gap, and there is no culprit commit.
+      Triage: pin each strategy explicitly and compare against AUTO — if any
+      explicit choice wins, the heuristic (or its measured envelope) is the
+      defect. The fix shape is a measured table with the PORTABLE implementation
+      as the out-of-range default; note that replacing a heuristic often deletes
+      its env overrides, so runbooks that set them become silent no-ops.
+
+  - id: pattern-stale-metadata-across-layout-change
+    name: A cached index/offset tensor encoding a token layout is reused after the layout changes
+    regression_class: [stale-cached-metadata]
+    signals: [acceptance-length-drop, throughput-drop]
+    modules: [spec-decode]
+    instances:
+      - case-dsa-mtp-stale-token-to-request-map
+    notes: >
+      A map built once in `prepare()` for the verify layout
+      (`max_draft_len + 1` tokens per request) was reused by the one-token-per-
+      request MTP draft loop, so every draft token was attributed to request 0.
+      Two properties make this class expensive to find. It is CORRECTNESS-NEUTRAL:
+      wrong draft tokens are simply rejected, so accuracy tests pass and the loss
+      surfaces only as acceptance length — it gets filed as a model-quality issue.
+      And it is accidentally correct at batch 1, so the discriminator is a
+      BATCH-SIZE SWEEP at fixed draft depth: acceptance length falling as batch
+      grows is an indexing bug, not a quality gap. Fix by rebuilding the metadata
+      UNCONDITIONALLY at every layout change (the predicate for "did the layout
+      change" is the thing that was wrong), using a capture-safe formulation —
+      `searchsorted(cumsum(seq_lens), arange(num_tokens), right=True)` — so it is
+      legal inside a CUDA-graph capture. Audit every cached cumsum/offset/index
+      buffer shared between a verify pass and a draft pass, chunked prefill vs
+      decode, or padded vs packed ADP layouts.
+
+  - id: pattern-fusion-pattern-drift
+    name: A fusion stops matching after upstream graph/node-pattern changes
+    regression_class: [fusion-broken, dependency-regression]
+    signals: [many-small-kernels, slower-kernel-in-trace, throughput-drop]
+    modules: [kernel-fusion]
+    instances: []
+    notes: >
+      No confirmed case yet — known unconfirmed sightings live in
+      data/pending.yaml: nvbug 6160248 (fuse_rope pattern broken by node
+      pattern change), nvbug 5940460 (FP8 AR+Norm quant fusion patterns
+      broken by PyTorch 26.02 bump), nvbug 5973199 (MoE fusion blocked
+      under attn-dp mapping config). Promote on confirmation. Triage:
+      dump the graph (ad-graph-dump for AutoDeploy) or count kernels in
+      the fused region; fusion pattern-matchers are brittle to emitted-node
+      changes from dep bumps and refactors — re-run fusion unit tests
+      against the new graph shape.

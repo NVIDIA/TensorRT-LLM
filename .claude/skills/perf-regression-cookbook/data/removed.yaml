@@ -1,0 +1,210 @@
+# Refuted / withdrawn cases — the "do not re-add" registry.
+#
+# WHY THIS FILE EXISTS, and why these entries are NOT in pending.yaml:
+# pending.yaml is a promote-or-drop worklist of cases whose perf nature is
+# *unconfirmed* ("promote once confirmed; drop if refuted"). The entries below
+# were confirmed and REFUTED — they had full case files, with provenance, and
+# were removed on evidence. Filing a refuted case as "pending" invites the next
+# sweep to re-promote it, which is the exact defect class this registry closes.
+# A bare `git rm` is the other failure mode: the next NVBug-first sweep
+# re-encounters the same bug id, finds a merged fix PR, and re-derives the case
+# from scratch, paying the whole investigation again to reach the same no.
+#
+# So: before adding a case, grep this file for its nvbug ids and PR numbers.
+# If it is here, the burden is to defeat `evidence:` — not merely to notice the
+# fix exists.
+#
+# `file:` PATHS ARE AS-OF REMOVAL AND ARE NOT MAINTAINED. On 2026-08-13
+# `references/` was reorganized from five mechanism families
+# (execution-and-graph, kernel-and-fusion, memory-and-capacity, communication,
+# measurement-and-test) into 18 module directories, so most paths below name a
+# directory that no longer exists. That is deliberate: the field records where
+# the case WAS when it was removed, which is what makes it findable in
+# `git log`. Grep this file by nvbug id / PR number, never by path.
+# Fields: id (the case id as it was), file (path as it was), removed_on,
+# reason (one of: not-a-perf-bug, moved-to-instability-cookbook,
+# maintainer-instruction, restructured), nvbugs, severity (as verified against
+# the bug record, the discriminator), evidence (the finding that decided it),
+# mechanism_kept_at (where the transferable knowledge still lives — every
+# removal left its prose behind), readd_if (the condition that would make it
+# admissible again).
+#
+# All severities below were re-verified against NVBugs on 2026-08-12, per id,
+# rather than copied from the removing commit's notes. That check found one bad
+# citation already in the tree (see the instability cookbook's own
+# removed.yaml, entry case-general-warmup-memory-pool), so re-verify rather
+# than trust this file's own severity column if you are acting on it.
+
+removed:
+  # ---- Removed 2026-08-12 by the per-case evidence audit (6 cases) ----------
+  # All six are genuine defects with merged fixes, and every one of their
+  # mechanisms is still described in data/patterns.yaml. What they lack is
+  # performance-bug provenance, which is this cookbook's admission rule.
+
+  - id: case-eagle3-dynamic-tree-worker-misroute
+    file: references/execution-and-graph/eagle3-dynamic-tree-worker-misroute.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6394425"]
+    commits: ["edf63e818557"]
+    success_prs: [15842]
+    severity: functional
+    evidence: >
+      Filed on the EAGLE3 dynamic-tree path diverging with
+      `dynamic_tree_max_topK=1`. Per the NVBug, that path ignores
+      temperature/top_k/top_p and always takes argmax(softmax(logits)) — a
+      sampling divergence. The ~0.6x speed was a side effect noticed while
+      root-causing the divergence, not the reported defect.
+    mechanism_kept_at: pattern-variant-misroute notes (kept as the pattern's
+      clearest illustration of a normalizer "promoting" a degenerate config
+      onto a slower worker)
+    readd_if: a performance bug is filed on the misroute's cost itself.
+
+  - id: case-helix-cp-warmup-missing
+    file: references/execution-and-graph/helix-cp-warmup-missing.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["5888410"]
+    commits: ["9c2d23c2e56e"]
+    success_prs: [11460]
+    severity: functional
+    evidence: >
+      With Helix, TPOT from the iteration logs disagreed widely with TPOT from
+      the benchmark logs — two instruments disagreeing about the SAME
+      quantity, with nothing extra actually spent. Contrast
+      case-png-encode-on-serving-hot-path, which is kept despite being a
+      functional bug precisely because there the gap is real host work the
+      user waits through. That contrast is the rule: an
+      instrument-disagreement bug is not a perf case; a real-work-spent bug is.
+    mechanism_kept_at: pattern-warmup-coverage-gap notes, shape (a) — read
+      PR #11460 directly when auditing context-parallel warmup.
+    readd_if: a performance bug measures the missing CP warmup's cost.
+
+  - id: case-autodeploy-symm-mem-nccl-fallback
+    file: references/communication/autodeploy-symm-mem-nccl-fallback.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6221450"]
+    commits: ["6ef7b387c6d9"]
+    success_prs: [14667]
+    severity: functional
+    evidence: >
+      An L0 post-merge *accuracy* assertion on
+      `TestQwen3_5_397B_MoE::test_nvfp4`. The slower SYMM_MEM->NCCL allreduce
+      was noticed while root-causing the accuracy collapse, not by a perf bar.
+    mechanism_kept_at: pattern-fast-path-silent-fallback notes; the identical
+      mechanism with performance-bug provenance is
+      case-nemotronh-mnnvl-nccl-fallback.
+    readd_if: a performance bug is filed on the AutoDeploy fallback's cost.
+
+  - id: case-perf-test-host-bound-concurrency
+    file: references/measurement-and-test/perf-test-host-bound-concurrency.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6192201"]
+    commits: ["e6784d834b8d"]
+    success_prs: [14691]
+    severity: functional
+    evidence: >
+      An L0 pre-merge *test failure* on `perf/test_perf_sanity.py::test_e2e`,
+      not a perf bar movement.
+    mechanism_kept_at: pattern-optimization-lost-in-port notes — "measure a
+      regime that is not noise-dominated" survives as triage advice there
+      because it cost a real investigation; it just has no performance-bug
+      case to cite.
+    readd_if: a performance bug is filed on the host-bound regime itself.
+
+  - id: case-eagle3-draft-kv-overallocation
+    file: references/memory-and-capacity/eagle3-draft-kv-overallocation.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6269778"]
+    commits: ["69ea407eb352"]
+    success_prs: [15017]
+    severity: functional
+    evidence: >
+      Eagle3 one-model over-allocates the draft KV cache by up to
+      max_draft_len x — a real capacity-accounting defect, filed as a
+      functional bug rather than a performance bug.
+    mechanism_kept_at: pattern-capacity-accounting-error notes (draft-length
+      term named explicitly, so an auditor knows the surviving instances cover
+      dtype-size and reuse-budget terms only).
+    readd_if: a performance bug is filed on the lost capacity.
+
+  - id: case-specdec-host-kv-budget-doublecount
+    file: references/memory-and-capacity/specdec-host-kv-budget-doublecount.md
+    removed_on: 2026-08-12
+    reason: not-a-perf-bug
+    nvbugs: ["6035425"]
+    commits: ["b857ee871b8d"]
+    success_prs: [13130]
+    severity: functional
+    evidence: >
+      The KV size reserved for host offloading doubled after a layout update
+      for one-model spec decoding — same shape as the entry above.
+    mechanism_kept_at: pattern-capacity-accounting-error notes (offload-layout
+      term named explicitly).
+    readd_if: a performance bug is filed on the lost capacity.
+
+  # ---- Removed 2026-08-12 at maintainer instruction (1 case) ---------------
+  # This one is NOT refuted on severity, and the distinction matters: it is the
+  # only entry in this file that a future sweep could legitimately re-add.
+
+  - id: case-disagg-pp-transfer-consensus-rendezvous
+    file: references/communication/disagg-pp-transfer-consensus-rendezvous.md
+    removed_on: 2026-08-12
+    reason: maintainer-instruction
+    nvbugs: ["6448152", "6517760", "6549955"]
+    commits: ["526c1e3229c0"]
+    success_prs: [16634]
+    severity: performance (all three ids)
+    evidence: >
+      Removed at maintainer instruction because the listed bugs were not yet
+      fixed. Verified 2026-08-12: that holds for 2 of the 3 — 6448152 (GB300
+      pp4 NIXL regression) and 6517760 (deepseek-r1 27-68%
+      total-token-throughput regression) are both still open; only 6549955 is
+      closed as verified, and PR #16634 (`526c1e3229c0`) is merged. So the
+      case as written violated the cookbook's own admission rule by folding
+      two OPEN bugs into a case whose Fix-mechanism bullet implied all three
+      were closed by one PR.
+    mechanism_kept_at: >
+      nothing in-tree — the per-iteration PP rendezvous mechanism (an unguarded
+      per-iter allgather added by `57bb6ee57a`, PR #15139) is described only in
+      the removed file's git history and in the bug bodies.
+    readd_if: >
+      re-add scoped to 6549955 ALONE with success_prs [16634], not to the trio.
+      Fold 6448152 / 6517760 back in only when each has its own merged fix —
+      per the folding rule in SKILL.md, one root cause and one fix PR.
+
+  # ---- Restructured, not removed (1 file) ----------------------------------
+
+  - id: case-trtllmgen-fmha-jit-warmup-coverage
+    file: references/kernel-and-fusion/trtllmgen-fmha-jit-warmup-coverage.md
+    removed_on: 2026-08-12
+    reason: restructured
+    nvbugs: ["6185446", "6193854", "6248837", "6293823", "6315845"]
+    severity: mixed — see evidence
+    evidence: >
+      Folded five bug ids and two independent fixes into one case. Wrong twice:
+      6248837 is a functional bug (an L0 post-merge accuracy test failure) and
+      so is not a perf bug at all, and the remaining four are TWO distinct
+      defects fixed a month apart — no warmup (#14851) and then a too-sparse
+      warmup grid (#15305). Folding erased the second fix's failed attempts
+      (#15279, #15472), which are the transferable half.
+    mechanism_kept_at: >
+      split into case-trtllmgen-fmha-jit-warmup (round 1: 6185446 + 6193854,
+      PR #14851) and case-trtllmgen-fmha-densify-grid (round 2: 6293823 +
+      6315845, PR #15305, failed #15279 + #15472), cross-linked. 6248837 is
+      dropped entirely.
+    readd_if: never — do not re-fold. See the folding rule in SKILL.md.
+
+# ---- Excluded bug ids (no case ever existed) -------------------------------
+# Ids a sweep will keep re-encountering because they sit next to real perf
+# bugs in the same PR series or dup cluster. Each was checked and rejected.
+excluded_bug_ids:
+  - id: "6248837"
+    severity: functional
+    evidence: L0 post-merge accuracy test failure (accuracy/test_llm_api_pytorch.py);
+      appeared in the trtllm-gen FMHA warmup PR series but is not a perf bug.
+    seen_in: the folded FMHA case above; also removed from the instability
+      cookbook's densify-grid case on the same date.

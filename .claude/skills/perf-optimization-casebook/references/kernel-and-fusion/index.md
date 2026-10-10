@@ -154,5 +154,5 @@ Implementation is always delegated to a `kernel-*` specialist/skill.
 Still open in this family: elementwise/activation fusion (delegate to
 **kernel-triton-writing** / **kernel-cute-writing**), TileIR optimization of an
 existing Triton kernel on Blackwell (the two-step pipeline via
-**kernel-tileir-optimization**), CuTe DSL generation (**kernel-cute-writing**),
+**kernel-tileir-optimization**), CuTe DSL kernel writing (**kernel-cute-writing**),
 and GEMM tactic / autotune selection.

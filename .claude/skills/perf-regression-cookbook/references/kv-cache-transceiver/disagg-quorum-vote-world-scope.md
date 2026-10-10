@@ -1,0 +1,69 @@
+---
+id: case-disagg-quorum-vote-world-scope
+type: regression-case
+family: communication
+module: kv-cache-transceiver
+maturity: full
+regression_class: [sync-introduced, communication-regression]
+signals: [ttft-increase, itl-increase, host-time-increase, perf-ci-bar-failure]
+subsystems: [communication, scheduler-executor]
+introduced_via: [prior-fix-side-effect]
+phase: [any-phase]
+patterns: [pattern-per-step-sync-added]
+nvbugs: ["6280060"]
+commits: ["9bc43218be56"]
+success_prs: [15136]
+failed_prs: []
+---
+
+# Disagg cache-transfer quorum vote over MPI_COMM_WORLD blocks every iteration
+
+> Part of the [KV-cache transceiver regression cookbook](index.md) · schema: [case-template](../case-template.md)
+
+- **Provenance:** nvbug `6280060` · commit `9bc43218be56` · PR #15136 —
+  Scope disagg-ctx cache-transfer quorum vote to TP instead of WORLD.
+- **Symptom:** Disaggregated serving on GB200 (<cluster>): TTFT +57% and TPOT
+  +7.6% after PR #14020; `benchmark_duration_s` 149.5 (bad) vs 127.1 (good),
+  127.7 after the fix (numbers from PR #15136). Surfaced via an automated
+  perf-regression benchmark (repair-bot).
+- **Root cause:** The disagg-ctx deadlock fix voted on whether to call
+  `_check_disagg_ctx_cache_transfer_status` with a host-blocking
+  `self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)` over
+  MPI_COMM_WORLD, on every rank, every iteration of both `_executor_loop`
+  and `_executor_loop_pp`. The C++ allgather inside
+  `CacheTransceiver::checkContextTransferStatus` it protects is only
+  TP-scoped (`mGroupTensorParaComm`, or `mGroupTPInDPComm` with
+  attention_dp), so a WORLD vote is over-collective — it serialized the CTX
+  prefill host loop (which has no CUDA graph) on cross-instance
+  synchronization every iteration.
+- **How introduced:** PR #14020 (named in PR #15136) fixed a real
+  disagg-prefill cross-TP deadlock — rank-local gating of the TP-scoped
+  allgather could leave the collective without full quorum — by adding the
+  per-iteration vote, but scoped it to WORLD instead of TP.
+- **Fix mechanism:** Adds a `tp_allreduce` method to
+  `Distributed`/`MPIDist`/`TorchDist` in
+  `tensorrt_llm/_torch/distributed/communicator.py` (mirroring
+  `tp_allgather`/`tp_broadcast`) and replaces both WORLD votes in
+  `py_executor.py` with `self.dist.tp_allreduce(...)`, plus a
+  `tp_size > 1` fast path that skips the collective entirely (matches the
+  C++ `syncComm->getSize() > 1` short-circuit). Deadlock invariant holds:
+  TP scope is an upper bound of the C++ syncComm scope.
+- **Detection signal:** Host-blocking per-iteration collective in the
+  executor loop of a disagg run; iteration time grows with the number of
+  instances in WORLD, not with local work. Inspect the vote scope with
+  `grep -n "tp_allreduce\|local_need_check" tensorrt_llm/_torch/pyexecutor/py_executor.py`
+  and confirm no bare `self.dist.allreduce` sits on the loop hot path.
+- **Prevention/guard:** PR #15136 updated the TP_SIZE=2 mock in
+  `tests/unittest/_torch/executor/test_benchmark_disagg.py` from `allreduce`
+  to `tp_allreduce`, pinning the scope; the regression itself was caught by
+  the automated perf benchmark. No static check asserts that a Python-side
+  quorum vote matches the scope of the C++ collective it guards (gap) —
+  review rule: a vote protecting a collective must use that collective's
+  communicator scope, and skip when the scope is size 1.
+- **Generalizes to:** pattern-per-step-sync-added — a correctness/deadlock
+  fix adds a per-iteration blocking collective, and over-scoping it
+  multiplies the cost; carries to any rank-agreement vote guarding a
+  TP/PP/EP-scoped collective, deadlock fixes that add per-step allreduces
+  without a size-1 fast path, disagg ctx/gen coordination that syncs across
+  instances when only one instance's ranks must agree, and host-loop paths
+  without CUDA-graph cover where added host blocking is fully exposed.

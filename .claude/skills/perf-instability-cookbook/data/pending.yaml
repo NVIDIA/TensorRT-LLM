@@ -1,0 +1,54 @@
+# Pending pool — suspected (unconfirmed) perf-instability mitigations.
+#
+# Every entry here plausibly touches a warmup / collective / determinism
+# path but its PR description was too thin to clearly frame it as an
+# instability mitigation as opposed to a functional/accuracy fix or a pure
+# refactor. This is the standing to-classify worklist; a future deep-dive
+# resolves each entry through its NVBug ID or its PR body.
+#
+# Do NOT cite these as precedents. Promote to a case in references/
+# (and remove from here) once the instability nature is confirmed; drop
+# the entry if refuted.
+#
+# Generated from the 2026-07-16 pass over PERF_RELATED_COMMITS.md
+# "Perf-Instability Mitigations".
+
+pending:
+  - pr: 14609
+    date: "2026-05-18"
+    title: "[None][feat] Targeted warmup-waste cleanup"
+    pattern_hint: "warmup-sizing-tradeoff"
+    why_suspected: >
+      PR body was left as the template stub (no explanation of what was
+      cleaned up or why). Diff would need to be inspected to tell whether
+      this removes redundant warmup passes (perf-neutral) or removes
+      coverage a later runtime path depends on (instability). Park until
+      the diff is classified.
+
+  - pr: 14841
+    date: "2026-05-26"
+    title: "[None][fix] Stabilize Mamba replay state update"
+    pattern_hint: "accuracy-stability (not perf-instability)"
+    why_suspected: >
+      Framed as stabilizing SSM replay state to avoid `<unk>` collapse — a
+      run-to-run *output* variance, not a run-to-run *perf* variance. Excluded
+      from the cookbook so far; keep pending in case a future NVBug thread
+      reveals a perf-throughput knock-on effect from the same code path.
+
+  - pr: 14509
+    date: "2026-05-19"
+    title: "[None][fix] Stabilize Mamba replay state update"
+    pattern_hint: "accuracy-stability (not perf-instability)"
+    why_suspected: >
+      Same class as #14841 — replay-path sanitize/clamp to prevent
+      non-finite propagation. Accuracy stability, not perf variance. Keep
+      pending only in case a follow-up thread reframes it as a perf-instability
+      root cause.
+
+  - pr: 14652
+    date: "2026-05-22"
+    title: "[https://nvbugs/6194552][fix] stabilize Triton Mamba softplus"
+    pattern_hint: "accuracy-stability (not perf-instability)"
+    why_suspected: >
+      Fixes inf/NaN when `dt` is large. Same reasoning: run-to-run output
+      variance, not perf variance. Pending pending a reframe.

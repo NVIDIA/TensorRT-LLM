@@ -1,0 +1,24 @@
+# black-forest-labs/FLUX.2-dev  ·  Flux2Pipeline  ·  image edit (reference mode)
+#
+# Needs its own file: ImageGenerationRequest declares no image field and forbids
+# extras, so a reference cannot ride on backend: openai-images (422).
+#
+# The shape follows the reference because FLUX.2 derives it anyway --
+# derive_output_size_from_reference is set on this pipeline alone, so the t2i file's
+# 1024x1024 is not the shape to copy here.
+backend: openai-image-edits
+
+common_params:
+  width: 832
+  height: 480
+  num_inference_steps: 50
+  guidance_scale: 3.5
+  max_sequence_length: 512
+  seed: 42
+
+# The one prompt here with no upstream source -- FLUX.2 declares no edit instruction.
+requests:
+  - prompt: Move the cat to a sunlit windowsill while preserving the cat's appearance and photographic style.
+    image_reference:
+      content: ../media/cat_piano.png
+      format: path
