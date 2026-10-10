@@ -37,10 +37,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
 
         # ModelingV2 targets are keyed by a synthetic architecture name that no
         # checkpoint declares -- the same shape as the Eagle3 rewrite above.
-        # Which target, if any, is decided once by the model loader (see
-        # `modeling_v2_resolve`) and travels here on the config; this never
-        # decides on its own, so with the decision unset the default path is
-        # byte-for-byte unchanged.
+        # Set by the model loader when a modeling_v2 target claims this
+        # deployment; None leaves the default path unchanged.
         #
         # Precedence, since this runs last and would override the rewrite
         # above: modeling_v2 wins. The decision was made on the *un-rewritten*

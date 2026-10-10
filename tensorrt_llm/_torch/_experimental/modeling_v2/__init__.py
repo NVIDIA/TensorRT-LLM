@@ -30,7 +30,6 @@ in the built-in static index would fail its staleness assertion.
 """
 
 from ._router_index import (
-    MODELING_V2_ARG,
     MODELING_V2_ROUTERS,
     ModelingV2Context,
     ModelingV2Mode,
@@ -38,7 +37,6 @@ from ._router_index import (
 )
 
 __all__ = [
-    "MODELING_V2_ARG",
     "MODELING_V2_ROUTERS",
     "ModelingV2Context",
     "ModelingV2Mode",

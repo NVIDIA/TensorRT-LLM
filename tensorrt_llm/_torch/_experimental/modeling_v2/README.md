@@ -42,8 +42,7 @@ the LLM API arguments it was configured with, `max_batch_size`,
 not exercise -- and says whether the target was certified for it. The model
 loader decides when it is about to build the model, after the built-in model's
 defaults have been applied to the arguments, and carries the answer on
-`ModelConfig.modeling_v2_target`. `explain.py` replays both stages the same
-way; pass it the same `--config` YAML `trtllm-serve` takes.
+`ModelConfig.modeling_v2_target`.
 
 **Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
 a configuration that misses a target's criteria silently gets the built-in
@@ -79,13 +78,6 @@ The synthetic name (`ModelingV2GptOss120bSm103Tp1`) is a registry key that no
 checkpoint declares. Upstream already does exactly this for `EAGLE3<Arch>`,
 which also exists only as a `_resolve_class` rewrite.
 
-To ask why a configuration landed where it did:
-
-```
-python -m tensorrt_llm._torch._experimental.modeling_v2.explain \
-    --model /path/to/DeepSeek-R1-0528-NVFP4 --tp 4 --ep 4 --attention-dp
-```
-
 ### What may decide a target
 
 A quantity may be a routing criterion only if it is known when
@@ -111,7 +103,6 @@ checkpoint of the same shape is ungated.
 
 ```
 _router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
-explain.py          why a configuration routed where it did
 models/<family>/
   routing.py        one forward-reading decision tree per architecture family
   <checkpoint>__<gpu arch>__<parallel>/
