@@ -2915,6 +2915,8 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         priorities = cache_a.get_page_priorities(attention_group)
         assert priorities and set(priorities) == {80}
         assert mgr.impl.init_config.secondary_offload_min_priority == 50
+        assert not mgr.can_evict
+        assert mgr.prefetch_for_context_tokens([request_a]) is True
         request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
         mgr.free_resources(request_a)
         _run_v2_hybrid_context(mgr, request_b)
