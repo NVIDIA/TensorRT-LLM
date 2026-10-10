@@ -3410,6 +3410,16 @@ class MXFP8LinearMethod(LinearMethodBase):
     _SF_ROW_PAD = 128
     _SF_COL_PAD = 4
 
+    @property
+    def supports_e4m3_input(self) -> bool:
+        """Whether a plain E4M3 tensor can be consumed without requantizing.
+
+        A plain E4M3 tensor is also a valid MXFP8 value tensor when every
+        UE8M0 block scale is one.  The compiled GEMM paths accept that pair
+        directly; the reference F.linear fallback does not.
+        """
+        return self.use_cutlass
+
     def __init__(self) -> None:
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available()
@@ -3508,6 +3518,56 @@ class MXFP8LinearMethod(LinearMethodBase):
         ncols = fp4_utils.pad_up(in_features // cls.BLOCK_SIZE, cls._SF_COL_PAD)
         return nrows * ncols
 
+    @classmethod
+    def _unit_activation_scales(cls, module: Linear,
+                                input: torch.Tensor) -> torch.Tensor:
+        """Slice one high-water UE8M0 buffer representing exactly 1.0.
+
+        Keep superseded allocations alive for previously captured graphs.
+        Geometric growth bounds all retained storage by twice the capacity.
+        """
+        m, k = input.shape
+        if k % cls.BLOCK_SIZE:
+            raise ValueError(
+                f"E4M3 input width {k} must be divisible by MXFP8 block size "
+                f"{cls.BLOCK_SIZE}")
+        required_size = cls._swizzled_scale_size(m, k)
+        scale = getattr(module, "_mxfp8_unit_activation_scales", None)
+        if scale is not None and scale.device != input.device:
+            raise ValueError(
+                "MXFP8 unit activation scales cannot change device")
+        if scale is None or scale.numel() < required_size:
+            # Dynamo cannot trace is_current_stream_capturing(), which returns
+            # a Python bool.  During tracing the scale creation itself becomes
+            # part of the graph; outside tracing, retain the eager CUDA-graph
+            # safety check so replay never allocates a missing buffer.
+            if (input.is_cuda and not torch.compiler.is_compiling()
+                    and torch.cuda.is_current_stream_capturing()):
+                raise RuntimeError(
+                    "MXFP8 unit activation scales must be initialized during warmup"
+                )
+            # UE8M0 uses an exponent bias of 127, so byte 127 encodes 2^0.
+            # Every entry is identical, making the linear and 128x4-swizzled
+            # layouts byte-for-byte equivalent.
+            capacity = required_size if scale is None else max(
+                required_size, 2 * scale.numel())
+            new_scale = torch.full(
+                [capacity],
+                127,
+                dtype=torch.uint8,
+                device=input.device,
+            )
+            if scale is not None:
+                retired = getattr(module,
+                                  "_mxfp8_retired_unit_activation_scales", None)
+                if retired is None:
+                    retired = []
+                    module._mxfp8_retired_unit_activation_scales = retired
+                retired.append(scale)
+            scale = new_scale
+            module._mxfp8_unit_activation_scales = scale
+        return scale[:required_size]
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         assert in_features % self.BLOCK_SIZE == 0, (
@@ -3558,7 +3618,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends and not is_torch_compiling()
+            if (input.dtype != torch.float8_e4m3fn
+                    and self.tune_decode_graph_backends
+                    and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 output = mxfp8_quantize_gemm_autotuned(
@@ -3571,7 +3633,12 @@ class MXFP8LinearMethod(LinearMethodBase):
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                if input.dtype == torch.float8_e4m3fn:
+                    act_e4m3 = input
+                    act_sf = self._unit_activation_scales(module, input)
+                else:
+                    act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(
+                        input, True)
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or

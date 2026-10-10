@@ -38,6 +38,7 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch.attention.backends.fmha.msa_decode import use_trtllm_gen_sparse_decode
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -2691,3 +2692,137 @@ def test_minimax_m3_swiglu_oai_fused_matches_reference(dtype):
     plain_ref = torch.nn.functional.silu(gate_c) * up_c
     plain = swiglu(gate_up, swiglu_limit=limit)
     torch.testing.assert_close(plain.float(), plain_ref.float(), atol=atol, rtol=1e-2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mode,expected", [(None, True), ("trtllm_gen", True), ("TRTLLM_GEN", True), ("triton", False)]
+)
+def test_sparse_nvfp4_decode_default_and_opt_out(
+    monkeypatch, mode: str | None, expected: bool
+) -> None:
+    if mode is None:
+        monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", mode)
+    assert use_trtllm_gen_sparse_decode() is expected
+
+
+@pytest.mark.cpu_only
+def test_sparse_nvfp4_decode_rejects_invalid_mode(monkeypatch) -> None:
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "invalid")
+    with pytest.raises(ValueError, match="Unknown MiniMax-M3 NVFP4 sparse decode mode"):
+        use_trtllm_gen_sparse_decode()
+
+
+@pytest.mark.cpu_only
+def test_sparse_nvfp4_uses_e4m3_for_eligible_mxfp8_o_proj(monkeypatch):
+    """Eligible pure decode uses the no-requantize handoff by default."""
+
+    class FakeMsa:
+        pass
+
+    monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3MsaSparseAttention", FakeMsa)
+    monkeypatch.delenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", raising=False)
+    monkeypatch.setattr(
+        modeling_minimaxm3,
+        "_dispatch_attention_over_live_tokens",
+        lambda _owner, _q, _k, _v, _idx_q, _idx_k, _metadata, output: output.zero_(),
+    )
+
+    attention = MiniMaxM3Attention.__new__(MiniMaxM3Attention)
+    nn.Module.__init__(attention)
+    attention.is_sparse_attention_layer = True
+    attention.main_kv_is_nvfp4 = True
+    attention.attn = FakeMsa()
+    attention.o_proj = SimpleNamespace(
+        has_mxfp8=True,
+        quant_method=SimpleNamespace(supports_e4m3_input=True),
+        lora=object(),
+    )
+    attention.register_to_config = False
+    attention.num_heads = 2
+    attention.head_dim = 32
+    attention.attn_activation_dtype = torch.bfloat16
+    q = torch.zeros((2, 2, 32), dtype=torch.float8_e4m3fn)
+
+    decode_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+    )
+    default_context_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=1, num_generations=0, num_tokens=2),
+    )
+
+    assert decode_output.dtype == torch.float8_e4m3fn
+    assert default_context_output.dtype == torch.bfloat16
+
+    mixed_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=1, num_generations=1, num_tokens=2),
+    )
+    assert mixed_output.dtype == torch.bfloat16
+    attention.o_proj.quant_method.supports_e4m3_input = False
+    incompatible_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+    )
+    assert incompatible_output.dtype == torch.bfloat16
+    attention.o_proj.quant_method.supports_e4m3_input = True
+    monkeypatch.setenv("TRTLLM_MINIMAX_M3_NVFP4_SPARSE_DECODE", "triton")
+    opt_out_output = attention._forward_attention_core(
+        q,
+        None,
+        None,
+        None,
+        None,
+        SimpleNamespace(num_contexts=0, num_generations=1, num_tokens=2),
+    )
+    assert opt_out_output.dtype == torch.bfloat16
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_scale_reload_refreshes_sparse_decode_bmm_in_place():
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
+        _get_bmm_scales,
+    )
+
+    owner = SimpleNamespace()
+    scales = torch.tensor([1.0, 0.25, 0.5])
+    k, v = _aligned_nvfp4_dequant_scales(owner, scales)
+    bmm1, bmm2 = _get_bmm_scales(owner, k, v, 0.125)
+    addresses = (bmm1.data_ptr(), bmm2.data_ptr())
+    scales.copy_(torch.tensor([1.0, 0.5, 0.75]))
+    _aligned_nvfp4_dequant_scales(owner, scales, refresh=True)
+    refreshed = _get_bmm_scales(owner, k, v, 0.125)
+    assert (refreshed[0].data_ptr(), refreshed[1].data_ptr()) == addresses
+    torch.testing.assert_close(bmm1, torch.tensor([0.0625, 0.0625 * 1.4426950408889634]))
+    torch.testing.assert_close(bmm2, torch.tensor([0.75]))
+
+
+@pytest.mark.cpu_only
+def test_sparse_native_output_rejects_noncontiguous_destination():
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.trtllm_gen_sparse_decode import (
+        _get_native_output,
+    )
+
+    output = torch.empty((2, 4, 128), dtype=torch.float8_e4m3fn).transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous output"):
+        _get_native_output(output, reserve=False)
