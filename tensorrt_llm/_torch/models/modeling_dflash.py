@@ -1506,7 +1506,8 @@ class DFlashForCausalLM(nn.Module):
 
         has_qk_norm = self._has_qk_norm
         is_bf16 = noise_embedding.dtype == torch.bfloat16
-        use_fused_qk_norm_rope = self._use_fused_qk_norm_rope and is_bf16
+        is_supported_dtype = noise_embedding.dtype in (torch.float16, torch.bfloat16)
+        use_fused_qk_norm_rope = self._use_fused_qk_norm_rope and is_supported_dtype
         use_fused_rope = (
             _flashinfer_rope is not None and has_qk_norm and is_bf16 and not use_fused_qk_norm_rope
         )
