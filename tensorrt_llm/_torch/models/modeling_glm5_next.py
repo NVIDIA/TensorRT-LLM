@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import copy
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -702,8 +702,10 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
                 target.copy_(tensor.to(device=device, dtype=target.dtype))
             filled.add(local)
 
-        def mark_linear(mod_path: str) -> None:
-            for param_name in ("weight", "weight_scale", "bias"):
+        def mark_linear(mod_path: str, labels: Iterable[str] = ()) -> None:
+            # ``labels`` are extra tensors the Linear's load_weights consumed
+            # (e.g. the router gate's e_score_correction_bias).
+            for param_name in ("weight", "weight_scale", "bias", *labels):
                 # mod_path is "" when the owner *is* the Linear (the LMHead).
                 name = f"{mod_path}.{param_name}" if mod_path else param_name
                 if name in params:
@@ -711,7 +713,7 @@ class Glm5NextForCausalLM(SpecDecOneEngineForCausalLM):
 
         for mod_path, group in linear_groups.items():
             named_modules[mod_path].load_weights([group])
-            mark_linear(mod_path)
+            mark_linear(mod_path, group)
         for fused_path, parts in fused_groups.items():
             dest_mod = named_modules[fused_path]
             groups = [parts[i] for i in sorted(parts)]
