@@ -62,16 +62,11 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     get_non_empty_aux_indices,
 )
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
-)
-from tensorrt_llm._torch.disaggregation.native.default_planner import PeerOverlap
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
     PeerIncompatibleError,
+    PeerTargets,
 )
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.retirement import (
@@ -82,7 +77,6 @@ from tensorrt_llm._torch.disaggregation.native.retirement import (
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -2871,6 +2865,7 @@ class Receiver(ReceiverBase):
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ):
         self._registrar = peer_registrar
+        self._planner = peer_registrar.planner
         self._agent = agent
         self._bounce = bounce
         # Internal component gate only. Production wiring is added after the
@@ -3023,56 +3018,6 @@ class Receiver(ReceiverBase):
             slice_id=task.slice_id,
         )
 
-    @staticmethod
-    def _fanin_bounce_safe(
-        overlap: PeerOverlap,
-        peer_ri: RankInfo,
-        receiver_page_table: Optional[KVCachePageTable],
-    ) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
-          * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
-            for PP fan-in, every overlapping stage must hold the same number of layers
-            (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
-            list isn't available (shorter than the fan-in degree), be conservative and fall back.
-        Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
-            return False
-        if overlap.overlap_pp_size > 1:
-            lpp = getattr(peer_ri, "layer_num_per_pp", None)
-            if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
-                return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
-        # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid. Inspect both endpoints:
-        # a masked PP stage may advertise no replicated view even though another
-        # stage owns one that is visible in the receiver's page table.
-        if len(overlap.ranks) > 1:
-            for page_table in (peer_ri.page_table, receiver_page_table):
-                if page_table is None:
-                    continue
-                for layer_group in page_table.layer_groups:
-                    for pool_view in getattr(layer_group, "pool_views", ()):
-                        if pool_view.mapper_kind == MapperKind.REPLICATED:
-                            return False
-        return True
-
-    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
-        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
-        pt = self._registrar.self_extractor.page_table
-        if pt is None:
-            return None
-        for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.STATE:
-                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
-                if block_ids.size > 0:
-                    return int(block_ids[0])
-        return None
-
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
         logger.debug(
@@ -3107,64 +3052,43 @@ class Receiver(ReceiverBase):
             task.fail(e)
             return
 
+        self_ri = self._registrar.self_rank_info
         if sender_dp_rank is not None:
             # Normal path: ctx_dp_rank is known, send to overlapping ranks.
-            peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
+            peer_targets = self._planner.targets(self_ri, peer_infos, sender_dp_rank)
+            dp0_targets = peer_targets
         else:
             # Gen-first with ADP: ctx_dp_rank unknown — broadcast REQUEST_DATA
-            # to ALL ctx sender ranks so every DP group receives it.
-            # get_peer_overlap returns ranks for one DP group (topology is
-            # symmetric), so use dp_rank=0 as representative.
-            dp_size = peer_infos.dp_size
-            dp0_overlap = self._registrar.get_peer_overlap(peer_infos, 0)
-            # Union of overlapping ranks across all DP groups for broadcast (deduplicated)
-            all_ranks_set: set[int] = set(dp0_overlap.ranks)
-            for dp in range(1, dp_size):
-                all_ranks_set.update(self._registrar.get_peer_overlap(peer_infos, dp).ranks)
+            # to ALL ctx sender ranks so every DP group receives it. The real
+            # writer count exceeds the per-group count, so the union is never
+            # a uniform writer set.
+            dp0_targets = self._planner.targets(self_ri, peer_infos, 0)
+            all_ranks_set: set[int] = set(dp0_targets.ranks)
+            for dp in range(1, peer_infos.dp_size):
+                all_ranks_set.update(self._planner.targets(self_ri, peer_infos, dp).ranks)
             all_ranks = list(all_ranks_set)
             logger.debug(
-                f"Receiver.dispatch_task: ADP broadcast path, dp_size={dp_size}, "
+                f"Receiver.dispatch_task: ADP broadcast path, dp_size={peer_infos.dp_size}, "
                 f"all_ranks={all_ranks}"
             )
-            peer_overlap = type(dp0_overlap)(ranks=all_ranks)
+            peer_targets = PeerTargets(ranks=all_ranks, uniform_writers=False)
 
-        # In gen-first ADP broadcast, peer_overlap contains the union of all DP
-        # groups, but expected_transfers should reflect per-DP-group count since
-        # only one DP group will actually process the context request.
-        if sender_dp_rank is not None:
-            task.expected_transfers = len(peer_overlap.ranks)
-        else:
-            task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
-        # None), where the real writer count exceeds expected_transfers and would overflow the slot.
-        topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
-        # Helix writers contribute unequal shares (one KV owner, one state
-        # sender, the rest empty), so the fan-in equal split would overflow
-        # into neighboring reservations; use the per-fragment path.
-        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
+        # expected_transfers reflects one DP group even under broadcast: only
+        # one group will actually process the context request.
+        task.expected_transfers = len(dp0_targets.ranks)
+        # TP fan-in splits ONE region equally, so allow it only when the planner says every
+        # writer contributes the same share, and never under ADP broadcast.
         allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None
-            and not cp_involved
-            and self._fanin_bounce_safe(
-                topo_overlap,
-                peer_infos,
-                self._registrar.self_extractor.page_table,
-            )
+            sender_dp_rank is not None and peer_targets.uniform_writers
         )
-        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
-        # so the bounce region must be sized for those bytes too.
-        extra_bytes = 0
-        mamba_dst_slot = self._get_mamba_slot(receiver_req)
-        if mamba_dst_slot is not None:
-            if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the recurrent-state payload
-            else:
-                extra_bytes = mamba_receiver_payload_bytes(
-                    sender_page_table=peer_infos.page_table,
-                    receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=mamba_dst_slot,
-                )
+        # Bytes beyond the paged blocks that ride the same coalesced write
+        # (recurrent state today) size the bounce region too; None = unknown.
+        extra_bytes = self._planner.receiver_payload_bytes(
+            self_ri, peer_infos, receiver_req.block_ids_per_layer_groups
+        )
+        if extra_bytes is None:
+            allow_bounce = False
+            extra_bytes = 0
         bounced = allow_bounce and self._bounce.reserve(
             receiver_req, task.expected_transfers, extra_bytes=extra_bytes
         )
@@ -3174,7 +3098,7 @@ class Receiver(ReceiverBase):
                 f"dispatch_task: RxSession {task._unique_rid} not found; "
                 "session may have been closed before dispatch"
             )
-        sender_endpoints = {peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks}
+        sender_endpoints = {peer_infos.sender_endpoints[rank] for rank in peer_targets.ranks}
         # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
@@ -3183,7 +3107,7 @@ class Receiver(ReceiverBase):
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
             session._sender_endpoints.update(sender_endpoints)
-            for i, rank in enumerate(peer_overlap.ranks):
+            for i, rank in enumerate(peer_targets.ranks):
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
                 if fanin_bounce:
@@ -3192,7 +3116,7 @@ class Receiver(ReceiverBase):
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
             return
 
-        peer_ranks = list(peer_overlap.ranks)
+        peer_ranks = list(peer_targets.ranks)
         serialized_requests: list[tuple[int, bytes]] = []
         for i, rank in enumerate(peer_ranks):
             if fanin_bounce:
@@ -3271,27 +3195,22 @@ class Receiver(ReceiverBase):
             finally:
                 messenger.stop()
 
-            # Peer compatibility gates on the receiver side.
-            # The sender-side check (PeerRegistrar.register) runs in the
-            # sender's listener thread, where exceptions are only logged, so
-            # reject here — before REGISTER_RANK_INFO is even sent, so no
-            # dealers are connected and no partial registration happens for
-            # the bad peer. The failure is converted to PeerIncompatibleError
-            # (handled in dispatch_task) so only requests targeting this peer
-            # fail, and cached so later requests fail fast.
+            # Receiver-side gate. The sender-side check (PeerRegistrar.register)
+            # runs in the sender's listener thread, where exceptions are only
+            # logged, so reject here — before REGISTER_RANK_INFO is even sent,
+            # so no dealers are connected and no partial registration happens
+            # for the bad peer. Only requests targeting this peer fail
+            # (PeerIncompatibleError is handled in dispatch_task), and the
+            # verdict is cached so later requests fail fast.
             try:
-                self._registrar.validate_bounded_replay_compatible(sender_info)
-                MambaPolicy.validate_peer_compatible(
-                    self._registrar.self_rank_info,
-                    sender_info,
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
-                )
-                AttentionPolicy.validate_peer_compatible(
-                    self._registrar.self_extractor.page_table,
-                    sender_info.page_table,
-                )
-            except ValueError as e:
+                if sender_info.planner_id != self._planner.planner_id:
+                    raise PeerIncompatibleError(
+                        f"context peer plans transfers with '{sender_info.planner_id}', "
+                        f"this rank with '{self._planner.planner_id}'; both sides of a "
+                        "disaggregated deployment must run the same model planner"
+                    )
+                self._planner.check_peer(self._registrar.self_rank_info, sender_info)
+            except PeerIncompatibleError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
                     "(cached: all further requests to this context peer fail "

@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for CacheReuseAdapter, the positional _create_chunk, and Sender ordinal pairing."""
+"""Tests for CacheReuseAdapter, the positional _create_chunk, and DefaultTransferPlanner ordinal pairing."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.transfer import Sender
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     _CacheReuseAdapterV1,
@@ -37,7 +37,7 @@ def _arr(values):
 
 
 # ---------------------------------------------------------------------------
-# Sender._pair_ordinals: the whole alignment protocol is one intersection.
+# DefaultTransferPlanner._pair_ordinals: the whole alignment protocol is one intersection.
 # ---------------------------------------------------------------------------
 
 
@@ -50,32 +50,32 @@ class TestPairOrdinals:
     """
 
     def test_identity(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12]), _arr([20, 21, 22]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, 11, 12]), _arr([20, 21, 22]))
         np.testing.assert_array_equal(src, [10, 11, 12])
         np.testing.assert_array_equal(dst, [20, 21, 22])
 
     def test_receiver_prefix_reuse_is_a_dst_hole(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_sender_chunk_bounds_are_src_holes(self):
-        src, dst = Sender._pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
         np.testing.assert_array_equal(src, [11, 12])
         np.testing.assert_array_equal(dst, [21, 22])
 
     def test_holes_on_both_sides_take_the_intersection(self):
-        src, dst = Sender._pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
         np.testing.assert_array_equal(src, [12])
         np.testing.assert_array_equal(dst, [22])
 
     def test_no_overlap_is_empty(self):
-        src, dst = Sender._pair_ordinals(_arr([10, 11, -1]), _arr([-1, -1, 22]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, 11, -1]), _arr([-1, -1, 22]))
         assert src.size == 0
         assert dst.size == 0
 
     def test_dst_start_block_masks_the_head(self):
-        src, dst = Sender._pair_ordinals(
+        src, dst = DefaultTransferPlanner._pair_ordinals(
             _arr([10, 11, 12, 13]), _arr([20, 21, 22, 23]), dst_start_block=2
         )
         np.testing.assert_array_equal(src, [12, 13])
@@ -83,7 +83,7 @@ class TestPairOrdinals:
 
     def test_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="differ in length"):
-            Sender._pair_ordinals(_arr([10, 11]), _arr([20, 21, 22]))
+            DefaultTransferPlanner._pair_ordinals(_arr([10, 11]), _arr([20, 21, 22]))
 
     def test_sender_not_yet_evicted_but_receiver_has(self):
         # Regression (DeepSeek-V4 SWA, prompt_len == 2 blocks, window == 1
@@ -91,14 +91,14 @@ class TestPairOrdinals:
         # advanced, while gen pre-declared history_length=prompt_len and never
         # allocated ordinal 0. Pairing by ordinal copies X1 -> G1; the old
         # length-based suffix arithmetic copied X0 -> G1.
-        src, dst = Sender._pair_ordinals(_arr([100, 101]), _arr([-1, 201]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([100, 101]), _arr([-1, 201]))
         np.testing.assert_array_equal(src, [101])
         np.testing.assert_array_equal(dst, [201])
 
     def test_receiver_with_wider_speculative_window(self):
         # Only gen runs spec decoding, so its SWA window keeps one more block.
         # That block has no source; it simply is not written.
-        src, dst = Sender._pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 

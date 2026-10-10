@@ -156,3 +156,61 @@ def test_build_kv_write_meta_empty_plan_still_delivers():
 
     assert wm.sizes.size == 0 and wm.src_ptrs.size == 0 and wm.dst_ptrs.size == 0
     assert wm.expected_transfers == 1 and wm.is_last_slice is True
+
+
+# --------------------------------------------------------------------------- #
+# Receiver drives the planner; transfer.py knows no cache kinds
+# --------------------------------------------------------------------------- #
+import inspect  # noqa: E402
+
+import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod  # noqa: E402
+from tensorrt_llm._torch.disaggregation.native.transfer import Receiver  # noqa: E402
+
+
+def test_transfer_module_has_no_model_knowledge():
+    src = inspect.getsource(transfer_mod)
+    for forbidden in ("mixers", "CacheKind", "MapperKind", "MambaPolicy", "AttentionPolicy"):
+        assert forbidden not in src, f"native/transfer.py mentions {forbidden}"
+
+
+def _receiver_with(planner) -> tuple[Receiver, SimpleNamespace]:
+    recv = Receiver.__new__(Receiver)
+    recv._enforce_physical_ownership = False
+    recv._registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(cp_size=1, instance_name="gen", instance_rank=0)
+    )
+    recv._planner = planner
+    recv._bounce = Mock()
+    req = SimpleNamespace(
+        unique_rid=7,
+        slice_id=0,
+        block_ids_per_layer_groups=[np.array([1], dtype=np.int64)],
+        bounce_dst_base=None,
+        to_bytes=Mock(return_value=b"req"),
+    )
+    recv._build_recv_req_info = Mock(return_value=req)
+    recv._get_sender_info = Mock(
+        return_value=SimpleNamespace(
+            sender_endpoints={0: "tcp://s0"}, page_table=None, dp_size=1, cp_size=1
+        )
+    )
+    session = SimpleNamespace(mark_transferring=Mock(), _sender_endpoints=set())
+    recv._get_session = Mock(return_value=session)
+    recv._request_sender_data = Mock()
+    task = SimpleNamespace(
+        _params=SimpleNamespace(ctx_dp_rank=0), _unique_rid=7, slice_id=0, _perf_timer=None
+    )
+    return recv, task
+
+
+def test_dispatch_task_payload_none_disables_bounce():
+    planner = Mock()
+    planner.targets.return_value = PeerTargets(ranks=[0], uniform_writers=True)
+    planner.receiver_payload_bytes.return_value = None
+    recv, task = _receiver_with(planner)
+
+    recv.dispatch_task(task)
+
+    recv._bounce.reserve.assert_not_called()
+    recv._request_sender_data.assert_called_once_with("tcp://s0", b"req")
+    assert task.expected_transfers == 1
