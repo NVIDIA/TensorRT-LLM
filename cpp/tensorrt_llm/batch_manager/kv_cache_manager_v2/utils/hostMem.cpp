@@ -97,8 +97,12 @@ void resizeFile(int fd, size_t newSize)
 
 bool hostUseThp()
 {
+    // THP is opt-in. Under transparent_hugepage/defrag=madvise every 2 MiB fault in a MADV_HUGEPAGE
+    // range enters synchronous direct compaction. On hosts whose free memory is fragmented by a large
+    // page cache (the steady state of long-running GPU nodes) those compactions mostly fail, and
+    // populating the host pool drops from GB/s to GB/min, long enough to time out server startup.
     char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_THP");
-    return value == nullptr || std::string_view(value) == "1";
+    return value != nullptr && std::string_view(value) == "1";
 }
 
 int hostPrefaultThreads()
