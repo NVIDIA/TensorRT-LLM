@@ -955,10 +955,10 @@ def test_qwen3_gdn_replay_uses_v2_preference(
     )
 
 
-def test_kimi_without_v2_preference_uses_mixed_manager(
+def test_kimi_model_preference_uses_v2_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Kimi K3 uses separate KV and recurrent-state pools for SA decoding."""
+    """Kimi's model preference selects V2 for its KDA and MLA cache."""
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
 
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
@@ -973,13 +973,13 @@ def test_kimi_without_v2_preference_uses_mixed_manager(
     )
     resolved = _resolve_kv_cache_manager_v2_auto(llm_args, KimiLinearForCausalLM)
 
-    assert resolved is False
-    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+    assert resolved is True
+    assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
     assert llm_args.kv_cache_config.enable_block_reuse is False
     assert llm_args.kv_cache_config.tokens_per_block == 64
     assert (
         get_kv_cache_manager_cls(_kimi_model_config(), llm_args.kv_cache_config)
-        is MixedMambaHybridCacheManager
+        is MambaHybridCacheManagerV2
     )
 
 
