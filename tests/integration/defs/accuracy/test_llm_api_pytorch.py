@@ -7541,9 +7541,11 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("kv_dtype", ["fp8", "nvfp4"])
     @parametrize_with_ids("fuse_qkv_index_projection", [False, True])
-    def test_nvfp4_eagle3_piecewise_cuda_graph(
-            self, fuse_qkv_index_projection: bool) -> None:
+    def test_nvfp4_eagle3_piecewise_cuda_graph(self,
+                                               fuse_qkv_index_projection: bool,
+                                               kv_dtype: str) -> None:
         """Check accuracy and draft acceptance from piecewise prefill to decode."""
         self._run_nvfp4_eagle3(
             4,
@@ -7552,6 +7554,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             overlap_scheduler=True,
             fuse_qkv_index_projection=fuse_qkv_index_projection,
             eval_mode="default",
+            kv_dtype=kv_dtype,
             piecewise=True)
 
     def _run_nvfp4_eagle3(self,
