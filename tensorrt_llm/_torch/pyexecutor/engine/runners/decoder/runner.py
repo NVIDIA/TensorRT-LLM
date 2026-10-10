@@ -2700,8 +2700,19 @@ class DecoderRunner(ScheduledModelRunner):
         Make some changes to the device inputs and avoid blocking the async data transfer
         """
         attn_meta = inputs.get("attn_metadata")
+        # Overlap scheduling corrects kv_lens_cuda below from the runtime
+        # accepted-token counts and calls on_update_kv_lens() again after it.
+        has_kv_lens_correction = (
+            enable_spec_decode
+            and not self._config.disable_overlap_scheduler
+            and attn_meta is not None
+            and attn_meta.kv_cache_manager is not None
+            and hasattr(attn_meta, "kv_lens_cuda")
+        )
         # Invalidate per-forward-pass caches so they are recomputed (and captured) on every _forward_step.
-        if attn_meta is not None:
+        # With a correction, the call after it does this: every on_update_kv_lens rebuilds
+        # from the current lengths and nothing reads its outputs in between.
+        if attn_meta is not None and not has_kv_lens_correction:
             attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
@@ -2727,7 +2738,7 @@ class DecoderRunner(ScheduledModelRunner):
                         :previous_batch_tokens
                     ]
 
-                if hasattr(inputs["attn_metadata"], "kv_lens_cuda"):
+                if has_kv_lens_correction:
                     if (
                         num_ctx_requests >= num_chunked_ctx_requests
                         and num_chunked_ctx_requests > 0

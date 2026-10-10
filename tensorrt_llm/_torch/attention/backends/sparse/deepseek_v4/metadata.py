@@ -922,9 +922,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 gen_output_offsets,
             )
 
-    def on_update_kv_lens(self):
+    def on_update_kv_lens(self, skip_indexer_schedule: bool = False):
         """Recompute kv-lens-dependent DeepSeek-V4 metadata on device."""
-        super().on_update_kv_lens()
+        super().on_update_kv_lens(skip_indexer_schedule=skip_indexer_schedule)
 
         batch_size = self.num_seqs
         num_tokens = self.num_tokens
