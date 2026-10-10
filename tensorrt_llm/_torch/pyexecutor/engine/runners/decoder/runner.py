@@ -53,10 +53,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
 )
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    warmup_sample_from_logits_op,
-    warmup_sampling_module,
-)
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
@@ -674,15 +671,6 @@ class DecoderRunner(ScheduledModelRunner):
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
             warmup_sampling_module()
-            if self._config.enable_in_graph_sampling:
-                # The fast tier samples inside the captured graph via a
-                # torch.compile'd op; compile it now so capture does not.
-                warmup_sample_from_logits_op(
-                    self.model.config.vocab_size,
-                    torch.device("cuda"),
-                    self._config.dtype,
-                    self._config.cuda_graph_batch_sizes or [],
-                )
 
         if kv_cache_manager is None:
             logger.info("Skipping warm up as no KV Cache manager allocated.")
