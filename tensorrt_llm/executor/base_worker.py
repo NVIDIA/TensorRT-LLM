@@ -831,6 +831,7 @@ class BaseWorker(GenerationExecutor):
                     torch.cuda.synchronize()
                     local_commit_started = True
                     if action == _SleepWakeupAction.SLEEP:
+                        self.engine.prepare_sleep(tags)
                         run_mnnvl = (getattr(
                             self.engine, "_run_mnnvl_checkpoint_resources",
                             None) if has_mnnvl_resources else None)
@@ -848,6 +849,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self.engine.finish_wakeup(tags)
             except Exception as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
@@ -947,6 +949,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self.engine.prepare_sleep(tags)
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()
@@ -1003,6 +1006,7 @@ class BaseWorker(GenerationExecutor):
                     local_mutation_started = True
                     materialize_with_tag(*tags)
                     torch.cuda.synchronize()
+                    self.engine.finish_wakeup(tags)
         except Exception:
             if local_mutation_started:
                 self.engine.fail_sleep_wakeup_transition()

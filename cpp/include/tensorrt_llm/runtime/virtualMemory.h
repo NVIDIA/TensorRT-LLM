@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,6 +35,13 @@ class VirtualMemoryManagerTest;
 
 namespace tensorrt_llm::runtime
 {
+
+using VirtualMemoryCudaErrorCheck = void (*)(CUresult);
+
+inline void checkVirtualMemoryCudaResult(CUresult result)
+{
+    TLLM_CU_CHECK(result);
+}
 
 /**
  * CUDAVirtualMemoryChunk is a handle to a piece of CUDA memory allocation,
@@ -208,16 +215,18 @@ private:
 template <bool count = true>
 struct LocalCreator : CUDAVirtualMemoryChunk::Creator
 {
-    LocalCreator(CUmemAllocationProp const& prop, size_t size)
+    LocalCreator(
+        CUmemAllocationProp const& prop, size_t size, VirtualMemoryCudaErrorCheck check = checkVirtualMemoryCudaResult)
         : mProp(prop)
         , mSize(size)
+        , mCheck(check)
     {
     }
 
     CUmemGenericAllocationHandle create() override
     {
         CUmemGenericAllocationHandle handle{};
-        TLLM_CU_CHECK(cuMemCreate(&handle, mSize, &mProp, 0));
+        mCheck(cuMemCreate(&handle, mSize, &mProp, 0));
         if constexpr (count)
         {
             MemoryCounters::getInstance().allocate(
@@ -238,6 +247,7 @@ struct LocalCreator : CUDAVirtualMemoryChunk::Creator
 
     CUmemAllocationProp mProp{};
     size_t mSize{};
+    VirtualMemoryCudaErrorCheck mCheck;
 };
 
 /**
@@ -245,17 +255,27 @@ struct LocalCreator : CUDAVirtualMemoryChunk::Creator
  */
 struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
 {
-    UnicastConfigurator(CUdeviceptr address, size_t size, CUmemAccessDesc const& desc)
+    UnicastConfigurator(CUdeviceptr address, size_t size, CUmemAccessDesc const& desc,
+        VirtualMemoryCudaErrorCheck check = checkVirtualMemoryCudaResult)
         : mAddress(address)
         , mSize(size)
         , mDesc(desc)
+        , mCheck(check)
     {
     }
 
     void setup(CUmemGenericAllocationHandle handle) override
     {
-        TLLM_CU_CHECK(cuMemMap(mAddress, mSize, 0, handle, 0));
-        TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        mCheck(cuMemMap(mAddress, mSize, 0, handle, 0));
+        try
+        {
+            mCheck(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        }
+        catch (...)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mAddress, mSize));
+            throw;
+        }
     }
 
     void teardown(CUmemGenericAllocationHandle, bool) override
@@ -266,6 +286,7 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
     CUdeviceptr mAddress;
     size_t mSize;
     CUmemAccessDesc mDesc;
+    VirtualMemoryCudaErrorCheck mCheck;
 };
 
 /**
@@ -554,7 +575,16 @@ public:
     void allocate(Pointer* ptr, std::size_t n, int device) const;
     void deallocate(Pointer ptr, std::size_t n) const;
 
+    // Register physical memory at a caller-owned virtual address. The caller
+    // retains the reservation across release/materialize and must unmap before
+    // freeing it. Size and address must satisfy the allocation granularity.
+    void map(CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop,
+        VirtualMemoryCudaErrorCheck check = checkVirtualMemoryCudaResult) const;
+    void unmap(CUdeviceptr address) const;
+
 private:
+    void map(CUdeviceptr address, std::size_t allocationSize, std::size_t contentSize, CUmemAllocationProp const& prop,
+        VirtualMemoryCudaErrorCheck check) const;
     std::shared_ptr<Configuration> mConfig;
 };
 

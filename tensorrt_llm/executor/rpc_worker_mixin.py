@@ -24,6 +24,7 @@ from ..llmapi.utils import logger_debug
 from ..logger import logger
 from .request import GenerationRequest
 from .rpc import RPCServer
+from .utils import ErrorResponse, RequestError
 
 
 class RpcWorkerMixin:
@@ -41,6 +42,12 @@ class RpcWorkerMixin:
     # Default number of RPC server workers
     # This can be overridden by setting num_workers in the inheriting class
     NUM_WORKERS = 6
+    _rpc_response_stream_enabled = False
+
+    def _init_rpc_response_stream(self):
+        self._response_queue = Queue()
+        self.set_result_queue(self._response_queue)
+        self._rpc_response_stream_enabled = True
 
     def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
@@ -49,8 +56,7 @@ class RpcWorkerMixin:
         self.hmac_key = hmac_key
         self.rank = rank
         self.shutdown_event = Event()
-        self._response_queue = Queue()
-        self.set_result_queue(self._response_queue)
+        self._init_rpc_response_stream()
 
         self.rpc_server = None
         self.rpc_addr = rpc_addr
@@ -219,7 +225,17 @@ class RpcWorkerMixin:
         """Submits a request to the worker."""
         with nvtx_range_debug("RpcWorker.submit", color="blue", category="Worker"):
             logger_debug(f"[worker] Submitting request {request.id}", color="green")
-            result = super().submit(request)
+            try:
+                result = super().submit(request)
+            except RequestError as error:
+                if self._rpc_response_stream_enabled:
+                    # One-way RPC needs the generation response stream to
+                    # deliver errors. MPI and in-process callers handle the
+                    # raised exception themselves, even when using stats RPC.
+                    self._await_response_helper.temp_error_responses.put(
+                        ErrorResponse(request.id, str(error), request.id)
+                    )
+                raise
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 

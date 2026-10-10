@@ -1882,6 +1882,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._guard_page_fill = os.environ.get("TRTLLM_KV_GUARD_PAGE", "").strip().lower()
         self._guard_page_value = _parse_kv_fill_value(self._guard_page_fill, "TRTLLM_KV_GUARD_PAGE")
         self._guard_page_by_layer: dict[int, int] = {}
+        self._sleep_guard_page_pending = False
         self._fresh_page_fill = _parse_kv_fill_value(
             os.environ.get("TRTLLM_KV_FRESH_PAGE_FILL", "").strip().lower(),
             "TRTLLM_KV_FRESH_PAGE_FILL",
@@ -1919,7 +1920,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
-        self._prepare_page_table_tensor(index_mapper_capacity)
+        from tensorrt_llm._torch.virtual_memory import preserve_contents
+
+        with preserve_contents():
+            self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
                 {
@@ -6571,6 +6575,24 @@ class KVCacheManagerV2(BaseResourceManager):
             finally:
                 kv_cache.close()
         return success
+
+    def prepare_sleep(self) -> None:
+        """Close the diagnostic cache before its backing can be discarded."""
+        guard = self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
+        if guard is not None:
+            guard.close()
+            self.index_mapper.remove_sequence(_GUARD_PAGE_REQUEST_ID)
+            self.impl.clear_stats_excluded(_GUARD_PAGE_REQUEST_ID)
+            self._guard_page_by_layer.clear()
+            self._sleep_guard_page_pending = True
+
+    def finish_wakeup(self) -> None:
+        """Recreate and refill the diagnostic page after memory is restored."""
+        if self._sleep_guard_page_pending:
+            self._reserve_guard_page()
+            if not self._guard_page_by_layer:
+                raise RuntimeError("Could not restore the KV cache guard page after wakeup")
+            self._sleep_guard_page_pending = False
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -343,9 +343,34 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
     std::size_t const alignedSize = mConfig->aligned(n, device);
     TLLM_CU_CHECK(cuMemAddressReserve(&address, alignedSize, 0, {}, 0));
 
+    try
+    {
+        map(address, alignedSize, n,
+            CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
+            checkVirtualMemoryCudaResult);
+    }
+    catch (...)
+    {
+        TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, alignedSize));
+        throw;
+    }
+    *ptr = deviceptr_cast(address);
+}
+
+void CudaVirtualMemoryAllocator::map(
+    CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
+{
+    map(address, size, size, prop, check);
+}
+
+void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t alignedSize, std::size_t n,
+    CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
+{
+
     CUDAVirtualMemoryChunk::Configurators configurators;
-    configurators.push_back(std::make_unique<UnicastConfigurator>(address, alignedSize,
-        CUmemAccessDesc{CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+    configurators.push_back(std::make_unique<UnicastConfigurator>(
+        address, alignedSize, CUmemAccessDesc{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}, check));
 
     switch (mConfig->mMode)
     {
@@ -363,13 +388,13 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
         break;
     }
 
-    mConfig->mManager.add(address, mConfig->mTag,
-        std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                                             CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
-            alignedSize),
-        std::move(configurators));
+    mConfig->mManager.add(
+        address, mConfig->mTag, std::make_unique<LocalCreator<>>(prop, alignedSize, check), std::move(configurators));
+}
 
-    *ptr = deviceptr_cast(address);
+void CudaVirtualMemoryAllocator::unmap(CUdeviceptr address) const
+{
+    mConfig->mManager.remove(address);
 }
 
 void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const
