@@ -13,11 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/tburt/pdx', 'trtllm-jenkins-shared-lib@user/tburt/pdx']) _
 
 LLM_ROOT = "llm"
 
-UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
+UBUNTU_24_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
 DURATION_FILE_PATH = "tests/integration/defs/.test_durations"
 // Target repository the updated duration file is committed straight back into.
 TARGET_REPO = "NVIDIA/TensorRT-LLM"

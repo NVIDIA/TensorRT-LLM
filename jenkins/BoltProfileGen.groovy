@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/tburt/pdx', 'trtllm-jenkins-shared-lib@user/tburt/pdx']) _
 
 // =============================================================================
 // BoltProfileGen.groovy - helper job: BOLT profile generation.
@@ -173,7 +173,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
                   kubernetes.io/os: linux"""
     def containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:

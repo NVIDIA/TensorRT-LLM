@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/tburt/pdx', 'trtllm-jenkins-shared-lib@user/tburt/pdx']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -388,7 +388,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -567,7 +567,7 @@ def mergeWaiveList(pipeline, globalVars)
             targetBranchTOTCommit = json[0].sha
         }
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
+        sh "wget https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
         isGetTOTWaiveList = true
     } catch (InterruptedException e) {
         throw e
@@ -628,7 +628,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
+    image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
@@ -770,7 +770,7 @@ def launchReleaseCheck(pipeline, globalVars)
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
-    def image = "urm.nvidia.com/docker/golang:1.23"
+    def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-@Library(['trtllm-jenkins-shared-lib@main']) _
+@Library(['trtllm-jenkins-shared-lib@user/tburt/pdx']) _
 import groovy.json.JsonSlurper
 
 def createKubernetesPodConfig()
@@ -22,7 +22,7 @@ def createKubernetesPodConfig()
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
-    def image = "urm.nvidia.com/docker/ubuntu:24.04"
+    def image = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
     // release mode requires a longer pod lifetime to survive the manual license review window
     def scannerSleepSeconds = (params?.scanMode == 'release') ? '345600' : '7200'
     def podConfig = [
