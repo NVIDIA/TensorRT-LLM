@@ -24,9 +24,9 @@
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
-/// Bounce v2 control-plane wire format. Carried over the ControlChannel (zmq by default).
+/// Bounce v3 control-plane wire format. Carried over the ControlChannel (zmq by default).
 /// Pure encode/decode — no IO — so it is fully unit-testable. NOTE: this is NOT the NIXL
-/// notifMsg (v2 does not use notifMsg at all); it is our own message set.
+/// notifMsg (bounce does not use notifMsg); it is our own message set.
 ///
 /// ENDIANNESS: fields are memcpy'd raw (host byte order), so this assumes both peers are
 /// little-endian — true for all NVIDIA GPU hosts (x86_64 / aarch64 LE). It is NOT a portable
@@ -35,11 +35,13 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 /// treats any unknown `msgType` as a no-op (default branch), so a bogus type can't misroute.
 enum class BounceMsgType : std::uint16_t
 {
-    kWANT = 1,  // sender -> receiver: per-chunk byte sizes[] for requestId (empty list cancels)
-    kGRANT = 2, // receiver -> sender: credits[] for requestId
-    kDATA = 3,  // sender -> receiver: region written; scatter entries[] (after getXferStatus SUCCESS)
-    kACK = 4,   // receiver -> sender: chunk scattered; region freed
-    kNACK = 5,  // receiver -> sender: chunk/request cannot be completed; sender fails the request
+    kWANT = 1,      // sender -> receiver: per-chunk byte sizes[] for requestId (empty list cancels)
+    kGRANT = 2,     // receiver -> sender: credits[] for requestId
+    kDATA = 3,      // sender -> receiver: region written; scatter entries[] (after getXferStatus SUCCESS)
+    kACK = 4,       // receiver -> sender: chunk scattered; region freed
+    kDRAIN = 6,     // sender -> receiver: no more RDMA; fence and drain every scatter
+    kDRAIN_ACK = 7, // receiver -> sender: flow fenced and all scatter physically complete
+    kNACK = 5,      // receiver -> sender: chunk/request cannot be completed; sender fails the request
 };
 
 #pragma pack(push, 1)
@@ -51,7 +53,7 @@ struct BounceMsgHeader
     std::uint32_t magic;     // kMagic
     std::uint16_t version;   // kBounceVersion
     std::uint16_t msgType;   // BounceMsgType
-    std::uint64_t requestId; // WANT/GRANT/DATA/ACK
+    std::uint64_t requestId; // all control messages
     std::uint64_t
         regionHandle; // DATA/ACK: the arena region offset of this chunk; 0 elsewhere (64-bit -> arena may exceed 4 GiB)
     std::uint32_t chunkIdx;     // DATA/ACK
@@ -97,10 +99,10 @@ static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 byt
 static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-// v2: DATA scatter entries became strided RUNS (BounceScatterRun). The out-of-band capability
+// v3: explicit DRAIN/DRAIN_ACK proves physical quiescence after logical failure. The out-of-band capability
 // handshake checks this version before bounce is selected; decodeHeader also rejects a mismatched
 // control message defensively.
-inline constexpr std::uint16_t kBounceVersion = 2U;
+inline constexpr std::uint16_t kBounceVersion = 3U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of
@@ -112,12 +114,14 @@ inline constexpr std::uint16_t kBounceVersion = 2U;
 /// decode via decodeWant.
 [[nodiscard]] std::string encodeWant(
     std::uint64_t requestId, std::vector<std::uint32_t> const& chunkBytes, std::string const& endpoint);
-/// Cancel/retract a request: a WANT with an EMPTY chunk list (the receiver frees everything it
-/// allocated/held for `requestId`). This is the ONLY meaning of an empty WANT — submit() never sends
-/// a zero-chunk WANT (a 0-chunk transfer resolves SUCCESS without any WANT) — so an empty chunk list
-/// is unambiguously a cancel. Thin named wrapper over encodeWant to make the intent explicit at call
-/// sites; the wire form is identical (still a WANT), so it reuses the receiver's onWant/reclaim path.
+/// Cancel/retract a request with an EMPTY WANT. This fences future WANT/DATA for the flow but
+/// supplies no physical completion evidence: unknown writes remain quarantined and queued scatters
+/// remain owned until completion. A zero-chunk transfer succeeds without sending WANT. Use DRAIN
+/// only after every write into the peer arena is proved stopped; its acknowledgment proves that
+/// the receiver has fenced the flow and physically completed all admitted scatters.
 [[nodiscard]] std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint);
+[[nodiscard]] std::string encodeDrain(std::uint64_t requestId, std::string const& endpoint);
+[[nodiscard]] std::string encodeDrainAck(std::uint64_t requestId);
 [[nodiscard]] std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits);
 [[nodiscard]] std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
     std::uint64_t regionHandle, std::vector<BounceScatterRun> const& entries);
@@ -184,10 +188,9 @@ struct BounceHandshake
     // This agent's effective per-chunk cap after the arena-capacity clamp. Peers compare this field
     // exactly, which also keeps their scatter-plan capacities consistent.
     std::uint64_t maxChunkSizeBytes{0};
-    // This agent's request_timeout_ms. Peers compare it exactly: the receiver's region lease (2x its
-    // value) must exceed the sender's timeout. The quarantine (1x) starts at lease expiry OR at a
-    // receiver-side peer teardown (forget()/invalidateRemoteAgent); on the lease path it needs no
-    // extra margin of its own.
+    // This agent's request_timeout_ms. Peers compare it exactly so the receiver lease (2x this
+    // value) gives live senders time to initiate drain. Lease expiry fences a flow; it never proves
+    // that a remote write stopped and cannot release quarantined storage.
     std::int32_t requestTimeoutMs{0};
     // Control-channel address: a zmq endpoint (kZMQ).
     std::string endpoint;

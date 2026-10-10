@@ -118,6 +118,21 @@ std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint)
     return encodeWant(requestId, {}, endpoint);
 }
 
+std::string encodeDrain(std::uint64_t requestId, std::string const& endpoint)
+{
+    auto blob = encodeWant(requestId, {}, endpoint);
+    BounceMsgHeader header{};
+    std::memcpy(&header, blob.data(), sizeof(header));
+    header.msgType = static_cast<std::uint16_t>(BounceMsgType::kDRAIN);
+    std::memcpy(blob.data(), &header, sizeof(header));
+    return blob;
+}
+
+std::string encodeDrainAck(std::uint64_t requestId)
+{
+    return encodeHeaderOnly(makeHeader(BounceMsgType::kDRAIN_ACK, requestId, 0, 0, 0, 0, 0));
+}
+
 std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits)
 {
     auto const bytes = static_cast<std::uint32_t>(credits.size() * sizeof(BounceCreditEntry));

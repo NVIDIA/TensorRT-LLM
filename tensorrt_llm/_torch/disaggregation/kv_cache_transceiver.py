@@ -302,6 +302,10 @@ class KvCacheTransceiver(ABC):
         """Whether the send session closed before its final slice."""
         return False
 
+    def require_request_quiescence(self, req: LlmRequest) -> None:
+        """Guard final executor resource release when the backend tracks owners."""
+        return
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         """Return whether this runtime consumes the C++ CacheTransBuffer budget."""

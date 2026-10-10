@@ -15,7 +15,7 @@ from tensorrt_llm import logger
 
 @dataclass(frozen=True)
 class QuiescenceFatalEvent:
-    """Immutable evidence that an exposed owner missed its retirement deadline."""
+    """Immutable evidence of unproven retirement or a missed drain deadline."""
 
     request_id: int
     direction: Literal["send", "receive"]
@@ -301,6 +301,29 @@ class RetirementWatchdog:
             self._admission_closed = True
             for owner in self._owners:
                 owner.request_drain("shutdown")
+
+    def reject_unproven_retirement(
+        self, request_id: int, direction: Literal["send", "receive"]
+    ) -> QuiescenceFatalEvent:
+        """Latch fatal containment before an executor bypasses normal drain.
+
+        Unlike an ordinary cancellation, final resource teardown cannot wait
+        for later polling. Its caller must hard-stop without releasing roots.
+        """
+        with self.lock:
+            self._admission_closed = True
+            if self.fatal is None:
+                now = self.clock()
+                self.fatal = QuiescenceFatalEvent(
+                    request_id,
+                    direction,
+                    "executor attempted resource release before physical quiescence",
+                    now,
+                    now,
+                    now,
+                )
+            self.wake.set()
+            return self.fatal
 
     @property
     def admission_closed(self) -> bool:

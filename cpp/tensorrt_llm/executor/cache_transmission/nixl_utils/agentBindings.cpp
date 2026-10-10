@@ -188,6 +188,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // the GIL here is safe and necessary for correct behavior when the concrete
     // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
+        .def("is_quiesced", &kvc::TransferStatus::isQuiesced, nb::call_guard<nb::gil_scoped_release>())
+        .def("request_cancel", &kvc::TransferStatus::requestCancel, nb::call_guard<nb::gil_scoped_release>())
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
         .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
         // Failure detail for the last terminal state (empty if unavailable). Named to match the

@@ -24,7 +24,7 @@ from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_ownership_peer
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, MapperKind, PoolView
 from tensorrt_llm._torch.disaggregation.resource.utils import (
@@ -72,6 +72,7 @@ class PeerRegistrar:
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
+        validate_ownership_peer(self._ri, peer_ri)
         assert self._self_ext_cache is not None
         if not self._check_peer_compatible(peer_ri):
             raise ValueError(

@@ -393,6 +393,19 @@ public:
     {
         return {};
     }
+
+    /// True only after no future source read or destination write is possible.
+    /// Logical failure, cancellation and handle release are not this proof.
+    [[nodiscard]] virtual bool isQuiesced() const
+    {
+        return false;
+    }
+
+    /// Request cancellation without waiting; acceptance is not a quiescence proof.
+    [[nodiscard]] virtual bool requestCancel()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig

@@ -75,18 +75,19 @@ def test_send_releases_the_index_slot_on_the_target_and_draft_kv_managers() -> N
 
 
 @pytest.mark.parametrize(
-    ("bridge_enabled", "has_inflight", "releases_claim"),
+    ("ownership_enabled", "has_inflight", "releases_claim"),
     [(True, False, True), (True, True, False), (False, False, False)],
 )
-def test_bridge_rejection_releases_the_claim_only_without_a_physical_owner(
-    bridge_enabled: bool, has_inflight: bool, releases_claim: bool
+def test_owned_transfer_rejection_releases_the_claim_only_without_a_physical_owner(
+    ownership_enabled: bool, has_inflight: bool, releases_claim: bool
 ) -> None:
-    """The FP4 MLA bridge may reject a send before any transfer session exists.
+    """An ownership-enabled transceiver may reject a send before any transfer session exists.
     Only then is there no physical accessor for the reap to poll, so the claim
     is released on the spot; a rejection with a live session, or a failure
-    without the bridge, stays claimed until the reap and the error path."""
+    without ownership enforcement, stays claimed until the reap and the error path."""
     h = _Harness(kv_transfer_timeout_ms=1000)
-    h.transceiver._fp4_mla_bridge_enabled = bridge_enabled
+    h.transceiver._fp4_mla_bridge_enabled = False
+    h.transceiver._enforce_physical_ownership = ownership_enabled
     h.transceiver.has_inflight_transfer = lambda _req: has_inflight
     h.transceiver.respond_and_send_async = lambda req: setattr(
         req, "state", LlmRequestState.DISAGG_TRANS_ERROR
