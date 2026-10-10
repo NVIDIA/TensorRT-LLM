@@ -50,6 +50,7 @@ def _coordinator(manager: Mock, receive: Mock) -> DisaggTransferCoordinator:
 def _manager() -> Mock:
     """Run the real admission and resource hooks with mocked cache allocation."""
     manager = Mock(spec=KVCacheManagerV2)
+    manager.impl = Mock()
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
     manager._pending_preemption = {}
