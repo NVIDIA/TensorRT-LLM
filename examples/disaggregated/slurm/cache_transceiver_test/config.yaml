@@ -58,6 +58,32 @@ test_matrix:
   # Warmup requests per (combination, length); excluded from bandwidth stats.
   warmup_requests: 2
 
+host_transfer_benchmark:
+  # NIXL payload benchmark on the same two nodes and UCX sweep. Reports both
+  # transport-only and GPU-ready (including staging) rates, with "gpu" as baseline.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host"]
+  bytes_per_transfer: 16777216
+  warmup: 2
+  samples: 8
+  # Keep registrations live for this interval after submission in the delayed
+  # completion and logical cancellation cases; exclude these from bandwidth.
+  delayed_completion_ms: 100
+  timeout_ms: 30000
+
+kvcm_transfer_benchmark:
+  # Native KVCM V2 sparse pages, including actual GPU→host offload and detached
+  # receive reservations. The same NIXL path is used for every mode.
+  enabled: true
+  modes: ["gpu", "host", "host_to_gpu", "gpu_to_host", "mixed"]
+  page_bytes: 1048576
+  pages: 16
+  tokens_per_block: 32
+  warmup: 2
+  samples: 8
+  delayed_completion_ms: 100
+  timeout_ms: 30000
+
 kv_cache:
   # KV cache geometry. Sized so transfers are large enough to measure bandwidth.
   num_layers: 32

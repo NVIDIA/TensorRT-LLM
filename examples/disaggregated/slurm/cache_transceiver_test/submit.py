@@ -16,7 +16,8 @@
 """Submit the 2-node KV cache transceiver bandwidth / UCX-tuning job.
 
 Usage:
-    python3 submit.py -c config.yaml [--dry-run]
+    ./submit.py [--dry-run]
+    ./submit.py -c other_config.yaml [--dry-run]
 """
 
 import argparse
@@ -34,7 +35,12 @@ PLACEHOLDER_PREFIX = "<"
 
 def parse_args():
     ap = argparse.ArgumentParser(description="Submit KV cache transceiver test")
-    ap.add_argument("-c", "--config", required=True, help="Path to config YAML")
+    ap.add_argument(
+        "-c",
+        "--config",
+        default=os.path.join(SCRIPT_DIR, "config.yaml"),
+        help="Path to config YAML (defaults to config.yaml beside this script)",
+    )
     ap.add_argument(
         "--dry-run",
         action="store_true",
@@ -76,7 +82,9 @@ def validate(cfg):
         errors.append("parallel section must be set")
         par = {}
     n = hardware.get("gpus_per_node")
-    if n is not None and par:
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        errors.append("hardware.gpus_per_node must be a positive integer")
+    if isinstance(n, int) and not isinstance(n, bool) and par:
         if par.get("ctx_tp") and par.get("ctx_pp") and par["ctx_tp"] * par["ctx_pp"] != n:
             errors.append(f"ctx_tp*ctx_pp ({par['ctx_tp']}*{par['ctx_pp']}) != gpus_per_node ({n})")
         if par.get("gen_tp") and par.get("gen_pp") and par["gen_tp"] * par["gen_pp"] != n:

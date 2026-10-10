@@ -36,6 +36,10 @@ GEN_NODE="${NODES[1]}"
 ZMQ_PORT=$((20000 + (SLURM_JOB_ID % 20000)))
 CONTAINER_NAME="ctt_${SLURM_JOB_ID}"
 DRIVER="python3 ${HERE}/run_cache_transceiver_test.py"
+HOST_DRIVER="python3 ${HERE}/run_host_transfer_benchmark.py"
+HOST_ENABLED="$(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(int(c.get("host_transfer_benchmark", {}).get("enabled", False)))' "${CONFIG}")"
+KVCM_DRIVER="python3 ${HERE}/run_kvcm_transfer_benchmark.py"
+KVCM_ENABLED="$(python3 -c 'import sys,yaml; c=yaml.safe_load(open(sys.argv[1])); print(int(c.get("kvcm_transfer_benchmark", {}).get("enabled", False)))' "${CONFIG}")"
 
 echo "ctx_node=${CTX_NODE} gen_node=${GEN_NODE} zmq_port=${ZMQ_PORT}"
 
@@ -133,6 +137,48 @@ ${DRIVER} --role gen" &
         OVERALL_RC=1
     fi
     echo "sweep ${SWEEP_IDX} done (ctx_rc=${CTX_RC} gen_rc=${GEN_RC})"
+
+    if [ "${HOST_ENABLED}" = "1" ]; then
+        timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
+            --nodelist="${CTX_NODE}" -N1 --ntasks-per-node="${N}" \
+            --output="${WORK}/logs/host${SWEEP_IDX}_ctx_rank%t.log" \
+            bash -c "${PRELUDE}
+${HOST_DRIVER} --role ctx" &
+        HOST_CTX_PID=$!
+        timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
+            --nodelist="${GEN_NODE}" -N1 --ntasks-per-node="${N}" \
+            --output="${WORK}/logs/host${SWEEP_IDX}_gen_rank%t.log" \
+            bash -c "${PRELUDE}
+${HOST_DRIVER} --role gen" &
+        HOST_GEN_PID=$!
+        wait "${HOST_CTX_PID}"; HOST_CTX_RC=$?
+        wait "${HOST_GEN_PID}"; HOST_GEN_RC=$?
+        if [ "${HOST_CTX_RC}" -ne 0 ] || [ "${HOST_GEN_RC}" -ne 0 ]; then
+            OVERALL_RC=1
+        fi
+        echo "host sweep ${SWEEP_IDX} done (ctx_rc=${HOST_CTX_RC} gen_rc=${HOST_GEN_RC})"
+    fi
+
+    if [ "${KVCM_ENABLED}" = "1" ]; then
+        timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
+            --nodelist="${CTX_NODE}" -N1 --ntasks-per-node="${N}" \
+            --output="${WORK}/logs/kvcm${SWEEP_IDX}_ctx_rank%t.log" \
+            bash -c "${PRELUDE}
+${KVCM_DRIVER} --role ctx" &
+        KVCM_CTX_PID=$!
+        timeout -k 60 --signal=TERM "${PER_SWEEP_TIMEOUT}" srun ${COMMON} --export="${EXPORTS}" \
+            --nodelist="${GEN_NODE}" -N1 --ntasks-per-node="${N}" \
+            --output="${WORK}/logs/kvcm${SWEEP_IDX}_gen_rank%t.log" \
+            bash -c "${PRELUDE}
+${KVCM_DRIVER} --role gen" &
+        KVCM_GEN_PID=$!
+        wait "${KVCM_CTX_PID}"; KVCM_CTX_RC=$?
+        wait "${KVCM_GEN_PID}"; KVCM_GEN_RC=$?
+        if [ "${KVCM_CTX_RC}" -ne 0 ] || [ "${KVCM_GEN_RC}" -ne 0 ]; then
+            OVERALL_RC=1
+        fi
+        echo "KVCM sweep ${SWEEP_IDX} done (ctx_rc=${KVCM_CTX_RC} gen_rc=${KVCM_GEN_RC})"
+    fi
 done
 
 # ---------------------------------------------------------------------------

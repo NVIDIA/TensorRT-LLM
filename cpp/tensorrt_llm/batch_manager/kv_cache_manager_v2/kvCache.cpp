@@ -27,6 +27,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
@@ -36,6 +37,21 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
+void describePage(std::vector<TransferPage>& result, StorageManager const& storage, LayerGroupId group,
+    BlockOrdinal ordinal, CacheLevel level, SlotId slot, int validTokens)
+{
+    if (storage.cacheTier(level) == CacheTier::DISK)
+        throw LogicError("Disk pages cannot be transferred directly");
+    auto const pg = storage.getPoolGroupIndex(level, group);
+    for (PoolIndex pool{0}; pool < storage.numPools(level, pg); ++pool)
+    {
+        auto const bytes = storage.slotSize(level, pg).at(pool);
+        result.push_back({group, ordinal, level, slot, pg, pool,
+            std::get<MemAddress>(storage.slotAddress(level, pg, slot, pool)), bytes,
+            std::get<MemAddress>(storage.slotAddress(level, pg, SlotId{0}, pool)),
+            bytes * slotCountToSizeT(storage.numSlots(pg, level)), validTokens});
+    }
+}
 int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleId lifeCycle)
 {
     PoolGroupIndex const poolGroup = storage.getPoolGroupIndex(level, lifeCycle);
@@ -128,6 +144,246 @@ KvCache::~KvCache()
 // ---------------------------------------------------------------------------
 // State machine
 // ---------------------------------------------------------------------------
+
+void KvCache::_checkNoExternalAccess() const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const lock = mManager->lockExclusive();
+    if (!mExternalAccesses.empty() || mExternalCloseRequested || mExternalReceiveFailed)
+    {
+            throw LogicError("Request mutation must wait for physical external access settlement");
+    }
+}
+
+uint64_t KvCache::beginExternalRead(std::vector<LayerGroupId> const& groups, int tokens)
+{
+    KVCM2_API_GUARD();
+    auto const lock = mManager->lockExclusive();
+    if (!isActive() || mExternalCloseRequested || mExternalReceiveFailed
+        || beamWidth() != BeamIndex{1} || hasScratchSlots() || tokens <= 0 || tokens > historyLength() || groups.empty())
+    {
+            throw LogicError("Transfer reads require allocated single-beam history without scratch reuse");
+    }
+    auto state = std::make_unique<ExternalAccess>();
+    std::set<LayerGroupId> uniqueGroups;
+    auto& storage = mManager->storage();
+    for (auto group : groups)
+    {
+        if (!uniqueGroups.insert(group).second)
+        {
+                throw LogicError("Transfer layer groups must be unique");
+        }
+        auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[group]);
+        if (!attn)
+        {
+                throw LogicError("External reads support attention history only");
+        }
+        for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{divUp(tokens, tokensPerBlock())}; ++ordinal)
+        {
+            if (attn->getStaleRange(tokens, tokensPerBlock()).contains(ordinal))
+            {
+                    continue;
+            }
+            auto page = _page(ordinal, kDefaultBeamIndex, group);
+            if (!page)
+            {
+                    throw LogicError("Required transfer history has no allocated page");
+            }
+            int const valid = std::min(tokensPerBlock(), tokens - ordinal.value() * tokensPerBlock());
+            if (page->isCommitted() && static_cast<CommittedPage const&>(*page).numTokensInBlock < valid)
+            {
+                    throw LogicError("Required transfer history exceeds committed coverage");
+            }
+            describePage(state->descriptors, storage, group, ordinal, page->cacheLevel, page->slotId(), valid);
+            state->events.push_back(page->readyEvent);
+            state->pinned.push_back(std::move(page));
+        }
+    }
+    state->events.emplace_back(reinterpret_cast<CudaStream>(cudaStream()));
+    return _registerExternalAccess(state);
+}
+
+uint64_t KvCache::reserveExternalReceive(LayerGroupId group, BlockOrdinal ordinal, CacheLevel level)
+{
+    KVCM2_API_GUARD();
+    auto const lock = mManager->lockExclusive();
+    if (status() != KvCache::Status::SUSPENDED || mExternalCloseRequested || mExternalReceiveFailed
+        || beamWidth() != BeamIndex{1} || ordinal < BlockOrdinal{0} || ordinal >= numBlocks())
+    {
+            throw LogicError("Receive reservations require suspended single-beam request pages");
+    }
+    auto& storage = mManager->storage();
+    auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[group]);
+    int const valid = std::min(tokensPerBlock(), historyLength() - ordinal.value() * tokensPerBlock());
+    if (!attn || valid <= 0 || (level != kHotLevel && level != kSparseHistoryLevel)
+        || (level == kSparseHistoryLevel && (!attn->isSparse || valid != tokensPerBlock()
+                || storage.numCacheLevels() <= level || storage.cacheTier(level) != CacheTier::HOST_MEM)))
+    {
+            throw LogicError("Host receive reservations require complete sparse attention history");
+    }
+    auto page = _page(ordinal, kDefaultBeamIndex, group);
+    if (!page || page->isCommitted() || page->externalAccessPins != 0)
+    {
+            throw LogicError("Receive reservations require an uncommitted, unreserved destination page");
+    }
+    auto state = std::make_unique<ExternalAccess>();
+    state->destinationLevel = level;
+    state->validTokens = valid;
+    state->pinned.push_back(page);
+    auto slots = storage.newSlotsForPoolGroup(level, storage.getPoolGroupIndex(level, group), SlotCount{1});
+    state->destination.emplace(std::move(slots.front()));
+    auto* pending = state.get();
+    auto rollback = FuncGuard(
+        [&]()
+        {
+            if (pending->destination)
+            {
+                    storage.releaseSlot(group, level, std::move(*pending->destination));
+            }
+        });
+    state->events.push_back(state->destination->readyEvent);
+    describePage(state->descriptors, storage, group, ordinal, level, state->destination->slotId(), valid);
+    auto const id = _registerExternalAccess(state);
+    rollback.cancel();
+    return id;
+}
+
+uint64_t KvCache::_registerExternalAccess(std::unique_ptr<ExternalAccess>& access)
+{
+    if (mNextExternalAccessId == std::numeric_limits<uint64_t>::max())
+    {
+            throw LogicError("External access ID space exhausted");
+    }
+    auto const id = mNextExternalAccessId++;
+    auto const it = mExternalAccesses.try_emplace(id, nullptr).first;
+    it->second = std::move(access);
+    for (auto const& page : it->second->pinned)
+    {
+        if (page->scheduledForEviction())
+        {
+                mManager->storage().excludeFromEviction(*page);
+        }
+        ++page->externalAccessPins;
+    }
+    ++mManager->mNumExternalAccesses;
+    return id;
+}
+
+KvCache::ExternalAccess const& KvCache::_getExternalAccess(uint64_t id) const
+{
+    auto const it = mExternalAccesses.find(id);
+    if (it == mExternalAccesses.end())
+    {
+            throw LogicError("Unknown or already settled external access ID");
+    }
+    return *it->second;
+}
+
+std::vector<TransferPage> KvCache::getExternalAccessPages(uint64_t id) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const lock = mManager->lockShared();
+    return _getExternalAccess(id).descriptors;
+}
+
+bool KvCache::externalAccessReady(uint64_t id) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const lock = mManager->lockShared();
+    auto const& events = _getExternalAccess(id).events;
+    return std::all_of(events.begin(), events.end(), [](auto const& event) { return event.queryComplete(); });
+}
+
+void KvCache::waitExternalAccessReady(uint64_t id) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    std::vector<CachedCudaEvent> events;
+    {
+        auto const lock = mManager->lockShared();
+        events = _getExternalAccess(id).events;
+    }
+    for (auto const& event : events)
+    {
+            event.synchronize();
+    }
+}
+
+void KvCache::exposeExternalAccess(uint64_t id)
+{
+    KVCM2_API_GUARD();
+    auto const lock = mManager->lockExclusive();
+    if (mExternalCloseRequested || mExternalReceiveFailed || !externalAccessReady(id))
+    {
+            throw LogicError("External access requires an open request and ready storage");
+    }
+    mExternalAccessKeepAlive = shared_from_this();
+    mExternalAccesses.at(id)->exposed = true;
+}
+
+void KvCache::_releaseExternalAccess(uint64_t id)
+{
+    auto& access = *mExternalAccesses.at(id);
+    auto& storage = mManager->storage();
+    if (access.destination)
+    {
+        mExternalReceiveFailed |= access.exposed;
+        storage.releaseSlot(access.pinned.front()->lifeCycle, access.destinationLevel, std::move(*access.destination));
+    }
+    for (auto const& page : access.pinned)
+    {
+        --page->externalAccessPins;
+        storage.scheduleForEviction(*page);
+    }
+    mExternalAccesses.erase(id); // Destroy non-atomic Page ownership under the exclusive API lock.
+    --mManager->mNumExternalAccesses;
+}
+
+void KvCache::endExternalAccess(uint64_t id)
+{
+    auto const self = shared_from_this();
+    auto const lock = mManager->lockExclusive();
+    if (Poison::poisoned())
+    {
+        mExternalAccessKeepAlive = self;
+        return;
+    }
+    if (!mExternalAccesses.contains(id))
+    {
+            throw LogicError("Unknown or already settled external access ID");
+    }
+    _releaseExternalAccess(id);
+    bool const hasExposed = std::any_of(mExternalAccesses.begin(), mExternalAccesses.end(),
+        [](auto const& entry) { return entry.second->exposed; });
+    if (!hasExposed)
+    {
+            mExternalAccessKeepAlive.reset();
+    }
+    if (mExternalCloseRequested && mExternalAccesses.empty())
+    {
+            close();
+    }
+}
+
+void KvCache::finalizeExternalReceive(uint64_t id, int validTokens, CUstream stream)
+{
+    KVCM2_API_GUARD();
+    auto const lock = mManager->lockExclusive();
+    auto& access = *mExternalAccesses.at(id);
+    if (!access.destination || !access.exposed || !externalAccessReady(id) || validTokens != access.validTokens
+        || mExternalCloseRequested || mExternalReceiveFailed || status() != Status::SUSPENDED)
+    {
+            throw LogicError("Receive finalization requires a settled reservation with exact valid coverage");
+    }
+    auto const completion = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+    auto& page = *access.pinned.front();
+    auto const oldLevel = page.cacheLevel;
+    access.destination->readyEvent = completion;
+    Slot oldSlot = page.exchangeSlot(std::move(*access.destination));
+    access.destination.reset();
+    page.cacheLevel = access.destinationLevel;
+    mManager->storage().releaseSlot(page.lifeCycle, oldLevel, std::move(oldSlot));
+    onPageStorageChanged();
+}
 
 CUstream KvCache::cudaStream() const
 {
@@ -247,6 +503,11 @@ void KvCache::_offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int histo
                 TLLM_CHECK_DEBUG(page && page->status() == PageStatus::LOCKED);
                 if (page->cacheLevel == kSparseHistoryLevel)
                     continue;
+                if (page->externalAccessPins != 0)
+                {
+                    deferred = true;
+                    continue;
+                }
                 auto const lock = page->holder.lock()->uniqLock.lock();
                 bool needsGpu = false;
                 for (auto const& owner : lock->owners())
@@ -291,6 +552,7 @@ bool KvCache::enterDecode()
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     if (!isActive())
         throw LogicError("Decode admission requires an active request");
     if (mIsDecoding && !mHasDeferredSparseOffload)
@@ -329,6 +591,7 @@ void KvCache::offloadSparsePages(std::vector<SharedPtr<Page>> const& pages)
 
 void KvCache::activate()
 {
+    _checkNoExternalAccess();
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     TLLM_CHECK_DEBUG_WITH_INFO(mCudaStream.has_value(), "cuda_stream must be set before activate()");
 
@@ -381,6 +644,8 @@ void KvCache::activate()
 bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecoding)
 {
     KVCM2_API_GUARD();
+    auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     TLLM_CHECK(mStatus == Status::SUSPENDED);
 
     // Set stream first (mirrors Python: self.cuda_stream = cuda_stream).
@@ -391,7 +656,6 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     TLLM_CHECK_WITH_INFO(mCudaStream.has_value(), "cuda_stream is never set");
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
 
-    auto const apiLock = mManager->lockExclusive();
     bool const oldIsDecoding = mIsDecoding;
     if (mIsDecoding && isDecoding == false)
         throw std::invalid_argument("Cannot return a decoding cache to prefill");
@@ -666,6 +930,7 @@ bool KvCache::prefetch(CacheLevel target)
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     TLLM_CHECK_DEBUG(mStatus == Status::SUSPENDED);
     auto& storageMgr = mManager->storage();
     CacheLevel const numTiers = storageMgr.numCacheLevels();
@@ -718,6 +983,7 @@ void KvCache::suspend()
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(_checkSanity());
     TLLM_CHECK_DEBUG(!mFinishEvent.has_value());
@@ -776,8 +1042,24 @@ void KvCache::close()
     if (mStatus == Status::CLOSED)
         return;
 
+    for (auto it = mExternalAccesses.begin(); it != mExternalAccesses.end();)
+    {
+        auto const id = it->first;
+        bool const exposed = it->second->exposed;
+        ++it;
+        if (!exposed)
+        {
+            _releaseExternalAccess(id);
+        }
+    }
+    if (!mExternalAccesses.empty())
+    {
+        mExternalCloseRequested = true;
+        return;
+    }
     discardPendingStats();
-    stopCommitting();
+    if (!mExternalReceiveFailed)
+        stopCommitting();
     TLLM_CHECK_DEBUG(_checkSanity());
 
     // Dummy/warmup caches are reserved at the model's full declared context, not at a realistic
@@ -1265,6 +1547,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 {
     KVCM2_API_GUARD();
     auto const lock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     TLLM_CHECK_DEBUG(mBlocks.size() == BlockOrdinal{divUp(mCapacity, mTokensPerBlock)});
 
@@ -2171,6 +2454,7 @@ void KvCache::commit(TokenSpan tokens, bool isEnd)
     KVCM2_API_GUARD();
     TLLM_CHECK(isActive());
     auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     if (tokens.size() == 0)
     {
         if (isEnd)
@@ -2260,6 +2544,8 @@ void KvCache::stopCommitting()
 {
     KVCM2_API_GUARD();
     auto const apiLock = mManager->lockExclusive();
+    if (!mExternalAccesses.empty() || mExternalReceiveFailed)
+        throw LogicError("Final commit requires physically settled, valid transfer storage");
     TLLM_CHECK_DEBUG(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
         return;
@@ -3271,6 +3557,7 @@ void KvCache::setEnableSwaScratchReuse(bool enable)
 {
     KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockExclusive();
+    _checkNoExternalAccess();
     if (enable == mEnableSwaScratchReuse)
         return;
     if (enable)

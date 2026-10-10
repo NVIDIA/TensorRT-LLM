@@ -153,6 +153,8 @@ void KvCacheManager::shutdown()
     // The latch is read under the lock because it is normally set by a thread holding it: a read
     // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
+    if (mNumExternalAccesses != 0)
+        throw LogicError("Manager teardown or adjustment must wait for physical transfer settlement");
     if (Poison::poisoned())
     {
         return;
@@ -458,6 +460,8 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (mNumExternalAccesses != 0)
+        throw LogicError("Manager teardown or adjustment must wait for physical transfer settlement");
     // Same precondition as adjust(): _adjustLevel may defragment, invalidating any page index an
     // ACTIVE cache holds.
     for (KvCache* kvc : mLivingKvCaches)
@@ -1059,6 +1063,8 @@ void KvCacheManager::adjust()
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (mNumExternalAccesses != 0)
+        throw LogicError("Manager teardown or adjustment must wait for physical transfer settlement");
     for (KvCache* kvc : mLivingKvCaches)
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "

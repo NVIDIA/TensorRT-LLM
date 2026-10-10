@@ -239,9 +239,17 @@ def get_physical_pool(page_table: KVCachePageTable, lg_idx: int, pool_idx: int) 
 
 
 def get_unique_pool_memory_descs(
-    page_table: KVCachePageTable, device_id: int
+    page_table: KVCachePageTable, device_id: int, memory_type: str = "VRAM"
 ) -> list[tuple[int, int, int, str]]:
-    """Return deduplicated (ptr, size, device_id, name) tuples for all physical pools."""
+    """Return deduplicated registration tuples for pools of one memory type.
+
+    Host pools use device ID zero. Call separately for VRAM and DRAM because
+    transfer-agent registration descriptors have one memory type per batch.
+    """
+    if memory_type not in ("VRAM", "DRAM"):
+        raise ValueError("KV pools must use VRAM or DRAM")
+    if memory_type == "DRAM":
+        device_id = 0
     unique_pools: dict[tuple[int, int], int] = {}  # (ptr, size) -> index
     pool_counter = 0
     for lg_idx, lg in enumerate(page_table.layer_groups):
@@ -257,6 +265,8 @@ def get_unique_pool_memory_descs(
                     key=lambda p: p.base_address,
                 )
                 for pool in pools:
+                    if pool.memory_type != memory_type:
+                        continue
                     pool_size = pool.num_slots * pool.slot_stride_bytes
                     if any(b <= pool.base_address < b + s for (b, s) in unique_pools):
                         continue
@@ -269,6 +279,8 @@ def get_unique_pool_memory_descs(
                 # allocation. Register each: size = num_layers * layer_stride.
                 for pv in lg.pool_views:
                     pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+                    if pool.memory_type != memory_type:
+                        continue
                     num_layers = len({int(e["local_layer_id"]) for e in pv.buffer_entries})
                     pool_size = num_layers * pool.layer_stride_bytes
                     pool_key = (pool.base_address, pool_size)
@@ -279,6 +291,8 @@ def get_unique_pool_memory_descs(
             # PAGED (attention): each pool view is an independent allocation
             for pv in lg.pool_views:
                 pool = get_physical_pool(page_table, lg_idx, pv.pool_idx)
+                if pool.memory_type != memory_type:
+                    continue
                 pool_key = (pool.base_address, pool.num_slots * pool.slot_stride_bytes)
                 if pool_key not in unique_pools:
                     unique_pools[pool_key] = pool_counter

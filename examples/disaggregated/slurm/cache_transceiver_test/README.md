@@ -10,6 +10,43 @@ generation (gen) side via the transceiver, verifies the received data, and
 reports the achieved transfer bandwidth — for both the **C++** and **Python**
 transceivers, and for every UCX environment set you list.
 
+The `host_transfer_benchmark` runs after each sweep on the same nodes and GPU
+ranks. It sends the same byte payload through NIXL as GPU→GPU, host→host,
+host→GPU, and GPU→host transfers. GPU→GPU is the comparison baseline. Every
+mode begins with the payload on the context GPU and ends with it on the
+generation GPU. Host modes time the necessary GPU→pinned-host and/or
+pinned-host→GPU copies separately from NIXL, and report both transport-only
+bandwidth and GPU-ready bandwidth from the sum of those stages. Every sample
+verifies the GPU-resident destination against a deterministic pattern. Two untimed
+cases retain registered buffers after submission: `delayed_completion` defers
+completion reporting, and `logical_cancel` sends cancellation notice before a
+separate physical-drain handshake. If physical
+completion cannot be proven, the process terminates without deregistering the
+possibly live buffer.
+
+This measures the physical NIXL DRAM/VRAM payload path and local staging cost.
+It does not allocate offloaded KVCM pages or exercise request claims. GPU-ready
+bandwidth excludes allocation, registration, KVCM admission, scheduling, and
+model execution; it is not end-to-end serving throughput.
+
+The `kvcm_transfer_benchmark` adds the native-page measurement. It creates a
+single sparse attention layer in KVCM V2, writes deterministic bytes to its GPU
+history, and calls `enter_decode()` to offload that history when a mode uses a
+host source. The destination reserves detached GPU or host pages. Both sides
+pin and expose their pages through KVCM external-access claims; NIXL registers
+the claimed pools and transfers pages paired by group, ordinal, and pool index.
+After each transfer the receiver compares every byte. On completion it
+finalizes the receive pages, then releases claims only after the backend status
+and peer handshake prove physical settlement. `mixed` reserves alternating
+host and GPU destination pages, exercising two NIXL memory-type batches.
+
+The KVCM benchmark compares host modes against its own GPU→GPU baseline with
+the same page geometry. It measures transport-only bandwidth through real KVCM
+addresses. Source offload occurs once during setup, and destination promotion
+to GPU is not timed, so its host→host ratio must not be read as a GPU-ready
+speedup. Production PD transfer planning, layer remapping, and decode are
+outside this benchmark.
+
 ## Topology
 
 One SLURM job on **2 nodes**. Per UCX env set, two `srun` steps run concurrently:
@@ -37,9 +74,14 @@ itself flows over UCX/NIXL.
 3. Submit:
 
    ```bash
-   python3 submit.py -c config.yaml            # submit
-   python3 submit.py -c config.yaml --dry-run  # validate + print sbatch only
+   ./submit.py --dry-run  # validate + print sbatch only
+   ./submit.py            # submit
    ```
+
+The older `python3 submit.py -c config.yaml` command still works. Pass
+`-c other_config.yaml` to either form to use another configuration file.
+The host and KVCM benchmark modes use sections in the same config and write
+their measurements into the same `results.json` as the transceiver sweep.
 
 ## What it tests
 
@@ -71,6 +113,8 @@ csv/<i>/ctx/py_*_*.csv                 # Python transceiver perf log (throughput
 status/sweep<i>_<role>.jsonl           # PASS / MISMATCH / TRANSFER_ERROR / TIMEOUT
 results.json                    # full results, grouped per combination (longest req_len)
 results.best.json               # best UCX env per combination (the deliverable)
+host_transfer/sweep<i>_rank<r>_<mode>.json # verified physical transfer samples
+kvcm_transfer/sweep<i>_rank<r>_<mode>.json # verified native-page transfer samples
 ```
 
 `results.json` is organized **per combination** (`by_combination`); under each combination every
@@ -105,6 +149,15 @@ deliverable for tuning your cluster.
 `Bandwidth(Gbps) ÷ 8`, Python `throughput_mbs × 1024² ÷ 1e9`, then takes the
 median across ranks. The two runtimes time slightly different spans, so compare
 within a `(combination)` across UCX sweeps.
+
+For `host_transfer_benchmark`, `per_gpu_GBps` and `ratio_to_gpu` remain the
+transport-only measurements. `gpu_ready_GBps` and `gpu_ready_ratio_to_gpu` use
+`gpu_ready_seconds = source_stage_seconds + seconds + destination_stage_seconds`
+for each timed request, then take the median per-GPU rate. The staging copies
+are repeated for every request; warmup, delayed completion, and logical cancel
+are excluded from bandwidth statistics. Existing result files without staging
+timings retain transport-only values and report `null` for GPU-ready values.
+`kvcm_transfer_benchmark` reports only transport-only rates.
 
 ## Notes & limitations
 
