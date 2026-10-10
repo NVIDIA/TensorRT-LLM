@@ -1819,9 +1819,18 @@ class MuseSparkOpenMoE(nn.Module):
         # is the same function: ``w * RMSNorm(gain * y)`` is computed per
         # (token, expert) row and non-local slots contribute exact zeros, so
         # summing the per-rank finalized partials equals finalizing the whole
-        # set. Ignored while ``experts.comm is None`` (attention DP off), which
-        # is why the aggregated path is untouched.
-        self.experts.unfinalized_combine_fn = self.finalize
+        # set.
+        #
+        # Registered ONLY when the layer has a communication strategy. The
+        # scheduler runs a registered ``unfinalized_combine_fn`` on every
+        # ``do_finalize=False`` forward, comm or not, and then returns the
+        # dense tensor; without a comm the triple must come back instead so
+        # ``forward`` can finalize it here, where the small-batch fused
+        # finalize + all-reduce path lives. ``comm`` is decided in the
+        # ConfigurableMoE constructor; the only later reassignment swaps one
+        # strategy for another, never between None and a strategy.
+        if getattr(self.experts, "comm", None) is not None:
+            self.experts.unfinalized_combine_fn = self.finalize
         # An explicit strategy, not the AUTO default. AUTO routes through
         # `torch.ops.trtllm.tunable_allreduce`, whose autotuner profiles each
         # tactic inside a `torch.cuda.graph` capture; at TP4 every rank hung in

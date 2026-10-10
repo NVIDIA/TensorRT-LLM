@@ -282,6 +282,55 @@ def test_model_finalize_accepts_scheduler_hook_keywords():
     signature.bind(None, **{name: None for name in keywords})
 
 
+def _tiny_moe_model_config() -> ModelConfig:
+    from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenConfig
+
+    config = MuseSparkOpenConfig(
+        hidden_size=64,
+        num_hidden_layers=2,
+        moe={
+            "topk": 2,
+            "num_experts": 4,
+            "override_routed_hidden_dim": 32,
+            "compression_factor": 2,
+            "router_score_division_eps": 1e-15,
+        },
+        metap={"base_width": 64.0, "m_emb": 1.0},
+    )
+    return ModelConfig(
+        pretrained_config=config,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
+        skip_create_weights_in_init=True,
+    )
+
+
+@pytest.mark.parametrize("has_comm", [False, True], ids=["no-comm", "comm"])
+def test_model_registers_finalize_only_under_a_comm_strategy(
+    monkeypatch: pytest.MonkeyPatch, has_comm: bool
+):
+    """The hook is registered exactly when a combine separates GEMM and module.
+
+    The scheduler runs a registered ``unfinalized_combine_fn`` on every
+    ``do_finalize=False`` forward, with or without a comm strategy, and hands
+    back the dense tensor. Without a comm the module's forward expects the
+    unfinalized triple and finalizes it itself (that is where the small-batch
+    fused finalize + all-reduce path lives), so a hook registered there turns
+    into a refusal at engine warmup.
+    """
+    from tensorrt_llm._torch.models import modeling_musespark_open as mod
+
+    experts = types.SimpleNamespace(
+        comm=object() if has_comm else None,
+        unfinalized_combine_fn=None,
+    )
+    monkeypatch.setattr(mod, "create_moe", lambda **kwargs: experts)
+    moe = mod.MuseSparkOpenMoE(_tiny_moe_model_config(), layer_idx=0)
+    if has_comm:
+        assert experts.unfinalized_combine_fn == moe.finalize
+    else:
+        assert experts.unfinalized_combine_fn is None
+
+
 # ---------------------------------------------------------------------------
 # Backend knob wiring
 # ---------------------------------------------------------------------------
