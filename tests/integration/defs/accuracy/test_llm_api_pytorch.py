@@ -4881,6 +4881,17 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(2)
     def test_bf16_2gpu_mtp_ar(self):
+        self._run_bf16_2gpu_mtp_ar()
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_2gpu_mtp_ar_flashinfer_ring_replay(self, monkeypatch):
+        """Same as test_bf16_2gpu_mtp_ar with GDN replay on the FlashInfer ring kernel."""
+        # "force" fails the test instead of silently falling back to Triton.
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+        self._run_bf16_2gpu_mtp_ar()
+
+    def _run_bf16_2gpu_mtp_ar(self):
         max_draft_len = 3
         mtp_config = MTPDecodingConfig(num_nextn_predict_layers=max_draft_len, )
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
@@ -5251,7 +5262,7 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def test_bf16_mtp(self, mocker):
+    def _run_bf16_mtp(self, mocker, acceptance_key):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
@@ -5276,10 +5287,17 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            assert_acceptance_length_for_llm(
-                "TestQwen3_5_35B_A3B::test_bf16_mtp",
-                llm,
-            )
+            assert_acceptance_length_for_llm(acceptance_key, llm)
+
+    def test_bf16_mtp(self, mocker):
+        self._run_bf16_mtp(mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp")
+
+    def test_bf16_mtp_flashinfer_ring_replay(self, mocker, monkeypatch):
+        """Same as test_bf16_mtp with GDN replay on the FlashInfer ring kernel."""
+        # "force" fails the test instead of silently falling back to Triton.
+        monkeypatch.setenv("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "force")
+        self._run_bf16_mtp(
+            mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp_flashinfer_ring_replay")
 
     @skip_pre_hopper
     @parametrize_with_ids("enable_block_reuse", [False, True])

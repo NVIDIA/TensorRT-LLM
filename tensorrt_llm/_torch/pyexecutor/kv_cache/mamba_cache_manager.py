@@ -309,6 +309,31 @@ def _advance_replay_state(
     replay_metadata.cache_buf_idx[slots] = next_cache_buf_idx
 
 
+def _advance_ring_start(
+    cache_base: torch.Tensor,
+    replay_metadata: ReplayStateUpdateMetadata,
+    state_indices: torch.Tensor,
+    is_dummy_request: Optional[torch.Tensor] = None,
+) -> None:
+    """Move each flushed slot's ring start past its folded history rows.
+
+    Reads the pre-step history lengths, so it must run before
+    ``_advance_replay_state`` overwrites them.
+    """
+    from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import \
+        FLASHINFER_REPLAY_RING_SIZE
+
+    slots = state_indices.long()
+    prev_len = replay_metadata.prev_num_accepted_tokens[slots]
+    flushed = (prev_len + replay_metadata.replay_step_width
+               > replay_metadata.replay_history_size)
+    if is_dummy_request is not None:
+        flushed = flushed & ~is_dummy_request
+    base = cache_base[slots]
+    cache_base[slots] = torch.where(flushed, (base + prev_len) %
+                                    FLASHINFER_REPLAY_RING_SIZE, base)
+
+
 class BaseMambaCacheManager(ABC):
     """Abstract interface for accessing mamba/recurrent state caches."""
 
@@ -401,16 +426,19 @@ class PythonMambaCacheManager(BaseResourceManager):
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens.
 
-        Supports three SSM update paths (only one set of tensors is
+        Supports four SSM update paths (only one set of tensors is
         allocated):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
         - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
+        - GDN ring replay (FlashInfer, V2 only): one 32-row ring per slot
+          (k_ring, u_ring, g_ring) plus its start (cache_base)
         - KDA replay: per-slot draft-token caches consumed by the fused
           ``trtllm::kda_mtp_decode`` verify kernel, which replays accepted
           drafts and commits states in place (kda_conv_*, kda_*_cache)
         """
         _SHARED_FIELDS = frozenset({
-            "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
+            "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed",
+            "cache_base"
         })
 
         # Allocated for the legacy and Mamba2-replay paths; None for the
@@ -453,6 +481,11 @@ class PythonMambaCacheManager(BaseResourceManager):
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
+        # GDN ring replay path: replaces old_* (see the class docstring).
+        cache_base: torch.Tensor | None = None  # (cache,) int32 — shared across layers
+        k_ring: torch.Tensor | None = None  # (layers, cache, ngroups, 32, dstate)
+        u_ring: torch.Tensor | None = None  # (layers, cache, nheads, 32, dim)
+        g_ring: torch.Tensor | None = None  # (layers, cache, nheads, 32) fp32
 
         @property
         def has_kda_replay_caches(self) -> bool:
@@ -1368,6 +1401,13 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """
 
     _supports_additional_snapshot_offsets = False
+    # Only MambaHybridCacheManagerV2 supports FlashInfer ring replay; the C++
+    # manager relies on this default.
+    _use_gdn_flashinfer_ring_replay = False
+
+    @property
+    def use_gdn_flashinfer_ring_replay(self) -> bool:
+        return self._use_gdn_flashinfer_ring_replay
 
     def _setup_mtp_intermediate_states(self, spec_config,
                                        max_batch_size: int) -> None:
@@ -1415,6 +1455,10 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self.cache_base = None
+        self.k_ring = None
+        self.u_ring = None
+        self.g_ring = None
 
         if (self.local_num_mamba_layers == 0
                 or (not self._use_replay_state_update
@@ -1427,16 +1471,25 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
         if spec_config is None or not self._use_replay_state_update:
             return False
 
-        history_size = self.replay_history_size
-        assert history_size is not None
-        nheads, head_dim, d_state = self.ssm_state_shape
-        common_shape = [self.local_num_mamba_layers, cache_size, 2]
         self.prev_num_accepted_tokens = torch.zeros(cache_size,
                                                     dtype=torch.int32,
                                                     device=device)
         self.cache_buf_idx = torch.zeros(cache_size,
                                          dtype=torch.int32,
                                          device=device)
+        if self._use_gdn_flashinfer_ring_replay:
+            self._allocate_gdn_ring_replay_history(cache_size, device)
+        else:
+            self._allocate_double_buffer_replay_history(cache_size, device)
+        return True
+
+    def _allocate_double_buffer_replay_history(self, cache_size: int,
+                                               device: torch.device) -> None:
+        """Two history buffers per slot (Triton replay kernels)."""
+        history_size = self.replay_history_size
+        assert history_size is not None
+        nheads, head_dim, d_state = self.ssm_state_shape
+        common_shape = [self.local_num_mamba_layers, cache_size, 2]
         self.old_x = torch.zeros(
             common_shape + [history_size, nheads, head_dim],
             dtype=self.conv_state_dtype,
@@ -1457,7 +1510,34 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             dtype=torch.float32,
             device=device,
         )
-        return True
+
+    def _allocate_gdn_ring_replay_history(self, cache_size: int,
+                                          device: torch.device) -> None:
+        """One 32-row ring per slot plus a ring start (FlashInfer GDN kernel)."""
+        from ...modules.fla.flashinfer_cached_replay import \
+            FLASHINFER_REPLAY_RING_SIZE
+
+        nheads, head_dim, d_state = self.ssm_state_shape
+        ring_shape = [self.local_num_mamba_layers, cache_size]
+        self.cache_base = torch.zeros(cache_size,
+                                      dtype=torch.int32,
+                                      device=device)
+        self.k_ring = torch.zeros(
+            ring_shape +
+            [self._n_groups_per_rank, FLASHINFER_REPLAY_RING_SIZE, d_state],
+            dtype=self.conv_state_dtype,
+            device=device,
+        )
+        self.u_ring = torch.zeros(
+            ring_shape + [nheads, FLASHINFER_REPLAY_RING_SIZE, head_dim],
+            dtype=self.conv_state_dtype,
+            device=device,
+        )
+        self.g_ring = torch.zeros(
+            ring_shape + [nheads, FLASHINFER_REPLAY_RING_SIZE],
+            dtype=torch.float32,
+            device=device,
+        )
 
     @torch.inference_mode()
     def _refresh_dummy_request_mask(self, is_dummy: List[bool]) -> None:
@@ -1493,6 +1573,11 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
                 self.old_dt.index_fill_(1, context_slots, 0)
             if self.old_dA_cumsum is not None:
                 self.old_dA_cumsum.index_fill_(1, context_slots, 0)
+            if self.cache_base is not None:
+                self.cache_base.index_fill_(0, context_slots, 0)
+                self.k_ring.index_fill_(1, context_slots, 0)
+                self.u_ring.index_fill_(1, context_slots, 0)
+                self.g_ring.index_fill_(1, context_slots, 0)
 
         if self.mamba_ssm_rand_seed is None:
             return
@@ -1568,10 +1653,17 @@ class MambaHybridCacheManager(BaseResourceManager, BaseMambaCacheManager):
             if self.mamba_ssm_rand_seed is not None:
                 spec_kwargs['mamba_ssm_rand_seed'] = self.mamba_ssm_rand_seed
             if self._use_replay_state_update:
-                spec_kwargs['old_x'] = self.old_x[layer_offset]
-                spec_kwargs['old_B'] = self.old_B[layer_offset]
-                spec_kwargs['old_dt'] = self.old_dt[layer_offset]
-                spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[layer_offset]
+                if self._use_gdn_flashinfer_ring_replay:
+                    spec_kwargs['cache_base'] = self.cache_base
+                    spec_kwargs['k_ring'] = self.k_ring[layer_offset]
+                    spec_kwargs['u_ring'] = self.u_ring[layer_offset]
+                    spec_kwargs['g_ring'] = self.g_ring[layer_offset]
+                else:
+                    spec_kwargs['old_x'] = self.old_x[layer_offset]
+                    spec_kwargs['old_B'] = self.old_B[layer_offset]
+                    spec_kwargs['old_dt'] = self.old_dt[layer_offset]
+                    spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[
+                        layer_offset]
                 spec_kwargs['cache_buf_idx'] = self.cache_buf_idx
                 spec_kwargs['prev_num_accepted_tokens'] = (
                     self.prev_num_accepted_tokens)
@@ -3035,6 +3127,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_estimating_kv_cache: bool = False,
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        use_flashinfer_ring_replay: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         conv_state_layout: Literal["x_b_c", "q_k_v"] = "x_b_c",
         kda_replay_num_spec: Optional[int] = None,
@@ -3093,9 +3186,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._mamba_layer_mask = list(mamba_layer_mask)
         self._use_replay_state_update = use_replay_state_update
-        self._use_gdn_cached_replay_all_layer_commit = (use_replay_state_update
-                                                        and conv_state_layout
-                                                        == "q_k_v")
+        # The FlashInfer ring kernel always folds in-kernel, so ring mode never
+        # uses the deferred all-layer commit.
+        self._use_gdn_cached_replay_all_layer_commit = (
+            use_replay_state_update and conv_state_layout == "q_k_v"
+            and not use_flashinfer_ring_replay)
+        if use_flashinfer_ring_replay and not (use_replay_state_update and
+                                               conv_state_layout == "q_k_v"):
+            raise ValueError(
+                "use_flashinfer_ring_replay requires GDN replay "
+                "(use_replay_state_update with conv_state_layout='q_k_v')")
+        self._use_gdn_flashinfer_ring_replay = use_flashinfer_ring_replay
         self._gdn_cached_replay_state_descriptors: Optional[torch.Tensor] = None
         self._gdn_cached_replay_state_strides: Optional[Tuple[int, int,
                                                               int]] = None
@@ -4646,6 +4747,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 num_contexts:num_contexts + num_gens]
             replay_metadata = self.get_replay_state_update_metadata()
             assert replay_metadata is not None
+            if self._use_gdn_flashinfer_ring_replay:
+                _advance_ring_start(self.cache_base, replay_metadata,
+                                    state_indices_d, is_dummy_request)
             _advance_replay_state(
                 replay_metadata,
                 state_indices_d,
@@ -4789,6 +4893,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self.cache_base = None
+        self.k_ring = None
+        self.u_ring = None
+        self.g_ring = None
         self._branch_snapshot_points.clear()
         self.kda_conv_q = None
         self.kda_conv_k = None

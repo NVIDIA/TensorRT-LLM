@@ -51,7 +51,8 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
-from ..utils import is_gdn_replay_enabled
+from ..utils import (is_gdn_flashinfer_replay_enabled,
+                     is_gdn_flashinfer_replay_required, is_gdn_replay_enabled)
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -2965,6 +2966,47 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
+def _use_gdn_flashinfer_ring_replay(use_replay: bool,
+                                    kv_cache_manager_cls: type,
+                                    mamba_params: MambaKVCacheParams,
+                                    spec_config) -> bool:
+    """Whether GDN replay should use the FlashInfer ring-buffer kernel.
+
+    Decided once at load: the ring and double-buffer history layouts differ,
+    so the kernel cannot be switched per call.
+    """
+    if not use_replay or not is_gdn_flashinfer_replay_enabled():
+        return False
+    from ..modules.fla.flashinfer_cached_replay import \
+        is_flashinfer_cached_replay_available
+
+    tokens_per_step = spec_config.tokens_per_gen_step
+    reason = None
+    if not issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+        reason = ("requires MambaHybridCacheManagerV2, got "
+                  f"{kv_cache_manager_cls.__name__}")
+    elif not is_flashinfer_cached_replay_available():
+        reason = "needs FlashInfer and an SM90/SM100/SM103 GPU"
+    elif (mamba_params.dtype != torch.bfloat16
+          or mamba_params.mamba_ssm_cache_dtype != torch.bfloat16):
+        reason = "requires bf16 model and SSM state dtypes"
+    elif mamba_params.state_size != 128 or mamba_params.head_dim != 128:
+        reason = "requires key and value head size 128"
+    elif tokens_per_step not in (4, 8):
+        reason = ("supports 4 or 8 tokens per generation step, got "
+                  f"{tokens_per_step}")
+    if reason is not None:
+        if is_gdn_flashinfer_replay_required():
+            raise RuntimeError(
+                "TRTLLM_USE_GDN_FLASHINFER_REPLAY=force but FlashInfer "
+                f"GDN replay {reason}")
+        logger.warning("TRTLLM_USE_GDN_FLASHINFER_REPLAY=1 ignored: "
+                       f"FlashInfer GDN replay {reason}; using the Triton "
+                       "replay kernel")
+        return False
+    return True
+
+
 def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
                                     is_draft: bool):
     """Align target-only PLE state with a target/draft cache layout."""
@@ -3531,10 +3573,16 @@ def _create_kv_cache_manager(
             use_replay = False
         logger.info("GDN replay state update: " +
                     ("ENABLED" if use_replay else "DISABLED"))
+        use_flashinfer_ring_replay = _use_gdn_flashinfer_ring_replay(
+            use_replay, kv_cache_manager_cls, mamba_params, spec_config)
+        if use_flashinfer_ring_replay:
+            logger.info("GDN replay kernel: FlashInfer ring buffer")
 
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if use_flashinfer_ring_replay:
+            mamba_manager_extra_kwargs["use_flashinfer_ring_replay"] = True
         if getattr(sparse_attention_config, "algorithm", None) == "qsa":
             # Resolve the side-cache shape from the same checkpoint geometry
             # used to construct the QSA index projection.
