@@ -44,7 +44,7 @@ from typing import Iterable, Sequence
 
 import yaml
 
-from agent_flow.workflows.perf_optimize.disagg_sol import CampaignLaunch, DisaggSolError
+from agent_flow.workflows.perf_optimize.disagg.sol import CampaignLaunch, DisaggSolError
 
 
 def materialize(launch: CampaignLaunch) -> Path:

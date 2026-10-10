@@ -96,8 +96,7 @@ from agent_flow.workflows.perf_optimize.disagg import (
     load_disagg_config,
     user_set_benchmark_keys,
 )
-from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
-from agent_flow.workflows.perf_optimize.sol_track import (
+from agent_flow.workflows.perf_optimize.disagg.sol_track import (
     CTX_JSON_KEY,
     GEN_TRACK,
     SOL_TRACK_FIELD,
@@ -117,6 +116,7 @@ from agent_flow.workflows.perf_optimize.sol_track import (
     sweep_path,
     track_name,
 )
+from agent_flow.workflows.perf_optimize.roadmap_schema import APPROACHES
 
 # Defaults merged under the user's values. ``target_improvement_pct`` is
 # deliberately absent: when the user does not set it, there is no
@@ -577,8 +577,8 @@ def _validate_sol_track_block(data: dict[str, Any], errors: list[str]) -> dict[s
         # Deferred, so importing this module for its key census costs nothing.
         # Reached only when a spec actually names a sweep, which is a campaign
         # being validated in a real workflow environment rather than linted.
-        from agent_flow.workflows.perf_optimize.bench_cli import BenchCliError
-        from agent_flow.workflows.perf_optimize.bench_cli import plan as sweep_plan
+        from agent_flow.workflows.perf_optimize.disagg.bench_cli import BenchCliError
+        from agent_flow.workflows.perf_optimize.disagg.bench_cli import plan as sweep_plan
 
         return sweep_plan(sweep)
     except BenchCliError as exc:

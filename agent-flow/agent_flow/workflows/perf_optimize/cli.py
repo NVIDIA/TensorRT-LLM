@@ -9,8 +9,8 @@ import yaml
 from agent_flow.workflows.perf_analyze.sol_methodology import resolve_sol_methodology
 
 from .disagg import has_disagg
+from .disagg.sol_track import track_name
 from .prompts import build_perf_optimize_prompts
-from .sol_track import track_name
 from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
@@ -123,8 +123,8 @@ def _run_disagg_sol(args) -> None:
 
     import yaml
 
-    from . import spawn
-    from .disagg_sol import DisaggSolError, supervise
+    from .disagg import spawn
+    from .disagg.sol import DisaggSolError, supervise
 
     raw = yaml.safe_load(Path(args.task).read_text(encoding="utf-8")) or {}
     block = raw.get("disagg_sol") or {}

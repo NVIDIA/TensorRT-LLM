@@ -41,7 +41,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import yaml
 
-from agent_flow.workflows.perf_optimize.bench_cli import (
+from agent_flow.workflows.perf_optimize.disagg.bench_cli import (
     GEN_ONLY_CSV,
     BenchCliError,
     ctx_cases,
@@ -49,7 +49,7 @@ from agent_flow.workflows.perf_optimize.bench_cli import (
     gen_only_points,
     operating_point,
 )
-from agent_flow.workflows.perf_optimize.sweep_design import designer_instruction, load_yaml
+from agent_flow.workflows.perf_optimize.disagg.sweep_design import designer_instruction, load_yaml
 
 DISAGG_SOL_FIELD = "disagg_sol"
 TRACKS_KEY = "tracks"
@@ -1146,7 +1146,7 @@ def supervise(
     and what was started. ``dry_run`` stops after the record, which is the
     same code path minus the processes.
     """
-    from agent_flow.workflows.perf_optimize import spawn
+    from agent_flow.workflows.perf_optimize.disagg import spawn
 
     design = design_dir(base)
     prefer = preference(base)

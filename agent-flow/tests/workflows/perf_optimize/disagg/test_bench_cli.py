@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_flow.workflows.perf_optimize import bench_cli
+from agent_flow.workflows.perf_optimize.disagg import bench_cli
 
 #: A gen sweep row, in the harness' order:
 #: [ctx, gen, tp, batch, max_num_tokens, attention_dp, gpu_mem_frac, mtp,

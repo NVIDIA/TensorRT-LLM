@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from agent_flow.workflows.perf_optimize import sweep_design
+from agent_flow.workflows.perf_optimize.disagg import sweep_design
 
 # ------------------------------------------------------------ the commands
 

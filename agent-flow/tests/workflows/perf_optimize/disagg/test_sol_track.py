@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_flow.workflows.perf_optimize import bench_cli, sol_track, task_schema
-from agent_flow.workflows.perf_optimize.sol_track import SOL_TRACK_FIELD
+from agent_flow.workflows.perf_optimize import task_schema
+from agent_flow.workflows.perf_optimize.disagg import bench_cli, sol_track
+from agent_flow.workflows.perf_optimize.disagg.sol_track import SOL_TRACK_FIELD
 
 #: A gen sweep as the config repo writes one. The row order is the
 #: harness': [ctx, gen, tp, batch, max_num_tokens, attention_dp,
