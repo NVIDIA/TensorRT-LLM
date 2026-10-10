@@ -130,7 +130,11 @@ def _read_address(path: Path) -> tuple[str, int]:
 
 
 def _request(
-    address: tuple[str, int], path: str, timeout: float, payload: dict[str, Any] | None = None
+    address: tuple[str, int],
+    path: str,
+    timeout: float,
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[int, bytes]:
     """Send one bounded HTTP request without proxies or redirect following.
 
@@ -139,6 +143,7 @@ def _request(
         path: HTTP request path.
         timeout: Total HTTP request budget in seconds.
         payload: Optional JSON POST body; otherwise send GET.
+        headers: Optional authentication headers for an isolated candidate.
 
     Returns:
         HTTP status and response bytes.
@@ -168,7 +173,7 @@ def _request(
             "POST" if payload is not None else "GET",
             path,
             body=json.dumps(payload) if payload is not None else None,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **(headers or {})},
         )
         response = connection.getresponse()
         body = response.read(_MAX_RESPONSE_BYTES + 1)

@@ -511,6 +511,13 @@ def launch_server(
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
 
+    if os.environ.get("TRTLLM_SNAPSHOT_DIR"):
+        from tensorrt_llm.serve.snapshot import validate_launch
+        validate_launch(
+            host, llm_args, metadata_server_cfg is None
+            and disagg_cluster_config is None
+            and multimodal_server_config is None and server_role is None)
+
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
     # re-execs this command line verbatim, so with port 0 every frontend binds
@@ -604,6 +611,12 @@ def launch_server(
                 media_load_workers=num_media_load_workers,
                 internal_disagg_auth_key=internal_disagg_auth_key)
             _apply_fastapi_middlewares(server.app, middleware)
+
+            if os.environ.get("TRTLLM_SNAPSHOT_DIR"):
+                from tensorrt_llm.serve.snapshot import (SnapshotAdmission,
+                                                         control_directory)
+                server.app.add_middleware(SnapshotAdmission,
+                                          directory=control_directory())
 
             # Optionally disable GC (default: not disabled)
             if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":

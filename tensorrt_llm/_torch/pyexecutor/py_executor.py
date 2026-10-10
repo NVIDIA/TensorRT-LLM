@@ -1111,6 +1111,10 @@ class PyExecutor:
 
         self.dwdp_manager = dwdp_manager
 
+        if os.environ.get("TRTLLM_SNAPSHOT_DIR"):
+            from tensorrt_llm.serve.snapshot import startup_checkpoint
+            startup_checkpoint(self)
+
         if start_worker:
             self.start_worker()
 

@@ -3,9 +3,12 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Snapshot Startup Qualification Prototype
+# Snapshot Startup Prototype
 
-This is a Phase 0 measurement tool, **not Snapshot integration or a production
+For the native capture/restore workflow, see [STANDALONE.md](STANDALONE.md).
+The sections below describe its Phase 0 measurement tool.
+
+`scripts/snapshot_probe.py` is a Phase 0 measurement tool, **not a production
 restore controller**. It launches an isolated native `trtllm-serve` candidate,
 checks HTTP health, sends deterministic completion requests, and compares a
 restore candidate against a cold baseline. No Dynamo, Kubernetes or GMS client
