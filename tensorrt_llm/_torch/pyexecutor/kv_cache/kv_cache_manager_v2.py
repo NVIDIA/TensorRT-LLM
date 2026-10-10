@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import hashlib
 import math
 import os
@@ -1228,6 +1229,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # The lender sharing.attach_* installs, one per manager for its life; None without one.
+    # On the class so it exists without running __init__.
+    _sharing = None
 
     def __init__(
         self,
@@ -3570,6 +3574,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}"
             )
+        self._after_shrink(request_id, kv_cache)
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
@@ -3600,6 +3605,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"request {req.py_request_id} from {kv_cache.capacity} "
                 f"to {pre_cap}"
             )
+        self._after_shrink(req.py_request_id, kv_cache)
         if pre_cap > 0:
             kv_cache.suspend()
         return True
@@ -4623,6 +4629,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
                         f"{self._draft_pool_diagnostic()}"
                     )
+                self._after_shrink(req.py_request_id, kv_cache)
 
             for req in scheduled_batch.generation_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
@@ -5566,14 +5573,22 @@ class KVCacheManagerV2(BaseResourceManager):
             # mirrored, and the target may release the same request twice.
             return
         if kv_cache is not None:
-            if self.sparse_metadata_batch is not None:
-                self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
-                self.sparse_metadata_batch.remove(kv_cache)
-            for beam_idx in range(int(kv_cache.beam_width)):
-                for pool_idx in range(self.num_pools):
-                    kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
+            self._detach_index_slot(kv_cache)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
+
+    def _detach_index_slot(self, kv_cache: _KVCache) -> None:
+        """Detach the cache from metadata owned by its reusable IndexMapper slot.
+
+        Args:
+            kv_cache: Live cache whose metadata must stop referencing the slot.
+        """
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.remove(kv_cache)
+        for beam_idx in range(int(kv_cache.beam_width)):
+            for pool_idx in range(self.num_pools):
+                kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -5611,12 +5626,35 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
+        if self._sharing is not None and self._sharing._on_free(
+            request.py_request_id,
+            kv_cache,
+            functools.partial(self.impl.clear_stats_excluded, request.py_request_id),
+        ):
+            self._free_lent(request.py_request_id, kv_cache)
+            return
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
         else:
             self.index_mapper.remove_sequence(request.py_request_id)
+
+    def _after_shrink(self, request_id: int, kv_cache) -> None:
+        """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
+        past its capacity lost their pages, and growing again does not bring their contents back."""
+        if self._sharing is not None:
+            self._sharing._on_shrink(request_id, kv_cache)
+
+    def _free_lent(self, request_id: int, kv_cache) -> None:
+        """Free a request whose cache is lent, leaving the cache open for the lender to close
+        after its last lease. The index slot is freed now unless an early free did, with the cache
+        detached from it first so the later close writes nothing into the slot's next owner."""
+        if request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request_id)
+            return
+        self._detach_index_slot(kv_cache)
+        self.index_mapper.remove_sequence(request_id)
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
         """Page-index scale of this layer's KV buffer. Layers in one pool can
@@ -5862,6 +5900,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        keeping_lent = self._sharing is not None and self._keep_lent_until_exit()
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
             self.sparse_metadata_batch.close()
@@ -5876,7 +5915,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # its plan, which mutates manager state.
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
-        self.impl.shutdown()
+        if not keeping_lent:
+            self.impl.shutdown()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
@@ -5884,6 +5924,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # on a closed manager, so there is no teardown-time None race.
         if isinstance(self.event_manager, StreamingKVCacheEventManager):
             self.event_manager.shutdown()
+
+    def _keep_lent_until_exit(self) -> bool:
+        """Keep every cache still lent in place, and the pools holding it, until the process exits.
+        Kept caches leave ``kv_cache_map`` so ``shutdown`` does not close them. Returns whether any
+        was kept; ``shutdown`` must then skip ``impl.shutdown()``."""
+        kept = self._sharing._on_shutdown(self.impl)
+        for request_id in [rid for rid, kv_cache in self.kv_cache_map.items() if kv_cache in kept]:
+            del self.kv_cache_map[request_id]
+        return bool(kept)
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -6349,6 +6398,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
+            if new_capacity is not None:
+                self._after_shrink(req.py_request_id, kv_cache)
             self._allocated_draft_lens.pop(req.py_request_id, None)
 
     def copy_batch_block_offsets(
