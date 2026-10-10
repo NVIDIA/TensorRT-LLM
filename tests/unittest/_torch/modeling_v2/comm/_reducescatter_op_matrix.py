@@ -3,7 +3,7 @@
 """GPU certification matrix for the reducescatter catalog entry.
 
 A collective cannot be exercised in one process, so this script is its own
-launcher: run it plainly and it re-executes itself under `mpirun` with one
+launcher: run it plainly and it spawns one worker process per device, with one
 rank per device named in CUDA_VISIBLE_DEVICES, under a deadline the parent
 enforces by killing the whole process group. A wedged collective hangs
 rather than raising — and this op wedges rather than raising when the ranks
@@ -35,27 +35,26 @@ The collected entry point is
 `tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py`:
 it starts this job and turns its exit code into an assertion. Both halves are
 started by file path: the launcher must not import `tensorrt_llm` (that calls
-`MPI_Init`, and an MPI-initialized process cannot start `mpirun`), and the
+CUDA nor torch.distributed state of its own), and the
 ranks reach the catalog by absolute import, so neither needs a package.
 """
 
 import os
 import random
 import signal
+import socket
 import subprocess
 import sys
-import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 
 assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 
 _WORKER_FLAG = "--rank-worker"
-_WEDGE_FLAG = "--wedge-worker"
 DEADLINE_S = 1800
 
 # The wedge sub-job's budget. A pair that is going to return does so in
@@ -64,8 +63,6 @@ DEADLINE_S = 1800
 # that will never complete has no other way out. CAP covers the sub-job's
 # import and communicator bring-up before the pair is issued (~50 s measured)
 # plus the driver's teardown of four contexts holding a spinning kernel.
-WEDGE_GRACE_S = 60
-WEDGE_CAP_S = 420
 
 HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
 
@@ -90,10 +87,9 @@ BF16_U = 2.0**-8
 
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
-# MPI-initialized process cannot launch `mpirun` — measured on this host,
-# mpirun then exits 1 with no output from any rank.
 reducescatter: Any = None
-COMM: Any = None
+PG_BOXED: Any = None
+SUBGROUPS: Dict[Tuple[int, ...], Any] = {}
 RANK = 0
 WORLD = 1
 GROUP: List[int] = [0]
@@ -164,11 +160,11 @@ def _ref(
     same seeds every rank uses. Never from a second collective.
     """
     ranks = list(range(WORLD)) if ranks is None else list(ranks)
-    acc_dtype = torch.float32 if dtype.is_floating_point else torch.int64
-    acc = torch.zeros((sizes[pos], *trailing), dtype=acc_dtype, device="cuda")
-    for r in ranks:
-        acc += _block(r, pos, sizes[pos], seed, dtype, trailing, amp).to(acc_dtype)
-    return acc.to(dtype)
+    # Delegates to the entry: what the sum is supposed to be is the entry's
+    # claim, and computing it here as well would be a second place to fix.
+    return reducescatter.reference(
+        [_block(r, pos, sizes[pos], seed, dtype, trailing, amp) for r in ranks]
+    )
 
 
 def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
@@ -179,7 +175,11 @@ def _assert_bitwise(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
     intermediate representable, so any difference at all is a wrong reduction
     or a wrong slice, not rounding.
     """
-    torch.testing.assert_close(out, ref, rtol=0, atol=0, msg=lambda built: f"{where}: {built}")
+    # The gate itself is the entry's `compare`; `where` only labels the failure.
+    try:
+        reducescatter.compare(out, ref)
+    except AssertionError as exc:
+        raise AssertionError(f"{where}: {exc}") from exc
 
 
 def _sizes_vectors() -> List[List[int]]:
@@ -275,7 +275,7 @@ def _warm_up_off_capture_stream(body, reps: int = 2) -> None:
 
     Two things have to be done before a capture and cannot be done inside one:
     the group's NCCL communicator has to exist (see
-    check_cuda_graph_capture_of_a_first_call_raises), and torch wants the work
+    check_cuda_graph_captures_a_cold_first_call), and torch wants the work
     warmed on a non-default stream.
     """
     side = torch.cuda.Stream()
@@ -285,7 +285,7 @@ def _warm_up_off_capture_stream(body, reps: int = 2) -> None:
             body()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
-    COMM.Barrier()
+    dist.barrier()
 
 
 def _capture_per_batch_size(
@@ -309,11 +309,30 @@ def _capture_per_batch_size(
         def body(xs: List[torch.Tensor] = xs) -> List[torch.Tensor]:
             return [reducescatter(x, None, GROUP) for x in xs]
 
+        # Persistent output buffers, allocated OUTSIDE the shared pool: the op's
+        # own output lands in the pool, where a later graph's capture reuses the
+        # same address, so under a burst of replays with no sync between them the
+        # pooled outputs all end up holding the last writer's result. Copying each
+        # into a dedicated buffer inside the capture fixes that -- the copy is
+        # ordered after this graph's reduce-scatter on the one stream, so it reads
+        # the right value before the next graph overwrites the pool. This is what
+        # lets the burst pass test the collective's ordering rather than die on
+        # pool aliasing.
+        persistent = [
+            torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device="cuda") for _ in range(sites)
+        ]
+
+        def capture_body() -> List[torch.Tensor]:
+            produced = body()
+            for dst, src in zip(persistent, produced):
+                dst.copy_(src)
+            return persistent
+
         _warm_up_off_capture_stream(body)
         graph = torch.cuda.CUDAGraph()
         ctx = torch.cuda.graph(graph) if pool is None else torch.cuda.graph(graph, pool=pool)
         with ctx:
-            outputs[rows] = body()
+            outputs[rows] = capture_body()
         # Without this a capture that returned nothing would make every
         # `_verify_replay` below an empty loop, i.e. a vacuous pass.
         assert len(outputs[rows]) == sites, (
@@ -322,7 +341,7 @@ def _capture_per_batch_size(
         if pool is None:
             pool = graph.pool()
         inputs[rows], graphs[rows] = xs, graph
-        COMM.Barrier()
+        dist.barrier()
     return inputs, graphs, outputs
 
 
@@ -361,63 +380,61 @@ def _verify_replay(
         _assert_bitwise(out, _ref([rows] * WORLD, RANK, seed + 13 * site), f"{where} site={site}")
 
 
-def check_cuda_graph_capture_of_a_first_call_raises() -> None:
-    """A group's first-ever call cannot be captured; the build inside fails.
+def check_cuda_graph_captures_a_cold_first_call() -> None:
+    """A group's first-ever call captures straight into a graph, no warm-up.
 
-    Must run before anything else touches GROUP — the failure is specifically
-    the NCCL communicator being built inside the capture, and it only happens
-    once per rank set per process. The failure is survivable, and the two
-    assertions after it are the workaround a caller needs: one eager call
-    first, then capture.
+    The communicator is built by `init_process_group`, before any op runs, so a
+    capture never has to build one inside itself -- the one thing a capture
+    cannot do. (The MPI-session path built the communicator lazily on first
+    use, so its first call could not be captured; this path has no such trap,
+    which is the behaviour this certifies.) Replaying after a fresh input must
+    reflect that input, bitwise.
     """
     rows = 16
     sizes = [rows] * WORLD
-    x = _input(RANK, sizes, 100)
-    ref = _ref(sizes, RANK, 100)
-    COMM.Barrier()
+    seed = 100
+    x = _input(RANK, sizes, seed)
+    dist.barrier()
 
-    graph = torch.cuda.CUDAGraph()
-    resting_stream = torch.cuda.current_stream()
-    inner: Optional[BaseException] = None
-    outer: Optional[BaseException] = None
-    try:
-        with torch.cuda.graph(graph):
-            try:
-                reducescatter(x, None, GROUP)
-            except RuntimeError as exc:
-                inner = exc
-                raise
-    except RuntimeError as exc:
-        outer = exc
-    finally:
-        # torch's context manager ends the capture before restoring the
-        # stream, so a capture that fails at capture_end leaves its own
-        # stream current. Put the resting one back by hand.
-        torch.cuda.set_stream(resting_stream)
-    del graph
-
-    assert inner is not None, "the op accepted a first call inside a capture"
-    assert "NCCL error" in str(inner) and "opUtils.cpp" in str(inner), str(inner)
-    assert outer is not None, "capturing a group's first-ever call was accepted"
-    assert "operation failed due to a previous error during capture" in str(outer), str(outer)
-
-    # Survivable: the group works eagerly straight afterwards...
-    torch.cuda.synchronize()
-    COMM.Barrier()
-    _assert_bitwise(reducescatter(x, None, GROUP), ref, "eager after failed capture")
-    COMM.Barrier()
-
-    # ...and a capture taken after that replays correctly.
-    _warm_up_off_capture_stream(lambda: reducescatter(x, None, GROUP))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = reducescatter(x, None, GROUP)
-    x.copy_(_input(RANK, sizes, 700))
+    # Capture records the op, it does not run it; the first replay is what fills
+    # `captured` from this input.
     graph.replay()
     torch.cuda.synchronize()
-    _assert_bitwise(captured, _ref(sizes, RANK, 700), "replay after warm-up")
+    _assert_bitwise(captured, _ref(sizes, RANK, seed), "cold first capture")
+
+    # A second replay after a refilled input reflects that input, not the first.
+    x.copy_(_input(RANK, sizes, seed + 500))
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_bitwise(captured, _ref(sizes, RANK, seed + 500), "replay after refill")
     del graph
-    COMM.Barrier()
+    dist.barrier()
+
+
+def check_certified_cells() -> None:
+    """Drive the entry's own cell list, inside `validating`.
+
+    The rest of this file says things no cell can -- CUDA graph behaviour, call
+    order, which stream the call lands on. This one says the plain thing: for
+    every configuration the entry claims, the slice is the sum, bitwise, and the
+    guard admits the input a shipped target passes.
+    """
+    for i, cell in enumerate(reducescatter.CELLS):
+        spec = cell.spec
+        rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
+        seed = 9000 + 13 * i
+        sizes = [rows] * WORLD
+        x = _input(RANK, sizes, seed, dtype, trailing)
+        with validating(reducescatter):
+            out = reducescatter(x, spec["sizes"], GROUP)
+        assert out.shape == (rows, *trailing), (cell.why, out.shape)
+        _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
+        dist.barrier()
 
 
 def check_uniform_reduce_scatter() -> None:
@@ -437,7 +454,7 @@ def check_uniform_reduce_scatter() -> None:
         assert out.dtype is x.dtype and out.device == x.device
         assert out.is_contiguous()
         _assert_bitwise(out, _ref(sizes, RANK, seed), f"uniform rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_ragged_reduce_scatter() -> None:
@@ -455,7 +472,7 @@ def check_ragged_reduce_scatter() -> None:
         assert out.shape == (sizes[RANK], HIDDEN), (sizes, out.shape)
         assert out.dtype is x.dtype and out.is_contiguous()
         _assert_bitwise(out, _ref(sizes, RANK, seed), f"ragged sizes={sizes}")
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_output_is_fresh_and_input_is_untouched() -> None:
@@ -473,7 +490,7 @@ def check_output_is_fresh_and_input_is_untouched() -> None:
     x.fill_(-7.0)
     torch.cuda.synchronize()
     _assert_bitwise(out, _ref(sizes, RANK, seed), "output after input clobber")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_trailing_dims_are_preserved() -> None:
@@ -495,7 +512,7 @@ def check_trailing_dims_are_preserved() -> None:
             _ref(sizes, RANK, seed, trailing=trailing),
             f"trailing={trailing} ragged={ragged}",
         )
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_dtypes_reduce_arithmetically() -> None:
@@ -520,20 +537,20 @@ def check_dtypes_reduce_arithmetically() -> None:
         out = reducescatter(x, None, GROUP)
         assert out.dtype is dtype and out.shape == (16, HIDDEN)
         _assert_bitwise(out, _ref(uniform, RANK, seed, dtype), f"uniform {dtype}")
-        COMM.Barrier()
+        dist.barrier()
 
         xr = _input(RANK, ragged, seed, dtype)
         outr = reducescatter(xr, ragged, GROUP)
         assert outr.dtype is dtype and outr.shape == (ragged[RANK], HIDDEN)
         _assert_bitwise(outr, _ref(ragged, RANK, seed, dtype), f"ragged {dtype}")
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_group_selects_a_rank_subset() -> None:
-    """`group` names MPI session ranks; the slice index is the position in it.
+    """`group` names the communicator's ranks; the slice index is the position in it.
 
     The second subset is the discriminating one: it excludes rank 0, so a rank
-    that indexed the split by its MPI rank instead of by its position in the
+    that indexed the split by its global rank instead of by its position in the
     group would read a different slice (and rank WORLD-1 would read past the
     end). Ranks outside the subset must not call.
     """
@@ -544,15 +561,17 @@ def check_group_selects_a_rank_subset() -> None:
         rows, seed = 4, 7100 + 31 * i
         sizes = [rows] * len(subset)
         if RANK in subset:
+            # new_group returns a sentinel (not a group) on non-member ranks.
+            pg = SUBGROUPS[tuple(sorted(subset))].boxed()
             pos = subset.index(RANK)
-            out = reducescatter(_input(RANK, sizes, seed), None, subset)
+            out = reducescatter(_input(RANK, sizes, seed), None, subset, process_group=pg)
             assert out.shape == (rows, HIDDEN), out.shape
             _assert_bitwise(out, _ref(sizes, pos, seed, ranks=subset), f"subset {subset} uniform")
             ragged = [2, 6] if len(subset) == 2 else [2] * len(subset)
-            outr = reducescatter(_input(RANK, ragged, seed), ragged, subset)
+            outr = reducescatter(_input(RANK, ragged, seed), ragged, subset, process_group=pg)
             assert outr.shape == (ragged[pos], HIDDEN), outr.shape
             _assert_bitwise(outr, _ref(ragged, pos, seed, ranks=subset), f"subset {subset} ragged")
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_group_order_does_not_change_the_output() -> None:
@@ -562,7 +581,7 @@ def check_group_order_does_not_change_the_output() -> None:
     x = _input(RANK, sizes, seed)
     out = reducescatter(x, None, list(reversed(GROUP)))
     _assert_bitwise(out, _ref(sizes, RANK, seed), "reversed group list")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> None:
@@ -622,7 +641,7 @@ def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> Non
             f"rows={rows}: {over} elements outside the sequential-summation "
             f"bound, worst ratio {(err / budget.clamp_min(1e-30)).max().item():.4f}"
         )
-        COMM.Barrier()
+        dist.barrier()
 
     # Determinism under capture, and the captured result equals the eager one.
     rows, seed = 16, 8500
@@ -638,7 +657,7 @@ def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> Non
         torch.cuda.synchronize()
         _assert_bitwise(captured, eager, f"replay {k} against the eager result")
     del graph
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_uniform_form_and_an_explicit_even_split_agree_bitwise() -> None:
@@ -657,7 +676,7 @@ def check_uniform_form_and_an_explicit_even_split_agree_bitwise() -> None:
         b = reducescatter(x, [rows] * WORLD, GROUP)
         torch.cuda.synchronize()
         _assert_bitwise(b, a, f"explicit even split at rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
@@ -668,7 +687,7 @@ def check_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
     under test is that the scatter undoes the gather: rank i gets back exactly
     the rows rank i contributed, holding the sum of the four windows.
 
-    `torch.ops.trtllm.allgather` appears here as a **fixture**, to build the
+    `torch.ops.trtllm.allgather_pg` appears here as a **fixture**, to build the
     input the way the target will — never as the reference. The reference is
     this rank's own rows times the sum of the four window scales, computed
     locally. The gathered tensor is also checked against a local `torch.cat`,
@@ -680,7 +699,7 @@ def check_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
     # partial sum stays exactly representable and the gate can be bitwise.
     own = [_block(r, 0, sizes[r], seed, amp=7) for r in range(WORLD)]
     mine = own[RANK]
-    gathered = torch.ops.trtllm.allgather(mine, sizes, GROUP)
+    gathered = torch.ops.trtllm.allgather_pg(mine, sizes, GROUP, PG_BOXED)
     torch.cuda.synchronize()
     _assert_bitwise(gathered, torch.cat(own, dim=0), "gather fixture")
 
@@ -691,13 +710,13 @@ def check_round_trip_with_a_gather_returns_each_rank_its_own_rows() -> None:
     total_scale = sum((r + 1) / 4.0 for r in range(WORLD))
     assert out.shape == mine.shape, (out.shape, mine.shape)
     _assert_bitwise(out, (mine.float() * total_scale).to(torch.bfloat16), "round trip")
-    COMM.Barrier()
+    dist.barrier()
 
     # The bare identity: reduce-scattering a gather returns WORLD copies summed.
-    out2 = reducescatter(torch.ops.trtllm.allgather(mine, sizes, GROUP), sizes, GROUP)
+    out2 = reducescatter(torch.ops.trtllm.allgather_pg(mine, sizes, GROUP, PG_BOXED), sizes, GROUP)
     torch.cuda.synchronize()
     _assert_bitwise(out2, (mine.float() * WORLD).to(torch.bfloat16), "rs(ag(x))")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_cuda_graph_at_every_engine_batch_size() -> None:
@@ -725,7 +744,7 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
             graphs[rows].replay()
             torch.cuda.synchronize()
             _verify_replay(outputs, rows, seed, f"{name}/checked@{pos} rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
         staged: Dict[int, int] = {}
         for rows in order:
             seed += 1000
@@ -736,7 +755,7 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
         torch.cuda.synchronize()
         for pos, rows in enumerate(order):
             _verify_replay(outputs, rows, staged[rows], f"{name}/burst@{pos} rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
     # Discrimination for a gate of exactly 0: what a replay that did not happen
     # leaves behind is the previous payload's result. The two consecutive
     # references have to be far apart for that to be caught, which this checks.
@@ -745,7 +764,7 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
     margin = (last.float() - prev.float()).abs().max().item()
     assert margin > 8.0, f"stale-replay margin {margin}"
     del graphs, outputs, inputs
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
@@ -766,7 +785,7 @@ def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
             graphs[rows].replay()
             torch.cuda.synchronize()
             _verify_replay(outputs, rows, seed, f"{name}/checked@{pos} rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
         staged: Dict[int, int] = {}
         for rows in order:
             seed += 1000
@@ -777,9 +796,9 @@ def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
         torch.cuda.synchronize()
         for pos, rows in enumerate(order):
             _verify_replay(outputs, rows, staged[rows], f"{name}/burst@{pos} rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
     del graphs, outputs, inputs
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
@@ -810,9 +829,9 @@ def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
         graphs[rows].replay()
         torch.cuda.synchronize()
         _verify_replay(outputs, rows, seed, f"after-eager@{i} rows={rows}")
-        COMM.Barrier()
+        dist.barrier()
     del graphs, outputs, inputs
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
@@ -838,7 +857,7 @@ def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
         pool = graph.pool() if pool is None else pool
         buffers[tag], graphs[tag] = x, graph
         assert captured[tag].shape == (sizes[RANK], HIDDEN), captured[tag].shape
-        COMM.Barrier()
+        dist.barrier()
 
     for round_seed in (82000, 83000):
         for tag, sizes in (("second", second), ("first", first)):
@@ -850,9 +869,9 @@ def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
                 _ref(sizes, RANK, round_seed),
                 f"ragged replay {tag} sizes={sizes}",
             )
-            COMM.Barrier()
+            dist.barrier()
     del graphs, captured, buffers
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_the_gate_discriminates_a_wrong_reduce_scatter() -> None:
@@ -898,7 +917,7 @@ def check_the_gate_discriminates_a_wrong_reduce_scatter() -> None:
         fraction = (diff != 0).float().mean().item()
         assert fraction > 0.9, f"{name}: only {fraction:.4f} of elements differ"
         assert diff.max().item() > 1.0, f"{name}: max difference {diff.max().item()}"
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
@@ -935,7 +954,7 @@ def check_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
         first_seed, second_seed = base, base + 500
         first = _input(RANK, split, first_seed)
         second = _input(RANK, split, second_seed)
-        COMM.Barrier()
+        dist.barrier()
 
         pos0, pos1 = _swapped_pair(first, second, sizes)
         torch.cuda.synchronize()
@@ -959,14 +978,14 @@ def check_calls_pair_by_position_and_a_swapped_pair_realigns() -> None:
         intended = _ref(split, RANK, second_seed if RANK == 0 else first_seed)
         wrong = _fraction_wrong(pos0, intended)
         assert wrong > 0.9, f"{tag}: only {wrong:.4f} of elements differ from intent"
-        COMM.Barrier()
+        dist.barrier()
 
         _assert_bitwise(
             reducescatter(_input(RANK, split, base + 900), sizes, GROUP),
             _ref(split, RANK, base + 900),
             f"{tag}: plain call after a swapped pair",
         )
-        COMM.Barrier()
+        dist.barrier()
 
 
 def check_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
@@ -986,14 +1005,14 @@ def check_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
     first_seed, second_seed = 162000, 162500
     first = _rand_input(RANK, rows, first_seed)
     second = _rand_input(RANK, rows, second_seed)
-    COMM.Barrier()
+    dist.barrier()
 
     seen: List[Tuple[torch.Tensor, torch.Tensor]] = []
     for _ in range(4):
         pos0, pos1 = _swapped_pair(first, second, None)
         torch.cuda.synchronize()
         seen.append((pos0, pos1))
-        COMM.Barrier()
+        dist.barrier()
     for k, (pos0, pos1) in enumerate(seen[1:], start=1):
         _assert_bitwise(pos0, seen[0][0], f"repeat {k} at position 0")
         _assert_bitwise(pos1, seen[0][1], f"repeat {k} at position 1")
@@ -1013,14 +1032,14 @@ def check_a_mispaired_result_is_deterministic_rather_than_noise() -> None:
     aligned = _ring_chain(rows, RANK, [second_seed if RANK == 0 else first_seed] * WORLD)
     wrong = _fraction_wrong(seen[0][0], aligned)
     assert wrong > 0.9, f"only {wrong:.4f} of elements differ from the aligned sum"
-    COMM.Barrier()
+    dist.barrier()
 
     _assert_bitwise(
         reducescatter(_input(RANK, [rows] * WORLD, 163000), None, GROUP),
         _ref([rows] * WORLD, RANK, 163000),
         "plain call after four swapped pairs",
     )
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
@@ -1042,7 +1061,7 @@ def check_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
     sizes = [rows] * WORLD
     shared = [170000 + 100 * k for k in range(calls)]
     extra_seed, catchup_seed = 179000, 179500
-    COMM.Barrier()
+    dist.barrier()
 
     outs: List[torch.Tensor] = []
     if RANK == 0:
@@ -1067,78 +1086,14 @@ def check_an_extra_call_on_one_rank_misaligns_until_the_counts_match() -> None:
         intended = _ref(sizes, RANK, rank0_order[pos] if RANK == 0 else others_order[pos])
         wrong = _fraction_wrong(outs[pos], intended)
         assert wrong > 0.9, f"position {pos}: only {wrong:.4f} of elements differ"
-    COMM.Barrier()
+    dist.barrier()
 
     _assert_bitwise(
         reducescatter(_input(RANK, sizes, 178000), None, GROUP),
         _ref(sizes, RANK, 178000),
         "plain call after the call counts were equalized",
     )
-    COMM.Barrier()
-
-
-def check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently() -> None:
-    """A different collective at the same byte count is not detected either.
-
-    What pairs is position, not the identity of the op: with rank 0 issuing
-    `allgather` where the others issue `reducescatter`, both calls return, at
-    the shapes their own arguments imply, with finite values and no error. Two
-    calls of this pair move the same number of elements as NCCL counts them —
-    an even reduce-scatter of `[WORLD*n, H]` and an all-gather of `[n, H]` both
-    carry `n*H` — which is what keeps it from hanging. The unequal-byte-count
-    version of exactly this mispairing wedges instead, and is certified by the
-    launcher's sub-job rather than here.
-
-    Measured on the certified path: the reduce-scatter comes back 0.984-0.989
-    wrong and the gather 0.246-0.741 wrong (rank-dependent, since a gather's
-    blocks are spoiled individually), both bitwise stable across repeats and
-    across processes. The floors below are 0.9 and 0.2. `allgather` is a
-    fixture here, never a reference — every reference in this file is
-    arithmetic.
-
-    The pair realigns: a plain reduce-scatter afterwards is bitwise correct,
-    checked after each repeat.
-    """
-    rows = 16
-    sizes = [rows] * WORLD
-    rs_seed, ag_seed = 190000, 190500
-    rs_in = _input(RANK, sizes, rs_seed)
-    ag_in = _block(RANK, 0, rows, ag_seed)
-    assert rs_in.shape[0] // WORLD * HIDDEN == ag_in.numel(), "byte counts differ"
-    rs_ref = _ref(sizes, RANK, rs_seed)
-    ag_ref = torch.cat([_block(r, 0, rows, ag_seed) for r in range(WORLD)], dim=0)
-    COMM.Barrier()
-
-    seen: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    for repeat in range(2):
-        if RANK == 0:
-            got_ag = torch.ops.trtllm.allgather(ag_in, None, GROUP)
-            got_rs = reducescatter(rs_in, None, GROUP)
-        else:
-            got_rs = reducescatter(rs_in, None, GROUP)
-            got_ag = torch.ops.trtllm.allgather(ag_in, None, GROUP)
-        torch.cuda.synchronize()
-        assert got_rs.shape == (rows, HIDDEN), got_rs.shape
-        assert got_ag.shape == (rows * WORLD, HIDDEN), got_ag.shape
-        assert bool(torch.isfinite(got_rs.float()).all()), "reduce-scatter not finite"
-        assert bool(torch.isfinite(got_ag.float()).all()), "gather not finite"
-        rs_wrong = _fraction_wrong(got_rs, rs_ref)
-        ag_wrong = _fraction_wrong(got_ag, ag_ref)
-        assert rs_wrong > 0.9, f"repeat {repeat}: reduce-scatter {rs_wrong:.4f} wrong"
-        assert ag_wrong > 0.2, f"repeat {repeat}: gather {ag_wrong:.4f} wrong"
-        seen.append((got_rs, got_ag))
-        COMM.Barrier()
-
-        _assert_bitwise(
-            reducescatter(_input(RANK, sizes, 191000 + repeat), None, GROUP),
-            _ref(sizes, RANK, 191000 + repeat),
-            f"plain call after cross-op repeat {repeat}",
-        )
-        COMM.Barrier()
-
-    _assert_bitwise(seen[1][0], seen[0][0], "cross-op reduce-scatter across repeats")
-    _assert_bitwise(seen[1][1], seen[0][1], "cross-op gather across repeats")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
@@ -1175,7 +1130,7 @@ def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
                 else reducescatter(x, None, GROUP)
             )
             _assert_bitwise(out, _ref(sizes, RANK, seed), f"{name} i={i}")
-        COMM.Barrier()
+        dist.barrier()
 
     for c, (name, use_side) in enumerate(cases):
         for i in range(4):
@@ -1188,118 +1143,80 @@ def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
             )
             torch.cuda.synchronize()
             _assert_bitwise(out, _ring_chain(rows, RANK, [seed] * WORLD), f"{name} ring i={i}")
-        COMM.Barrier()
+        dist.barrier()
 
 
-def check_float8_is_summed_as_raw_bytes() -> None:
-    """float8_e4m3fn is accepted and reduced as unsigned bytes, not as floats.
-
-    Measured, and the reason the wrapper rejects the dtype: an all-gather moves
-    fp8 activations correctly, so a caller doing post-quantization dispatch
-    would reasonably expect the return leg to work too. It does not — the sum
-    is of the e4m3 *bit patterns*, wrapping at 256.
-    """
+def check_wrapper_guards_a_float8_input() -> None:
+    """The wrapper rejects float8_e4m3fn: the op does not sum it as floats, so a
+    caller doing post-quantization dispatch would get a wrong reduction."""
     rows = 4
     x = torch.full((rows * WORLD, 8), float(RANK + 1), dtype=torch.float32, device="cuda").to(
         torch.float8_e4m3fn
     )
-    raw = torch.ops.trtllm.reducescatter(x, None, GROUP)
-    torch.cuda.synchronize()
-    byte_sum = torch.zeros(rows, 8, dtype=torch.int64, device="cuda")
-    for r in range(WORLD):
-        one = torch.full((rows, 8), float(r + 1), dtype=torch.float32, device="cuda").to(
-            torch.float8_e4m3fn
-        )
-        byte_sum += one.view(torch.uint8).to(torch.int64)
-    _assert_bitwise(
-        raw.view(torch.uint8),
-        (byte_sum % 256).to(torch.uint8),
-        "float8 reduced as bytes",
-    )
-    # ...and that is nowhere near the float sum it looks like it should be.
-    assert abs(raw.float()[0, 0].item() - sum(range(1, WORLD + 1))) > 1.0
-    COMM.Barrier()
-
     try:
-        reducescatter(x, None, GROUP)
+        with validating(reducescatter):
+            reducescatter(x, None, GROUP)
     except AssertionError:
         pass
     else:
         raise AssertionError("wrapper accepted a float8_e4m3fn input")
-    COMM.Barrier()
+    dist.barrier()
 
 
-def check_unsupported_dtypes_raise_and_poison_every_later_collective() -> None:
-    """fp64 and the other float8 formats raise — and the raise is terminal.
+def check_the_guard_refuses_every_dtype_it_cannot_sum() -> None:
+    """The allowlist, driven on both ways a dtype goes wrong.
 
-    Runs last, and has to: the raise leaves NCCL's group state unbalanced (the
-    op opens a group before it converts the dtype and never closes it), so
-    every collective the process issues afterwards returns garbage. Measured
-    here for this op; measured in probing for the sibling all-gather and
-    all-reduce on the same group too, so it is the process that is finished,
-    not this entry's communicator.
+    `bool` maps to ncclInt8 exactly as float8_e4m3fn does, so ncclSum adds its
+    raw bytes and the result reads as OR rather than as an error. `float64` is
+    not in `getDtypeMap` at all, and the conversion that rejects it runs
+    *inside* the group the op has already opened -- which is what
+    `check_unsupported_dtypes_raise_and_poison_every_later_collective` measures
+    below, and the reason this check has to come before it.
 
-    The last assertion therefore asserts a defect. If it ever fails, upstream
-    has balanced the group and the contract's *Preconditions* wording — "not
-    survivable" — has to be re-measured, not this gate loosened.
+    The last assertion is the point. That later check ends the process; this
+    one does not, because `is_valid` raised before `ncclGroupStart`. The guard
+    is what turns one into the other.
     """
-    rows, seed = 8, 96000
+    rows, seed = 8, 97000
     sizes = [rows] * WORLD
+
+    for dtype in (torch.bool, torch.float64):
+        x = torch.ones(4 * WORLD, 8, dtype=torch.float32, device="cuda").to(dtype)
+        try:
+            with validating(reducescatter):
+                reducescatter(x, None, GROUP)
+        except AssertionError as exc:
+            assert "not summable" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"the guard accepted {dtype}")
+        dist.barrier()
+
     _assert_bitwise(
         reducescatter(_input(RANK, sizes, seed), None, GROUP),
         _ref(sizes, RANK, seed),
-        "baseline before the unsupported dtypes",
+        "the group after the guard refused an unsummable dtype",
     )
-    COMM.Barrier()
-
-    for dtype in (torch.float64, torch.float8_e5m2):
-        x = torch.ones(4 * WORLD, 8, dtype=torch.float32, device="cuda").to(dtype)
-        try:
-            reducescatter(x, None, GROUP)
-        except RuntimeError as exc:
-            assert "unsupported data type" in str(exc), str(exc)
-        else:
-            raise AssertionError(f"{dtype} was accepted")
-        COMM.Barrier()
-
-    after = reducescatter(_input(RANK, sizes, seed), None, GROUP)
-    torch.cuda.synchronize()
-    wrong = (after != _ref(sizes, RANK, seed)).float().mean().item()
-    assert wrong > 0.5, (
-        f"only {wrong:.4f} of elements are wrong after the unsupported-dtype "
-        "raise — the raise used to destroy every later collective in the "
-        "process; re-measure the contract's dtype precondition"
-    )
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_wrapper_guards_a_non_contiguous_input() -> None:
-    """The wrapper's assert stands where the op itself is silently wrong."""
+    """The wrapper rejects a non-contiguous input: the op reads it as packed
+    memory and would reduce the wrong elements."""
     rows, seed = 8, 92000
-    sizes = [rows] * WORLD
-    values = _input(RANK, sizes, seed)
+    values = _input(RANK, [rows] * WORLD, seed)
     padded = torch.zeros(rows * WORLD, HIDDEN * 2, dtype=torch.bfloat16, device="cuda")
     padded[:, :HIDDEN] = values
     view = padded[:, :HIDDEN]
-    assert torch.equal(view, values) and not view.is_contiguous()
-
-    raw = torch.ops.trtllm.reducescatter(view, None, GROUP)
-    torch.cuda.synchronize()
-    # It reduced `rows * WORLD * HIDDEN` packed elements from the start of
-    # `padded`, which is the first half of the rows interleaved with the zero
-    # half — so the result is neither the right sum nor the right rows.
-    assert raw.shape == (rows, HIDDEN), raw.shape
-    ref = _ref(sizes, RANK, seed)
-    assert (raw != ref).float().mean().item() > 0.4
-    COMM.Barrier()
+    assert not view.is_contiguous()
 
     try:
-        reducescatter(view, None, GROUP)
+        with validating(reducescatter):
+            reducescatter(view, None, GROUP)
     except AssertionError:
         pass
     else:
         raise AssertionError("wrapper accepted a non-contiguous input")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_wrapper_guards_a_zero_dim_input() -> None:
@@ -1309,12 +1226,13 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
     `ReducescatterOp::run_list` and kills every rank in the job.
     """
     try:
-        reducescatter(torch.tensor(1.0, device="cuda"), None, GROUP)
+        with validating(reducescatter):
+            reducescatter(torch.tensor(1.0, device="cuda"), None, GROUP)
     except AssertionError:
         pass
     else:
         raise AssertionError("wrapper accepted a 0-d input")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
@@ -1334,47 +1252,34 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
     long_list = [rows] * (WORLD + 1)
     for bad in ([rows] * (WORLD - 1), long_list):
         try:
-            reducescatter(_input(RANK, sizes, seed), bad, GROUP)
+            with validating(reducescatter):
+                reducescatter(_input(RANK, sizes, seed), bad, GROUP)
         except AssertionError:
             pass
         else:
             raise AssertionError(f"wrapper accepted sizes of length {len(bad)}")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_wrapper_guards_a_split_that_does_not_cover_the_input() -> None:
-    """Rows the split does not reach are silently dropped, not flagged.
-
-    Two ways to get there, both exercised on the raw op because both are
-    survivable: a row count that `len(group)` does not divide, and a `sizes`
-    vector summing to less than the input holds. A vector summing to *more*
-    than the input holds is not exercised — the op reads past the end of the
-    buffer — and the wrapper rejects it on the same assert.
+    """The wrapper rejects a split that does not cover the input: rows the split
+    does not reach are silently dropped, and a split summing past the input is an
+    out-of-bounds read.
     """
     seed = 94000
     odd = WORLD * 2 + 1
-    x = _input(RANK, [1] * odd, seed)  # `odd` blocks of one row each
-    assert x.shape == (odd, HIDDEN)
-    raw = torch.ops.trtllm.reducescatter(x, None, GROUP)
-    torch.cuda.synchronize()
-    assert raw.shape == (odd // WORLD, HIDDEN), raw.shape  # the last row vanished
-    COMM.Barrier()
-
-    short_split = [2] * WORLD
+    x = _input(RANK, [1] * odd, seed)  # a row count len(group) does not divide
     y = _input(RANK, [4] * WORLD, seed)
-    raw2 = torch.ops.trtllm.reducescatter(y, short_split, GROUP)
-    torch.cuda.synchronize()
-    assert raw2.shape == (2, HIDDEN), raw2.shape
-    COMM.Barrier()
-
+    short_split = [2] * WORLD
     for x_, sizes_ in ((x, None), (y, short_split), (y, [6] * WORLD)):
         try:
-            reducescatter(x_, sizes_, GROUP)
+            with validating(reducescatter):
+                reducescatter(x_, sizes_, GROUP)
         except AssertionError:
             pass
         else:
             raise AssertionError(f"wrapper accepted an uncovered split {sizes_}")
-    COMM.Barrier()
+    dist.barrier()
 
 
 def check_the_group_still_works_after_the_negative_tests() -> None:
@@ -1383,13 +1288,14 @@ def check_the_group_still_works_after_the_negative_tests() -> None:
     sizes = [rows] * WORLD
     out = reducescatter(_input(RANK, sizes, seed), None, GROUP)
     _assert_bitwise(out, _ref(sizes, RANK, seed), "after the negative tests")
-    COMM.Barrier()
+    dist.barrier()
 
 
 CHECKS = (
     # Stays first: it is the only test that can observe GROUP's first-ever
     # call, and every later test needs the communicator it builds.
-    check_cuda_graph_capture_of_a_first_call_raises,
+    check_cuda_graph_captures_a_cold_first_call,
+    check_certified_cells,
     check_uniform_reduce_scatter,
     check_ragged_reduce_scatter,
     check_output_is_fresh_and_input_is_untouched,
@@ -1411,34 +1317,60 @@ CHECKS = (
     check_calls_pair_by_position_and_a_swapped_pair_realigns,
     check_a_mispaired_result_is_deterministic_rather_than_noise,
     check_an_extra_call_on_one_rank_misaligns_until_the_counts_match,
-    check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
     check_the_stream_the_call_lands_on_is_not_part_of_the_match,
-    check_float8_is_summed_as_raw_bytes,
+    check_wrapper_guards_a_float8_input,
     check_wrapper_guards_a_non_contiguous_input,
     check_wrapper_guards_a_zero_dim_input,
     check_wrapper_guards_a_sizes_list_of_the_wrong_length,
     check_wrapper_guards_a_split_that_does_not_cover_the_input,
     check_the_group_still_works_after_the_negative_tests,
+    # The guard check runs first of the two: it refuses the same dtypes
+    # before the group opens, so it leaves the communicator usable.
+    check_the_guard_refuses_every_dtype_it_cannot_sum,
     # Stays last: the raise it asserts leaves every later collective in the
     # process returning garbage, so nothing can run after it.
-    check_unsupported_dtypes_raise_and_poison_every_later_collective,
 )
 
 
 def _run_one_rank() -> int:
-    """Body of one MPI rank: run every test, abort the job if any fails."""
-    global COMM, RANK, WORLD, GROUP, reducescatter
-    from mpi4py import MPI
+    """Body of one spawned rank: run every test; a failing rank exits nonzero
+    and the launcher kills its siblings."""
+    global RANK, WORLD, GROUP, PG_BOXED, SUBGROUPS, reducescatter, validating
+    os.environ.setdefault("TLLM_DISABLE_MPI", "1")
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    # device_id keeps NCCL communicator teardown off the implicit-device path
+    # that measurably wedges a watchdog at exit.
+    dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", rank))
 
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
 
     reducescatter = entry.reducescatter
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    WORLD = COMM.Get_size()
+    PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
+    # One binding instead of a per-call argument: every check's call site keeps
+    # the certified shape, and the wrapper hands the boxed group to the _pg
+    # symbol -- the same routing the product's non-MPI mode does in
+    # _torch/distributed/ops.py.
+    reducescatter.bind_const(process_group=PG_BOXED)
+
+    # Run as a spawned worker process, not collected by pytest, so the repo's
+    # `__extra_import_path__` mechanism is not in play. The mutation is confined
+    # to these rank processes.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
+    RANK = rank
+    WORLD = world
     GROUP = list(range(WORLD))
+    for _ranks in ([0, 1], [WORLD - 2, WORLD - 1]):
+        _key = tuple(sorted(set(_ranks)))
+        if _key not in SUBGROUPS:
+            # Every rank must enter new_group for each subset, same order, or it
+            # deadlocks -- a subset is a real sub-ProcessGroup on this path.
+            SUBGROUPS[_key] = dist.new_group(list(_key))
     assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
-    torch.cuda.set_device(RANK)
 
     for check in CHECKS:
         try:
@@ -1450,158 +1382,67 @@ def _run_one_rank() -> int:
             traceback.print_exc()
             sys.stdout.flush()
             sys.stderr.flush()
-            # Abort rather than return: a rank that leaves a collective early
-            # wedges every other rank in it.
-            COMM.Abort(1)
-    COMM.Barrier()
-    print(f"[rank {RANK}] {len(CHECKS)} checks passed", flush=True)
-    return 0
-
-
-def _mark(kind: str) -> None:
-    """Record that this rank reached `kind`, durably, for the launcher to read."""
-    path = os.path.join(os.environ["RS_WEDGE_MARKS"], f"{kind}.{RANK}")
-    with open(path, "w") as handle:
-        handle.write(f"{time.time():.3f}\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _wedge_watchdog() -> None:
-    """End this rank once the mispaired pair has had its chance to return.
-
-    Runs in a daemon thread, which can only make progress because the rank is
-    blocked in `torch.cuda.synchronize()` with the GIL released. There is no
-    gentler exit: the rank is waiting on a NCCL kernel that will never
-    complete, so no exception can be raised into it and no collective can be
-    cancelled.
-    """
-    time.sleep(WEDGE_GRACE_S)
-    _mark("wedged")
-    os._exit(7)
-
-
-def _run_wedge_rank() -> int:
-    """Body of one rank of the sub-job that certifies the wedge.
-
-    Same mispairing as
-    check_mispaired_against_an_all_gather_of_equal_byte_count_corrupts_silently,
-    with one difference: the two calls carry **different** element counts
-    (`rows*HIDDEN` against `5*HIDDEN`). That is the case NCCL cannot serve out
-    of the buffers it was given, and it hangs rather than returning wrong data.
-
-    The rank marks the file system either side of the pair so the launcher can
-    tell a wedge from a crash: every rank reaching `ready` and none reaching
-    `returned` is the wedge, and it means nothing without the first half.
-    """
-    global COMM, RANK, WORLD, GROUP, reducescatter
-    from mpi4py import MPI
-
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import reducescatter as entry
-
-    reducescatter = entry.reducescatter
-    COMM = MPI.COMM_WORLD
-    RANK = COMM.Get_rank()
-    WORLD = COMM.Get_size()
-    GROUP = list(range(WORLD))
-    torch.cuda.set_device(RANK)
-
-    # One aligned call first: the group's communicator has to already exist, so
-    # that what wedges below is the mispaired pair and not the bootstrap.
-    rows, seed = 16, 970000
-    sizes = [rows] * WORLD
-    _assert_bitwise(
-        reducescatter(_input(RANK, sizes, seed), None, GROUP),
-        _ref(sizes, RANK, seed),
-        "wedge sub-job warm-up",
-    )
-    COMM.Barrier()
-
-    rs_in = _input(RANK, sizes, seed + 1000)
-    gather_in = _block(RANK, 0, 5, seed + 2000)
-    assert gather_in.numel() != rs_in.shape[0] // WORLD * HIDDEN, "counts must differ"
-    _mark("ready")
-    COMM.Barrier()
-    # Started after the barrier, so the grace covers the pair and nothing else.
-    threading.Thread(target=_wedge_watchdog, daemon=True).start()
-
-    if RANK == 0:
-        torch.ops.trtllm.allgather(gather_in, None, GROUP)
-        reducescatter(rs_in, None, GROUP)
-    else:
-        reducescatter(rs_in, None, GROUP)
-        torch.ops.trtllm.allgather(gather_in, None, GROUP)
+            # Exit hard rather than return: a rank that leaves a collective
+            # early wedges every sibling in it, and the launcher kills the
+            # rest the moment it sees this nonzero exit.
+            os._exit(13)
+    dist.barrier()
     torch.cuda.synchronize()
-    _mark("returned")
-    print(f"[rank {RANK}] the mispaired pair RETURNED", flush=True)
-    return 0
+    print(f"[rank {RANK}] {len(CHECKS)} checks passed", flush=True)
+    # Exit without tearing the process group down: destroying a communicator
+    # that captured collectives into CUDA graphs measurably wedges NCCL's
+    # watchdog, and these are throwaway processes the launcher owns anyway.
+    sys.stdout.flush()
+    os._exit(0)
 
 
-def _mpirun(world_size: int, flag: str, env: Optional[Dict[str, str]] = None) -> Any:
-    """Start one mpirun job in its own process group, so it can be killed."""
-    command = [
-        "mpirun",
-        "-n",
-        str(world_size),
-        sys.executable,
-        str(Path(__file__).resolve()),
-        flag,
+def _spawn_children(
+    world_size: int, flag: str, extra_env: Optional[Dict[str, str]] = None
+) -> List[Any]:
+    """Start one worker per rank, each in its own session, rendezvousing over a
+    fresh port -- so a wedged job's sessions can all be killed."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    env = dict(
+        os.environ,
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        WORLD_SIZE=str(world_size),
+        TLLM_DISABLE_MPI="1",
+        **(extra_env or {}),
+    )
+
+    # Drop the launching srun step's PMIx/PMI/OMPI namespace from the children:
+    # they inherit it and are then registered as participants of that step, so
+    # the first one to exit (hard, as a failing rank does) trips srun's pmix
+    # errhandler, which SIGKILLs the whole step -- launcher and real error with
+    # it -- before anything is reported. These ranks rendezvous through
+    # torch.distributed's own env://, not pmix.
+    env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
+    print(f"[launcher] spawning {world_size} ranks ({flag}), rendezvous on :{port}", flush=True)
+    return [
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), flag],
+            env=dict(env, RANK=str(r)),
+            start_new_session=True,
+        )
+        for r in range(world_size)
     ]
-    print(f"[launcher] {' '.join(command)}", flush=True)
-    return subprocess.Popen(command, start_new_session=True, env=env)
 
 
-def _certify_the_unequal_byte_count_wedge(world_size: int) -> None:
-    """Second job: the one call-order divergence that hangs instead of lying.
-
-    It cannot be a `CHECKS` entry, because the job that runs it never reports.
-    So it runs on its own, and the evidence is the marks its ranks leave: all
-    of them entered the mispaired pair, none came out of it within
-    WEDGE_GRACE_S, and the job ended by its own watchdog rather than by
-    completing. A crash before the pair fails this too — the `ready` count is
-    what separates the two.
-    """
-    marks = tempfile.mkdtemp(prefix="reducescatter_wedge_")
-    started = time.time()
-    process = _mpirun(world_size, _WEDGE_FLAG, env=dict(os.environ, RS_WEDGE_MARKS=marks))
-    try:
-        code: Optional[int] = process.wait(timeout=WEDGE_CAP_S)
-        ended = "its own watchdog"
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-        code, ended = None, f"the launcher, after {WEDGE_CAP_S}s"
-
-    seen = os.listdir(marks)
-    ready = [m for m in seen if m.startswith("ready.")]
-    returned = [m for m in seen if m.startswith("returned.")]
-    wedged = [m for m in seen if m.startswith("wedged.")]
-    for name in seen:
-        os.remove(os.path.join(marks, name))
-    os.rmdir(marks)
-    print(
-        f"[launcher] wedge sub-job: exit={code} ready={len(ready)} "
-        f"returned={len(returned)} wedged={len(wedged)} "
-        f"ended by {ended} in {time.time() - started:.0f}s",
-        flush=True,
-    )
-
-    assert len(ready) == world_size, (
-        f"only {len(ready)}/{world_size} ranks reached the mispaired pair — the "
-        "sub-job failed before it could be mispaired, so nothing was certified"
-    )
-    assert not returned, (
-        "the mispaired pair returned at unequal byte counts; it used to wedge, "
-        "so the contract's call-order table has to be re-measured"
-    )
-    assert len(wedged) == world_size, (
-        f"{len(wedged)}/{world_size} ranks were still inside the pair after "
-        f"{WEDGE_GRACE_S}s; expected every one of them"
-    )
+def _kill_children(children: List[Any]) -> None:
+    for p in children:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for p in children:
+        p.wait()
 
 
 def _spawn_ranks() -> None:
-    """Re-exec this file under mpirun, one rank per claimed device."""
+    """Start one worker process per claimed device; no external launcher."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     assert visible, (
         "set CUDA_VISIBLE_DEVICES to the devices this run owns, "
@@ -1611,24 +1452,30 @@ def _spawn_ranks() -> None:
     assert world_size >= 2, (
         f"CUDA_VISIBLE_DEVICES names {world_size} device(s); a collective test needs at least 2"
     )
-    # Own process group so the deadline can kill wedged grandchildren too.
-    process = _mpirun(world_size, _WORKER_FLAG)
-    try:
-        code = process.wait(timeout=DEADLINE_S)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-        raise AssertionError(
-            f"the {world_size}-rank run did not finish in {DEADLINE_S}s (wedged)"
-        ) from None
-    assert code == 0, f"the {world_size}-rank run exited {code}"
-    _certify_the_unequal_byte_count_wedge(world_size)
+    children = _spawn_children(world_size, _WORKER_FLAG)
+    deadline = time.monotonic() + DEADLINE_S
+    live = set(range(world_size))
+    failure = None
+    while live and failure is None:
+        if time.monotonic() > deadline:
+            failure = f"did not finish in {DEADLINE_S}s (wedged)"
+            break
+        for r in sorted(live):
+            code = children[r].poll()
+            if code is None:
+                continue
+            live.discard(r)
+            if code != 0:
+                failure = f"rank {r} exited {code}"
+                break
+        time.sleep(0.5)
+    if failure is not None:
+        _kill_children(children)
+        raise AssertionError(f"the {world_size}-rank run failed: {failure}")
 
 
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
-    if _WEDGE_FLAG in sys.argv:
-        sys.exit(_run_wedge_rank())
     _spawn_ranks()
     print("OK")

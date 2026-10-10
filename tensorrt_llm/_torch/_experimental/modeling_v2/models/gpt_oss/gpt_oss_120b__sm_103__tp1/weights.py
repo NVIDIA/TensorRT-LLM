@@ -1,44 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Weight manifest and loader: gpt-oss-120b / sm_103 / tp1.
+"""Weight table: gpt-oss-120b / sm_103 / tp1.
 
-MANIFEST is a data table: target parameter -> the checkpoint keys that fill
-it, each with an optional destination index into the parameter and an
-optional source transform. tp1: no sharding — every checkpoint tensor
-reaches exactly one parameter whole.
+One `W` per weight role, carrying its shape, checkpoint source, dtype and
+load-time transform. tp1: no sharding -- every checkpoint tensor reaches
+exactly one parameter whole. Storage layout is HF [out, in] row-major, so the
+attention, router and embed copies are layout-preserving.
 
-Storage layout is HF [out, in] row-major, so every attention/router/embed
-copy is layout-preserving; the GEMM-side column-major views are derived
-after load in modeling.build_layer_views(). Two families need a transform:
-
-* **fp32 promotions.** The expert biases and the attention sink logits are
-  bf16 on disk, but the MoE op rejects a bf16 bias and thop_attention reads
-  the sink buffer as raw fp32.
-
-* **The MXFP4 expert operands.** The checkpoint stores each layer's experts
-  as `gate_up_proj_blocks` [E, 2I, H/32, 16] / `_scales` [E, 2I, H/32] and
-  `down_proj_blocks` [E, H, I/32, 16] / `_scales` [E, H, I/32] — E2M1 codes
-  two per byte (low nibble = even K index) with one E8M0 exponent per 32 K
-  elements, already in [out, in] orientation. The MoE op wants them padded,
-  row-permuted and (scales only) swizzled; `_prep_fc1` / `_prep_fc2` below
-  are that recipe, applied on device, one layer at a time.
-
-  The parity trap: this checkpoint's `2I` axis runs (gate, up, gate, up,
-  ...) — HF reads `gate = gate_up[..., ::2]`, `up = gate_up[..., 1::2]` —
-  while the kernel's interleave wants destination row `2i` = **up** `i` and
-  `2i+1` = gate `i`. The halves are therefore split by parity and
-  re-concatenated as [up ; gate] before the permutation. Getting it
-  backwards is finite, plausibly scaled and invisible to a boot check.
-
-Loading contract: `load(model, weights)` consumes the engine-provided
-per-rank checkpoint dict (safetensors lazy slices), fills every declared
-parameter exactly once, and asserts full bidirectional coverage — every
-target parameter written, every checkpoint key consumed.
+The parity trap in the MXFP4 expert operands: this checkpoint's `2I` axis
+runs (gate, up, gate, up, ...) -- HF reads `gate = gate_up[..., ::2]`, `up =
+gate_up[..., 1::2]` -- while the kernel's interleave wants destination row
+`2i` = **up** `i` and `2i+1` = gate `i`. Getting it backwards is finite,
+plausibly scaled and invisible to a boot check.
 """
+
+from types import SimpleNamespace
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2._weights import ModelWeights, W
+
 SCALE_BLOCK = 32  # mxfp4: one E8M0 exponent per 32 elements along K
+
+# FC1's K alignment for the trtllm-gen MXFP4 weight family. It sizes the
+# declared expert operands here and is the alignment mxfp8_quantize pads the
+# hidden states up to in modeling.py; the two must be the same number.
+FC1_K_ALIGN = 512
+
+
+def _pad_up(x: int, align: int) -> int:
+    return (x + align - 1) // align * align
 
 
 def _pad_rows_cols(t: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
@@ -99,7 +90,8 @@ def _fc1_perm(rows: int, device) -> torch.Tensor:
 
 def _prep_fc1_weight(blocks: torch.Tensor, core) -> torch.Tensor:
     """[E, 2I, H/32, 16] uint8 blocks -> kernel FC1 operand."""
-    b = blocks.reshape(core.num_experts, 2 * core.inter, core.hidden // 2)
+    cfg = core.model_config.pretrained_config
+    b = blocks.reshape(cfg.num_local_experts, 2 * cfg.intermediate_size, cfg.hidden_size // 2)
     up, gate = _split_gate_up(b)
     cols = core.fc1_k_pad // 2
     w = torch.cat(
@@ -135,8 +127,9 @@ def _prep_fc1_bias(bias: torch.Tensor, core) -> torch.Tensor:
 
 def _prep_fc2_weight(blocks: torch.Tensor, core) -> torch.Tensor:
     """[E, H, I/32, 16] uint8 blocks -> kernel FC2 operand (no interleave)."""
+    cfg = core.model_config.pretrained_config
     w = _pad_rows_cols(
-        blocks.reshape(core.num_experts, core.hidden, core.inter // 2),
+        blocks.reshape(cfg.num_local_experts, cfg.hidden_size, cfg.intermediate_size // 2),
         core.fc2_rows_pad,
         core.inter_pad // 2,
     )
@@ -160,87 +153,123 @@ def _to_fp32(t: torch.Tensor, core) -> torch.Tensor:
     return t.float()
 
 
-def _manifest(core) -> dict:
-    """target param key -> list of (ckpt key, index into the param | None,
-    source transform | None)."""
-    q_width = core.heads_q * core.head_dim
-    kv_width = core.heads_kv * core.head_dim
-    rows: dict = {}
-    for i in range(core.num_layers):
-        p = f"model.layers.{i}"
-        rows[f"l{i}_norm1"] = [(f"{p}.input_layernorm.weight", None, None)]
-        rows[f"l{i}_qkv"] = [
-            (f"{p}.self_attn.q_proj.weight", (slice(0, q_width),), None),
-            (
-                f"{p}.self_attn.k_proj.weight",
-                (slice(q_width, q_width + kv_width),),
-                None,
+class GptOssWeights(ModelWeights):
+    """gpt-oss-120b / sm_103 / tp1."""
+
+    WEIGHTS: tuple[W, ...] = (
+        W("norm1", shape=lambda d: (d.hidden,), src="{p}.input_layernorm.weight"),
+        W(
+            "qkv",
+            shape=lambda d: (d.q_width + 2 * d.kv_width, d.hidden),
+            src=(
+                ("{p}.self_attn.q_proj.weight", lambda d: (slice(0, d.q_width),)),
+                (
+                    "{p}.self_attn.k_proj.weight",
+                    lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+                ),
+                (
+                    "{p}.self_attn.v_proj.weight",
+                    lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+                ),
             ),
-            (
-                f"{p}.self_attn.v_proj.weight",
-                (slice(q_width + kv_width, q_width + 2 * kv_width),),
-                None,
+        ),
+        W(
+            "qkv_bias",
+            shape=lambda d: (d.q_width + 2 * d.kv_width,),
+            src=(
+                ("{p}.self_attn.q_proj.bias", lambda d: (slice(0, d.q_width),)),
+                (
+                    "{p}.self_attn.k_proj.bias",
+                    lambda d: (slice(d.q_width, d.q_width + d.kv_width),),
+                ),
+                (
+                    "{p}.self_attn.v_proj.bias",
+                    lambda d: (slice(d.q_width + d.kv_width, d.q_width + 2 * d.kv_width),),
+                ),
             ),
-        ]
-        rows[f"l{i}_qkv_bias"] = [
-            (f"{p}.self_attn.q_proj.bias", (slice(0, q_width),), None),
-            (f"{p}.self_attn.k_proj.bias", (slice(q_width, q_width + kv_width),), None),
-            (
-                f"{p}.self_attn.v_proj.bias",
-                (slice(q_width + kv_width, q_width + 2 * kv_width),),
-                None,
-            ),
-        ]
-        rows[f"l{i}_sinks"] = [(f"{p}.self_attn.sinks", None, _to_fp32)]
-        rows[f"l{i}_o"] = [(f"{p}.self_attn.o_proj.weight", None, None)]
-        rows[f"l{i}_o_bias"] = [(f"{p}.self_attn.o_proj.bias", None, None)]
-        rows[f"l{i}_norm2"] = [(f"{p}.post_attention_layernorm.weight", None, None)]
-        rows[f"l{i}_router"] = [(f"{p}.mlp.router.weight", None, None)]
-        rows[f"l{i}_router_bias"] = [(f"{p}.mlp.router.bias", None, None)]
-        rows[f"l{i}_fc1_w"] = [(f"{p}.mlp.experts.gate_up_proj_blocks", None, _prep_fc1_weight)]
-        rows[f"l{i}_fc1_s"] = [(f"{p}.mlp.experts.gate_up_proj_scales", None, _prep_fc1_scale)]
-        rows[f"l{i}_fc1_b"] = [(f"{p}.mlp.experts.gate_up_proj_bias", None, _prep_fc1_bias)]
-        rows[f"l{i}_fc2_w"] = [(f"{p}.mlp.experts.down_proj_blocks", None, _prep_fc2_weight)]
-        rows[f"l{i}_fc2_s"] = [(f"{p}.mlp.experts.down_proj_scales", None, _prep_fc2_scale)]
-        rows[f"l{i}_fc2_b"] = [(f"{p}.mlp.experts.down_proj_bias", None, _prep_fc2_bias)]
-    rows["final_norm"] = [("model.norm.weight", None, None)]
-    rows["embed"] = [("model.embed_tokens.weight", None, None)]
-    return rows
-
-
-def load(model, weights) -> None:
-    core = model.model
-    manifest = _manifest(core)
-    consumed: set = set()
-
-    def fill(param: torch.nn.Parameter, ckpt_key: str, index, transform) -> None:
-        assert ckpt_key in weights, f"checkpoint key missing: {ckpt_key}"
-        src = weights[ckpt_key][:]  # materialize the lazy slice
-        dst = param.data if index is None else param.data[index]
-        if transform is not None:
-            # The expert transforms are heavy row gathers over ~1 GB of
-            # blocks; run them where the destination lives.
-            src = transform(src.to(dst.device, non_blocking=True), core)
-        assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
-        assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
-        dst.copy_(src, non_blocking=True)
-        consumed.add(ckpt_key)
-
-    assert set(manifest.keys()) == set(core.w.keys()), (
-        "manifest/parameter drift",
-        set(manifest.keys()) ^ set(core.w.keys()),
+        ),
+        W(
+            "sinks",
+            shape=lambda d: (d.heads_q,),
+            dtype=torch.float32,
+            src="{p}.self_attn.sinks",
+            transform=_to_fp32,
+        ),
+        W("o", shape=lambda d: (d.hidden, d.q_width), src="{p}.self_attn.o_proj.weight"),
+        W("o_bias", shape=lambda d: (d.hidden,), src="{p}.self_attn.o_proj.bias"),
+        W("norm2", shape=lambda d: (d.hidden,), src="{p}.post_attention_layernorm.weight"),
+        W("router", shape=lambda d: (d.num_experts, d.hidden), src="{p}.mlp.router.weight"),
+        W("router_bias", shape=lambda d: (d.num_experts,), src="{p}.mlp.router.bias"),
+        W(
+            "fc1_w",
+            shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 2),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.gate_up_proj_blocks",
+            transform=_prep_fc1_weight,
+        ),
+        W(
+            "fc1_s",
+            shape=lambda d: (d.num_experts, d.fc1_rows, d.fc1_k_pad // 32),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.gate_up_proj_scales",
+            transform=_prep_fc1_scale,
+        ),
+        W(
+            "fc1_b",
+            shape=lambda d: (d.num_experts, d.fc1_rows),
+            dtype=torch.float32,
+            src="{p}.mlp.experts.gate_up_proj_bias",
+            transform=_prep_fc1_bias,
+        ),
+        W(
+            "fc2_w",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 2),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.down_proj_blocks",
+            transform=_prep_fc2_weight,
+        ),
+        W(
+            "fc2_s",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad, d.inter_pad // 32),
+            dtype=torch.uint8,
+            src="{p}.mlp.experts.down_proj_scales",
+            transform=_prep_fc2_scale,
+        ),
+        W(
+            "fc2_b",
+            shape=lambda d: (d.num_experts, d.fc2_rows_pad),
+            dtype=torch.float32,
+            src="{p}.mlp.experts.down_proj_bias",
+            transform=_prep_fc2_bias,
+        ),
+        W("final_norm", shape=lambda d: (d.hidden,), src="model.norm.weight", layers=None),
+        W(
+            "embed",
+            shape=lambda d: (d.vocab, d.hidden),
+            src="model.embed_tokens.weight",
+            layers=None,
+        ),
     )
-    for param_key, sources in manifest.items():
-        for ckpt_key, index, transform in sources:
-            fill(core.w[param_key], ckpt_key, index, transform)
-        # The transforms allocate several GB of scratch per layer; release it
-        # before the next one so peak load memory stays one layer deep.
-        if param_key.endswith("_fc2_b"):
-            torch.cuda.empty_cache()
 
-    # Shell-registered exception: the base class owns lm_head (untied).
-    fill(model.lm_head.weight, "lm_head.weight", None, None)
+    RELEASE_AFTER = "_fc2_b"
 
-    torch.cuda.synchronize()
-    leftover = set(weights.keys()) - consumed
-    assert not leftover, f"unconsumed checkpoint keys: {sorted(leftover)[:8]}"
+    def dims(self, core) -> SimpleNamespace:
+        cfg = core.model_config.pretrained_config
+        inter_pad = _pad_up(cfg.intermediate_size, 128)
+        return SimpleNamespace(
+            num_layers=cfg.num_hidden_layers,
+            hidden=cfg.hidden_size,
+            q_width=cfg.num_attention_heads * cfg.head_dim,
+            kv_width=cfg.num_key_value_heads * cfg.head_dim,
+            heads_q=cfg.num_attention_heads,
+            num_experts=cfg.num_local_experts,
+            vocab=cfg.vocab_size,
+            fc1_rows=2 * inter_pad,
+            fc1_k_pad=_pad_up(cfg.hidden_size, FC1_K_ALIGN),
+            inter_pad=inter_pad,
+            fc2_rows_pad=_pad_up(cfg.hidden_size, 128),
+            dtype=core.model_config.torch_dtype,
+        )
+
+
+MODEL_WEIGHTS = GptOssWeights()

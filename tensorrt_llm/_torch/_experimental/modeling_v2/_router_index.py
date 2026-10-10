@@ -55,6 +55,32 @@ _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 #: which every rank re-applies to its own environment before it builds a model.
 MODELING_V2_ENV = "TRTLLM_MODELING_V2"
 
+#: Turns the step contract check on. Off by default, so a served engine runs
+#: the forward and nothing else: the checks describe facts fixed at engine
+#: construction, and a check that can only ever hold is a check whose failure
+#: mode is its own bug taking down a working deployment.
+#:
+#: It is an environment variable for the same reason the switch above is, and
+#: with the same caveat about ranks. When modeling_v2 stops being experimental
+#: this belongs in the LLM args instead, where a caller can set it per engine
+#: rather than per process.
+MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
+
+
+def step_contract_enabled() -> bool:
+    """Whether targets should check their step contract on the first forward.
+
+    Read once per model instance at construction rather than per forward: the
+    answer cannot change within a process, and the forward is the hot path.
+    """
+    return os.environ.get(MODELING_V2_VALIDATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # architectures[0] -> routing module, relative to this package.
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",

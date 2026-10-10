@@ -1,17 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Every op a target names has to exist in the build it is running against.
+"""The pybind surface a target reaches for has to exist in the build.
 
-A target reads private engine surface: custom ops registered under
-``torch.ops.trtllm`` and one pybind entry point. With no version pin, nothing
-declares which build it was written for -- so the only thing that can tell you
-the surface moved is running against it.
+A target reads private engine surface with no version pin, so the only thing
+that can tell you the surface moved is running against it.
 
-This used to be an ``assert`` loop that each target ran at import. That made
-every import of a modeling module pay for the check and put a test in the
-product tree; the missing symbol is a fact of the build, so the place to find
-it out is a test on a machine that has the extension built. Each target now
-declares ``REQUIRED_TRTLLM_OPS`` and this asserts it.
+Custom ops are not checked here. Naming them took a hand-kept list per target
+that nothing could prove complete: an op added to a forward and left out of the
+list cost nothing to forget, and a stale entry still passed because the op was
+still registered upstream. The forward reaches every op it needs anyway, so a
+renamed op fails there -- at the call, which says where. A list that has to be
+maintained to restate that is not worth its own upkeep.
 
 Distinct from ``test_modeling_v2_claims.py``, which is deliberately import-free
 and runs anywhere: this one imports the targets, so it needs a real build.
@@ -22,9 +21,7 @@ from __future__ import annotations
 import importlib
 
 import pytest
-import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     MODELING_V2_ROUTERS,
     routing_module,
@@ -44,20 +41,6 @@ def _target_modules():
 
 def _target_ids():
     return [name for name, _ in _target_modules()]
-
-
-@pytest.mark.parametrize("name,module", list(_target_modules()), ids=_target_ids())
-def test_every_declared_op_exists(name, module):
-    """A named op that is not registered is a build the target cannot run on."""
-    declared = getattr(module, "REQUIRED_TRTLLM_OPS", None)
-    assert declared, f"{name}: modeling.py declares no REQUIRED_TRTLLM_OPS"
-
-    missing = [op for op in declared if not hasattr(torch.ops.trtllm, op)]
-    assert not missing, (
-        f"{name} names {len(missing)} op(s) this build does not register: "
-        f"{', '.join(missing)}. Either the op was renamed upstream and the "
-        f"target has not followed, or this build predates it."
-    )
 
 
 @pytest.mark.parametrize("name,module", list(_target_modules()), ids=_target_ids())

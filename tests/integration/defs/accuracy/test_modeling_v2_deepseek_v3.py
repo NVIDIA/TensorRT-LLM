@@ -34,6 +34,7 @@ that rules out setting the variable directly.
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch._experimental.modeling_v2 import MODELING_V2_VALIDATE_ENV
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfig
 
@@ -111,8 +112,14 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         task = GSM8K(self.MODEL_NAME)
 
         # One dict for both legs: the comparison only means anything if the two
-        # engines were built under the same mode.
-        modeling_v2 = modeling_v2_llm_args("require", monkeypatch)
+        # engines were built under the same mode. It also asks each engine to
+        # check its step contract on its first forward -- the contract is about
+        # metadata that engine prepared, so the only place it can be checked
+        # honestly is a run that prepared it; a synthesized metadata object
+        # would be checking the synthesizer.
+        modeling_v2 = modeling_v2_llm_args(
+            "require", monkeypatch, **{MODELING_V2_VALIDATE_ENV: "1"}
+        )
 
         with LLM(self.MODEL_PATH, **modeling_v2, **self.DEP4) as llm:
             identity = task.evaluate(llm)
@@ -165,7 +172,13 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         # makes the two comparable rather than less so. Only this leg needs it:
         # the target builds that path itself and never consults the factory.
         # It rides along with the switch because it is read on the ranks too.
-        deep_ep = {"TRTLLM_CAN_USE_DEEP_EP": "0"} if mode == "off" else {}
+        # Ask the engine to check its step contract on its first forward. The
+        # contract is about metadata that engine prepared, so the only place it
+        # can be checked honestly is a run that prepared it; a synthesized
+        # metadata object would be checking the synthesizer.
+        rank_env = {MODELING_V2_VALIDATE_ENV: "1"}
+        if mode == "off":
+            rank_env["TRTLLM_CAN_USE_DEEP_EP"] = "0"
 
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
@@ -175,7 +188,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             kv_cache_config=self.MTP3_KV,
             cuda_graph_config=CudaGraphConfig(),
             enable_iter_perf_stats=True,
-            **modeling_v2_llm_args(mode, monkeypatch, **deep_ep),
+            **modeling_v2_llm_args(mode, monkeypatch, **rank_env),
             **self.DEP4,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)

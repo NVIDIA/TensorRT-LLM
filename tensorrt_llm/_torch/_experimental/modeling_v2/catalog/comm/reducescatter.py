@@ -1,19 +1,37 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sum every rank's copy of a tensor and hand each rank back its own rows."""
+"""Sum across ranks and keep this rank's slice, via the trtllm reducescatter op."""
 
-from typing import List, Optional
+from __future__ import annotations
+
+from typing import List, Optional, Sequence
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 
+from .._op import Arch, Cell, OpWrapper
 
-def reducescatter(
-    input: torch.Tensor,
-    sizes: Optional[List[int]],
-    group: List[int],
-) -> torch.Tensor:
+#: The dtypes whose NCCL mapping performs the sum the caller means by it.
+#: `getDtypeMap` in `cpp/tensorrt_llm/common/opUtils.cpp` is the whole table:
+#: these entries land on a native NCCL float or int type, so `ncclSum` is a
+#: float or integer sum of the values. Every other entry, and every dtype the
+#: table omits, is refused below -- see `is_valid` for the two distinct ways
+#: they go wrong.
+_SUMMABLE_DTYPES = frozenset(
+    {
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int64,
+        torch.int8,
+        torch.uint8,
+    }
+)
+
+
+class Reducescatter(OpWrapper):
     """Sum `input` across every rank in `group`, then keep this rank's slice.
 
     Every rank passes a tensor of the same full shape; the elementwise sum is
@@ -22,36 +40,148 @@ def reducescatter(
     `None` when the split is even. The result is a freshly allocated tensor on
     every rank; `input` is left untouched.
     """
-    # Pure-metadata guards, each for a violation measured on this machine to
-    # end in silent corruption, a wedge, or a process kill rather than an error.
-    assert input.dim() >= 1, (
-        "input must have at least one dimension; a 0-d tensor segfaults inside "
-        "ReducescatterOp::run_list"
+
+    ARCHS = frozenset({Arch.SM_103})
+
+    # deepseek-r1 at dep4 is the only caller and always passes `sizes=None`:
+    # it pads to a common height first. The row counts are the full heights an
+    # attention-DP step reduces, which is the rank count times a slice.
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="decode: one row per rank after the split, hidden 7168",
+            spec=dict(rows_per_rank=1, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
+        ),
+        Cell(
+            why="a small padded batch",
+            spec=dict(rows_per_rank=32, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
+        ),
+        Cell(
+            why="prefill chunk height",
+            spec=dict(rows_per_rank=2048, trailing=(7168,), dtype=torch.bfloat16, sizes=None),
+        ),
     )
-    assert input.is_contiguous(), (
-        "input must be contiguous; the op reads it as packed memory and a "
-        "strided view is silently reduced over the wrong elements"
-    )
-    assert input.dtype is not torch.float8_e4m3fn, (
-        "float8_e4m3fn is accepted by the op but summed as raw unsigned bytes, "
-        "not as floats, so the result is meaningless; reduce in bf16/fp16/fp32 "
-        "and quantize afterwards"
-    )
-    if sizes is None:
-        assert input.shape[0] % len(group) == 0, (
-            f"input.shape[0]={input.shape[0]} must be divisible by "
-            f"len(group)={len(group)} when sizes is None; the op takes "
-            "shape[0] // len(group) rows per rank and silently drops the remainder"
+
+    note = """
+    The ragged form and dtypes other than bf16 work and are exercised by the op
+    matrix, but no shipped target reaches them, so they are not cells. CUDA
+    graph behaviour is carried by the matrix's own named checks rather than as
+    a cell axis.
+    """
+
+    def raw_call(
+        self,
+        input: torch.Tensor,
+        sizes: Optional[List[int]],
+        group: List[int],
+        process_group: Optional[object] = None,
+    ) -> torch.Tensor:
+        """`process_group` selects the communicator flavor, mirroring the
+        product router in `_torch/distributed/ops.py`: None runs the
+        MPI-session symbol -- the one a dep4 serving world calls -- and a boxed
+        c10d ProcessGroup runs the `_pg` symbol the non-MPI backends use.
+        """
+        if process_group is None:
+            return torch.ops.trtllm.reducescatter(input, sizes, group)
+        return torch.ops.trtllm.reducescatter_pg(input, sizes, group, process_group)
+
+    def reference(
+        self,
+        contributions_to_this_slice: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """The sum of what every rank sent to this rank's slice.
+
+        The documented exception to mirroring `raw_call`, for the same reason as
+        allgather: a collective's output is not a function of what the calling
+        rank holds. It takes the one block each rank contributed to *this*
+        position, in ascending rank order -- not their whole inputs, because a
+        rank can regenerate exactly those WORLD blocks from the shared seed
+        convention and never has to materialize anybody else's full tensor.
+
+        Accumulated in fp32 (int64 for integer dtypes) and rounded once. The op
+        sums in the input dtype in whatever order NCCL picks; on a cell's payload
+        that costs nothing, because every partial sum there is exact in the input
+        dtype either way -- which is what lets `compare` be bitwise.
+        """
+        first = contributions_to_this_slice[0]
+        acc_dtype = torch.float32 if first.dtype.is_floating_point else torch.int64
+        acc = torch.zeros(first.shape, dtype=acc_dtype, device=first.device)
+        for block in contributions_to_this_slice:
+            acc += block.to(acc_dtype)
+        return acc.to(first.dtype)
+
+    def compare(self, out: torch.Tensor, ref: torch.Tensor) -> None:
+        """A gate of exactly zero, which the cells earn rather than assume.
+
+        This op computes, so NCCL's summation order and the reference's rank
+        order could in general differ by rounding. They do not here, because a
+        cell's payload is drawn from a value set -- multiples of 1/8, bounded --
+        on which every partial sum is exactly representable in the input dtype.
+        That makes the strong gate available, and taking it is the point: any
+        difference at all is then a wrong reduction or a wrong slice, never
+        rounding, and a band would have hidden both.
+
+        A cell built from unrestricted random values would need a band instead.
+        None is; see the matrix's payload builder.
+        """
+        assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
+        assert out.shape == ref.shape, (out.shape, ref.shape)
+        torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+    def is_valid(
+        self,
+        input: torch.Tensor,
+        sizes: Optional[List[int]],
+        group: List[int],
+        process_group: Optional[object] = None,
+    ) -> None:
+        # Each guard is for a violation measured to end in silent corruption, a
+        # wedge, or a process kill rather than an error.
+        assert input.dim() >= 1, (
+            "input must have at least one dimension; a 0-d tensor segfaults inside "
+            "ReducescatterOp::run_list"
         )
-    else:
-        assert len(sizes) == len(group), (
-            f"len(sizes)={len(sizes)} must equal len(group)={len(group)}; a short "
-            "list raises on the highest rank and wedges the others, a long one "
-            "reduces more rows than the input holds and returns garbage"
+        assert input.is_contiguous(), (
+            "input must be contiguous; the op reads it as packed memory and a "
+            "strided view is silently reduced over the wrong elements"
         )
-        assert sum(sizes) == input.shape[0], (
-            f"sum(sizes)={sum(sizes)} must equal input.shape[0]={input.shape[0]}; "
-            "the op sizes the reduction from `sizes` alone, so a short split "
-            "silently drops the trailing rows and a long one reads past the input"
+        # An allowlist rather than a list of known-bad dtypes, because the two
+        # ways a dtype goes wrong here are both silent and the second is not
+        # confined to this call:
+        #
+        #   mapped to the wrong arithmetic -- float8_e4m3fn and bool both land
+        #   on ncclInt8, so ncclSum adds their raw bytes. fp8 comes back as
+        #   nonsense and bool behaves like OR, neither with an error.
+        #
+        #   not in the map at all -- float64, quint4x2 and the rest reach
+        #   `TorchUtils::dataType()`, which throws. That call is *inside* the
+        #   group: reducescatterOp.cpp opens with ncclGroupStart() on line 21,
+        #   converts on line 25, and the matching ncclGroupEnd() on line 57 is
+        #   never reached. The communicator is left mid-group, and the
+        #   collectives after this one return invalid data. A guard here turns
+        #   that into a Python error before the group opens.
+        assert input.dtype in _SUMMABLE_DTYPES, (
+            f"{input.dtype} is not summable by this op; it is accepted and then "
+            f"either summed as raw bytes or thrown on inside an open NCCL group, "
+            f"which corrupts later collectives. Reduce in one of "
+            f"{sorted(str(d) for d in _SUMMABLE_DTYPES)} and cast afterwards"
         )
-    return torch.ops.trtllm.reducescatter(input, sizes, group)
+        if sizes is None:
+            assert input.shape[0] % len(group) == 0, (
+                f"input.shape[0]={input.shape[0]} must be divisible by "
+                f"len(group)={len(group)} when sizes is None; the op takes "
+                "shape[0] // len(group) rows per rank and silently drops the remainder"
+            )
+        else:
+            assert len(sizes) == len(group), (
+                f"len(sizes)={len(sizes)} must equal len(group)={len(group)}; a short "
+                "list raises on the highest rank and wedges the others, a long one "
+                "reduces more rows than the input holds and returns garbage"
+            )
+            assert sum(sizes) == input.shape[0], (
+                f"sum(sizes)={sum(sizes)} must equal input.shape[0]={input.shape[0]}; "
+                "the op sizes the reduction from `sizes` alone, so a short split "
+                "silently drops the trailing rows and a long one reads past the input"
+            )
+
+
+reducescatter = Reducescatter()
