@@ -35,6 +35,7 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEInputRequirement,
                             MoEStaticCapability,
                             nvfp4_fc1_row_alignment_rejection,
                             require_comm_plan)
+from .impl_environment import collect_moe_environment
 from .interface import _reject
 from .quantization import UnquantizedFusedMoEMethod
 
@@ -214,6 +215,34 @@ class CutlassFusedMoE(MoEImplBase):
         sm_version = d.env.sm
         quant_algo = p.quant_algo
 
+        if not d.env.oss_cutlass_moe:
+            if p.activation_type in (ActivationType.SiTu, ActivationType.Relu2):
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    f"CutlassFusedMoE {p.activation} requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if quant_algo in (QuantAlgo.MXFP8, QuantAlgo.W4A8_MXFP4_MXFP8,
+                              QuantAlgo.W4A16_MXFP4, QuantAlgo.W4A8_AWQ):
+                return _reject(
+                    MoERejectReason.QUANT_UNSUPPORTED,
+                    f"CutlassFusedMoE {quant_algo.name} requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if quant_algo == QuantAlgo.NVFP4 and d.force_dynamic_quantization:
+                return _reject(
+                    MoERejectReason.QUANT_UNSUPPORTED,
+                    "CutlassFusedMoE dynamic FC2 scaling requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if p.clamp_after_silu:
+                return _reject(
+                    MoERejectReason.ACTIVATION_UNSUPPORTED,
+                    "CutlassFusedMoE post-SiLU clamping requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+            if d.moe_lora_enabled:
+                return _reject(
+                    MoERejectReason.LORA_UNSUPPORTED,
+                    "CutlassFusedMoE routed-expert LoRA requires a build with "
+                    "USING_OSS_CUTLASS_MOE_GEMM=ON")
+
         # Check minimum SM version for Cutlass backend
         if sm_version < 80:
             return _reject(
@@ -305,6 +334,15 @@ class CutlassFusedMoE(MoEImplBase):
             return rejection
 
         return MoEEligibility.ok()
+
+    @property
+    def supports_alltoall(self) -> bool:
+        return collect_moe_environment().oss_cutlass_moe
+
+    def validate_configurable_moe(self, moe: torch.nn.Module) -> None:
+        if moe.enable_alltoall and not self.supports_alltoall:
+            raise ValueError("CutlassFusedMoE all-to-all requires a build with "
+                             "USING_OSS_CUTLASS_MOE_GEMM=ON")
 
     def __init__(
         self,

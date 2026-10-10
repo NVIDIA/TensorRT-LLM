@@ -132,6 +132,172 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 logger = logging.getLogger(__name__)
 
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cutlass_moe_routing_round_trip(dtype: torch.dtype) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUTLASS routing requires CUDA")
+    torch.manual_seed(17)
+    num_experts, hidden_size = 4, 128
+    x = torch.randn(8, hidden_size, device="cuda", dtype=dtype)
+    selected = torch.arange(8, device="cuda", dtype=torch.int32).remainder(num_experts).unsqueeze(1)
+    scores = torch.ones(8, 1, device="cuda", dtype=torch.float32)
+    w1 = torch.empty(num_experts, hidden_size * 2, hidden_size, device="cuda", dtype=dtype)
+    w2 = torch.empty(num_experts, hidden_size, hidden_size, device="cuda", dtype=dtype)
+
+    p2u, _, permuted, offsets, _, u2p = torch.ops.trtllm.moe_permute_op(
+        x, selected, scores, w1, w2, None, None, num_experts, 1, 0, 1, 0, 1, 0, False, False, False
+    )
+    torch.testing.assert_close(permuted, x[p2u.long()], atol=0, rtol=0)
+    restored = torch.ops.trtllm.moe_finalize_scale_op(
+        permuted,
+        None,
+        scores,
+        u2p,
+        p2u,
+        selected,
+        offsets,
+        False,
+        x.shape[0],
+        hidden_size,
+        hidden_size,
+        1,
+        num_experts,
+        1,
+        0,
+        1,
+        0,
+    )
+    torch.testing.assert_close(restored, x, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "activation_type,clamp_limit,alpha_only,capture_first",
+    [
+        (ActivationType.Identity, None, False, False),
+        (ActivationType.Gelu, None, False, False),
+        (ActivationType.Relu, None, False, False),
+        (ActivationType.Silu, None, False, False),
+        (ActivationType.Swiglu, None, False, False),
+        (ActivationType.Geglu, None, False, False),
+        (ActivationType.SwigluBias, None, False, False),
+        (ActivationType.Swiglu, 0.2, False, False),
+        (ActivationType.SwigluBias, 0.2, False, False),
+        pytest.param(ActivationType.Swiglu, 0.2, True, False, id="alpha-only-clamp"),
+        pytest.param(ActivationType.Swiglu, 0.2, False, True, id="capture-before-eager"),
+    ],
+)
+def test_cutlass_moe_public_activation_ids(
+    activation_type: ActivationType,
+    clamp_limit: Optional[float],
+    alpha_only: bool,
+    capture_first: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not torch.cuda.is_available() or get_sm_version() < 80:
+        pytest.skip("BF16 CUTLASS MoE requires CUDA and SM80 or newer")
+
+    torch.manual_seed(17)
+    dtype = torch.bfloat16
+    num_experts, hidden_size, inter_size = 4, 128, 128
+    gated = is_gated_activation(activation_type)
+    x = torch.randn(8, hidden_size, device="cuda", dtype=dtype) * 0.5
+    w1 = (
+        torch.randn(
+            num_experts, inter_size * (2 if gated else 1), hidden_size, device="cuda", dtype=dtype
+        )
+        * 0.1
+    )
+    w2 = torch.randn(num_experts, hidden_size, inter_size, device="cuda", dtype=dtype) * 0.1
+    selected = torch.arange(8, device="cuda", dtype=torch.int32).remainder(num_experts).unsqueeze(1)
+    scores = torch.ones(8, 1, device="cuda", dtype=torch.float32)
+    alpha = (
+        torch.ones(num_experts, device="cuda")
+        if activation_type == ActivationType.SwigluBias or alpha_only
+        else None
+    )
+    beta = (
+        torch.zeros(num_experts, device="cuda")
+        if activation_type == ActivationType.SwigluBias
+        else None
+    )
+    limit = (
+        torch.full((num_experts,), clamp_limit, device="cuda") if clamp_limit is not None else None
+    )
+
+    def run_moe():
+        return torch.ops.trtllm.fused_moe(
+            x,
+            selected,
+            scores,
+            w1,
+            None,
+            w2,
+            None,
+            dtype,
+            [],
+            activation_type=int(activation_type),
+            swiglu_alpha=alpha,
+            swiglu_beta=beta,
+            swiglu_limit=limit,
+        )[0]
+
+    if capture_first:
+        from tensorrt_llm._torch.custom_ops.torch_custom_ops import MoERunner
+
+        # Isolate the native runner from earlier parameterized cases. Construct
+        # it before capture, with no eager forward or cached neutral defaults.
+        key = (dtype, dtype, dtype, False, False, False, False, False)
+        runner = torch.classes.trtllm.FusedMoeRunner(*key, True)
+        monkeypatch.setattr(MoERunner, "runner_dict", {key: runner})
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run_moe()
+        # Same stream, before replay: the eager call must not read defaults
+        # whose initialization was only recorded in the captured graph.
+        with torch.cuda.stream(stream):
+            actual = run_moe()
+        torch.cuda.current_stream().wait_stream(stream)
+    else:
+        actual = run_moe()
+
+    expected = []
+    for row, expert in zip(x, selected[:, 0]):
+        fc1 = torch.nn.functional.linear(row.float(), w1[expert].float())
+        if gated:
+            up, gate = fc1.chunk(2)
+            if clamp_limit is not None:
+                up = up.clamp(min=-clamp_limit, max=clamp_limit)
+                gate = gate.clamp(max=clamp_limit)
+            activated = (
+                torch.nn.functional.gelu(gate, approximate="tanh")
+                if activation_type == ActivationType.Geglu
+                else torch.nn.functional.silu(gate)
+            ) * up
+        elif activation_type == ActivationType.Gelu:
+            activated = torch.nn.functional.gelu(fc1, approximate="tanh")
+        elif activation_type == ActivationType.Relu:
+            activated = torch.nn.functional.relu(fc1)
+        elif activation_type == ActivationType.Silu:
+            activated = torch.nn.functional.silu(fc1)
+        else:
+            activated = fc1
+        expected.append(
+            torch.nn.functional.linear(activated.to(dtype).float(), w2[expert].float()).to(dtype)
+        )
+
+    torch.testing.assert_close(actual, torch.stack(expected), atol=0.01, rtol=0.05)
+    if clamp_limit is not None:
+        if not capture_first:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run_moe()
+        graph.replay()
+        torch.testing.assert_close(captured, torch.stack(expected), atol=0.01, rtol=0.05)
+
+
 _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,

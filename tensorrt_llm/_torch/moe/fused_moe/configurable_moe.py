@@ -249,8 +249,14 @@ class ConfigurableMoE(MoE):
             self.event_dict = None
 
         # Validate configuration
-        self.validate_config()
-        self.validate_backend(self.backend)
+        validated = False
+        try:
+            self.validate_config()
+            self.validate_backend(self.backend)
+            validated = True
+        finally:
+            if not validated and self.comm is not None:
+                self.comm.destroy()
 
         # Mark as _weights_removed to skip ConfigurableMoE's post_load_weights in model_loader
         # The backend's post_load_weights will be called directly by model_loader
@@ -639,6 +645,7 @@ class ConfigurableMoE(MoE):
             use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
+            allow_alltoall=self.backend.supports_alltoall,
         )
 
     def forward_impl(

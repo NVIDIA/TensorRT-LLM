@@ -61,9 +61,11 @@ namespace torch_ext
 
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
-using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;
+using ActivationParams = kernels::ActivationParams;
 using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
 using MoeGemmId = CUTLASS_MOE_GEMM_NAMESPACE::MoeGemmId;
+#endif
 // Always use public header as it is just utility functions and types
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using profiler_backend = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::GemmProfilerBackend;
@@ -146,9 +148,67 @@ inline void moeLoraGroupedGemmRunImpl(::tensorrt_llm::kernels::cutlass_kernels::
     sync_check_cuda_error(stream);
 }
 
-static ActivationParams makeActivationParams(ActivationType activation_type,
+namespace
+{
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+void validateInternalMoeInputs(int64_t num_rows, int64_t hidden_size, int64_t unpadded_hidden_size,
+    torch::optional<int64_t> const& num_valid_tokens, bool enable_alltoall, bool has_input_sf, bool swizzled_input_sf,
+    bool use_dynamic_fc2_scale)
+{
+    TORCH_CHECK(
+        unpadded_hidden_size == hidden_size, "Unpadded MoE output requires the open-source CUTLASS MoE kernels.");
+    TORCH_CHECK(!num_valid_tokens.has_value() || num_valid_tokens.value() == num_rows,
+        "A separate valid-token count requires the open-source CUTLASS MoE kernels.");
+    TORCH_CHECK(!enable_alltoall, "MoE all-to-all requires the open-source CUTLASS MoE kernels.");
+    TORCH_CHECK(
+        !has_input_sf || swizzled_input_sf, "Unswizzled MoE input scales require the open-source CUTLASS MoE kernels.");
+    TORCH_CHECK(!use_dynamic_fc2_scale, "Dynamic FC2 scaling requires the open-source CUTLASS MoE kernels.");
+}
+#endif
+
+ActivationType getActivationType(int64_t activation_type)
+{
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+    return static_cast<ActivationType>(activation_type);
+#else
+    using PublicActivationType = tensorrt_llm::kernels::cutlass_kernels::ActivationType;
+    switch (static_cast<PublicActivationType>(activation_type))
+    {
+    case PublicActivationType::InvalidType:
+        TORCH_CHECK(false, "Invalid MoE activation type.");
+        return ActivationType::InvalidType;
+    case PublicActivationType::Identity: return ActivationType::Identity;
+    case PublicActivationType::Gelu: return ActivationType::Gelu;
+    case PublicActivationType::Relu: return ActivationType::Relu;
+    case PublicActivationType::Silu: return ActivationType::Silu;
+    case PublicActivationType::Swiglu: return ActivationType::Swiglu;
+    case PublicActivationType::Geglu: return ActivationType::Geglu;
+    case PublicActivationType::SwigluBias: return ActivationType::SwigluBias;
+    default: TORCH_CHECK(false, "Unsupported activation type for internal CUTLASS MoE kernels.");
+    }
+    return ActivationType::InvalidType;
+#endif
+}
+
+bool isSiTuActivation(ActivationType activation_type)
+{
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+    return activation_type == ActivationType::SiTu;
+#else
+    return false;
+#endif
+}
+
+struct ActivationParamBuffers
+{
+    std::map<std::tuple<int, int64_t, cudaStream_t>, std::pair<torch::Tensor, torch::Tensor>> defaults;
+};
+
+ActivationParams makeActivationParams(ActivationType activation_type,
     torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
-    torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu)
+    torch::optional<torch::Tensor> const& swiglu_limit, bool const swiglu_clamp_after_silu,
+    [[maybe_unused]] ActivationParamBuffers& buffers,
+    [[maybe_unused]] std::pair<torch::Tensor, torch::Tensor>& capture_buffers)
 {
     auto const* swiglu_alpha_ptr
         = reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr);
@@ -164,9 +224,43 @@ static ActivationParams makeActivationParams(ActivationType activation_type,
     // not implement this clamp order. Reject it instead of silently ignoring it.
     TORCH_CHECK(
         !swiglu_clamp_after_silu, "Post-SiLU SwiGLU clamping requires TensorRT-LLM's open-source CUTLASS MoE kernels.");
+    if ((swiglu_alpha_ptr || swiglu_beta_ptr || swiglu_limit_ptr) && (!swiglu_alpha_ptr || !swiglu_beta_ptr))
+    {
+        auto const& reference = swiglu_alpha.has_value() ? swiglu_alpha.value()
+            : swiglu_beta.has_value()                    ? swiglu_beta.value()
+                                                         : swiglu_limit.value();
+        // The legacy adaptor ignores the limit unless alpha and beta are both
+        // present. Keep neutral tensors per device, expert count and stream so
+        // repeated forwards do not allocate or refill them, or cross streams.
+        auto const stream = at::cuda::getCurrentCUDAStream(reference.device().index()).stream();
+        cudaStreamCaptureStatus capture_status;
+        TLLM_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        // Captured fills execute only on replay. Keep these tensors local to
+        // this forward so no later call can reuse an uninitialized graph buffer.
+        auto& defaults = capture_status != cudaStreamCaptureStatusNone
+            ? capture_buffers
+            : buffers.defaults[{reference.device().index(), reference.numel(), stream}];
+        if (!swiglu_alpha_ptr)
+        {
+            if (!defaults.first.defined())
+            {
+                defaults.first = torch::ones_like(reference);
+            }
+            swiglu_alpha_ptr = static_cast<float const*>(defaults.first.const_data_ptr());
+        }
+        if (!swiglu_beta_ptr)
+        {
+            if (!defaults.second.defined())
+            {
+                defaults.second = torch::zeros_like(reference);
+            }
+            swiglu_beta_ptr = static_cast<float const*>(defaults.second.const_data_ptr());
+        }
+    }
     return ActivationParams(activation_type, swiglu_alpha_ptr, swiglu_beta_ptr, swiglu_limit_ptr);
 #endif
 }
+} // namespace
 
 class FusedMoeRunner : public torch::CustomClassHolder
 {
@@ -248,6 +342,10 @@ public:
         mUseMxfp8WeightScaling = use_mxfp8_weight_scaling;
         mUseFusedFinalize = use_fused_finalize;
         mInnerDimMultiplier = 1;
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+        TORCH_CHECK(!mUseMxfp8ActScaling, "MXFP8 activations require the open-source CUTLASS MoE kernels.");
+        TORCH_CHECK(!mUseMxfp8WeightScaling, "MXFP8 x MXFP8 requires the open-source CUTLASS MoE kernels.");
+#endif
 
         // MXFP8xMXFP8 grouped MoE is only meaningful for the <e4m3, e4m3>
         // template instantiation. Reject other (act, weight) dtype pairs at
@@ -306,6 +404,7 @@ public:
         }
         if (isWFP4A16Quant())
         {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
             mInnerDimMultiplier = 2;
             if (mActivationDtype == c10::ScalarType::Half)
             {
@@ -316,6 +415,9 @@ public:
             {
                 mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<__nv_bfloat16, __nv_fp4_e2m1>>();
             }
+#endif
+#else
+            TORCH_CHECK(false, "NVFP4 weight-only MoE requires the open-source CUTLASS MoE kernels.");
 #endif
         }
 #endif
@@ -332,8 +434,12 @@ public:
             {
                 if (isInt4Quant() and mUseW4GroupScaling)
                 {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
                     mKernelRunner = std::make_unique<
                         kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, __nv_bfloat16, __nv_fp8_e4m3>>();
+#else
+                    TORCH_CHECK(false, "FP8-input W4A8 MoE requires the open-source CUTLASS MoE kernels.");
+#endif
                 }
                 else
                 {
@@ -356,11 +462,18 @@ public:
         }
 
         mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         mKernelRunner->use_mxfp8_weight_scaling_ = mUseMxfp8WeightScaling;
+#endif
 
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
         mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
+#else
+        mGemm1Profiles = mKernelRunner->getTactics();
+        mGemm2Profiles = mGemm1Profiles;
+#endif
         replaceUnsupportedProfiles(mGemm1Profiles);
         replaceUnsupportedProfiles(mGemm2Profiles);
         cuInit(0);
@@ -493,9 +606,8 @@ public:
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
 
-        ActivationType base_activation_type = activation_type.has_value()
-            ? static_cast<ActivationType>(activation_type.value())
-            : ActivationType::Swiglu;
+        ActivationType base_activation_type
+            = activation_type.has_value() ? getActivationType(activation_type.value()) : ActivationType::Swiglu;
         if (mUseINT8WoqPerChannel)
         {
             // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
@@ -531,8 +643,6 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t unpadded_hidden_size_val
-            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseINT8WoqPerChannel)
         {
@@ -541,6 +651,9 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
+
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
 
         if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
         {
@@ -560,6 +673,10 @@ public:
         }
 
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+        validateInternalMoeInputs(num_rows, hidden_size, unpadded_hidden_size_val, num_valid_tokens, enable_alltoall,
+            input_sf.has_value(), swizzled_input_sf, use_dynamic_fc2_scale);
+#endif
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
 
@@ -568,7 +685,7 @@ public:
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
@@ -578,7 +695,7 @@ public:
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
@@ -588,20 +705,20 @@ public:
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
-        TORCH_CHECK(
-            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+        TORCH_CHECK(!isSiTuActivation(base_activation_type) || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
             "SiTu requires both swiglu_alpha and swiglu_beta.");
-        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+        TORCH_CHECK(!isSiTuActivation(base_activation_type) || !swiglu_limit.has_value(),
             "SiTu does not support swiglu_limit.");
         // A SwiGLU clamp promotes base_activation_type to SwigluBias above,
         // which selects the only CUTLASS adaptor that consumes clampAfterSilu.
-        auto activation_params = makeActivationParams(
-            base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, swiglu_clamp_after_silu);
+        std::pair<torch::Tensor, torch::Tensor> capture_buffers;
+        auto activation_params = makeActivationParams(base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit,
+            swiglu_clamp_after_silu, mActivationParamBuffers, capture_buffers);
 
         // ===== Routed-expert LoRA activation flags =====
         // LoRA is activated by the per-request (fc1_lora_ranks) or slot-indexed
@@ -687,6 +804,7 @@ public:
             = getQuantParams(num_experts_on_rank, hidden_size, inter_size, quant_scales, base_activation_type);
 
         // Dynamic fc2 scale: allocate workspace buffers
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         at::Tensor dynamic_fc2_amax_tensor, dynamic_fc2_alpha_tensor, dynamic_fc2_bf16_tensor;
         if (use_dynamic_fc2_scale && isNvfp4Quant() && quant_scales.has_value() && quant_scales.value().size() >= 7)
         {
@@ -706,6 +824,7 @@ public:
                 = static_cast<float const*>(quant_scales.value()[6].data_ptr());
         }
 
+#endif
         kernels::MoeMinLatencyParams min_latency_params{};
 
         // Use the populated LoraParams when LoRA is active, otherwise a default-constructed empty one.
@@ -728,7 +847,7 @@ public:
             lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -736,8 +855,7 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
-            num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, lora_active, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
@@ -815,8 +933,6 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t unpadded_hidden_size_val
-            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         if (mUseINT8WoqPerChannel)
         {
@@ -825,19 +941,24 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
+        int64_t unpadded_hidden_size_val
+            = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+        validateInternalMoeInputs(num_rows, hidden_size, unpadded_hidden_size_val, num_valid_tokens, enable_alltoall,
+            input_sf.has_value(), swizzled_input_sf, /*use_dynamic_fc2_scale=*/false);
+#endif
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config
             = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
-        ActivationType base_activation_type = activation_type.has_value()
-            ? static_cast<ActivationType>(activation_type.value())
-            : ActivationType::Swiglu;
+        ActivationType base_activation_type
+            = activation_type.has_value() ? getActivationType(activation_type.value()) : ActivationType::Swiglu;
         if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
@@ -847,7 +968,7 @@ public:
             CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
@@ -857,18 +978,18 @@ public:
             CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_limit must have num_experts_on_rank elements.");
-            if (base_activation_type != ActivationType::SiTu)
+            if (!isSiTuActivation(base_activation_type))
             {
                 base_activation_type = ActivationType::SwigluBias;
             }
         }
-        TORCH_CHECK(
-            base_activation_type != ActivationType::SiTu || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
+        TORCH_CHECK(!isSiTuActivation(base_activation_type) || (swiglu_alpha.has_value() && swiglu_beta.has_value()),
             "SiTu requires both swiglu_alpha and swiglu_beta.");
-        TORCH_CHECK(base_activation_type != ActivationType::SiTu || !swiglu_limit.has_value(),
+        TORCH_CHECK(!isSiTuActivation(base_activation_type) || !swiglu_limit.has_value(),
             "SiTu does not support swiglu_limit.");
-        auto activation_params = makeActivationParams(
-            base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, swiglu_clamp_after_silu);
+        std::pair<torch::Tensor, torch::Tensor> capture_buffers;
+        auto activation_params = makeActivationParams(base_activation_type, swiglu_alpha, swiglu_beta, swiglu_limit,
+            swiglu_clamp_after_silu, mActivationParamBuffers, capture_buffers);
 
         // Validate the fc1/fc2 inter-size relationship now that the activation type (gated vs
         // non-gated) is finalized. INT8-woq uses a transposed weight layout, so its fc1/fc2 dim
@@ -956,7 +1077,7 @@ public:
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -964,8 +1085,7 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, num_valid_tokens.has_value() ? num_valid_tokens.value() : num_rows, hidden_size, inter_size,
-            num_experts_total, static_cast<int>(experts_per_token),
+            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
             static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
             static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
@@ -997,7 +1117,7 @@ public:
         {
             return;
         }
-        ActivationType activation_type = static_cast<ActivationType>(activation_type_int);
+        ActivationType activation_type = getActivationType(activation_type_int);
 
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
@@ -1009,6 +1129,11 @@ public:
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+        validateInternalMoeInputs(num_rows, hidden_size, unpadded_hidden_size > 0 ? unpadded_hidden_size : hidden_size,
+            std::nullopt, enable_alltoall,
+            /*has_input_sf=*/false, /*swizzled_input_sf=*/true, /*use_dynamic_fc2_scale=*/false);
+#endif
         int64_t const group_size_
             = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
         int64_t const group_size = isWFP4A16Quant()
@@ -1093,6 +1218,7 @@ private:
     int64_t mInnerDimMultiplier;
     char* mProfileWorkspace = nullptr;
     std::map<cudaStream_t, WorkspaceInfo> mStreamWorkspaces;
+    ActivationParamBuffers mActivationParamBuffers;
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
@@ -1750,6 +1876,7 @@ private:
         int64_t inter_size, c10::ScalarType act_dtype, int64_t lora_max_low_rank, bool is_gated_activation,
         cudaStream_t stream, int experts_per_token)
     {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         bool const has_per_request = fc1_lora_ranks.has_value();
         bool const has_slot_indexed = fc1_slot_lora_ranks.has_value();
         if (!has_per_request && !has_slot_indexed)
@@ -2126,6 +2253,11 @@ private:
         }
 
         return lora_params;
+#else
+        TORCH_CHECK(!fc1_lora_ranks.has_value() && !fc1_slot_lora_ranks.has_value(),
+            "Routed-expert LoRA requires the open-source CUTLASS MoE kernels.");
+        return std::nullopt;
+#endif
     }
 
     kernels::QuantParams getQuantParams(int64_t const num_experts_on_rank, int64_t const hidden_size,
@@ -2276,11 +2408,12 @@ private:
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
                 static_cast<float const*>(fc2_global.data_ptr()));
 #else
-            TORCH_CHECK(false, "MXFP8 x MXFP4 quantization is not supported in OSS Cutlass Moe Gemm");
+            TORCH_CHECK(false, "MXFP8 x MXFP4 requires the open-source CUTLASS MoE kernels.");
 #endif
         }
         else if (isWMxfp8AMxfp8Quant())
         {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
             // <e4m3, e4m3> with MXFP8 1x32 UE8M0 block scales on both sides;
             // SF storage is int32-packed UE8M0 (same convention as MXFP4 MoE).
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for MXFP8 x MXFP8 quantization");
@@ -2298,6 +2431,9 @@ private:
             return kernels::QuantParams::MXFP8MXFP8(
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
                 static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()));
+#else
+            TORCH_CHECK(false, "MXFP8 x MXFP8 requires the open-source CUTLASS MoE kernels.");
+#endif
         }
         else if (isNvfp4Quant())
         {
@@ -2412,7 +2548,11 @@ private:
                 // Whether it is per-expert activation scale
                 bool fc1_use_per_expert_act_scale = fc1_act_scales.numel() > hidden_size;
                 bool fc2_use_per_expert_act_scale = fc2_act_scales.numel() > inter_size;
-                return kernels::QuantParams::GroupWise(group_size,
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+                TORCH_CHECK(!fc1_use_per_expert_act_scale && !fc2_use_per_expert_act_scale,
+                    "Per-expert W4A8 activation scales require the open-source CUTLASS MoE kernels.");
+#endif
+                auto quant_params = kernels::QuantParams::GroupWise(group_size,
                     static_cast<void const*>(fc1_weight_scales.data_ptr()),
                     static_cast<void const*>(fc2_weight_scales.data_ptr()),
                     static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
@@ -2420,8 +2560,12 @@ private:
                     static_cast<void const*>(fc1_weight_zeros.numel() > 0 ? fc1_weight_zeros.data_ptr() : nullptr),
                     static_cast<void const*>(fc2_weight_zeros.numel() > 0 ? fc2_weight_zeros.data_ptr() : nullptr),
                     static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
-                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr),
-                    fc1_use_per_expert_act_scale, fc2_use_per_expert_act_scale);
+                    static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+                quant_params.groupwise.fc1.use_per_expert_act_scale = fc1_use_per_expert_act_scale;
+                quant_params.groupwise.fc2.use_per_expert_act_scale = fc2_use_per_expert_act_scale;
+#endif
+                return quant_params;
             }
             else
             {
@@ -2498,6 +2642,15 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY(trtllm, m)
 {
+    m.def("is_oss_cutlass_moe() -> bool",
+        []()
+        {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+            return true;
+#else
+            return false;
+#endif
+        });
     m.class_<tensorrt_llm::torch_ext::FusedMoeRunner>("FusedMoeRunner")
         .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &tensorrt_llm::torch_ext::FusedMoeRunner::runGemmProfile)

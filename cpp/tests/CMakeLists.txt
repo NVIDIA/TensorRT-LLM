@@ -39,7 +39,7 @@ add_custom_target(google-tests)
 
 function(add_gtest test_name test_src)
   set(options NO_GTEST_MAIN NO_TLLM_LINKAGE)
-  set(oneValueArgs TIMEOUT)
+  set(oneValueArgs TIMEOUT TEST_PREFIX)
   cmake_parse_arguments(ARGS "${options}" "${oneValueArgs}" "${multiValueArgs}"
                         ${ARGN})
   add_executable(${test_name} ${test_src})
@@ -69,6 +69,7 @@ function(add_gtest test_name test_src)
 
   gtest_discover_tests(
     ${test_name}
+    TEST_PREFIX "${ARGS_TEST_PREFIX}"
     PROPERTIES ${test_properties}
                DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.

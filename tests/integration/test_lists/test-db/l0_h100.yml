@@ -14,6 +14,8 @@ l0_h100:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
   # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
   # is what picks them up:
