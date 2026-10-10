@@ -1912,18 +1912,18 @@ typing-extensions = ">=4.16.0"
 
 [[package]]
 name = "python-discovery"
-version = "1.6.1"
+version = "1.6.2"
 description = "Python interpreter discovery"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.6.1-py3-none-any.whl", hash = "sha256:d43fcdef879fe795352bd13ccf8d185ba5a9f86f36cfcd00529f596e737442b3"},
-    {file = "python_discovery-1.6.1.tar.gz", hash = "sha256:cf87d3627dfb4412437fdd5b13eae402607722998d21567993aedbc59b23c15e"},
+    {file = "python_discovery-1.6.2-py3-none-any.whl", hash = "sha256:f0c697f95a3aaec4174a6e5e58f5885e25768684bafc76f1afde384709ebdcf2"},
+    {file = "python_discovery-1.6.2.tar.gz", hash = "sha256:cd1738ca1d37c86ef9d0b654dd46fcee1e41c97c6add12575e8501ced39afdb4"},
 ]
 
 [package.dependencies]
-filelock = ">=3.15.4"
+filelock = ">=3.16.1"
 
 [[package]]
 name = "pyyaml"

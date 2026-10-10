@@ -1317,14 +1317,14 @@ standard-no-fastapi-cloud-cli = ["email-validator (>=2.0.0)", "fastapi-cli[stand
 
 [[package]]
 name = "filelock"
-version = "4.0.12"
+version = "4.1.0"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.0.12-py3-none-any.whl", hash = "sha256:5f17ee83ecee8a6f3e389c75822fb70a1c2f0506b99438a6dffa1d56793588c8"},
-    {file = "filelock-4.0.12.tar.gz", hash = "sha256:cf42711a7ac791818b299fab0332a088c65aeeefa36290de98db92c434303b0c"},
+    {file = "filelock-4.1.0-py3-none-any.whl", hash = "sha256:2ce9818e3e2d8f284c1a964414447ef148d42a5fd5e2a477a7118e574b293ec1"},
+    {file = "filelock-4.1.0.tar.gz", hash = "sha256:ad7f724afef953e731b1cc39bcd3a09166d72ed7fcdf29e6e88b1c3235c6715d"},
 ]
 
 [[package]]
@@ -3870,14 +3870,14 @@ dev = ["PyYAML (>=5.1.0)", "attrs", "build", "bump-my-version", "coveralls", "no
 
 [[package]]
 name = "openai"
-version = "3.27.0"
+version = "3.28.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.27.0-py3-none-any.whl", hash = "sha256:342cc911201c0b7acc5b566e4c71212c05b00a30b4b4c4c67b65d96e1db66c8c"},
-    {file = "openai-3.27.0.tar.gz", hash = "sha256:b84a941b8e488cd29c1555dd6edda4aa57452add9e3a0eb29eb732cec49e4468"},
+    {file = "openai-3.28.0-py3-none-any.whl", hash = "sha256:1ea40a084ffe2f9f16fd3bea6e870f757853b536b18d8e737c518ef849a2920c"},
+    {file = "openai-3.28.0.tar.gz", hash = "sha256:cf0509d32d7bd8eb6a3db02417957cb455212b6629d071826b9ea1f61659e2a4"},
 ]
 
 [package.dependencies]
@@ -7308,4 +7308,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "ceff152b2d62301f5647fbbcfcfd2855a22b4b213e88a3b699af744e7b89364a"
+content-hash = "12c64c1226ad1ede520507c70f4e8fcdaa08d7b96f253d16840103558f0da36d"
