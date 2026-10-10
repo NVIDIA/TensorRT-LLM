@@ -200,7 +200,6 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::Tes
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model] SKIP (https://nvbugs/6672360)
 full:RTX_PRO_6000_Blackwell_Server_Edition/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto] SKIP (https://nvbugs/6844164)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
-perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k8k] SKIP (https://nvbugs/6877254)
 perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-gb300_deepseek-v4-pro-dspark_agentx_con1156_ctx2_dep8_gen1_dep8_eplb0_dspark3_ccb-NIXL] SKIP (https://nvbugs/6877254)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_doc.py::test_relative_path_validity SKIP (https://nvbugs/6784181)
