@@ -516,7 +516,16 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        // build_wheel.py downloads third-party sources while configuring
+        // (FetchContent clones, UCXX's rapids-cmake and CPM.cmake), so a network
+        // hiccup fails it within the first few minutes. Retry any failure in that
+        // window; a later failure is still retried only when its log matches a
+        // known fail signature. The build dir is kept, so a retry is incremental.
+        trtllm_utils.llmExecStepWithRetry(
+            pipeline,
+            script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}",
+            shortCommondRunTimeMax: 600  // always retry on failure if the cmd runs less than 600s
+        )
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
