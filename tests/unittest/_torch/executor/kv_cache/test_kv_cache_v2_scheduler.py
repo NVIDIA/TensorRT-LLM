@@ -137,7 +137,7 @@ def sparse_offset_manager() -> KVCacheManagerV2:
     manager.max_copy_beam_width = 1
     manager.kv_cache_type = CacheTypeCpp.SELF
     manager.tokens_per_block = 4
-    manager.kv_cache_map = {req_id: Mock(is_decoding=True, history_length=8) for req_id in (7, 8)}
+    manager.kv_cache_map = {req_id: Mock(is_decoding=False, history_length=8) for req_id in (7, 8)}
     for cache in manager.kv_cache_map.values():
         cache.get_page_storage_snapshot.return_value = Mock(
             cache_levels=[0, 0], eligible_history_blocks=0
@@ -157,7 +157,7 @@ def sparse_offset_manager() -> KVCacheManagerV2:
     "cache_levels",
     [pytest.param([0, 0], id="gpu"), pytest.param([None, 0, None], id="invalid-slots")],
 )
-def test_sparse_gpu_resident_history_uses_dense_attention_offsets(
+def test_sparse_gpu_prefill_uses_dense_attention_offsets(
     sparse_offset_manager: KVCacheManagerV2, cache_levels: list[int | None], per_layer: bool
 ) -> None:
     manager = sparse_offset_manager
@@ -226,17 +226,14 @@ def test_sparse_host_indices_cannot_reach_dense_attention_offsets(
     manager.sparse_metadata_batch.publish.assert_called_once_with(123)
 
 
-def test_sparse_dense_offsets_check_residency_after_publication(
+def test_sparse_mixed_prefill_and_decode_rejects_dense_offsets(
     sparse_offset_manager: KVCacheManagerV2,
 ) -> None:
     manager = sparse_offset_manager
+    manager.kv_cache_map[8].is_decoding = True
     snapshot = manager.kv_cache_map[8].get_page_storage_snapshot.return_value
-
-    def offload_history(stream: int) -> None:
-        snapshot.cache_levels = [1, 1]
-        snapshot.eligible_history_blocks = 2
-
-    manager.sparse_metadata_batch.publish.side_effect = offload_history
+    snapshot.cache_levels = [1, 1]
+    snapshot.eligible_history_blocks = 2
     with patch(
         "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
         "copy_batch_block_offsets_to_device"

@@ -38,6 +38,7 @@ class KvCache;
 class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
+class SparsePageBacking;
 
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
@@ -83,7 +84,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// CommittedPage — page associated with a Block in the radix tree.
+// CommittedPage — immutable block payload, canonical or request-private.
 //
 // A committed page is immutable — all access after commit is read-only.
 //
@@ -125,6 +126,20 @@ public:
     {
         return true;
     }
+
+    //! Claim a GPU allocation for one request, or report that a private copy is required.
+    bool claimSparseGpu(KvCache& kvCache);
+
+    //! Shared host backing for a complete immutable sparse block; partial pages have none.
+    SharedPtr<SparsePageBacking> sparseBacking();
+
+private:
+    friend class SparsePageBacking;
+    friend class StorageManager;
+    friend class UniqPageLock;
+    friend class UncommittedPage;
+    std::weak_ptr<KvCache> mSparseGpuOwner;
+    SharedPtr<SparsePageBacking> mSparseBacking;
 };
 
 // ---------------------------------------------------------------------------
@@ -146,13 +161,14 @@ public:
         return false;
     }
 
-    // Convert this UncommittedPage into a CommittedPage and attach to `block`.
+    // Convert this UncommittedPage into a CommittedPage. A private sparse copy
+    // keeps its GPU slot and shares the existing block's host-backing record.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
     SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock, bool privateSparseCopy = false);
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +187,9 @@ public:
     // Acquire a shared lock (creates or reuses the UniqPageLock).
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+
+    //! Pin storage without installing an execution mapping in a request.
+    SharedPtr<UniqPageLock> pin();
 
     SharedPtr<Page> page;
     WeakPtr<UniqPageLock> uniqLock; // non-null → LOCKED
@@ -210,17 +229,20 @@ public:
     // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
     void notifyFinish(CachedCudaEvent event);
 
-    //! Validate complete sparse history for every owner and prepare non-allocating completion updates.
+    //! Validate complete sparse history owned by the requesting cache.
     void prepareSparseOffload(KvCache const& requestingCache);
 
-    //! Validate a locked host page and prepare non-allocating completion updates for shared promotion.
-    void prepareSparsePromotion();
-
     //! Record a copy ordered after page readiness, finished readers, and all live owners' prior work.
-    void recordMigrationEvent(CachedCudaEvent const& event);
+    void recordOffloadEvent(CachedCudaEvent const& event);
 
-    //! Publish a GPU/host handoff to every owner and return the fenced source slot. Caller holds the API lock.
-    [[nodiscard]] Slot moveToCacheLevel(CacheLevel destination, Slot&& slot);
+    //! Publish the host slot to every owner and return the fenced GPU slot. Caller holds the API lock.
+    [[nodiscard]] Slot moveToSparseHistory(Slot&& hostSlot);
+
+    //! Reserve owner storage before replacing a request's execution binding.
+    void reserveOwners(size_t count);
+
+    //! Release a private GPU allocation after all execution bindings have been removed.
+    void releaseSparseGpuSlot();
 
     std::vector<LockOwner> const& owners() const noexcept
     {
@@ -235,6 +257,21 @@ private:
     void removeOwner(LockOwner const& owner);
 
     std::vector<LockOwner> mOwners;
+};
+
+//! Host backing shared by request-private copies of one full immutable block.
+//! The host page does not retain this object, avoiding a storage ownership cycle.
+class SparsePageBacking
+{
+public:
+    explicit SparsePageBacking(SharedPtr<Block> const& block);
+
+    SharedPtr<UniqPageLock> hostLock(LifeCycleId lifeCycle);
+    void publishHost(SharedPtr<UniqPageLock> const& lock);
+
+private:
+    WeakPtr<Block> mBlock;
+    SharedPtr<UniqPageLock> mHostLock;
 };
 
 // ---------------------------------------------------------------------------
@@ -289,7 +326,7 @@ struct BatchedLockTarget
 // ---------------------------------------------------------------------------
 // batchedLockPages — restore pages to their intended levels, then lock them.
 // Returns one SharedPageLock per target.
-// Only promotes cold pages; GPU-to-host offload has a separate ownership handoff.
+// Sparse GPU destinations are private to the receiving request.
 // ---------------------------------------------------------------------------
 std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 

@@ -460,6 +460,86 @@ class TestStorageStatistics(TestKVCacheManagerV2):
 
 
 class TestNoBatching(TestKVCacheManagerV2):
+    def test_sparse_prefix_private_gpu_and_shared_host_lifecycle(self) -> None:
+        import torch
+
+        self.manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=4,
+                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
+                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)])],
+            )
+        )
+        group = self.manager.get_layer_group_id(0)
+        batch = Batch(self.manager, max_rows=3, max_blocks=2)
+        first = self.manager.create_kv_cache()
+        second = incoming = None
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            try:
+                self.assertTrue(first.resume(stream))
+                self.assertTrue(first.resize(4, 4))
+                first.commit([0, 1, 2, 3])
+                second = self.manager.create_kv_cache(ReuseScope(), [0, 1, 2, 3])
+                self.assertTrue(second.resume(stream))
+                batch.add(first, 0)
+                batch.add(second, 1)
+                batch.publish(stream)
+                table = torch.from_dlpack(batch.page_table(group))
+                counts = torch.from_dlpack(batch.num_blocks(group))
+                rows = table.cpu().tolist()
+                self.assertNotEqual(rows[0][0][0], rows[1][0][0])
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [0]])
+                batch.record_read(stream)
+
+                second_version = second.page_storage_version
+                self.assertTrue(first.enter_decode())
+                host_index = first.get_page_storage_snapshot(group).base_page_indices[0]
+                self.assertEqual(second.page_storage_version, second_version)
+                self.assertEqual(second.get_page_storage_snapshot(group).cache_levels, [0])
+                first.close()
+                self.assertTrue(second.resize(8, 8))
+                self.assertTrue(second.enter_decode())
+                self.assertEqual(
+                    second.get_page_storage_snapshot(group).base_page_indices[0], host_index
+                )
+                batch.publish(stream)
+                self.assertEqual(counts.cpu().tolist(), [[0], [2], [0]])
+                batch.record_read(stream)
+
+                second_version = second.page_storage_version
+                incoming = self.manager.create_kv_cache(ReuseScope(), [0, 1, 2, 3])
+                self.assertTrue(incoming.prefetch(GPU_LEVEL))
+                self.assertTrue(incoming.resume(stream))
+                self.assertEqual(incoming.get_page_storage_snapshot(group).cache_levels, [0])
+                self.assertEqual(second.page_storage_version, second_version)
+                self.assertEqual(second.get_page_storage_snapshot(group).cache_levels, [1, 1])
+                batch.add(incoming, 2)
+                batch.publish(stream)
+                self.assertEqual(counts.cpu().tolist(), [[0], [2], [0]])
+                batch.record_read(stream)
+
+                second.close()
+                incoming.suspend()
+                self.assertTrue(incoming.resume(stream))
+                self.assertTrue(incoming.enter_decode())
+                self.assertEqual(
+                    incoming.get_page_storage_snapshot(group).base_page_indices, [host_index]
+                )
+                batch.publish(stream)
+                self.assertEqual(counts.cpu().tolist(), [[0], [0], [1]])
+                batch.record_read(stream)
+                for pool in self.manager.get_storage_statistics(GPU_LEVEL):
+                    self.assertEqual(pool.free, pool.total)
+            finally:
+                batch.close()
+                if incoming is not None:
+                    incoming.close()
+                if second is not None:
+                    second.close()
+                first.close()
+        stream_holder.take_finish_event().synchronize()
+
     def test_batch_publishes_sparse_gpu_metadata(self) -> None:
         import torch
 
@@ -536,72 +616,6 @@ class TestNoBatching(TestKVCacheManagerV2):
                 stream.synchronize()
                 batch.close()
                 cache.close()
-
-    @parameterized.expand(["decode", "suspend", "close"])
-    def test_shared_prefill_defers_sparse_offload(self, release: str) -> None:
-        import torch
-
-        self.manager = KVCacheManager(
-            KVCacheManagerConfig(
-                tokens_per_block=4,
-                cache_tiers=[GpuCacheTierConfig(4 << 20), HostCacheTierConfig(4 << 20)],
-                layers=[AttentionLayerConfig(0, [BufferConfig("key", 4096, is_sparse=True)])],
-            )
-        )
-        decoder = self.manager.create_kv_cache()
-        prefill = None
-        batch = Batch(self.manager, max_rows=1, max_blocks=3)
-        group = self.manager.get_layer_group_id(0)
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            try:
-                self.assertTrue(decoder.resume(stream.cuda_stream))
-                self.assertTrue(decoder.resize(12, 8))
-                decoder.commit([0, 1, 2, 3])
-                prefill = self.manager.create_kv_cache(ReuseScope(), [0, 1, 2, 3])
-                self.assertTrue(prefill.resume(stream.cuda_stream))
-                self.assertEqual(
-                    decoder.get_base_page_indices(group)[0], prefill.get_base_page_indices(group)[0]
-                )
-                self.assertTrue(decoder.enter_decode())
-                self.assertTrue(decoder.is_decoding)
-                deferred = decoder.get_page_storage_snapshot(group)
-                self.assertEqual(deferred.cache_levels, [0, 1, 0])
-                self.assertEqual(deferred.eligible_history_blocks, 0)
-                batch.add(decoder)
-                self.assertEqual(batch.publish(stream.cuda_stream), [0])
-                table = torch.from_dlpack(batch.page_table(group))
-                counts = torch.from_dlpack(batch.num_blocks(group))
-                address = table.data_ptr()
-                self.assertEqual(table.cpu().tolist(), [[deferred.base_page_indices]])
-                self.assertEqual(counts.cpu().tolist(), [[0]])
-                batch.record_read(stream.cuda_stream)
-                self.assertEqual(batch.publish(stream.cuda_stream), [])
-
-                if release == "decode":
-                    self.assertTrue(prefill.enter_decode())
-                elif release == "suspend":
-                    prefill.suspend()
-                else:
-                    prefill.close()
-                self.assertEqual(batch.publish(stream.cuda_stream), [0])
-                batch.wait_ready(stream.cuda_stream)
-                self.assertEqual(decoder.history_length, 8)
-                completed = decoder.get_page_storage_snapshot(group)
-                self.assertEqual(completed.cache_levels, [1, 1, 0])
-                self.assertEqual(completed.eligible_history_blocks, 2)
-                self.assertGreater(completed.version, deferred.version)
-                self.assertEqual(table.data_ptr(), address)
-                self.assertEqual(table.cpu().tolist(), [[completed.base_page_indices]])
-                self.assertEqual(counts.cpu().tolist(), [[2]])
-                batch.record_read(stream.cuda_stream)
-                self.assertEqual(batch.publish(stream.cuda_stream), [])
-            finally:
-                stream.synchronize()
-                batch.close()
-                decoder.close()
-                if prefill is not None:
-                    prefill.close()
 
     def test_sparse_page_storage_metadata(self) -> None:
         self.manager = KVCacheManager(

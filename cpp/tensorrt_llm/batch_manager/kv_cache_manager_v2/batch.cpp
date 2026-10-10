@@ -222,15 +222,6 @@ std::vector<int> Batch::publish(CudaStream stream)
     checkOpen();
     auto const cudaStream = reinterpret_cast<CUstream>(stream);
     checkOutsideCapture(stream);
-    // Owner release can unblock history without changing a request's watermark or metadata version.
-    // Retry before collecting dirty rows: one shared-page move can invalidate several rows.
-    for (auto* cache : mRows)
-    {
-        if (cache != nullptr && cache->isActive() && cache->mIsDecoding && cache->mHasDeferredSparseOffload)
-        {
-            cache->_offloadSparseHistory({0, 0}, cache->mHistoryLength);
-        }
-    }
     auto rows = dirtyRows();
     if (rows.empty())
     {

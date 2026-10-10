@@ -40,6 +40,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Forward declarations.
 class Page;
+class CommittedPage;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
@@ -159,6 +160,11 @@ public:
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
 
+    //! Copy immutable sparse pages into request-private GPU allocations, retaining host backing.
+    std::vector<SharedPtr<CommittedPage>> copySparsePages(KvCache& requestingCache,
+        std::vector<SharedPtr<CommittedPage>> const& pages, MigrationRecorder const& migrationRecorder,
+        DropRecorder const& dropRecorder);
+
     // ---- Eviction ----------------------------------------------------------
 
     // Schedule a page for eviction (if evictable).
@@ -192,18 +198,14 @@ public:
     void batchedMigrate(
         CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
 
-    //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
+    //! Establish host backing for complete sparse pages and release the requesting cache's GPU copies.
     //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
     void offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
-    //! Promote locked sparse host pages into one shared GPU allocation per page, updating all owners.
-    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves host ownership.
-    void promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
-
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
-    // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
+    // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
+    // nothing, which in practice means slot preparation failed before anything moved.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
@@ -388,8 +390,6 @@ private:
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
         bool defrag = false);
-    void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
-        KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,

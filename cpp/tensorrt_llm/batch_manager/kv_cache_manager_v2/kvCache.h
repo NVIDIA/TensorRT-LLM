@@ -180,7 +180,6 @@ public:
         return mCacheLevels;
     }
 
-    // Contiguous complete sparse history on host; stops at the first missing or GPU mapping.
     int eligibleHistoryBlocks() const noexcept
     {
         return mEligibleHistoryBlocks;
@@ -245,9 +244,8 @@ public:
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt, std::optional<bool> isDecoding = std::nullopt);
 
-    // Enter decode only after prefill has submitted its final KV accesses. Offloads complete sparse
-    // history, deferring pages still needed on GPU by another owner. Retries deferred pages even
-    // with an unchanged watermark. Returns false on host OOM.
+    // Enter decode only after prefill has submitted its final KV accesses. Reconciles all complete
+    // sparse history, including on retries with an unchanged watermark. Returns false on host OOM.
     bool enterDecode();
 
     bool isDecoding() const noexcept
@@ -563,6 +561,7 @@ public:
 private:
     friend class KvCacheIntrospection;
     friend class UniqPageLock;
+    friend class StorageManager;
     friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
@@ -579,8 +578,12 @@ private:
     // Prefill and writable pages require GPU storage. Decode keeps cold sparse history on host.
     CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
 
-    // Offload GPU pages in the supplied complete-history range and retry deferred history.
-    // Pages stay on GPU until they belong to every live owner's complete decode history.
+    bool _isSparsePartialCopySource(Page const& page, BlockOrdinal ordinal) const;
+
+    void _prepareSparsePages(std::vector<BatchedLockTarget>& targets);
+    void _useSparseHostPage(SharedPtr<UniqPageLock> const& source, SharedPtr<UniqPageLock> const& host);
+
+    // Offload this request's GPU pages in the supplied complete-history range.
     // The candidate watermark is visible only under the exclusive API lock until offload succeeds.
     void _offloadSparseHistory(HalfOpenRange<BlockOrdinal> range, int historyLength);
     void _publishHistoryLength(int historyLength);
@@ -742,8 +745,6 @@ private:
     int mCapacity;
     int mHistoryLength;
     bool mIsDecoding = false;
-    // Retry by scanning current blocks; deferred work does not retain pages or other requests.
-    bool mHasDeferredSparseOffload = false;
     std::optional<int> mExpectedPromptLength;
     bool mGenerationAllocReady = false;
 
