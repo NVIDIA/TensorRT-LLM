@@ -85,6 +85,7 @@ l0_cpu:
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_nccl_window_graph.py
   - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_utils.py
   - unittest/_torch/thop/parallel_hw_agnostic

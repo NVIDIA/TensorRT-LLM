@@ -17,6 +17,7 @@ import tensorrt_llm
 from tensorrt_llm import mapping as mapping_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_pixtral
+from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 mpi4py.MPI.pickle.__init__(
@@ -223,9 +224,10 @@ def _run_pixtral_and_compare_against_ref(
     assert params_fraction < 1.0
     assert params_fraction == pytest.approx(1.0 / world_size, rel=1e-2)
 
-    out = pixtral_model(
-        pixel_values=pixel_values,
-        image_sizes=image_sizes,
-    )
-    torch.testing.assert_close(out, expected_output, atol=0.2, rtol=0.2)
+    with discard_nccl_window_tensor_outputs((pixel_values, image_sizes, expected_output)):
+        out = pixtral_model(
+            pixel_values=pixel_values,
+            image_sizes=image_sizes,
+        )
+        torch.testing.assert_close(out, expected_output, atol=0.2, rtol=0.2)
     return True

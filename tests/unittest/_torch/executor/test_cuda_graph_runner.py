@@ -1,17 +1,54 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import Mock
+import contextlib
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
 
+import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     EncoderCUDAGraphRunner,
     EncoderCUDAGraphRunnerConfig,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_encoder_capture_discards_warmup_and_capture_outputs(monkeypatch) -> None:
+    discarded = []
+
+    @contextlib.contextmanager
+    def discard(inputs):
+        discarded.append(inputs)
+        yield
+
+    capture_inputs = {"attn_metadata": object()}
+    graph = MagicMock()
+    graph.pool.return_value = (1, 2)
+    monkeypatch.setattr(cuda_graph_runner_module, "discard_nccl_window_tensor_outputs", discard)
+    monkeypatch.setattr(cuda_graph_runner_module.torch.cuda, "CUDAGraph", lambda: graph)
+    monkeypatch.setattr(
+        cuda_graph_runner_module,
+        "nccl_window_graph_capture",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+
+    runner = EncoderCUDAGraphRunner.__new__(EncoderCUDAGraphRunner)
+    runner.feature_mode = False
+    runner.is_warmup_only = False
+    runner.memory_pool = (1, 2)
+    runner.graph_metadata = {}
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner._prepare_token_capture = Mock(return_value=(capture_inputs, None))
+    runner._get_capture_stream = Mock(return_value=object())
+    runner._contains_nested_tensor = Mock(return_value=False)
+
+    runner.capture((1, 1, 1), Mock(return_value=torch.tensor(1)), {})
+
+    assert discarded == [capture_inputs] * (runner.WARMUP_STEPS + 1)
 
 
 def _feature_encoder_runner(
