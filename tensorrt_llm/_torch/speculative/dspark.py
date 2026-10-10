@@ -20,6 +20,7 @@
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 import json
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -37,6 +38,7 @@ from .interface import SpecMetadata, SpecWorkerBase
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+    from ..pyexecutor.llm_request import LlmRequest
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -60,7 +62,10 @@ def load_sts_temperatures_from_path(path: str) -> list[float]:
         )
     if not isinstance(temps, list) or not temps:
         raise ValueError(f"{path} must contain a non-empty temperature list")
-    return [float(t) for t in temps]
+    temperatures = [float(t) for t in temps]
+    if any(not math.isfinite(value) or value <= 0.0 for value in temperatures):
+        raise ValueError("STS temperatures must be a finite positive numeric vector")
+    return temperatures
 
 
 def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.Module]:
@@ -70,6 +75,35 @@ def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.M
     if not stages:
         return None
     return getattr(stages[-1], "confidence_head", None)
+
+
+def validate_confidence_request(spec_config: "DSparkDecodingConfig", request: "LlmRequest") -> None:
+    """Reject unsupported request controls before confidence-policy admission."""
+    if not spec_config.enable_confidence_scheduling:
+        return
+    if getattr(request, "py_logits_post_processors", None):
+        raise ValueError(
+            "DSpark confidence scheduling does not support per-request logits post-processors"
+        )
+    sampling = request.sampling_config
+    if not spec_config.use_rejection_sampling or sampling is None:
+        return
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    # Match SpecMetadata's actual draft-sampler classification; temperature
+    # alone is insufficient (for example, top_k=1 remains greedy).
+    greedy = SamplingParams.params_imply_greedy_decoding(
+        temperature=sampling.temperature,
+        top_k=sampling.top_k,
+        top_p=sampling.top_p,
+        min_p=sampling.min_p,
+        use_beam_search=False,
+    )
+    if not greedy:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection draft sampling: "
+            "confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
@@ -233,6 +267,7 @@ class DSparkSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
+                    worker._confidence_incarnations.pop(rid, None)
                     worker._ctx_len[slot] = 0
                     worker._valid_len[slot] = 0
                     worker._position_initialized[slot] = False
@@ -397,6 +432,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # gen path (set on the host in prepare(), so the captured forward indexes
         # the rolling windows through a tensor instead of a python dict lookup).
         self._req_to_slot = {}  # request_id -> slot index
+        # Enabled only for admitted host-mixed scheduling. Slot reuse cannot
+        # authenticate a different request incarnation with an older snapshot.
+        self._mixed_confidence_tracking = bool(
+            getattr(spec_config, "confidence_mixed_evidence", None) is not None
+        )
+        self._confidence_incarnations: dict[int, int] = {}
+        self._confidence_incarnation_sequence = 0
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
         # Index of the throwaway "scratch" window row that absorbs padded /
@@ -451,7 +493,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         sequence of the last completed draft.
         """
         prev = self._draft_seq_host
-        self._draft_seq_host += 1
+        self._draft_seq_host = (prev + 1) & ((1 << 31) - 1)
+        if self._draft_seq_host == 0:
+            # Recycled stamps must not authenticate an ancient score. The
+            # wrap step sees expected=-1 and uses neutral confidence; later
+            # steps can consume only newly produced scores or neutral rows.
+            if self._confidence_stamp is not None:
+                self._confidence_stamp.zero_()
+            if self._confidence_logits is not None:
+                self._confidence_logits.fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         if self._draft_seq_cuda is not None:
             self._draft_seq_cuda.fill_(self._draft_seq_host)
         return prev
@@ -699,6 +749,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
+            self._confidence_incarnations.pop(req_id, None)
             self._ctx_len[old] = 0
             self._valid_len[old] = 0
             self._position_initialized[old] = False
@@ -712,6 +763,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
+            if self._mixed_confidence_tracking:
+                self._confidence_incarnation_sequence += 1
+                self._confidence_incarnations[req_id] = self._confidence_incarnation_sequence
             self._ctx_len[slot] = 0
             self._valid_len[slot] = 0
             self._position_initialized[slot] = False
@@ -722,6 +776,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 # the full block.
                 self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
+
+    def confidence_incarnation_for(self, req_id: int) -> int | None:
+        """Host ownership generation, independent of a recycled device slot."""
+        return self._confidence_incarnations.get(req_id)
 
     def _seed_context_windows(
         self,

@@ -8,12 +8,34 @@ import pytest
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor._util import _get_num_reserved_index_slots
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
+
+
+@pytest.mark.parametrize(
+    ("spec_config", "estimating_kv_cache", "expected"),
+    [
+        (None, False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=False), False, 1),
+        (SimpleNamespace(enable_confidence_scheduling=True), False, 2),
+        (SimpleNamespace(enable_confidence_scheduling=True), True, 0),
+    ],
+    ids=[
+        "no-speculation",
+        "static-dspark",
+        "confidence-dspark",
+        "confidence-estimator",
+    ],
+)
+def test_index_mapper_reservation_tracks_confidence_scheduling(
+    spec_config: SimpleNamespace | None, estimating_kv_cache: bool, expected: int
+) -> None:
+    assert _get_num_reserved_index_slots(spec_config, estimating_kv_cache) == expected
 
 
 def _manager(

@@ -16,6 +16,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 from tensorrt_llm._utils import get_sm_version
 
 _ROPE_DIM = 64
+_PHYSICAL_KS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -106,7 +107,7 @@ def _reference(
     ("invalid_case", "reason"),
     [
         ("q_dtype", "q dtype must be BF16"),
-        ("block_size", "draft block size must be 5 or 6"),
+        ("block_size", "draft block size must be 1 through 8"),
         ("valid_len_dtype", "valid_len must use INT64"),
         ("freqs_shape", "inverse_rope_freqs shape must be"),
     ],
@@ -119,8 +120,8 @@ def test_fused_dsv4_dspark_attention_support_gate_logs_rejection(monkeypatch, in
     if invalid_case == "q_dtype":
         inputs[0] = q.float()
     elif invalid_case == "block_size":
-        inputs[0] = q[:, :4].contiguous()
-        inputs[4] = freqs[:, :4].contiguous()
+        inputs[0] = q.new_empty((q.shape[0], 9, *q.shape[2:]))
+        inputs[4] = freqs.new_empty((q.shape[0], 9, *freqs.shape[2:]))
     elif invalid_case == "valid_len_dtype":
         inputs[2] = inputs[2].to(torch.int32)
     else:
@@ -177,7 +178,7 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         )
 
 
-@pytest.mark.parametrize("block", (5, 6))
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
 @pytest.mark.parametrize(
     ("start_pos_values", "valid_len_values"),
     [
@@ -188,8 +189,10 @@ def test_fused_dsv4_dspark_attention_rejects_invalid_inputs_before_launch(
         ([5, 100], [6, 101]),
         # Bootstrapped positions with short physical suffixes exercise wraparound.
         ([257, 390], [3, 5]),
+        # The first row is a graph-padding request with no initialized context.
+        ([0, 5], [0, 6]),
     ],
-    ids=["full_window", "partial_window", "wrapped_suffix"],
+    ids=["full_window", "partial_window", "wrapped_suffix", "empty_scratch_window"],
 )
 def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, valid_len_values):
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
@@ -199,6 +202,9 @@ def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
         _make_inputs(29, block=block, start_pos_values=start_pos_values)
     )
+    if valid_len_values[0] == 0:
+        # Use a reserved scratch page rather than aliasing a live request slot.
+        slots[0] = kv_cache.shape[0] - 1
     valid_len = torch.tensor(valid_len_values, device=q.device, dtype=torch.long)
     expected, expected_cache = _reference(
         q,
@@ -215,6 +221,8 @@ def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, 
     draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
         main_kv, block_kv, kv_cache, slots, start_pos
     )
+    # A wrong draft mask must not accidentally pass because padding is zero.
+    draft_block[:, block:].fill_(17)
 
     actual = fused_dsv4_dspark_attention(
         q,
@@ -232,7 +240,8 @@ def test_fused_dsv4_dspark_attention_matches_reference(block, start_pos_values, 
     torch.testing.assert_close(kv_cache, expected_cache, rtol=0, atol=0)
 
 
-def test_fused_dsv4_dspark_attention_cuda_graph_replay():
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_fused_dsv4_dspark_attention_cuda_graph_replay(block):
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
         fused_dsv4_dspark_attention,
         warmup_fused_dsv4_dspark_attention,
@@ -244,9 +253,9 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay():
     )
 
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, blk_freqs, inverse_rope_freqs = (
-        _make_inputs(3, start_pos_values=[257, 5, 390])
+        _make_inputs(3, block=block, start_pos_values=[257, 5, 390, 0])
     )
-    batch, block, dim = block_kv.shape
+    batch, _, dim = block_kv.shape
     scale = dim**-0.5
     main_x = main_kv.unsqueeze(1)
     block_x = block_kv
@@ -256,8 +265,10 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay():
     main_freqs[..., 0] = 1
     block_freqs[..., 0] = 1
     slots = slots.long()
+    slots[-1] = kv_cache.shape[0] - 1
     start_pos = start_pos.long()
     valid_len = _legacy_valid_len(start_pos)
+    valid_len[-1] = 0
 
     # The named best-effort prewarm calls the same self-JIT ops used below,
     # so graph capture sees only hot compile-cache entries.
@@ -282,7 +293,15 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay():
 
     main_x.copy_(torch.randn_like(main_x))
     block_x.copy_(torch.randn_like(block_x))
-    valid_len.copy_(torch.tensor([3, 2, 7], device=q.device))
+    q.copy_(torch.randn_like(q))
+    sink.copy_(torch.randn_like(sink))
+    # Replay must read new positions, page mappings, and inverse-RoPE phases.
+    start_pos.copy_(torch.tensor([390, 127, 257, 0], device=q.device))
+    slots[:3].copy_(slots[:3].roll(1))
+    valid_len.copy_(torch.tensor([3, 128, 7, 0], device=q.device))
+    table = precompute_dspark_freqs_cis(_ROPE_DIM, 512, device=q.device)
+    blk_freqs = table[start_pos.unsqueeze(1) + 1 + torch.arange(block, device=q.device)]
+    inverse_rope_freqs.copy_(torch.view_as_real(blk_freqs))
     expected_main = cute_dsl_dspark_rmsnorm_rope(
         main_x, weight, main_freqs, 1, _ROPE_DIM, 1e-6, True, True, False
     ).squeeze(1)
@@ -312,13 +331,14 @@ def test_fused_dsv4_dspark_attention_cuda_graph_replay():
 
 
 @pytest.mark.parametrize("persist", (False, True))
-def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist):
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_dspark_attention_forward_batched_matches_fallback(monkeypatch, persist, block):
     import tensorrt_llm._torch.models.modeling_dspark as dspark_attention
 
     torch.manual_seed(17)
     device = torch.device("cuda")
     dtype = torch.bfloat16
-    batch, block, hidden = 2, 6, 64
+    batch, hidden = 2, 64
     heads, head_dim, rope_dim = 128, 512, 64
     q_rank, groups, o_rank, window = 1024, 8, 32, 128
 
@@ -444,7 +464,8 @@ def test_warmup_is_best_effort(monkeypatch):
     assert "synthetic compile failure" in warnings[0]
 
 
-def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales(block):
     from tensorrt_llm._torch.custom_ops.dspark_attention_custom_op import (
         _dspark_attention_kernel_cache,
         _get_dspark_arch_str,
@@ -459,13 +480,13 @@ def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
     assert _get_dspark_arch_str(101) is None
     assert _get_dspark_arch_str(109) is None
     assert _get_dspark_arch_str() in ("sm_100", "sm_103")
-    assert is_dsv4_dspark_attention_config_supported(5, 128, 512, 128)
-    assert not is_dsv4_dspark_attention_config_supported(4, 128, 512, 128)
+    assert is_dsv4_dspark_attention_config_supported(block, 128, 512, 128)
+    assert not is_dsv4_dspark_attention_config_supported(9, 128, 512, 128)
     assert not is_dsv4_dspark_attention_config_supported(5, 24, 512, 128)
 
     _dspark_attention_kernel_cache.clear()
     q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(
-        11, start_pos_values=[300, 4, 250], cache_pages=40
+        11, block=block, start_pos_values=[300, 4, 250], cache_pages=40
     )
     scale = q.shape[-1] ** -0.5
     valid_len = _legacy_valid_len(start_pos)
@@ -505,7 +526,9 @@ def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
     # hit on the same compiled object without compiler calls or runtime padding.
     for batch in (1, 3, 32):
         values = [5 + (37 * i) % 386 for i in range(batch)]
-        args = _make_inputs(17 + batch, start_pos_values=values, cache_pages=batch + 41)
+        args = _make_inputs(
+            17 + batch, block=block, start_pos_values=values, cache_pages=batch + 41
+        )
         q_b, main_b, block_b, cache_b, slots_b, pos_b, sink_b, blk_freqs_b, freqs_b = args
         if batch == 3:
             cache_b = cache_b.clone()
@@ -541,6 +564,43 @@ def test_self_jit_reuses_one_kernel_across_runtime_shapes_and_scales():
         torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
         torch.testing.assert_close(cache_b, expected_cache, rtol=0, atol=0)
     assert len(_dspark_attention_kernel_cache) == 1
+
+
+def test_attention_cache_isolates_all_k_with_shared_dummy_scratch():
+    import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as attention_op
+
+    attention_op._dspark_attention_kernel_cache.clear()
+    for block in _PHYSICAL_KS:
+        attention_op.warmup_fused_dsv4_dspark_attention(block, 1e-6)
+    arch = attention_op._get_dspark_arch_str()
+    kernels = attention_op._dspark_attention_kernel_cache.copy()
+    assert set(kernels) == {(block, arch) for block in _PHYSICAL_KS}
+    assert len({id(kernel) for kernel in kernels.values()}) == len(_PHYSICAL_KS)
+
+    # Keep all specializations live while alternating K. Two padding requests
+    # read the reserved scratch page, never a real request's window. No duplicate
+    # cache-write launches are needed for this attention-only aliasing check.
+    for block in reversed(_PHYSICAL_KS):
+        q, main, block_kv, cache, slots, pos, sink, blk_freqs, freqs = _make_inputs(
+            59, block=block, start_pos_values=[257, 0, 0]
+        )
+        scratch = cache.shape[0] - 1
+        slots.copy_(torch.tensor([0, scratch, scratch], device=q.device, dtype=slots.dtype))
+        main[1:].zero_()
+        cache[0, 257 % 128].copy_(main[0])
+        cache[scratch, 0].zero_()
+        valid = torch.tensor([3, 0, 0], device=q.device, dtype=torch.long)
+        draft = block_kv.new_zeros((3, 8, 512))
+        draft[:, :block].copy_(block_kv)
+        expected, expected_cache = _reference(
+            q, main, block_kv, cache, slots, pos, valid, sink, blk_freqs, 512**-0.5
+        )
+        actual = attention_op.fused_dsv4_dspark_attention(
+            q, draft, cache, slots, pos, valid, sink, freqs, 512**-0.5
+        )
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=3e-2)
+        torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+        assert attention_op._dspark_attention_kernel_cache == kernels
 
 
 def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypatch):
@@ -596,11 +656,12 @@ def test_compile_without_real_specimens_and_cached_wrapper_avoids_views(monkeypa
     assert output.shape == q.shape
 
 
-def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch, block):
     import tensorrt_llm._torch.custom_ops.dspark_attention_custom_op as dspark_attention_op
 
     dspark_attention_op._dspark_attention_kernel_cache.clear()
-    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(43, block=5)
+    q, main_kv, block_kv, kv_cache, slots, start_pos, sink, _, freqs = _make_inputs(43, block=block)
     draft_block, slots_i32, cache_seqs = _prepare_attention_inputs(
         main_kv, block_kv, kv_cache, slots, start_pos
     )
@@ -630,7 +691,8 @@ def test_attention_cache_miss_rejects_cuda_graph_capture(monkeypatch):
         )
 
 
-def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch, block):
     import tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op as preparation_op
 
     preparation_op._compile_dspark_rmsnorm_rope_cache_write.cache_clear()
@@ -645,10 +707,11 @@ def test_preparation_cache_misses_reject_cuda_graph_capture(monkeypatch):
     with pytest.raises(RuntimeError, match="cache-write must be warmed up"):
         preparation_op._compile_dspark_rmsnorm_rope_cache_write(1e-6)
     with pytest.raises(RuntimeError, match="draft-block must be warmed up"):
-        preparation_op._compile_dspark_rmsnorm_rope_draft_block(5, 1e-6)
+        preparation_op._compile_dspark_rmsnorm_rope_draft_block(block, 1e-6)
 
 
-def test_preparation_self_jit_covers_dynamic_batches():
+@pytest.mark.parametrize("block", _PHYSICAL_KS)
+def test_preparation_self_jit_covers_dynamic_batches(block):
     from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
         _compile_dspark_rmsnorm_rope_cache_write,
         _compile_dspark_rmsnorm_rope_draft_block,
@@ -659,7 +722,7 @@ def test_preparation_self_jit_covers_dynamic_batches():
     _compile_dspark_rmsnorm_rope_cache_write.cache_clear()
     _compile_dspark_rmsnorm_rope_draft_block.cache_clear()
     q, main_kv, block_kv, kv_cache, slots, start_pos, _, _, _ = _make_inputs(
-        23, start_pos_values=[300, 4, 250], cache_pages=40
+        23, block=block, start_pos_values=[300, 4, 250], cache_pages=40
     )
     weight = torch.ones(512, device=q.device, dtype=q.dtype)
     main_freqs = torch.zeros(q.shape[0], _ROPE_DIM // 2, 2, device=q.device)
@@ -668,7 +731,7 @@ def test_preparation_self_jit_covers_dynamic_batches():
     block_freqs[..., 0] = 1
 
     for batch in (1, 3, 32):
-        args = _make_inputs(31 + batch, batch=batch, cache_pages=40)
+        args = _make_inputs(31 + batch, block=block, batch=batch, cache_pages=40)
         q_b, main_b, block_b, cache_b, slots_b, pos_b, _, _, _ = args
         main_freqs_b = torch.zeros(batch, _ROPE_DIM // 2, 2, device=q.device)
         block_freqs_b = torch.zeros(batch * q_b.shape[1], _ROPE_DIM // 2, 2, device=q.device)
