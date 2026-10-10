@@ -49,7 +49,14 @@ if TYPE_CHECKING:
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024
 _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop flag and reclaim
-_RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
+# Send side: a sender (KV transfer worker thread) may wait this long for bounce space before
+# falling back to per-fragment writes.
+_RESERVE_TIMEOUT_S = 0.2
+# Receive side: never wait. The receiver reserves on the executor thread while it admits
+# generation requests, so any wait pauses the whole iteration (and, under attention DP, every rank
+# of the group). If the recv region is full, use the per-fragment path right away; a timed-out
+# wait ends in the same fallback, and the transfer stays asynchronous either way.
+_RECV_RESERVE_TIMEOUT_S = 0.0
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
 
@@ -233,7 +240,7 @@ class VmmBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         """Reserve a region and create its state, recording the address for the senders. Returns
@@ -522,7 +529,7 @@ class NoBounceTransport(BounceTransport):
         recv_req,
         num_writers: int = 1,
         *,
-        timeout: Optional[float] = _RESERVE_TIMEOUT_S,
+        timeout: Optional[float] = _RECV_RESERVE_TIMEOUT_S,
         extra_bytes: int = 0,
     ) -> bool:
         return False
