@@ -42,12 +42,14 @@
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
 #if ENABLE_MULTI_DEVICE
+
 #include <ATen/cuda/EmptyTensor.h>
 #include <c10/util/irange.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/GroupRegistry.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -930,6 +932,11 @@ private:
     void initGroupTopology()
     {
         static std::map<std::set<int>, std::tuple<bool, bool, bool>> cache;
+        static std::mutex cacheMutex;
+        // This probe performs ProcessGroup collectives.  Model construction
+        // can reach it concurrently, so avoid racing the cache or issuing
+        // overlapping metadata collectives on the same ProcessGroup.
+        std::lock_guard<std::mutex> lock(cacheMutex);
         if (cache.find(mGroup) != cache.end())
         {
             auto [is_NVLINK_supported, is_P2P_supported, is_MNNVL_supported] = cache[mGroup];
@@ -1862,6 +1869,58 @@ std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optio
 #endif // ENABLE_MULTI_DEVICE
 }
 
+std::vector<torch::Tensor> allreduce_pg_by_name(torch::Tensor const& input,
+    torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+    torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias,
+    torch::optional<torch::Tensor> const& workspace, torch::List<int64_t> const& group, int64_t rank,
+    std::string const& group_name, int64_t const strategy, int64_t const fusion_op, double const eps,
+    bool const trigger_completion_at_end)
+{
+#if ENABLE_MULTI_DEVICE
+    return allreduce_pg(input, residual, norm_weight, scale, bias, workspace, group, rank,
+        c10d::resolve_process_group(group_name), strategy, fusion_op, eps, trigger_completion_at_end);
+#else
+    return {input};
+#endif
+}
+
+torch::Tensor allreduce_pg_warmup_by_name(torch::Tensor const& token, torch::List<int64_t> const& group_,
+    int64_t rank, std::string const& group_name)
+{
+#if ENABLE_MULTI_DEVICE
+    std::set<int> group;
+    for (int64_t group_rank : group_)
+    {
+        group.insert(static_cast<int>(group_rank));
+    }
+    auto const process_group = c10d::resolve_process_group(group_name);
+    auto const rank_it = group.find(rank);
+    TORCH_CHECK(rank_it != group.end(), "Rank not found in ProcessGroup");
+    TORCH_CHECK(std::distance(group.begin(), rank_it) == process_group->getRank(),
+        "ProcessGroup rank does not match TensorRT-LLM TP rank");
+
+    // Run the ProcessGroup topology metadata exchanges before Dynamo/PCG
+    // capture. The normal named allreduce then reuses this cached topology
+    // and continues through its existing optimized native implementation.
+    AllreduceOp op(group, process_group, tensorrt_llm::DataType::kFLOAT,
+        AllReduceStrategyType::AUTO, AllReduceFusionOp::NONE, 0.0F);
+    op.initialize();
+
+    // ``initialize`` discovers topology but does not launch the c10d NCCL
+    // collective.  The first ProcessGroup::allreduce would otherwise lazily
+    // create that communicator while CUDA graph capture is active.  Exercise
+    // the exact c10d path once, eagerly, with a private one-element tensor.
+    TORCH_CHECK(token.is_cuda() && token.numel() > 0 && token.scalar_type() == torch::kFloat,
+        "allreduce_pg_warmup_by_name requires a non-empty CUDA float32 token");
+    AllreduceOp nccl_warmup(group, process_group, tensorrt_llm::DataType::kFLOAT,
+        AllReduceStrategyType::NCCL, AllReduceFusionOp::NONE, 0.0F);
+    nccl_warmup.initialize();
+    (void) nccl_warmup.run(token, std::nullopt, std::nullopt, std::nullopt, std::nullopt, true, std::nullopt);
+    TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+#endif
+    return token;
+}
+
 // residual [m, hidden_dim]
 // norm_weight [hidden_dim]
 // device_num_experts [1]
@@ -2187,9 +2246,19 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
-    // Threshold to switch between one-shot and two-shot allreduce kernel.
-    // Empirical value from the MNNVL sweep, matching FlashInfer's byte threshold.
-    constexpr size_t kOneShotSizeThreshold = 64 * 1024 * 8 * 2;
+    // Threshold to switch between one-shot and two-shot allreduce kernel, in bytes of the
+    // full message (tokens * hidden * ranks * element size). Default: empirical value from the
+    // MNNVL sweep, matching FlashInfer's byte threshold. TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES
+    // overrides it (the Python workspace sizing in distributed/ops.py reads the same variable).
+    static size_t const kOneShotSizeThreshold = []() -> size_t
+    {
+        char const* env = std::getenv("TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES");
+        if (env != nullptr && *env != '\0')
+        {
+            return static_cast<size_t>(std::strtoull(env, nullptr, 10));
+        }
+        return 64 * 1024 * 8 * 2;
+    }();
 
     if (numTokens * hiddenDim * allreduce_params.nRanks * input.itemsize() <= kOneShotSizeThreshold)
     {
@@ -2312,8 +2381,13 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
+        // comm_buffer (like buffer_flags and allreduce's workspace) is opaque
+        // communication scratch: it is mutated by the kernel but deliberately
+        // not alias-annotated, since AOT functionalization rejects non-ATen
+        // ops with alias annotations (needed for torch.compile / piecewise
+        // CUDA graphs). Ordering comes from the input/output data deps.
         "mnnvl_fusion_allreduce(Tensor input, Tensor? gamma, Tensor? residual, "
-        "float? epsilon, Tensor(a!) comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
+        "float? epsilon, Tensor comm_buffer, Tensor buffer_flags, bool rmsnorm_fusion, "
         "Tensor? scale=None, int fusion_op=0) -> "
         "Tensor[]");
     m.def(
@@ -2362,6 +2436,22 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int op,"
         "float eps,"
         "bool trigger_completion_at_end) -> Tensor[]");
+    m.def(
+        "allreduce_pg_by_name("
+        "Tensor input,"
+        "Tensor? residual,"
+        "Tensor? norm_weight,"
+        "Tensor? scale,"
+        "Tensor? bias,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int rank,"
+        "str group_name,"
+        "int strategy,"
+        "int op,"
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
+    m.def("allreduce_pg_warmup_by_name(Tensor token, int[] group, int rank, str group_name) -> Tensor");
     m.def(
         "moe_allreduce("
         "Tensor residual,"
@@ -2418,6 +2508,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("autotuned_allreduce", &tensorrt_llm::torch_ext::autotunedAllreduce);
     m.impl("register_allreduce_tactic", &tensorrt_llm::torch_ext::registerAllReduceTactic);
     m.impl("allreduce_pg", &tensorrt_llm::torch_ext::allreduce_pg);
+    m.impl("allreduce_pg_by_name", &tensorrt_llm::torch_ext::allreduce_pg_by_name);
+    m.impl("allreduce_pg_warmup_by_name", &tensorrt_llm::torch_ext::allreduce_pg_warmup_by_name);
     m.impl("moe_allreduce", &tensorrt_llm::torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &tensorrt_llm::torch_ext::moe_finalize_allreduce);
     m.impl("preallocate_nccl_window_buffer", &tensorrt_llm::torch_ext::preallocateNCCLWindowBuffer);

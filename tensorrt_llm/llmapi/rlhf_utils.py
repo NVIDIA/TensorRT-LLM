@@ -3,8 +3,8 @@
 
 import base64
 import gc
-from contextlib import contextmanager
-from typing import Iterator, Optional
+import os
+from typing import Optional
 
 import torch
 
@@ -13,43 +13,6 @@ from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import serialization
 from tensorrt_llm.logger import logger
-
-
-@contextmanager
-def _preserve_cuda_graph_refit_caches(model: torch.nn.Module) -> Iterator[None]:
-    """Keep refit-derived tensor addresses stable across post-load hooks.
-
-    Qwen3.5 eager fusion caches ``weight + 1`` for Gemma RMSNorm in the plain
-    tensor attribute ``_fused_norm_weight``. Its post-load hook recomputes that
-    cache by assigning a new tensor, but a CUDA Graph captured before refit
-    continues to reference the original allocation. Preserve that allocation
-    during refit and copy the refreshed value into it after post-load hooks run.
-    """
-    cached_tensors = []
-    for module in model.modules():
-        cached = getattr(module, "_fused_norm_weight", None)
-        if isinstance(cached, torch.Tensor):
-            cached_tensors.append((module, cached))
-
-    yield
-
-    for module, original in cached_tensors:
-        refreshed = getattr(module, "_fused_norm_weight", None)
-        if refreshed is original:
-            continue
-        if not isinstance(refreshed, torch.Tensor):
-            raise RuntimeError("Refit removed the CUDA-Graph-visible _fused_norm_weight cache")
-        if (
-            refreshed.shape != original.shape
-            or refreshed.dtype != original.dtype
-            or refreshed.device != original.device
-        ):
-            raise RuntimeError(
-                "Refit changed the shape, dtype, or device of the CUDA-Graph-visible "
-                "_fused_norm_weight cache"
-            )
-        original.copy_(refreshed)
-        module._fused_norm_weight = original
 
 
 class WorkerExtension:
@@ -74,21 +37,82 @@ class WorkerExtension:
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
 
+    @staticmethod
+    def _refit_modules(model: torch.nn.Module):
+        """Yield each module once, skipping torch.compile wrappers.
+
+        ``torch.compile`` leaves an ``OptimizedModule`` in the tree, and that
+        wrapper forwards unknown attributes to ``_orig_mod``. A plain
+        ``model.modules()`` walk therefore reaches every compiled submodule
+        TWICE -- once through the wrapper, once as itself -- and fires each
+        refit hook twice. Any non-idempotent weight transform is then applied
+        twice and the weights are scrambled in place.
+
+        This is defence in depth, not the fix for the Qwen3.5 397B refit
+        corruption -- that one was the compile wrapper renaming parameter paths
+        so ``load_weights`` matched nothing, handled by
+        ``unwrap_compiled_model_for_refit``. Double invocation was never
+        observed on that model (the wrapped scope owns none of these hooks), but
+        it does occur for any model whose wrapped scope does own one.
+
+        Deduplicating here makes refit correct regardless of whether a compile
+        wrapper happens to be installed, so it does not depend on the caller
+        unwrapping first.
+        """
+        # Opt-out so the dedup can be isolated from the other refit fixes when
+        # bisecting; the dedup is correct regardless, so it defaults on.
+        if os.environ.get("TLLM_REFIT_DEDUP_MODULES", "1") == "0":
+            yield from model.modules()
+            return
+        seen = set()
+        for module in model.modules():
+            # ``_orig_mod`` is the marker for a torch.compile wrapper and is a
+            # real attribute on it, so this does not go through the forwarding
+            # __getattr__ that causes the problem. Keyed on the attribute rather
+            # than on the class name so it survives renames and subclasses.
+            # The wrapped module is visited on its own in this same walk.
+            if getattr(module, "_orig_mod", None) is not None:
+                continue
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            yield module
+
+    def begin_weight_update(self) -> None:
+        """Prepare modules and captures for refit."""
+        model_engine = self.engine.model_engine
+        model_engine.unwrap_compiled_model_for_refit()
+        model_engine.model_loader.begin_update_weights()
+        for module in self._refit_modules(model_engine.model):
+            if hasattr(module, "pre_reload_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.pre_reload_weights()
+
+    def finish_weight_update(self) -> None:
+        """Finalize runtime caches and captures after refit."""
+        self.engine.reset_prefix_cache()
+        torch.cuda.synchronize()
+        self.engine.model_engine.restore_compiled_model_after_refit(
+            self.engine.resource_manager
+        )
+
     def finalize_weight_update(self) -> None:
         """Finalize a refit and refresh post-load state safely for CUDA Graph replay."""
         model_engine = self.engine.model_engine
         model = model_engine.model
-        with _preserve_cuda_graph_refit_caches(model):
-            model_engine.model_loader.finalize_update_weights()
-            for module in model.modules():
-                if hasattr(module, "process_weights_after_loading") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.process_weights_after_loading()
-                if hasattr(module, "post_load_weights") and not getattr(
-                    module, "_weights_removed", False
-                ):
-                    module.post_load_weights()
+        model_engine.model_loader.finalize_update_weights()
+        # _refit_modules, not model.modules(): a torch.compile wrapper in the
+        # tree would otherwise make every hook below fire twice per module.
+        for module in self._refit_modules(model):
+            if hasattr(module, "process_weights_after_loading") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.process_weights_after_loading()
+            if hasattr(module, "post_load_weights") and not getattr(
+                module, "_weights_removed", False
+            ):
+                module.post_load_weights()
 
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
@@ -109,12 +133,7 @@ class WorkerExtension:
         """
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
-                self.engine.model_engine.model_loader.begin_update_weights()
-                for module in self.engine.model_engine.model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
-                        module.pre_reload_weights()
+                self.begin_weight_update()
                 setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
@@ -192,14 +211,13 @@ class WorkerExtension:
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
                     logger.info("moe_load_balancer finalize model done")
-                self.engine.reset_prefix_cache()
                 delattr(self.engine.model_engine.model, "first_pre_reload_weights")
 
-                torch.cuda.synchronize()
                 # Done once after all buckets to avoid per-bucket cleanup overhead.
                 gc.collect()
                 torch.cuda.ipc_collect()
                 torch.cuda.empty_cache()
+                self.finish_weight_update()
 
         except Exception as e:
             self.engine.model_engine.model_loader.abort_update_weights()

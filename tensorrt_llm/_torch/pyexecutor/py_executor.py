@@ -393,6 +393,15 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+def _request_flag(request, name: str) -> bool:
+    """Read a request state predicate that is a nanobind read-only property on
+    the C++ ``LlmRequest`` (``is_generation_only_request`` etc.) but a plain
+    method on the Python wrapper; a missing attribute reads as False."""
+    value = getattr(request, name, False)
+    if callable(value):
+        value = value()
+    return bool(value)
+
 class PyExecutor:
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -4845,6 +4854,66 @@ class PyExecutor:
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
 
+    def _retire_inflight_batch_for_control(self) -> None:
+        """Retire the overlap loop's in-flight batch before a control action fires.
+
+        ``_handle_control_request`` runs on the executor-loop thread at a point
+        every rank reaches in the same iteration (the control sentinel travels
+        in the request broadcast and blocks further fetches), so this is a
+        lockstep point. The overlap loop may still hold ``previous_batch`` -- a
+        batch whose forward and sampling completed but whose results were not
+        applied to the requests yet -- on some ranks only: it is kept on a rank
+        whose own batch was non-empty while the attention-DP group could not
+        queue, and it is None on ranks whose batch was empty. A control action
+        that touches the KV cache (weight update + recompute, sleep/wakeup)
+        must not run with such a batch pending, and consuming it later from a
+        per-rank code path issues the attention-DP gathers of
+        ``_flush_pending_transfer_responses`` / ``_handle_responses`` on some
+        ranks only, which deadlocks the TP group against the loop's own
+        exchanges.
+
+        Mirrors the tail of ``_executor_loop_overlap`` with the loop's own
+        divergence handling made unconditional: ranks without a batch join
+        every gather with an empty payload. Per rank the collectives are
+        [first-token 1] + flush 1 + responses 1 under attention-DP and none
+        otherwise. Pipeline parallelism keeps its in-flight microbatches
+        (``previous_batch`` is a ``BatchStatePP`` consumed by
+        ``_handle_executed_batch``) and is out of scope, as is the non-overlap
+        loop, which never has an in-flight batch.
+        """
+        if self.dist.pp_size > 1 or self.disable_overlap_scheduler:
+            return
+        batch = self.previous_batch
+        if batch is not None:
+            self._update_requests(batch.sample_state)
+            if self.speculation_gate is not None:
+                self._update_batch_acceptance_rate(
+                    batch.scheduled_requests,
+                    batch.sample_state,
+                    iteration_id=self.iter_counter)
+            self._send_kv_async(batch.scheduled_requests.all_requests())
+        if self.enable_early_first_token_response:
+            if batch is not None:
+                self._emit_first_token_responses(batch.scheduled_requests)
+            else:
+                self._enqueue_responses([])
+        self._flush_pending_transfer_responses()
+        if batch is not None:
+            if self.drafter is not None and self.use_spec_decode:
+                self.drafter.cleanup_previous_draft_resources()
+            self._commit_kv_cache_stats(batch.scheduled_requests)
+            self._wait_for_model_engine_input_copy()
+            self._process_previous_batch()
+            self.perf_manager.compute_batch_gpu_times(
+                batch.scheduled_requests.all_requests())
+            self.previous_batch = None
+        else:
+            # Match the one gather _handle_responses issues on ranks that had
+            # a batch to process.
+            self._enqueue_responses([])
+        # The next forward runs on host tokens, like the loop's first iteration.
+        self.has_previous_draft_tokens = False
+
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
 
@@ -4881,6 +4950,10 @@ class PyExecutor:
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
         # freeing memory) could race with kernels still reading those tensors.
         torch.cuda.synchronize()
+        # Retire the overlap loop's in-flight batch (lockstep on all ranks) so
+        # the action runs against a quiescent executor and nothing consumes it
+        # later from a per-rank code path.
+        self._retire_inflight_batch_for_control()
         self.control_requests.pop(0)
         control_id = getattr(pending, "control_id", None)
         self._active_control_id = control_id
@@ -4894,7 +4967,8 @@ class PyExecutor:
             self._active_control_id = None
             return
         self.control_request_barrier.set()
-        self.control_action_done.wait()
+        with self.hang_detector.pause():
+            self.control_action_done.wait()
         self.control_action_done.clear()
         self._active_control_id = None
         logger.debug("[control_action] control request finished")
@@ -8932,6 +9006,121 @@ class PyExecutor:
                                 "route_capture", None)
         if route_capture is not None:
             route_capture.clear_shared()
+
+    # Request states in which the KV cache is owned by a disaggregated
+    # transfer rather than by the local scheduler.
+    _DISAGG_TRANSFER_BOUND_STATES = frozenset({
+        LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS,
+        LlmRequestState.DISAGG_CONTEXT_COMPLETE,
+        LlmRequestState.DISAGG_GENERATION_INIT,
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    })
+
+    def _is_disagg_transfer_bound(self, request: LlmRequest) -> bool:
+        """True if ``request`` must not be terminated/paused by a KV recompute.
+
+        Blocks pinned by an asynchronous send (cache transceiver or KV
+        connector) are always bound. With a cache transceiver every
+        context-only request is treated as bound, deliberately broader than
+        necessary (a request still mid-prefill could be re-prefilled), so
+        that a context engine's recompute reduces to ``reset_prefix_cache``;
+        the cost is a few requests keeping old-weight KV, as with
+        ``recompute_kv=False``. Every generation-only request is bound as
+        well: pausing one would re-prefill its whole prompt on the decode
+        engine (the C++ ``pause`` path warns about exactly this), and under
+        load those paused requests are not rescheduled until the engine runs
+        dry, which stalls the client past its timeout. A generation-only
+        request therefore finishes its current turn on the cache it already
+        holds, as with ``recompute_kv=False``. Any other request in a
+        ``DISAGG_*`` transfer state is bound as a safety net; in practice
+        those states are only ever entered by context-only or
+        generation-only requests, so that branch is belt-and-braces.
+        """
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if (transfer_manager is not None and request.py_request_id
+                in transfer_manager.requests_in_transfer()):
+            return True
+        if getattr(self, "kv_cache_transceiver", None) is None:
+            return False
+        if _request_flag(request, "is_context_only_request"):
+            return True
+        if _request_flag(request, "is_generation_only_request"):
+            return True
+        return request.state in self._DISAGG_TRANSFER_BOUND_STATES
+
+    def recompute_active_requests(self) -> None:
+        """Discard live request caches so they are rebuilt with current weights.
+
+        This method is intended to run inside :meth:`control_action` after a
+        non-draining weight update. A prefix-cache reset alone is insufficient:
+        active requests still own KV and recurrent-state caches computed with
+        the previous weights, and completing those requests can register stale
+        blocks in the reuse pool after the reset.
+
+        Preserve already generated tokens by pausing each request. The normal
+        scheduler then treats those tokens as context and prefills them again
+        before decoding resumes.
+
+        Under PD disaggregation, context-only and generation-only requests
+        are left untouched (see :meth:`_is_disagg_transfer_bound`): a
+        context-only request that has finished its prefill still has to hand
+        its blocks to the cache transceiver (pausing it frees blocks the
+        transfer still references and the ctx executor loop dies in
+        ``_send_kv_async`` with ``unordered_map::at``), and a generation-only
+        request would have to re-prefill its whole prompt on the decode
+        engine, where it starves behind the running decodes. Both keep the
+        cache computed with the previous weights for the remainder of their
+        current turn, exactly as ``recompute_kv=False`` would treat every
+        request. The reuse-tree reset below drops the blocks released so far;
+        requests left untouched may still register their old-weight blocks
+        for reuse when they finish (inert on hybrid engines, whose release
+        path stores no attention blocks; a residual staleness hazard on
+        non-hybrid engines with block reuse). On a disaggregated engine the
+        recompute thus reduces to ``reset_prefix_cache``; aggregated engines
+        recompute every request as before.
+
+        Must run at a control-action boundary: ``_handle_control_request``
+        retires the overlap loop's in-flight batch on every rank before the
+        action fires (see ``_retire_inflight_batch_for_control``), so
+        everything here is rank-local and issues no TP collectives. Consuming
+        an in-flight batch here instead would gather on some attention-DP
+        ranks only and deadlock the engine.
+        """
+        if self.dist.pp_size == 1 and self.previous_batch is not None:
+            raise RuntimeError(
+                "recompute_active_requests requires a quiescent executor (no "
+                "in-flight batch); call it from within control_action(), "
+                "which retires the in-flight batch on every rank first.")
+
+        requests_to_recompute = []
+        transfer_bound = []
+        for request in self.active_requests:
+            if self._is_disagg_transfer_bound(request):
+                transfer_bound.append(request)
+            else:
+                requests_to_recompute.append(request)
+        print(
+            "TRTLLM_RECOMPUTE_ACTIVE_REQUESTS_CALLED "
+            f"active_requests={len(self.active_requests)} "
+            f"recompute={len(requests_to_recompute)} "
+            f"disagg_transfer_bound={len(transfer_bound)}",
+            flush=True,
+        )
+        if transfer_bound:
+            logger.info(
+                "recompute_active_requests: leaving "
+                f"{len(transfer_bound)} disaggregated transfer-bound request(s) "
+                "untouched (their KV cache keeps the previous weights): "
+                f"{[r.py_request_id for r in transfer_bound[:8]]}")
+        self._terminate_requests(requests_to_recompute)
+        self._pause_requests(requests_to_recompute)
+
+        # free_resources() may register old-weight blocks for reuse. Clear the
+        # reuse tree after the recomputed requests have released their caches.
+        # Requests left untouched (disaggregated ctx-only / gen-only) may still
+        # register blocks when they finish later, see _is_disagg_transfer_bound.
+        self.reset_prefix_cache()
 
     def _handle_guided_decoder_errors(
             self, scheduled_batch: ScheduledRequests,

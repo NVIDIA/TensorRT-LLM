@@ -603,6 +603,58 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+def _load_weights_strips_compile_wrapper(model: torch.nn.Module) -> bool:
+    """Whether ``model.load_weights`` tolerates a torch.compile wrapper in the tree.
+
+    The generic loaders (``modeling_utils._load_weights_impl`` / ``_v2``) strip
+    the wrapper's ``_orig_mod`` path component before matching checkpoint
+    keys, so a model that inherits ``DecoderModelForCausalLM.load_weights``
+    is safe. A model with its own ``load_weights`` walk is not known to be,
+    unless its class sets ``load_weights_strips_compile_wrapper = True``
+    (for overrides that only pre-process and delegate to the generic path).
+    """
+    cls = type(model)
+    if getattr(cls, "load_weights_strips_compile_wrapper", False):
+        return True
+    from tensorrt_llm._torch.models.modeling_utils import \
+        DecoderModelForCausalLM
+    return getattr(cls, "load_weights",
+                   None) is DecoderModelForCausalLM.load_weights
+
+
+def _assert_no_compile_wrapper_in_paths(model: torch.nn.Module) -> None:
+    """Fail loudly if a torch.compile wrapper would make this reload a no-op.
+
+    Loaders that match checkpoint tensors to modules by dotted path over
+    ``named_modules()`` see ``._orig_mod.`` in every path under a compiled
+    scope and match nothing; because RL refit passes
+    ``allow_partial_loading=True`` the compiled subtree is then skipped in
+    silence and keeps its pre-refit weights. The generic loaders strip the
+    component themselves (``strip_torch_compile_wrapper``); this guard covers
+    models with their own ``load_weights`` walk (see
+    ``_load_weights_strips_compile_wrapper``). Callers unwrap first via
+    ``model_engine.unwrap_compiled_model_for_refit()``.
+    """
+    # Escape hatch, for reproducing the pre-guard behaviour on purpose.
+    if os.environ.get("TLLM_REFIT_SKIP_WRAPPER_CHECK") == "1":
+        return
+    for name, _ in model.named_parameters():
+        if "._orig_mod." in name or name.startswith("_orig_mod."):
+            raise RuntimeError(
+                "Refit would silently load nothing: a torch.compile wrapper is still "
+                f"installed, so parameter paths carry '_orig_mod' (e.g. {name!r}) while "
+                "checkpoint keys do not, and this model's load_weights does not strip "
+                "it. Unwrap before loading weights (e.g. "
+                "model_engine.unwrap_compiled_model_for_refit()), or set "
+                "load_weights_strips_compile_wrapper = True on a model class whose "
+                "load_weights delegates to the generic loaders.")
+
+
+def _check_compile_wrapper_before_reload(model: torch.nn.Module) -> None:
+    if not _load_weights_strips_compile_wrapper(model):
+        _assert_no_compile_wrapper_in_paths(model)
+
+
 class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
@@ -1797,6 +1849,12 @@ class ModelLoader:
         running post-load processing once all bytes are present. Weight
         manifests are not written here; see `_dump_final_weight_manifest`.
 
+        A torch.compile wrapper left in the tree is fine for models that load
+        through the generic loaders (they strip the wrapper's ``_orig_mod``
+        path component, ``modeling_utils.strip_torch_compile_wrapper``); a
+        model with its own ``load_weights`` walk must be unwrapped first, and
+        ``_check_compile_wrapper_before_reload`` fails loudly otherwise.
+
         Args:
             model: Model instance receiving the replacement weights.
             weights: Checkpoint weights to pass to `model.load_weights`.
@@ -1811,6 +1869,7 @@ class ModelLoader:
                 "Cannot reload weights: weight_mapper was not initialized. "
                 "This can happen when the initial load used GMS, MX P2P, or "
                 "VISION_ONLY, which bypass the standard weight mapping path.")
+        _check_compile_wrapper_before_reload(model)
         if not allow_partial_loading:
             self._reset_weights_transformed(model)
         self._call_load_weights(model.load_weights,
