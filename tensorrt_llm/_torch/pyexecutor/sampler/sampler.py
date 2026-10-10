@@ -68,6 +68,7 @@ from .sampler_common import (
     FinishReasonsList,
     SampleType,
     _BatchedSamplingResult,
+    _get_beam_width_in,
     _get_beam_width_out,
     _request_get_sampling_params,
     add_token,
@@ -462,6 +463,7 @@ class SamplingRequestsMetadata:
 class SampleStateTensorsHostTorch(SampleStateTensors):
     finish_reasons: torch.Tensor | None
     first_finish_reasons: torch.Tensor | None
+    predecessor_beams: torch.Tensor | None = None
     logprobs_state: LogProbsState | None = None
     single_step_greedy: bool = False
     """Whether `new_tokens` uses the compact `(num_requests,)` layout instead of
@@ -1604,9 +1606,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    if _get_beam_width_in(req) > 1 and state.host.predecessor_beams is not None:
+                        assert req.py_seq_slot is not None
+                        pred = state.host.predecessor_beams[req.py_seq_slot].tolist()
+                        new_gen_tokens = []
+                        for beam_idx in range(_get_beam_width_out(req)):
+                            parent_idx = pred[beam_idx]
+                            parent_tokens = req.get_tokens(parent_idx)[req.py_prompt_len :]
+                            new_gen_tokens.append(
+                                parent_tokens + [new_tokens_list[0][req.py_seq_slot][beam_idx]]
+                            )
+                        req.set_generated_tokens(new_gen_tokens)
+                    else:
+                        for beam_idx in range(_get_beam_width_out(req)):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
@@ -1793,6 +1807,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
+        predecessor_beams_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
@@ -1830,6 +1845,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert seq_lens_cuda is not None
                 first_finish_reasons = beam_search_store.first_finish_reasons
                 first_finish_reasons_host = self._copy_to_host(first_finish_reasons)
+                predecessor_beams_host = self._copy_to_host(beam_search_store.predecessor_beams)
                 self._update_original_tokens(
                     beam_search_store.original_tokens, seq_slots_cuda, seq_lens_cuda, new_tokens
                 )
@@ -1866,6 +1882,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens=new_tokens_host,
                 finish_reasons=finish_reasons_host,
                 first_finish_reasons=first_finish_reasons_host,
+                predecessor_beams=predecessor_beams_host,
                 logprobs_state=logprobs_state,
                 single_step_greedy=single_step_greedy,
             ),
