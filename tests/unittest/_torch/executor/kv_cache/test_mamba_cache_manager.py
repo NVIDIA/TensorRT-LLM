@@ -61,6 +61,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -2354,6 +2355,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    secondary_offload_min_priority=None,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2381,6 +2383,7 @@ def _build_v2_hybrid_with_mamba_layer(
             enable_branch_snapshot=enable_branch_snapshot,
         ),
         dtype=kv_cache_dtype,
+        secondary_offload_min_priority=secondary_offload_min_priority,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2429,6 +2432,7 @@ def _make_v2_conversation_request(
     request_id: int,
     tokens: list[int],
     conversation_id: str,
+    retention: KvCacheRetentionConfig | None = None,
 ) -> LlmRequest:
     request = LlmRequest(
         request_id=request_id,
@@ -2436,6 +2440,7 @@ def _make_v2_conversation_request(
         input_tokens=tokens,
         sampling_config=SamplingConfig(),
         is_streaming=False,
+        kv_cache_retention_config=retention,
     )
     request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
     return request
@@ -2876,8 +2881,14 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         block_reuse_policy="per_conversation",
         max_num_turns=2,
         additional_snapshot_offsets_from_end=[0],
+        secondary_offload_min_priority=50,
     )
-    request_a = _make_v2_conversation_request(1, list(range(64)), "conv-1")
+    request_a = _make_v2_conversation_request(
+        1,
+        list(range(64)),
+        "conv-1",
+        KvCacheRetentionConfig([KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]),
+    )
     request_b = _make_v2_conversation_request(2, list(range(100, 164)), "conv-1")
     # Use fresh conversation IDs so probes query the shared prefix cache
     # without altering conv-1's retained-turn accounting.
@@ -2899,6 +2910,11 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
 
     try:
         _run_v2_hybrid_context(mgr, request_a)
+        cache_a = mgr.kv_cache_map[request_a.py_request_id]
+        attention_group = mgr.impl.get_layer_group_id(1)
+        priorities = cache_a.get_page_priorities(attention_group)
+        assert priorities and set(priorities) == {80}
+        assert mgr.impl.init_config.secondary_offload_min_priority == 50
         request_a_state_index = mgr.get_state_indices([request_a.py_request_id], [False])[0]
         mgr.free_resources(request_a)
         _run_v2_hybrid_context(mgr, request_b)

@@ -35,6 +35,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings.executor import KvCacheTransferMode
+from tensorrt_llm.llmapi import RequestError
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           CapacitySchedulerPolicy,
                                           KvCacheConfig, KvCacheConnectorConfig,
@@ -1274,6 +1276,20 @@ def test_connector_priorities(enforce_single_worker, model_with_connector,
     )
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+
+    if use_kv_cache_manager_v2:
+        for mode in (KvCacheTransferMode.GDS,
+                     KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
+            with pytest.raises(RequestError, match="per-request GDS/POSIX"):
+                model.generate([0] * NUM_INPUT_TOKENS,
+                               sampling_params=sampling_params,
+                               kv_cache_retention_config=KvCacheRetentionConfig(
+                                   [], transfer_mode=mode, directory="/tmp"))
+        with pytest.raises(RequestError, match="between 0 and 100"):
+            model.generate([0] * NUM_INPUT_TOKENS,
+                           sampling_params=sampling_params,
+                           kv_cache_retention_config=KvCacheRetentionConfig(
+                               [], decode_retention_priority=101))
 
     generate_and_wait(model,
                       scheduler,

@@ -769,6 +769,7 @@ private:
     std::optional<int> mPageStorageRow;
 
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
+    std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.

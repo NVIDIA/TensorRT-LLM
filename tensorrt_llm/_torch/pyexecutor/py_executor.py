@@ -33,6 +33,7 @@ from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
+from tensorrt_llm.bindings import executor as executor_bindings
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -5930,6 +5931,16 @@ class PyExecutor:
                     f"beam_width={request.py_beam_width}).")
 
     def _validate_request(self, request: LlmRequest):
+        retention = request.kv_cache_retention_config
+        if self._is_kv_manager_v2 and retention is not None:
+            if retention.transfer_mode != executor_bindings.KvCacheTransferMode.DRAM:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support per-request GDS/POSIX "
+                    "transfer_mode or directory; configure the manager's cache tiers instead."
+                )
+            if not 0 <= retention.decode_retention_priority <= 100:
+                raise ValueError(
+                    "Decode retention priority must be between 0 and 100")
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None

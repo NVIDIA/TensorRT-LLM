@@ -105,6 +105,25 @@ void Page::claimRetention(std::optional<Priority> priority, std::optional<std::c
     mRetentionDuration = duration;
 }
 
+void Page::inheritRetention(Page const& source)
+{
+    claimRetention(source.mPriority, source.mRetentionDuration);
+}
+
+bool Page::hasRetentionConsumers() const
+{
+    auto const h = holder.lock();
+    // A pending partial copy protects the source bytes but does not claim its retention policy.
+    return h && (!h->uniqLock.expired() || h.useCount() > mPartialCopyHolders + 1);
+}
+
+FuncGuard<std::function<void()>> Page::borrowRetentionForCopy()
+{
+    FuncGuard<std::function<void()>> guard([self = sharedFromThis()]() { --self->mPartialCopyHolders; });
+    ++mPartialCopyHolders;
+    return guard;
+}
+
 SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
 {
     return hold()->lock(kvCache, beamIndex, ordinal, lc, skipWait);
@@ -229,8 +248,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     this->readyEvent = std::move(readyEv);
 
     auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority());
-    auto const retention = kvCache->getRetention(blk->ordinal());
-    committed->claimRetention(retention.retentionPriority, retention.durationMs);
+    committed->inheritRetention(*this);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);

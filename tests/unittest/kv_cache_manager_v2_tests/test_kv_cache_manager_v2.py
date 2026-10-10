@@ -51,8 +51,10 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
+        KVCacheEventManager,
         KVCacheManager,
         KVCacheManagerConfig,
+        KVCacheUpdatedData,
         LayerGroupId,
         LayerId,
         LogicError,
@@ -106,8 +108,10 @@ else:
         GpuCacheTierConfig,
         HostCacheTierConfig,
         KVCacheDesc,
+        KVCacheEventManager,
         KVCacheManager,
         KVCacheManagerConfig,
+        KVCacheUpdatedData,
         LayerGroupId,
         LayerId,
         LogicError,
@@ -530,14 +534,21 @@ class TestRetention(TestKVCacheManagerV2):
         free = self.manager.get_storage_statistics()[0].free
         pressure = self._cache([])
         self.assertTrue(pressure.resize((free + 1) * 4))
-        snapshot = cached.get_page_storage_snapshot(0)
-        self.assertEqual(snapshot.cache_levels, [CacheLevel(1)])
+        self.assertEqual(_introspection.active_page_stats(cached)[0], [0, 1])
         pressure.close()
         self.assertTrue(cached.resume(self.stream.handle))
         self.assertEqual(cached.get_page_priorities(0), [80])
         self.assertEqual(cached.get_page_storage_snapshot(0).cache_levels, [GPU_LEVEL])
         self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
         self.stream.synchronize()
+        for config in (None, self._config(10)):
+            partial = self._cache(tokens[:3], config)
+            self.assertEqual(partial.num_committed_tokens, 3)
+            self.assertEqual(partial.get_page_priorities(0), [80])
+            self.assertEqual(cached.get_page_priorities(0), [80])
+            self.assertNotEqual(
+                partial.get_aggregated_page_indices(0), cached.get_aggregated_page_indices(0)
+            )
         capacity = cached.capacity
         total = self.manager.get_storage_statistics()[0].total
         self.assertFalse(cached.resize((total + 1) * 4))
@@ -559,6 +570,23 @@ class TestRetention(TestKVCacheManagerV2):
             for stats in self.manager.get_storage_statistics(level):
                 self.assertEqual(stats.free, stats.total)
                 self.assertEqual(stats.evictable, 0)
+
+        donor = self._cache(list(range(8)), self._config(80))
+        donor.close()
+        pending = []
+        for priority in (10, 90):
+            copy = self.manager.create_kv_cache(
+                input_tokens=list(range(3)),
+                expected_prompt_length=3,
+                kv_cache_retention_config=self._config(priority),
+            )
+            self.caches.append(copy)
+            pending.append(copy)
+        for copy in pending:
+            self.assertTrue(copy.resume(self.stream.handle))
+            self.assertEqual(copy.get_page_priorities(0), [90])
+            self.engine.execute([Step(copy, [], list(range(3)))], self.stream.handle)
+        self.stream.synchronize()
 
     @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50)])
     def test_released_offload_threshold_and_duration(self, priority, threshold):
@@ -4988,6 +5016,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         gpu_quota: int = 64 << 20,
         window_size: int | None = None,
         reuse_match_backoff: int = 0,
+        event_manager=None,
     ) -> None:
         kv_buf_size = 8192
         window_size = self.WINDOW_SIZE if window_size is None else window_size
@@ -5016,7 +5045,7 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
             reuse_match_backoff=reuse_match_backoff,
         )
         self.engine = FakeEngine(self.cfg)
-        self.manager = KVCacheManager(self.cfg)
+        self.manager = KVCacheManager(self.cfg, event_manager=event_manager)
 
     @property
     def _full_attn_lc_id(self) -> int:
@@ -5159,7 +5188,8 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         s.take_finish_event().synchronize()
 
     def test_rewind_endpoint_survives_longer_sibling_created_after(self) -> None:
-        self.prepare_partial()
+        events = KVCacheEventManager(max_kv_event_entries=128)
+        self.prepare_partial(event_manager=events)
         base = [TokenId(i) for i in range(80)]
         extended = base + [TokenId(i) for i in range(1000, 1080)]
         rewind = base + [TokenId(2000)]
@@ -5178,6 +5208,26 @@ class TestPartialCoverageReuse(TestKVCacheManagerV2):
         # The partial SWA page is stale at the longer endpoint and must not constrain
         # the full-attention lifecycle's reusable prefix.
         self.assertEqual(self.manager.probe_reuse(input_tokens=extended), len(extended))
+        events.flush_iteration_events()
+        events.get_latest_events(0)
+        claimant = self.manager.create_kv_cache(
+            input_tokens=rewind,
+            expected_prompt_length=len(rewind),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]
+            ),
+        )
+        try:
+            events.flush_iteration_events()
+            updates = [
+                event
+                for event in events.get_latest_events(0)
+                if isinstance(event.data, KVCacheUpdatedData)
+            ]
+            self.assertTrue(updates)
+            self.assertEqual({event.layer_group_id for event in updates}, {self._full_attn_lc_id})
+        finally:
+            claimant.close()
 
     def test_rewind_endpoint_attaches_to_longer_sibling_created_before(self) -> None:
         self.prepare_partial()

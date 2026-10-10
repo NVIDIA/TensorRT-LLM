@@ -389,6 +389,8 @@ private:
 
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
+    void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
         DropRecorder const& dropRecorder = {});

@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
 #include <chrono>
@@ -70,6 +71,9 @@ public:
 
     //! Apply a request claim, preserving priority when unspecified and replacing its duration.
     void claimRetention(std::optional<Priority> priority, std::optional<std::chrono::milliseconds> duration);
+    void inheritRetention(Page const& source);
+    bool hasRetentionConsumers() const;
+    FuncGuard<std::function<void()>> borrowRetentionForCopy();
 
     PageStatus status() const noexcept;
 
@@ -93,6 +97,7 @@ public:
 private:
     friend class StorageManager;
     Priority mPriority;
+    int mPartialCopyHolders = 0;
     std::optional<std::chrono::milliseconds> mRetentionDuration;
     std::optional<RetentionExpiryQueue::iterator> mRetentionExpiry;
 };

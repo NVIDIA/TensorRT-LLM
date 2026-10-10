@@ -865,6 +865,12 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     refreshRetention();
+    _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
     for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
     {
@@ -882,7 +888,6 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
 void StorageManager::forceEvict(
     CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, DropRecorder const& dropRecorder)
 {
-    refreshRetention();
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
 
@@ -1891,7 +1896,8 @@ void StorageManager::shrinkPoolGroup(
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
-    prepareFreeSlots(level, reqs);
+    // The eviction order captured above must remain stable through defragmentation.
+    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{});
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),

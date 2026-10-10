@@ -605,6 +605,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
         // Phase 1: Copy locked sources into private GPU slots. A shared sparse
         // prefix may be locked on host by another request and must stay there.
         std::vector<SharedPageLock*> srcLocks;
+        TypedVec<LifeCycleId, SharedPtr<Page>> copiedSources(numLc);
         for (LifeCycleId lcIdx{0}; lcIdx < numLc; ++lcIdx)
         {
             if (!deferredSlots[lcIdx].has_value())
@@ -626,6 +627,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             TLLM_CHECK_DEBUG(lock && lock->isValid());
             bool const hasPartialReuseSource = _hasReuseSource(*sourcePage);
             srcLocks.push_back(lock);
+            copiedSources[lcIdx] = lock->page();
 
             CacheLevel const sourceLevel = lock->page()->cacheLevel;
             deferredCopiesStarted = true;
@@ -684,6 +686,12 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
             }
 
             auto newPage = makeShared<UncommittedPage>(*this, blockOrdinal, lcIdx, kHotLevel, beamIdx);
+            if (blockOrdinal != kBadBlockOrdinal)
+            {
+                auto const& source = copiedSources[lcIdx];
+                TLLM_CHECK_DEBUG(source);
+                newPage->inheritRetention(*source);
+            }
             newPage->setSlot(newSlot);
             auto newLock = newPage->lock(*this, beamIdx, blockOrdinal, lcIdx, /*skipWait=*/true);
             *targetBp = std::move(newLock);
@@ -695,6 +703,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<bool> isDecod
     }
 
     // Deferred copies survive a failed decode admission and must not be repeated on retry.
+    mPartialCopyRetentionHolds.clear();
     mNeverResumed = false;
     if (mIsDecoding)
     {
@@ -1084,6 +1093,7 @@ bool KvCache::_hasReuseSource(BlockPage const& page)
 
 void KvCache::_clearBlocks()
 {
+    mPartialCopyRetentionHolds.clear();
     // Drop last block first (mirrors Python: while self._blocks: self._blocks.pop()).
     while (!mBlocks.empty())
         mBlocks.pop_back();
@@ -1134,7 +1144,14 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         auto committed = makeShared<CommittedPage>(
             &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
         auto const retention = getRetention(treeBlock->ordinal());
-        committed->claimRetention(retention.retentionPriority, retention.durationMs);
+        if (mManager->lifeCycles().ssmLifeCycleId() == lcIdx)
+        {
+            committed->claimRetention(retention.retentionPriority, retention.durationMs);
+        }
+        else
+        {
+            committed->inheritRetention(*srcPage);
+        }
         committed->setSlot(newSlot);
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
@@ -2670,9 +2687,18 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             TLLM_CHECK_WITH_INFO(page, "Expected page in non-stale block");
             CacheLevel const level = page->cacheLevel;
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
+            bool const partialCopy = hasPartialMatch && ordinal == fullReusedEnd;
+            bool const borrowPartial = partialCopy && page->hasRetentionConsumers();
             bpSlot = page->hold();
-            auto const retention = getRetention(ordinal);
-            page->claimRetention(retention.retentionPriority, retention.durationMs);
+            if (!borrowPartial)
+            {
+                auto const retention = getRetention(ordinal);
+                page->claimRetention(retention.retentionPriority, retention.durationMs);
+            }
+            if (partialCopy)
+            {
+                mPartialCopyRetentionHolds.push_back(page->borrowRetentionForCopy());
+            }
             if (!isAttention)
             {
                 return;
