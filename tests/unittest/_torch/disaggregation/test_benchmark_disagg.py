@@ -96,9 +96,9 @@ def _make_v2_kv_cache_manager() -> Mock:
 
 
 def _stub_transfer_entry_points(ex) -> None:
-    """Mock the coordinator's transfer polls and receive start once the
-    executor builds it; the build stays lazy so a test can finish configuring
-    the executor before the first ``ex.disagg`` use.
+    """Mock the coordinator's transfer polls, CP admission alignment and
+    receive start once the executor builds it; the build stays lazy so a test
+    can finish configuring the executor before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -107,6 +107,7 @@ def _stub_transfer_entry_points(ex) -> None:
         coordinator.poll_gen_transfers = Mock()
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
+        coordinator.align_gen_admission_across_cp = Mock(side_effect=lambda admitted: admitted)
         coordinator.receive_gen_init = Mock()
         return coordinator
 

@@ -310,6 +310,32 @@ class DisaggTransferCoordinator:
         if deferred_requests:
             self._effects.revert_ctx_alloc(deferred_requests)
 
+    @nvtx_range("align_gen_admission_across_cp")
+    def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        """Keep only the gen-init requests that every CP rank of the group admitted.
+
+        In async-transfer mode ``receive_gen_init`` ends with the gen transfer
+        status collective, entered only on ranks that admitted something, so
+        the CP ranks must admit the same requests in the same iteration. Equal
+        KV capacity does not guarantee that: KV cache manager V1 deals helix
+        blocks round-robin from CP rank 0, so that rank can hold one more block
+        per request, and a client cancel or a transfer timeout retires a request
+        rank-locally, so one CP rank can have room before its peer. The pp=1
+        loops call this on every rank every iteration; the dropped requests give
+        back their V2 KV and are retried on a later iteration.
+        """
+        if self._dist.cp_size == 1:
+            return admitted
+        local_ids = [request.py_request_id for request in admitted]
+        common_ids = set(local_ids)
+        for peer_ids in self._dist.cp_allgather(local_ids):
+            common_ids.intersection_update(peer_ids)
+        if len(common_ids) == len(local_ids):
+            return admitted
+        aligned = [request for request in admitted if request.py_request_id in common_ids]
+        self.revert_deferred_gen_init(admitted, aligned)
+        return aligned
+
     def _transfer_window_is_active(self) -> bool:
         """Whether the executor-level transfer window bounds admission."""
         return (
@@ -807,6 +833,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
         self, candidates: List[LlmRequest], admitted: List[LlmRequest]
     ) -> None:
         return None
+
+    def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
+        return admitted
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None

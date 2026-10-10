@@ -353,13 +353,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             # The transfer worker is already live by this point.
             self._transfer_worker.shutdown()
             raise
-        # _chunk_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
-        # except under attention DP where the local count already is the total.
-        # Helix CP ranks hold disjoint block sets, so they scale the request
-        # total the same way TP shards do (metric only).
-        self._kv_size_rank_factor = (
-            1 if mapping.enable_attention_dp else max(1, mapping.tp_size * mapping.cp_size)
-        )
+        self._kv_size_rank_factor = self._kv_size_rank_factor_for(mapping)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -392,15 +386,78 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return endpoint
         return cast(str, self._dist.broadcast(None, 0))
 
+    @staticmethod
+    def _kv_size_rank_factor_for(mapping) -> int:
+        """TP part of the scale from this rank's KV shard bytes to the request total.
+
+        TP shards are equal, so they scale by tp_size; under attention DP the TP dimension
+        is not sharded. Helix CP shares are unequal and are scaled per request instead
+        (see _request_kv_bytes).
+        """
+        return 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
+
+    def _request_kv_bytes(self, req: LlmRequest, local_bytes: int) -> int:
+        """Request-total KV bytes from this rank's share (metric only, no collective).
+
+        Helix deals prompt blocks round-robin over the CP ranks, so this rank holds
+        ceil(prompt_len / tpb) of the ceil(total_input_len_cp / tpb) blocks (prompt_len
+        is the rank-local slice) and the shares differ by up to one block. Scaling the
+        per-block bytes by the global block count gives the exact total. A CP rank that
+        owns no block reports 0; responses come from CP rank 0, which owns block 0.
+        """
+        if local_bytes == 0:
+            return 0
+        total = local_bytes * self._kv_size_rank_factor
+        if self._mapping.cp_size == 1:
+            return total
+        tpb = self._reuse_adapter.tokens_per_block
+        local_blocks = (req.prompt_len + tpb - 1) // tpb
+        global_blocks = (req.total_input_len_cp + tpb - 1) // tpb
+        if local_blocks == 0:
+            return total
+        return total * global_blocks // local_blocks
+
     def _init_sync_policy(self):
         m = self._mapping
+        # The ctx side never syncs over CP: helix pairs a cp=1 context instance
+        # with a cp=N generation instance (see attention/peer.py check_peer_compatible),
+        # so on the context side the CP group is always a single rank.
         self._ctx_need_tp_sync = m.tp_size > 1 and not m.enable_attention_dp
         self._ctx_need_pp_sync = m.pp_size > 1
-        self._gen_need_sync = not (m.world_size == 1 or (m.enable_attention_dp and m.pp_size == 1))
-        pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-        self._gen_allgather: Callable = (
-            pp_allgather if m.enable_attention_dp else self._dist.allgather
-        )
+        if m.enable_attention_dp:
+            # DP groups schedule independently, but the PP ranks and the helix CP
+            # ranks of one DP group share the same requests, so gen-side consensus
+            # spans PP x CP (like the C++ transceiver's mGroupDataComm). Without it
+            # a CP rank can start decoding before its partner received the KV and
+            # the helix all-to-all deadlocks.
+            #
+            # Invariant: check_gen_transfer_status gathers over this group, and
+            # besides the per-iteration poll the executor also enters it from
+            # receive_gen_init, only on ranks that admitted gen-init requests.
+            # The CP ranks of one DP group must therefore admit the same requests
+            # in the same iteration. Equal KV capacity is not enough: V1 deals
+            # helix blocks round-robin, and a client cancel or transfer timeout
+            # retires a request rank-locally, so one CP rank can have room
+            # before its peer. The pp=1 loops intersect the admitted ids over CP
+            # first (DisaggTransferCoordinator.align_gen_admission_across_cp).
+            # Non-DP tp x cp gathers over the world behind the same predicate and
+            # goes through the same step, which lines up its CP ranks but not its
+            # TP ranks; a rank-local cancel or timeout can still skew those, as it
+            # can without CP. The PP loop is not covered: under attention DP with
+            # tp > 1 its first-stage ranks admit from their own schedule.
+            self._gen_need_sync = m.pp_size * m.cp_size > 1
+            self._gen_allgather: Callable = self._dp_group_allgather
+        else:
+            self._gen_need_sync = m.world_size > 1
+            self._gen_allgather = self._dist.allgather
+
+    def _dp_group_allgather(self, obj):
+        """Allgather over the PP x CP ranks of this DP group (CP first, then PP)."""
+        m = self._mapping
+        gathered = list(self._dist.cp_allgather(obj)) if m.cp_size > 1 else [obj]
+        if m.pp_size > 1:
+            gathered = [x for part in self._dist.pp_allgather(gathered) for x in part]
+        return gathered
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -666,11 +723,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return ready_ids
 
     def _gen_consensus(self, local_ids: list) -> list:
-        sync_size = (
-            self._mapping.pp_size if self._mapping.enable_attention_dp else self._mapping.world_size
-        )
-        all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
-        return _find_consensus_request_ids(all_ranks, sync_size)
+        if not self._gen_need_sync:
+            return list(local_ids)
+        all_ranks = self._gen_allgather(local_ids)
+        return _find_consensus_request_ids(all_ranks, len(all_ranks))
 
     @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
@@ -1124,7 +1180,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.py_kv_transfer_verified = session.kv_write_verified()
                 # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
                 req.set_kv_cache_size(
-                    self._chunk_num_bytes(extent.local) * self._kv_size_rank_factor
+                    self._request_kv_bytes(req, self._chunk_num_bytes(extent.local))
                 )
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
@@ -1188,7 +1244,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return
         extent = self._create_cache_extent(req)
         chunk_bytes = self._chunk_num_bytes(extent.local)
-        req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        req.py_kv_cache_xfer_bytes = self._request_kv_bytes(req, chunk_bytes)
         fetches = self._open_peer_source(req)
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
