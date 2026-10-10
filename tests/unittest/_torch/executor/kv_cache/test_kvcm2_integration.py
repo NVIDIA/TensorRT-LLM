@@ -41,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, Res
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheType
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
@@ -971,6 +972,7 @@ def test_prepare_context_cache_records_lookup_without_mutating_cursor(
         py_request_id=7,
         lora_task_id=3,
         cache_salt=11,
+        kv_cache_retention_config=None,
         is_dummy=False,
         return_perf_metrics=False,
         prompt_len=8,
@@ -1599,6 +1601,7 @@ class _ContextRequest:
     use_conversation_params: bool = True
     lora_task_id: int | None = None
     cache_salt: str | None = None
+    kv_cache_retention_config: KvCacheRetentionConfig | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
@@ -1775,6 +1778,59 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
             manager.free_resources(request)
         assert not manager.kv_cache_map
     finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "global_prompt,local_prompt,rank,range_end,expected",
+    [(256, 128, 0, 128, [35, 80]), (64, 0, 1, 128, [10]), (130, 66, 0, 65, [35, 80])],
+)
+def test_helix_retention_uses_rank_local_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+    global_prompt: int,
+    local_prompt: int,
+    rank: int,
+    range_end: int,
+    expected: list[int],
+) -> None:
+    # Only cross-process coordination is replaced; allocation and policy run in native V2 on GPU.
+    dist = SimpleNamespace(allreduce=lambda value, op: value, local_world_size=1)
+    monkeypatch.setattr(Distributed, "get", lambda mapping: dist)
+    manager = KVCacheManagerV2(
+        KvCacheConfig(enable_block_reuse=False, max_gpu_total_bytes=4 << 20),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=64,
+        max_seq_len=512,
+        max_batch_size=1,
+        max_num_tokens=256,
+        mapping=Mapping(
+            world_size=2, cp_size=2, tp_size=1, rank=rank, cp_config={"cp_type": "HELIX"}
+        ),
+        dtype=DataType.HALF,
+    )
+    request = _ContextRequest(
+        1, list(range(local_prompt)), local_prompt, "retention", use_conversation_params=False
+    )
+    request.total_input_len_cp = global_prompt
+    request.kv_cache_retention_config = KvCacheRetentionConfig(
+        [KvCacheRetentionConfig.TokenRangeRetentionConfig(64, range_end, 80)],
+        decode_retention_priority=10,
+    )
+    try:
+        assert isinstance(manager.impl, KVCacheManager)
+        assert manager.impl.init_config.tokens_per_block == 128
+        assert manager.prepare_context_cache(request) is not None
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.resize(global_prompt)
+        group = manager.impl.get_layer_group_id(0)
+        assert cache.get_page_priorities(group) == expected
+        assert cache.resize((len(expected) + 1) * 128)
+        assert cache.get_page_priorities(group) == expected + [10]
+    finally:
+        manager.free_resources(request)
         manager.shutdown()
 
 

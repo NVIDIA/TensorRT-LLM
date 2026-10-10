@@ -50,6 +50,7 @@ from tensorrt_llm._utils import (
     prefer_pinned,
     str_dtype_to_torch,
 )
+from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper,
@@ -3029,6 +3030,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
             ),
             initial_pool_ratio=kv_cache_config.pool_ratio,
+            secondary_offload_min_priority=(
+                30
+                if kv_cache_config.secondary_offload_min_priority is None
+                else kv_cache_config.secondary_offload_min_priority
+            ),
         )
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
@@ -3708,6 +3714,42 @@ class KVCacheManagerV2(BaseResourceManager):
             self._context_reuse_tokens(req),
         )
 
+    def _retention_config_for_request(self, req: LlmRequest) -> KvCacheRetentionConfig | None:
+        config = req.kv_cache_retention_config
+        if config is None or not self._has_cp_helix:
+            return config
+        # Retention ranges use rank-local physical tokens; native ordinals use CP super-blocks.
+        prompt_blocks = (req.prompt_len + self.tokens_per_block - 1) // self.tokens_per_block
+        prompt_end = prompt_blocks * self.tokens_per_block
+        ranges = []
+        for token_range in config.token_range_retention_configs:
+            end = min(prompt_end, token_range.token_end or prompt_end)
+            if token_range.token_start < end:
+                ranges.append(
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        token_range.token_start * self._helix_cp_size,
+                        end * self._helix_cp_size,
+                        token_range.priority,
+                        token_range.duration_ms,
+                    )
+                )
+        # A short or empty rank can allocate a decode page within the final global prompt block.
+        ranges.append(
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                prompt_end * self._helix_cp_size,
+                None,
+                config.decode_retention_priority,
+                config.decode_duration_ms,
+            )
+        )
+        return KvCacheRetentionConfig(
+            ranges,
+            decode_retention_priority=config.decode_retention_priority,
+            decode_duration_ms=config.decode_duration_ms,
+            transfer_mode=config.transfer_mode,
+            directory=config.directory,
+        )
+
     def prepare_context_cache(self, req: LlmRequest, reuse_limit: int | None = None) -> int | None:
         """Create/resume a context cache without touching request cursors. ``reuse_limit``
         caps the claimed depth while retaining its lookahead evidence; the returned
@@ -3736,6 +3778,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.lora_task_id,
                     tokens,
                     cache_salt=req.cache_salt,
+                    kv_cache_retention_config=self._retention_config_for_request(req),
                     is_dummy=req.is_dummy,
                     enable_request_stats=req.return_perf_metrics,
                     expected_prompt_length=(
@@ -4177,6 +4220,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        self.impl.refresh_retention()
         for request in scheduled_batch.context_requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:
@@ -4549,6 +4593,8 @@ class KVCacheManagerV2(BaseResourceManager):
             None,
             cache_salt=req.cache_salt,
             is_dummy=req.is_dummy,
+            expected_prompt_length=req.prompt_len,
+            kv_cache_retention_config=self._retention_config_for_request(req),
         )
         if kv_cache is None:
             return None
@@ -6428,6 +6474,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
+        kv_cache_retention_config: KvCacheRetentionConfig | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -6462,6 +6509,7 @@ class KVCacheManagerV2(BaseResourceManager):
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            kv_cache_retention_config=kv_cache_retention_config,
             **priority_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
@@ -6548,28 +6596,21 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse:
             return False
-        # Prefetch via a transient KV cache that holds the reuse-matched blocks,
-        # prefetches disk->host, then closes. Holding blocks costs no GPU space
-        # (never resumed) and close() needs no stream sync. The transient cache
-        # is NOT registered in kv_cache_map / IndexMapper.
+        if not self.can_evict:
+            return True
+        # Prefetch holds storage without claiming a request's retention interval.
         success = True
         for req in requests:
             tokens = self._context_reuse_tokens(req)
             # Use the same salt derivation as _create_kv_cache so the transient
             # cache hits the same radix-tree blocks.
             salt_int = self._derive_reuse_salt(req.cache_salt)
-            kv_cache = self.impl.create_kv_cache(
-                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens
+            prefetched = self.impl.prefetch_reuse(
+                ReuseScope(lora_id=req.lora_task_id, salt=salt_int), tokens, CACHE_LEVEL1
             )
-            try:
-                # Prefetch to the first tier below GPU (host if present,
-                # otherwise disk). prefetch() is a best-effort hint.
-                prefetched = kv_cache.prefetch(CACHE_LEVEL1)
-                if not prefetched:
-                    logger.warning("prefetch failed for request %s", req.py_request_id)
-                    success = False
-            finally:
-                kv_cache.close()
+            if not prefetched:
+                logger.warning("prefetch failed for request %s", req.py_request_id)
+                success = False
         return success
 
     def reset_reuse_state(self):

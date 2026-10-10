@@ -23,9 +23,12 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
+#include <chrono>
 #include <functional>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -38,6 +41,8 @@ class KvCache;
 class PageHolder;
 class UniqPageLock;
 class SharedPageLock;
+class Page;
+using RetentionExpiryQueue = std::multimap<std::chrono::steady_clock::time_point, WeakPtr<Page>>;
 
 // ---------------------------------------------------------------------------
 // Page — base class for all KV-cache pages.
@@ -50,9 +55,6 @@ public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
-    // Immutable: PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value,
-    // so changing it while the page is scheduled would erase from the wrong list.
-    Priority const priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 
@@ -61,6 +63,17 @@ public:
     virtual ~Page();
 
     virtual bool isCommitted() const = 0;
+
+    Priority priority() const noexcept
+    {
+        return mPriority;
+    }
+
+    //! Apply a request claim, preserving priority when unspecified and replacing its duration.
+    void claimRetention(std::optional<Priority> priority, std::optional<std::chrono::milliseconds> duration);
+    void inheritRetention(Page const& source);
+    bool hasRetentionConsumers() const;
+    FuncGuard<std::function<void()>> borrowRetentionForCopy();
 
     PageStatus status() const noexcept;
 
@@ -80,6 +93,13 @@ public:
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
+
+private:
+    friend class StorageManager;
+    Priority mPriority;
+    int mPartialCopyHolders = 0;
+    std::optional<std::chrono::milliseconds> mRetentionDuration;
+    std::optional<RetentionExpiryQueue::iterator> mRetentionExpiry;
 };
 
 // ---------------------------------------------------------------------------

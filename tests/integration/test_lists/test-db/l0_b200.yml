@@ -267,6 +267,13 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
   - unittest/kv_cache_manager_v2_tests
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
+  - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
+  - unittest/_torch/executor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
+  - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v1]
+  - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_connector_cancel_holds_pages_until_the_save_reads_them
   # ------------- KV Cache V2 Scheduler IT ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_v2_vs_v1_basic
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_token_budget_limited

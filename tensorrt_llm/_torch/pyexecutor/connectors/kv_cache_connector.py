@@ -59,14 +59,6 @@ if TYPE_CHECKING:
     from .kv_cache_layout import KvCacheLayout
 
 
-# `logger.warning_once` key for the KVCacheManagerV2 retention diagnostic
-# emitted by `KvCacheConnectorSchedulerOutputRequest.update_and_build_data`.
-# `log_once` marks a key as seen before consulting the log level
-# (tensorrt_llm/logger.py:284-287), so the key survives a run that printed
-# nothing; a test that wants to observe the warning has to clear it first.
-V2_RETENTION_IGNORED_LOG_KEY = "kv_connector_v2_retention_config_ignored"
-
-
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -583,8 +575,7 @@ class KvCacheConnectorSchedulerOutputRequest:
 
         new_block_ids_by_layer_group: List[List[int]] = []
         if is_v2:
-            # Block hashes and retention priorities have no V2 accessor yet, so
-            # they are reported empty rather than guessed at.
+            # Block hashes have no V2 accessor yet.
             block_hashes = []
             indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
             while len(self.block_ids_by_layer_group) < len(indices_by_group):
@@ -628,22 +619,16 @@ class KvCacheConnectorSchedulerOutputRequest:
                 req
             )  # Specdec with draft tokens is not supported yet.
 
-        # Get retention priority for each new block only if retention config is
-        # provided (for priority-based offload filtering). Priorities stay None
-        # under KVCacheManagerV2, which honours no `KvCacheRetentionConfig`:
-        # every page carries the default there, so reporting a priority would
-        # misdescribe what the user asked for. Warn rather than report nothing
-        # in silence -- the user configured retention and it is not in effect.
+        # Report the native pages' current priorities, including shared-page claims.
         priorities = None
         if req.kv_cache_retention_config is not None:
             if is_v2:
-                logger.warning_once(
-                    "KvCacheRetentionConfig has no effect in this configuration: no "
-                    "per-block retention priority is honoured, so RequestData.priorities is "
-                    "reported as None and a connector cannot filter offloads by priority. Set "
-                    "kv_cache_config.use_kv_cache_manager_v2=False to keep retention "
-                    "priorities on the connector path.",
-                    key=V2_RETENTION_IGNORED_LOG_KEY,
+                priorities = (
+                    kv_cache_manager.kv_cache_map[req.py_request_id].get_page_priorities(0)[
+                        len(self.block_ids) - len(new_block_ids) : len(self.block_ids)
+                    ]
+                    if len(new_block_ids_by_layer_group) == 1
+                    else []
                 )
             else:
                 priorities = [

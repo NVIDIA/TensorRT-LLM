@@ -100,6 +100,7 @@ class StubRequest:
         self.is_dummy = False
         self.lora_task_id = lora_task_id
         self.cache_salt = cache_salt
+        self.kv_cache_retention_config = None
         # LlmRequest's own default; a truthy value here turns on the
         # per-request stats branch of _create_kv_cache.
         self.return_perf_metrics = return_perf_metrics

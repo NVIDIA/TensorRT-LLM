@@ -128,6 +128,7 @@ class _KVCacheManagerConfigFieldSpec:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
+    secondary_offload_min_priority: int = 30
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
