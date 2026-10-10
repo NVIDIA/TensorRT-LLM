@@ -14,6 +14,28 @@ from ..distributed import allgather
 from .linear import Linear, TensorParallelMode
 
 
+def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
+                              output_dtype: torch.dtype) -> torch.Tensor:
+    """Compute ``input @ weight.T`` and write the result in ``output_dtype``.
+
+    ``input`` and ``weight`` stay in the model dtype; cuBLAS accumulates in
+    float32 and stores the result directly in ``output_dtype``, so the output
+    is not rounded to the model dtype first.
+    """
+    out_features = weight.shape[0]
+    output_shape = (*input.shape[:-1], out_features)
+    input_2d = input.reshape(-1, input.shape[-1])
+    if input_2d.shape[0] == 0:
+        return input.new_empty(output_shape, dtype=output_dtype)
+    # cublas_mm reads mat_b as column-major with leading dimension K.
+    assert weight.is_contiguous(), "LM head weight must be contiguous"
+    output = torch.ops.trtllm.cublas_mm(input_2d.contiguous(),
+                                        weight.t(),
+                                        None,
+                                        out_dtype=output_dtype)
+    return output.view(output_shape)
+
+
 class LMHead(Linear):
     """LM head layer.
 
@@ -23,6 +45,11 @@ class LMHead(Linear):
         dtype (Optional[torch.dtype]): type of the parameters.
         mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
+        output_dtype (Optional[torch.dtype]): dtype of the logits written by
+            the GEMM. None keeps the parameter dtype. torch.float32 keeps the
+            weights and inputs in the parameter dtype but writes the float32
+            accumulator directly, so logits are not rounded to bf16/fp16.
+            Only supported for unquantized, non-ROW-parallel heads.
     """
 
     def __init__(
@@ -36,6 +63,7 @@ class LMHead(Linear):
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
         quant_config=None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -119,6 +147,21 @@ class LMHead(Linear):
             self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
             self.register_parameter("bias", None)
 
+        if output_dtype is not None:
+            if self.has_any_quant:
+                raise NotImplementedError(
+                    "LMHead output_dtype is only supported for unquantized "
+                    f"LM heads (quant_algo={quant_config.quant_algo})")
+            if self.tp_mode == TensorParallelMode.ROW:
+                raise NotImplementedError(
+                    "LMHead output_dtype does not support ROW tensor-parallel "
+                    "mode")
+        self.output_dtype = output_dtype
+
+    def _writes_output_dtype(self) -> bool:
+        return (self.output_dtype is not None
+                and self.output_dtype != self.weight.dtype)
+
     @property
     def vocab_size_padded(self) -> int:
         if self.tp_mode == TensorParallelMode.COLUMN and self.gather_output:
@@ -141,8 +184,12 @@ class LMHead(Linear):
             slice_width = ceil_div(self.out_features, tp_size)
             slice_start = tp_rank * slice_width
             slice_end = min((tp_rank + 1) * slice_width, self.out_features)
-            output = F.linear(input, self.weight[slice_start:slice_end, :],
-                              None)
+            weight = self.weight[slice_start:slice_end, :]
+            if self._writes_output_dtype():
+                output = _matmul_with_output_dtype(input, weight,
+                                                   self.output_dtype)
+            else:
+                output = F.linear(input, weight, None)
         else:
             output = super().forward(input, all_reduce_params=all_reduce_params)
         if (self.tp_mode == TensorParallelMode.COLUMN and self.gather_output
@@ -150,6 +197,20 @@ class LMHead(Linear):
             output = output[..., :-self.padding_size]
 
         return output
+
+    def apply_linear(self,
+                     input,
+                     bias,
+                     lora_params: Optional[dict] = None,
+                     layer_idx: Optional[int] = None):
+        # Linear.forward runs the GEMM through apply_linear for the COLUMN and
+        # non-parallel modes, so the TP all-gather and the vocab-padding slice
+        # in forward() apply unchanged to the output_dtype logits.
+        if self._writes_output_dtype():
+            assert bias is None, "LMHead has no bias"
+            return _matmul_with_output_dtype(input, self.weight,
+                                             self.output_dtype)
+        return super().apply_linear(input, bias, lora_params, layer_idx)
 
     def skip_forward(
             self,

@@ -233,6 +233,10 @@ class ModelConfig(Generic[TConfig]):
     # draft models so greedy draft sampling can do a lighter TP gather. Defaults
     # to True to preserve behavior for every non-draft model.
     lm_head_gather_output: bool = True
+    # Dtype of the logits written by the LM head GEMM (LlmArgs.lm_head_dtype).
+    # None keeps the model dtype; torch.float32 writes the float32 accumulator
+    # directly instead of rounding the logits to bf16/fp16 first.
+    lm_head_dtype: Optional[torch.dtype] = None
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
     kv_cache_compression_config: Optional["KvCacheCompressionConfig"] = None

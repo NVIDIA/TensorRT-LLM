@@ -578,6 +578,7 @@ class DecoderModelForCausalLM(nn.Module,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_dtype,
             )
         else:
             if (hasattr(config, 'lora_config')
@@ -607,6 +608,7 @@ class DecoderModelForCausalLM(nn.Module,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                output_dtype=config.lm_head_dtype,
             )
 
             if self.has_custom_lm_head:
