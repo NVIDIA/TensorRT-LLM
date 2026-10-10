@@ -1602,6 +1602,7 @@ class _ContextRequest:
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
+    is_generation_only_request: bool = False
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
@@ -1925,6 +1926,58 @@ def test_preempt_request_gives_a_full_pool_back_its_pages(
     finally:
         for request in started:
             _free_if_active(manager, request)
+
+
+def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
+    manager: KVCacheManagerV2,
+) -> None:
+    """A connector save in flight defers the release rather than racing it.
+
+    The pages are the source of those reads, so handing them to another request
+    now would let it overwrite the bytes mid-transfer and publish them under a
+    hash that says they are the victim's prefix.
+    """
+    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+
+    # Reports a save in flight for every request, which is the only answer the
+    # deferral depends on; the rest is what free_resources reaches for.
+    connector = SimpleNamespace(
+        request_finished=lambda *_args: True,
+        capacity_only=False,
+        prefix_reservations_enabled=False,
+        # Declining keeps the allocation hooks out of a preemption test.
+        should_add_sequence=lambda _req: False,
+        release_unstarted_prefix_loads=lambda _req: None,
+        has_pending_load=lambda _req: False,
+        release_prefix_reservation=lambda _req: None,
+        reset_request_state=lambda _req: None,
+    )
+    manager.kv_connector_manager = connector
+    try:
+        assert _try_run_context(manager, victim)
+
+        assert manager.preempt_request(victim) is False
+        assert manager.has_pending_preemption()
+        assert manager.is_preemption_pending(victim)
+        # Nothing was given up yet: the victim still owns its cache.
+        assert manager.is_request_active(victim.py_request_id)
+        assert victim.py_num_connector_matched_tokens == TOKENS_PER_BLOCK
+
+        assert manager.try_complete_preemption(victim) is True
+        assert not manager.has_pending_preemption()
+        assert not manager.is_preemption_pending(victim)
+        assert not manager.is_request_active(victim.py_request_id)
+        assert victim.py_request_id not in manager.kv_cache_map
+        assert victim.py_num_connector_matched_tokens == 0
+
+        # How the executor tells a preempted request apart from a finished one
+        # in the connector's get_finished output, so a second call must not
+        # claim this one again.
+        assert manager.try_complete_preemption(victim) is False
+    finally:
+        manager.kv_connector_manager = None
+        _free_if_active(manager, victim)
 
 
 def test_per_conversation_policy_delays_commit_until_last_context_chunk(

@@ -75,6 +75,8 @@ def test_openengine_server_serves_the_control_contract() -> None:
         assert server.port != 0
 
         await server.start()
+        with pytest.raises(RuntimeError, match="Failed to bind"):
+            OpenEngineServer(host="127.0.0.1", port=server.port, llm=llm, model="test-model")
         channel = grpc.aio.insecure_channel(f"127.0.0.1:{server.port}")
         try:
             control = openengine_pb2_grpc.ControlStub(channel)
@@ -127,6 +129,7 @@ def test_launch_server_disables_gc_only_when_requested(
     class _Llm:
         def __init__(self, **kwargs) -> None:
             del kwargs
+            self.llm_id = "test-instance"
 
         def shutdown(self) -> None:
             pass

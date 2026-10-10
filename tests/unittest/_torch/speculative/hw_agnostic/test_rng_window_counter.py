@@ -20,12 +20,21 @@ CUDA buffers the latter also fills.
 import types
 from typing import Optional
 
+import pytest
 import torch
 
-from tensorrt_llm._torch.speculative.interface import DEFAULT_SAMPLING_SEED, SpecMetadata
+from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import UNSEEDED_OFFSET_BASE
+from tensorrt_llm._torch.speculative.interface import (
+    _RNG_SLOT_SPAN,
+    DEFAULT_SAMPLING_SEED,
+    SpecMetadata,
+    SpecWorkerBase,
+)
 
 MAX_DRAFT_LEN = 3
-WINDOW = MAX_DRAFT_LEN + 1
+# One slot per target row, per draft step and for the acceptance kernel.
+WINDOW = ((MAX_DRAFT_LEN + 1) + MAX_DRAFT_LEN + 1) * _RNG_SLOT_SPAN
+BASE = UNSEEDED_OFFSET_BASE
 
 
 def _meta(max_num_requests: int = 8) -> SpecMetadata:
@@ -113,7 +122,7 @@ def test_seeded_slot_reuse_reset_leaves_other_counters_alone() -> None:
     # shared unseeded counter must keep advancing where they left off.
     _offsets(meta, [_request(3)])
     assert _offsets(meta, [_request(0, seed=7, request_id=3), survivor]) == [0, WINDOW]
-    assert _offsets(meta, [_request(3)]) == [WINDOW]
+    assert _offsets(meta, [_request(3)]) == [BASE + WINDOW]
 
 
 # --- unseeded requests: one shared counter ------------------------------------
@@ -127,18 +136,32 @@ def test_unseeded_serial_requests_on_fresh_slots_get_distinct_windows() -> None:
     seen: list[int] = []
     for slot in range(meta.max_num_requests):
         seen.extend(_offsets(meta, [_request(slot)]))
-    assert seen == [i * WINDOW for i in range(meta.max_num_requests)]
+    assert seen == [BASE + i * WINDOW for i in range(meta.max_num_requests)]
 
 
 def test_unseeded_requests_in_one_batch_get_distinct_windows() -> None:
     meta = _meta()
-    assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [0, WINDOW, 2 * WINDOW]
+    assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [
+        BASE,
+        BASE + WINDOW,
+        BASE + 2 * WINDOW,
+    ]
     # Next pass continues from where the shared counter left off.
     assert _offsets(meta, [_request(0), _request(1), _request(2)]) == [
-        3 * WINDOW,
-        4 * WINDOW,
-        5 * WINDOW,
+        BASE + 3 * WINDOW,
+        BASE + 4 * WINDOW,
+        BASE + 5 * WINDOW,
     ]
+
+
+def test_unseeded_windows_differ_from_a_default_seeded_request() -> None:
+    # Unseeded requests draw with DEFAULT_SAMPLING_SEED, which a user may also
+    # pass as their seed; the two must still not share a (seed, offset).
+    meta = _meta()
+    seeded = _request(0, seed=DEFAULT_SAMPLING_SEED, request_id=1)
+    for _ in range(4):
+        seeded_offset, unseeded_offset = _offsets(meta, [seeded, _request(1, request_id=2)])
+        assert seeded_offset < BASE <= unseeded_offset
 
 
 def test_unseeded_windows_never_repeat_across_slot_reuse() -> None:
@@ -179,19 +202,63 @@ def test_graph_copy_shares_the_counters() -> None:
     # Same for the shared unseeded counter: a context step runs eagerly and
     # the generation steps replay a graph, and neither may hand out a window
     # the other already did.
-    assert _offsets(meta, [_request(1)]) == [0]
-    assert _offsets(graph_meta, [_request(1)]) == [WINDOW]
-    assert _offsets(meta, [_request(1)]) == [2 * WINDOW]
+    assert _offsets(meta, [_request(1)]) == [BASE]
+    assert _offsets(graph_meta, [_request(1)]) == [BASE + WINDOW]
+    assert _offsets(meta, [_request(1)]) == [BASE + 2 * WINDOW]
+
+
+# --- the slots of one window --------------------------------------------------
+
+
+@pytest.mark.parametrize("is_tree", [False, True], ids=["linear", "tree"])
+def test_window_slots_do_not_overlap(is_tree: bool) -> None:
+    """Every row a request samples in one step draws from its own stretch of the
+    window, and no stretch reaches into the next step's window."""
+    meta = SpecMetadata(
+        max_num_requests=1,
+        max_draft_len=MAX_DRAFT_LEN,
+        max_total_draft_tokens=10 if is_tree else MAX_DRAFT_LEN,
+        is_spec_dec_tree=is_tree,
+    )
+    assert _offsets(meta, [_request(0, seed=7)]) == [0]
+    window = _offsets(meta, [_request(0, seed=7)])[0]
+
+    target_rows = (10 if is_tree else MAX_DRAFT_LEN) + 1
+    slots = list(range(target_rows))
+    slots += [meta.rng_draft_slot(step) for step in range(MAX_DRAFT_LEN)]
+    slots.append(meta.rng_accept_slot)
+
+    used: set[int] = set()
+    for slot in slots:
+        stretch = set(range(slot * _RNG_SLOT_SPAN, (slot + 1) * _RNG_SLOT_SPAN))
+        assert used.isdisjoint(stretch), f"slot {slot} overlaps another row's draws"
+        used |= stretch
+    assert max(used) < window
+
+
+def test_block_rows_take_consecutive_slots() -> None:
+    """A block sampler's K rows per request start at ``slot`` and take one slot each."""
+    meta = types.SimpleNamespace(
+        request_seeds=torch.tensor([5, 7, 9]),
+        request_offsets=torch.tensor([0, 1000, BASE]),
+    )
+    seeds, offsets = SpecWorkerBase._rng_state_per_request(None, meta, 1, 3, repeat=3, slot=4)
+    assert seeds.tolist() == [7, 7, 7, 9, 9, 9]
+    assert offsets.tolist() == [
+        base + (4 + row) * _RNG_SLOT_SPAN for base in (1000, BASE) for row in range(3)
+    ]
 
 
 # --- all-greedy batches ------------------------------------------------------
+
+ROWS = MAX_DRAFT_LEN + 1
 
 
 def _populated(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
     """Run _populate_request_rng_state on CPU buffers and return request_offsets."""
     for request in requests:
         request.sampling_config = types.SimpleNamespace(seed=request.seed)
-    normalized = [(0.0, 0, 1.0, 0.0, WINDOW) for _ in requests]
+    normalized = [(0.0, 0, 1.0, 0.0, ROWS) for _ in requests]
     meta._populate_request_rng_state(requests, normalized)
     return meta.request_offsets[: len(requests)].tolist()
 
@@ -202,17 +269,19 @@ def test_all_greedy_batch_skips_the_copies_but_advances_the_windows() -> None:
     # batch gets the same offsets it would have had.
     meta = _meta()
     sentinel = -5
-    meta.temperatures = torch.ones(8 * WINDOW)
+    meta.temperatures = torch.ones(8 * ROWS)
     meta.request_seeds = torch.full((8,), sentinel, dtype=torch.int64)
     meta.request_offsets = torch.full((8,), sentinel, dtype=torch.int64)
-    meta.seeds = torch.full((8 * WINDOW,), sentinel, dtype=torch.int64)
-    meta.offsets = torch.full((8 * WINDOW,), sentinel, dtype=torch.int64)
+    meta.seeds = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
+    meta.offsets = torch.full((8 * ROWS,), sentinel, dtype=torch.int64)
 
     meta.is_all_greedy_sample = True
     assert _populated(meta, [_request(0, seed=7), _request(1)]) == [sentinel, sentinel]
     assert meta.seeds.eq(sentinel).all() and meta.offsets.eq(sentinel).all()
 
     meta.is_all_greedy_sample = False
-    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [WINDOW, WINDOW]
+    assert _populated(meta, [_request(0, seed=7), _request(1)]) == [WINDOW, BASE + WINDOW]
     assert meta.request_seeds[:2].tolist() == [7, DEFAULT_SAMPLING_SEED]
-    assert meta.offsets[: 2 * WINDOW].tolist() == [WINDOW] * (2 * WINDOW)
+    assert meta.offsets[: 2 * ROWS].tolist() == [
+        base + row * _RNG_SLOT_SPAN for base in (WINDOW, BASE + WINDOW) for row in range(ROWS)
+    ]
