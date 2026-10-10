@@ -352,6 +352,17 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
 
 
 class KVCacheManager(BaseResourceManager):
+    # Declared on the class so it is present even when an instance is built
+    # without running __init__ (which overwrites it from the spec config);
+    # prepare_resources reads it on such test-built instances. Zero disables
+    # the spec recompute tail.
+    _spec_recompute_tail: int = 0
+    # Whether this manager also holds recurrent (conv/SSM) state. Hybrid
+    # Mamba/GDN managers override this: a reused request's recurrent slot
+    # already summarizes the matched prefix, so a partial rewind would apply
+    # the tokens between the rewind target and the matched length to that
+    # state a second time. Only a full re-prefill (rewind target 0) is safe.
+    _has_recurrent_state: bool = False
 
     def __init__(
         self,
@@ -501,6 +512,26 @@ class KVCacheManager(BaseResourceManager):
         # Import here to avoid circular imports
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        # Recompute tail for hidden-state-conditioned drafters with block
+        # reuse: rewind cache-hit context requests so at least this many
+        # prompt tokens pass through the target forward. Resolved from the
+        # draft model config (or set explicitly) on the spec config; see
+        # _maybe_rewind_reused_context for why drafters need it. None means
+        # the auto value never resolved; recompute everything rather than
+        # silently serving a degraded drafter.
+        tail = getattr(spec_config, "context_recompute_tail", 0)
+        tail = -1 if tail is None else int(tail)
+        if tail > 0 and self._has_recurrent_state:
+            # A partial rewind double-applies the rewound span to the
+            # recurrent state (see _has_recurrent_state); only a full
+            # re-prefill rebuilds that state from scratch.
+            logger.warning(
+                "context_recompute_tail > 0 is unsupported on recurrent-state "
+                "cache managers: a partial rewind would apply reused tokens "
+                "to the conv/SSM state twice. Forcing a full re-prefill "
+                "(context_recompute_tail=-1).")
+            tail = -1
+        self._spec_recompute_tail = tail
         # Kept so prepare_resources can re-validate the per-step token budget
         # (the forward-pass scratch size enforced in _prepare_tp_inputs).
         self.max_num_tokens = max_num_tokens
@@ -1170,10 +1201,15 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
+                    # A capacity-only connector cannot reach these blocks, so
+                    # gathering their indices would be for nothing.
+                    if (self.kv_connector_manager is not None
+                            and not self.kv_connector_manager.capacity_only):
                         block_ids = self.get_cache_indices(req)
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
+
+                self._maybe_apply_spec_recompute_tail(batch_llm_requests)
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
@@ -1199,6 +1235,98 @@ class KVCacheManager(BaseResourceManager):
         # `context_requests_last_chunk` in `add_sequence` due to KV cache
         # reuse, so we rebuild the context request lists here.
         scheduled_batch.reset_context_requests()
+
+    def _maybe_apply_spec_recompute_tail(
+            self, batch_llm_requests: List[LlmRequest]) -> None:
+        """Gate and apply the spec-recompute rewind for this batch.
+
+        Target manager only: the rewind restores target-forward coverage for
+        drafter hidden-state capture, and the V2 counterpart
+        (_spec_recompute_claim_limit) no-ops on draft pools for the same
+        reason. The gates run here rather than in __init__ because
+        enable_chunked_prefill and the final attention windows are settled
+        after construction.
+        """
+        if not self._spec_recompute_tail or self.is_draft:
+            return
+        # Entries <= 0 are not attention windows (recurrent-state sentinels).
+        if any(window is not None and 0 < window < self.max_seq_len
+               for window in self.max_attention_window_vec):
+            # The rewind reattaches no blocks, and a sliding-window layer
+            # detaches out-of-window blocks (placeholder page-list slots), so
+            # a rewound cursor would read and write spans with no pages behind
+            # them. Unlike the V2 manager, which caps the reuse claim instead
+            # of rewinding, this manager cannot shorten the C++ match.
+            logger.warning(
+                "context_recompute_tail is unsupported with sliding-window "
+                "attention layers on this KV cache manager: a rewound cursor "
+                "would cross spans whose out-of-window blocks are detached. "
+                "Disabling the spec recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        if not self.enable_chunked_prefill:
+            # The scheduler admits cache-hit requests at their reuse-discounted
+            # token cost, so a rewound batch can exceed max_num_tokens; only
+            # chunked prefill (fit_token_budget) can shrink it back under the
+            # budget.
+            logger.warning("context_recompute_tail requires chunked prefill: "
+                           "without it a batch of rewound cache-hit requests "
+                           "can exceed max_num_tokens. Disabling the spec "
+                           "recompute tail.")
+            self._spec_recompute_tail = 0
+            return
+        self._maybe_rewind_reused_context(batch_llm_requests)
+
+    def _maybe_rewind_reused_context(
+            self, batch_llm_requests: List[LlmRequest]) -> None:
+        """Recompute a tail of reused prompt tokens for drafter capture.
+
+        Hidden-state-conditioned drafters (DFlash/DSpark) capture target
+        hidden states only for tokens that physically pass through a target
+        forward. A prefix-cache hit skips the reused tokens, so the drafter's
+        cross-attention context never sees them and acceptance length drops
+        (measured -15% AL at a 100% prefix-hit rate). Rewinding the context
+        position after ``add_sequence_batch`` keeps the blocks reused (the
+        allocation/dedup win stays, and the recompute rewrites them with
+        identical values) while restoring the drafter's inputs.
+
+        Driven by the spec config's ``context_recompute_tail`` (0 — off — by
+        default; an explicit None resolves from the draft model config): each
+        cache-hit request is rewound
+        so at least that many prompt tokens (block-aligned start) are
+        recomputed. For a drafter whose context attention is windowed (e.g.
+        DFlash2 ``swa_window_size``), a tail of the window size reproduces
+        the no-reuse drafter inputs exactly. ``-1`` forces a full re-prefill
+        (needed for non-windowed drafters). Chunked prefill is required and
+        enforced by the caller: the micro-batch scheduler admits on estimated
+        reuse, and ``fit_token_budget`` needs chunking to trim the extra
+        compute tokens when a batch of rewound requests exceeds
+        ``max_num_tokens``.
+        """
+        tail = self._spec_recompute_tail
+        tokens_per_block = self.tokens_per_block
+        for req in batch_llm_requests:
+            prepopulated = req.prepopulated_prompt_len
+            if prepopulated <= 0:
+                continue
+            prompt_len = req.prompt_len
+            if tail < 0:
+                target = 0
+            else:
+                if prompt_len - prepopulated >= tail:
+                    continue  # already recomputing at least the tail
+                target = max(0, (prompt_len - tail) // tokens_per_block *
+                             tokens_per_block)
+            if target >= prepopulated:
+                continue
+            # Reuses the C++ setter so context_current_position and the
+            # first-chunk invariant (position == prepopulated) stay coherent.
+            req.set_prepopulated_prompt_len(target, tokens_per_block)
+            if target == 0:
+                # The C++ setter only advances the position for nonzero
+                # values; a full re-prefill must reset it explicitly.
+                req.context_current_position = 0
+            req.context_chunk_size = prompt_len - target
 
     def report_batch_to_connector(self,
                                   scheduled_batch: ScheduledRequests) -> None:

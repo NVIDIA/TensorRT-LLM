@@ -1602,6 +1602,7 @@ class _ContextRequest:
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
+    is_generation_only_request: bool = False
     is_dummy_request: bool = False
     return_perf_metrics: bool = False
     context_current_position: int = 0
@@ -1927,6 +1928,58 @@ def test_preempt_request_gives_a_full_pool_back_its_pages(
             _free_if_active(manager, request)
 
 
+def test_preemption_waits_for_a_connector_still_reading_the_victims_pages(
+    manager: KVCacheManagerV2,
+) -> None:
+    """A connector save in flight defers the release rather than racing it.
+
+    The pages are the source of those reads, so handing them to another request
+    now would let it overwrite the bytes mid-transfer and publish them under a
+    hash that says they are the victim's prefix.
+    """
+    victim = _ContextRequest(1, list(range(MAX_SEQ_LEN)), MAX_SEQ_LEN, "conv-1")
+    victim.py_num_connector_matched_tokens = TOKENS_PER_BLOCK
+
+    # Reports a save in flight for every request, which is the only answer the
+    # deferral depends on; the rest is what free_resources reaches for.
+    connector = SimpleNamespace(
+        request_finished=lambda *_args: True,
+        capacity_only=False,
+        prefix_reservations_enabled=False,
+        # Declining keeps the allocation hooks out of a preemption test.
+        should_add_sequence=lambda _req: False,
+        release_unstarted_prefix_loads=lambda _req: None,
+        has_pending_load=lambda _req: False,
+        release_prefix_reservation=lambda _req: None,
+        reset_request_state=lambda _req: None,
+    )
+    manager.kv_connector_manager = connector
+    try:
+        assert _try_run_context(manager, victim)
+
+        assert manager.preempt_request(victim) is False
+        assert manager.has_pending_preemption()
+        assert manager.is_preemption_pending(victim)
+        # Nothing was given up yet: the victim still owns its cache.
+        assert manager.is_request_active(victim.py_request_id)
+        assert victim.py_num_connector_matched_tokens == TOKENS_PER_BLOCK
+
+        assert manager.try_complete_preemption(victim) is True
+        assert not manager.has_pending_preemption()
+        assert not manager.is_preemption_pending(victim)
+        assert not manager.is_request_active(victim.py_request_id)
+        assert victim.py_request_id not in manager.kv_cache_map
+        assert victim.py_num_connector_matched_tokens == 0
+
+        # How the executor tells a preempted request apart from a finished one
+        # in the connector's get_finished output, so a second call must not
+        # claim this one again.
+        assert manager.try_complete_preemption(victim) is False
+    finally:
+        manager.kv_connector_manager = None
+        _free_if_active(manager, victim)
+
+
 def test_per_conversation_policy_delays_commit_until_last_context_chunk(
     manager: KVCacheManagerV2,
 ) -> None:
@@ -2126,6 +2179,199 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
 
+def _make_spec_recompute_manager(
+    policy: str,
+    context_recompute_tail: int,
+    manager_cls: type[KVCacheManagerV2] = KVCacheManagerV2,
+    max_attention_window: list[int] | None = None,
+) -> KVCacheManagerV2:
+    """A real target manager with a DFlash spec config carrying the tail."""
+    spec = DFlashDecodingConfig(
+        max_draft_len=4,
+        speculative_model="draft",
+        context_recompute_tail=context_recompute_tail,
+    )
+    return manager_cls(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_gpu_total_bytes=16 << 20,
+            max_attention_window=max_attention_window or [MAX_SEQ_LEN],
+            max_util_for_resume=1.0,
+            block_reuse_config=BlockReuseConfig(policy=policy),
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=2,
+        head_dim=64,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=spec,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+
+
+def _drive_context_chunks(
+    manager: KVCacheManagerV2,
+    batch: ScheduledRequests,
+    request: _ContextRequest,
+) -> None:
+    """Finish *request* in single-block chunks, updating resources per chunk."""
+    position = request.context_current_position
+    while position < request.prompt_len:
+        chunk = min(TOKENS_PER_BLOCK, request.prompt_len - position)
+        assert manager.resize_context(request, num_tokens=chunk)
+        position += chunk
+        request.context_current_position = position
+        request.context_remaining_length = request.prompt_len - position
+        _update_context_resources(manager, batch)
+        request.is_first_context_chunk = False
+
+
+@pytest.mark.parametrize("policy", ["per_request", "per_conversation"])
+def test_deferred_commit_policies_disable_the_spec_recompute_tail(policy: str) -> None:
+    """The recompute tail is enforced by capping the fresh radix claim, and
+    per_conversation reuse resumes the prior turn's cache without a claim to
+    cap; the deferred-commit protocols are unvalidated with the tail. The
+    manager disables the recompute tail for these policies at construction; a
+    chunked cache-hit request must then run start to finish with its cursor
+    held at the matched prefix.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = _make_spec_recompute_manager(policy, context_recompute_tail=-1)
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == 0
+
+        _run_context(manager, request_a)
+        assert manager.kv_cache_map[request_a.py_request_id].num_committed_tokens > 0
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        matched = request_b.prepopulated_prompt_len
+        assert matched > 0, "the second identical prompt must take a prefix hit"
+        # No rewind: the cursor stays at the matched prefix, so no later chunk
+        # can ask the history marker to decrease.
+        assert request_b.context_current_position == matched
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+def test_all_reusable_policy_recomputes_the_tail_across_chunks() -> None:
+    """Under ALL_REUSABLE the recompute tail stays enabled: a cache-hit
+    request's reuse claim is capped (here to a full re-prefill, which claims
+    nothing), the cursor starts at the claim, and chunked prefill completes
+    and commits the recomputed blocks.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    manager = _make_spec_recompute_manager("all_reusable", context_recompute_tail=-1)
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == -1
+
+        _run_context(manager, request_a)
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        # A full re-prefill claims no reuse, so every prompt token passes the
+        # target forward and every page it touches is freshly allocated.
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == 0
+        assert request_b.context_current_position == 0
+        assert request_b.prepopulated_prompt_len == 0
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+def test_windowed_layers_keep_the_recompute_tail_claim_capped() -> None:
+    """Sliding-window regression for the claim cap: a match is claimed only up
+    to the recompute boundary, so the pages the recomputed span needs (the
+    window at the CLAIMED endpoint) are materialized by the core. The old
+    rewind approach claimed the full match and walked the cursor back, where a
+    windowed life cycle has no pages behind the out-of-window span.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    window = 2 * TOKENS_PER_BLOCK  # 8 < MAX_SEQ_LEN: a real sliding window
+    manager = _make_spec_recompute_manager(
+        "all_reusable",
+        context_recompute_tail=6,
+        max_attention_window=[window],
+    )
+    prompt = list(range(MAX_SEQ_LEN))
+    request_a = _ContextRequest(1, prompt, MAX_SEQ_LEN, "conv-1", use_conversation_params=False)
+    request_b = _ContextRequest(2, prompt, MAX_SEQ_LEN, "conv-2", use_conversation_params=False)
+    try:
+        assert manager._spec_recompute_tail == 6
+
+        _run_context(manager, request_a)
+
+        batch = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        committed = manager.kv_cache_map[request_b.py_request_id].num_committed_tokens
+        # floor_block(16 - 6) = 8: the claim stops at the recompute boundary
+        # (and the window at that endpoint is fully materialized), instead of
+        # claiming the full match and rewinding below its live window.
+        assert committed == 8
+        assert request_b.context_current_position == committed
+        assert request_b.prepopulated_prompt_len == committed
+
+        _drive_context_chunks(manager, batch, request_b)
+        assert manager.kv_cache_map[request_b.py_request_id].num_committed_tokens == MAX_SEQ_LEN
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("has_recurrent_state,expected_tail", [(False, 6), (True, -1)])
+def test_recurrent_state_managers_allow_only_a_full_reprefill_tail(
+    has_recurrent_state: bool, expected_tail: int
+) -> None:
+    """Managers with recurrent state coerce a positive tail to a full
+    re-prefill; attention-only managers keep it. Conservative: a capped claim
+    is equivalent to a shorter match, but the hybrid snapshot/commit protocol
+    is unvalidated with a partial tail.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+
+    class _RecurrentManager(KVCacheManagerV2):
+        _has_recurrent_state = True
+
+    manager_cls = _RecurrentManager if has_recurrent_state else KVCacheManagerV2
+    manager = _make_spec_recompute_manager(
+        "all_reusable", context_recompute_tail=6, manager_cls=manager_cls
+    )
+    try:
+        assert manager._spec_recompute_tail == expected_tail
+    finally:
+        manager.shutdown()
+
+
 def test_live_storage_stats_use_the_manager_api() -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2224,6 +2470,7 @@ def _make_admission_manager(
     manager.is_draft = False
     manager.kv_cache_type = CacheType.SELF
     manager.is_estimating_kv_cache = is_estimating_kv_cache
+    manager._spec_recompute_tail = 0
     manager._disagg_transfer_overwrites_whole_cached_prefix = lambda: overwrites_whole_cached_prefix
     manager._resume_and_restore = lambda _req_id, _kv_cache: True
     kv_cache = SimpleNamespace(

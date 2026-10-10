@@ -600,18 +600,12 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         checkpoint_path = Path(checkpoint_dir)
         extra_attrs: Dict[str, Any] = {}
 
-        # LTX-2 stage-2 paths (spatial_upsampler_path, distilled_lora_path)
-        # are surfaced to the LTX2 pipeline consumer via extra_attrs. The
-        # resolved pipeline_config kwarg comes from PipelineLoader after
-        # registry validation; when from_pretrained is called directly
-        # (mostly in unit tests), fall back to the raw VisualGenArgs dict.
+        # Preserve all registry-resolved model options, including False and None.
+        # Direct callers may supply the raw dictionary without a PipelineLoader.
         resolved_pipeline_config = kwargs.pop("pipeline_config", None)
         if resolved_pipeline_config is None:
             resolved_pipeline_config = dict(args.pipeline_config) if args else {}
-        for key in ("spatial_upsampler_path", "distilled_lora_path"):
-            value = resolved_pipeline_config.get(key)
-            if value:
-                extra_attrs[key] = value
+        extra_attrs.update(resolved_pipeline_config)
 
         h3_workflow = resolved_pipeline_config.get("workflow")
         if h3_workflow is not None:

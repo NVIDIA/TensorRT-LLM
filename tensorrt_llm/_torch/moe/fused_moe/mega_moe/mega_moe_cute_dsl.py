@@ -867,13 +867,27 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
         os.environ["MASTER_ADDR"] = str(host)
         os.environ["MASTER_PORT"] = str(port)
+        # The executor already bound this rank's device before the model was
+        # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
+        # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
+        # node) and would move only the layers built after this point, so bind
+        # NCCL to the current device instead of selecting one.
+        device_id = None
+        if torch.cuda.is_available():
+            device_id = torch.device("cuda", torch.cuda.current_device())
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
+            f"device={device_id}, "
             f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
             f"EP rendezvous."
         )
-        dist.init_process_group(backend="cuda:nccl,cpu:gloo", rank=rank, world_size=world)
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:gloo",
+            rank=rank,
+            world_size=world,
+            device_id=device_id,
+        )
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
