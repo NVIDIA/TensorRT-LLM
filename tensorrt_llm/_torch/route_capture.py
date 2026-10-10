@@ -460,7 +460,7 @@ class RouteCapture:
         self._had_context = False
         for req in scheduled_batch.context_requests:
             # A context request contributes ONLY this forward's chunk of prompt
-            # tokens, mirroring model_engine._prepare_inputs:
+            # tokens, mirroring DecoderRunner._prepare_inputs:
             #   begin = req.context_current_position
             #   toks  = req.get_tokens(0)[begin : begin + req.context_chunk_size]
             # Using py_prompt_len (the full prompt) misattributes every row under

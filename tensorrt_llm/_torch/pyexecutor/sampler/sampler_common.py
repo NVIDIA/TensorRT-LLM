@@ -59,7 +59,7 @@ class SampleType(Enum):
 
     A batch is dispatched to the simplest tier its requests allow:
 
-    - ``FAST``: only temperature / top_p / top_k. Sampled inside the graph.
+    - ``FAST``: only temperature / top_p / top_k / min_p. Sampled inside the graph.
     - ``FULL``: every sampling feature. Sampled eagerly after the forward.
 
     There is deliberately no argmax tier: greedy sampling is two cheap kernels,
@@ -235,21 +235,12 @@ def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
 
 @dataclass(kw_only=True)
 class RequestSeeds:
-    """Per-request RNG state for user-specified ``SamplingParams.seed``.
+    """Per-row Philox state for one sampling call.
 
-    Threaded alongside ``generator`` through the strategy impls and handed to
-    the flashinfer sampling ops as their stateless ``seed``/``offset`` pair.
-    Both tensors are int64 and 1-D with one entry per group row, matching the
-    per-row shape flashinfer documents; a row whose request did not specify a
-    seed carries the sampler's global seed, so unseeded requests keep their
-    previous behavior only in distribution, not token-for-token (see
-    ``_SeedManager``).
-
-    NB: the pinned flashinfer (0.6.15) accepts these per-row tensors but reads
-    only element 0 of each, separating rows by ``blockIdx.x``. The per-row
-    values below are therefore carried end-to-end but not yet honored for
-    batched requests; see the warning on ``_SeedManager`` and the upstream fix
-    at https://github.com/flashinfer-ai/flashinfer/pull/2345.
+    Handed to the fused sampling op as its ``seed``/``offset`` pair. Both
+    tensors are int64 and 1-D with one entry per group row. A row whose request
+    did not specify a seed carries the sampler's global seed and an offset from
+    the shared unseeded counter (see ``_SeedManager``).
 
     ``offset`` advances per request per sampling step, which is what makes a
     seeded request's stream depend on how many tokens it has drawn rather than

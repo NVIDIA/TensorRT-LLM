@@ -35,12 +35,23 @@ from typing import (
 # From _common.py
 NDEBUG: Final[int]
 DEFAULT_BEAM_INDEX: Final[BeamIndex]
+BAD_PAGE_INDEX: Final[int]
+GPU_LEVEL: Final[CacheLevel]
+CACHE_LEVEL1: Final[CacheLevel]
 
 class CorruptedError(Exception):
-    """Raised by every public entry point once a broken invariant has been recorded.
+    """Raised by every public entry point once a broken invariant has been recorded."""
 
-    Only the C++ backend has the latch that raises this; the pure-Python backend never does.
-    """
+class CuError(Exception):
+    """A CUDA driver call failed; carries the driver's own status code."""
+
+    error_code: Any
+
+class LogicError(Exception):
+    """An operation violates the cache or batch's state and usage requirements."""
+
+class OutOfMemoryError(Exception): ...
+class OutOfPagesError(OutOfMemoryError): ...
 
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
@@ -56,12 +67,36 @@ class CacheTier(enum.IntEnum):
     HOST_MEM = 1
     DISK = 2
 
+class PageStatus(enum.Enum):
+    LOCKED = enum.auto()
+    HELD = enum.auto()
+    DROPPABLE = enum.auto()
+
 class PageIndexMode(enum.IntEnum):
     SHARED = 0
     PER_LAYER = 1
 
 LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
+
+class AttnLifeCycle:
+    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
+
+    @staticmethod
+    def make(
+        window_size: int | None,
+        num_sink_tokens: int | None,
+        tokens_per_block: int,
+        is_sparse: bool = False,
+    ) -> "AttnLifeCycle": ...
+    @property
+    def window_size(self) -> int | None: ...
+    @property
+    def num_sink_blocks(self) -> int: ...
+    @property
+    def is_sparse(self) -> bool: ...
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
+
 CacheLevel = NewType("CacheLevel", int)
 TokenId = NewType("TokenId", int)
 TokenIdExt = Union[TokenId, bytes]
@@ -73,6 +108,7 @@ class ReuseScope(NamedTuple):
     lora_id: int | None = None
     salt: int | None = None
 
+SlidingWindowSize: TypeAlias = int | None
 LayerId = NewType("LayerId", int)
 CudaStream = NewType("CudaStream", int)
 BeamIndex = NewType("BeamIndex", int)
@@ -187,6 +223,7 @@ class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
+    is_sparse: bool = False
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -208,6 +245,8 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    beam_width: int = 1
+    prompt_length: int = 0
 
 @dataclass(slots=True)
 class BatchDesc:
@@ -237,6 +276,7 @@ class KVCacheManagerConfig:
     commit_min_snapshot: bool = False
     enable_stats: bool = True
     text_only: bool = False
+    enable_partial_commit: bool = True
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -295,6 +335,47 @@ class KVCacheEvent:
     attention_dp_rank: int | None = None
     layer_group_id: int | None = None
 
+class StreamingBlockStoredData:
+    @property
+    def lora_id(self) -> int | None: ...
+    @property
+    def block_hashes(self) -> list[int]: ...
+    @property
+    def parent_block_hash(self) -> int | None: ...
+    @property
+    def token_ids(self) -> list[EventTokenId]: ...
+    @property
+    def mm_keys(self) -> list[list[MmKey]]: ...
+
+class StreamingBlockRemovedData:
+    @property
+    def block_hashes(self) -> list[int]: ...
+
+class StreamingEventStats:
+    @property
+    def stored_blocks(self) -> int: ...
+    @property
+    def removed_blocks(self) -> int: ...
+    @property
+    def partial_blocks_suppressed(self) -> int: ...
+    @property
+    def non_target_life_cycles_ignored(self) -> int: ...
+    @property
+    def dropped_events(self) -> int: ...
+
+class StreamingEventSink:
+    def __init__(
+        self,
+        max_entries: int = ...,
+        mm_token_id_offset: int | None = None,
+    ) -> None: ...
+    def set_target_life_cycle(self, life_cycle_id: int) -> None: ...
+    def drain_iteration_events(
+        self,
+    ) -> list[StreamingBlockStoredData | StreamingBlockRemovedData]: ...
+    @property
+    def stats(self) -> StreamingEventStats: ...
+
 class KVCacheEventManager:
     def __init__(
         self,
@@ -334,7 +415,7 @@ class KVCacheEventManager:
     def flush_iteration_events(self) -> None: ...
     def get_latest_events(self, timeout_ms: float | None = None) -> list[KVCacheEvent]: ...
 
-# Backend-neutral key builders (native C++ under the C++ backend, pure-Python otherwise).
+# Native key builders, shared with the radix tree so routing hashes match the engine's.
 def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
@@ -353,7 +434,86 @@ class _Status(enum.Enum):
     SUSPENDED = enum.auto()
     CLOSED = enum.auto()
 
+KvCacheStatus: TypeAlias = _Status
+
 IndexSeq = array.array[int] | memoryview[int]
+
+class BatchDeviceArray:
+    """DLPack view of int32 CUDA metadata; the view keeps its allocation alive.
+
+    Treat these arrays as read-only. Convert with ``torch.from_dlpack(view)`` or
+    another DLPack consumer, after publication. Holding a view does not pin KV pages.
+    """
+
+    def __dlpack_device__(self) -> tuple[int, int]: ...
+    def __dlpack__(self, stream: int | None = None, **kwargs: object) -> object: ...
+
+class Batch:
+    """Stable request slots and raw GPU metadata across all layer groups.
+
+    Membership is non-owning and exclusive. Closing/destroying a request removes
+    it; closing/destroying the batch detaches live requests without closing them.
+    Use the requests' owning thread. ``publish`` runs outside graph capture after
+    mutations; ``wait_ready`` orders readers after upload and KV-copy completion.
+    Call ``record_read`` after submitting reads (or graph replay), before mutating,
+    suspending, removing, or closing requests. Device addresses remain stable.
+    """
+
+    def __init__(
+        self, manager: KVCacheManager, max_rows: int, max_blocks: int, max_beam_width: int = 1
+    ) -> None:
+        """Allocate fixed device tables. Currently supports beam width 1."""
+    @property
+    def max_rows(self) -> int: ...
+    @property
+    def max_blocks(self) -> int: ...
+    @property
+    def max_beam_width(self) -> int: ...
+    @property
+    def num_layer_groups(self) -> int: ...
+    @property
+    def dirty_rows(self) -> list[int]: ...
+    def add(self, kv_cache: _KVCache, row: int | None = None) -> int: ...
+    def remove(self, kv_cache: _KVCache) -> None: ...
+    def close(self) -> None: ...
+    def publish(self, cuda_stream: CudaStream) -> list[int]:
+        """Queue dirty rows and return their slots. Failures stay dirty; retry before reading."""
+    def wait_ready(self, cuda_stream: CudaStream) -> None: ...
+    def record_read(self, cuda_stream: CudaStream) -> None: ...
+    def resize(
+        self,
+        capacities: list[int | None],
+        history_lengths: list[int | None],
+        cuda_stream: CudaStream,
+    ) -> list[bool | None]:
+        """Lists use stable row slots. Return per-request success (None for holes), then publish."""
+    def page_table(self, layer_group_id: LayerGroupId) -> BatchDeviceArray:
+        """Raw slot IDs, shape [max_rows, max_beam_width, max_blocks]; preserves BAD_PAGE_INDEX."""
+    def num_blocks(self, layer_group_id: LayerGroupId) -> BatchDeviceArray:
+        """Eligible history counts, shape [max_rows, max_beam_width]; zero for inactive/dense rows."""
+
+class PageStorageSnapshot:
+    """Copied host metadata for one layer group and beam; indices are raw mixed-tier slot IDs.
+
+    ``BAD_PAGE_INDEX`` is preserved and has no cache level. Eligibility is zero for
+    prefill, inactive requests and dense groups. Readiness events are retained internally;
+    they do not pin storage. Use indices only while the request is active and the version
+    matches. Submit reads on the request's stream, or call ``record_page_storage_read``
+    after submission on another stream, before mutating or closing the request.
+    """
+
+    @property
+    def version(self) -> int: ...
+    @property
+    def row(self) -> int | None: ...
+    @property
+    def base_page_indices(self) -> list[int]: ...
+    @property
+    def cache_levels(self) -> list[CacheLevel | None]: ...
+    @property
+    def eligible_history_blocks(self) -> int: ...
+    def wait_ready(self, cuda_stream: CudaStream) -> None:
+        """Queue copy-completion waits without blocking the CPU or uploading metadata."""
 
 class _KVCache:
     Status: ClassVar[Type[_Status]]
@@ -386,7 +546,15 @@ class _KVCache:
     @property
     def beam_width(self) -> BeamIndex: ...
     @beam_width.setter
-    def beam_width(self, beam_width: BeamIndex) -> None: ...
+    def beam_width(self, beam_width: BeamIndex) -> None:
+        """Expand before the first generation step, never during generation (C++ only).
+
+        First resume the cache and materialize prompt storage (or prepare synthetic
+        warmup state). Full prompt blocks are shared; the writable tail, including
+        preallocated blocks, is copied using the boundary set by
+        ``expected_prompt_length`` at cache creation.
+        """
+        ...
     def get_base_page_indices(
         self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
     ) -> IndexSeq: ...
@@ -423,7 +591,28 @@ class _KVCache:
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None: ...
-    def resume(self, cuda_stream: CudaStream | None = None) -> bool: ...
+    def resume(
+        self, cuda_stream: CudaStream | None = None, is_decoding: bool | None = None
+    ) -> bool: ...
+    def enter_decode(self) -> bool: ...
+    @property
+    def is_decoding(self) -> bool: ...
+    @property
+    def page_storage_version(self) -> int: ...
+    @property
+    def page_storage_dirty(self) -> bool: ...
+    @property
+    def page_storage_row(self) -> int | None: ...
+    def bind_page_storage_row(self, row: int | None) -> None:
+        """Bind a standalone consumer's row; Batch members must use Batch.add/remove."""
+    def acknowledge_page_storage(self, version: int) -> bool:
+        """Clear dirty state after all groups/beams use this same version, if it is still current."""
+    def get_page_storage_snapshot(
+        self, layer_group_id: LayerGroupId, beam_id: BeamIndex = DEFAULT_BEAM_INDEX
+    ) -> PageStorageSnapshot:
+        """Read the final state under the manager lock, including after a failed operation's rollback."""
+    def record_page_storage_read(self, cuda_stream: CudaStream) -> None:
+        """Join submitted reader work into the active request's stream before any cache mutation."""
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> ScratchDesc | None: ...
     @property
@@ -547,13 +736,14 @@ class KVCacheManager:
     def __init__(
         self,
         config: KVCacheManagerConfig,
-        event_manager: KVCacheEventManager | None = None,
-        # C++ backend only; the pure-Python backend does not accept this parameter.
+        event_manager: KVCacheEventManager | StreamingEventSink | None = None,
         cold_page_codec: IKvCacheColdPageCodec | None = None,
     ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
+    def is_sparse(self, layer_id: LayerId, data_role: DataRole) -> bool:
+        """Whether the named buffer uses sparse attention. Rejects unknown buffers."""
     def get_mem_pool_base_address(
         self, layer_id: LayerId, data_role: DataRole, index_mode: PageIndexMode | None = None
     ) -> MemAddress: ...
@@ -572,7 +762,17 @@ class KVCacheManager:
         expected_prompt_length: int | None = None,
         text_only: bool | None = None,
         enable_request_stats: bool = False,
-    ) -> _KVCache: ...
+    ) -> _KVCache:
+        """Create a suspended cache with a prefill-to-generation boundary.
+
+        On the C++ backend, ``expected_prompt_length`` also determines which full
+        prompt blocks are shared by beams. Pass the actual full prompt length for
+        beam search if ``input_tokens`` is absent or shortened for reuse matching.
+        It defaults to the non-empty input length; without either value, the beam
+        sharing boundary is zero and the statistics boundary is unset. When set,
+        it also marks generation-phase allocation stats.
+        """
+        ...
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -626,6 +826,8 @@ class KVCacheManager:
     def allow_seq_rebasing(self) -> bool: ...
     @property
     def enable_partial_match(self) -> bool: ...
+    @property
+    def enable_partial_commit(self) -> bool: ...
     def supports_index_mode(self, mode: PageIndexMode) -> bool | None: ...
     @property
     def num_layers(self) -> int: ...
@@ -645,3 +847,6 @@ class KVCacheManager:
     def need_adjustment(self) -> bool: ...
     @property
     def commit_min_snapshot(self) -> bool: ...
+
+def exact_div(x: int, y: int) -> int: ...
+def typed_range(*args: int) -> range: ...

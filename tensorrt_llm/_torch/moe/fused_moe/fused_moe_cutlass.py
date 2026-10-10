@@ -115,6 +115,7 @@ class CutlassFusedMoE(MoEImplBase):
         }),
         alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
         limit=ActivationParamShape.PER_EXPERT_TENSOR,
+        clamp_after_silu=True,
     )
 
     # Quantization algorithm support table for can_implement()
@@ -277,6 +278,16 @@ class CutlassFusedMoE(MoEImplBase):
                 f"CutlassFusedMoE {algo_name} requires {dtype_list}, "
                 f"got {p.dtype_act}")
 
+        # SM120 FP8 block scales use the Triton fallback below rather than the
+        # CUTLASS adaptor, and that fallback has no clamp-order parameter.
+        if (p.clamp_after_silu and quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+                and sm_version == 120):
+            return _reject(
+                MoERejectReason.ACTIVATION_UNSUPPORTED,
+                "CutlassFusedMoE SM120 FP8 block scales use a Triton fallback "
+                "that does not implement post-SiLU clamping",
+            )
+
         # Routed-expert MoE LoRA supports unquantized fp16/bf16 or per-tensor FP8 only.
         if d.moe_lora_enabled and quant_algo not in (None, QuantAlgo.FP8):
             return _reject(
@@ -370,6 +381,8 @@ class CutlassFusedMoE(MoEImplBase):
         self.tune_max_num_tokens = min(
             self.moe_max_num_tokens,
             16384 * self.num_slots // routing_method.get_experts_per_token(),
+            # A forward can never present more tokens than this.
+            default_moe_max_num_tokens,
         )
         self.has_been_profiled = False
         self.has_been_profiled_min_latency = False
@@ -1039,6 +1052,7 @@ class CutlassFusedMoE(MoEImplBase):
             swiglu_alpha=self.act_alpha,
             swiglu_beta=self.act_beta,
             swiglu_limit=self.act_clamp,
+            swiglu_clamp_after_silu=self.act_clamp_after_silu,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
@@ -1090,31 +1104,18 @@ class CutlassFusedMoE(MoEImplBase):
         *,
         enable_alltoall: bool,
     ) -> torch.Tensor:
-        """W4A16 fallback for NVFP4 MoE on SM<100. Active-mask dequant into
-        a static [E_total, N, K] bf16 workspace, then bf16 fused_moe with the
-        original (global) token_selected_experts. CUDA-graph capturable.
-
-        ``enable_alltoall`` has no default because it picks the expert-id remap
-        below, and either default is silently wrong for half the callers: the
-        ids are local after an alltoall dispatch and global otherwise, so a
-        wrong guess shifts every id by ``slot_start`` without failing.
-        """
+        """Dequantize active NVFP4 slots before executing the BF16/FP16 MoE."""
         assert isinstance(self.quant_method, W4A16NVFP4CutlassFusedMoEMethod)
 
         if output_dtype is None:
             output_dtype = x.dtype
 
-        # Same EP id convention as the FP8 path above: global ids (or
-        # ``local_n``-padded under alltoall). Clamp to local range so the
-        # active-mask scatter is in-bounds; non-local tokens collapse onto a
-        # boundary expert (1 extra dequant/rank). ``trtllm.fused_moe`` below
-        # still gets the original global ids -- it does its own remap.
+        # Dispatch preserves global slot IDs. Dequantization indexes local
+        # weights; clamp padding and non-local IDs to keep its scatter in bounds.
+        # The MoE kernel receives the global IDs and filters non-local work.
         local_n = self.expert_size_per_partition
-        if enable_alltoall:
-            local_ids = token_selected_experts.clamp(0, local_n - 1)
-        else:
-            local_ids = (token_selected_experts - self.slot_start).clamp(
-                0, local_n - 1)
+        local_ids = (token_selected_experts - self.slot_start).clamp(
+            0, local_n - 1)
 
         w3_w1_hp, w2_hp = self.quant_method.dequant_active_experts_to_hp(
             self, local_ids, output_dtype)
@@ -1135,6 +1136,7 @@ class CutlassFusedMoE(MoEImplBase):
             swiglu_alpha=self.act_alpha,
             swiglu_beta=self.act_beta,
             swiglu_limit=self.act_clamp,
+            swiglu_clamp_after_silu=self.act_clamp_after_silu,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,

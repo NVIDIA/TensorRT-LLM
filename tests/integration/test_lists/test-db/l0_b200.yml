@@ -87,7 +87,7 @@ l0_b200:
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp
-  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0] # nvbugs 5300551
+  - disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction # nvbugs 5300551
   - test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Nano-9B-v2-nvfp4-NVIDIA-Nemotron-Nano-9B-v2-NVFP4]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
@@ -100,7 +100,10 @@ l0_b200:
   #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
   #               rebind mpi4py's serializer at import time, which applies process-wide on
   #               every stage that collects them, including where the tests themselves skip.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py
+  # Keep cold-JIT MSA coverage out of the 60-minute attention aggregate.
+  # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/compilation
   - unittest/_torch/debugger
@@ -127,6 +130,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modeling/test_kimi_kda_fp8_packed_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_cache_soundness.py
+  - unittest/_torch/modules/kimi_kda/test_kda_buf_cache_bounded.py
   - unittest/_torch/modules/kimi_kda/test_kimi_k3_mamba_metadata.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
@@ -161,6 +165,8 @@ l0_b200:
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_swiglu_2in.py
+  - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
@@ -302,12 +308,18 @@ l0_b200:
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
-  - unittest/_torch/visual_gen/test_attention_cute_dsl_sol_attn.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_kernels.py
+  - unittest/_torch/visual_gen/sparse_attention/vsa/test_vsa_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_parity.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor.py
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_predictor_kernels.py
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_cudnn.py
   - unittest/_torch/visual_gen/test_attention_integration.py
+  - unittest/_torch/visual_gen/test_trtllm_attention_metadata.py
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
@@ -342,8 +354,11 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_action.py
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
+  - unittest/_torch/visual_gen/test_cosmos3_fp8.py
+  - unittest/_torch/visual_gen/test_cosmos3_step_precision_component.py
   - unittest/_torch/visual_gen/test_cosmos3_transfer.py
   - unittest/_torch/visual_gen/test_control_kernels.py
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_transformer.py
@@ -369,6 +384,7 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_public_visual_gen_api_smoke TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]

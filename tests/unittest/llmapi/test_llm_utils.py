@@ -77,10 +77,31 @@ def test_cached_model_loader_returns_model_dir(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_attached_model_loader_resolves_hub_on_nonzero_device(
+        monkeypatch, tmp_path):
+    args = TorchLlmArgs(model="example/model", gpus_per_node=1)
+    loader = CachedModelLoader(args, is_attached_frontend=True)
+    model = SimpleNamespace(is_hub_model=True,
+                            model_name="example/model",
+                            model_dir=None)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 1)
+    download = MagicMock(return_value=tmp_path)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
+                        download)
+
+    assert loader._download_hf_model_if_needed(
+        model, revision="pinned-revision") == tmp_path
+    assert model.model_dir == tmp_path
+    download.assert_called_once_with("example/model", "pinned-revision")
+
+
+@pytest.mark.cpu_only
 def test_torch_llm_build_passes_model_dir_to_executor(monkeypatch, tmp_path):
     llm = object.__new__(_TorchLLM)
     llm.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
     llm.mpi_session = None
+    llm._is_attached_frontend = False
     llm._executor_cls = MagicMock()
 
     monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)
@@ -113,6 +134,7 @@ def test_multimodal_encoder_build_passes_none_to_executor(
     encoder = object.__new__(MultimodalEncoder)
     encoder.args = TorchLlmArgs(model=str(tmp_path), gpus_per_node=1)
     encoder.mpi_session = None
+    encoder._is_attached_frontend = False
     encoder._executor_cls = MagicMock()
 
     monkeypatch.setattr(CachedModelLoader, "__call__", lambda self: tmp_path)

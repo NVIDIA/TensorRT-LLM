@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
@@ -22,7 +22,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     CustomAttentionMask,
 )
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm.logger import logger
 
 from .interface import Fmha, FmhaPhase
 
@@ -45,6 +47,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
         "timestep",  # consumed by sparse prediction before FMHA dispatch
+        "sparse_attn_phase",  # host-resolved sparse phase, consumed before FMHA dispatch
     }
 )
 
@@ -59,6 +62,155 @@ class FallbackFmha(Fmha):
 
     supports_skip_correction = True
     supports_workspace_reclamation = True
+
+    # Head sizes whose fused context FMHA kernel is proven absent for at
+    # least one KV cache dtype, per SM version. This is a blocklist of
+    # proven-problematic cells, not a support matrix: sourced from the
+    # runtime fallback warning "Fall back to unfused MHA ... headSize = 64
+    # ... in sm_103" and the silent-wrong-answer incident it caused. Inside
+    # a blocklisted cell, the ``fused_context_fmha_kernel_exists`` native
+    # lookup decides per KV dtype and page size which configurations the
+    # running build can serve. Outside it, no probe runs: the lookup is a
+    # fixed-convention diagnostic (dense causal Q_PAGED_KV, Q and output
+    # precision inferred from the KV precision) that does not model every
+    # configuration the op can run (MLA, cross attention, 16-bit context
+    # math over an FP8 KV cache), so probing unconditionally would refuse
+    # configurations the op serves correctly. The authoritative
+    # exact-parameter check is the op-level refusal in
+    # thop/attentionOp.cpp's get_attention_op; this gate exists to move the
+    # proven-problematic cells to FMHA dispatch with a remedial error.
+    # Extend as further combinations are proven.
+    CONTEXT_FMHA_ABSENT_HEAD_DIMS: ClassVar[dict[int, tuple[int, ...]]] = {
+        103: (64,),
+    }
+
+    @classmethod
+    def _validate_paged_context_fmha(cls, metadata: "TrtllmAttentionMetadata") -> None:
+        """Refuse paged-context FMHA when no kernel exists for this config.
+
+        When ``use_paged_context_fmha`` is enabled but the fused context FMHA
+        kernel is absent for this SM/head-size combination, attentionOp.cpp
+        falls back to unfused MHA whose context path builds K/V from the
+        current chunk only: the cached prefix is DROPPED from attention and
+        then OVERWRITTEN by the chunk's write-back. Any request with a
+        non-zero cached length -- block reuse, partial reuse, chunked
+        prefill, speculative draft tokens -- returns a plausible wrong answer
+        with no error. That fallback happens inside the C++ op, after
+        selection has already committed to this library, so ``_is_supported``
+        calls this check for every batch with a context phase and raises
+        instead of returning False: this library is last in the registry, so
+        the raise skips no other library, and it replaces the silent wrong
+        answer with an error naming the cause and the remedy.
+
+        Inside a blocklisted (SM, head_dim) cell the decision is per KV
+        dtype and page size, made by asking the build what it contains via
+        the ``fused_context_fmha_kernel_exists`` native lookup: a present
+        kernel admits the configuration, an absent one refuses it. Nothing
+        about kernel presence is hand-maintained. The check fails closed
+        wherever it cannot be made: managers without a ``dtype`` or
+        ``tokens_per_block`` attribute, and builds whose bindings predate
+        the lookup (which also predate the op-level refusal, so passing
+        unverified would reintroduce the silent corruption there).
+        """
+        if not metadata.use_paged_context_fmha:
+            return
+        manager = metadata.kv_cache_manager
+        head_dim = getattr(manager, "head_dim", None) if manager else None
+        if head_dim is None:
+            return
+        head_dims = head_dim if isinstance(head_dim, list) else [head_dim]
+        sm = get_sm_version()
+        absent = [dim for dim in head_dims if dim in cls.CONTEXT_FMHA_ABSENT_HEAD_DIMS.get(sm, ())]
+        if not absent:
+            return
+        kv_dtype = getattr(manager, "dtype", None)
+        tokens_per_block = getattr(manager, "tokens_per_block", None)
+        if kv_dtype is not None and tokens_per_block is not None:
+            kernel_exists = getattr(thop, "fused_context_fmha_kernel_exists", None)
+            if kernel_exists is None:
+                raise RuntimeError(
+                    f"Paged-context FMHA with head_dim {absent} on SM {sm} "
+                    f"requires confirming the fused context kernel against "
+                    f"this build via the fused_context_fmha_kernel_exists "
+                    f"lookup, but this build's bindings predate it. Bindings "
+                    f"that old also predate the op-level paged-context "
+                    f"refusal, so an unverified pass would risk a silent "
+                    f"fall back to unfused MHA that corrupts the cached "
+                    f"prefix; the configuration stays refused. Rebuild the "
+                    f"bindings, or use the FlashInfer attention backend."
+                )
+            # Probe with every output precision the op can pair with this
+            # KV precision. For an FP8 KV cache the op quantizes Q to FP8
+            # but keeps dataTypeOut at the activation dtype (BF16/FP16)
+            # unless FP8 attention output is enabled, and neither the
+            # activation dtype nor that per-module flag is visible to this
+            # metadata-only check, so one present variant admits the
+            # cell; if the variant the model actually needs is the absent
+            # one, the exact-parameter refusal in get_attention_op still
+            # raises. An NVFP4 KV cache is read by the FP8-output kernels,
+            # and a 16-bit KV cache runs matched output, mirroring the
+            # binding's probe convention in
+            # test_context_fmha_kernel_presence.py. Dtypes the lookup does
+            # not model report absent, so they stay refused.
+            if kv_dtype == DataType.FP8:
+                probe_output_dtypes = (DataType.BF16, DataType.HALF, DataType.FP8)
+            elif kv_dtype == DataType.NVFP4:
+                probe_output_dtypes = (DataType.FP8,)
+            else:
+                probe_output_dtypes = (kv_dtype,)
+            if all(
+                any(
+                    kernel_exists(
+                        head_size=dim,
+                        kv_cache_dtype=kv_dtype,
+                        tokens_per_block=tokens_per_block,
+                        output_dtype=probe_output_dtype,
+                    )
+                    for probe_output_dtype in probe_output_dtypes
+                )
+                for dim in absent
+            ):
+                logger.info_once(
+                    f"Paged-context FMHA enabled for head_dim {absent} on SM "
+                    f"{sm}: this build's fused context FMHA kernel is present "
+                    f"for KV cache dtype {kv_dtype} at {tokens_per_block} "
+                    f"tokens per block.",
+                    key=f"paged_context_fmha_present_{sm}_{absent}_{kv_dtype}_{tokens_per_block}",
+                )
+                return
+            cause = (
+                f"this build contains no fused context FMHA kernel for that "
+                f"combination with KV cache dtype {kv_dtype} at "
+                f"{tokens_per_block} tokens per block"
+            )
+        else:
+            missing = [
+                name
+                for name, value in (("dtype", kv_dtype), ("tokens_per_block", tokens_per_block))
+                if value is None
+            ]
+            cause = (
+                f"the KV cache manager exposes no {' or '.join(missing)}, so "
+                f"the fused context FMHA kernel cannot be confirmed present "
+                f"(the check fails closed)"
+            )
+        features = [
+            name
+            for name in ("chunked_prefill", "cache_reuse", "has_speculative_draft_tokens")
+            if getattr(metadata.runtime_features, name, False)
+        ]
+        raise RuntimeError(
+            f"{'/'.join(features)} requires attending to cached KV during "
+            f"the context phase (use_paged_context_fmha), but for head_dim "
+            f"{absent} on SM {sm} {cause}. The unfused fallback silently "
+            f"drops and corrupts the cached prefix, producing plausible "
+            f"wrong answers, so the configuration is refused. A build whose "
+            f"--cuda_architectures does not name SM {sm} carries no kernels "
+            f"for SM {sm} at all and lands here too; check the architecture "
+            f"list first. Otherwise use the FlashInfer attention backend, or "
+            f"disable KV block reuse, chunked prefill and speculative "
+            f"decoding for this model."
+        )
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -81,6 +233,17 @@ class FallbackFmha(Fmha):
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
         del k, v, phase
+        # A context phase served by the thop op with use_paged_context_fmha
+        # enabled would silently corrupt the cached prefix wherever the fused
+        # context kernel is absent. Raise rather than return False: no
+        # library follows this one, and the error names the cause and the
+        # remedy instead of the generic no-library message. Generation-only
+        # batches never run the context path, so they pass; whether a batch
+        # has a context phase is part of the FMHA cache key
+        # (``context_batch_size``), so the admitted result cannot be reused
+        # for a context batch.
+        if metadata.num_contexts > 0:
+            self._validate_paged_context_fmha(metadata)
         # A verify group may straddle a page boundary onto two CP ranks, so
         # its KV ownership is per-token. The fused thop path cannot express
         # that: its spec-dec mask and the per-sequence helix_is_inactive_rank
@@ -195,6 +358,7 @@ class FallbackFmha(Fmha):
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
             sage_attn_qk_int8=forward_args.sage_attn_qk_int8,
+            sage_attn_smooth_k=forward_args.sage_attn_smooth_k,
             is_fused_qkv=forward_args.is_fused_qkv,
             update_kv_cache=forward_args.update_kv_cache,
             cross_kv=forward_args.cross_kv,

@@ -40,6 +40,7 @@ def temp_extra_llm_api_options_file(request):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.6,
+                "use_kv_cache_manager_v2": True,
             },
             "max_num_tokens": 16384,  # for pytorch backend
             # NOTE: This is for video support.

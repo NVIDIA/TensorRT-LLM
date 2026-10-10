@@ -1038,7 +1038,7 @@ class MultimodalModelMixin:
             embedding_layer=self.text_embedding_layer,
             extra_embeds=extra_embeds,
             # `text_token_indices` / `mm_token_indices` are pre-computed by the
-            # executor (see model_engine._prepare_inputs) and must reach
+            # executor (see DecoderRunner._prepare_inputs) and must reach
             # `fuse_input_embeds` to (a) preserve the active-chunk subset
             # contract when MM rows are a subset of visible MM tokens and
             # (b) avoid the torch.where host sync inside
@@ -1709,7 +1709,7 @@ def _dispatch_cross_iter_prefetch(
             # the (possibly new) dict to each request so the next iteration's
             # `_prepare_inputs` sees the cached embedding stamped below. Mirrors
             # the reassignment at the canonical to_device call site in
-            # model_engine._prepare_inputs.
+            # DecoderRunner._prepare_inputs.
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
 

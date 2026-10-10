@@ -52,6 +52,7 @@ def _manager() -> Mock:
     manager = Mock(spec=KVCacheManagerV2)
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
+    manager._pending_preemption = {}
     manager.is_draft = False
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False
@@ -70,6 +71,9 @@ def _request(manager: Mock, request_id: int = 1) -> SimpleNamespace:
         prompt_len=128,
         py_draft_tokens=[],
         is_first_context_chunk=True,
+        # Read by _prepare_disagg_gen_resources to latch cached_tokens; a real
+        # request always carries it (C++ read-only property).
+        prepopulated_prompt_len=0,
     )
     manager.kv_cache_map[request_id] = Mock(capacity=0)
     manager.kv_cache_map[request_id].resize.return_value = True

@@ -14,7 +14,8 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
-| `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
+| `ExaoneMoeForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
+| `ExaoneMoeForCausalLM`               | K-EXAONE 2.0                       | `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B`         |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma4ForConditionalGeneration`     | Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it`, `google/gemma-4-31B-it` |
 | `Gemma4UnifiedForConditionalGeneration` | Gemma 4 12B Unified (encoder-free) | `google/gemma-4-12B`, `google/gemma-4-12B-it`              |
@@ -224,7 +225,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | **Wan 2.1** | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **Wan 2.2** | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | **LTX-2** | Yes | Yes | No | Yes | Yes | No | No | Yes | Yes | Yes | Yes | No |
-| **MiniMax-H3** | Yes | Yes | No | No | No | No | No | Yes | Yes | No | No | No |
+| **MiniMax-H3** | Yes | Yes | No | No | Yes | Yes | No | Yes | Yes | No | No | No |
 | **Qwen-Image** | Yes | Yes | Yes | Yes | Yes | No | Yes | Yes | Yes | Yes | Yes | No |
 | **Qwen-Image-Layered** | Yes | No | No | No | No | No | Yes | Yes | Yes | No | No | No |
 | **Qwen-Image-Edit-2511** | Yes | Yes | No | Yes | No | No | Yes | Yes | Yes | No | No | No |

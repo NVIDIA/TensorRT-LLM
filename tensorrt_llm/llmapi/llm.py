@@ -56,7 +56,8 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
+                       TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
@@ -425,6 +426,8 @@ class BaseLLM:
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
 
+            self._capture_usage_startup(llm_args=self.args)
+
         except Exception as e:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
@@ -432,6 +435,18 @@ class BaseLLM:
 
         finally:
             logger.set_level(log_level)  # restore the log level
+
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so that no other deployment loads
+        # this connector's package, which pulls in its worker and scheduler.
+        # The registry names every preset's module without importing any of
+        # them, and tolerates an absent connector config.
+        from .._torch.pyexecutor.connectors.registry import uses_connector
+        if uses_connector(self.args.kv_connector_config, "mooncake-store"):
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
@@ -451,9 +466,9 @@ class BaseLLM:
 
         # Attached serving frontends connect to an already-running worker:
         # they must not spawn an MPI session (see GenerationExecutor.create).
-        is_attached_frontend = os.getenv(
+        self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
-        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
+        if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -507,6 +522,21 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _capture_usage_startup(self, **context: Any) -> None:
+        """Capture optional startup context without affecting model construction."""
+        try:
+            from tensorrt_llm.usage import record_llm_initialization_attempt
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+
+            args = context.get("llm_args")
+            if (args is not None and hasattr(self, "_usage_attempt_tracked")
+                    and not self._usage_attempt_tracked):
+                self._usage_attempt_tracked = record_llm_initialization_attempt(
+                    args.telemetry_config)
+            _capture_startup_context(**context)
+        except Exception as exc:
+            logger.debug("Usage telemetry startup capture failed: %s", exc)
 
     def _start_usage_reporting(self) -> None:
         """Start the success-only initial report and heartbeat stream."""
@@ -1174,8 +1204,11 @@ class BaseLLM:
             batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
             copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
-            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
-                inputs_embeds (reward models).
+            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:
+                token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).
+                With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor
+                value runs that call eagerly.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
@@ -1264,16 +1297,10 @@ class BaseLLM:
         # Build inputs dict — common + model-specific kwargs.
         # Filter keys that are supplied by EncoderRunner itself to avoid
         # "multiple values for keyword argument" errors.
-        _RESERVED_KEYS = {
-            'input_ids',
-            'seq_lens',
-            'multi_item_part_lens',
-            'attn_metadata',
-            'return_context_logits',
-        }
         filtered_kwargs = {
             k: v
-            for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
+            for k, v in model_kwargs.items()
+            if k not in ENCODER_RUNNER_MANAGED_INPUTS
         }
 
         forward_inputs = {
@@ -1607,8 +1634,10 @@ class BaseLLM:
                 "(Router Replay): routes are not captured otherwise.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session)
+        model_loader = CachedModelLoader(
+            self.args,
+            mpi_session=self.mpi_session,
+            is_attached_frontend=self._is_attached_frontend)
         self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
@@ -1823,13 +1852,13 @@ class _TorchLLM(BaseLLM):
         self._usage_lifecycle_active = False
         self._usage_lifecycle_lock = threading.Lock()
         telemetry_config = kwargs.get("telemetry_config")
-        usage_attempt_tracked = False
+        self._usage_attempt_tracked = False
         _usage = None
         # Telemetry: Track before construction so initialization failures are visible.
         try:
             import tensorrt_llm.usage as _usage
 
-            usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                 telemetry_config,
                 default_usage_context=_usage.UsageContext.LLM_CLASS.value,
             )
@@ -1838,6 +1867,13 @@ class _TorchLLM(BaseLLM):
                 f"Usage telemetry initialization tracking failed: {exc}")
 
         backend = kwargs.pop("backend", "pytorch")
+
+        if self._usage_attempt_tracked:
+            self._capture_usage_startup(
+                requested=dict(kwargs,
+                               backend=backend,
+                               tensor_parallel_size=tensor_parallel_size,
+                               dtype=dtype))
 
         try:
             # Validate that only arguments supported by the PyTorch backend are passed.
@@ -1855,18 +1891,18 @@ class _TorchLLM(BaseLLM):
                              backend=backend,
                              **kwargs)
         except Exception:
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked and _usage is not None:
                 _usage.record_llm_initialization_failure()
             raise
 
         try:
-            if not usage_attempt_tracked and _usage is not None:
-                usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+            if not self._usage_attempt_tracked and _usage is not None:
+                self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
                     getattr(self.args, 'telemetry_config', None),
                     default_usage_context=_usage.UsageContext.LLM_CLASS.value,
                 )
 
-            if usage_attempt_tracked:
+            if self._usage_attempt_tracked:
                 self._usage_lifecycle_active = _usage.record_llm_initialized()
         except Exception as exc:
             logger.debug(f"Usage telemetry completion tracking failed: {exc}")
@@ -1954,6 +1990,7 @@ class _TorchLLM(BaseLLM):
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._capture_usage_startup(pretrained_config=self._hf_model_config)
         self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(

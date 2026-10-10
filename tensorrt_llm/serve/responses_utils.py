@@ -540,9 +540,14 @@ def _construct_harmony_messages(
             # User passes in a a tool call request and its output. We need
             # to add the tool call request to prev_outputs so that the
             # parse_response_input can find the tool call request when
-            # parsing the tool call output.
+            # parsing the tool call output. Depending on the pydantic version,
+            # the request union may hand the call over as a plain dict.
             if isinstance(input_msg, ResponseFunctionToolCall):
                 prev_outputs.append(input_msg)
+            elif isinstance(input_msg,
+                            dict) and input_msg.get("type") == "function_call":
+                prev_outputs.append(
+                    ResponseFunctionToolCall.model_validate(input_msg))
     return messages
 
 
@@ -2613,45 +2618,6 @@ class ResponsesStreamingProcessor:
             raise RuntimeError("Failed to generate streaming events")
 
         return [self._send_event(event) for event in event_generator]
-
-
-async def process_streaming_events(
-    generator,
-    request: ResponsesRequest,
-    sampling_params: SamplingParams,
-    model_name: str,
-    conversation_store: ConversationHistoryStore,
-    enable_store: bool = False,
-    use_harmony: bool = True,
-    create_time: Optional[int] = None,
-    reasoning_parser: Optional[str] = None,
-    tool_parser: Optional[str] = None,
-) -> AsyncGenerator[str, None]:
-    streaming_processor = ResponsesStreamingProcessor(
-        request=request,
-        sampling_params=sampling_params,
-        model_name=model_name,
-        create_time=create_time,
-        conversation_store=conversation_store,
-        enable_store=enable_store,
-        use_harmony=use_harmony,
-        reasoning_parser=reasoning_parser,
-        tool_parser=tool_parser,
-    )
-
-    initial_responses = streaming_processor.get_initial_responses()
-    for initial_response in initial_responses:
-        yield initial_response
-
-    async for res in generator:
-        final_res = res
-        events = streaming_processor.process_single_output(res)
-        for event in events:
-            yield event
-
-    final_response = await streaming_processor.get_final_response(final_res)
-
-    yield final_response
 
 
 class ServerArrivalTimeMiddleware:

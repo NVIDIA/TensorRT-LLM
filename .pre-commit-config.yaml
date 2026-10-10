@@ -9,7 +9,6 @@ common-files: &common_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -28,7 +27,6 @@ common-files: &common_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -684,7 +682,6 @@ common-files: &common_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -765,7 +762,6 @@ legacy-files: &legacy_files |
         .devcontainer/make_env.py |
         .github/scripts/label_community_user.py |
         .github/scripts/pr_checklist_check.py |
-        cpp/conanfile.py |
         cpp/kernels/fmha_v2/conftest.py |
         cpp/kernels/fmha_v2/fmha_test.py |
         cpp/kernels/fmha_v2/setup.py |
@@ -784,7 +780,6 @@ legacy-files: &legacy_files |
         cpp/kernels/xqa/gen_cpp_header.py |
         cpp/kernels/xqa/gen_cubins.py |
         cpp/kernels/xqa/ref.py |
-        cpp/libnuma_conan.py |
         cpp/micro_benchmarks/gen-moe-benchmark-file.py |
         cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py |
         cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py |
@@ -1440,7 +1435,6 @@ legacy-files: &legacy_files |
         tests/unittest/llmapi/apps/_test_openai_responses.py |
         tests/unittest/llmapi/apps/_test_openai_tool_call.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py |
-        tests/unittest/llmapi/apps/_test_trtllm_serve_duplicated_args.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_example.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_lora.py |
         tests/unittest/llmapi/apps/_test_trtllm_serve_multimodal_benchmark.py |
@@ -1612,6 +1606,18 @@ repos:
         additional_dependencies: [PyYAML]
         always_run: true
         pass_filenames: false
+    -   id: openengine-bindings-check
+        name: verify generated OpenEngine bindings are in sync
+        entry: python scripts/generate_openengine_protos.py --check
+        language: python
+        # Keep these pins in sync with requirements-build-openengine.txt.
+        additional_dependencies:
+        - grpcio==1.67.1
+        - grpcio-tools==1.67.1
+        - protobuf==5.27.2
+        - setuptools==84.0.0
+        pass_filenames: false
+        files: ^(requirements\.txt|requirements-build-openengine\.txt|scripts/generate_openengine_protos\.py|tensorrt_llm/grpc/openengine/(proto/|_generated/))
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py

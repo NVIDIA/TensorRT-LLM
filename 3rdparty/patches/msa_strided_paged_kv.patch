@@ -4085,10 +4085,95 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..b1fd74b 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
-@@ -199,6 +199,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -1,4 +1,5 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ # SPDX-License-Identifier: MIT
+ 
+ """Per-variant lazy JIT compilation for FMHA varlen kernels.
+@@ -6,11 +7,12 @@
+ Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
+ independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
+ 
+-To recompile after kernel changes: scripts/clear_fmha_cache.sh
++Source changes select a new cache automatically; prewarm using the same sources.
+ """
+ 
+ import itertools
+ import fcntl
++import hashlib
+ import logging
+ import os
+ import shutil
+@@ -22,11 +24,18 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Kernel sources and CUTLASS headers are shipped inside the package directory
++# so that JIT compilation works from both editable and wheel installs.
++_PACKAGE_DIR = Path(__file__).resolve().parent
++_FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
++_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
++_CUTLASS_INCLUDE = _CUTLASS_DIR / "include"
++_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
++
++
+ def _compute_cache_base():
+     explicit = os.environ.get("MINFER_FMHA_CACHE_DIR")
+-    if explicit:
+-        return Path(explicit)
+-    base = Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
++    base = Path(explicit) if explicit else Path(os.path.expanduser("~/.cache/minfer/fmha_sm100"))
+     # Different build configs get separate cache dirs to avoid conflicts
+     suffix = ""
+     if os.environ.get("GPU_TRACE") is not None:
+@@ -35,9 +44,27 @@
+         suffix += "_sm_timing"
+     if os.environ.get("FMHA_GMEM_CHECK") is not None:
+         suffix += "_gmem_check"
+-    if suffix:
++    if suffix and not explicit:
+         base = base.parent / (base.name + suffix)
+-    return base
++
++    # Hash templates, bindings and headers together; jit.py also covers changes
++    # to dispatch and compiler flags. Use relative names so installs share keys.
++    digest = hashlib.sha256()
++    sources = sorted(path for path in _FMHA_VARLEN_DIR.rglob("*") if path.is_file())
++    sources.append(_PACKAGE_DIR / "jit.py")
++    for path in sources:
++        content = path.read_bytes()
++        digest.update(path.relative_to(_PACKAGE_DIR).as_posix().encode() + b"\0")
++        digest.update(len(content).to_bytes(8, "little"))
++        digest.update(content)
++    # An explicit cache root must also isolate instrumented and normal binaries.
++    digest.update(suffix.encode())
++    cache_base = base / ("sources_sha256_" + digest.hexdigest())
++    logger.info(
++        "Using FMHA cache %s (source/build fingerprint; changed sources or "
++        "diagnostic modes require recompilation)", cache_base,
++    )
++    return cache_base
+ 
+ 
+ CACHE_BASE = _compute_cache_base()
+@@ -55,13 +82,6 @@
+     os.close(fd)
+ 
+ 
+-# Kernel sources and CUTLASS headers are shipped inside the package directory
+-# so that JIT compilation works from both editable and wheel installs.
+-_PACKAGE_DIR = Path(__file__).resolve().parent
+-_FMHA_VARLEN_DIR = _PACKAGE_DIR / "csrc"
+-_CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
+-_CUTLASS_INCLUDE = _CUTLASS_DIR / "include"
+-_CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
+ 
+ _PACK_FACTORS = [1,2,4,6,8,16]
+ # _PACK_FACTORS = [1, 6]
+@@ -199,6 +219,9 @@
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -4335,3 +4420,576 @@ index 306b416..a564d47 100644
          out.copy_(result)
          return out, None
      return result, None
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_params.h b/python/fmha_sm100/csrc/fmha_sm100_params.h
+--- a/python/fmha_sm100/csrc/fmha_sm100_params.h
++++ b/python/fmha_sm100/csrc/fmha_sm100_params.h
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -54,6 +55,9 @@
+   int max_k_tiles;
+   int* kv_block_indexes_ptr;
+   int kv_block_num;
++  int64_t kv_block_stride_n = 0;
++  int64_t kv_block_stride_h = 0;
++  int64_t kv_block_stride_b = 1;
+   int pack_factor = 1;
+   int h_r_original = 0;
+   int q_stride_n_original = 0;
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+--- a/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_variant_run.cu.jinja
+@@ -1,9 +1,11 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ // Auto-generated per-variant FMHA run binding: {{ variant_name }}
+ #include "fmha_sm100_params.h"
+ #include "tvm_ffi_utils.h"
++#include <climits>
+ #include <cmath>
+ #include <cstdlib>
+ 
+@@ -121,9 +123,25 @@
+   params.max_score_ptr = max_score_ptr;
+   params.max_k_tiles = static_cast<int>(max_k_tiles);
+   params.kv_block_indexes_ptr = kv_block_indexes_ptr;
+-  params.kv_block_num = maybe_kv_block_indexes.has_value()
+-                            ? static_cast<int>(maybe_kv_block_indexes.value().size(2))
+-                            : 0;
++  params.kv_block_num = 0;
++  if (maybe_kv_block_indexes.has_value()) {
++    auto const selector = maybe_kv_block_indexes.value();
++    CHECK_CUDA(selector);
++    CHECK_DEVICE(selector, q);
++    CHECK_INPUT_TYPE(selector, dl_int32);
++    CHECK_DIM(3, selector);
++    TVM_FFI_ICHECK_EQ(selector.size(0), q.size(0));
++    TVM_FFI_ICHECK_EQ(selector.size(1), num_kv_heads);
++    TVM_FFI_ICHECK_GT(selector.size(2), 0);
++    TVM_FFI_ICHECK_LE(selector.size(2), INT_MAX);
++    for (int dim = 0; dim < 3; ++dim) {
++      TVM_FFI_ICHECK_GE(selector.stride(dim), 0);
++    }
++    params.kv_block_num = static_cast<int>(selector.size(2));
++    params.kv_block_stride_n = selector.stride(0);
++    params.kv_block_stride_h = selector.stride(1);
++    params.kv_block_stride_b = selector.stride(2);
++  }
+ 
+   params.pack_factor = static_cast<int>(pack_factor);
+   params.num_ctas = static_cast<int>(packed_work_range.size(0));
+@@ -187,10 +205,18 @@
+       ? static_cast<int>(maybe_max_score.value().size(0)
+                          * maybe_max_score.value().size(1)
+                          * maybe_max_score.value().size(2)) : 0;
+-  params.gmem_bounds.kv_block_indexes_numel = maybe_kv_block_indexes.has_value()
+-      ? static_cast<int>(maybe_kv_block_indexes.value().size(0)
+-                         * maybe_kv_block_indexes.value().size(1)
+-                         * maybe_kv_block_indexes.value().size(2)) : 0;
++  // A sliced head-major view can span more storage than its logical numel.
++  // TensorView::data_ptr() already includes the view's storage offset.
++  params.gmem_bounds.kv_block_indexes_span = 0;
++  if (maybe_kv_block_indexes.has_value()) {
++    auto const selector = maybe_kv_block_indexes.value();
++    if (selector.size(0) > 0 && selector.size(1) > 0) {
++      params.gmem_bounds.kv_block_indexes_span =
++          (selector.size(0) - 1) * params.kv_block_stride_n
++          + (selector.size(1) - 1) * params.kv_block_stride_h
++          + (selector.size(2) - 1) * params.kv_block_stride_b + 1;
++    }
++  }
+   params.gmem_bounds.split_kv_size = maybe_kv_tile_begin_indices.has_value()
+       ? static_cast<int>(maybe_kv_tile_begin_indices.value().size(0)) : 0;
+   params.gmem_bounds.qo_offsets_size = maybe_qo_offsets.has_value()
+diff --git a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+--- a/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
++++ b/python/fmha_sm100/csrc/fmha_sm100_inst.jinja
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ // Auto-generated FMHA variant: {{ variant_name }}
+@@ -28,12 +29,14 @@
+ 
+   using ActiveMaskType = {% if pack_factor is defined and pack_factor > 1 %}PackedCausalMask<{{ pack_factor }}>{% else %}CausalMask{% endif %};
+ 
+-  return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
++  auto run = [&](auto unit_selector_column) {
++    return run_fmha_fwd<cutlass_type_in, cutlass_type_out, int32_t,
+                       TileShapeQK, TileShapePV, ActiveMaskType, FmhaThreadShape,
+                       /*IsSplitKV=*/{{ is_split_kv }},
+                       /*SingleSoftmaxWarpGroup=*/{{ single_wg }},
+                       {{ page_size }},
+-                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }}>(
++                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
++                      decltype(unit_selector_column)::value>(
+       p.workspace_buffer_ptr,
+       static_cast<cutlass_type_in*>(p.q_ptr),
+       static_cast<cutlass_type_in*>(p.k_ptr),
+@@ -58,6 +61,7 @@
+       p.kv_indices_ptr, p.kv_page_indptr_ptr, p.total_page_num,
+       p.max_score_ptr, p.max_k_tiles,
+       p.kv_block_indexes_ptr, p.kv_block_num,
++      p.kv_block_stride_n, p.kv_block_stride_h, p.kv_block_stride_b,
+       p.pack_factor, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
+       flashinfer::PackGQAUnpackParams{p.max_score_direct_ptr, p.total_qo_len_orig,
+                                       p.o_direct_ptr, p.num_qo_heads_orig,
+@@ -67,4 +71,13 @@
+ #endif
+                                       },
+       p.num_ctas);
++  };
++{% if dtype_in == "nv_bfloat16" and page_size > 0 and sparse_mode == "Sparse" %}
++  // The selector layout is host metadata; capture the matching existing kernel
++  // specialization without copying the selector or reading device values.
++  if (p.kv_block_stride_b == 1) {
++    return run(cute::true_type{});
++  }
++{% endif %}
++  return run(cute::false_type{});
+ }
+diff --git a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+--- a/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
++++ b/python/fmha_sm100/csrc/include/fmha_cutlass_sm100.cuh
+@@ -1,3 +1,4 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ /*
+  * Copyright (c) 2023 by FlashInfer team.
+  *
+@@ -57,7 +58,8 @@
+           bool SingleSoftmaxWarpGroup = false,
+           int KVPageSize = -1,
+           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
+-              cutlass::fmha::collective::SparseAttnMode::Off>
++              cutlass::fmha::collective::SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct FwdRunner {
+   using Element = DTypeIn;
+   using ElementAccumulatorQK = float;
+@@ -89,7 +91,8 @@
+ 
+   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
+-      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
++      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode,
++      UnitSelectorColumn>;
+   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
+   using Operation =
+@@ -126,6 +129,9 @@
+                          int max_k_tiles = 0,
+                          int* kv_block_indexes = nullptr,
+                          int kv_block_num = 0,
++                         int64_t kv_block_stride_n = 0,
++                         int64_t kv_block_stride_h = 0,
++                         int64_t kv_block_stride_b = 1,
+                          int pack_factor = 1,
+                          int q_stride_n_original = 0,
+                          int q_stride_h_original = 0,
+@@ -223,11 +229,28 @@
+       if constexpr (IsSplitKV) {
+         arguments = {
+           {problem_shape,
+-           {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
+-#ifdef FMHA_GMEM_BOUNDS_CHECK
+-             pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
+-#endif
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+             sm_scale, q_scale, k_scale, v_scale, o_scale},
+            epi_args,
+            sched_args,
+@@ -244,11 +267,28 @@
+       } else {
+         arguments = {
+           problem_shape,
+-          {{q, layout_Q, k, layout_K, v, layout_V, kv_indices, kv_page_indptr, kv_block_indexes, kv_block_num,
+-#ifdef FMHA_GMEM_BOUNDS_CHECK
+-            pack_gqa.gmem_bounds.kv_page_indptr_size, pack_gqa.gmem_bounds.kv_indices_size, pack_gqa.gmem_bounds.kv_block_indexes_numel,
+-#endif
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = kv_indices,
++             .kv_page_indptr = kv_page_indptr,
++             .kv_block_indexes = kv_block_indexes,
++             .kv_block_num = kv_block_num,
++             .kv_block_stride_n = kv_block_stride_n,
++             .kv_block_stride_h = kv_block_stride_h,
++             .kv_block_stride_b = kv_block_stride_b,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = pack_gqa.gmem_bounds.kv_page_indptr_size,
++             .kv_indices_size = pack_gqa.gmem_bounds.kv_indices_size,
++             .kv_block_indexes_span = pack_gqa.gmem_bounds.kv_block_indexes_span,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+            sm_scale, q_scale, k_scale, v_scale, o_scale},
+           epi_args,
+           sched_args,
+@@ -343,8 +383,28 @@
+       if constexpr (IsSplitKV) {
+         arguments = {
+           {problem_shape,
+-           {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-             pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++           {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+             sm_scale, q_scale, k_scale, v_scale, o_scale},
+            epi_args,
+            sched_args,
+@@ -361,8 +421,28 @@
+       } else {
+         arguments = {
+           problem_shape,
+-          {{q, layout_Q, k, layout_K, v, layout_V, nullptr, nullptr, nullptr, 0,
+-            pack_factor, q_stride_n_original, q_stride_h_original, h_r_original},
++          {{.ptr_Q = q,
++             .layout_Q = layout_Q,
++             .ptr_K = k,
++             .layout_K = layout_K,
++             .ptr_V = v,
++             .layout_V = layout_V,
++             .kv_indices = nullptr,
++             .kv_page_indptr = nullptr,
++             .kv_block_indexes = nullptr,
++             .kv_block_num = 0,
++             .kv_block_stride_n = 0,
++             .kv_block_stride_h = 0,
++             .kv_block_stride_b = 1,
++#ifdef FMHA_GMEM_BOUNDS_CHECK
++             .kv_page_indptr_size = 0,
++             .kv_indices_size = 0,
++             .kv_block_indexes_span = 0,
++#endif
++             .pack_factor = pack_factor,
++             .q_stride_n_original = q_stride_n_original,
++             .q_stride_h_original = q_stride_h_original,
++             .h_r_original = h_r_original},
+            sm_scale, q_scale, k_scale, v_scale, o_scale},
+           epi_args,
+           sched_args,
+@@ -412,7 +492,8 @@
+           bool SingleSoftmaxWarpGroup = false,
+           int KVPageSize = -1,
+           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
+-              cutlass::fmha::collective::SparseAttnMode::Off>
++              cutlass::fmha::collective::SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
+                          IdType* qo_segment_lens, IdType* kv_segment_lens,
+                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
+@@ -436,6 +517,9 @@
+                          int max_k_tiles = 0,
+                          int* kv_block_indexes = nullptr,
+                          int kv_block_num = 0,
++                         int64_t kv_block_stride_n = 0,
++                         int64_t kv_block_stride_h = 0,
++                         int64_t kv_block_stride_b = 1,
+                          int pack_factor = 1,
+                          int q_stride_n_original = 0,
+                          int q_stride_h_original = 0,
+@@ -443,7 +527,8 @@
+                          PackGQAUnpackParams pack_gqa = {},
+                          int num_ctas = 0) {
+   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
+-                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
++                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode,
++                   UnitSelectorColumn>::run(
+       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
+       qo_segment_offsets, kv_segment_offsets, packed_work_range,
+       packed_work_info, o, mask_mode_code, sm_scale,
+@@ -455,6 +540,7 @@
+       kv_indices, kv_page_indptr, total_page_num,
+       maybe_max_score, max_k_tiles,
+       kv_block_indexes, kv_block_num,
++      kv_block_stride_n, kv_block_stride_h, kv_block_stride_b,
+       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
+       pack_gqa, num_ctas);
+ }
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_load_tma_warpspecialized.hpp
+@@ -1,5 +1,5 @@
+ /***************************************************************************************************
+- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -64,7 +64,8 @@
+ template <class Element, class CollectiveMmaQK, class CollectiveMmaPV, class SmemLayoutQ,
+           class SmemLayoutK, class SmemLayoutV, class TensorStorage, class PipelineQ,
+           class PipelineKV, class Mask, class TileShape, int KVPageSize = -1,
+-          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
++          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct Sm100FmhaLoadTmaWarpspecialized {
+   // P0: OnlyScore mode never reads V — skip every V slot in the KV pipeline.
+   // mma() gates the matching wait_V/release_V under `kNeedOutput` so producer
+@@ -112,10 +113,13 @@
+     int* kv_page_indptr = nullptr;
+     int* kv_block_indexes = nullptr;
+     int kv_block_num = 0;
++    int64_t kv_block_stride_n = 0;
++    int64_t kv_block_stride_h = 0;
++    int64_t kv_block_stride_b = 1;
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+     int kv_page_indptr_size = 0;
+     int kv_indices_size = 0;
+-    int kv_block_indexes_numel = 0;
++    int64_t kv_block_indexes_span = 0;
+ #endif
+     int pack_factor = 1;
+     int q_stride_n_original = 0;
+@@ -148,10 +152,13 @@
+     int* kv_page_indptr = nullptr;
+     int* kv_block_indexes = nullptr;
+     int kv_block_num = 0;
++    int64_t kv_block_stride_n = 0;
++    int64_t kv_block_stride_h = 0;
++    int64_t kv_block_stride_b = 1;
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+     int kv_page_indptr_size = 0;
+     int kv_indices_size = 0;
+-    int kv_block_indexes_numel = 0;
++    int64_t kv_block_indexes_span = 0;
+ #endif
+     const Element* ptr_Q_orig = nullptr;
+     int q_stride_n_orig = 0;
+@@ -218,8 +225,9 @@
+ 
+     Params p{tma_load_Q, layout_Q, tma_load_K, layout_K, tma_load_V, layout_V,
+                   args.kv_indices, args.kv_page_indptr, args.kv_block_indexes, args.kv_block_num,
++                  args.kv_block_stride_n, args.kv_block_stride_h, args.kv_block_stride_b,
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+-                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_numel,
++                  args.kv_page_indptr_size, args.kv_indices_size, args.kv_block_indexes_span,
+ #endif
+                   args.ptr_Q, args.q_stride_n_original, args.q_stride_h_original, args.h_r_original,
+                   tma_desc_q_pack};
+@@ -525,11 +533,10 @@
+       constexpr int effective_tile_kv = get<1>(TileShapeQK{});
+       constexpr int tiles_per_page = KVPageSize / effective_tile_kv;
+ 
+-      int kv_block_offset = 0;
++      int64_t kv_block_offset = 0;
+       if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+-        int num_kv_heads_val = get<3, 0, 1>(params_problem_shape);
+-        kv_block_offset = batch_idx * num_kv_heads_val * params.kv_block_num
+-                        + kv_head_idx * params.kv_block_num;
++        kv_block_offset = batch_idx * params.kv_block_stride_n
++                        + kv_head_idx * params.kv_block_stride_h;
+       }
+ 
+       // Keep full 4D tensor (page_size, D, H_kv, P) — select head at copy time
+@@ -549,7 +556,12 @@
+         int page_for_lookup;
+         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+           int sparse_idx = (logical_page < params.kv_block_num)
+-              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
++              ? (UnitSelectorColumn
++                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page, params.kv_block_indexes_span)
++                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page * params.kv_block_stride_b,
++                          params.kv_block_indexes_span))
+               : -1;
+           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
+         } else {
+@@ -573,7 +585,12 @@
+         int page_for_lookup;
+         if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+           int sparse_idx = (logical_page < params.kv_block_num)
+-              ? __ldg(&params.kv_block_indexes[kv_block_offset + logical_page])
++              ? (UnitSelectorColumn
++                    ? KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page, params.kv_block_indexes_span)
++                    : KV_BLOCK_INDEX_LOAD(params.kv_block_indexes,
++                          kv_block_offset + logical_page * params.kv_block_stride_b,
++                          params.kv_block_indexes_span))
+               : -1;
+           page_for_lookup = (sparse_idx >= 0) ? sparse_idx : 0;
+         } else {
+diff --git a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+--- a/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
++++ b/python/fmha_sm100/csrc/include/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+@@ -1,5 +1,5 @@
+ /***************************************************************************************************
+- * Copyright (c) 2024 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * Copyright (c) 2024 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: BSD-3-Clause
+  *
+  * Redistribution and use in source and binary forms, with or without
+@@ -158,7 +158,8 @@
+           class ThreadShape = Shape<_2, _1, _1>,
+           bool IsSplitKV_ = false,
+           int KVPageSize_ = -1,
+-          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
++          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
++          bool UnitSelectorColumn = false>
+ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+   static constexpr bool IsSplitKV = IsSplitKV_;
+   static constexpr int KVPageSize = KVPageSize_;
+@@ -376,7 +377,7 @@
+   using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
+                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
+                                                PipelineQ, PipelineKV, Mask, TileShape, KVPageSize,
+-                                               kSparseAttnMode>;
++                                               kSparseAttnMode, UnitSelectorColumn>;
+   using LayoutQ = typename Load::LayoutQ;
+   using LayoutK = typename Load::LayoutK;
+   using LayoutV = typename Load::LayoutV;
+@@ -1131,14 +1132,13 @@
+     int skip_count, real_masked_count, unmasked_count;
+     int effective_end;
+ 
+-    int kbi_off_s = 0;
++    int64_t kbi_off_s = 0;
+     if constexpr (kNeedSparse) {
+       int h_r_s = get<3, 0, 0>(problem_shape);
+-      int num_kv_heads_s = get<3, 0, 1>(problem_shape);
+       int kv_head_idx_s = get<2, 0>(blk_coord) / h_r_s;
+       int batch_idx_s = get<2, 1>(blk_coord);
+-      kbi_off_s = batch_idx_s * num_kv_heads_s * params.load.kv_block_num
+-                + kv_head_idx_s * params.load.kv_block_num;
++      kbi_off_s = batch_idx_s * params.load.kv_block_stride_n
++                + kv_head_idx_s * params.load.kv_block_stride_h;
+     }
+ 
+     if constexpr (kNeedSparse) {
+@@ -1154,7 +1154,12 @@
+ 
+       // Count padding blocks (backward scan for -1)
+       int valid_blks = params.load.kv_block_num;
+-      while (valid_blks > 0 && __ldg(&params.load.kv_block_indexes[kbi_off_s + valid_blks - 1]) < 0)
++      while (valid_blks > 0 && (UnitSelectorColumn
++          ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                kbi_off_s + valid_blks - 1, params.load.kv_block_indexes_span)
++          : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                kbi_off_s + (valid_blks - 1) * params.load.kv_block_stride_b,
++                params.load.kv_block_indexes_span)) < 0)
+         valid_blks--;
+ 
+       int valid_tiles = (valid_blks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+@@ -1223,7 +1228,12 @@
+           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+           return false;
+         }
+-        int pos = __ldg(&params.load.kv_block_indexes[kbi_off_s + page_idx]);
++        int pos = UnitSelectorColumn
++            ? KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                  kbi_off_s + page_idx, params.load.kv_block_indexes_span)
++            : KV_BLOCK_INDEX_LOAD(params.load.kv_block_indexes,
++                  kbi_off_s + page_idx * params.load.kv_block_stride_b,
++                  params.load.kv_block_indexes_span);
+         if (pos < 0) {
+           cS = domain_offset(make_coord(q_s, INT_MAX / 2), cS_base);
+           return false;
+diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc/gmem_bounds_check.h
+--- a/python/fmha_sm100/csrc/gmem_bounds_check.h
++++ b/python/fmha_sm100/csrc/gmem_bounds_check.h
+@@ -1,4 +1,5 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
+@@ -9,6 +10,7 @@
+ #ifdef FMHA_GMEM_BOUNDS_CHECK
+ 
+ #include <cstdio>
++#include <cstdint>
+ 
+ struct GmemBounds {
+   int packed_work_range_size;
+@@ -19,17 +21,17 @@
+   int kv_page_indptr_size;
+   int kv_indices_size;
+   int max_score_numel;
+-  int kv_block_indexes_numel;
++  int64_t kv_block_indexes_span;
+   int split_kv_size;
+   int qo_offsets_size;
+ };
+ 
+ template <typename T>
+ __device__ __forceinline__ T gmem_load_checked(
+-    const T* base, int idx, int size, const char* name) {
++    const T* base, int64_t idx, int64_t size, const char* name) {
+   if (__builtin_expect(idx < 0 || idx >= size, 0)) {
+-    printf("GMEM-OOB-LOAD [%s] idx=%d size=%d blk=(%d,%d,%d) thr=%d\n",
+-           name, idx, size, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
++    printf("GMEM-OOB-LOAD [%s] idx=%lld size=%lld blk=(%d,%d,%d) thr=%d\n",
++           name, static_cast<long long>(idx), static_cast<long long>(size), blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x);
+     return T(0);
+   }
+   return base[idx];
+@@ -82,6 +84,7 @@
+ // Macros for paged KV reads
+ #define KV_INDPTR_LOAD(ptr, idx, sz)  gmem_load_checked((ptr), (idx), (sz), "kv_page_indptr")
+ #define KV_INDICES_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_indices")
++#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) gmem_load_checked((ptr), (idx), (sz), "kv_block_indexes")
+ 
+ #else  // FMHA_GMEM_BOUNDS_CHECK not defined
+ 
+@@ -93,5 +96,6 @@
+ #define SEG_LEN_LOAD(vl, idx, sz)  (vl).segment_lens[(idx)]
+ #define KV_INDPTR_LOAD(ptr, idx, sz)  __ldg(&(ptr)[(idx)])
+ #define KV_INDICES_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
++#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
+ 
+ #endif  // FMHA_GMEM_BOUNDS_CHECK
