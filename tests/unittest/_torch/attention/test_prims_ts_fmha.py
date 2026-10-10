@@ -88,6 +88,7 @@ class _Attention:
         self.v_head_dim = 128 if is_mla else None
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
+        self.quant_attention_config = None
         self.skip_correction_threshold = 0.0
         self.position_embedding_type = 0
         self.quant_mode = 0
@@ -1034,7 +1035,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
         "q_dtype": torch.bfloat16,
-        "kv_dtype": torch.bfloat16,
+        "k_dtype": torch.bfloat16,
+        "v_dtype": torch.bfloat16,
         "out_dtype": torch.bfloat16,
         "page_size": 32,
         "mask_type": "causal",
@@ -2330,3 +2332,53 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
             assert params.value_input is None
         assert params.output.shape == (params.num_tokens, attn.num_heads, out_head_size)
         assert params.output.data_ptr() == output[token_slice].data_ptr()
+
+
+def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cache-free context path plans one contiguous wrapper per shape and reuses it."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    wrapper = Mock()
+    wrapper_factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(prims_context_module, "BatchPrefillTSWrapper", wrapper_factory)
+    batch_size, seq_len = 2, 16
+    q = torch.empty(
+        (batch_size * seq_len, (attn.num_heads + 2 * attn.num_kv_heads) * attn.head_dim),
+        dtype=torch.bfloat16,
+    )
+    output = torch.empty(
+        (batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=None,
+        num_contexts=batch_size,
+        num_generations=0,
+        max_seq_len=seq_len,
+        prompt_lens_cpu_runtime=torch.full((batch_size,), seq_len, dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.context_only,
+        attention_mask=PredefinedAttentionMask.FULL,
+    )
+
+    fmha.forward(q, None, None, metadata, forward_args)
+    fmha.forward(q, None, None, metadata, forward_args)
+
+    wrapper_factory.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+    plan_kwargs = wrapper.plan.call_args.kwargs
+    assert plan_kwargs["batch_size"] == batch_size
+    assert plan_kwargs["max_seq_len_q"] == plan_kwargs["max_kv_len"] == seq_len
+    assert (
+        plan_kwargs["q_dtype"] == plan_kwargs["k_dtype"] == plan_kwargs["v_dtype"] == torch.bfloat16
+    )
+    assert plan_kwargs["mask_type"] == "dense"
+    assert wrapper.run.call_count == 2
+    run_args, run_kwargs = wrapper.run.call_args
+    assert tuple(run_args[0].shape) == (batch_size, seq_len, attn.num_heads, attn.head_dim)
+    assert tuple(run_args[2].shape) == (batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
+    assert run_kwargs["out"].data_ptr() == output.data_ptr()
+    assert run_kwargs["scale_softmax_log2"] is None
+    assert run_kwargs["output_scale"] is None

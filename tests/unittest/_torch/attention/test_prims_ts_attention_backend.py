@@ -21,7 +21,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from backend_case import BackendCase, generate_inputs, run_backend, run_case
+from backend_case import (
+    BF16_ATOL,
+    BF16_RTOL,
+    FP8_ATOL,
+    BackendCase,
+    generate_inputs,
+    run_backend,
+    run_case,
+)
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
@@ -656,7 +664,8 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         q_dtype=dtype,
-        kv_dtype=dtype,
+        k_dtype=dtype,
+        v_dtype=dtype,
         out_dtype=dtype,
         page_size=page_size,
         mask_type="causal",
@@ -1334,3 +1343,113 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
 
     assert calls["fallback"] > 0
     assert calls["prims_context"] == 0
+
+
+def _build_trtllm_attention_with_recipe(monkeypatch: pytest.MonkeyPatch, recipe) -> None:
+    """Make the shared harness pass the attention recipe to the TRTLLM layer it builds."""
+    import backend_case
+
+    create_attention = backend_case.create_attention
+
+    def create_attention_with_recipe(backend, **kwargs):
+        attn = create_attention(backend, **kwargs)
+        if backend == "TRTLLM":
+            attn.quant_attention_config = recipe
+        return attn
+
+    monkeypatch.setattr(backend_case, "create_attention", create_attention_with_recipe)
+
+
+_CACHE_FREE_CASE = dict(
+    num_heads=8,
+    num_kv_heads=8,
+    head_dim=128,
+    seq_lens=[256, 256],
+    num_cached_tokens=[0, 0],
+    num_contexts=2,
+    dtype="bfloat16",
+    cache="none",
+    causal=False,
+)
+
+
+@pytest.mark.parametrize(("qk_dtype", "v_dtype"), [("bf16", "fp8"), ("fp8", "fp8")])
+def test_prims_ts_cache_free_fp8_recipes(
+    monkeypatch: pytest.MonkeyPatch, qk_dtype: str, v_dtype: str
+) -> None:
+    """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA."""
+    from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    recipe = QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype=v_dtype, algorithm="primsts")
+    _build_trtllm_attention_with_recipe(monkeypatch, recipe)
+    plans: list[dict] = []
+    runs: list[dict] = []
+    plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
+
+    def recording_plan(self, *args, **kwargs):
+        plans.append(kwargs)
+        return plan(self, *args, **kwargs)
+
+    def recording_run(self, *args, **kwargs):
+        runs.append(kwargs)
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(BatchPrefillTSWrapper, "plan", recording_plan)
+    monkeypatch.setattr(BatchPrefillTSWrapper, "run", recording_run)
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "+prims_ts")
+    case = BackendCase(**_CACHE_FREE_CASE)
+    inputs = generate_inputs(case, seed=0)
+
+    out = run_backend(case, "TRTLLM", inputs, kv_dtype=torch.bfloat16, kv_layout="HND")
+
+    def bhsd(x: torch.Tensor) -> torch.Tensor:
+        return x.view(case.num_seqs, -1, case.num_heads, case.head_dim).transpose(1, 2).float()
+
+    golden = torch.nn.functional.scaled_dot_product_attention(
+        bhsd(inputs["q"]), bhsd(inputs["new_k"]), bhsd(inputs["new_v"])
+    )
+    golden = golden.transpose(1, 2).reshape_as(out).to(out.dtype)
+
+    fp8, bf16 = torch.float8_e4m3fn, torch.bfloat16
+    (plan_kwargs,) = plans
+    (run_kwargs,) = runs
+    expected_dtypes = (fp8, fp8, fp8) if qk_dtype == "fp8" else (bf16, bf16, fp8)
+    assert (
+        plan_kwargs["q_dtype"],
+        plan_kwargs["k_dtype"],
+        plan_kwargs["v_dtype"],
+    ) == expected_dtypes
+
+    def dequant_scale(x: torch.Tensor) -> torch.Tensor:
+        return (x.float().abs().amax() / 448.0).reshape(1)
+
+    # The quantize op returns BF16-rounded dequant scales.
+    torch.testing.assert_close(
+        run_kwargs["output_scale"], dequant_scale(inputs["new_v"]), rtol=1e-2, atol=0.0
+    )
+    if qk_dtype == "fp8":
+        expected = (
+            dequant_scale(inputs["q"])
+            * dequant_scale(inputs["new_k"])
+            * (math.log2(math.e) / math.sqrt(case.head_dim))
+        )
+        torch.testing.assert_close(run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0)
+    else:
+        assert run_kwargs["scale_softmax_log2"] is None
+    torch.testing.assert_close(out, golden, atol=FP8_ATOL + BF16_ATOL, rtol=BF16_RTOL)
+
+
+def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PrimTS recipe fails instead of running unquantized on another FMHA library."""
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8", algorithm="primsts")
+    _build_trtllm_attention_with_recipe(monkeypatch, recipe)
+    monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    case = BackendCase(**_CACHE_FREE_CASE)
+
+    with pytest.raises(RuntimeError, match="needs the PrimTS FMHA library"):
+        run_backend(
+            case, "TRTLLM", generate_inputs(case, seed=0), kv_dtype=torch.bfloat16, kv_layout="HND"
+        )

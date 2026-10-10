@@ -57,7 +57,7 @@ index c7e881ca73dfb95314da532912db39fe7b05eb94..e19dc7b1de7fca03c44b8e98217f8d10
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29d692b430 100644
+index 8421619d1d6779d9a3a0a5d767d9f1d5bb36d6c5..4a4b9dd638855651f92d07eeba75cf1cecd5bbba 100644
 --- a/context.py
 +++ b/context.py
 @@ -31,8 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
@@ -70,7 +70,7 @@ index 4ada42762c38c1c7215d2dfbe4582926fd8f9701..678432780332b20a78fb553405ad1e29
  """
  
  from dataclasses import dataclass
-@@ -438,7 +437,7 @@ def _validate_device(device: torch.device) -> int:
+@@ -488,7 +487,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
