@@ -382,19 +382,14 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
         config = model_config.pretrained_config
 
         for i, layer in enumerate(model.model.layers):
-            attn = layer.self_attn
-            if config.layer_types[i] == "sliding_attention":
-                self.assertEqual(
-                    attn.head_dim,
-                    config.head_dim,
-                    f"Layer {i} (sliding) should have head_dim={config.head_dim}",
-                )
-            else:
-                self.assertEqual(
-                    attn.head_dim,
-                    config.global_head_dim,
-                    f"Layer {i} (full) should have head_dim={config.global_head_dim}",
-                )
+            expected_head_dim = GEMMA4_SMALL_CONFIG[
+                "head_dim" if config.layer_types[i] == "sliding_attention" else "global_head_dim"
+            ]
+            self.assertEqual(
+                layer.self_attn.head_dim,
+                expected_head_dim,
+                f"Layer {i} should have head_dim={expected_head_dim}",
+            )
 
     def test_k_eq_v_attention(self):
         """Full attention layers with attention_k_eq_v=True should have v_norm."""
