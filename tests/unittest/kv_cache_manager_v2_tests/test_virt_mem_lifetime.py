@@ -35,6 +35,8 @@ import sys
 import pytest
 import torch
 
+from tensorrt_llm._torch import virtual_memory
+from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfMemoryError
 from tensorrt_llm.runtime.kv_cache_manager_v2._introspection import PooledPhysMemAllocator, VirtMem
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -98,7 +100,8 @@ def _vm_size_bytes() -> int:
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc/self/status")
-def test_failed_construction_releases_its_address_reservation() -> None:
+@pytest.mark.parametrize("sleep_enabled", [False, True])
+def test_failed_construction_releases_its_address_reservation(sleep_enabled) -> None:
     """A VirtMem whose initial extend() throws must not strand the reservation.
 
     ``VirtMem`` reserves the address range, then maps the initial chunks. A constructor
@@ -120,9 +123,10 @@ def test_failed_construction_releases_its_address_reservation() -> None:
 
     allocator = PooledPhysMemAllocator(leak_chunk)
     before = _vm_size_bytes()
-    for _ in range(attempts):
-        with pytest.raises(Exception):
-            VirtMem(leak_chunk, allocator, init_num_phys_mem=1)
+    with virtual_memory.maybe_scope(sleep_enabled, "failed_construction"):
+        for _ in range(attempts):
+            with pytest.raises(OutOfMemoryError):
+                VirtMem(leak_chunk, allocator, init_num_phys_mem=1)
     growth = _vm_size_bytes() - before
 
     # One stranded reservation is already the bug, so allow only a fraction of one.

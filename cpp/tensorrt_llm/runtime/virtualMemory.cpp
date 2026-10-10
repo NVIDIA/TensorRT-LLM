@@ -347,7 +347,8 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
     {
         map(address, alignedSize, n,
             CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
-                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}});
+                CUmemLocation{CU_MEM_LOCATION_TYPE_DEVICE, {device}}},
+            checkVirtualMemoryCudaResult);
     }
     catch (...)
     {
@@ -357,18 +358,19 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
     *ptr = deviceptr_cast(address);
 }
 
-void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop) const
+void CudaVirtualMemoryAllocator::map(
+    CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
 {
-    map(address, size, size, prop);
+    map(address, size, size, prop, check);
 }
 
-void CudaVirtualMemoryAllocator::map(
-    CUdeviceptr address, std::size_t alignedSize, std::size_t n, CUmemAllocationProp const& prop) const
+void CudaVirtualMemoryAllocator::map(CUdeviceptr address, std::size_t alignedSize, std::size_t n,
+    CUmemAllocationProp const& prop, VirtualMemoryCudaErrorCheck check) const
 {
 
     CUDAVirtualMemoryChunk::Configurators configurators;
     configurators.push_back(std::make_unique<UnicastConfigurator>(
-        address, alignedSize, CUmemAccessDesc{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}));
+        address, alignedSize, CUmemAccessDesc{prop.location, CU_MEM_ACCESS_FLAGS_PROT_READWRITE}, check));
 
     switch (mConfig->mMode)
     {
@@ -387,7 +389,7 @@ void CudaVirtualMemoryAllocator::map(
     }
 
     mConfig->mManager.add(
-        address, mConfig->mTag, std::make_unique<LocalCreator<>>(prop, alignedSize), std::move(configurators));
+        address, mConfig->mTag, std::make_unique<LocalCreator<>>(prop, alignedSize, check), std::move(configurators));
 }
 
 void CudaVirtualMemoryAllocator::unmap(CUdeviceptr address) const
