@@ -876,23 +876,41 @@ class TestDeepseekV4CacheManager:
             assert len(codec_state.lifecycle_metadata) == 1
             metadata = codec_state.lifecycle_metadata[0]
             assert metadata.num_buffers == 3
-            assert metadata.integers[:3, 1].tolist() == [0, 1, 1]
-            assert metadata.cold_page_bytes == 30720
+            assert metadata.integers[:3, 1].tolist() == [2, 1, 1]
+            assert metadata.cold_page_bytes == 27136
         finally:
             cache_manager.shutdown()
 
     @pytest.mark.parametrize(
-        ("dtype", "cold_page_bytes"),
-        [(DataType.BF16, 15360), (DataType.FP8, 12800)],
+        ("dtype", "skip_rope_quantization", "residual_dim", "cold_page_bytes"),
+        [
+            (DataType.BF16, False, None, 13568),
+            (DataType.FP8, False, None, 13056),
+            (DataType.BF16, False, 0, 12416),
+            (DataType.FP8, False, 0, 11904),
+            (DataType.BF16, True, None, 15360),
+            (DataType.FP8, True, None, 12800),
+        ],
     )
     def test_nvfp4_cold_page_codec_migrates_real_csa_hca_through_host(
-        self, dtype: DataType, cold_page_bytes: int
+        self,
+        dtype: DataType,
+        skip_rope_quantization: bool,
+        residual_dim: int | None,
+        cold_page_bytes: int,
     ) -> None:
         prompt_len = 64 * self.tokens_per_block
         pressure_len = 65 * self.tokens_per_block
         compress_ratios = [4, 128]
+        # Leave the switch unset in default cases; test the opt-in lossless layout too.
+        if skip_rope_quantization:
+            compression_config = ColdPageQuantizationCompressionConfig(skip_rope_quantization=True)
+        elif residual_dim == 0:
+            compression_config = ColdPageQuantizationCompressionConfig(nvfp4_residual_dim=0)
+        else:
+            compression_config = ColdPageQuantizationCompressionConfig()
         provider = Nvfp4ColdPageQuantizationCompression(
-            ColdPageQuantizationCompressionConfig(),
+            compression_config,
             pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
         )
         requests: list[LlmRequest] = []
@@ -929,6 +947,9 @@ class TestDeepseekV4CacheManager:
 
             try:
                 assert create_codec.call_count == 1
+                metadata = create_codec.call_args.args[1].lifecycle_metadata[0]
+                expected_transform = 2 if not skip_rope_quantization and residual_dim is None else 0
+                assert metadata.integers[:3, 1].tolist() == [expected_transform, 1, 1]
                 first = self._create_request(request_id=0, prompt_len=prompt_len)
                 requests.append(first)
                 expected = self._create_random_cache(
@@ -939,18 +960,19 @@ class TestDeepseekV4CacheManager:
                     compressor_dtype=binding_to_torch_dtype(DataType.FLOAT),
                 )
                 expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
-                nope_values = torch.linspace(
+                quantized_elements = 448 if skip_rope_quantization else self.head_dim
+                quantized_values = torch.linspace(
                     -1.0,
                     1.0,
-                    448,
+                    quantized_elements,
                     dtype=torch.float32,
                     device=expected_csa.device,
                 ).expand(expected_csa.size(0), -1)
                 if dtype == DataType.FP8:
-                    nope_values = nope_values.to(torch.float8_e4m3fn).view(torch.uint8)
+                    quantized_values = quantized_values.to(torch.float8_e4m3fn).view(torch.uint8)
                 else:
-                    nope_values = nope_values.to(expected_csa.dtype)
-                expected_csa[:, :448] = nope_values
+                    quantized_values = quantized_values.to(expected_csa.dtype)
+                expected_csa[:, :quantized_elements] = quantized_values
                 assert cache_manager.prepare_context(first)
                 assert cache_manager.resize_context(first, first.context_chunk_size)
                 self._write_request_prefill(first, prompt_len, cache_manager, expected)
@@ -996,19 +1018,22 @@ class TestDeepseekV4CacheManager:
                 )
                 expected_csa, _ = expected[0, DeepseekV4AttentionType.COMPRESS]
                 actual_csa, _ = actual[0, DeepseekV4AttentionType.COMPRESS]
-                expected_nope = expected_csa[:, :448]
-                actual_nope = actual_csa[:, :448]
-                assert not torch.equal(actual_nope, expected_nope)
+                expected_quantized = expected_csa[:, :quantized_elements]
+                actual_quantized = actual_csa[:, :quantized_elements]
+                assert not torch.equal(actual_csa[:, :448], expected_csa[:, :448])
                 if dtype == DataType.FP8:
-                    expected_nope = expected_nope.view(torch.float8_e4m3fn)
-                    actual_nope = actual_nope.view(torch.float8_e4m3fn)
+                    expected_quantized = expected_quantized.view(torch.float8_e4m3fn)
+                    actual_quantized = actual_quantized.view(torch.float8_e4m3fn)
                 torch.testing.assert_close(
-                    actual_nope.float(),
-                    expected_nope.float(),
+                    actual_quantized.float(),
+                    expected_quantized.float(),
                     rtol=0.25,
                     atol=0.02,
                 )
-                assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
+                if skip_rope_quantization:
+                    assert torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
+                elif residual_dim == 0:
+                    assert not torch.equal(actual_csa[:, 448:], expected_csa[:, 448:])
 
                 expected_indexer = expected[0, DeepseekV4AttentionType.INDEXER_COMPRESS]
                 actual_indexer = actual[0, DeepseekV4AttentionType.INDEXER_COMPRESS]

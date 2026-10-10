@@ -49,6 +49,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .connectors.registry import uses_connector
 from .dwdp import DwdpManager, get_global_dwdp_manager
 from .engine.runners.decoder.runner import uses_full_generation_page_table
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
@@ -999,24 +1000,12 @@ def _create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the three manager-dependent
-        # rejections below fire here only when the config names the manager
-        # outright, sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats all three against the
-        # manager that was actually built.
+        # not chosen until model loading, so the manager-dependent rejections
+        # below fire here only when the config names the manager outright,
+        # sparing an explicit config a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the manager
+        # that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
-
-        # A policy that destroys and replays a live request leaves the
-        # connector's per-request block delta measured against pages that were
-        # freed with it. Only KVCacheManagerV2 drops that delta on replay.
-        if (scheduler_config.capacity_scheduler_policy
-                != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-                and v2_selection is False):
-            raise NotImplementedError(
-                "KV connector in this configuration is only supported with the "
-                "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
-                "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
-            )
 
         # Rejected draft tokens shrink a request's page list, and the freed slot
         # goes to whichever request allocates next. The connector is only told
@@ -1079,6 +1068,29 @@ def _create_py_executor(
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise e
+
+        if not kv_connector_manager.capacity_only:
+            if (scheduler_config.capacity_scheduler_policy
+                    != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
+                    and v2_selection is False):
+                raise NotImplementedError(
+                    "KV connector in this configuration is only supported with the "
+                    "GUARANTEED_NO_EVICT capacity scheduler policy. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True to use another policy."
+                )
+
+        if uses_connector(kv_connector_config, "mooncake-store"):
+            # Imported here because `registry.py` leaves a connector package to
+            # the importlib call above, off every other deployment's path.
+            from .connectors.mooncake_store import settings as mooncake_settings
+
+            # `BaseLLM.__init__` settles these for the usage report and the
+            # ranks alike; this covers a caller that reached an executor
+            # without the constructor, and a role it could not resolve. The KV
+            # cache manager is built after this and reads the result.
+            if not kv_connector_manager.capacity_only:
+                mooncake_settings.apply_transferring_role_overrides(
+                    kv_cache_config)
     else:
         kv_connector_manager = None
 

@@ -203,8 +203,42 @@ Cold-page NVFP4 is different from an active NVFP4 KV cache. The former stores
 NVFP4 only in a cold cache tier and restores the runtime type before Attention;
 the latter sets `KvCacheConfig(dtype="nvfp4")` and keeps active GPU KV in
 NVFP4. See [Quantization](quantization.md) for active KV-cache quantization.
+
 For complete single-GPU and disaggregated-serving configurations, see the
 [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md).
+
+#### Skipping RoPE Quantization
+
+In some models, part of each K vector carries positional information (RoPE).
+When NVFP4 cold-page compression is enabled, `skip_rope_quantization` controls
+how that part is stored:
+
+- `false` (default): quantize RoPE as well. DeepSeek-V4 compressed rows use single
+  NVFP4 for NoPE and two FP4 components (2FP4) for RoPE by default; other models
+  use single NVFP4.
+- `true`: copy the supported target RoPE part unchanged at the hot-cache
+  precision, such as FP8 or BF16. The remaining values use NVFP4.
+
+For DeepSeek-V4, `nvfp4_residual_dim` defaults to `64`, using 2FP4 for its
+64 RoPE values. Set it to `0` with `skip_rope_quantization: false`
+for single NVFP4 throughout the row. Only `0` and `64` are supported. Setting
+`skip_rope_quantization` to `true` preserves RoPE regardless of the residual
+option. See the [DeepSeek-V4 example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4)
+for the three formats.
+
+Preserving RoPE increases cold-cache storage relative to single NVFP4. These
+formats are exploratory; validate accuracy on your model and workload. Skipping
+RoPE is available for DeepSeek-V4, GLM-5 (`glm_moe_dsa`), and the Qwen3.5 series;
+2FP4 is available only for DeepSeek-V4. To add model support, follow the layout
+requirements in the
+[development guide](../developer-guide/kv-cache-compression-development.md#which-numbers-of-a-k-or-v-vector-become-nvfp4).
+
+```yaml
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  skip_rope_quantization: true
+```
 
 ### TriAttention
 
@@ -251,7 +285,7 @@ structures. Both share the same general platform requirements.[^general-requirem
 | MLA Attention KV | Supported | Not supported |
 | GDN, SSM, and Conv state | Skipped by quantization and preserved losslessly | Not supported |
 | DSA and other Attention side buffers | Preserved losslessly | Not supported |
-| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; the NoPE part of the compressed KV is encoded as NVFP4, the RoPE part and the indexer cache are preserved losslessly | Not supported |
+| DeepSeek-V4 CSA cache | Supported[^deepseek-v4]; NoPE uses NVFP4 and RoPE defaults to 2FP4, or keeps its original precision when `skip_rope_quantization` is `true`; the indexer cache is preserved losslessly | Not supported |
 | DeepSeek-V4 SWA, HCA, and compressor state | Preserved losslessly | Not supported |
 
 [^general-requirements]: Both methods currently require the PyTorch backend,

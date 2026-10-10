@@ -264,10 +264,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """Register the AsyncTransferManager the deadlock detector consults.
 
         A finished disaggregated context sender leaves active_requests once its
-        response is emitted, but the transfer manager still owns it and its
-        pinned KV pages until the send lands. Without this reference the
-        detector cannot see those pages and may report a false deadlock on a
-        context server whose pool is full of in-flight sends.
+        response is emitted, but the transfer manager still owns its pinned KV
+        pages until the send lands. Without this reference the detector cannot
+        see those pages and reports a false deadlock.
         """
         self._async_transfer_manager = mgr
 
@@ -469,9 +468,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             A success ends the phase 2 loop, reserving the pages for the
             request that paid a re-prefill for them. Letting a later context
-            request take them instead would leave `req` to preempt again on
-            the next pass, repeating without ever admitting it. The cost is
-            one iteration of admission.
+            request take them instead would leave `req` preempting again every
+            pass without ever being admitted.
             """
             protected = {r.py_request_id for r in scheduled_gen}
             protected.update(r.py_request_id for r in scheduled_ctx)
@@ -1477,13 +1475,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         `KVCacheManagerV2.preempt_request`. With a cache tier below GPU,
         suspension is cheaper and keeps the pages, so that path is left alone.
 
-        The victim leaves on `recompute_paused`, the same channel the generation
-        side uses, because a re-prefill needs more teardown than the KV cache:
-        the executor frees the request's remaining resources, its sequence slot
-        included, and `reset_for_recompute` rewrites the prompt and resyncs the
-        Python-side mirrors of it. Pausing the request here instead would leave
-        the slot owned by SeqSlotManager while `py_seq_slot` is None, which
-        asserts on the next schedule.
+        The victim leaves on `recompute_paused`, the same channel the
+        generation side uses, because a re-prefill needs more teardown than the
+        KV cache: the executor frees the sequence slot and
+        `reset_for_recompute` rewrites the prompt. Pausing the request here
+        instead would leave the slot owned by SeqSlotManager while
+        `py_seq_slot` is None, which asserts on the next schedule.
 
         Returns True when pages became available in this iteration.
         """
@@ -1505,15 +1502,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             if not self.kv_cache_manager.is_request_active(victim.py_request_id):
                 continue
 
-            self.kv_cache_manager.preempt_request(victim)
+            if not self._preempt_or_defer(victim, recompute_paused):
+                return False
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "
                 f"(state={victim.state.name})"
             )
-            self._clear_request_runtime_state(victim)
-            if self.draft_kv_cache_manager is not None:
-                self.draft_kv_cache_manager.free_resources(victim)
-            recompute_paused.append(victim)
             preempted_ids.add(victim.py_request_id)
             return True
 
@@ -1547,11 +1541,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> None:
         """Fail loudly when no request can be scheduled or reclaimed.
 
-        Without this the executor spins at full speed while scheduling
-        nothing, which looks healthy to the hang detector and to `/health`
-        while the job burns its wall clock. Context candidates count alongside
-        generation ones because a disaggregated prefill server has no
-        generation requests at all.
+        Unchecked, the executor spins at full speed while scheduling nothing,
+        which looks healthy to the hang detector and to `/health`. Context
+        candidates count alongside generation ones because a disaggregated
+        prefill server has no generation requests at all.
         """
         if made_progress:
             if self._stalled_schedules:
@@ -1587,7 +1580,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # A connector load in flight releases its pages when it lands, so a
         # pass that reclaims nothing while one is outstanding is not a stall.
-        if any(self._has_pending_connector_load(r) for r in active_requests):
+        # A preemption awaiting the connector's saves is the same case from
+        # the other direction: those pages are already given up, but the
+        # victim keeps its state until they land, so nothing above sees them.
+        if (
+            any(self._has_pending_connector_load(r) for r in active_requests)
+            or self.kv_cache_manager.has_pending_preemption()
+        ):
             self._stalled_schedules = 0
             return
 
@@ -1673,8 +1672,8 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> str:
         """One-line breakdown of a stalled pass for the deadlock logs.
 
-        Re-derives the blocked candidates so the per-pass detector stays cheap:
-        this runs only on the rare logging branches.
+        Re-derives the blocked candidates so the per-pass detector stays
+        cheap, this running only on the rare logging branches.
         """
         gen = [
             r
@@ -1744,9 +1743,34 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self._is_started_request(req)
 
-    def _recompute_pause_request(self, req: LlmRequest) -> None:
+    def _preempt_or_defer(self, req: LlmRequest, recompute_paused: RequestList) -> bool:
+        """Give up *req*'s pages for another request, if they are free to give.
+
+        Every destructive release goes through here, because a page a connector
+        save is still reading cannot be freed: a later request would allocate it
+        and overwrite the bytes mid-transfer, and the store would publish one
+        request's KV under another's hash. `KVCacheManagerV2.preempt_request`
+        answers that question and parks the victim until the executor completes
+        the release; see `PyExecutor._resume_preempted_request`.
+
+        On success *req* lands on `recompute_paused`, the channel a re-prefill
+        needs: the executor frees the sequence slot and `reset_for_recompute`
+        rewrites the prompt. False means the pages are unavailable this
+        iteration, and the caller stops looking rather than taking a second
+        victim, so one drains at a time and the next pass finds those pages
+        instead of a second request having given up its cache for nothing.
+        """
+        if not self.kv_cache_manager.preempt_request(req):
+            logger.debug(
+                f"[V2Scheduler] Preemption of request {req.py_request_id} "
+                "deferred until its connector saves retire"
+            )
+            return False
         self._clear_request_runtime_state(req)
-        self._free_kv_caches(req)
+        if self.draft_kv_cache_manager is not None:
+            self.draft_kv_cache_manager.free_resources(req)
+        recompute_paused.append(req)
+        return True
 
     def _try_evict_for_gen(
         self, req, requests_list, req_it, req_it_end, evicted, inflight_request_ids
@@ -1852,8 +1876,11 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"[V2Scheduler] Recompute-pausing request {victim.py_request_id} "
                 f"to free pages for request {req.py_request_id}"
             )
-            self._recompute_pause_request(victim)
-            recompute_paused.append(victim)
+            if not self._preempt_or_defer(victim, recompute_paused):
+                # Off `evicted` above and onto no list here: a parked victim
+                # keeps its pages, and the `pause` an evicted request gets
+                # would overwrite the state that holds it there.
+                return req_it_end, False
             recompute_pause_state.victim_indices.add(victim_idx)
             recompute_pause_state.frontier = min(recompute_pause_state.frontier, victim_idx)
 
