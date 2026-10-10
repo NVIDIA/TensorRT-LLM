@@ -72,7 +72,8 @@ resources need adapter-owned cleanup; the probe does not manage them.
 
 Run the same command structure with `--mode restore` and
 `--baseline /tmp/startup-cold-01/report.json`, replacing the native cold-launch
-argv with that adapter's argv. There is no bundled restore command yet. Merely
+argv with that adapter's argv. The bundled same-host adapter instead runs its
+own private validation; use the commands in [STANDALONE.md](STANDALONE.md). Merely
 passing a cold launcher under `--mode restore` can pass the generation probe;
 it cannot qualify Snapshot. Do not use that result as evidence of fast restore.
 

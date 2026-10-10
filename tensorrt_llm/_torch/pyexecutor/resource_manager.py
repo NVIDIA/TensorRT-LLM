@@ -2774,6 +2774,28 @@ class KVCacheManager(BaseResourceManager):
                         num_tokens_to_keep: int):
         self.impl.truncate_blocks(target_tokens, num_tokens_to_keep)
 
+    def _snapshot_startup_state(self) -> dict:
+        """Describe resident KV storage at the clean startup boundary.
+
+        Returns:
+            Pool addresses and capacity counters; this is not a live-KV export.
+        """
+        stats = self.get_kv_cache_stats()
+        return {
+            "manager":
+            "v1",
+            "pools": [
+                self.get_buffers(layer).data_ptr()
+                for layer in sorted(self.layer_offsets)
+            ],
+            "max_blocks":
+            stats.max_num_blocks,
+            "free_blocks":
+            stats.free_num_blocks,
+            "used_blocks":
+            stats.used_num_blocks,
+        }
+
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""
         self.impl.reset_reuse_state()

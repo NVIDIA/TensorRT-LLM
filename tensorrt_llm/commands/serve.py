@@ -516,7 +516,9 @@ def launch_server(
         validate_launch(
             host, llm_args, metadata_server_cfg is None
             and disagg_cluster_config is None
-            and multimodal_server_config is None and server_role is None)
+            and (multimodal_server_config is None
+                 or multimodal_server_config.media_io_kwargs is None)
+            and server_role is None)
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     # Same hazard the disaggregated fleet guard covers: _spawn_attached_frontends
@@ -1267,6 +1269,10 @@ def serve(
     MODEL: model name or Hugging Face checkpoint path
     """
     logger.set_level(log_level)
+
+    if os.environ.get("TRTLLM_SNAPSHOT_DIR") and (grpc or enable_visual_gen):
+        raise click.UsageError(
+            "Snapshot prototype requires the OpenAI HTTP server")
 
     if not grpc and grpc_protocol != "smg":
         raise click.UsageError("--grpc-protocol requires --grpc")

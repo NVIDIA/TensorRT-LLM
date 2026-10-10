@@ -243,6 +243,75 @@ class TestKVCacheManagerPoolPointers(unittest.TestCase):
             manager.shutdown()
 
 
+@pytest.mark.parametrize("manager_type", [KVCacheManager, KVCacheManagerV2])
+def test_snapshot_startup_kv_state_preserves_storage(
+        manager_type: type) -> None:
+    """Snapshot evidence reads real GPU pools without clearing or reallocating them.
+
+    Args:
+        manager_type: V1 or V2 manager under test.
+    """
+    manager = manager_type(kv_cache_config=KvCacheConfig(
+        max_tokens=64, enable_block_reuse=False),
+                           kv_cache_type=tensorrt_llm.bindings.internal.
+                           batch_manager.CacheType.SELF,
+                           num_layers=1,
+                           num_kv_heads=1,
+                           head_dim=128,
+                           tokens_per_block=32,
+                           max_seq_len=64,
+                           max_batch_size=1,
+                           mapping=Mapping(),
+                           dtype=DataType.HALF)
+    try:
+        before = manager.get_buffers(0)
+        state = manager._snapshot_startup_state()
+        assert state["pools"] == [before.data_ptr()]
+        assert manager._snapshot_startup_state() == state
+        assert manager.get_buffers(0).data_ptr() == before.data_ptr()
+        assert state[
+            "max_blocks"] == state["free_blocks"] + state["used_blocks"]
+    finally:
+        manager.shutdown()
+
+
+def test_snapshot_v2_rejects_user_owned_kv() -> None:
+    """User ownership is rejected before any storage introspection or mutation."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_map = {7: object()}
+    with pytest.raises(ValueError, match="non-reserved"):
+        manager._snapshot_startup_state()
+
+
+def test_snapshot_reads_instantiated_cuda_graph_handle() -> None:
+    """The default PyTorch graph supports executable, not retained-source, handles."""
+    from tensorrt_llm.serve.snapshot import startup_state
+
+    buffer = torch.zeros(4, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        buffer.add_(1)
+    executor = SimpleNamespace(
+        active_requests=[],
+        previous_batch=None,
+        _pending_transfer_responses=[],
+        _pending_response_terminations=[],
+        request_accumulated=[],
+        inflight_req_ids=set(),
+        num_scheduled_requests=0,
+        num_unscheduled_requests=0,
+        model_engine=SimpleNamespace(
+            model=torch.nn.Linear(4, 4).cuda(),
+            cuda_graph_runner=SimpleNamespace(graphs={"batch1": graph})),
+        kv_cache_manager=SimpleNamespace(_snapshot_startup_state=lambda: {}))
+    before = startup_state(executor)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert before == startup_state(executor)
+    assert before["graphs"]["batch1"] == graph.raw_cuda_graph_exec()
+    assert torch.equal(buffer, torch.full_like(buffer, 1))
+
+
 class TestResourceManager(unittest.TestCase):
     CPP_RESOURCES_DIR = os.path.join(str(root_dir), "cpp", "tests", "resources")
     CPP_DATA_DIR = os.path.join(CPP_RESOURCES_DIR, "data")

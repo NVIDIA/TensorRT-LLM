@@ -6496,6 +6496,30 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.close()
         return success
 
+    def _snapshot_startup_state(self) -> dict:
+        """Check clean-template ownership without freeing graph-required blocks.
+
+        Returns:
+            Allocation, reserved-owner and capacity evidence for restore checks.
+
+        Raises:
+            ValueError: If a user KV cache remains at the startup boundary.
+        """
+        if any(request_id < _GUARD_PAGE_REQUEST_ID for request_id in self.kv_cache_map):
+            raise ValueError("Snapshot startup contains non-reserved KV owners")
+        stats = self.get_kv_cache_stats()
+        return {
+            "manager": "v2",
+            "pools": [self.get_buffers(layer).data_ptr() for layer in sorted(self.layer_offsets)],
+            "reserved_owners": [
+                [request_id, cache.num_blocks, cache.capacity]
+                for request_id, cache in sorted(self.kv_cache_map.items())
+            ],
+            "max_blocks": stats.max_num_blocks,
+            "free_blocks": stats.free_num_blocks,
+            "used_blocks": stats.used_num_blocks,
+        }
+
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:

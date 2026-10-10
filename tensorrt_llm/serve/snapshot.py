@@ -6,6 +6,7 @@
 import hmac
 import json
 import os
+import socket
 import stat
 import time
 from pathlib import Path
@@ -114,7 +115,10 @@ def startup_checkpoint(executor: "PyExecutor") -> None:
 
     args = executor.llm_args
     if (
-        executor.dist.world_size != 1
+        executor.dist.mapping.pp_size != 1
+        or executor.dist.mapping.cp_size != 1
+        or executor.dist.world_size > executor.dist.mapping.gpus_per_node
+        or executor.enable_attention_dp
         or executor.kv_cache_transceiver is not None
         or executor.kv_connector_manager is not None
         or executor.draft_model_engine is not None
@@ -125,7 +129,7 @@ def startup_checkpoint(executor: "PyExecutor") -> None:
         or args.kv_cache_config.host_cache_size
     ):
         raise ValueError(
-            "Snapshot prototype requires one aggregate rank, resident KV and no block reuse/GMS"
+            "Snapshot prototype requires single-node aggregate TP, resident KV and no block reuse/GMS"
         )
     if executor.worker_started or executor.active_requests or executor.previous_batch is not None:
         raise ValueError("Snapshot requires the clean startup boundary, not a live worker")
@@ -133,6 +137,7 @@ def startup_checkpoint(executor: "PyExecutor") -> None:
     if runner is None or not runner.graphs:
         raise ValueError("Snapshot prototype requires warmed CUDA graphs")
     torch.cuda.synchronize()
+    before = startup_state(executor)
     template = read_record(directory / "template.json")
     if not template.get("template_id"):
         raise ValueError("Missing Snapshot template identity")
@@ -142,6 +147,8 @@ def startup_checkpoint(executor: "PyExecutor") -> None:
         "world_size": executor.dist.world_size,
         "graph_keys": sorted(map(str, runner.graphs)),
         "template_id": template["template_id"],
+        "hostname": socket.gethostname(),
+        "state": before,
     }
     write_record(directory / f"capture-{executor.global_rank}.json", evidence)
     # The host owns the timeout. An absolute deadline saved in a template would
@@ -166,10 +173,58 @@ def startup_checkpoint(executor: "PyExecutor") -> None:
     )
     if sorted(map(str, runner.graphs)) != evidence["graph_keys"]:
         raise ValueError("Restored CUDA graph set changed")
+    if startup_state(executor) != before:
+        raise ValueError("Restored weights, graph handles or KV metadata changed")
+    peers = executor.dist.allgather(
+        (executor.global_rank, restored["session_id"], template["template_id"])
+    )
+    if sorted(peers) != [
+        (rank, restored["session_id"], template["template_id"])
+        for rank in range(executor.dist.world_size)
+    ]:
+        raise ValueError("Restored MPI cohort does not agree on the fresh session")
     write_record(
         directory / f"runtime-{executor.global_rank}.json",
         {**evidence, "session_id": restored["session_id"]},
     )
+
+
+def startup_state(executor: "PyExecutor") -> dict[str, Any]:
+    """Read clean-template invariants without resetting or reallocating KV.
+
+    Args:
+        executor: Warmed executor whose request loop has not started.
+
+    Returns:
+        Weight/buffer addresses, graph handles and manager-owned KV evidence.
+
+    Raises:
+        ValueError: If scheduler or transfer work exists at the boundary.
+    """
+    if (
+        executor.active_requests
+        or executor.previous_batch is not None
+        or executor._pending_transfer_responses
+        or executor._pending_response_terminations
+        or executor.request_accumulated
+        or executor.inflight_req_ids
+        or executor.num_scheduled_requests
+        or executor.num_unscheduled_requests
+    ):
+        raise ValueError("Snapshot startup has outstanding scheduler or transfer state")
+    model = executor.model_engine.model
+    tensors = list(model.named_parameters()) + list(model.named_buffers())
+    return {
+        "weights_and_buffers": [
+            [name, tensor.data_ptr(), list(tensor.shape), str(tensor.dtype)]
+            for name, tensor in tensors
+        ],
+        "graphs": {
+            str(key): graph.raw_cuda_graph_exec()
+            for key, graph in executor.model_engine.cuda_graph_runner.graphs.items()
+        },
+        "kv": executor.kv_cache_manager._snapshot_startup_state(),
+    }
 
 
 class SnapshotAdmission:
@@ -209,7 +264,17 @@ class SnapshotAdmission:
             and hmac.compare_digest(supplied, expected)
             and scope.get("path") in {"/health", "/v1/completions", "/server_info"}
         )
-        if not read_record(self.directory / "abort.json") and (active or validation):
+        lease = read_record(self.directory / "lease.json")
+        lease_valid = (
+            lease.get("session_id") == restored.get("session_id")
+            and isinstance(lease.get("expires_at"), (int, float))
+            and time.time() < lease["expires_at"]
+        )
+        if (
+            lease_valid
+            and not read_record(self.directory / "abort.json")
+            and (active or validation)
+        ):
             await self.app(scope, receive, send)
             return
         await send(

@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import signal
+import socket
 import subprocess
 import time
 import uuid
@@ -81,12 +82,24 @@ def terminate_tree(owned: dict[int, str]) -> None:
     Args:
         owned: Process identities recorded by this coordinator.
     """
-    for pid, identity in reversed(list(owned.items())):
+    descendants = dict(owned)
+    for pid, identity in owned.items():
+        current = process_tree(pid)
+        if current.get(pid) == identity:
+            descendants.update(current)
+    for pid, identity in reversed(list(descendants.items())):
         if process_tree(pid).get(pid) == identity:
             try:
-                os.kill(pid, signal.SIGKILL)
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            try:
+                if process_tree(pid).get(pid) == identity:
+                    signal.pidfd_send_signal(descriptor, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            finally:
+                os.close(descriptor)
 
 
 def run_tool(argv: list[str], log: Path, deadline: float) -> str:
@@ -113,13 +126,16 @@ def run_tool(argv: list[str], log: Path, deadline: float) -> str:
     return result.stdout.strip()
 
 
-def host_identity(bin_dir: Path, log: Path, deadline: float) -> dict[str, Any]:
+def host_identity(
+    bin_dir: Path, log: Path, deadline: float, interpose: bool = False
+) -> dict[str, Any]:
     """Record strict same-host compatibility and require real checkpoint tools.
 
     Args:
         bin_dir: Matched Snapshot/CRIU tool directory.
         log: Command log.
         deadline: Operation deadline.
+        interpose: Whether shared mappings require the matched interposer stack.
 
     Returns:
         Host, namespace, driver and executable identities.
@@ -132,6 +148,18 @@ def host_identity(bin_dir: Path, log: Path, deadline: float) -> dict[str, Any]:
     binaries = {
         name: file_digest((bin_dir / name).resolve()) for name in ("criu", "cuda-checkpoint-helper")
     }
+    if interpose:
+        binaries.update(
+            {
+                name: file_digest(bin_dir / name)
+                for name in (
+                    "cuinterpose-launch",
+                    "cuinterpose-coordinator",
+                    "libcuinterpose.so",
+                    "libcuinterpose_core.so",
+                )
+            }
+        )
     run_tool([str(bin_dir / "criu"), "check"], log, deadline)
     gpu = run_tool(
         ["nvidia-smi", "--query-gpu=uuid,name,driver_version", "--format=csv,noheader"],
@@ -147,7 +175,7 @@ def host_identity(bin_dir: Path, log: Path, deadline: float) -> dict[str, Any]:
         "kernel": platform.release(),
         "gpus": gpu,
         "binaries": binaries,
-        "snapshot_revision": SNAPSHOT_REVISION,
+        "adapter_contract_revision": SNAPSHOT_REVISION,
     }
 
 
@@ -164,8 +192,78 @@ def validate_profile(profile: dict[str, Any]) -> None:
         raise ValueError(f"Profile requires {sorted(_PROFILE_KEYS)}")
     if any(profile[key] in (None, "", [], {}) for key in _PROFILE_KEYS):
         raise ValueError("Profile identity fields must be nonempty")
-    if profile["topology"] != {"nodes": 1, "tp": 1, "pp": 1, "cp": 1}:
-        raise ValueError("Phase 1 host adapter supports one aggregate GPU only")
+    topology = profile["topology"]
+    if (
+        not isinstance(topology, dict)
+        or set(topology) != {"nodes", "tp", "pp", "cp"}
+        or type(topology["tp"]) is not int
+        or topology["tp"] < 1
+        or topology["nodes"] != 1
+        or topology["pp"] != 1
+        or topology["cp"] != 1
+    ):
+        raise ValueError("Host adapter supports only full-cohort single-node aggregate TP")
+
+
+def rank_records(
+    control: Path, phase: str, count: int, template_id: str, session_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Require one matching acknowledgement per configured rank.
+
+    Args:
+        control: Private control directory.
+        phase: Capture, memory or runtime record prefix.
+        count: Configured full-cohort size.
+        template_id: Expected artifact identity.
+        session_id: Expected fresh restore identity, when restoring.
+
+    Returns:
+        Complete rank records, or an empty list while some ranks are missing.
+
+    Raises:
+        ValueError: If any available record is stale or from another cohort.
+    """
+    result = []
+    for rank in range(count):
+        path = control / f"{phase}-{rank}.json"
+        if not path.exists():
+            continue
+        record = probe._read_json(path)
+        if (
+            record.get("rank") != rank
+            or record.get("world_size") != count
+            or record.get("template_id") != template_id
+            or record.get("hostname") != socket.gethostname()
+            or (session_id is not None and record.get("session_id") != session_id)
+        ):
+            raise ValueError(f"Invalid {phase} acknowledgement from rank {rank}")
+        result.append(record)
+    if len(result) != count:
+        return []
+    if len({record["pid"] for record in result}) != count:
+        raise ValueError("MPI ranks must have distinct process identities")
+    return result
+
+
+def interposer_operation(
+    bin_dir: Path, action: str, pids: list[int], images: Path, log: Path, deadline: float
+) -> None:
+    """Invoke Snapshot's real shared-mapping coordinator for the fixed cohort.
+
+    Args:
+        bin_dir: Matched Snapshot binaries.
+        action: Inspect, prepare or restore.
+        pids: Complete CUDA process cohort in the same PID namespace.
+        images: Artifact directory for interposer state.
+        log: Command log.
+        deadline: Operation deadline.
+    """
+    command = [str(bin_dir / "cuinterpose-coordinator"), f"--{action}", "--socket-dir", "/tmp"]
+    if action != "inspect":
+        command += ["--checkpoint-dir", str(images)]
+    for pid in pids:
+        command += ["--process", str(pid)]
+    run_tool(command, log, deadline)
 
 
 def capture(args: argparse.Namespace) -> dict[str, Any]:
@@ -179,11 +277,19 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
     """
     profile = probe._read_json(args.profile)
     validate_profile(profile)
+    world_size = profile["topology"]["tp"]
+    interpose = world_size > 1
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
-    if not command or Path(command[0]).name != "trtllm-serve" or command.count("{address}") != 1:
-        raise ValueError("Expected trtllm-serve argv with exactly one {address} argument")
+    if (
+        not command
+        or Path(command[0]).name != "trtllm-serve"
+        or command.count("{address}") != 1
+        or command.count("--report_addr") != 1
+        or command.index("{address}") != command.index("--report_addr") + 1
+    ):
+        raise ValueError("Expected trtllm-serve argv with exactly one --report_addr {address}")
     artifact = args.artifact.resolve()
     artifact.mkdir(mode=0o700)
     control = artifact / "control"
@@ -193,11 +299,19 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
     deadline = time.monotonic() + args.timeout
     started = time.monotonic()
     log = artifact / "capture.log"
-    identity = host_identity(args.snapshot_bin, log, deadline)
+    identity = host_identity(args.snapshot_bin, log, deadline, interpose)
     template_id = uuid.uuid4().hex
     probe._write_report(control / "template.json", {"template_id": template_id})
     env = dict(os.environ, TRTLLM_SNAPSHOT_DIR=str(control))
     command = [str(control / "address") if item == "{address}" else item for item in command]
+    if interpose:
+        command = [
+            str(args.snapshot_bin / "cuinterpose-launch"),
+            "--library",
+            str(args.snapshot_bin / "libcuinterpose.so"),
+            "--",
+            *command,
+        ]
     owned = {}
     with (artifact / "candidate.log").open("w") as output:
         process = subprocess.Popen(
@@ -209,24 +323,24 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             start_new_session=True,
         )
         try:
-            while not (control / "capture-0.json").exists():
+            ranks = []
+            while not ranks:
                 probe._check_process(process)
                 probe._remaining(deadline)
+                ranks = rank_records(control, "capture", world_size, template_id)
                 time.sleep(0.05)
-            rank = probe._read_json(control / "capture-0.json")
             owned = process_tree(process.pid)
-            if (
-                rank["template_id"] != template_id
-                or rank["world_size"] != 1
-                or rank["pid"] not in owned
-            ):
+            if any(rank["pid"] not in owned for rank in ranks):
                 raise ValueError("Capture rank is not in the owned native process tree")
             cuda_pids = run_tool(
                 ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], log, deadline
             )
             cuda_pids = sorted(set(int(pid) for pid in cuda_pids.splitlines()) & owned.keys())
-            if rank["pid"] not in cuda_pids:
+            if any(rank["pid"] not in cuda_pids for rank in ranks):
                 raise ValueError("Warmed rank is not reported as a CUDA process")
+            if interpose:
+                interposer_operation(args.snapshot_bin, "inspect", cuda_pids, images, log, deadline)
+                interposer_operation(args.snapshot_bin, "prepare", cuda_pids, images, log, deadline)
             for action in ("lock", "checkpoint"):
                 for pid in cuda_pids:
                     run_tool(
@@ -269,7 +383,8 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
                 "root_pid": process.pid,
                 "pids": list(owned),
                 "cuda_pids": cuda_pids,
-                "ranks": [rank],
+                "ranks": ranks,
+                "interpose": interpose,
                 "artifact_path": str(artifact),
                 "capture_seconds": time.monotonic() - started,
                 "images": {
@@ -296,6 +411,7 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
     Returns:
         Trial evidence. Cold fallback is never attempted.
     """
+    started = time.monotonic()
     artifact = args.artifact.resolve()
     manifest = probe._read_json(artifact / "manifest.json")
     profile = probe._read_json(args.profile)
@@ -314,14 +430,18 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
         or baseline.get("generation_probe_status") != "PASS"
         or baseline.get("profile_digest") != probe._digest(profile)
         or baseline.get("requests_digest") != probe._digest(requests)
+        or not isinstance(requests, list)
+        or not requests
+        or not isinstance(baseline.get("outputs"), list)
+        or len(baseline["outputs"]) != len(requests)
     ):
         raise ValueError("Need a passing cold probe with the same profile and requests")
-    deadline = time.monotonic() + args.timeout
+    deadline = started + args.timeout
     session = uuid.uuid4().hex
     trial = artifact / f"restore-{session}"
     trial.mkdir(mode=0o700)
     log = trial / "host.log"
-    if host_identity(args.snapshot_bin, log, deadline) != manifest["host"]:
+    if host_identity(args.snapshot_bin, log, deadline, manifest["interpose"]) != manifest["host"]:
         raise ValueError("Host, GPU, driver, namespace or Snapshot tools changed")
     images = artifact / "images"
     if {
@@ -333,7 +453,9 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
     if any(Path(f"/proc/{pid}").exists() for pid in manifest["pids"]):
         raise ValueError("Source PID is still occupied; refuse restore")
     control = artifact / "control"
-    for path in [control / name for name in ("restore.json", "activate.json", "abort.json")]:
+    for path in [
+        control / name for name in ("restore.json", "activate.json", "abort.json", "lease.json")
+    ]:
         path.unlink(missing_ok=True)
     for path in list(control.glob("memory-*.json")) + list(control.glob("runtime-*.json")):
         path.unlink()
@@ -343,12 +465,11 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
         "session_id": session,
         "template_id": manifest["template_id"],
         "status": "FAIL",
-        "timings_seconds": {},
+        "timings_seconds": {"preflight": time.monotonic() - started},
         "outputs": [],
         "profile_digest": manifest["profile_digest"],
     }
     owned = {}
-    started = time.monotonic()
     try:
         run_tool(
             [
@@ -390,6 +511,10 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
                     deadline,
                 )
         report["timings_seconds"]["cuda_restored"] = time.monotonic() - started
+        if manifest["interpose"]:
+            interposer_operation(
+                args.snapshot_bin, "restore", manifest["cuda_pids"], images, log, deadline
+            )
         probe._write_report(
             control / "restore.json",
             {
@@ -398,14 +523,29 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
                 "validation_token": token,
             },
         )
+        probe._write_report(
+            control / "lease.json",
+            {"session_id": session, "expires_at": time.time() + probe._remaining(deadline)},
+        )
         while True:
             probe._remaining(deadline)
             if not process_tree(root):
                 raise RuntimeError("Restored server exited before runtime validation")
-            if (control / "runtime-0.json").exists():
-                rank = probe._read_json(control / "runtime-0.json")
-                if rank.get("session_id") != session:
-                    raise ValueError("Stale runtime-ready acknowledgement")
+            memory = rank_records(
+                control, "memory", profile["topology"]["tp"], manifest["template_id"], session
+            )
+            if memory:
+                report["timings_seconds"].setdefault("memory_ready", time.monotonic() - started)
+            runtime = rank_records(
+                control, "runtime", profile["topology"]["tp"], manifest["template_id"], session
+            )
+            if memory and runtime:
+                if [
+                    {key: value for key, value in rank.items() if key != "session_id"}
+                    for rank in runtime
+                ] != manifest["ranks"]:
+                    raise ValueError("Runtime evidence differs from the captured cohort")
+                report["ranks"] = runtime
                 break
             time.sleep(0.05)
         report["timings_seconds"]["runtime_ready"] = time.monotonic() - started
@@ -429,9 +569,13 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
             if status != 200:
                 raise ValueError(f"Private generation returned HTTP {status}")
             report["outputs"].append(probe._completion(body))
+            report["timings_seconds"].setdefault("first_completion", time.monotonic() - started)
         if report["outputs"] != baseline["outputs"]:
             raise ValueError("Restored completions differ from the cold baseline")
         report["timings_seconds"]["first_validated_responses"] = time.monotonic() - started
+        probe._write_report(
+            control / "lease.json", {"session_id": session, "expires_at": time.time() + 5}
+        )
         probe._write_report(
             control / "activate.json",
             {"template_id": manifest["template_id"], "session_id": session},
@@ -444,15 +588,20 @@ def restore(args: argparse.Namespace) -> dict[str, Any]:
         print(json.dumps(report), flush=True)
         if args.serve:
             while process_tree(root):
+                probe._write_report(
+                    control / "lease.json", {"session_id": session, "expires_at": time.time() + 5}
+                )
                 time.sleep(1)
         return report
     except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
         report["error"] = f"{type(error).__name__}: {error}"
         raise
     finally:
-        probe._write_report(control / "abort.json", {"session_id": session})
-        terminate_tree(owned)
-        probe._write_report(trial / "report.json", report)
+        try:
+            probe._write_report(control / "abort.json", {"session_id": session})
+        finally:
+            terminate_tree(owned)
+            probe._write_report(trial / "report.json", report)
 
 
 def main() -> None:

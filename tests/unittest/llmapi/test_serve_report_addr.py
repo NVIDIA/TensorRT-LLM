@@ -31,7 +31,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, launch_server
+from tensorrt_llm.commands.serve import _publish_bound_address, disaggregated, launch_server, serve
+from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 
 # The reader half lives with the integration helpers, so both halves of the
 # round trip are exercised together and a change to either side fails here.
@@ -182,6 +183,57 @@ def test_launch_server_requires_a_way_to_learn_the_port() -> None:
     llm_args = {"backend": "pytorch", "model": "dummy"}
     with pytest.raises(AssertionError, match="Port must be specified"):
         launch_server("localhost", 0, llm_args)
+
+
+def test_snapshot_accepts_default_cli_multimodal_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI's empty multimodal config must not reject ordinary text serving.
+
+    Args:
+        tmp_path: Isolated control and address directory.
+        monkeypatch: Test-scoped environment and model-construction replacement.
+    """
+    tmp_path.chmod(0o700)
+    monkeypatch.setenv("TRTLLM_SNAPSHOT_DIR", str(tmp_path))
+
+    def model_boundary(**kwargs: object) -> None:
+        """Stop after the real launch checks and before GPU model construction.
+
+        Args:
+            **kwargs: Validated native model arguments.
+
+        Raises:
+            RuntimeError: To identify the model boundary without loading a model.
+        """
+        raise RuntimeError("reached model construction")
+
+    monkeypatch.setattr("tensorrt_llm.commands.serve.PyTorchLLM", model_boundary)
+    with pytest.raises(RuntimeError, match="reached model construction"):
+        launch_server(
+            "127.0.0.1",
+            0,
+            {"backend": "pytorch", "model": "dummy"},
+            multimodal_server_config=MultimodalServerConfig(),
+            report_addr=str(tmp_path / "address"),
+        )
+
+
+@pytest.mark.parametrize("option", ["--grpc", "--enable_visual_gen"])
+def test_snapshot_rejects_unguarded_transports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, option: str
+) -> None:
+    """No non-HTTP CLI path may bypass Snapshot's admission middleware.
+
+    Args:
+        tmp_path: Isolated control directory.
+        monkeypatch: Test-scoped environment replacement.
+        option: Non-HTTP serving option.
+    """
+    monkeypatch.setenv("TRTLLM_SNAPSHOT_DIR", str(tmp_path))
+    result = CliRunner().invoke(serve, ["dummy", option])
+    assert result.exit_code != 0
+    assert "Snapshot prototype requires the OpenAI HTTP server" in result.output
 
 
 @pytest.mark.parametrize(
