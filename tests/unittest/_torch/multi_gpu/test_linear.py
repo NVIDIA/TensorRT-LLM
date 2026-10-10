@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pickle
 import sys
 import traceback
@@ -12,8 +15,13 @@ from utils.util import skip_pre_blackwell
 import tensorrt_llm
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
-from tensorrt_llm.functional import AllReduceFusionOp, AllReduceParams
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
+                                     AllReduceStrategy)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -344,10 +352,20 @@ def check_accuracy(a, b, atol, rtol, percent):
 
 
 @torch.inference_mode
-def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
-                             hidden_size, dtype, output_ref, x_sf_global,
-                             w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
-                             w_sf_block_unswizzled):
+def fp4_row_linear_allreduce(tp_size,
+                             local_rank,
+                             seq_len,
+                             output_size,
+                             hidden_size,
+                             dtype,
+                             output_ref,
+                             x_sf_global,
+                             w_sf_global,
+                             x_fp4s,
+                             w_fp4,
+                             x_sf_blocks,
+                             w_sf_block_unswizzled,
+                             use_locality_domain=False):
     output_ref = output_ref.cuda()
     x_sf_global = x_sf_global.cuda()
     w_sf_global = w_sf_global.cuda()
@@ -369,6 +387,9 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
             rank=local_rank,
         ),
         tensor_parallel_mode=TensorParallelMode.ROW,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        locality_domain_policy=LocalityDomainPolicy(
+            enabled=use_locality_domain),
     )
 
     l0.load_weights([{
@@ -383,28 +404,54 @@ def fp4_row_linear_allreduce(tp_size, local_rank, seq_len, output_size,
     }])
 
     l0.cuda()
+    if use_locality_domain:
+        l0.post_load_weights()
+        assert l0.partition_plan.enabled
+        assert l0._locality_domain_weight_shards is not None
+        assert len(l0._locality_domain_weight_shards) == 2
+        assert l0.weight.numel() == 0
+        assert l0.weight_scale.numel() == 0
+        assert l0.all_reduce.strategy == AllReduceStrategy.AUTO
+        assert l0.all_reduce.uses_nccl_symmetric_memory_window()
+        # Guarantee that this regression exercises the routing guard even when
+        # fused GEMM-allreduce is unavailable in a particular test environment.
+        l0.use_fused_gemm_allreduce = True
+
     # TODO: parameters['weight']' size mismatch at index 0
     # l0 = torch.compile(l0)
     with torch.inference_mode(), autotune():
-        output = l0.forward((x_fp4, x_sf_block))
+        if use_locality_domain:
+            output = l0.forward((x_fp4, x_sf_block),
+                                all_reduce_params=AllReduceParams())
+        else:
+            output = l0.forward((x_fp4, x_sf_block))
 
     torch.cuda.synchronize()
-    check_accuracy(output, output_ref, atol=0.05, rtol=0.05, percent=0.99)
+    atol = 0.15 if use_locality_domain else 0.05
+    check_accuracy(output, output_ref, atol=atol, rtol=0.05, percent=0.99)
 
 
-def fp4_row_linear_allreduce_run_single_rank(func, tp_size, seq_len,
-                                             output_size, hidden_size, dtype,
-                                             output_ref, x_sf_global,
-                                             w_sf_global, x_fp4s, w_fp4,
+def fp4_row_linear_allreduce_run_single_rank(func,
+                                             tp_size,
+                                             seq_len,
+                                             output_size,
+                                             hidden_size,
+                                             dtype,
+                                             output_ref,
+                                             x_sf_global,
+                                             w_sf_global,
+                                             x_fp4s,
+                                             w_fp4,
                                              x_sf_blocks,
-                                             w_sf_block_unswizzled):
+                                             w_sf_block_unswizzled,
+                                             use_locality_domain=False):
     local_rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(local_rank)
 
     try:
         func(tp_size, local_rank, seq_len, output_size, hidden_size, dtype,
              output_ref, x_sf_global, w_sf_global, x_fp4s, w_fp4, x_sf_blocks,
-             w_sf_block_unswizzled)
+             w_sf_block_unswizzled, use_locality_domain)
     except Exception as e:
         print(f"Error: {e}")
         raise
@@ -475,3 +522,199 @@ def test_fp4_row_linear_allreduce(seq_len, output_size, hidden_size, dtype,
 
     for r in results:
         assert r is True
+
+
+@torch.inference_mode
+def bf16_row_linear_locality_domain_forward(x, hidden_size, dtype,
+                                            tensor_parallel_size,
+                                            tensor_parallel_rank, weights):
+    x = x.cuda()
+    output_size = weights[0].shape[0]
+    local_hidden_size = hidden_size // tensor_parallel_size
+
+    linear = Linear(
+        in_features=hidden_size,
+        out_features=output_size,
+        bias=False,
+        dtype=dtype,
+        mapping=Mapping(
+            world_size=tensor_parallel_size,
+            tp_size=tensor_parallel_size,
+            rank=tensor_parallel_rank,
+        ),
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        allreduce_strategy=AllReduceStrategy.AUTO,
+        use_cute_dsl_bf16_gemm=True,
+        enable_locality_domain_bf16_linear=True,
+        locality_domain_policy=LocalityDomainPolicy(enabled=True),
+    )
+    linear.load_weights([{"weight": weights[0]}])
+    linear.cuda()
+    linear.post_load_weights()
+
+    assert linear.partition_plan.enabled
+    assert linear.partition_plan.op_kind == "bf16_linear"
+    assert linear._locality_domain_weight_shards is not None
+    assert len(linear._locality_domain_weight_shards) == 2
+    assert linear.weight.numel() == 0
+    assert linear._locality_domain_weight_shards[0]["weight"].shape == (
+        output_size // 2,
+        local_hidden_size,
+    )
+    # ROW-TP must not select a path that reads the released full weight even if
+    # a fused GEMM/all-reduce capability flag is set.
+    linear.use_fused_gemm_allreduce = True
+
+    input_shard = torch.chunk(x, tensor_parallel_size,
+                              dim=-1)[tensor_parallel_rank].contiguous()
+    with autotune():
+        output = linear(input_shard, all_reduce_params=AllReduceParams())
+    expected = x.float() @ weights[0].cuda().t().float()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), expected, rtol=1e-2, atol=0.5)
+
+
+def _prepare_fp4_row_linear_allreduce_case(
+    seq_len: int,
+    output_size: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    tp_size: int,
+    sample_device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor],
+           torch.Tensor, list[torch.Tensor], torch.Tensor]:
+    scaling_vector_size = 16
+    x = torch.randn((seq_len, hidden_size), dtype=dtype,
+                    device=sample_device).cuda()
+    weight = torch.randn((output_size, hidden_size),
+                         dtype=dtype,
+                         device=sample_device).cuda()
+
+    x_sf_global = (448 * 6) / x.abs().max().float()
+    x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(x, x_sf_global,
+                                                      scaling_vector_size,
+                                                      False)
+    weight_sf_global = (448 * 6) / weight.abs().max().float()
+    weight_fp4, weight_sf_block = torch.ops.trtllm.fp4_quantize(
+        weight, weight_sf_global, scaling_vector_size, False)
+    weight_sf_unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
+        weight_sf_block.cpu().view(pad_up(output_size, 128), -1))
+
+    with torch.inference_mode():
+        alpha_ref = 1.0 / (weight_sf_global * x_sf_global)
+        output_ref = torch.ops.trtllm.fp4_gemm(
+            x_fp4,
+            weight_fp4,
+            x_sf_block,
+            weight_sf_block,
+            alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+            dtype,
+        )
+
+    input_fp4_shards = []
+    input_sf_shards = []
+    for input_shard in torch.chunk(x, tp_size, dim=-1):
+        input_fp4, input_sf = torch.ops.trtllm.fp4_quantize(
+            input_shard.contiguous(), x_sf_global, scaling_vector_size, False)
+        input_fp4_shards.append(input_fp4.cpu())
+        input_sf_shards.append(input_sf.cpu())
+
+    torch.cuda.synchronize()
+    return (
+        output_ref.cpu(),
+        x_sf_global.cpu(),
+        weight_sf_global.cpu(),
+        input_fp4_shards,
+        weight_fp4.cpu(),
+        input_sf_shards,
+        weight_sf_unswizzled.cpu(),
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="CuTe DSL package with Rubin support is not available",
+)
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_fp4_row_linear_allreduce_locality_domain_freed_weights(
+        mpi_pool_executor, monkeypatch):
+    is_locality_domain_enabled.cache_clear()
+    if not is_locality_domain_enabled():
+        pytest.skip(
+            "locality domain localization is not enabled/supported on this system"
+        )
+
+    monkeypatch.setenv("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "1")
+    monkeypatch.setenv("TLLM_NCCL_SYMMETRIC_ZERO_COPY", "1")
+    torch.manual_seed(42)
+
+    seq_len = 1
+    output_size = 1536
+    hidden_size = 4224
+    dtype = torch.bfloat16
+    tp_size = mpi_pool_executor.num_workers
+    case_inputs = _prepare_fp4_row_linear_allreduce_case(seq_len,
+                                                         output_size,
+                                                         hidden_size,
+                                                         dtype,
+                                                         tp_size,
+                                                         sample_device="cuda")
+    rank_args = (fp4_row_linear_allreduce, tp_size, seq_len, output_size,
+                 hidden_size, dtype, *case_inputs, True)
+    results = mpi_pool_executor.map(
+        fp4_row_linear_allreduce_run_single_rank,
+        *zip(*[rank_args] * tp_size),
+    )
+
+    for result in results:
+        assert result is True
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="CuTe DSL package with Rubin support is not available",
+)
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="needs 2 GPUs to run this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_bf16_row_linear_allreduce_locality_domain_freed_weights(
+        mpi_pool_executor):
+    is_locality_domain_enabled.cache_clear()
+    if not is_locality_domain_enabled():
+        pytest.skip(
+            "locality domain localization is not enabled/supported on this system"
+        )
+
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    torch.manual_seed(107)
+    seq_len = 1
+    hidden_size = 512
+    output_size = 256
+    dtype = torch.bfloat16
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    weight = torch.randn((output_size, hidden_size), dtype=dtype)
+
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(
+            tensor_parallel_size,
+            bf16_row_linear_locality_domain_forward,
+            x,
+            [weight],
+            hidden_size,
+            dtype,
+        )] * tensor_parallel_size),
+    )
+    for result in results:
+        assert result is True

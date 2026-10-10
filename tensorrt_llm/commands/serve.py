@@ -292,6 +292,7 @@ def get_llm_args(
         agent_percentage: float = 0.0,
         agent_types: Optional[str] = None,
         explicit_cli_keys: Optional[Set[str]] = None,
+        enable_locality_domains: bool = False,
         **llm_args_extra_dict: Any):
 
     explicit_cli_keys = explicit_cli_keys or set()
@@ -361,6 +362,8 @@ def get_llm_args(
         enable_chunked_prefill,
         "enable_attention_dp":
         enable_attention_dp,
+        "enable_locality_domains":
+        enable_locality_domains,
         "revision":
         revision,
         "reasoning_parser":
@@ -1138,6 +1141,12 @@ def launch_visual_gen_server(
                   default=False,
                   help="Enable attention data parallel.",
                   status="beta")
+@stability_option(
+    "--enable_locality_domains",
+    is_flag=True,
+    default=False,
+    help="Enable locality domain execution for supported PyTorch backend ops.",
+    status="prototype")
 @stability_option("--media_io_kwargs",
                   type=str,
                   default=None,
@@ -1285,6 +1294,7 @@ def serve(
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
     report_addr: Optional[str],
+    enable_locality_domains: bool = False,
 ) -> None:
     """Running an OpenAI API compatible server
 
@@ -1401,6 +1411,7 @@ def serve(
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_attention_dp=enable_attention_dp,
+            enable_locality_domains=enable_locality_domains,
             video_pruning_rate=video_pruning_rate,
             telemetry=telemetry,
             agent_percentage=agent_percentage,

@@ -21,9 +21,14 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
+                                                IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+from tensorrt_llm._torch.modules.linear import (Linear, WeightMode,
+                                                WeightsLoadingConfig)
+from tensorrt_llm._torch.modules.swiglu import swiglu
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, model_extra_attrs
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -929,3 +934,500 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
     # Tolerance is kept because the biased and unbiased calls may pick
     # different autotuner tactics, i.e. a different accumulation order.
     torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)
+
+
+def _skip_if_no_locality_domain():
+    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CuTe DSL package with Rubin support is not available")
+    is_locality_domain_enabled.cache_clear()
+    if not is_locality_domain_enabled():
+        pytest.skip(
+            "locality domain localization is not enabled/supported on this system"
+        )
+
+
+def _create_fp4_weights(output_size, hidden_size, dtype):
+    weight = torch.randn((output_size, hidden_size), dtype=dtype).cuda()
+    weight_sf_global = (448 * 6) / weight.abs().max().float()
+    weight_fp4, weight_sf_block = torch.ops.trtllm.fp4_quantize(
+        weight, weight_sf_global, scaling_vector_size, False)
+    weight_sf_block_unswizzled = (
+        torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_sf_block.cpu().view(pad_up(output_size, 128), -1)))
+    return weight_fp4, weight_sf_block, weight_sf_block_unswizzled, weight_sf_global
+
+
+def _create_fp4_input(seq_len, hidden_size, dtype):
+    input_raw = torch.randn(seq_len, hidden_size, dtype=dtype).cuda()
+    input_sf_global = (448 * 6) / input_raw.abs().max().float()
+    input_fp4, input_sf_block = torch.ops.trtllm.fp4_quantize(
+        input_raw, input_sf_global, scaling_vector_size, False)
+    return Fp4QuantizedTensor(input_fp4, input_sf_block), input_sf_global
+
+
+def _make_locality_domain_weight_dict(weight_fp4,
+                                      weight_sf_block_unswizzled,
+                                      input_sf_global,
+                                      weight_sf_global,
+                                      bias=None):
+    weight_dict = {
+        "input_scale": 1.0 / input_sf_global.cpu(),
+        "weight": weight_fp4.cpu(),
+        "weight_scale": weight_sf_block_unswizzled.view(torch.float8_e4m3fn),
+        "weight_scale_2": 1.0 / weight_sf_global.cpu(),
+    }
+    if bias is not None:
+        weight_dict["bias"] = bias
+    return [weight_dict]
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize(
+    "mnk",
+    [(1, 7168, 2112), (256, 7168, 2112)],
+)
+def test_fp4_linear_locality_domain_correctness(mnk, tmp_path):
+    _skip_if_no_locality_domain()
+    from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile
+
+    seq_len, output_size, hidden_size = mnk
+    dtype = torch.bfloat16
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+
+    locality_domain_linear = Linear(
+        in_features=hidden_size,
+        out_features=output_size,
+        bias=False,
+        dtype=dtype,
+        quant_config=quant_config,
+        nvfp4_allowed_backends=["cutedsl"],
+        locality_domain_policy=LocalityDomainPolicy(enabled=True))
+    assert locality_domain_linear.partition_plan.enabled
+
+    weight_fp4, weight_sf, weight_sf_unswizzled, weight_sf_global = (
+        _create_fp4_weights(output_size, hidden_size, dtype))
+    input_tensor, input_sf_global = _create_fp4_input(seq_len, hidden_size,
+                                                      dtype)
+    weight_dict = _make_locality_domain_weight_dict(weight_fp4,
+                                                    weight_sf_unswizzled,
+                                                    input_sf_global,
+                                                    weight_sf_global)
+
+    locality_domain_linear.load_weights(weight_dict)
+    locality_domain_linear = locality_domain_linear.cuda()
+    locality_domain_linear.post_load_weights()
+
+    tuner = AutoTuner.get()
+    old_settings = (tuner.warmup, tuner.repeat, tuner.stream_delay_micro_secs)
+    # Compile each tactic before the autotuner captures its CUDA graph.
+    tuner.warmup = 1
+    tuner.repeat = 1
+    tuner.stream_delay_micro_secs = 10
+    try:
+        tuner.clear_cache()
+        with torch.inference_mode():
+            output_base = torch.ops.trtllm.nvfp4_gemm_cutlass(
+                input_tensor.fp4_tensor,
+                weight_fp4,
+                input_tensor.scaling_factor,
+                weight_sf,
+                1.0 / (input_sf_global * weight_sf_global),
+                dtype,
+            )
+
+        tuner.clear_cache()
+        tuner.reset_statistics()
+        with torch.inference_mode(), autotune(
+                cache_path=str(tmp_path / "locality_domain.json")):
+            output_locality_domain = locality_domain_linear.forward(
+                input_tensor)
+
+        assert seq_len in (1, 256), (
+            f"tactic expectations are only defined for seq_len 1 and 256, got {seq_len}"
+        )
+        op_name = ("trtllm::cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin"
+                   "::locality_domain_concurrent")
+        assert tuner.stats.tuned_op_profiled_configs.get(op_name, 0) > 0, str(
+            tuner.stats)
+        assert not tuner.stats.failed_profiling_count.get(op_name, set())
+
+        with tuner.capture() as tactics_capture, torch.inference_mode():
+            output_locality_domain = locality_domain_linear.forward(
+                input_tensor)
+
+        assert len(tactics_capture._captured_contexts) == 1
+        context = tactics_capture._captured_contexts[0]
+        assert context["custom_op"] == op_name
+        concurrent_runner = context["runners"][0]
+        tactics = concurrent_runner.get_valid_tactics(context["inputs"],
+                                                      OptimizationProfile())
+        base_tactics = [tactic for tactic in tactics if tactic[0] == "base"]
+        mixed_tactics = [
+            tactic for tactic in tactics if tactic[0] == "mixed_clusters"
+        ]
+
+        if seq_len == 1:
+            assert {tactic[4] for tactic in base_tactics} == {True}
+            assert not mixed_tactics
+            replay_tactics = [base_tactics[0]]
+        else:
+            assert {tactic[4] for tactic in base_tactics} == {False}
+            assert {tactic[5] for tactic in mixed_tactics} == {True}
+            replay_tactics = [base_tactics[0], mixed_tactics[0]]
+
+        for tactic in replay_tactics:
+            with torch.inference_mode():
+                context["inputs"][-1].zero_()
+                concurrent_runner(context["inputs"], tactic=tactic)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output_base,
+                context["inputs"][-1][:, :output_size],
+                rtol=1e-2,
+                atol=0.15,
+            )
+    finally:
+        tuner.warmup, tuner.repeat, tuner.stream_delay_micro_secs = old_settings
+
+    torch.cuda.synchronize()
+    assert locality_domain_linear.partition_plan.num_partitions == 2
+    torch.testing.assert_close(output_base,
+                               output_locality_domain,
+                               rtol=1e-2,
+                               atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("input_kind", ["quantized-tensor", "tuple"])
+def test_fp4_linear_locality_domain_rank3_prequantized_input(input_kind):
+    _skip_if_no_locality_domain()
+    torch.manual_seed(0)
+
+    batch_size, seq_len = 2, 3
+    output_size, hidden_size = 192, 128
+    dtype = torch.bfloat16
+    common_kwargs = {
+        "in_features": hidden_size,
+        "out_features": output_size,
+        "bias": False,
+        "dtype": dtype,
+        "quant_config": QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        "nvfp4_allowed_backends": ["cutlass"],
+    }
+    base_linear = Linear(**common_kwargs,
+                         locality_domain_policy=LocalityDomainPolicy(
+                             enabled=False))
+    locality_domain_linear = Linear(**common_kwargs,
+                                    locality_domain_policy=LocalityDomainPolicy(
+                                        enabled=True))
+
+    input_flat, input_sf_global = _create_fp4_input(batch_size * seq_len,
+                                                    hidden_size, dtype)
+    reference_input = Fp4QuantizedTensor(
+        input_flat.fp4_tensor.reshape(batch_size, seq_len,
+                                      input_flat.fp4_tensor.shape[-1]),
+        input_flat.scaling_factor,
+        input_flat.is_sf_swizzled,
+    )
+    input_tensor = (reference_input if input_kind == "quantized-tensor" else
+                    (reference_input.fp4_tensor,
+                     reference_input.scaling_factor))
+    weight_fp4, _, weight_sf_unswizzled, weight_sf_global = (
+        _create_fp4_weights(output_size, hidden_size, dtype))
+    weight_dict = _make_locality_domain_weight_dict(
+        weight_fp4,
+        weight_sf_unswizzled,
+        input_sf_global,
+        weight_sf_global,
+    )
+    base_linear.load_weights(weight_dict)
+    base_linear = base_linear.cuda()
+    base_linear.post_load_weights()
+    locality_domain_linear.load_weights(weight_dict)
+    locality_domain_linear = locality_domain_linear.cuda()
+    locality_domain_linear.post_load_weights()
+    assert locality_domain_linear.partition_plan.enabled
+
+    with torch.inference_mode(), autotune():
+        output_base = base_linear(reference_input)
+        output_locality_domain = locality_domain_linear(input_tensor)
+
+    assert output_locality_domain.shape == (batch_size, seq_len, output_size)
+    torch.testing.assert_close(output_locality_domain,
+                               output_base,
+                               rtol=1e-2,
+                               atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+def test_fp4_fused_gate_up_linear_locality_domain_correctness():
+    _skip_if_no_locality_domain()
+    torch.manual_seed(0)
+
+    m, intermediate_size, hidden_size = 1, 1024, 2048
+    output_size = 2 * intermediate_size
+    dtype = torch.bfloat16
+    weights_loading_config = WeightsLoadingConfig(
+        weight_mode=WeightMode.FUSED_GATE_UP_LINEAR)
+    locality_domain_linear = Linear(
+        in_features=hidden_size,
+        out_features=output_size,
+        bias=False,
+        dtype=dtype,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        weights_loading_config=weights_loading_config,
+        fused_weight_shard_indices_mapping={
+            "gate": (0, intermediate_size),
+            "up": (intermediate_size, intermediate_size),
+        },
+        use_cute_dsl_blockscaling_mm=True,
+        nvfp4_allowed_backends=["cutlass"],
+        locality_domain_policy=LocalityDomainPolicy(enabled=True),
+    )
+    assert locality_domain_linear.partition_plan.enabled
+
+    input_tensor, input_sf_global = _create_fp4_input(m, hidden_size, dtype)
+    full_weight = torch.randn(output_size,
+                              hidden_size,
+                              dtype=dtype,
+                              device="cuda")
+    weight_sf_global = (448 * 6) / full_weight.abs().max().float()
+    weight_dicts = []
+    quantized_weights = []
+    quantized_weight_scales = []
+    for weight in full_weight.chunk(2, dim=0):
+        weight_fp4, weight_sf = torch.ops.trtllm.fp4_quantize(
+            weight, weight_sf_global, scaling_vector_size, False)
+        weight_sf_unswizzled = (torch.ops.trtllm.block_scale_interleave_reverse(
+            weight_sf.cpu().view(pad_up(intermediate_size, 128), -1)))
+        quantized_weights.append(weight_fp4)
+        quantized_weight_scales.append(weight_sf)
+        weight_dicts.append(
+            _make_locality_domain_weight_dict(
+                weight_fp4,
+                weight_sf_unswizzled,
+                input_sf_global,
+                weight_sf_global,
+            )[0])
+
+    locality_domain_linear.load_weights(weight_dicts)
+    for attr in (
+            "tmp_nvfp4_weight_scales",
+            "tmp_nvfp4_input_scales_list",
+            "tmp_nvfp4_weight_scale_2_list",
+            "tmp_nvfp4_pre_quant_scale",
+    ):
+        assert not hasattr(locality_domain_linear, attr)
+    locality_domain_linear = locality_domain_linear.cuda()
+    locality_domain_linear.post_load_weights()
+
+    shards = locality_domain_linear._locality_domain_weight_shards
+    assert shards is not None
+    for shard, weight, weight_scale in zip(shards, quantized_weights,
+                                           quantized_weight_scales):
+        assert torch.equal(shard["weight"], weight)
+        assert torch.equal(shard["weight_scale"], weight_scale)
+    assert locality_domain_linear.weight.numel() == 0
+    assert locality_domain_linear.weight_scale.numel() == 0
+
+    with torch.inference_mode(), autotune():
+        alpha = 1.0 / (input_sf_global * weight_sf_global)
+        base_gate_up = torch.cat([
+            torch.ops.trtllm.nvfp4_gemm_cutlass(
+                input_tensor.fp4_tensor,
+                weight,
+                input_tensor.scaling_factor,
+                weight_scale,
+                alpha,
+                dtype,
+            ) for weight, weight_scale in zip(quantized_weights,
+                                              quantized_weight_scales)
+        ],
+                                 dim=-1)
+        locality_domain_gate_up = locality_domain_linear(input_tensor)
+        base_activated = swiglu(base_gate_up)
+        locality_domain_activated = swiglu(locality_domain_gate_up)
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(locality_domain_gate_up,
+                               base_gate_up,
+                               rtol=1e-2,
+                               atol=0.15)
+    torch.testing.assert_close(locality_domain_activated,
+                               base_activated,
+                               rtol=3e-2,
+                               atol=2.0)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize(
+    ("output_size", "hidden_size"),
+    [
+        pytest.param(7168, 2112, id="aligned-production-shape"),
+        pytest.param(192, 128, id="padded-scale-reload"),
+    ],
+)
+def test_fp4_linear_locality_domain_weight_lifecycle_and_global_bias(
+        output_size, hidden_size):
+    _skip_if_no_locality_domain()
+    torch.manual_seed(0)
+
+    m = 8
+    dtype = torch.bfloat16
+    linear = Linear(
+        in_features=hidden_size,
+        out_features=output_size,
+        bias=True,
+        dtype=dtype,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
+        nvfp4_allowed_backends=["cutedsl"],
+        locality_domain_policy=LocalityDomainPolicy(enabled=True),
+    )
+    assert linear.partition_plan.enabled
+
+    input_tensor, input_sf_global = _create_fp4_input(m, hidden_size, dtype)
+
+    def make_weight_generation():
+        weight_fp4, weight_sf, weight_sf_unswizzled, weight_sf_global = (
+            _create_fp4_weights(output_size, hidden_size, dtype))
+        bias = torch.randn(output_size, dtype=dtype)
+        weight_dict = _make_locality_domain_weight_dict(
+            weight_fp4,
+            weight_sf_unswizzled,
+            input_sf_global,
+            weight_sf_global,
+            bias,
+        )
+        return (weight_fp4, weight_sf, weight_sf_unswizzled, weight_sf_global,
+                bias, weight_dict)
+
+    def check_output(weight_fp4, weight_sf, weight_sf_global):
+        with torch.inference_mode():
+            output_no_bias = linear.apply_linear(input_tensor, None)
+            output = linear(input_tensor)
+            reference = torch.ops.trtllm.nvfp4_gemm_cutlass(
+                input_tensor.fp4_tensor,
+                weight_fp4,
+                input_tensor.scaling_factor,
+                weight_sf,
+                1.0 / (input_sf_global * weight_sf_global),
+                dtype,
+            )
+        torch.testing.assert_close(output_no_bias,
+                                   reference,
+                                   rtol=1e-2,
+                                   atol=0.15)
+        torch.testing.assert_close(output,
+                                   output_no_bias + linear.bias,
+                                   rtol=1e-2,
+                                   atol=0.15)
+
+    first_generation = make_weight_generation()
+    first_weight, first_scale, _, first_scale_global, first_bias, weight_dict = (
+        first_generation)
+    linear.load_weights(weight_dict)
+    linear = linear.cuda()
+    full_weight = linear.weight.data.clone()
+    full_bias = linear.bias.data.clone()
+    linear.post_load_weights()
+    shards = linear._locality_domain_weight_shards
+    assert shards is not None
+    assert len(shards) == linear.partition_plan.num_partitions
+
+    layout = linear.partition_plan.layout
+    assert layout is not None
+    assert layout.padded_axis_extent == full_weight.size(0)
+    partition_n = layout.per_partition_axis_extent(padded=True)
+    for shard in shards:
+        assert shard["weight"].shape == (partition_n, full_weight.shape[1])
+
+    reconstructed = torch.cat([shard["weight"] for shard in shards], dim=0)
+    assert torch.equal(reconstructed.cpu(), full_weight.cpu())
+    assert linear.weight.numel() == 0
+    assert linear.weight_scale.numel() == 0
+    assert torch.equal(linear.bias.cpu(), full_bias.cpu())
+    torch.testing.assert_close(full_bias.cpu(), first_bias)
+    assert all(set(shard) == {"weight", "weight_scale"} for shard in shards)
+    assert all("param" not in metadata
+               for metadata in linear.rebuild_tensor_metadata.values())
+    check_output(first_weight, first_scale, first_scale_global)
+
+    original_weight_shape = (output_size, hidden_size // 2)
+    original_scale_shape = tuple(
+        linear.rebuild_tensor_metadata["weight_scale"]["meta"].shape)
+    linear.pre_reload_weights()
+    assert linear._locality_domain_weight_shards is None
+    assert tuple(linear.weight.shape) == original_weight_shape
+    assert tuple(linear.weight_scale.shape) == original_scale_shape
+    assert linear.rebuild_tensor_metadata == {}
+
+    second_generation = make_weight_generation()
+    (second_weight, second_scale, second_scale_unswizzled, second_scale_global,
+     second_bias, second_weight_dict) = second_generation
+    linear.load_weights(second_weight_dict)
+    linear.post_load_weights()
+    second_shards = linear._locality_domain_weight_shards
+    assert second_shards is not None
+    assert second_shards is not shards
+    assert torch.equal(
+        torch.cat([shard["weight"] for shard in second_shards], dim=0),
+        second_weight,
+    )
+
+    logical_scale_parts = []
+    shard_n = output_size // len(second_shards)
+    for shard in second_shards:
+        padded_rows = pad_up(shard_n, 128)
+        scale = shard["weight_scale"].view(padded_rows, -1)
+        scale = torch.ops.trtllm.block_scale_interleave_reverse(scale)
+        logical_scale_parts.append(scale[:shard_n])
+    reloaded_scale = torch.cat(logical_scale_parts, dim=0)
+    torch.testing.assert_close(reloaded_scale.cpu(),
+                               second_scale_unswizzled[:output_size])
+    assert linear.weight.numel() == 0
+    assert linear.weight_scale.numel() == 0
+    assert all("bias" not in shard for shard in second_shards)
+    torch.testing.assert_close(linear.bias.cpu(), second_bias)
+    check_output(second_weight, second_scale, second_scale_global)
+
+
+@pytest.mark.skipif(get_sm_version() != 107
+                    or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+                    reason="Requires Rubin CuTe DSL")
+def test_cute_dsl_nvfp4_non_inplace_rubin():
+    torch.manual_seed(47)
+    x, x_scale = _create_fp4_input(8, 128, torch.bfloat16)
+    w, w_sf, _, w_scale = _create_fp4_weights(256, 128, torch.bfloat16)
+    alpha = 1.0 / (x_scale * w_scale)
+    args = (x.fp4_tensor, w, x.scaling_factor, w_sf, alpha, torch.bfloat16)
+    expected = torch.ops.trtllm.nvfp4_gemm_cutlass(*args)
+    op = torch.ops.trtllm.cute_dsl_nvfp4_gemm_rubin
+    output = op(*args)
+    torch.testing.assert_close(output, expected, rtol=1e-2, atol=0.15)
+    assert output.shape == (8, 256)
+    assert output.dtype == torch.bfloat16
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(*args)
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, expected, rtol=1e-2, atol=0.15)
+
+    with pytest.raises(ValueError, match="partition_id must be -1"):
+        op(*args, partition_id=0)
+    with pytest.raises(ValueError, match="must use"):
+        op(*args, output_tensor=output)
