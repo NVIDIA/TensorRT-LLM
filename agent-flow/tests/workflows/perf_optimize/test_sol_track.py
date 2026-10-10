@@ -706,6 +706,76 @@ def test_a_resumed_run_keeps_measuring_what_it_started_with(tmp_path):
     }
 
 
+def _adopted_workspace(tmp_path):
+    """A campaign workspace as the workflow leaves it: task.yaml + adopted sweep."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    task = {
+        SOL_TRACK_FIELD: {"track": "gen", "workspace": "/w", "sweep": str(_sweep_dir(tmp_path))}
+    }
+    sol_track.adopt_sweep(task, ws)
+    (ws / "task.yaml").write_text(yaml.safe_dump(task), encoding="utf-8")
+    (ws / "tuning").mkdir()
+    (ws / "tuning" / "extra_llm_api_options.yaml").write_text("{}\n", encoding="utf-8")
+    return ws
+
+
+def _item_tuning(ws, item: str, overlay: dict):
+    tuning = ws / "rounds" / "round_1" / item / "tuning" / "extra_llm_api_options.yaml"
+    tuning.parent.mkdir(parents=True)
+    tuning.write_text(yaml.safe_dump(overlay), encoding="utf-8")
+    return tuning
+
+
+def test_an_items_candidate_is_what_its_submit_measures(tmp_path):
+    """The reviewer's case: an item turns `enable_cuda_graph` on in ITS file.
+
+    The CLI used to read `<workspace>/tuning/` unconditionally, so the sweep
+    still carried the accepted configuration and the evaluator measured that
+    -- rejecting an untested candidate as having no gain.
+    """
+    ws = _adopted_workspace(tmp_path)
+    tuning = _item_tuning(ws, "item_1_opt-001", {"enable_cuda_graph": True})
+    sol_track._main(["--workspace", str(ws), "--tuning", str(tuning)])
+
+    item_sweep = tuning.parent.parent / "sweep" / "sweep.yaml"
+    assert yaml.safe_load(item_sweep.read_text())["gen_extra_llm_api"] == {
+        "enable_cuda_graph": True
+    }
+    # The campaign's own copy is not where a candidate goes.
+    assert "gen_extra_llm_api" not in yaml.safe_load((ws / "sweep" / "sweep.yaml").read_text())
+    # It travels with its siblings: the harness imports the plugin from beside it.
+    assert (item_sweep.parent / "gen_worker_config.py").is_file()
+
+
+def test_parallel_items_do_not_overwrite_each_others_overlay(tmp_path):
+    ws = _adopted_workspace(tmp_path)
+    one = _item_tuning(ws, "item_1_opt-001", {"enable_cuda_graph": True})
+    two = _item_tuning(ws, "item_2_opt-002", {"moe_config": {"backend": "TRTLLM"}})
+    sol_track._main(["--workspace", str(ws), "--tuning", str(one)])
+    sol_track._main(["--workspace", str(ws), "--tuning", str(two)])
+
+    def overlay(tuning):
+        sweep = tuning.parent.parent / "sweep" / "sweep.yaml"
+        return yaml.safe_load(sweep.read_text())["gen_extra_llm_api"]
+
+    assert overlay(one) == {"enable_cuda_graph": True}
+    assert overlay(two) == {"moe_config": {"backend": "TRTLLM"}}
+
+
+def test_without_an_item_the_campaign_sweep_is_used_as_before(tmp_path, capsys):
+    ws = _adopted_workspace(tmp_path)
+    (ws / "tuning" / "extra_llm_api_options.yaml").write_text(
+        yaml.safe_dump({"enable_cuda_graph": True}), encoding="utf-8"
+    )
+    sol_track._main(["--workspace", str(ws)])
+    printed = json.loads(capsys.readouterr().out)
+    assert Path(printed["sweep"]).resolve() == (ws / "sweep" / "sweep.yaml").resolve()
+    assert yaml.safe_load((ws / "sweep" / "sweep.yaml").read_text())["gen_extra_llm_api"] == {
+        "enable_cuda_graph": True
+    }
+
+
 def test_a_resume_does_not_overwrite_where_the_copy_came_from(tmp_path):
     """``adopted_from`` is what ``--clean`` restores from, so it must survive.
 
@@ -775,6 +845,18 @@ def _sections():
     from agent_flow.workflows.perf_optimize.prompts._common import SOL_TRACK_CTX, SOL_TRACK_GEN
 
     return SOL_TRACK_CTX, SOL_TRACK_GEN
+
+
+def test_both_tracks_apply_their_stages_own_tuning_file():
+    """The code takes `--tuning`; the prompt has to actually pass it.
+
+    A CLI that can apply an item's file is no fix if the agent is still told
+    to run it without one -- the root file would be applied and the candidate
+    left unmeasured, exactly as before.
+    """
+    for section in _sections():
+        assert "sol_track --workspace <workspace> --tuning $T" in section
+        assert 'S=<the "sweep" path that command printed>' in section
 
 
 def test_neither_track_is_told_to_hand_write_its_result():
