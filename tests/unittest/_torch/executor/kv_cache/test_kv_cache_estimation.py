@@ -19,7 +19,11 @@ import torch
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import (
+    KVCacheLayerSpec,
+    ModelConfig,
+    _get_kv_cache_layer_specs,
+)
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import (
     CacheCost,
@@ -30,7 +34,10 @@ from tensorrt_llm._torch.pyexecutor._util import (
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _get_static_cache_size_layer_components,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -48,6 +55,11 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_unconfigured_mock_has_no_kv_cache_layer_specs() -> None:
+    """A lightweight mock must not fabricate iterable per-layer geometry."""
+    assert _get_kv_cache_layer_specs(Mock()) is None
 
 
 def _make_mock_request(num_input_tokens, beam_width=1):
@@ -619,8 +631,14 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
-    config = hybrid._model_engine.model.model_config.pretrained_config
-    config.head_dim, config.global_head_dim = 256, 128
+    hybrid._model_engine.model.model_config.kv_cache_layer_specs = tuple(
+        KVCacheLayerSpec(
+            head_dim=256 if layer_type == "sliding_attention" else 128,
+            num_kv_heads=1,
+            attention_window=sliding_window if layer_type == "sliding_attention" else None,
+        )
+        for layer_type in layer_types
+    )
     uniform = _make_creator(
         tpb,
         [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
@@ -712,7 +730,10 @@ def test_uniform_window_overrides_mixed_attention_metadata() -> None:
         sliding_window=128,
     )
 
-    assert _get_num_pool_groups_for_estimation(config, 4096, [512]) == 1
+    assert (
+        _get_num_pool_groups_for_estimation(SimpleNamespace(pretrained_config=config), 4096, [512])
+        == 1
+    )
 
 
 def test_vswa_max_attention_window_fallback_scales():
@@ -766,8 +787,14 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         layer_types=layer_types,
         sliding_window=sliding_window,
     )
-    config = c._model_engine.model.model_config.pretrained_config
-    config.head_dim, config.global_head_dim = 256, 128
+    c._model_engine.model.model_config.kv_cache_layer_specs = tuple(
+        KVCacheLayerSpec(
+            head_dim=256 if layer_type == "sliding_attention" else 128,
+            num_kv_heads=1,
+            attention_window=sliding_window if layer_type == "sliding_attention" else None,
+        )
+        for layer_type in layer_types
+    )
 
     total_tokens = c._get_token_num_for_estimation()
     per_pool_tokens = total_tokens // 2  # 2 pool groups
@@ -931,6 +958,90 @@ def test_v2_cache_size_per_token_charges_reuse_window_lookahead():
     assert unsupported == no_draft
     assert block_reuse_disabled == no_draft
     assert single_kvcm == target == draft == CacheCost(slope=0, intercept=3 * 192 * 64)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "enable_attention_dp", "expected_sliding_layer_size"),
+    [
+        (1, False, 8192),
+        (8, False, 1024),
+        (8, True, 8192),
+    ],
+)
+def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
+    tp_size: int,
+    enable_attention_dp: bool,
+    expected_sliding_layer_size: int,
+) -> None:
+    layer_specs = tuple(
+        KVCacheLayerSpec(
+            head_dim=256 if (layer_idx + 1) % 6 else 512,
+            num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
+            attention_window=128 if (layer_idx + 1) % 6 else None,
+        )
+        for layer_idx in range(12)
+    )
+
+    class StrictConfig:
+        num_hidden_layers = 12
+        num_attention_heads = 16
+        hidden_size = 3840
+        vocab_size = 262_144
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"head_dim", "num_key_value_heads"}:
+                raise RuntimeError(f"global geometry must not be read: {name}")
+            return super().__getattribute__(name)
+
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = StrictConfig()
+        kv_cache_layer_specs = layer_specs
+
+        def get_num_attention_layers(self) -> int:
+            return self.pretrained_config.num_hidden_layers
+
+    model_config = FakeModelConfig()
+    mapping = Mapping(
+        world_size=tp_size,
+        tp_size=tp_size,
+        rank=0,
+        enable_attention_dp=enable_attention_dp,
+    )
+    max_seq_len = 8192
+    kv_cache_config = KvCacheConfig(
+        max_attention_window=[
+            spec.attention_window if spec.attention_window is not None else max_seq_len
+            for spec in layer_specs
+        ]
+    )
+
+    layer_sizes, attention_windows = _get_static_cache_size_layer_components(
+        model_config,
+        mapping,
+        max_seq_len=max_seq_len,
+        kv_cache_config=kv_cache_config,
+    )
+    expected_layer_sizes = [
+        expected_sliding_layer_size if spec.attention_window is not None else 2048
+        for spec in layer_specs
+    ]
+    expected_windows = [spec.attention_window for spec in layer_specs]
+    assert layer_sizes == expected_layer_sizes
+    assert attention_windows == expected_windows
+    assert CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            model_config,
+            mapping,
+            tokens_per_block=32,
+            max_seq_len=max_seq_len,
+            max_batch_size=1,
+            kv_cache_config=kv_cache_config,
+        )
+    ) == CacheCost(
+        slope=2 * 2048,
+        intercept=10 * 128 * expected_sliding_layer_size,
+    )
 
 
 def test_creator_uses_v2_affine_cache_cost():
