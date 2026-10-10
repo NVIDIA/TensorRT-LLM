@@ -732,6 +732,107 @@ def test_resolve_model_prefs_allows_registered_class_without_preference_hook(mon
     assert calls[0][1:] == (model_cls, hf_view)
 
 
+def _declared_arch_api(monkeypatch, registry, seen):
+    """API stand-in whose registry only knows `registry`'s architectures.
+
+    Both "auto" resolvers append the model class they were handed to `seen`,
+    keyed by resolver, and the checkpoint starts out unstaged (config.json
+    unreadable -> no class and no pretrained-config view).
+    """
+
+    def resolve_v2(args, model_cls, _pretrained_config):
+        seen.setdefault("v2", []).append((args, model_cls))
+        return True
+
+    def resolve_runtime(shim, model_cls, _pretrained_config):
+        seen.setdefault("runtime", []).append(model_cls)
+        shim.cache_transceiver_config.transceiver_runtime = "PYTHON"
+
+    monkeypatch.setattr(
+        rp,
+        "load_internal_apis",
+        lambda: types.SimpleNamespace(
+            get_registered_model_class=registry.get,
+            TorchLlmArgs=lambda **kwargs: types.SimpleNamespace(**kwargs),
+            resolve_kv_cache_manager_v2_auto=resolve_v2,
+            resolve_transceiver_runtime_auto=resolve_runtime,
+        ),
+    )
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (None, None))
+
+
+def test_resolve_model_prefs_auto_falls_back_to_declared_architecture(monkeypatch):
+    """An unstaged checkpoint must not decide the manager version or runtime.
+
+    Both preference hooks key off the architecture, so a yaml-declared
+    architecture keeps "auto" resolvable through the real serving resolvers
+    instead of aborting every ctx/gen instance (nvbugs/6748135).
+    """
+    model_cls = type("DeclaredModel", (), {})
+    seen = {}
+    _declared_arch_api(monkeypatch, {"DeepseekV4ForCausalLM": model_cls}, seen)
+    cache_cfg = types.SimpleNamespace(transceiver_runtime="auto")
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 8, "pp": 1, "cp": 1},
+        "architectures": ["DeepseekV4ForCausalLM"],
+    }
+
+    assert rp.resolve_model_prefs(None, side, cache_cfg) is True
+    # Same class through both resolvers, and the runtime really was resolved.
+    assert seen["runtime"] == [model_cls]
+    assert [cls for _args, cls in seen["v2"]] == [model_cls]
+    assert cache_cfg.transceiver_runtime == "PYTHON"
+    args = seen["v2"][0][0]
+    # TorchLlmArgs.model is a required str, so an unresolved dir must not be None.
+    assert args.model == ""
+    assert args.tensor_parallel_size == 8
+
+
+def test_resolve_model_prefs_prefers_the_staged_checkpoint_over_the_yaml(monkeypatch):
+    """The checkpoint stays authoritative when it is actually staged."""
+    from_ckpt = type("FromCheckpoint", (), {})
+    declared = type("FromYaml", (), {})
+    seen = {}
+
+    _declared_arch_api(monkeypatch, {"DeepseekV4ForCausalLM": declared}, seen)
+    monkeypatch.setattr(rp, "_lookup_model_cls", lambda _model_dir: (from_ckpt, object()))
+
+    rp.resolve_model_prefs(
+        "/models/staged",
+        {
+            "use_kv_cache_manager_v2": "auto",
+            "parallel": {"tp": 1, "pp": 1, "cp": 1},
+            "architectures": ["DeepseekV4ForCausalLM"],
+        },
+        types.SimpleNamespace(transceiver_runtime="PYTHON"),
+    )
+
+    assert [cls for _args, cls in seen["v2"]] == [from_ckpt]
+
+
+@pytest.mark.parametrize(
+    "architectures",
+    ([], ["NotARegisteredArchitecture"]),
+    ids=("none-declared", "unregistered"),
+)
+def test_resolve_model_prefs_still_fails_closed_without_a_resolvable_class(
+    monkeypatch, architectures
+):
+    """No checkpoint and no usable declaration must not silently assume V1."""
+    seen = {}
+    _declared_arch_api(monkeypatch, {}, seen)
+    side = {
+        "use_kv_cache_manager_v2": "auto",
+        "parallel": {"tp": 1, "pp": 1, "cp": 1},
+        "architectures": architectures,
+    }
+
+    with pytest.raises(RuntimeError, match="refusing to assume V1"):
+        rp.resolve_model_prefs(None, side, types.SimpleNamespace(transceiver_runtime="PYTHON"))
+    assert "v2" not in seen, "the serving resolver must not run without a model class"
+
+
 # --------------------------------------------------------------------------- #
 # Transfer ownership
 # --------------------------------------------------------------------------- #
@@ -1229,6 +1330,25 @@ class TestInternalApiContract:
         cache_cfg = api.CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
 
         assert rp.resolve_model_prefs(str(model_dir), side, cache_cfg) is True
+
+    def test_declared_architecture_selects_v2_without_a_staged_checkpoint(self, api):
+        """The unstaged-checkpoint path must reach the same answer as a staged one.
+
+        Real registry, real serving resolver, no config.json on disk: the
+        DeepSeek-V4 GB300 disagg lanes must still resolve to V2 + Python
+        rather than aborting the precheck (nvbugs/6748135).
+        """
+        side = {
+            "use_kv_cache_manager_v2": "auto",
+            "parallel": {"tp": 8, "pp": 1, "cp": 1},
+            "architectures": ["DeepseekV4ForCausalLM"],
+        }
+        cache_cfg = api.CacheTransceiverConfig(
+            backend="NIXL", transceiver_runtime="auto", kv_transfer_timeout_ms=600000
+        )
+
+        assert rp.resolve_model_prefs(None, side, cache_cfg) is True
+        assert cache_cfg.transceiver_runtime == "PYTHON"
 
     def test_enum_members(self, api):
         for enum, members in (
