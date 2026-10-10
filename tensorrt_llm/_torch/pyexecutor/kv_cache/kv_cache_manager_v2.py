@@ -1919,7 +1919,10 @@ class KVCacheManagerV2(BaseResourceManager):
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
-        self._prepare_page_table_tensor(index_mapper_capacity)
+        from tensorrt_llm._torch.virtual_memory import preserve_contents
+
+        with preserve_contents():
+            self._prepare_page_table_tensor(index_mapper_capacity)
         self._sparse_layer_group_ids = tuple(
             sorted(
                 {

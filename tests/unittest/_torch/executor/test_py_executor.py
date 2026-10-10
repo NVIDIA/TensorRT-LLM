@@ -2698,6 +2698,26 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
+@pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
+@pytest.mark.parametrize("release_kv", [False, True])
+def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv):
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+    stub = object.__new__(PyExecutor)
+    stub.llm_args = types.SimpleNamespace(
+        sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
+    )
+    stub.kv_cache_manager = Mock()
+    stub.draft_kv_cache_manager = Mock()
+    tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
+
+    PyExecutor.prepare_sleep(stub, tags)
+
+    expected = int(release_kv and mode in ("NONE", "MEMSET"))
+    assert stub.kv_cache_manager.reset_reuse_state.call_count == expected
+    assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected
+
+
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""

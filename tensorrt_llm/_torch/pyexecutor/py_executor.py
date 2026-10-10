@@ -1910,6 +1910,20 @@ class PyExecutor:
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
 
+    def prepare_sleep(self, tags: list[ExecutorMemoryType]) -> None:
+        """Invalidate cached prefixes before their contents are discarded.
+
+        Called on each rank with the executor drained and CUDA synchronized.
+        CPU/PINNED modes retain both the cache contents and reuse metadata.
+        """
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+
+        if ExecutorMemoryType.KV_CACHE in tags:
+            mode = self.llm_args.sleep_config.restore_modes[
+                ExecutorMemoryType.KV_CACHE]
+            if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
+                self.reset_prefix_cache()
+
     def complete_sleep_transition(self) -> None:
         self.executor_request_queue.complete_sleep_transition()
 
@@ -3479,6 +3493,7 @@ class PyExecutor:
                                     self._has_mnnvl_checkpoint_resources(tags))
                                 release_control_request = False
                             elif target_action == _SleepWakeupAction.SLEEP:
+                                self.prepare_sleep(tags)
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
                                 release_with_tag(*tags)

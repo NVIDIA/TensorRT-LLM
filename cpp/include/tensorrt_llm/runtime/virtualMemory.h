@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -255,7 +255,15 @@ struct UnicastConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override
     {
         TLLM_CU_CHECK(cuMemMap(mAddress, mSize, 0, handle, 0));
-        TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        try
+        {
+            TLLM_CU_CHECK(cuMemSetAccess(mAddress, mSize, &mDesc, 1));
+        }
+        catch (...)
+        {
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(mAddress, mSize));
+            throw;
+        }
     }
 
     void teardown(CUmemGenericAllocationHandle, bool) override
@@ -554,7 +562,15 @@ public:
     void allocate(Pointer* ptr, std::size_t n, int device) const;
     void deallocate(Pointer ptr, std::size_t n) const;
 
+    // Register physical memory at a caller-owned virtual address. The caller
+    // retains the reservation across release/materialize and must unmap before
+    // freeing it. Size and address must satisfy the allocation granularity.
+    void map(CUdeviceptr address, std::size_t size, CUmemAllocationProp const& prop) const;
+    void unmap(CUdeviceptr address) const;
+
 private:
+    void map(CUdeviceptr address, std::size_t allocationSize, std::size_t contentSize,
+        CUmemAllocationProp const& prop) const;
     std::shared_ptr<Configuration> mConfig;
 };
 

@@ -831,6 +831,7 @@ class BaseWorker(GenerationExecutor):
                     torch.cuda.synchronize()
                     local_commit_started = True
                     if action == _SleepWakeupAction.SLEEP:
+                        self.engine.prepare_sleep(tags)
                         run_mnnvl = (getattr(
                             self.engine, "_run_mnnvl_checkpoint_resources",
                             None) if has_mnnvl_resources else None)
@@ -947,6 +948,7 @@ class BaseWorker(GenerationExecutor):
                 ):
                     torch.cuda.synchronize()
                     local_mutation_started = True
+                    self.engine.prepare_sleep(tags)
                     release_with_tag(*tags)
                     torch.cuda.synchronize()
                     gc.collect()

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import os
 
@@ -17,7 +20,7 @@ from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 @pytest.mark.asyncio
 async def test_async_llm_awaitable():
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, use_kv_cache_manager_v2=True)
 
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
@@ -27,8 +30,10 @@ async def test_async_llm_awaitable():
         sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     )
 
+    await llm.collective_rpc("assert_v2_cache_manager")
     output = await llm.generate_async(prompt, sampling_params)
     assert output.outputs[0].text
     print("Output text:", output.outputs[0].text)
@@ -42,7 +47,9 @@ async def test_async_llm_awaitable():
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, max_tokens=4096, use_kv_cache_manager_v2=True
+    )
 
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
@@ -54,7 +61,9 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=2,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     ) as llm:
+        await llm.collective_rpc("assert_v2_cache_manager")
         # Generate baseline
         output_before = await llm.generate_async(prompt, sampling_params)
         baseline_text = output_before.outputs[0].text

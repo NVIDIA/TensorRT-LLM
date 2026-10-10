@@ -319,6 +319,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
+            self.engine.prepare_sleep(tags)
             release_with_tag(*tags)
             torch.cuda.synchronize()
             gc.collect()

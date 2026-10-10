@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import pytest
 from utils.llm_data import llm_models_root
 from utils.util import get_current_process_gpu_memory
 
@@ -6,14 +10,28 @@ from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
 
-def test_llm_sleep(process_gpu_memory_info_available):
+@pytest.mark.parametrize(
+    "sleep_tags",
+    [
+        [ExecutorMemoryType.KV_CACHE],
+        list(ExecutorMemoryType),
+    ],
+    ids=["kv_cache_only", "all_tags"],
+)
+def test_llm_sleep(process_gpu_memory_info_available, sleep_tags):
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True, max_tokens=16384, use_kv_cache_manager_v2=True
+    )
 
     llm = LLM(
         model=llama_model_path,
         sleep_config=SleepConfig(),
         kv_cache_config=kv_cache_config,
+        max_seq_len=512,
+        max_batch_size=4,
+        max_num_tokens=512,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     )
 
     prompts = [
@@ -23,22 +41,25 @@ def test_llm_sleep(process_gpu_memory_info_available):
         "The future of AI is",
     ]
 
-    sampling_params = SamplingParams(temperature=0)
+    prompts = [prompt * 20 for prompt in prompts]
+    sampling_params = SamplingParams(temperature=0, max_tokens=16, return_perf_metrics=True)
 
     with llm:
+        llm._collective_rpc("assert_v2_cache_manager")
         outputs = llm.generate(prompts, sampling_params)
         generated_before_sleep = [output.outputs[0].text for output in outputs]
+
+        warm_outputs = llm.generate(prompts, sampling_params)
+        assert any(
+            output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks > 0
+            for output in warm_outputs
+        )
 
         memory_usage_active = get_current_process_gpu_memory(True)
 
         llm._collective_rpc(
             "sleep",
-            (
-                [
-                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
-                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN,
-                ],
-            ),
+            (sleep_tags,),
         )
 
         memory_usage_sleep = get_current_process_gpu_memory(True)
@@ -47,12 +68,7 @@ def test_llm_sleep(process_gpu_memory_info_available):
 
         llm._collective_rpc(
             "wakeup",
-            (
-                [
-                    ExecutorMemoryType.MODEL_ENGINE_MAIN,
-                    ExecutorMemoryType.MODEL_WEIGHTS_MAIN,
-                ],
-            ),
+            (sleep_tags,),
         )
 
         memory_usage_wakeup = get_current_process_gpu_memory(True)
@@ -61,6 +77,10 @@ def test_llm_sleep(process_gpu_memory_info_available):
 
         outputs = llm.generate(prompts, sampling_params)
         generated_after_sleep = [output.outputs[0].text for output in outputs]
+        assert all(
+            output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks == 0
+            for output in outputs
+        )
 
     for before, after in zip(generated_before_sleep, generated_after_sleep, strict=True):
         assert before == after, "Generated result mismatch before and after sleep"
@@ -74,7 +94,9 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
     forward pass without crashing — output correctness is not expected.
     """
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=16384)
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, max_tokens=16384, use_kv_cache_manager_v2=True
+    )
 
     sleep_config = SleepConfig(
         restore_modes={
@@ -87,6 +109,7 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
         model=llama_model_path,
         sleep_config=sleep_config,
         kv_cache_config=kv_cache_config,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     )
 
     prompts = [
@@ -99,6 +122,7 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
     sampling_params = SamplingParams(temperature=0)
 
     with llm:
+        llm._collective_rpc("assert_v2_cache_manager")
         outputs = llm.generate(prompts, sampling_params)
         assert all(len(output.outputs[0].text) > 0 for output in outputs)
 
