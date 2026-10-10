@@ -408,8 +408,13 @@ def _make_peer_registrar(self_rankinfo):
     return reg
 
 
-def test_peer_registrar_register_and_get():
+@pytest.mark.parametrize(
+    ("local_replay", "peer_replay"),
+    [(False, False), (True, True), (False, True), (True, False)],
+)
+def test_peer_registrar_register_and_get(local_replay: bool, peer_replay: bool) -> None:
     self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.bounded_replay_on_generation = local_replay
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -417,6 +422,17 @@ def test_peer_registrar_register_and_get():
         layer_num_per_pp=[2],
         page_table=make_page_table(),
     )
+    peer_ri.bounded_replay_on_generation = peer_replay
+    if local_replay != peer_replay:
+        with pytest.raises(
+            ValueError,
+            match=f"bounded_replay_on_generation.*local={local_replay}, peer={peer_replay}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        with pytest.raises(KeyError):
+            reg.get_peer_rank_info("peer", 1)
+        return
+
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
 

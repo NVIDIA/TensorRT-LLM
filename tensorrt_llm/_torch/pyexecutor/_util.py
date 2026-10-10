@@ -517,6 +517,15 @@ def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
             model_config)
 
 
+def get_attention_workspace_fixed_bytes(model_config, mapping,
+                                        **capacities) -> int:
+    """Capacity-sized reserve declared by the model's selected backend."""
+    from ..attention.backends.utils import get_attention_backend
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_fixed_bytes(
+            model_config, mapping, **capacities)
+
+
 def get_mla_context_workspace_kv_len_cap(
         kv_cache_config,
         max_batch_size,
@@ -1736,6 +1745,22 @@ class KvCacheCreator:
             logger.info(
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
+
+        fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
+            self._model_engine.model.model_config,
+            self._mapping,
+            max_batch_size=self._max_batch_size,
+            max_num_tokens=self._max_num_tokens,
+            max_seq_len=self._max_seq_len,
+            enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
+        )
+        # A decode arena can first appear after the peak prefill step. Reserve
+        # its full capacity for coexistence with the profiled transient peak.
+        peak_memory += fixed_workspace_reserve
+        if fixed_workspace_reserve:
+            logger.info(
+                f"Reserving {fixed_workspace_reserve / GB:.2f} GiB for capacity-sized "
+                "attention workspace across serving steps.")
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
@@ -3318,13 +3343,23 @@ def _create_kv_cache_manager(
             **kda_extra_kwargs,
             **manager_extra_kwargs,
         )
-    elif is_mla(config):
+    elif (getattr(sparse_attention_config, "algorithm", None) == "csa2"
+          or is_mla(config)):
+        if getattr(sparse_attention_config, "algorithm", None) == "csa2":
+            manager_extra_kwargs["context_swa_layer_limit"] = (
+                _model_config.extra_attrs.get("csa2_context_swa_layer_limit"))
+            manager_extra_kwargs["bounded_replay_on_generation"] = (
+                _model_config.extra_attrs.get("bounded_replay_on_generation",
+                                              False))
         kv_cache_manager = kv_cache_manager_cls(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
             num_layers=num_hidden_layers,
             num_kv_heads=1,
-            head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+            head_dim=(getattr(config, "head_dim", 512)
+                      if sparse_attention_config is not None
+                      and sparse_attention_config.algorithm == "csa2" else
+                      config.kv_lora_rank + config.qk_rope_head_dim),
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,

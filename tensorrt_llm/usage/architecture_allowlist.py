@@ -33,6 +33,8 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "DeepSeekV2ForCausalLM",
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
+        "DeepseekV41ForCausalLM",
+        "DeepseekV41ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "EAGLE3LlamaForCausalLM",
         "Eagle3DeepSeekV3ForCausalLM",

@@ -2182,6 +2182,22 @@ def _make_boundary_test_params():
         for comm_type in ALL_COMM_TYPES:
             aligned_top_k = 8 if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER else 2
             boundary_cases = []
+            if comm_type == COMM_NVLINK_ONE_SIDED:
+                # DSpark routes to three experts; include an idle ADP peer.
+                boundary_cases.append(
+                    (
+                        2,
+                        CommTestConfig(
+                            comm_type=comm_type,
+                            ep_size=2,
+                            num_experts=FIXED_NUM_EXPERTS,
+                            top_k=3,
+                            hidden_size=DEFAULT_HIDDEN_SIZE,
+                            all_num_tokens=[17, 0],
+                        ),
+                        f"{comm_type}_topk3",
+                    )
+                )
             if comm_type != COMM_NVLINK_TWO_SIDED_FLASHINFER:
                 boundary_cases.append(
                     (

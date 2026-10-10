@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import warnings
 from dataclasses import dataclass
@@ -272,6 +275,20 @@ class BaseMoeRoutingMethod(nn.Module):
         """
         raise NotImplementedError("Subclasses must implement this method")
 
+    def apply_with_aux(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        routing_aux: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route with token-aligned auxiliary data supplied by the model.
+
+        ``routing_aux`` shares the logits' token dimension; the routing method
+        defines its dtype and remaining dimensions. Unsupported methods raise.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support auxiliary routing data")
+
     def get_experts_per_token(self) -> int:
         return self.top_k
 
@@ -532,6 +549,8 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         callable_e_score_correction_bias: Callable[[], torch.Tensor],
         callable_tid2eid: Callable[[], torch.Tensor],
         is_hashed: bool = True,
+        callable_e_score_correction_bias_vl: Optional[Callable[
+            [], torch.Tensor]] = None,
     ):
         super().__init__()
         self._top_k = top_k
@@ -545,6 +564,58 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
         assert callable(callable_tid2eid)
         self.callable_e_score_correction_bias = callable_e_score_correction_bias
         self.callable_tid2eid = callable_tid2eid
+        self.callable_e_score_correction_bias_vl = callable_e_score_correction_bias_vl
+
+    def apply_with_aux(
+        self,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        routing_aux: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route with a bool ``[num_tokens]`` image-span mask.
+
+        The per-token text or vision bias selects experts, while their weights
+        are gathered from the unbiased FP32 sqrt-softplus scores.
+        """
+        if routing_aux.dtype != torch.bool or routing_aux.shape != (
+                router_logits.shape[0], ):
+            raise ValueError(
+                "DeepSeek image routing mask must be bool [num_tokens]")
+        if routing_aux.device != router_logits.device:
+            raise ValueError(
+                "DeepSeek image routing mask must share the logits device")
+        if self.is_hashed or self.callable_e_score_correction_bias_vl is None:
+            raise ValueError(
+                "DeepSeek image routing requires a vision-bias gate")
+
+        logits = router_logits.to(torch.float32)
+        if logits.is_cuda and self._top_k == 6 and logits.shape[-1] in (256,
+                                                                        384):
+            return self._apply_native(logits, input_ids, routing_aux)
+        return self._apply_pytorch(logits, input_ids, routing_aux)
+
+    def _apply_pytorch(
+        self,
+        logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        image_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FP32 reference for CPU and unsupported native-gate shapes."""
+        scores = F.softplus(logits.to(torch.float32)).sqrt()
+        if self.is_hashed:
+            assert input_ids is not None
+            indices = self.callable_tid2eid()[input_ids.long()]
+        else:
+            bias = self.callable_e_score_correction_bias().to(torch.float32)
+            if image_mask is not None:
+                vision_bias = self.callable_e_score_correction_bias_vl().to(
+                    torch.float32)
+                bias = torch.where(image_mask.unsqueeze(-1), vision_bias, bias)
+            indices = torch.topk(scores + bias, k=self._top_k, dim=-1).indices
+        weights = scores.gather(1, indices.long())
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+        weights = weights * self.routed_scaling_factor
+        return indices.to(torch.int32), weights
 
     def apply(
         self,
@@ -553,6 +624,20 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # gate_forward kernel requires float32 input scores
         logits = logits.to(torch.float32)
+        # gate_forward supports target geometries (256/384 experts, top-6),
+        # not V4.1's smaller draft bank. Keep target routing on its fused path.
+        # TODO: Add a fused 128-expert/top-3 specialization for draft latency.
+        if self._top_k == 3 and logits.shape[-1] == 128:
+            return self._apply_pytorch(logits, input_ids)
+        return self._apply_native(logits, input_ids)
+
+    def _apply_native(
+        self,
+        logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+        image_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logits = logits.contiguous()
         m = logits.shape[0]
         out_weights = torch.empty(m,
                                   self._top_k,
@@ -584,10 +669,17 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
                                          dtype=torch.int32,
                                          device=logits.device,
                                          requires_grad=False)
+            vision_bias = None
+            if image_mask is not None:
+                image_mask = image_mask.contiguous()
+                vision_bias = self.callable_e_score_correction_bias_vl().to(
+                    torch.float32).contiguous()
             torch.ops.trtllm.gate_forward(
-                logits, self.callable_e_score_correction_bias(),
-                input_ids_tensor, tid2eid_tensor, out_weights, out_indices,
-                self._top_k, self.routed_scaling_factor, False)
+                logits,
+                self.callable_e_score_correction_bias().to(
+                    torch.float32).contiguous(), input_ids_tensor,
+                tid2eid_tensor, out_weights, out_indices, self._top_k,
+                self.routed_scaling_factor, False, image_mask, vision_bias)
         return out_indices, out_weights
 
     @property

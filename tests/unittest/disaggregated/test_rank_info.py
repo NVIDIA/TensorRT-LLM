@@ -45,9 +45,11 @@ def test_rank_info_construction():
     assert ri.pp_size == 1
     assert ri.layer_num_per_pp == [32]
     assert ri.sender_endpoints == ["tcp://10.0.0.1:5000"]
+    assert ri.bounded_replay_on_generation is False
 
 
-def test_rank_info_msgpack_roundtrip():
+@pytest.mark.parametrize("bounded_replay_on_generation", [False, True])
+def test_rank_info_msgpack_roundtrip(bounded_replay_on_generation: bool) -> None:
     ri = RankInfo(
         instance_name="gen_0",
         instance_rank=0,
@@ -59,6 +61,7 @@ def test_rank_info_msgpack_roundtrip():
         sender_endpoints=["tcp://10.0.0.1:5000"],
         self_endpoint="tcp://10.0.0.1:5001",
         transfer_engine_info=b"\x00\x01\x02",
+        bounded_replay_on_generation=bounded_replay_on_generation,
     )
     data = ri.to_bytes()
     restored = RankInfo.from_bytes(data)
@@ -66,6 +69,7 @@ def test_rank_info_msgpack_roundtrip():
     assert restored.tp_size == ri.tp_size
     assert restored.transfer_engine_info == ri.transfer_engine_info
     assert restored.aux_meta is None
+    assert restored.bounded_replay_on_generation is bounded_replay_on_generation
 
 
 def test_rank_info_roundtrip_with_aux_meta():
@@ -123,6 +127,11 @@ def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.attention.kv_heads_per_rank == 8
+    assert info.bounded_replay_on_generation is False
+
+    manager.bounded_replay_on_generation = True
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+    assert info.bounded_replay_on_generation is True
 
 
 def test_from_kv_cache_manager_preserves_attention_dp_on_attention_free_stage(
