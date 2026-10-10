@@ -133,6 +133,7 @@ class IterationWriter:
         """
         context = None
         socket = None
+        message = None
 
         try:
             # Create a ZeroMQ context and socket for inter-process communication
@@ -156,12 +157,13 @@ class IterationWriter:
                     message = socket.recv_json()
                 logger.debug(f"Iteration logging: Received end message")
         except KeyboardInterrupt:
-            # Handle keyboard interrupt by continuing to receive
-            # messages until "None" is received. LlmManager will
-            # send "None" when it is finished.
+            # Handle keyboard interrupt by continuing to receive messages until
+            # the "end" sentinel is received. LlmManager sends {"end": True}
+            # when it is finished.
             logger.info("Keyboard interrupt, exiting iteration logging...")
-            while message != b"None":
-                message = socket.recv_json()
+            if socket is not None:
+                while message is None or "end" not in message:
+                    message = socket.recv_json()
         finally:
             # Finalize the logging process by closing the socket and terminating
             # the context
