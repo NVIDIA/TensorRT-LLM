@@ -180,6 +180,46 @@ class TestAttentionConfigQuantValidation:
 
         assert attention.quant_attention_config is not None
 
+    @pytest.mark.parametrize("sm_ver", [100, 103])
+    @pytest.mark.parametrize(
+        ("qk_dtype", "algorithm"),
+        [
+            ("bf16", "primsts"),
+            ("fp8", "primsts"),
+            ("bf16", "vc_attention-qk16"),
+            ("fp8", "vc_attention-qk8"),
+        ],
+    )
+    def test_supported_quant_config_primsts(self, sm_ver, qk_dtype, algorithm):
+        """PrimTS per-tensor and VC-Attention recipes validate on Blackwell."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype=qk_dtype, v_dtype="fp8", algorithm=algorithm
+                ),
+            )
+
+        assert attention.quant_attention_config.algorithm == algorithm
+
+    def test_vc_repair_budget_requires_vc_attention(self):
+        """The repair budget belongs to VC-Attention-QK16 and is rejected elsewhere."""
+        with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
+            attention = AttentionConfig(
+                backend="TRTLLM",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="bf16", algorithm="vc_attention-qk16", vc_repair_budget=0.005
+                ),
+            )
+            assert attention.quant_attention_config.vc_repair_budget == 0.005
+            with pytest.raises(ValidationError, match="vc_repair_budget is a VC-Attention"):
+                AttentionConfig(
+                    backend="TRTLLM",
+                    quant_attention_config=QuantAttentionConfig(
+                        qk_dtype="bf16", algorithm="primsts", vc_repair_budget=0.005
+                    ),
+                )
+
     @pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN", "FLASHINFER", "VANILLA"])
     def test_smooth_k_rejected_on_non_trtllm_backend(self, backend):
         with pytest.raises(ValidationError, match="smooth_k is a SageAttention option"):

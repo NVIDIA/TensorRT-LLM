@@ -36,6 +36,7 @@ from tensorrt_llm.visual_gen.params import MediaRole
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
 from .checkpoints import WeightLoader
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .denoise_step import set_denoise_step
 from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
@@ -1356,6 +1357,7 @@ class BasePipeline(nn.Module):
 
         for i, t in self._profile_denoise_steps(timesteps):
             step_start = time.time()
+            set_denoise_step(i, total_steps)
 
             current_guidance_scale = self._resolve_step_guidance_scale(
                 t,
@@ -1434,6 +1436,7 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
+        set_denoise_step(None)
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
