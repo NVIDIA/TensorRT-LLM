@@ -1072,6 +1072,9 @@ def _run_worker_dispatch(
         **worker_inputs.dispatch_kwargs,
     )
 
+    if config.comm_type == COMM_NCCL_EP:
+        assert recv_scales.dtype == worker_inputs.scales.dtype
+
     return DispatchOutputs(
         recv_hs=recv_hs,
         recv_sf=recv_sf,
@@ -1240,7 +1243,7 @@ def _nccl_ep_replay_slots(
     return (target_rank * experts_per_rank + local_experts).view(num_tokens, 1)
 
 
-def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
+def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig, routing_dtype: torch.dtype) -> dict:
     """Capture LL dispatch, change routing, and verify replay sees the change."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -1266,7 +1269,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             dtype=torch.bfloat16,
             device="cuda",
         )
-        weights = torch.ones(num_tokens, 1, dtype=torch.float32, device="cuda")
+        weights = torch.ones(num_tokens, 1, dtype=routing_dtype, device="cuda")
         local_routes = _nccl_ep_replay_slots(
             target_rank=rank,
             num_tokens=num_tokens,
@@ -1293,7 +1296,7 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
         static_routes = local_routes.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            recv_hs, _, recv_slots, _ = comm.dispatch(
+            recv_hs, _, recv_slots, recv_scales = comm.dispatch(
                 hidden_states,
                 None,
                 static_routes,
@@ -1302,7 +1305,9 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             )
         torch.cuda.synchronize()
 
-        def replay_and_check(expected_sender: int) -> dict:
+        assert recv_scales.dtype == routing_dtype
+
+        def replay_and_check(expected_sender: int, expected_weight: float) -> dict:
             graph.replay()
             torch.cuda.synchronize()
             valid = recv_slots[:, 0] >= 0
@@ -1310,12 +1315,15 @@ def _worker_nccl_ep_cuda_graph_replay(config: CommTestConfig) -> dict:
             return {
                 "valid_count": int(valid.sum().item()),
                 "sender_matches": bool(torch.all(received == expected_sender + 1).item()),
+                "weights_match": bool(torch.all(recv_scales[valid, 0] == expected_weight).item()),
             }
 
         static_routes.copy_(local_routes)
-        local_result = replay_and_check(rank)
+        weights.fill_(0.5)
+        local_result = replay_and_check(rank, 0.5)
         static_routes.copy_(peer_routes)
-        peer_result = replay_and_check(peer_rank)
+        weights.fill_(0.25)
+        peer_result = replay_and_check(peer_rank, 0.25)
         return {"rank": rank, "local": local_result, "peer": peer_result}
     except Exception:
         traceback.print_exc()
@@ -2456,7 +2464,7 @@ def _run_full_test_group(mpi_pool_executor, group: CommTestGroup):
     _verify_full_test_results(all_results, pending.config)
 
 
-def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
+def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype: torch.dtype) -> None:
     """Verify graph replay observes routing changed between replays."""
     ep_size = mpi_pool_executor.num_workers
     config = CommTestConfig(
@@ -2472,7 +2480,7 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
         pytest.skip(skip_reason)
 
     futures = [
-        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config)
+        mpi_pool_executor.submit(_worker_nccl_ep_cuda_graph_replay, config, routing_dtype)
         for _ in range(config.ep_size)
     ]
     results = sorted((future.result() for future in futures), key=lambda result: result["rank"])
@@ -2486,6 +2494,9 @@ def _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor) -> None:
             )
             assert replay["sender_matches"], (
                 f"rank {rank}: {replay_name} replay did not observe the expected routing buffer"
+            )
+            assert replay["weights_match"], (
+                f"rank {rank}: {replay_name} replay did not observe the updated routing weights"
             )
 
 
@@ -3013,9 +3024,12 @@ class TestMoEComm:
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(self, mpi_pool_executor) -> None:
+    @pytest.mark.parametrize("routing_dtype", [torch.bfloat16, torch.float16, torch.float32])
+    def test_nccl_ep_cuda_graph_replay_uses_updated_routing(
+        self, mpi_pool_executor, routing_dtype: torch.dtype
+    ) -> None:
         """Verify LL CUDA graph replay reads routing written after capture."""
-        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor)
+        _run_nccl_ep_cuda_graph_replay_test(mpi_pool_executor, routing_dtype)
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
