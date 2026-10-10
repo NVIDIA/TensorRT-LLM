@@ -575,8 +575,7 @@ class KvCacheConnectorSchedulerOutputRequest:
 
         new_block_ids_by_layer_group: List[List[int]] = []
         if is_v2:
-            # Block hashes and retention priorities have no V2 accessor yet, so
-            # they are reported empty rather than guessed at.
+            # Block hashes have no V2 accessor yet.
             block_hashes = []
             indices_by_group = kv_cache_manager.get_page_indices_by_layer_group(req)
             while len(self.block_ids_by_layer_group) < len(indices_by_group):
@@ -620,13 +619,22 @@ class KvCacheConnectorSchedulerOutputRequest:
                 req
             )  # Specdec with draft tokens is not supported yet.
 
-        # V2 does not honour KvCacheRetentionConfig, so it cannot provide
-        # per-block retention priorities for connector offload filtering.
+        # Report the native pages' current priorities, including shared-page claims.
         priorities = None
-        if not is_v2 and req.kv_cache_retention_config is not None:
-            priorities = [
-                kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
-            ]
+        if req.kv_cache_retention_config is not None:
+            if is_v2:
+                priorities = (
+                    kv_cache_manager.kv_cache_map[req.py_request_id].get_page_priorities(0)[
+                        len(self.block_ids) - len(new_block_ids) : len(self.block_ids)
+                    ]
+                    if len(new_block_ids_by_layer_group) == 1
+                    else []
+                )
+            else:
+                priorities = [
+                    kv_cache_manager.get_priority_by_block_id(block_id)
+                    for block_id in new_block_ids
+                ]
 
         return RequestData(
             req.request_id,
