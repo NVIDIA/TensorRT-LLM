@@ -75,6 +75,7 @@ class KVCacheLayerSpec:
 
     head_dim: int
     num_kv_heads: int
+    num_q_heads: int
     attention_window: Optional[int] = None
 
 

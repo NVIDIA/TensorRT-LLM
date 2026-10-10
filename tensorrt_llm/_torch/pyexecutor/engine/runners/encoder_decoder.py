@@ -86,7 +86,7 @@ class EncoderStage(EncoderMixin):
             raise ValueError("Encoder sequence lengths and request IDs must have the same length.")
         metadata = self._create_attention_metadata(
             enable_context_mla_with_cached_kv=False,
-            num_heads_per_kv=1,
+            max_num_heads_per_kv=1,
         )
         if not isinstance(metadata, (VanillaAttentionMetadata, TrtllmAttentionMetadata)):
             raise TypeError(

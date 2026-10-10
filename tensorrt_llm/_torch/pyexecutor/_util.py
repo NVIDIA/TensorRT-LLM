@@ -3077,13 +3077,13 @@ def _create_kv_cache_manager(
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
     hidden_size = config.hidden_size
-    num_attention_heads = config.num_attention_heads
 
     layer_specs = _get_kv_cache_layer_specs(_model_config)
     if layer_specs:
         head_dim = [spec.head_dim for spec in layer_specs]
         num_key_value_heads = [spec.num_kv_heads for spec in layer_specs]
     else:
+        num_attention_heads = config.num_attention_heads
         num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
             config, 'num_key_value_heads', num_attention_heads)
         if not isinstance(head_dim, int):

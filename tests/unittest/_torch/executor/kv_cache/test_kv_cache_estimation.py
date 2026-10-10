@@ -635,6 +635,7 @@ def test_gemma4_hybrid_scales_by_num_pool_groups():
         KVCacheLayerSpec(
             head_dim=256 if layer_type == "sliding_attention" else 128,
             num_kv_heads=1,
+            num_q_heads=1,
             attention_window=sliding_window if layer_type == "sliding_attention" else None,
         )
         for layer_type in layer_types
@@ -791,6 +792,7 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
         KVCacheLayerSpec(
             head_dim=256 if layer_type == "sliding_attention" else 128,
             num_kv_heads=1,
+            num_q_heads=1,
             attention_window=sliding_window if layer_type == "sliding_attention" else None,
         )
         for layer_type in layer_types
@@ -977,6 +979,7 @@ def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
         KVCacheLayerSpec(
             head_dim=256 if (layer_idx + 1) % 6 else 512,
             num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
+            num_q_heads=16,
             attention_window=128 if (layer_idx + 1) % 6 else None,
         )
         for layer_idx in range(12)
@@ -989,7 +992,7 @@ def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
         vocab_size = 262_144
 
         def __getattribute__(self, name: str) -> object:
-            if name in {"head_dim", "num_key_value_heads"}:
+            if name in {"head_dim", "num_key_value_heads", "num_attention_heads"}:
                 raise RuntimeError(f"global geometry must not be read: {name}")
             return super().__getattribute__(name)
 
@@ -1029,6 +1032,14 @@ def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
     expected_windows = [spec.attention_window for spec in layer_specs]
     assert layer_sizes == expected_layer_sizes
     assert attention_windows == expected_windows
+    full_layer_sizes, full_windows = _get_static_cache_size_layer_components(
+        model_config,
+        mapping,
+        max_seq_len=max_seq_len,
+        kv_cache_config=KvCacheConfig(),
+    )
+    assert full_layer_sizes == expected_layer_sizes
+    assert full_windows == [None] * len(layer_specs)
     assert CacheCost.from_raw(
         KVCacheManagerV2.get_cache_size_per_token(
             model_config,
@@ -1040,7 +1051,7 @@ def test_v2_static_sizing_uses_model_provided_per_layer_geometry(
         )
     ) == CacheCost(
         slope=2 * 2048,
-        intercept=10 * 128 * expected_sliding_layer_size,
+        intercept=10 * 160 * expected_sliding_layer_size,
     )
 
 
@@ -1513,6 +1524,7 @@ def _create_manager_and_capture_config(
     kv_cache_config: KvCacheConfig,
     max_seq_len: int,
     manager_cls: type[KVCacheManager] | type[KVCacheManagerV2] = KVCacheManagerV2,
+    publish_layer_specs: bool = False,
     **factory_overrides: object,
 ) -> KvCacheConfig:
     """Run `_create_kv_cache_manager` with a recording subclass of `manager_cls`
@@ -1528,6 +1540,16 @@ def _create_manager_and_capture_config(
     model_config = Mock()
     model_config.pretrained_config = pretrained
     model_config.quant_config = None
+    if publish_layer_specs:
+        model_config.kv_cache_layer_specs = tuple(
+            KVCacheLayerSpec(
+                head_dim=256 if layer_type == _SLIDING else 512,
+                num_kv_heads=8 if layer_type == _SLIDING else 1,
+                num_q_heads=16,
+                attention_window=256 if layer_type == _SLIDING else None,
+            )
+            for layer_type in pretrained.layer_types
+        )
 
     factory_kwargs: dict[str, object] = dict(
         model_engine=None,
@@ -1578,7 +1600,10 @@ def _eagle3_one_model_spec_config(num_draft_hidden_layers: int | None = None) ->
     )
 
 
-def test_create_kv_cache_manager_pool_ratio_arity_mismatch_keeps_single_window() -> None:
+@pytest.mark.parametrize("publish_layer_specs", [False, True], ids=["layer_types", "layer_specs"])
+def test_create_kv_cache_manager_pool_ratio_arity_mismatch_keeps_single_window(
+    publish_layer_specs: bool,
+) -> None:
     """A `pool_ratio` written for the single pool (one entry) does not match the
     two layer groups the derived windows would create. Rather than failing the
     manager's arity check at startup, the derivation is skipped with a warning
@@ -1590,6 +1615,7 @@ def test_create_kv_cache_manager_pool_ratio_arity_mismatch_keeps_single_window()
             _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
             kv_cache_config,
             max_seq_len=2048,
+            publish_layer_specs=publish_layer_specs,
         )
 
     assert manager_config is kv_cache_config
@@ -1600,7 +1626,10 @@ def test_create_kv_cache_manager_pool_ratio_arity_mismatch_keeps_single_window()
     assert "2 layer groups" in message
 
 
-def test_create_kv_cache_manager_pool_ratio_per_layer_group_keeps_derivation() -> None:
+@pytest.mark.parametrize("publish_layer_specs", [False, True], ids=["layer_types", "layer_specs"])
+def test_create_kv_cache_manager_pool_ratio_per_layer_group_keeps_derivation(
+    publish_layer_specs: bool,
+) -> None:
     """One `pool_ratio` entry per derived layer group is the intended pairing."""
     kv_cache_config = KvCacheConfig(pool_ratio=[0.5, 0.5])
 
@@ -1608,9 +1637,16 @@ def test_create_kv_cache_manager_pool_ratio_per_layer_group_keeps_derivation() -
         _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
         kv_cache_config,
         max_seq_len=2048,
+        publish_layer_specs=publish_layer_specs,
     )
 
-    assert manager_config.max_attention_window == [512, 512, 2048, 512]
+    sliding_window = 256 if publish_layer_specs else 512
+    assert manager_config.max_attention_window == [
+        sliding_window,
+        sliding_window,
+        2048,
+        sliding_window,
+    ]
     assert manager_config.pool_ratio == [0.5, 0.5]
 
 
@@ -1666,7 +1702,10 @@ def test_create_kv_cache_manager_keeps_appended_spec_layers_full_context(
     assert manager_config.max_attention_window == expected_windows
 
 
-def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> None:
+@pytest.mark.parametrize("publish_layer_specs", [False, True], ids=["layer_types", "layer_specs"])
+def test_create_kv_cache_manager_cross_pool_keeps_single_window_default(
+    publish_layer_specs: bool,
+) -> None:
     """The cross-attention pool stores encoder-side KV, which the decoder's
     `layer_types` do not describe."""
     kv_cache_config = KvCacheConfig()
@@ -1675,6 +1714,7 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> Non
         _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
         kv_cache_config,
         max_seq_len=2048,
+        publish_layer_specs=publish_layer_specs,
         kv_cache_type=batch_manager.CacheType.CROSS,
         num_layers=4,
         num_kv_heads=8,
@@ -1683,3 +1723,20 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default() -> Non
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window is None
+
+
+@pytest.mark.parametrize("guard", ["draft", "explicit_window"])
+def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) -> None:
+    kv_cache_config = KvCacheConfig(
+        max_attention_window=[1024] if guard == "explicit_window" else None
+    )
+    manager_config = _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_SLIDING, _SLIDING, _FULL, _SLIDING]),
+        kv_cache_config,
+        max_seq_len=2048,
+        publish_layer_specs=True,
+        is_draft=guard == "draft",
+    )
+
+    assert manager_config is kv_cache_config
+    assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
