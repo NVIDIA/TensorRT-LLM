@@ -23,8 +23,9 @@ Two levels, on purpose:
 * The routing module owns the rest of the decision as one forward-reading
   tree, in two stages. ``route`` reads the configuration's *identity* --
   checkpoint shape, GPU architecture, parallel topology -- and names a target.
-  ``within_bounds`` then reads the *deployment* -- the LLM API arguments it
-  was configured with -- and says whether that target was certified for it.
+  ``within_bounds`` then reads the *deployment* -- the LLM API arguments as
+  the engine will run with them, model defaults included -- and says whether
+  that target was certified for it.
   Reading that single file tells you where any configuration lands, and
   ``explain.py`` replays both stages to say *why*.
 
@@ -214,22 +215,11 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     prevent is silent: asking for a target, getting the in-tree
     implementation, and reading the resulting curve as modeling_v2's.
 
-    Decided **once per ``llm_args``** and remembered there. The model loader
-    asks twice -- first to pick the class whose model defaults apply, then to
-    build -- and ``within_bounds`` reads the arguments as configured, which
-    the model defaults go on to modify in between. Deciding again after that
-    could flip the answer, so the first decision is the decision; it is made
-    before any model default is applied.
+    The model loader calls this when it is about to build the model, after
+    the built-in model's defaults have been applied to ``llm_args``: a
+    target's ``within_bounds`` therefore judges the deployment as it will
+    actually run, model defaults included.
     """
-    if llm_args._modeling_v2_resolved:
-        return llm_args._modeling_v2_target
-    target = _decide(config, llm_args)
-    llm_args._modeling_v2_target = target
-    llm_args._modeling_v2_resolved = True
-    return target
-
-
-def _decide(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[str]:
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
         return None
