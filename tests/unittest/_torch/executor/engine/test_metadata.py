@@ -8,7 +8,11 @@ from unittest.mock import Mock
 import pytest
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.engine.metadata import build_attention_metadata
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec, ModelConfig
+from tensorrt_llm._torch.pyexecutor.engine.metadata import (
+    _get_num_heads_per_kv,
+    build_attention_metadata,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -95,3 +99,27 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
     assert metadata.draft_kv_cache_manager is draft_kv_cache_manager
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.num_heads_per_kv == 4
+
+
+def test_metadata_gqa_ratio_uses_model_provided_per_layer_kv_heads():
+    class StrictConfig:
+        num_hidden_layers = 12
+        num_attention_heads = 16
+
+        def __getattribute__(self, name):
+            if name == "num_key_value_heads":
+                raise RuntimeError(f"global geometry must not be read: {name}")
+            return super().__getattribute__(name)
+
+    model_config = ModelConfig(pretrained_config=StrictConfig())
+    model_config.set_kv_cache_layer_specs(
+        [
+            KVCacheLayerSpec(
+                head_dim=256,
+                num_kv_heads=8 if (layer_idx + 1) % 6 else 1,
+            )
+            for layer_idx in range(12)
+        ]
+    )
+
+    assert _get_num_heads_per_kv(model_config) == 16
