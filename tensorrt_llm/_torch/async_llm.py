@@ -1,8 +1,6 @@
-#!/usr/bin/env python
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Sequence
 from typing import Any, List, Optional
 
 from ..llmapi.llm import LLM
@@ -68,6 +66,9 @@ class AsyncLLM(LLM):
     ) -> None:
         """Release the GPU memory used by the LLM asynchronously.
 
+        Pass all tags for a sleep cycle in one call. New generation requests
+        are rejected until all released tags have been resumed.
+
         Args:
             tags: Memory types to release. When omitted, release every
                 sleep-managed runtime memory type.
@@ -87,6 +88,9 @@ class AsyncLLM(LLM):
         tags: Sequence[ExecutorMemoryType | str] | None = None,
     ) -> None:
         """Resume the GPU memory used by the LLM asynchronously.
+
+        Tags may be resumed in separate calls. Generation remains blocked
+        until the last released tag has been restored.
 
         Args:
             tags: Memory types to restore. When omitted, restore every
