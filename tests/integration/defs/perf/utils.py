@@ -22,6 +22,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -391,10 +392,16 @@ class PerfServeScriptTestCmds:
             "--host", self._host, "--port",
             str(self._port)
         ]
-        self._server_log_path = os.path.join(os.getcwd(),
-                                             "trtllm-serve-perf.log")
         print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
-        self._server_log_file = open(self._server_log_path, "w")
+        # Concurrent tests can share the working directory. Each server needs
+        # its own file so another launch cannot truncate its startup metrics.
+        self._server_log_file = tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="trtllm-serve-perf-",
+            suffix=".log",
+            dir=os.getcwd(),
+            delete=False)
+        self._server_log_path = self._server_log_file.name
         self._server_proc = subprocess.Popen(cmd,
                                              env=self.server_env,
                                              stdout=self._server_log_file,
