@@ -821,7 +821,7 @@ void StorageManager::refreshRetention()
         if (page)
         {
             page->mRetentionExpiry.reset();
-            TLLM_CHECK_DEBUG(page->status() == PageStatus::DROPPABLE);
+            // A prefetch may hold storage without claiming or extending its retention interval.
             updatePriority(*page, kPriorityDefault);
         }
     }
@@ -944,26 +944,35 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     CacheLevel lvlId, PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder,
     DropRecorder const& dropRecorder)
 {
+    TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> belowOffloadThreshold(numLifeCycles());
+    auto restoreBelowThreshold = FuncGuard(
+        [&]()
+        {
+            for (auto const& pages : belowOffloadThreshold)
+            {
+                for (auto iter = pages.rbegin(); iter != pages.rend(); ++iter)
+                {
+                    auto const& page = *iter;
+                    if (!page->scheduledForEviction())
+                        mLevels.at(page->cacheLevel).controller.scheduleForEviction(*page, /*evictFirst=*/true);
+                }
+            }
+        });
     for (auto& pages : fallenPages)
     {
-        std::vector<SharedPtr<Page>> dropped;
         for (auto iter = pages.begin(); iter != pages.end();)
         {
             auto const& page = *iter;
             if (page->cacheLevel == kHotLevel && page->status() == PageStatus::DROPPABLE
                 && page->priority() < mSecondaryOffloadMinPriority)
             {
-                dropped.push_back(std::move(*iter));
+                belowOffloadThreshold.at(page->lifeCycle).push_back(std::move(*iter));
                 iter = pages.erase(iter);
             }
             else
             {
                 ++iter;
             }
-        }
-        if (dropRecorder && !dropped.empty())
-        {
-            dropRecorder(dropped, kHotLevel);
         }
     }
     if (TLLM_UNLIKELY(gDebug))
@@ -1191,6 +1200,11 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         }
     }
     rescheduleEvictedPagesOnFailure.cancel();
+    if (dropRecorder)
+        for (auto const& pages : belowOffloadThreshold)
+            if (!pages.empty())
+                dropRecorder(pages, kHotLevel);
+    restoreBelowThreshold.cancel();
 }
 
 // ---------------------------------------------------------------------------

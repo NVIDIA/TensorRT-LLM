@@ -56,7 +56,7 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
     std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
     std::optional<bool> textOnly, bool enableRequestStats,
-    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig, bool isPrefetch)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
@@ -121,7 +121,7 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
 
     if (reuseMatch.has_value())
     {
-        _setupForReuse(*reuseMatch);
+        _setupForReuse(*reuseMatch, !isPrefetch);
     }
 
     _refreshGenerationAllocReady();
@@ -191,11 +191,15 @@ std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, Beam
     auto const apiLock = mManager->lockShared();
     std::vector<Priority> result;
     result.reserve(mBlocks.stdSize());
+    bool const isSsm
+        = std::holds_alternative<SsmLifeCycle>(mManager->storage().getLifeCycle(LifeCycleId{layerGroupId.value()}));
     for (auto const& block : mBlocks)
     {
         auto const* page = beamIndex < block.pages.size()
             ? blockPageGetPage(block.pages[beamIndex].at(layerGroupId)).get()
             : nullptr;
+        if (isSsm && block.treeBlock)
+            page = block.treeBlock->getPage(LifeCycleId{layerGroupId.value()});
         // Preserve ordinals, including absent pages, just like getAggregatedPageIndices(validOnly=false).
         result.push_back(page ? page->priority() : kPriorityDefault);
     }
@@ -1653,6 +1657,11 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         TLLM_CHECK_DEBUG(std::all_of(slots.begin(), slots.end(), [](auto const& vec) { return vec.empty(); }));
     }
 
+    for (auto const& backup : backupHolders)
+    {
+        // Leaving the attention window ends the retention interval without changing priority.
+        backup.holder->page->claimRetention(std::nullopt, std::nullopt);
+    }
     mCapacity = newCap;
     _publishHistoryLength(newHist);
     _refreshGenerationAllocReady();
@@ -2156,8 +2165,6 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
             {
                 LifeCycleId lc = reuseTasks[ri].lifeCycle;
-                auto const retention = getRetention(BlockOrdinal{ord});
-                locks[ri].page()->claimRetention(retention.retentionPriority, retention.durationMs);
                 sb.pages[kDefaultBeamIndex][lc] = std::move(locks[ri]);
             }
             if (mIsDecoding)
@@ -2612,7 +2619,7 @@ void KvCache::dropPartialBlockCachedTokenAttribution()
 // _setupForReuse: find existing blocks in radix tree matching input tokens.
 // ---------------------------------------------------------------------------
 
-void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
+void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claimRetention)
 {
     auto const& matched = match.blocks;
     int const numTokens = match.numTokens;
@@ -2690,7 +2697,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             bool const partialCopy = hasPartialMatch && ordinal == fullReusedEnd;
             bool const borrowPartial = partialCopy && page->hasRetentionConsumers();
             bpSlot = page->hold();
-            if (!borrowPartial)
+            if (claimRetention && !borrowPartial)
             {
                 auto const retention = getRetention(ordinal);
                 page->claimRetention(retention.retentionPriority, retention.durationMs);

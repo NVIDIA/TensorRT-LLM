@@ -220,6 +220,17 @@ void KvCacheManager::refreshRetention()
     mStorage->refreshRetention();
 }
 
+bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens, CacheLevel target, bool knownNoDigest)
+{
+    KVCM2_API_GUARD();
+    auto const apiLock = lockExclusive();
+    auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
+    auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
+        KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);
+    auto close = FuncGuard([&cache]() { cache->close(); });
+    return cache->prefetch(target);
+}
+
 BlockRadixTree::ReuseMatch KvCacheManager::matchReuse(
     ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest) const
 {

@@ -458,9 +458,20 @@ class TestRetention(TestKVCacheManagerV2):
     def test_shared_claim_order_controls_eviction(self, first, second, close_newer_first):
         self.prepare(2 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
         prompt = [1, 2, 3, 4]
+        late = self.manager.create_kv_cache(
+            input_tokens=prompt, kv_cache_retention_config=self._config(100)
+        )
+        self.caches.append(late)
+        self.assertTrue(late.resume(self.stream.handle))
+        self.assertTrue(late.resize(len(prompt)))
+        self.engine.execute([Step(late, prompt, [])], self.stream.handle)
         older = self._cache(prompt, self._config(first))
         newer = self._cache(prompt, self._config(second))
         priority = first if second is None else second
+        # Deduplicating an already computed page is not a new request claim.
+        late.commit(prompt)
+        self.assertEqual(late.get_page_priorities(0), [priority])
+        late.close()
         self.assertEqual(older.get_page_priorities(0), [priority])
         self.assertEqual(newer.get_aggregated_page_indices(0), older.get_aggregated_page_indices(0))
         requests = [newer, older] if close_newer_first else [older, newer]
@@ -508,6 +519,7 @@ class TestRetention(TestKVCacheManagerV2):
         self.assertEqual(second.get_page_priorities(0), [35, 80, 10])
         second.close()
         time.sleep(0.04)
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), tokens, GPU_LEVEL))
         self.manager.refresh_retention()
         reclaimed = self._cache(tokens)
         self.assertEqual(reclaimed.get_page_priorities(0), [35, 35, 35])
@@ -3605,7 +3617,12 @@ class TestSSMSupport(unittest.TestCase):
         stream = cast(CudaStream, stream_holder.handle)
         prompt = [self.next_token() for _ in range(48)]
 
-        kv_cache = self.manager.create_kv_cache()
+        kv_cache = self.manager.create_kv_cache(
+            expected_prompt_length=len(prompt),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]
+            ),
+        )
         kv_cache.resume(stream)
         kv_cache.capacity = len(prompt)
         kv_cache.history_length = len(prompt)
@@ -3634,6 +3651,9 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(attn_page[0], attn_tail_slot)
         self.assertEqual(ssm_page[0], ssm_slot)
         self.assertEqual(ssm_page[1], 16)
+        probe = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(probe.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 80)
+        probe.close()
 
     def test_ssm_snapshot_moves_to_covering_block(self) -> None:
         """A snapshot on a partial block survives the full sibling that replaces it."""

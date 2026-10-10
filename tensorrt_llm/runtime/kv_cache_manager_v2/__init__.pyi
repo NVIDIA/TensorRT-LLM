@@ -781,6 +781,10 @@ class KVCacheManager:
         """
         ...
     def refresh_retention(self) -> None: ...
+    def prefetch_reuse(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt], target: CacheLevel
+    ) -> bool:
+        """Prefetch matched storage while preserving request retention policies and deadlines."""
     def probe_reuse(
         self,
         reuse_scope: ReuseScope | None = None,
