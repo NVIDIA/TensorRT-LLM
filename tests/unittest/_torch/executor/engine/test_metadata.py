@@ -95,3 +95,47 @@ def test_build_attention_metadata_forwards_shared_and_cache_inputs() -> None:
     assert metadata.draft_kv_cache_manager is draft_kv_cache_manager
     assert metadata.enable_context_mla_with_cached_kv
     assert metadata.num_heads_per_kv == 4
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_build_attention_metadata_passes_ragged_opt_in_to_supported_backend(enabled) -> None:
+    class RaggedMetadata(_AttentionMetadata):
+        enable_ragged_verification = False
+
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        sparse_attention_config=None,
+        enable_flash_mla=False,
+    )
+    metadata = build_attention_metadata(
+        model_config,
+        max_batch_size=4,
+        max_num_tokens=16,
+        max_beam_width=1,
+        attention_backend=SimpleNamespace(Metadata=RaggedMetadata),
+        attention_runtime_features=AttentionRuntimeFeatures(),
+        mapping=object(),
+        cache_indirection=None,
+        enable_ragged_verification=enabled,
+    )
+    assert metadata.enable_ragged_verification is enabled
+
+
+def test_build_attention_metadata_does_not_pass_ragged_option_to_other_backend() -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(),
+        sparse_attention_config=None,
+        enable_flash_mla=False,
+    )
+    metadata = build_attention_metadata(
+        model_config,
+        max_batch_size=4,
+        max_num_tokens=16,
+        max_beam_width=1,
+        attention_backend=_AttentionBackend,
+        attention_runtime_features=AttentionRuntimeFeatures(),
+        mapping=object(),
+        cache_indirection=None,
+        enable_ragged_verification=True,
+    )
+    assert not hasattr(metadata, "enable_ragged_verification")

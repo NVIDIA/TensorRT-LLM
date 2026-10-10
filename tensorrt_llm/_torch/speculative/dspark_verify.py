@@ -124,6 +124,8 @@ class DSparkVerifyPlanner:
         self._prev_buffer: torch.Tensor | None = None
         self._prev_event: torch.cuda.Event | None = None
         self._prev_valid = False
+        self._host_confidence_stamp: torch.Tensor | None = None
+        self._prev_confidence_stamp: torch.Tensor | None = None
         # Count every path that declines to trim; degradation here is silent.
         self.stats = {
             "fallback_no_snapshot": 0,
@@ -304,7 +306,11 @@ class DSparkVerifyPlanner:
     def max_verify_len(self) -> int:
         return self.cfg.resolved_max_verify_len
 
-    def stage_confidence(self, confidence_logits: torch.Tensor) -> None:
+    def stage_confidence(
+        self,
+        confidence_logits: torch.Tensor,
+        confidence_stamp: torch.Tensor | None = None,
+    ) -> None:
         """Start a non-blocking device->host copy of the confidence buffer.
 
         ``confidence_logits`` is the worker's whole slot-indexed buffer, staged
@@ -317,12 +323,24 @@ class DSparkVerifyPlanner:
         """
         if confidence_logits is None or confidence_logits.shape[0] == 0:
             return
+        # Validate before rotating any buffer; a rejected stamp must leave the
+        # original decode snapshot/event ownership unchanged.
+        if confidence_stamp is not None and (
+            confidence_stamp.dtype != torch.int32
+            or confidence_stamp.ndim != 1
+            or confidence_stamp.shape[0] != confidence_logits.shape[0]
+        ):
+            raise ValueError("Confidence stamps must be int32, one per slot")
         if self.device_windows:
             # Rotate before overwriting: what was current becomes the older
             # (lag-2) snapshot the budget argmax reads; the old older buffer's
             # storage is reused for this staging. Pure reference swaps.
             self._host_buffer, self._prev_buffer = (self._prev_buffer, self._host_buffer)
             self._copy_event, self._prev_event = (self._prev_event, self._copy_event)
+            self._host_confidence_stamp, self._prev_confidence_stamp = (
+                self._prev_confidence_stamp,
+                self._host_confidence_stamp,
+            )
             self._prev_valid = self._snapshot_valid
             self._snapshot_valid = False
         if self._host_buffer is None or self._host_buffer.shape != confidence_logits.shape:
@@ -334,6 +352,20 @@ class DSparkVerifyPlanner:
             )
             self._copy_event = torch.cuda.Event()
         self._host_buffer.copy_(confidence_logits, non_blocking=True)
+        if confidence_stamp is not None:
+            if (
+                self._host_confidence_stamp is None
+                or self._host_confidence_stamp.shape != confidence_stamp.shape
+            ):
+                self._host_confidence_stamp = torch.empty(
+                    confidence_stamp.shape,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=prefer_pinned(),
+                )
+            self._host_confidence_stamp.copy_(confidence_stamp, non_blocking=True)
+        else:
+            self._host_confidence_stamp = None
         self._copy_event.record()
         self._snapshot_valid = True
 
