@@ -10,15 +10,16 @@ shared abstractions. The two live side by side: ``models/<x>/`` here
 corresponds one-to-one with the zoo's ``modeling_<x>.py``, and the contrast is
 the point.
 
-Entry is a single environment variable::
+Entry is a single LLM API argument::
 
-    TRTLLM_MODELING_V2 = require
+    LLM(model, modeling_v2="require")
 
-``off`` (unset, the default) is byte-for-byte today's behaviour: the resolver returns
+``off`` (the default) is byte-for-byte today's behaviour: the resolver returns
 immediately and nothing in this package is imported. ``auto`` uses a target
-when one matches and falls back to the built-in implementation when none
-does. ``require`` raises instead of falling back -- see ``_router_index`` for
-why that mode is not optional.
+when one claims the configuration and the deployment is within that target's
+bounds, and falls back to the built-in implementation otherwise. ``require``
+raises instead of falling back -- see ``_router_index`` for why that mode is
+not optional.
 
 This package sits *beside* ``_torch/models/`` rather than inside it, which is
 load-bearing twice over: ``is_builtin_zoo_module`` matches on the zoo's
@@ -29,21 +30,15 @@ in the built-in static index would fail its staleness assertion.
 """
 
 from ._router_index import (
-    MODELING_V2_ENV,
     MODELING_V2_ROUTERS,
-    ROUTING_BACKENDS,
     ModelingV2Context,
     ModelingV2Mode,
-    assert_backend_can_route,
     modeling_v2_resolve,
 )
 
 __all__ = [
-    "ROUTING_BACKENDS",
-    "MODELING_V2_ENV",
     "MODELING_V2_ROUTERS",
     "ModelingV2Context",
     "ModelingV2Mode",
-    "assert_backend_can_route",
     "modeling_v2_resolve",
 ]

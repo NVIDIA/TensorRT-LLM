@@ -19,16 +19,16 @@ test_llm_api_pytorch.py: these gate a parallel implementation, and reading them
 next to the built-in model's tests would invite treating one as a variant of
 the other.
 
-Every test here runs under ``TRTLLM_MODELING_V2=require``, which the case puts
-in place itself -- see ``modeling_v2_env``. Under ``"auto"`` a configuration
-that missed a target's criteria would quietly fall back to the built-in
-implementation, pass, and report the built-in's numbers as the target's --
-which is the one failure this whole system exists to prevent. The one exception
-is the stock leg of the acceptance gate, which asks for ``"off"`` on purpose.
+Every test here passes ``modeling_v2="require"`` to ``LLM``. Under ``"auto"`` a
+configuration that missed a target's criteria -- or fell outside its bounds --
+would quietly fall back to the built-in implementation, pass, and report the
+built-in's numbers as the target's, which is the one failure this whole
+system exists to prevent. The one exception is the stock leg of the acceptance
+gate, which asks for ``"off"`` on purpose.
 
 These targets are multi-rank, and the mode has to hold on every rank rather
-than only on the one running the test body; ``modeling_v2_env`` explains why
-that rules out setting the variable directly.
+than only on the one running the test body. The switch is an LLM API argument,
+so it reaches the ranks the way the rest of the arguments do.
 """
 
 import pytest
@@ -44,7 +44,6 @@ from .accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
-from .modeling_v2_env import modeling_v2_llm_args
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -89,7 +88,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
 
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    def test_gsm8k_identity_vs_mtp3(self, mocker, monkeypatch):
+    def test_gsm8k_identity_vs_mtp3(self, mocker):
         """The identity accuracy gate, and the gate on MTP not moving it.
 
         Turning MTP on must not move the answers.
@@ -112,7 +111,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
 
         # One dict for both legs: the comparison only means anything if the two
         # engines were built under the same mode.
-        modeling_v2 = modeling_v2_llm_args("require", monkeypatch)
+        modeling_v2 = dict(modeling_v2="require")
 
         with LLM(self.MODEL_PATH, **modeling_v2, **self.DEP4) as llm:
             identity = task.evaluate(llm)
@@ -138,7 +137,7 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("mode", ["require", "off"], ids=["modeling_v2", "stock"])
-    def test_mtp3_acceptance(self, mode, mocker, monkeypatch):
+    def test_mtp3_acceptance(self, mode, mocker):
         """The only gate that can see a miscomputed draft layer.
 
         Rejection sampling makes a wrong draft path *slower*, not wrong: every
@@ -164,8 +163,8 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
         # which is the strategy the modeling_v2 target implements by hand, so it
         # makes the two comparable rather than less so. Only this leg needs it:
         # the target builds that path itself and never consults the factory.
-        # It rides along with the switch because it is read on the ranks too.
-        deep_ep = {"TRTLLM_CAN_USE_DEEP_EP": "0"} if mode == "off" else {}
+        # It travels as ``env_overrides`` because it is read on the ranks.
+        deep_ep = {"TRTLLM_CAN_USE_DEEP_EP": "0"} if mode == "off" else None
 
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
@@ -175,7 +174,8 @@ class TestModelingV2DeepseekR10528Nvfp4Sm103Dep4(LlmapiAccuracyTestHarness):
             kv_cache_config=self.MTP3_KV,
             cuda_graph_config=CudaGraphConfig(),
             enable_iter_perf_stats=True,
-            **modeling_v2_llm_args(mode, monkeypatch, **deep_ep),
+            modeling_v2=mode,
+            env_overrides=deep_ep,
             **self.DEP4,
         ) as llm:
             task = GSM8K(self.MODEL_NAME)

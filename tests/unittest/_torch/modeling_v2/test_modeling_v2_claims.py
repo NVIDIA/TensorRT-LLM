@@ -138,7 +138,7 @@ def test_checkpoint_fingerprints_are_distinct(arch):
 
 
 # Context fields a routing tree may not branch on yet, and what has to happen
-# before it can. Both would otherwise decide silently on a value that is not
+# before it can. A tree would otherwise decide silently on a value that is not
 # the deployment's -- the failure ``require`` exists to prevent. Delete a row
 # once its prerequisite is met.
 _UNREADABLE_CONTEXT_FIELDS = {
@@ -146,25 +146,13 @@ _UNREADABLE_CONTEXT_FIELDS = {
         "no caller sets it, so it reads False in every deployment, "
         "disaggregated or not; plumb it onto ModelConfig first"
     ),
-    "spec_config": (
-        "explain.py has no flag for a speculative config, so it would report "
-        "the wrong target for every drafting configuration; give explain a "
-        "way to name one first"
-    ),
 }
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
 @pytest.mark.parametrize("field", sorted(_UNREADABLE_CONTEXT_FIELDS))
 def test_no_routing_module_reads_an_unplumbed_dimension(arch, field):
-    """A routing tree may only read what both the engine and explain can fill.
-
-    ``explain`` replays the same tree to answer "why did I not get the target
-    I expected". A criterion it cannot evaluate makes that answer wrong on
-    exactly the configurations someone would ask about -- so the set of
-    readable fields is bounded by the weaker of the two callers, not the
-    engine alone.
-    """
+    """A routing tree may only read what the engine actually fills."""
     source = _module_path(MODELING_V2_ROUTERS[arch]).read_text()
     assert field not in source, (
         f"{arch}: routing reads ctx.{field}, but {_UNREADABLE_CONTEXT_FIELDS[field]}"

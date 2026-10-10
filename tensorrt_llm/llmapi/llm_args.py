@@ -6560,6 +6560,17 @@ class TorchLlmArgs(BaseLlmArgs):
     def quant_config(self, value: QuantConfig):
         self._quant_config = value
 
+    modeling_v2: Literal["off", "auto", "require"] = Field(
+        default="off",
+        status="prototype",
+        description=
+        "Whether to build the model from a modeling_v2 target (experimental) "
+        "instead of the built-in implementation. 'off' never does. 'auto' "
+        "uses a target when one claims this deployment and falls back to the "
+        "built-in implementation otherwise. 'require' raises instead of "
+        "falling back.",
+        json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
+
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
         default="pytorch",

@@ -99,6 +99,10 @@ methods:
         annotation: Literal["pytorch"]
         default: pytorch
         status: deprecated
+      modeling_v2:
+        annotation: Literal['off', 'auto', 'require']
+        default: 'off'
+        status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null

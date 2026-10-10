@@ -10,9 +10,12 @@ DeepseekV3 implementation; in ``require`` it raises, quoting the trace below).
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..._router_index import NULL_TRACE, ModelingV2Context, Trace
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target.
@@ -74,3 +77,9 @@ def route(ctx: ModelingV2Context, trace: Trace = NULL_TRACE) -> Optional[str]:
         return None
 
     return _TARGETS.get((ckpt, parallel))
+
+
+def within_bounds(
+    target: str, args: "TorchLlmArgs", ctx: ModelingV2Context, trace: Trace = NULL_TRACE
+) -> bool:
+    return True

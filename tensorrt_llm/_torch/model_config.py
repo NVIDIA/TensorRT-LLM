@@ -308,19 +308,24 @@ class ModelConfig(Generic[TConfig]):
     # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
     multimodal_config: MultimodalConfig | None = None
 
+    # Class name of the modeling_v2 target to build, or None for the built-in
+    # implementation. Set by the model loader, read by `_resolve_class`.
+    modeling_v2_target: Optional[str] = None
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
+        'modeling_v2_target' is set by the model loader once it has decided.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+                           'quant_config', 'modeling_v2_target'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
