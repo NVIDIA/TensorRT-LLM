@@ -254,7 +254,7 @@ speculative_config:
 	num_nextn_predict_layers: 1
 EOF
 ```
-2. Evaluate accuracy on the [MMLU](https://people.eecs.berkeley.edu/~hendrycks/data.tar) dataset:
+2. Evaluate accuracy on the [MMLU](https://huggingface.co/datasets/cais/mmlu/resolve/main/data.tar) dataset:
 ```
 model_path=<your model path>
 trtllm-eval --model ${model_path} \
