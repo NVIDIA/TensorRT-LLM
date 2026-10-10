@@ -1274,6 +1274,11 @@ class MuseSparkOpenOmniForConditionalGeneration(MultimodalModelMixin, PreTrained
         return MuseSparkOpenForCausalLM.get_preferred_kv_cache_manager_version(pretrained_config)
 
     @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config: Any = None) -> bool:
+        """Whatever the wrapped decoder requires; today ``True``."""
+        return MuseSparkOpenForCausalLM.requires_kv_cache_manager_v2(pretrained_config)
+
+    @classmethod
     def get_preferred_transceiver_runtime(
         cls, pretrained_config: Any = None
     ) -> Optional[Literal["CPP", "PYTHON"]]:

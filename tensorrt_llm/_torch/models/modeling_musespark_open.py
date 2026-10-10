@@ -2669,6 +2669,16 @@ class MuseSparkOpenForCausalLM(
         independently instead of splitting one budget statically."""
         return "V2"
 
+    @classmethod
+    def requires_kv_cache_manager_v2(cls, pretrained_config: Any = None) -> bool:
+        """The V1 manager is not a supported route for this model.
+
+        Routes that cannot keep V2 (disaggregated serving outside NIXL with
+        the Python transceiver) are refused at configuration time rather
+        than demoted to V1.
+        """
+        return True
+
     def load_weights(
         self, weights: Dict[str, Any], weight_mapper: Optional[Any] = None, **kwargs
     ) -> Dict[str, int]:

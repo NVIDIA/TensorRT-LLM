@@ -1159,7 +1159,7 @@ def _framework_class_hooks():
     return sorted(
         name
         for name in dir(MuseSparkOpenForCausalLM)
-        if name.startswith("get_preferred_") or name == "get_model_defaults"
+        if name.startswith(("get_preferred_", "requires_")) or name == "get_model_defaults"
     )
 
 
@@ -1202,6 +1202,11 @@ def test_the_wrapper_prefers_the_same_kv_cache_manager_as_its_decoder():
     assert (
         MuseSparkOpenOmniForConditionalGeneration.get_preferred_kv_cache_manager_version()
         == MuseSparkOpenForCausalLM.get_preferred_kv_cache_manager_version()
+    )
+    assert MuseSparkOpenForCausalLM.requires_kv_cache_manager_v2() is True
+    assert (
+        MuseSparkOpenOmniForConditionalGeneration.requires_kv_cache_manager_v2()
+        is MuseSparkOpenForCausalLM.requires_kv_cache_manager_v2()
     )
     assert (
         MuseSparkOpenOmniForConditionalGeneration.get_preferred_transceiver_runtime()

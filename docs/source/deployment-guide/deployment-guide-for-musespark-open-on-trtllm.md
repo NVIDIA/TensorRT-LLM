@@ -34,7 +34,7 @@ The examples below use `/path/to/musespark-open-checkpoint` — replace it with 
 * **KV-cache block reuse is supported and enabled** (`enable_block_reuse: true`, `enable_partial_reuse: true`).
 * **Guided decoding is supported** with the `xgrammar` backend (`guided_decoding_backend: xgrammar`), including JSON-schema constrained output.
 * **Speculative decoding is supported** with model-free suffix-automaton (SA) drafting as an opt-in; see [Speculative Decoding](#speculative-decoding) below.
-* **Disaggregated serving:** some disaggregated configurations currently require adjusting the attention-kernel library selection with `TLLM_FMHA_LIBS=-fallback` in the server environment (this removes the fallback attention library from the default selection order).
+* **Disaggregated serving:** this model runs on the KV cache manager v2 only, which disaggregated serving keeps on the NIXL backend with the Python transceiver runtime (`cache_transceiver_config: {backend: NIXL, transceiver_runtime: PYTHON}`); other transceiver configurations are refused at startup. Some disaggregated configurations additionally require adjusting the attention-kernel library selection with `TLLM_FMHA_LIBS=-fallback` in the server environment (this removes the fallback attention library from the default selection order). On GB300 (`SM103`, aarch64) also set `UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp` in every worker environment: with the default UCX transport list, NIXL memory registration fails at startup (`registerMem: registration failed for the specified or all potential backends`).
 
 ## Deployment Steps
 
@@ -90,11 +90,14 @@ MODEL=/path/to/musespark-open-checkpoint
 trtllm-serve ${MODEL} \
     --host 0.0.0.0 --port 8000 \
     --config ${EXTRA_LLM_API_FILE} \
+    --custom_tokenizer musespark_open \
     --tool_parser musespark \
     --reasoning_parser musespark
 ```
 
 The `--tool_parser` / `--reasoning_parser` flags enable tool-call and reasoning-content extraction on `/v1/chat/completions`; pass `musespark` explicitly for this model.
+
+`--custom_tokenizer musespark_open` selects the model's bundled tokenizer wrapper (a registered alias); it is not auto-detected, and the speculative-decoding guide lists it as a prerequisite. The wrapper carries the model's padding and dual EOS-id configuration, which a generic Hugging Face tokenizer does not.
 
 TensorRT LLM will load weights and select kernels during startup. The server is successfully launched when the following log is shown:
 
@@ -257,6 +260,7 @@ Before running the benchmark, adjust `ISL` and `OSL` for the server configuratio
 * **Startup fails with a paged-context FMHA error:** On `SM103`, chunked prefill and KV-cache block reuse require the FP8 KV cache for this model (`kv_cache_config.dtype: fp8`); a 16-bit KV cache in that combination is refused at startup by design. Either keep the FP8 KV cache (recommended) or disable both chunked prefill and block reuse.
 * **CUDA out-of-memory errors:** Reduce `kv_cache_config.free_gpu_memory_fraction`, `max_batch_size`, or `max_seq_len`.
 * **Disaggregated serving produces attention-kernel errors:** Set `TLLM_FMHA_LIBS=-fallback` in the server environment for the affected configuration.
+* **Startup refuses the cache transceiver configuration (`requires KV cache manager v2`):** Use `cache_transceiver_config: {backend: NIXL, transceiver_runtime: PYTHON}`; the model does not run on the v1 KV cache manager, and that is the only disaggregated route that keeps v2.
 * **Model fails to load:** Make sure `trust_remote_code: true` is set and that the checkpoint path is a complete Hugging Face-format Muse Spark Open checkpoint with its tokenizer and processor files.
 * **Tool calls or reasoning content not parsed:** Pass `--tool_parser musespark` and `--reasoning_parser musespark` explicitly on the `trtllm-serve` command line.
 * **GPU utilization:** For performance issues, check GPU utilization with `nvidia-smi` while the server is running.

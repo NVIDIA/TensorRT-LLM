@@ -1399,6 +1399,7 @@ def test_causal_lm_is_a_one_engine_speculative_model():
     assert issubclass(MuseSparkOpenForCausalLM, SpecDecOneEngineForCausalLM)
     assert MuseSparkOpenForCausalLM.load_weights is not SpecDecOneEngineForCausalLM.load_weights
     assert MuseSparkOpenForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
+    assert MuseSparkOpenForCausalLM.requires_kv_cache_manager_v2() is True
     assert "infer_max_seq_len" in vars(MuseSparkOpenForCausalLM)
 
 
