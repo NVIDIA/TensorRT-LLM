@@ -982,6 +982,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
             return None
+        # Claiming the minimum stops the target's lookup there, hiding where the
+        # prompt leaves the tree; the attention-only draft match still reaches it.
+        self.kv_cache_manager.note_context_fork(req, draft_match)
         return min(draft_match, target_match)
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:

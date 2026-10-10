@@ -1415,7 +1415,9 @@ class TestKVCacheFailuresCtx:
         """Both pools claim the minimum of their backed-off probe depths.
 
         Pairing up front rather than claim-then-reconcile keeps the mismatch path
-        -- free the draft pages, re-claim shallower -- off the common case.
+        -- free the draft pages, re-claim shallower -- off the common case. The
+        draft's depth also goes to the target, whose capped lookup cannot see a
+        fork past the claim.
         """
         mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
         draft_mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -1440,6 +1442,7 @@ class TestKVCacheFailuresCtx:
         assert ids(out.context_requests) == [0]
         assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
         mgr.prepare_context_cache.assert_called_once_with(req, expected)
+        mgr.note_context_fork.assert_called_once_with(req, draft_probe)
         draft_mgr.free_resources.assert_not_called()
 
     def test_paired_reuse_falls_back_to_zero_when_pools_disagree(self):

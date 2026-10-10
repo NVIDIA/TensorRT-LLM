@@ -2975,6 +2975,7 @@ def _branch_snapshot_manager(
         ),
     )
     mgr._branch_snapshot_points = {}
+    mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
     mgr._branch_snapshots_taken_total = 0
@@ -3064,6 +3065,44 @@ def test_branch_snapshot_skipped_when_reuse_already_reached_the_fork():
     assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
 
 
+def test_branch_snapshot_uses_a_paired_fork_hidden_by_the_claim():
+    """A paired claim at the last snapshot ends the lookup before the fork.
+
+    The capped lookup matched all 64 tokens it was given, which on its own
+    reads as no fork. The attention-only draft pool matched through 192, where
+    the prompt leaves the tree, so that is where a sibling can resume.
+    """
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    kv_cache = _fake_reuse_match(divergence=64, reused=64)
+
+    mgr.note_context_fork(request, 192)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=64)
+
+    assert mgr._branch_snapshot_points == {1: 192}
+    assert request.expect_snapshot_points == [192, 256]
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {}
+
+
+def test_branch_snapshot_ignores_a_paired_fork_within_a_block_of_the_reuse():
+    """An append resumes from the end-offset snapshot of the turn it extends.
+
+    Its fork, where that turn's prompt ended, lies less than a block past the
+    snapshot, so a point there would add a prefill chunk for almost no reuse.
+    """
+    mgr = _branch_snapshot_manager(tokens_per_block=64)
+    request = _fake_context_request(prompt_len=512, context_current_position=392)
+    kv_cache = _fake_reuse_match(divergence=392, reused=392)
+
+    mgr.note_context_fork(request, 450)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=392)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {"no_divergence": 1}
+
+
 def test_branch_snapshot_uses_cache_depth_before_request_cursor_is_rewound():
     """A shallower retry must apply points hidden by the stale request cursor."""
     mgr = _branch_snapshot_manager()
@@ -3137,10 +3176,12 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     request = _fake_context_request(prompt_len=256)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
+    mgr.note_context_fork(request, 192)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
     mgr.prepare_expect_snapshot_points([request])
 
     assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0

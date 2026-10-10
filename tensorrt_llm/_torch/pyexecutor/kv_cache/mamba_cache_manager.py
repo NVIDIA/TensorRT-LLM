@@ -2987,6 +2987,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Recurrent-state snapshots use a specialized commit/history protocol, so
     # keep main-like reuse endpoints and the existing unpaired draft path.
     _supports_reuse_match_backoff = False
+    # get_layer_masks() returns an all-False mamba mask for a draft pool, so
+    # local_num_mamba_layers == 0 and the truncation above cannot apply to it.
+    _supports_draft_reuse_match_backoff = True
+    # It still applies to the paired target, which the scheduler caps at the
+    # draft's claim; waive the trim so it cannot leave the snapshot grid.
+    _drop_advisory_draft_lookahead = True
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the
     # cache manager __init__ coerces a positive spec recompute tail to a full
@@ -3116,6 +3122,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # overwrites the per-request list on every scheduler pass, so the point
         # has to be re-merged from here rather than stored only on the request.
         self._branch_snapshot_points: Dict[int, int] = {}
+        # Fork depths a paired draft probe found past this pool's capped claim.
+        self._context_fork_hints: Dict[int, int] = {}
         self._snapshot_pruned_tokens_total = 0
         self._page_pruned_tokens_total = 0
         self._branch_snapshots_taken_total = 0
@@ -3657,6 +3665,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._snapshot_pruned_tokens_total += max(0, hybrid_depth - reused)
             self._page_pruned_tokens_total += max(0, divergence - hybrid_depth)
 
+        fork = self._context_fork_hints.pop(req.py_request_id, None)
+        if fork is not None and fork - reused > self.tokens_per_block:
+            # A paired claim stops the lookup at its depth, hiding a fork past
+            # it. One within a block of the reuse is not worth a snapshot.
+            divergence = max(divergence, fork)
+            num_lookup_tokens = max(num_lookup_tokens, req.prompt_len - 1)
+
         # The whole lookup range matched, so there is no fork here.
         if divergence >= num_lookup_tokens:
             self._skip_branch_snapshot("no_divergence")
@@ -3680,6 +3695,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         self._branch_snapshot_points[req.py_request_id] = point
         self._apply_branch_snapshot_point(req, context_current_position=reused)
+
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        if self.kv_cache_config.mamba_state_config.enable_branch_snapshot:
+            self._context_fork_hints[req.py_request_id] = fork
 
     def prepare_expect_snapshot_points(self,
                                        requests: List[LlmRequest]) -> None:
@@ -4360,6 +4379,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._request_id_to_state_index.pop(request.py_request_id, None)
         self._request_id_to_is_dummy.pop(request.py_request_id, None)
         self._branch_snapshot_points.pop(request.py_request_id, None)
+        self._context_fork_hints.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -4701,6 +4721,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 f"request {request.py_request_id} to {history_length} tokens")
 
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
+        if self.is_draft:
+            # Attention-only pool: no recurrent state, so the snapshot-boundary
+            # gate below does not apply. expect_snapshot_points is target
+            # geometry. Commit on the base class's block cadence instead.
+            return super().try_commit_blocks(request)
         should_block_reuse = (self.enable_block_reuse and not self.is_draft
                               and not request.is_dummy_request)
         if not should_block_reuse:
@@ -4735,6 +4760,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def update_context_resources(self,
                                  scheduled_batch: ScheduledRequests) -> None:
+        if self.is_draft:
+            # Attention-only pool; see try_commit_blocks.
+            return super().update_context_resources(scheduled_batch)
         for request in scheduled_batch.context_requests:
             kv_cache = self.kv_cache_map.get(request.py_request_id)
             if kv_cache is None or not kv_cache.is_active:
