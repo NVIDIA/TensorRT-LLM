@@ -68,6 +68,9 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     mamba_receiver_payload_bytes,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
+    PeerIncompatibleError,
+)
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.retirement import (
@@ -190,16 +193,6 @@ class MessageType:
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
     SESSION_QUIESCED = b"SESSION_QUIESCED"
-
-
-class PeerIncompatibleError(ValueError):
-    """A context peer failed the KV/recurrent-state layout compatibility check.
-
-    Subclasses ValueError so existing ``except ValueError`` handlers still
-    match, while letting dispatch_task catch peer incompatibility narrowly and
-    fail only the requests targeting that peer instead of crashing the
-    executor loop.
-    """
 
 
 class TaskStatus(Enum):
