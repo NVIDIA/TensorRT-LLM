@@ -323,6 +323,9 @@ l0_b200:
   - unittest/_torch/visual_gen/test_attention_fa4.py
   - unittest/_torch/visual_gen/test_attention_perf.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_registry.py
+  - unittest/_torch/visual_gen/test_qwen_image_registry.py
+  - unittest/_torch/visual_gen/test_qwen_image_parity.py
+  - unittest/_torch/visual_gen/test_qwen_image_layered_parity.py
   - unittest/_torch/visual_gen/test_trtllm_serve_e2e.py
   - unittest/_torch/visual_gen/test_model_loader.py
   - unittest/_torch/visual_gen/test_fp4_conv_autotuner.py
