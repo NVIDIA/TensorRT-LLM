@@ -918,7 +918,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             top_ks_rej = spec_metadata.request_top_ks[gen_slice]
             top_ps_rej = spec_metadata.request_top_ps[gen_slice]
             seed_rej, offset_rej = self._rng_state_per_request(
-                spec_metadata, num_contexts, num_contexts + num_gens
+                spec_metadata,
+                num_contexts,
+                num_contexts + num_gens,
+                slot=spec_metadata.rng_accept_slot,
             )
 
             slot_storage = spec_tree_manager.slot_storage

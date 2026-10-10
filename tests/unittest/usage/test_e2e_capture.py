@@ -265,7 +265,7 @@ def test_startup_failure_context_e2e(failure, capture_server, monkeypatch, enabl
         assert params["llmApiConfigJson"] == "{}"
     else:
         assert meta["capture_succeeded"]
-        assert params["architectureClassName"] == "LlamaForCausalLM"
+        assert params["architectureClassName"] == "Qwen3ForCausalLM"
     assert model not in json.dumps(payload)
     assert payload["events"][0]["ts"] == payload["events"][1]["ts"]
     assert not usage_lib._REPORTER_STARTED

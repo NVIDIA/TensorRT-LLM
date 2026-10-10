@@ -2502,6 +2502,105 @@ class DecodingBaseConfig(StrictBaseModel):
         return 0
 
 
+class MooncakeStoreConfig(StrictBaseModel):
+    """How this server joins a Mooncake store pool.
+
+    The settings every participant shares come from the master named by
+    `pool`; what is left here is per-server. Setting this makes
+    `trtllm-serve` render the Mooncake client config and export
+    `MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.
+    """
+    pool: str = Field(
+        ...,
+        description="The pool to join: 'file://<path>' naming a manifest "
+        "published by 'trtllm-serve mooncake_master --pool_file', or a "
+        "master's 'host:port'. The manifest form also carries the settings "
+        "every participant must agree on.")
+    role: Literal["both", "producer", "consumer", "capacity"] = Field(
+        "both",
+        description="What this server does with the pool. 'both' reads and "
+        "writes, 'producer' only writes, 'consumer' only reads, and "
+        "'capacity' does neither: its ranks lend memory without moving any "
+        "KV, so they pin no staging buffers and pay no per-request cost.")
+    segment_size: Union[int, str] = Field(
+        "16GiB",
+        description="Host memory each of this server's ranks contributes to "
+        "the pool, as a binary size ('16GiB') or a byte count; ambiguous "
+        "units such as 'GB' are refused. A node's demand is ranks_on_node x "
+        "segment_size, checked against available memory at startup. Zero "
+        "lends nothing, leaving the server to use only capacity its peers "
+        "hold.")
+    transfer_batch_size: PositiveInt = Field(
+        64, telemetry=False, description="Page keys per store call.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Key namespace, isolating this deployment's cache from "
+        "others on the same pool. Bump it after any change to page layout or "
+        "contents. Defaults to the pool manifest's.")
+    model_key: str = Field(
+        ...,
+        telemetry=False,
+        description="What the pool keys identify this checkpoint by. Two "
+        "engines share cache only when they agree on it, and two that "
+        "disagree read each other's pages as their own, so it has no default "
+        "and must be unique per checkpoint.")
+    stage_through_host: bool = Field(
+        True,
+        telemetry=False,
+        description="Copy pages through a pinned host buffer instead of "
+        "registering the KV pools with Mooncake. The only transfer path "
+        "supported today, so 'false' is ignored with a warning. Costs a copy "
+        "each way and needs no GPUDirect RDMA.")
+    local_hostname: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Address this server's ranks register their segments "
+        "under, for peers to reach them at. Derived by default from the "
+        "interface that routes to the master. One value covers every rank, so "
+        "only set it on a server whose ranks share a node.")
+    run_dir: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where this server keeps the Mooncake client config it "
+        "renders and each rank's record of the segment it mounted. Required "
+        "when a launcher starts one task per rank, as trtllm-llmapi-launch "
+        "does, and must not be shared between servers. Defaults to a "
+        "temporary directory removed at shutdown.")
+    master_timeout: float = Field(
+        60.0,
+        telemetry=False,
+        description="Seconds to wait for the pool manifest to appear and the "
+        "master to accept connections. Raise it when the wait spans a "
+        "container start on another node. Expiring fails the server at "
+        "startup.")
+
+    @field_validator("stage_through_host", mode="after")
+    @classmethod
+    def _force_host_staging(cls, value):
+        """Say here what the workers would otherwise each say after bringup."""
+        if not value:
+            logger.warning(
+                "Ignoring mooncake_store.stage_through_host=False: pages pass "
+                "through pinned host memory, which is the only transfer path "
+                "this connector supports today.")
+        return True
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _check_segment_size(cls, value):
+        """Reject a bad size here rather than in every rank after bringup."""
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"mooncake_store.segment_size: {exc}")
+        if parsed < 0:
+            raise ValueError(f"mooncake_store.segment_size: {value!r} is "
+                             f"{parsed} bytes; it cannot be negative.")
+        return value
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -2516,7 +2615,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
         "auto-populated from the preset registry.",
-        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm',
+                                             'mooncake-store'))
     connector_module: Optional[str] = Field(
         None,
         description=
@@ -2531,11 +2631,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    mooncake_store: Optional[MooncakeStoreConfig] = Field(
+        None,
+        description="Pool topology for the 'mooncake-store' connector. When "
+        "set, trtllm-serve provisions the pool during bringup instead of "
+        "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
-        from tensorrt_llm._torch.pyexecutor.connectors.registry import \
-            CONNECTOR_REGISTRY
+        from tensorrt_llm._torch.pyexecutor.connectors.registry import (
+            CONNECTOR_REGISTRY, uses_connector)
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
@@ -2553,6 +2658,12 @@ class KvCacheConnectorConfig(StrictBaseModel):
             raise ValueError("connector_scheduler_class is required")
         if self.connector_worker_class is None:
             raise ValueError("connector_worker_class is required")
+        if self.mooncake_store is not None and not uses_connector(
+                self, "mooncake-store"):
+            raise ValueError(
+                "mooncake_store describes a Mooncake pool, but this config "
+                f"resolves to connector_module={self.connector_module!r}. "
+                "Set connector: mooncake-store, or drop mooncake_store.")
         return self
 
 
@@ -4237,6 +4348,24 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    skip_rope_quantization: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "True: preserve the position-encoded (RoPE) part of each K vector in "
+        "its original active-cache precision and quantize the rest to NVFP4. "
+        "False (default): quantize both parts, using residual RoPE quantization "
+        "for DeepSeek-V4 when nvfp4_residual_dim is 64. "
+        "An option to explore; measure its accuracy effect on your model.")
+    nvfp4_residual_dim: Literal[0, 64] = Field(
+        default=64,
+        status="prototype",
+        description=
+        "64 (default): use two independently scaled FP4 components for the 64 "
+        "DeepSeek-V4 target cold-page RoPE values: a main component and its "
+        "residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. "
+        "Ignored for other models, draft caches, and when skip_rope_quantization "
+        "preserves the original RoPE precision.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,
@@ -5464,7 +5593,7 @@ class BaseLlmArgs(StrictBaseModel):
         # test_multi_frontend_routing pins the two together.
         le=64,
         description=
-        "The number of HTTP frontend processes serving one executor. Used by "
+        "The number of HTTP or OpenEngine frontend processes serving one executor. Used by "
         "trtllm-serve: values > 1 run additional attached frontend processes "
         "that share the serving port via SO_REUSEPORT (classic IPC executor "
         "path only).",
