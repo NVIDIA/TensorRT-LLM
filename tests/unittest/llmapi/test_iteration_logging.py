@@ -187,6 +187,27 @@ def test_iteration_logging_shutdown(case: str, tmp_path: Path) -> None:
         process.close()
 
 
+def test_iteration_writer_drains_after_transient_post_stop_gap(tmp_path: Path) -> None:
+    """A temporary empty poll after stop does not discard queued tail records."""
+    stop = multiprocessing.Event()
+    stop.set()
+    socket = MagicMock()
+    socket.poll.side_effect = [False, True, True]
+    socket.recv_json.side_effect = [{"iteration": 1}, {"end": True}]
+    context = MagicMock()
+    context.socket.return_value = socket
+    log = tmp_path / "iterations.log"
+
+    with (
+        patch.object(processes, "Context", return_value=context),
+        patch.object(processes.logger, "warning") as warning,
+    ):
+        processes.IterationWriter.run("ipc://unused", log, stop)
+
+    assert [ast.literal_eval(line) for line in log.read_text().splitlines()] == [{"iteration": 1}]
+    warning.assert_not_called()
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 def test_latency_command_forwards_iteration_log(enabled: bool, tmp_path: Path) -> None:
     """Latency configuration enables iteration statistics only when requested."""

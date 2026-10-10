@@ -14,6 +14,7 @@
 # limitations under the License.
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from multiprocessing import Event, Process
 from multiprocessing.synchronize import Event as MpEvent
@@ -26,6 +27,8 @@ from tensorrt_llm import logger
 
 _ITERATION_WRITER_JOIN_TIMEOUT_SEC = 5.0
 _ITERATION_WRITER_POLL_MS = 100
+# Allow queued tail messages to bridge transient empty polls after shutdown.
+_ITERATION_WRITER_IDLE_TIMEOUT_SEC = 1.0
 
 
 # The IterationWriter class implements a multi-process logging system that captures and writes
@@ -172,9 +175,14 @@ class IterationWriter:
                 context = Context(io_threads=1)
                 socket = context.socket(PULL)
                 socket.bind(address)
+                drain_deadline = None
                 while True:
+                    if stop_event.is_set() and drain_deadline is None:
+                        drain_deadline = (time.monotonic() +
+                                          _ITERATION_WRITER_IDLE_TIMEOUT_SEC)
                     if not socket.poll(_ITERATION_WRITER_POLL_MS, POLLIN):
-                        if stop_event.is_set():
+                        if (drain_deadline is not None
+                                and time.monotonic() >= drain_deadline):
                             logger.warning(
                                 "Iteration writer stopped without receiving the "
                                 "end marker; the iteration log may be incomplete."
@@ -185,6 +193,10 @@ class IterationWriter:
                     if "end" in message:
                         break
                     f.write(f"{message}\n")
+                    if stop_event.is_set():
+                        # Keep draining while queued tail messages are arriving.
+                        drain_deadline = (time.monotonic() +
+                                          _ITERATION_WRITER_IDLE_TIMEOUT_SEC)
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt, exiting iteration logging...")
         finally:
