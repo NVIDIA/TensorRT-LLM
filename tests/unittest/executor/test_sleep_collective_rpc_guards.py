@@ -44,7 +44,6 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
 
     w = object.__new__(BaseWorker)
     w._backend = backend
-    w._is_pytorch_backend = backend == "pytorch"
     w.llm_args = SimpleNamespace(
         backend=backend,
         parallel_config=SimpleNamespace(world_size=world_size),

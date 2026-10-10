@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import atexit
 import faulthandler
 import json
@@ -557,7 +559,6 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Path,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,
         world_size: int = 0,
@@ -576,8 +577,8 @@ class GenerationExecutor(ABC):
 
         if world_size > 1 and world_size < model_world_size:
             raise RuntimeError(
-                "Cannot instantiate Generator for engine built "
-                f"for {model_world_size} ranks, while currently running "
+                "Cannot instantiate an executor requiring "
+                f"{model_world_size} ranks, while currently running "
                 f"on {world_size} ranks.")
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -618,7 +619,6 @@ class GenerationExecutor(ABC):
                 is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
-            "engine": engine,
             "batched_logits_processor": batched_logits_processor,
             "hf_model_dir": hf_model_dir,
             "tokenizer": tokenizer,
