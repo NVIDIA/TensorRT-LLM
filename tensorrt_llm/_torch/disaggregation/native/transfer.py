@@ -4428,6 +4428,10 @@ class TransferWorker:
         # the object and serializes on request, so setting it here is in time.
         self._rank_info.planner_id = self._planner.planner_id
         self._rank_info.planner_blob = self._planner.describe()
+        logger.info(
+            f"TransferWorker: KV transfer planned by {type(self._planner).__name__} "
+            f"(planner_id={self._planner.planner_id!r})"
+        )
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor, self._planner)
 
     def _setup_transfer_engine(self):
