@@ -2356,6 +2356,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
     secondary_offload_min_priority=None,
+    host_cache_size=None,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2384,6 +2385,7 @@ def _build_v2_hybrid_with_mamba_layer(
         ),
         dtype=kv_cache_dtype,
         secondary_offload_min_priority=secondary_offload_min_priority,
+        host_cache_size=host_cache_size,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -2882,6 +2884,7 @@ def test_v2_hybrid_retains_configured_number_of_conversation_turns():
         max_num_turns=2,
         additional_snapshot_offsets_from_end=[0],
         secondary_offload_min_priority=50,
+        host_cache_size=0,
     )
     request_a = _make_v2_conversation_request(
         1,
