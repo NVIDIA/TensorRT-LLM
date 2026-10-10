@@ -2393,6 +2393,7 @@ def create_softmax_task(
             "prev_sum": None,
             "row_sum": None,
             "sums": None,
+            "k_next": None,
             "kept": None,
         }
 
@@ -2463,8 +2464,9 @@ def create_softmax_task(
             if vc_attention:
                 init = sp.vc_init_row_scale()
                 vc_row_scale, vc_state["prev_sum"] = init[0], init[1]
-                vc_state["sums"] = init[2:-1]
-                vc_state["kept"] = init[-1]
+                vc_state["sums"] = init[2:18]
+                vc_state["kept"] = init[18]
+                vc_state["k_next"] = init[19]
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
@@ -2507,8 +2509,10 @@ def create_softmax_task(
                         section=FmhaStage.Loop,
                     )
                 elif vc_attention:
-                    old_row_max, row_max = sp.vc_compute_row_max(
-                        row_max=row_max, vc_row_scale=vc_row_scale
+                    old_row_max, row_max, vc_state["k_next"] = sp.vc_compute_row_max(
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
@@ -2767,7 +2771,9 @@ def create_softmax_task(
                 sp.wait()
                 if vc_attention:
                     old_row_max, row_max = sp.vc_fixed_dense_k_tail_masked_row_max(
-                        row_max=row_max, vc_row_scale=vc_row_scale
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
                     )
                 else:
                     old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(

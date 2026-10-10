@@ -680,6 +680,8 @@ def build_context_task_manager(
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     tma_mu_desc: cutlass.Pointer | None = None,
+    vc_q_scale: cute.Tensor | None = None,
+    vc_k_scale: cute.Tensor | None = None,
     vc_ctrl: cute.Tensor | None = None,
     num_kv_tiles: int | Int32,
     q_offset: int | Int32,
@@ -1208,6 +1210,8 @@ def build_context_task_manager(
         variable_window_q_stride=variable_window_q_stride,
         scale_softmax_log2=scale_softmax_log2,
         smem_p=smem_p0,
+        vc_q_scale=vc_q_scale,
+        vc_k_scale=vc_k_scale,
         name="tmem_sp0",
     )
     tmem_p0: TmemPResource | None = None
@@ -1301,6 +1305,8 @@ def build_context_task_manager(
             variable_window_q_stride=variable_window_q_stride,
             scale_softmax_log2=scale_softmax_log2,
             smem_p=smem_p1,
+            vc_q_scale=vc_q_scale,
+            vc_k_scale=vc_k_scale,
             name="tmem_sp1",
         )
         tmem_vec1 = TmemStatsResource(
@@ -1894,6 +1900,9 @@ def _kv_ring_smem_budget_bytes(
         if cfg.vc_restores_means:
             # The row-sum operand lives behind each P tile.
             p_block_bytes += cfg.vc_rowsum_tile_bytes
+        if cfg.vc_qk8:
+            # VC-Attention-QK8 keeps its K-scale table behind the P tile.
+            p_block_bytes += cfg.vc_kscale_table_bytes
         smem_p_bytes = (
             (p_block_bytes + align - 1) // align * align * cfg.num_qkv_instances
         )
@@ -2624,6 +2633,8 @@ def build_fmha_task_manager(
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
     tma_mu_desc: cutlass.Pointer | None = None,
+    vc_q_scale: cute.Tensor | None = None,
+    vc_k_scale: cute.Tensor | None = None,
     vc_ctrl: cute.Tensor | None = None,
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
@@ -2718,6 +2729,8 @@ def build_fmha_task_manager(
         g_seq_lens_kv=g_seq_lens_kv,
         max_seq_len_kv=max_seq_len_kv,
         tma_mu_desc=tma_mu_desc,
+        vc_q_scale=vc_q_scale,
+        vc_k_scale=vc_k_scale,
         vc_ctrl=vc_ctrl,
         num_kv_tiles=domain_num_kv_tiles,
         q_offset=effective_q_offset,
@@ -2834,6 +2847,10 @@ class FmhaTs:
         vc_k_block_size: int = 0,
         vc_num_q_heads: int = 0,
         vc_head_dim_v: int = 128,
+        vc_q_block_log2: int = 7,
+        vc_max_kv_tiles: int = 0,
+        vc_seq_len_q: int = 0,
+        vc_seq_len_k: int = 0,
         vc_repair_tiles: int = 0,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
@@ -2918,6 +2935,10 @@ class FmhaTs:
         cfg.vc_k_block_size = vc_k_block_size
         cfg.vc_num_q_heads = vc_num_q_heads
         cfg.vc_head_dim_v = vc_head_dim_v
+        cfg.vc_q_block_log2 = vc_q_block_log2
+        cfg.vc_max_kv_tiles = vc_max_kv_tiles
+        cfg.vc_seq_len_q = vc_seq_len_q
+        cfg.vc_seq_len_k = vc_seq_len_k
         cfg.vc_repair_tiles = vc_repair_tiles
         cfg.fp8_psmem_early_token = fp8_psmem_early_token
         self.cfg = cfg
@@ -3114,14 +3135,18 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
         vc_mu: cute.Tensor | None = None,
+        vc_q_scale: cute.Tensor | None = None,
+        vc_k_scale: cute.Tensor | None = None,
         vc_ctrl: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
-        VC-Attention-QK16 takes ``vc_mu`` ([B, Hkv, ceil(num_kv_tiles / 16), 16, 256] bf16, the
+        VC-Attention takes ``vc_mu`` ([B, Hkv, ceil(num_kv_tiles / 16), 16, 256] bf16, the
         host-packed tile-mean UMMA operands) and ``vc_ctrl`` (one Int32, 1 to
         restore the tile means and 0 for the plain kernel after the V-Smooth
-        window).
+        window). VC-Attention-QK8 also takes ``vc_q_scale``
+        ([Hq, flat_scale_numel(B, Sq, q_block)] fp32, sage flat layout) and
+        ``vc_k_scale`` ([Hkv, flat_scale_numel(B, Skv, 128)] fp32).
 
         ``scale_softmax_log2`` and ``output_scale`` must be one-element float32
         device tensors. Example host values are
@@ -3329,7 +3354,11 @@ class FmhaTs:
         tma_mu_desc = tma_v_desc
         if cutlass.const_expr(cfg.vc_restores_means):
             if cutlass.const_expr(vc_mu is None):
-                raise ValueError("VC-Attention-QK16 requires vc_mu")
+                raise ValueError("VC-Attention requires vc_mu")
+            if cutlass.const_expr(
+                cfg.vc_qk8 and (vc_q_scale is None or vc_k_scale is None)
+            ):
+                raise ValueError("VC-Attention-QK8 requires vc_q_scale and vc_k_scale")
             mu_rows, mu_cols = vc_mean_operand_shape(cfg.vc_head_dim_v)
             tma_mu_desc = cuda.create_tensor_map_tiled_from_view(
                 vc_mu,
@@ -3449,6 +3478,8 @@ class FmhaTs:
             variable_window_cta_starts,
             Int32(s_q),
             tma_mu_desc,
+            vc_q_scale,
+            vc_k_scale,
             vc_ctrl,
             self.is_persistent,
             self.is_clc_dynamic,
@@ -3491,6 +3522,8 @@ class FmhaTs:
         variable_window_cta_starts: cute.Tensor | None,
         variable_window_q_stride: Int32,
         tma_mu_desc: cutlass.GridConstant[cuda.TensorMap],
+        vc_q_scale: cute.Tensor | None,
+        vc_k_scale: cute.Tensor | None,
         vc_ctrl: cute.Tensor | None,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
@@ -3560,6 +3593,8 @@ class FmhaTs:
             output_scale=output_scale,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
+            vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
+            vc_k_scale=vc_k_scale if cfg.vc_qk8 else None,
             vc_ctrl=vc_ctrl if cfg.vc_restores_means else None,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,

@@ -98,6 +98,7 @@ from .vc_resources import (
     _f16x2_sum4,
     _split_bf16_hi_lo_word,
 )
+from .vc_scales import VCKScaleTable, vc_flat_k_base, vc_flat_q_slot
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
@@ -428,7 +429,7 @@ class FmhaConfig:
     two_cta_umma: bool = False
     # exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     exp2_fma_pairs: int = 0
-    # VC-Attention-QK16. A nonzero ``vc_k_block_size`` (the 128-token K/V tile)
+    # VC-Attention. A nonzero ``vc_k_block_size`` (the 128-token K/V tile)
     # stores E4M3 V as per-tile residuals whose bf16 tile means one K=16 UMMA
     # step per tile restores into O.
     vc_k_block_size: int = 0
@@ -438,6 +439,18 @@ class FmhaConfig:
     # Strides of the per-(batch, head, channel) VC output scale table.
     vc_num_q_heads: int = 0
     vc_head_dim_v: int = 128
+    # VC-Attention-QK8 (E4M3 Q/K): one dequant scale per Q block and per K/V
+    # tile folded into the exp2 multiplier. log2 of the Q tokens sharing one scale.
+    vc_q_block_log2: int = 7
+    # Upper bound on K/V tiles per request: sizes the per-group SMEM table of K
+    # dequant scales that softmax fills once per work tile.
+    vc_max_kv_tiles: int = 0
+    # Exact Q and K/V sequence lengths of the fixed plan: the Q/K dequant scales
+    # use the sage flat layout, slot(b, t) = (b*S >> log2(blk)) + b + (t >> log2(blk)).
+    vc_seq_len_q: int = 0
+    vc_seq_len_k: int = 0
+    # Named barrier ids (one per softmax group) ordering that table's refill.
+    vc_kscale_barrier_id: int = 8
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -520,12 +533,17 @@ class FmhaConfig:
         return self.vc_k_block_size != 0
 
     @property
+    def vc_qk8(self) -> bool:
+        """VC-Attention-QK8, the E4M3 Q/K recipe with per-block dequant scales."""
+        return self.vc_attention and self.q_dtype.width == 8
+
+    @property
     def vc_restores_means(self) -> bool:
         """Whether VC-Attention-QK16 restores the V tile means rather than using V repair rows."""
         return self.vc_attention and self.vc_repair_tiles == 0
 
     def validate_vc_profile(self) -> None:
-        """Validate the VC-Attention-QK16 recipe against the configured kernel."""
+        """Validate the VC-Attention recipe against the configured kernel."""
         if not self.vc_attention:
             if self.vc_num_q_heads != 0:
                 raise ValueError("vc_num_q_heads requires vc_k_block_size")
@@ -557,10 +575,15 @@ class FmhaConfig:
         # channels and 128 query rows.
         if self.logical_head_dim_qk != 128 or self.vc_head_dim_v != 128:
             raise ValueError("VC-Attention-QK16 requires head_dim 128")
-        if self.q_dtype.width != 16 or self.v_dtype.width != 8:
-            raise ValueError("VC-Attention-QK16 requires 16-bit Q/K and E4M3 V")
+        if self.q_dtype.width not in (8, 16) or self.v_dtype.width != 8:
+            raise ValueError("VC-Attention requires 16-bit or E4M3 Q/K and E4M3 V")
+        if self.vc_qk8 and not (0 <= self.vc_q_block_log2 <= 8):
+            raise ValueError("vc_q_block_log2 must be in [0, 8]")
         if not self.p_in_smem:
-            raise ValueError("VC-Attention-QK16 requires P staged in SMEM")
+            raise ValueError(
+                "VC-Attention requires P staged in SMEM, the dense paired D128 "
+                "schedule with a 16-bit output"
+            )
 
     @property
     def vc_mean_operand_bytes(self) -> int:
@@ -586,6 +609,12 @@ class FmhaConfig:
     def vc_rowsum_tile_bytes(self) -> int:
         """Bytes of the row-sum operands of one tile group."""
         return VC_MEAN_OPERANDS * self.vc_rowsum_operand_bytes
+
+    @property
+    def vc_kscale_table_bytes(self) -> int:
+        """Bytes of one softmax group's fp32 K-scale table (16-byte padded)."""
+        entries = max(self.vc_max_kv_tiles, 1)
+        return (entries * 4 + 15) // 16 * 16
 
     @property
     def smem_q_head_dim(self) -> int:
@@ -2573,9 +2602,14 @@ class SmemPResource(MemoryResource):
     ) -> None:
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
-        # VC-Attention-QK16 appends the group's bf16 [128 x 16] row-sum operand
-        # behind the P tile.
-        extra_bytes = cfg.vc_rowsum_tile_bytes if cfg.vc_restores_means else 0
+        # VC-Attention appends the group's bf16 [128 x 16] row-sum operands behind
+        # the P tile when it restores the tile means, and VC-Attention-QK8 its
+        # K-scale table behind those.
+        extra_bytes = 0
+        if cfg.vc_restores_means:
+            extra_bytes += cfg.vc_rowsum_tile_bytes
+        if cfg.vc_qk8:
+            extra_bytes += cfg.vc_kscale_table_bytes
         self._alloc = SmemAllocation(
             f"smem_p{group_idx}",
             cfg.smem_p_bytes + extra_bytes,
@@ -2587,8 +2621,15 @@ class SmemPResource(MemoryResource):
 
     @property
     def rowsum_tile_offset(self) -> int:
-        """Byte offset of the VC-Attention-QK16 row-sum operand inside this allocation."""
+        """Byte offset of the VC-Attention row-sum operands inside this allocation."""
         return self.cfg.smem_p_bytes
+
+    @property
+    def kscale_table_offset(self) -> int:
+        """Byte offset of the VC-Attention-QK8 K-scale table inside this allocation,
+        behind the row-sum operand when the tile means are restored."""
+        rowsum = self.cfg.vc_rowsum_tile_bytes if self.cfg.vc_restores_means else 0
+        return self.cfg.smem_p_bytes + rowsum
 
     @property
     def row_bytes(self) -> int:
@@ -2660,11 +2701,19 @@ class TmemSPResource(MemoryResource):
     variable_window_end: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
-    # VC-Attention-QK16: the row's softmax scale in log2 units (per work tile) and
-    # the previous tile's fp32 row sum awaiting its deferred mean step.
+    # VC-Attention-QK8 dequant scales in the flat layout: Q [Hq, numel] and K/V
+    # tile [Hkv, numel], both fp32.
+    vc_q_scale: cute.Tensor | None = field(init=False, default=None)
+    vc_k_scale: cute.Tensor | None = field(init=False, default=None)
+    # VC-Attention: the row's softmax scale in log2 units (per work tile, times
+    # sfQ under QK8) and the previous tile's fp32 row sum awaiting its deferred
+    # mean step.
     vc_row_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_prev_tile_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_kept_row_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    # VC-Attention-QK8: sfK of the next K/V tile, read from the SMEM table one
+    # tile ahead so no shared load sits on the row-max critical chain.
+    vc_k_scale_next: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     # Row sums of the current mean group, kept in the running max's units.
     vc_pend0: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_pend1: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -2700,6 +2749,8 @@ class TmemSPResource(MemoryResource):
         variable_window_q_stride: int | Int32 = 0,
         scale_softmax_log2: cute.Tensor | None = None,
         smem_p: Optional[SmemPResource] = None,
+        vc_q_scale: cute.Tensor | None = None,
+        vc_k_scale: cute.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata."""
@@ -2718,6 +2769,8 @@ class TmemSPResource(MemoryResource):
         self.variable_window_cta_starts = variable_window_cta_starts
         self.variable_window_q_stride = variable_window_q_stride
         self.scale_softmax_log2 = scale_softmax_log2
+        self.vc_q_scale = vc_q_scale
+        self.vc_k_scale = vc_k_scale
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
             cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage,
@@ -2879,6 +2932,11 @@ class TmemSPResource(MemoryResource):
             dtype=Float32,
             default=Float32(0.0),
             docs="VC-Attention-QK16: row sum of tile 15 of the current mean group.",
+        )
+        self.vc_k_scale_next = TaskLocalVariable(
+            dtype=Float32,
+            default=Float32(1.0),
+            docs="VC-Attention-QK8: K dequant scale of the next K/V tile.",
         )
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
@@ -3222,7 +3280,9 @@ class TmemSPResource(MemoryResource):
     def init_softmax_state_early(self, stage_info: StageInfo) -> None:
         """Initialize softmax TMEM state without a function-lifetime P value."""
         self._init_function_state(stage_info)
-        if cutlass.const_expr(self.cfg.vc_attention):
+        if cutlass.const_expr(self.cfg.vc_restores_means):
+            # The row-sum operand exists behind the P tile only when the tile
+            # means are restored; V repair plans have no such buffer.
             self._zero_vc_rowsum_row(stage_info)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_chunk)
@@ -3263,16 +3323,60 @@ class TmemSPResource(MemoryResource):
             vc_pend14,
             vc_pend15,
             vc_kept_row_sum,
+            vc_k_scale_next,
         ),
     )
     @cute.jit
     def vc_init_row_scale(self, stage_info: StageInfo) -> tuple[Float32, ...]:
-        """VC-Attention-QK16 work-tile setup. Returns the softmax scale in log2 units,
-        a zero previous-tile row sum, zero group row sums and a zero kept row sum."""
-        _ = stage_info
-        return (self.scale_softmax_log2[0], Float32(0.0)) + (Float32(0.0),) * 17
+        """VC-Attention work-tile setup. Returns the softmax scale in log2 units,
+        a zero previous-tile row sum, zero group row sums, a zero kept row sum
+        (V repair) and tile 0's sfK.
 
-    @consumer_work(returns=(old_row_max, row_max))
+        Under VC-Attention-QK8 the row scale also carries this row's sfQ, and the
+        group's SMEM sfK table is filled with one coalesced pass. Both named
+        barrier syncs of the fill cover the group's four warps: the first keeps
+        a fast warp from refilling while a peer still reads the previous work
+        tile's entries, the second publishes the new table.
+        """
+        row_scale = self.scale_softmax_log2[0]
+        k_scale_next = Float32(1.0)
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            batch_coord, head, row = self._vc_coords(stage_info)
+            kv_head = head // self.cfg.h_r
+            q_slot = vc_flat_q_slot(
+                batch_coord, row, self.cfg.vc_seq_len_q, self.cfg.vc_q_block_log2
+            )
+            row_scale = row_scale * Float32(self.vc_q_scale[(head, q_slot)])
+            k_base = vc_flat_k_base(
+                batch_coord, self.cfg.vc_seq_len_k, self.cfg.kv_tile_n
+            )
+            k_scale_next = self._vc_k_scales.fill(
+                stage_info, self.vc_k_scale, kv_head, k_base
+            )
+        return (row_scale, Float32(0.0)) + (Float32(0.0),) * 17 + (k_scale_next,)
+
+    @cute.jit
+    def _vc_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32]:
+        """Return ``(batch, head, q_row)`` of this softmax thread's row."""
+        seq_coord, head_coord, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        warp_id_in_sg = cute.arch.warp_idx() % len(self.cfg.softmax0_warp_ids)
+        row_in_tile = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+        row = (
+            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+            + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
+            + row_in_tile
+        )
+        head = head_coord * self.cfg.work_tile_q_heads
+        return batch_coord, head, row
+
+    @property
+    def _vc_k_scales(self) -> VCKScaleTable:
+        """This softmax group's staged ``sfK`` table (see ``vc_scales``)."""
+        return VCKScaleTable(self.cfg, self.smem_p, self.q_half)
+
+    @consumer_work(returns=(old_row_max, row_max, vc_k_scale_next))
     @cute.jit
     def vc_compute_row_max(
         self,
@@ -3280,14 +3384,26 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         vc_row_scale: SoftmaxScalar,
-    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """VC-Attention-QK16 K-loop row max in log2 units."""
-        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
-            return self._load_s_chunks_and_reduce_row_max(
-                stage_info, row_max, tile_scale=vc_row_scale
+        vc_k_scale_next: SoftmaxScalar,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar, Float32]:
+        """VC-Attention K-loop row max in log2 units. Under QK8 the tile maximum is
+        scaled by ``vc_row_scale * sfK[tile]`` (prefetched) and the next tile's
+        ``sfK`` is read."""
+        tile_scale = vc_row_scale
+        k_scale_after = vc_k_scale_next
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            k_scale_after = self._vc_k_scales.next_scale(
+                stage_info, Int32(stage_info.loop_offset)
             )
-        s_data = self._load_s_chunks(stage_info)
-        return self._reduce_row_max(s_data, row_max, vc_row_scale)
+            tile_scale = vc_row_scale * vc_k_scale_next
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            old_row_max, new_row_max = self._load_s_chunks_and_reduce_row_max(
+                stage_info, row_max, tile_scale=tile_scale
+            )
+        else:
+            s_data = self._load_s_chunks(stage_info)
+            old_row_max, new_row_max = self._reduce_row_max(s_data, row_max, tile_scale)
+        return old_row_max, new_row_max, k_scale_after
 
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
@@ -3297,12 +3413,15 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         vc_row_scale: SoftmaxScalar,
+        vc_k_scale_next: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """VC-Attention-QK16 dense tail: mask the zero-filled lanes of the partial last
-        K/V tile before the row max."""
+        """VC-Attention dense tail: mask the zero-filled lanes of the partial last
+        K/V tile before the row max; under QK8 the tile's prefetched ``sfK`` scales it."""
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         tile_scale = vc_row_scale
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            tile_scale = vc_row_scale * vc_k_scale_next
         s_data = self._load_s_chunks(stage_info)
         neg_inf = cutlass.vector.full(
             [tmem_x],
