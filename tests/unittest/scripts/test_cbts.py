@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import importlib.util
 import io
 import json
@@ -47,10 +48,15 @@ sys.path.insert(0, str(CBTS_ROOT / "coverage_utils"))
 
 from blocks import Block, Stage, YAMLIndex  # noqa: E402
 from compact_db import write_leaf_database  # noqa: E402
+from coverage_tier import apply_coverage_tier  # noqa: E402
 from main import Selector, _combine_scopes  # noqa: E402
-from python_change_analysis import analyze_python_changes  # noqa: E402
+from python_change_analysis import ImportTarget, analyze_python_changes  # noqa: E402
 from repository_reference import RepositoryReferenceIndex  # noqa: E402
-from rules._helpers import iter_diff_deleted_post_lines, iter_diff_post_line_numbers  # noqa: E402
+from rules._helpers import (  # noqa: E402
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from rules.agent_flow_rule import (  # noqa: E402
     AGENT_FLOW_STAGE,
     AgentFlowRule,
@@ -72,6 +78,7 @@ from rules.tests_def_rule import (  # noqa: E402
 )
 from rules.tests_def_rule import TestsDefRule as CbtsTestsDefRule  # noqa: E402
 from rules.visual_gen_rule import _is_vg_claim  # noqa: E402
+from selector import CoverageSelector  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -750,6 +757,7 @@ def _analyze(source: str, diff: str):
         source,
         iter_diff_post_line_numbers(diff),
         iter_diff_deleted_post_lines(diff),
+        pre_source=reconstruct_diff_pre_image(source, diff),
     )
 
 
@@ -781,6 +789,238 @@ def test_unsupported_import_time_changes_remain_fail_closed(source: str, reason:
     assert analysis.limitation == reason
 
 
+def test_added_literal_class_attribute_resolves_class_and_method() -> None:
+    source = (
+        "from typing import ClassVar, Optional\n\n"
+        "class Example:\n"
+        "    VALUE: ClassVar[Optional[str]] = None\n\n"
+        "    def value(self):\n"
+        "        return self.VALUE\n"
+    )
+    diff = (
+        "@@ -1,6 +1,7 @@\n"
+        " from typing import ClassVar, Optional\n"
+        " \n"
+        " class Example:\n"
+        "+    VALUE: ClassVar[Optional[str]] = None\n"
+        " \n"
+        "     def value(self):\n"
+        "         return self.VALUE\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example", "Example.value"}
+
+
+def test_conditional_class_resolves_added_attribute_method_and_docstring() -> None:
+    source = (
+        'if AVAILABLE:\n    class Example:\n        "new docs"\n'
+        "        CACHE: dict = {}\n\n"
+        "        def resolve(self, key: int) -> int:\n"
+        "            return self.CACHE[key]\n"
+    )
+    diff = (
+        "@@ -1,3 +1,7 @@\n if AVAILABLE:\n     class Example:\n"
+        '-        "old docs"\n+        "new docs"\n'
+        "+        CACHE: dict = {}\n+\n"
+        "+        def resolve(self, key: int) -> int:\n"
+        "+            return self.CACHE[key]\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example", "Example.resolve"}
+
+
+def test_conditional_function_is_included_as_binding_consumer() -> None:
+    source = "VALUE = 2\nif AVAILABLE:\n    def helper():\n        return VALUE\n"
+    diff = "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize("declaration", ("class Example:", "def helper():"))
+def test_ambiguous_conditional_definition_remains_fail_closed(declaration: str) -> None:
+    source = (
+        f"if AVAILABLE:\n    {declaration}\n        VALUE = 1\n"
+        f"else:\n    {declaration}\n        VALUE = 2\n"
+    )
+    diff = f"@@ -2,2 +2,2 @@\n     {declaration}\n-        VALUE = 0\n+        VALUE = 1\n"
+    if declaration.startswith("def"):
+        diff = f"@@ -2 +2 @@\n-    def helper(old):\n+    {declaration}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "ambiguous class/function declaration"
+
+
+def test_changed_condition_is_not_resolved_by_conditional_class_support() -> None:
+    source = "if check_available():\n    class Example:\n        VALUE = 1\n"
+    diff = "@@ -1 +1 @@\n-if AVAILABLE:\n+if check_available():\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
+
+
+def test_changed_binding_with_ambiguous_consumer_remains_fail_closed() -> None:
+    source = (
+        "VALUE = 2\nif AVAILABLE:\n    def helper():\n        return VALUE\n"
+        "else:\n    def helper():\n        return 0\n"
+    )
+
+    analysis = _analyze(source, "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n")
+
+    assert analysis.limitation == "ambiguous class/function declaration"
+
+
+def test_unrelated_property_accessors_do_not_block_literal_binding_change() -> None:
+    source = (
+        "VALUE = 2\n"
+        "class Example:\n"
+        "    @property\n"
+        "    def state(self):\n"
+        "        return self._state\n"
+        "    @state.setter\n"
+        "    def state(self, value):\n"
+        "        self._state = value\n"
+        "def helper():\n"
+        "    return VALUE\n"
+    )
+
+    analysis = _analyze(source, "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n")
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize("consumer", ("getter", "setter"))
+def test_changed_binding_consumed_by_property_accessor_remains_fail_closed(consumer: str) -> None:
+    getter = "VALUE" if consumer == "getter" else "self._state"
+    setter = "VALUE" if consumer == "setter" else "value"
+    source = (
+        "VALUE = 2\n"
+        "class Example:\n"
+        "    @property\n"
+        "    def state(self):\n"
+        f"        return {getter}\n"
+        "    @state.setter\n"
+        "    def state(self, value):\n"
+        f"        self._state = {setter}\n"
+    )
+
+    analysis = _analyze(source, "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n")
+
+    assert analysis.limitation == "ambiguous class/function declaration"
+
+
+def test_removed_ambiguous_definition_is_not_treated_as_a_new_declaration() -> None:
+    source = "def helper(value: int):\n    return value\n"
+    diff = (
+        "@@ -1,6 +1,2 @@\n"
+        "-if AVAILABLE:\n"
+        "-    def helper():\n"
+        "-        return 0\n"
+        "-else:\n"
+        "-    def helper(value: int):\n"
+        "-        return value\n"
+        "+def helper(value: int):\n"
+        "+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "ambiguous class/function declaration"
+
+
+def test_conditional_callers_include_every_branch_with_an_unrelated_binding_change() -> None:
+    source = (
+        "VALUE = 2\n"
+        "def helper():\n    return 1\n"
+        "if AVAILABLE:\n    def caller():\n        return helper()\n"
+        "else:\n    def caller():\n        return 0\n"
+    )
+    diff = "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.binding_consumers
+    assert analysis.callers == {"helper": {"caller"}}
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "VALUE = factory()",
+        "VALUE: CustomType = None",
+    ),
+)
+def test_unsafe_added_class_attribute_remains_fail_closed(declaration: str) -> None:
+    source = f"class Example:\n    pass\n    {declaration}\n"
+    diff = f"@@ -1,2 +1,3 @@\n class Example:\n     pass\n+    {declaration}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_replaced_literal_class_attribute_remains_fail_closed() -> None:
+    source = "class Example:\n    VALUE = 2\n"
+    diff = "@@ -1,2 +1,2 @@\n class Example:\n-    VALUE = 1\n+    VALUE = 2\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_module_docstring_replacement_keeps_import_and_runtime_consumers() -> None:
+    source = '"new docs"\n\ndef helper():\n    return __doc__\n'
+    diff = '@@ -1,4 +1,4 @@\n-"old docs"\n+"new docs"\n \n def helper():\n     return __doc__\n'
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"__doc__"}
+    assert analysis.binding_consumers == {"<module>", "helper"}
+
+
+def test_class_docstring_replacement_keeps_class_and_reflective_consumers() -> None:
+    source = (
+        'class Example:\n    "new docs"\n\n'
+        '    def docs(self):\n        return getattr(self, "__doc__")\n'
+    )
+    diff = '@@ -1,2 +1,2 @@\n class Example:\n-    "old docs"\n+    "new docs"\n'
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example", "Example.docs"}
+
+
+@pytest.mark.parametrize(
+    "source,diff",
+    (
+        ('"new docs"\n', '@@ -1 +1 @@\n-f"{factory()}"\n+"new docs"\n'),
+        ('"new docs"\n', '@@ -0,0 +1 @@\n+"new docs"\n'),
+        (
+            'VALUE = 1\n"new docs"\n',
+            '@@ -1,2 +1,2 @@\n VALUE = 1\n-"old docs"\n+"new docs"\n',
+        ),
+    ),
+)
+def test_unsupported_string_expression_changes_remain_fail_closed(source: str, diff: str) -> None:
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation
+
+
 def test_replaced_literal_is_resolved_when_both_images_are_literals() -> None:
     source = "_VALUE = 521\n"
     diff = "@@ -1 +1 @@\n-_VALUE = 520\n+_VALUE = 521\n"
@@ -797,6 +1037,827 @@ def test_replaced_effectful_assignment_remains_fail_closed() -> None:
     analysis = _analyze(source, diff)
 
     assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_literal_resolves_pre_image_consumers() -> None:
+    source = "\ndef helper():\n    return _VALUE\n"
+    diff = "@@ -1,4 +1,3 @@\n-_VALUE = 521\n \n def helper():\n     return _VALUE\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"_VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
+def test_deleted_literal_anchored_to_unchanged_assignment_retains_old_consumer() -> None:
+    source = "STABLE = 0.5\ndef helper():\n    return 0\n"
+    diff = (
+        "@@ -1,4 +1,3 @@\n-VALUE = 1000\n STABLE = 0.5\n def helper():\n"
+        "-    return VALUE\n+    return 0\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize("declaration", ("def helper():", "async def helper():"))
+@pytest.mark.parametrize("decorator", ("", "@decorate\n"))
+def test_deleted_literal_adjacent_to_signature_retains_consumer(
+    declaration: str, decorator: str
+) -> None:
+    source = f"{decorator}{declaration}\n    return VALUE\n"
+    diff = "".join(
+        difflib.unified_diff(
+            ("VALUE = 521\n" + source).splitlines(keepends=True),
+            source.splitlines(keepends=True),
+        )
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize(
+    "deleted",
+    (
+        "initialize()\n",
+        "initialize(\n    1,\n)\n",
+        "VALUE = factory()\n",
+        "import sys as VALUE\n",
+        "from .helpers import VALUE\n",
+        "def removed():\n    return 1\n",
+        "class Removed:\n    VALUE = 1\n",
+    ),
+)
+def test_unsupported_deletion_adjacent_to_signature_remains_fail_closed(deleted: str) -> None:
+    source = "def helper():\n    return 0\n"
+    diff = "".join(
+        difflib.unified_diff(
+            (deleted + source).splitlines(keepends=True), source.splitlines(keepends=True)
+        )
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_class_attribute_adjacent_to_method_remains_fail_closed() -> None:
+    source = "class Example:\n    def helper(self):\n        return self.VALUE\n"
+    diff = (
+        "@@ -1,4 +1,3 @@\n class Example:\n-    VALUE = 521\n"
+        "     def helper(self):\n         return self.VALUE\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_literal_adjacent_to_signature_retains_pre_image_consumer() -> None:
+    source = "def helper():\n    return 0\n"
+    diff = "@@ -1,3 +1,2 @@\n-VALUE = 521\n def helper():\n-    return VALUE\n+    return 0\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize("old_binding", ("VALUE = factory()", "import sys as VALUE"))
+def test_effectful_deletion_at_unchanged_assignment_remains_fail_closed(old_binding: str) -> None:
+    source = "STABLE = 0.5\n"
+    diff = f"@@ -1,2 +1 @@\n-{old_binding}\n STABLE = 0.5\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deletion_anchor_cannot_hide_a_changed_following_assignment() -> None:
+    source = "STABLE = 0.75\n"
+    diff = "@@ -1,2 +1 @@\n-VALUE = 1000\n-STABLE = 0.5\n+STABLE = 0.75\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_deleted_literal_with_import_time_consumer_remains_fail_closed() -> None:
+    source = "\nOTHER = _VALUE\n"
+    diff = "@@ -1,3 +1,2 @@\n-_VALUE = 521\n \n OTHER = _VALUE\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "import-time binding consumer"
+
+
+def test_deleted_effectful_assignment_remains_fail_closed() -> None:
+    source = "\ndef helper():\n    return _VALUE\n"
+    diff = "@@ -1,4 +1,3 @@\n-_VALUE = create_value()\n \n def helper():\n     return _VALUE\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "unresolved import replacement"
+
+
+def test_same_module_import_from_replacement_resolves_consumers_and_targets() -> None:
+    source = "from .helpers import new_helper, stable\n\ndef consumer():\n    return new_helper()\n"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper, stable\n"
+        "+from .helpers import new_helper, stable\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"old_helper", "new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_multiline_import_from_addition_resolves_consumer_and_new_target() -> None:
+    source = (
+        "from .helpers import (new_helper,\n"
+        "                      stable)\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        "-from .helpers import (stable)\n"
+        "+from .helpers import (new_helper,\n"
+        "+                      stable)\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_parenthesized_import_from_replacement_resolves_consumers_and_targets() -> None:
+    source = (
+        "from .helpers import (\n    new_helper,\n    stable,\n)\n\n"
+        "def consumer():\n    return new_helper()\n"
+    )
+    old_source = source.replace("new_helper", "old_helper")
+    diff = "".join(
+        difflib.unified_diff(old_source.splitlines(keepends=True), source.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"old_helper", "new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert analysis.old_import_targets == {ImportTarget("helpers", 1, "old_helper")}
+    assert analysis.new_import_targets == {ImportTarget("helpers", 1, "new_helper")}
+
+
+def test_new_import_from_statement_resolves_consumer_and_target() -> None:
+    source = (
+        "from .helpers import stable\n"
+        "from .new_helpers import new_helper\n\n"
+        "def consumer():\n"
+        "    return new_helper()\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from .helpers import stable\n"
+        "+from .new_helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "     return new_helper()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert analysis.binding_consumers == {"consumer"}
+    assert not analysis.old_import_targets
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "new_helper")}
+    assert analysis.new_import_bindings == {"new_helper"}
+
+
+def test_import_addition_is_not_new_when_pre_image_already_bound_the_name() -> None:
+    source = "new_helper = None\nfrom .helpers import new_helper, stable\n"
+    diff = (
+        "@@ -1,2 +1,2 @@\n"
+        " new_helper = None\n"
+        "-from .helpers import stable\n"
+        "+from .helpers import new_helper, stable\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"new_helper"}
+    assert not analysis.new_import_bindings
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        (
+            "value: int, enabled: bool = True",
+            "value: int, callback: int = None, enabled: bool = True",
+        ),
+        (
+            "value: int, *, enabled: bool = True",
+            "value: int, *, callback: int = None, enabled: bool = True",
+        ),
+    ),
+)
+def test_inserted_safe_parameter_preserves_existing_arguments(before: str, after: str) -> None:
+    source = f"def helper({after}):\n    return value\n"
+    diff = f"@@ -1,2 +1,2 @@\n-def helper({before}):\n+def helper({after}):\n     return value\n"
+    analysis = _analyze(source, diff)
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize(
+    "after",
+    (
+        "enabled: bool = True, value: int = None, callback: int = None",
+        "value: int, callback: int = None, enabled: bool = False",
+        "value: str, callback: int = None, enabled: bool = True",
+        "value: int, callback: int = None",
+        "value: int, callback: int = factory(), enabled: bool = True",
+    ),
+)
+def test_inserted_parameter_rejects_changed_existing_contracts(after: str) -> None:
+    before = "value: int, enabled: bool = True"
+    source = f"def helper({after}):\n    return value\n"
+    diff = f"@@ -1,2 +1,2 @@\n-def helper({before}):\n+def helper({after}):\n     return value\n"
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("alias", ("Callable", "Callback"))
+def test_added_cached_typing_name_used_in_safe_annotation(alias: str) -> None:
+    imported = "Callable" if alias == "Callable" else "Callable as Callback"
+    before = "from typing import Optional\ndef helper(value: int):\n    return value\n"
+    source = (
+        f"from typing import Optional, {imported}\n"
+        f"def helper(value: int, callback: Optional[{alias}[[int], None]] = None):\n"
+        "    return value\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    analysis = _analyze(source, diff)
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
+    assert not analysis.new_import_targets
+
+
+def test_first_typing_import_still_requires_import_target_validation() -> None:
+    before = "def helper(value: int):\n    return value\n"
+    source = (
+        "from typing import Callable\n"
+        "def helper(value: int, callback: Callable[[int], None] = None):\n"
+        "    return value\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    analysis = _analyze(source, diff)
+    assert analysis.limitation == "import-time binding consumer"
+
+
+@pytest.mark.parametrize("mutation", ("typing.Callable = Custom", "del typing.Callable"))
+def test_mutated_typing_module_does_not_exempt_new_annotation_import(mutation: str) -> None:
+    before = (
+        f"import typing\n{mutation}\nfrom typing import Optional\n"
+        "def helper(value: int):\n    return value\n"
+    )
+    source = (
+        f"import typing\n{mutation}\nfrom typing import Optional, Callable\n"
+        "def helper(value: int, callback: Callable[[int], None] = None):\n    return value\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "import-time binding consumer"
+
+
+def test_cached_typing_name_runtime_module_consumer_remains_fail_closed() -> None:
+    before = "from typing import Optional\ndef helper(value: int):\n    return value\n"
+    source = (
+        "from typing import Optional, Callable\nALIAS = Callable\n"
+        "def helper(value: int, callback: Callable[[int], None] = None):\n"
+        "    return value\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "effectful module statement"
+
+
+def test_added_method_accepts_cached_typing_import_and_dtype_load() -> None:
+    before = "import torch\nfrom typing import Optional\nclass Example:\n    pass\n"
+    source = (
+        "import torch\nfrom typing import Optional, Callable\nclass Example:\n    pass\n"
+        "    def helper(self, callback: Optional[Callable[..., torch.Tensor]] = None,\n"
+        "               output_dtype: Optional[torch.dtype] = None) -> torch.Tensor:\n"
+        "        return callback()\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    analysis = _analyze(source, diff)
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.helper"}
+    assert not analysis.new_import_targets
+
+
+@pytest.mark.parametrize(
+    "prefix", ("from .typing import Callable", "from typing import Callable\nCallable = Custom")
+)
+def test_relative_or_rebound_typing_name_does_not_trust_subscript(prefix: str) -> None:
+    before = f"{prefix}\ndef helper(value: int):\n    return value\n"
+    source = f"{prefix}\ndef helper(value: int, callback: Callable[[int], None] = None):\n    return value\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("existing_method", (False, True))
+def test_typing_generic_annotation_rejects_class_binding_shadow(existing_method: bool) -> None:
+    prefix = "from typing import Callable\nclass Example:\n    Callable = Custom\n"
+    before = prefix + ("    def helper(self):\n        pass\n" if existing_method else "")
+    source = (
+        prefix + "    def helper(self, callback: Callable[[int], None] = None):\n        pass\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    assert _analyze(source, diff).limitation == "class/signature import change"
+
+
+def test_optional_parameter_addition_resolves_function_and_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "def helper(value: int, option: Optional[int] = None):\n"
+        "    return value\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, option: Optional[int] = None):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,8 +1,8 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        "+def helper(value: int, option: Optional[int] = None):\n"
+        "     return value\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        "+    def method(self, value: int, option: Optional[int] = None):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper", "Example.method"}
+
+
+def test_keyword_only_optional_parameter_addition_resolves_method() -> None:
+    source = (
+        "from typing import Optional\n\n"
+        "class Example:\n"
+        "    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,5 +1,5 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: Optional[int] = None, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+def test_required_keyword_only_parameter_addition_resolves_method() -> None:
+    source = (
+        "class Example:\n"
+        "    def method(self, value: int, *, option: int, **kwargs):\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " class Example:\n"
+        "-    def method(self, value: int, **kwargs):\n"
+        "+    def method(self, value: int, *, option: int, **kwargs):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+def test_required_positional_parameter_addition_resolves_method() -> None:
+    source = (
+        "class Example:\n    def method(self, value: int, required: bool):\n        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        "+    def method(self, value: int, required: bool):\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+@pytest.mark.parametrize("annotation", ("None", "bool", "list[int]", "Optional[int]"))
+def test_added_safe_return_annotation_resolves_function_and_method(annotation: str) -> None:
+    source = (
+        "from typing import Optional\n"
+        f"def helper(value: int) -> {annotation}:\n"
+        "    return value\n"
+        "class Example:\n"
+        f"    def method(self, value: int) -> {annotation}:\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,6 +1,6 @@\n"
+        " from typing import Optional\n"
+        "-def helper(value: int):\n"
+        f"+def helper(value: int) -> {annotation}:\n"
+        "     return value\n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        f"+    def method(self, value: int) -> {annotation}:\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper", "Example.method"}
+
+
+def test_parameter_and_return_annotation_additions_resolve_method() -> None:
+    source = (
+        "class Example:\n"
+        "    def method(self, value: int, metadata: list[dict[str, list[int]]] | None = None) -> None:\n"
+        "        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,3 @@\n"
+        " class Example:\n"
+        "-    def method(self, value: int):\n"
+        "+    def method(self, value: int, metadata: list[dict[str, list[int]]] | None = None) -> None:\n"
+        "         return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.method"}
+
+
+@pytest.mark.parametrize(
+    "annotation", ("factory()", "CustomType", "CustomType | None", "types.Result")
+)
+def test_unsafe_added_return_annotation_remains_fail_closed(annotation: str) -> None:
+    source = f"def helper(value: int) -> {annotation}:\n    return value\n"
+    diff = (
+        "@@ -1,2 +1,2 @@\n-def helper(value: int):\n"
+        f"+def helper(value: int) -> {annotation}:\n     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(("old_return", "new_return"), ((" -> int", " -> None"), (" -> int", "")))
+def test_return_annotation_replacement_or_deletion_remains_fail_closed(
+    old_return: str, new_return: str
+) -> None:
+    source = f"def helper(value: int){new_return}:\n    return value\n"
+    diff = (
+        f"@@ -1,2 +1,2 @@\n-def helper(value: int){old_return}:\n"
+        f"+def helper(value: int){new_return}:\n     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("decorator", ("register", "property", "staticmethod"))
+def test_decorated_return_annotation_addition_remains_fail_closed(decorator: str) -> None:
+    source = f"@{decorator}\ndef helper(value: int) -> None:\n    return value\n"
+    diff = (
+        f"@@ -1,3 +1,3 @@\n @{decorator}\n-def helper(value: int):\n"
+        "+def helper(value: int) -> None:\n     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "new_parameter",
+    (
+        "option: Optional[int] = factory()",
+        "option: CustomType = None",
+    ),
+)
+def test_unsafe_parameter_addition_remains_fail_closed(new_parameter: str) -> None:
+    source = (
+        "from typing import Optional\n\n"
+        f"def helper(value: int, {new_parameter}):\n"
+        "    return value\n"
+    )
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        " from typing import Optional\n"
+        " \n"
+        "-def helper(value: int):\n"
+        f"+def helper(value: int, {new_parameter}):\n"
+        "     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize("alias", ("torch", "torch as th"))
+def test_added_function_accepts_canonical_tensor_annotation_load(alias: str) -> None:
+    local = "th" if " as " in alias else "torch"
+    source = (
+        f"import {alias}\ndef helper(value: {local}.Tensor) -> {local}.Tensor:\n    return value\n"
+    )
+    diff = (
+        f"@@ -1 +1,3 @@\n import {alias}\n"
+        f"+def helper(value: {local}.Tensor) -> {local}.Tensor:\n+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"helper"}
+
+
+@pytest.mark.parametrize(
+    "annotation", ("torch.Tensor | None", "torch.Tensor[int]", "torch.Unknown")
+)
+def test_tensor_annotation_load_does_not_trust_type_operators_or_other_attributes(
+    annotation: str,
+) -> None:
+    source = f"import torch\ndef helper(value: {annotation}):\n    return value\n"
+    diff = f"@@ -1 +1,3 @@\n import torch\n+def helper(value: {annotation}):\n+    return value\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "torch = other",
+        "del torch.Tensor",
+        "torch.Tensor = other",
+        "from custom import *",
+        "def stable(value=(torch := other)): pass",
+        "class Setup: torch.Tensor = other",
+    ),
+)
+def test_tensor_annotation_load_rejects_a_changed_module_binding(mutation: str) -> None:
+    source = f"import torch\n{mutation}\ndef helper(value: torch.Tensor):\n    return value\n"
+    diff = (
+        f"@@ -1,2 +1,4 @@\n import torch\n {mutation}\n"
+        "+def helper(value: torch.Tensor):\n+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_tensor_annotation_load_rejects_a_class_alias_shadow() -> None:
+    source = (
+        "import torch\nclass Example:\n    torch = other\n"
+        "    def helper(self, value: torch.Tensor):\n        return value\n"
+    )
+    diff = (
+        "@@ -1,3 +1,5 @@\n import torch\n class Example:\n     torch = other\n"
+        "+    def helper(self, value: torch.Tensor):\n+        return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_tensor_annotation_load_rejects_a_noncanonical_module_alias() -> None:
+    source = "import custom as torch\ndef helper(value: torch.Tensor):\n    return value\n"
+    diff = (
+        "@@ -1 +1,3 @@\n import custom as torch\n"
+        "+def helper(value: torch.Tensor):\n+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+@pytest.mark.parametrize(
+    ("imports", "annotation"),
+    (
+        ("from typing import Callable, Optional", "Optional[Callable[[], None]]"),
+        ("from typing import Callable", "Callable[[int, str], bool]"),
+        ("from collections.abc import Callable as Callback", "Callback[[int], None]"),
+        ("import typing", "typing.Callable[[int], None]"),
+    ),
+)
+def test_added_method_with_callable_parameter_list_resolves_consumer(
+    imports: str, annotation: str
+) -> None:
+    source = (
+        f"{imports}\n\nclass Example:\n    pass\n"
+        f"    @staticmethod\n    def close(callback: {annotation} = None) -> None:\n"
+        "        if callback is not None:\n            callback()\n"
+    )
+    diff = (
+        f"@@ -1,4 +1,8 @@\n {imports}\n \n class Example:\n     pass\n"
+        f"+    @staticmethod\n+    def close(callback: {annotation} = None) -> None:\n"
+        "+        if callback is not None:\n+            callback()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Example.close"}
+
+
+@pytest.mark.parametrize("parameter_types", ("factory()", "*TYPES", "CustomType"))
+def test_effectful_or_unknown_callable_parameter_list_remains_fail_closed(
+    parameter_types: str,
+) -> None:
+    source = (
+        "from typing import Callable\n\n"
+        f"def helper(value: int, callback: Callable[[{parameter_types}], None] = None):\n"
+        "    return value\n"
+    )
+    diff = (
+        "@@ -1,4 +1,4 @@\n from typing import Callable\n \n"
+        "-def helper(value: int):\n"
+        f"+def helper(value: int, callback: Callable[[{parameter_types}], None] = None):\n"
+        "     return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_reconstruct_diff_pre_image_rejects_mismatched_post_source() -> None:
+    diff = "@@ -1 +1 @@\n-old\n+new\n"
+
+    assert reconstruct_diff_pre_image("different\n", diff) is None
+
+
+def test_import_from_replacement_from_different_module_resolves_targets() -> None:
+    source = "from .new_helpers import helper\n"
+    diff = "@@ -1 +1 @@\n-from .old_helpers import helper\n+from .new_helpers import helper\n"
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.old_import_targets == {ImportTarget("old_helpers", 1, "helper")}
+    assert analysis.new_import_targets == {ImportTarget("new_helpers", 1, "helper")}
+    assert not analysis.new_import_bindings
+
+
+def test_import_only_type_checking_addition_is_ignored() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n\n"
+        "if TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+    )
+    diff = (
+        "@@ -1,4 +1,5 @@\n"
+        " from typing import TYPE_CHECKING\n"
+        " \n"
+        " if TYPE_CHECKING:\n"
+        "+    from .model import Model\n"
+        "     from .scheduler import ScheduledRequests\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert not analysis.changed_bindings
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        (
+            "from typing import TYPE_CHECKING\n"
+            "TYPE_CHECKING = enabled()\n\n"
+            "if TYPE_CHECKING:\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+        (
+            "from typing import TYPE_CHECKING\n\n"
+            "if TYPE_CHECKING:\n"
+            "    initialize()\n"
+            "    from .model import Model\n"
+            "    from .scheduler import ScheduledRequests\n"
+        ),
+    ),
+)
+def test_untrusted_type_checking_import_addition_remains_fail_closed(source: str) -> None:
+    added_line = 5
+    diff = f"@@ -{added_line - 1},0 +{added_line} @@\n+    from .model import Model\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
+
+
+@pytest.mark.parametrize("alias", ("typing", "t"))
+@pytest.mark.parametrize("rebound", (False, True))
+@pytest.mark.parametrize("has_else", (False, True))
+def test_typing_attribute_guard_requires_trusted_alias_and_no_else(
+    alias: str, rebound: bool, has_else: bool
+) -> None:
+    source = "import typing\n" if alias == "typing" else f"import typing as {alias}\n"
+    if rebound:
+        source += f"{alias} = fake()\n"
+    source += (
+        f"if {alias}.TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+    )
+    if has_else:
+        source += "else:\n    initialize()\n"
+    before = source.replace("    from .model import Model\n", "")
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), source.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(source, diff)
+
+    if rebound or has_else:
+        assert analysis.limitation == "effectful module statement"
+    else:
+        assert not analysis.limitation
+        assert not analysis.changed_bindings
+        assert not analysis.binding_consumers
+
+
+def test_type_checking_name_guard_with_else_remains_fail_closed() -> None:
+    source = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from .model import Model\n"
+        "    from .scheduler import ScheduledRequests\n"
+        "else:\n    initialize()\n"
+    )
+    diff = "@@ -2,0 +3 @@\n+    from .model import Model\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "effectful module statement"
 
 
 @pytest.mark.parametrize("body", ("", "# explanatory comment"))
@@ -898,6 +1959,197 @@ def test_plain_function_declaration_with_postponed_annotations_is_safe() -> None
     assert analysis.binding_consumers == {"_helper"}
 
 
+def test_added_module_function_with_safe_definition_expressions_is_resolved() -> None:
+    source = (
+        "from .request import Request\n\n"
+        "def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "    return request\n"
+    )
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .request import Request\n"
+        "+\n"
+        "+def helper(request: Request, retries: int = 1, *, timeout: int | None = None):\n"
+        "+    return request\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"helper"}
+    assert analysis.binding_consumers == {"helper"}
+    assert analysis.new_declaration_bindings == {"helper"}
+
+
+def test_added_method_can_use_earlier_module_class_annotation() -> None:
+    source = (
+        "class Budget:\n"
+        "    pass\n\n"
+        "class Scheduler:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def has_budget(self, budget: Budget) -> bool:\n"
+        "        return True\n"
+    )
+    diff = (
+        "@@ -1,6 +1,9 @@\n"
+        " class Budget:\n"
+        "     pass\n"
+        " \n"
+        " class Scheduler:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def has_budget(self, budget: Budget) -> bool:\n"
+        "+        return True\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"Scheduler.has_budget"}
+
+
+def test_added_function_cannot_use_later_module_binding_annotation() -> None:
+    source = "VALUE = 1\n\ndef helper(value: Later):\n    return value\n\nclass Later:\n    pass\n"
+    diff = (
+        "@@ -1,4 +1,7 @@\n"
+        " VALUE = 1\n"
+        "+\n"
+        "+def helper(value: Later):\n"
+        "+    return value\n"
+        " \n"
+        " class Later:\n"
+        "     pass\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_plain_and_builtin_decorated_methods_are_resolved() -> None:
+    source = (
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    def plain(self, required, option=None):\n"
+        "        return required\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n\n"
+        "    @staticmethod\n"
+        "    def static(value):\n"
+        "        return value\n\n"
+        "    @classmethod\n"
+        "    def create(cls):\n"
+        "        return cls()\n"
+    )
+    diff = (
+        "@@ -1,3 +1,18 @@\n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    def plain(self, required, option=None):\n"
+        "+        return required\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+        "+\n"
+        "+    @staticmethod\n"
+        "+    def static(value):\n"
+        "+        return value\n"
+        "+\n"
+        "+    @classmethod\n"
+        "+    def create(cls):\n"
+        "+        return cls()\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {
+        "Example.create",
+        "Example.plain",
+        "Example.static",
+        "Example.value",
+    }
+    assert not analysis.new_declaration_bindings
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    (
+        "@decorate\ndef helper():\n    return 1",
+        "def helper(value=factory()):\n    return value",
+    ),
+)
+def test_added_function_with_effectful_definition_expression_falls_back(
+    declaration: str,
+) -> None:
+    source = f"VALUE = 1\n\n{declaration}\n"
+    added = "\n".join(f"+{line}" for line in declaration.splitlines())
+    diff = f"@@ -1 +1,{len(declaration.splitlines()) + 2} @@\n VALUE = 1\n+\n{added}\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_added_function_with_custom_subscript_annotation_falls_back() -> None:
+    source = "from .types import Custom\n\ndef helper(value: Custom[int]):\n    return value\n"
+    diff = (
+        "@@ -1 +1,4 @@\n"
+        " from .types import Custom\n"
+        "+\n"
+        "+def helper(value: Custom[int]):\n"
+        "+    return value\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_shadowed_builtin_method_decorator_falls_back() -> None:
+    source = (
+        "property = decorate\n\n"
+        "class Example:\n"
+        "    def existing(self):\n"
+        "        return 0\n\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return 1\n"
+    )
+    diff = (
+        "@@ -1,5 +1,9 @@\n"
+        " property = decorate\n"
+        " \n"
+        " class Example:\n"
+        "     def existing(self):\n"
+        "         return 0\n"
+        "+\n"
+        "+    @property\n"
+        "+    def value(self):\n"
+        "+        return 1\n"
+    )
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
+def test_replaced_module_binding_is_not_treated_as_new_function() -> None:
+    source = "def helper():\n    return 1\n"
+    diff = "@@ -1 +1,2 @@\n-helper = None\n+def helper():\n+    return 1\n"
+
+    analysis = _analyze(source, diff)
+
+    assert analysis.limitation == "class/signature import change"
+
+
 def test_local_shadow_does_not_create_direct_caller_edge() -> None:
     source = (
         "_VALUE = 521\n"
@@ -924,6 +2176,47 @@ def test_local_shadow_does_not_create_binding_consumer() -> None:
     assert analysis.binding_consumers == set()
 
 
+@pytest.mark.parametrize("deleted_binding", (False, True))
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        "def consumer(VALUE):\n    return VALUE()\n",
+        "def consumer():\n    VALUE = lambda: 0\n    return VALUE()\n",
+        "def consumer():\n    import sys as VALUE\n    return VALUE()\n",
+    ),
+)
+def test_shadowed_direct_call_is_not_a_binding_consumer(
+    deleted_binding: bool, consumer: str
+) -> None:
+    before = "VALUE = 521\n\n" + consumer
+    after = "\n" + consumer if deleted_binding else before.replace("521", "522")
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(after, diff)
+
+    assert not analysis.limitation
+    assert analysis.changed_bindings == {"VALUE"}
+    assert not analysis.binding_consumers
+
+
+@pytest.mark.parametrize("deleted_binding", (False, True))
+def test_explicit_global_direct_call_remains_a_binding_consumer(deleted_binding: bool) -> None:
+    before = "VALUE = 521\n\ndef consumer():\n    global VALUE\n    return VALUE()\n"
+    after = (
+        before.removeprefix("VALUE = 521\n") if deleted_binding else before.replace("521", "522")
+    )
+    diff = "".join(
+        difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True))
+    )
+
+    analysis = _analyze(after, diff)
+
+    assert not analysis.limitation
+    assert analysis.binding_consumers == {"consumer"}
+
+
 def test_comprehension_target_does_not_shadow_outer_iterable_load() -> None:
     source = "VALUE = (1, 2, 3)\n\ndef consumer():\n    return [VALUE for VALUE in VALUE]\n"
 
@@ -948,6 +2241,538 @@ def test_function_alias_marks_caller_graph_incomplete() -> None:
     assert analysis.binding_consumers == {"helper"}
     assert analysis.callers == {}
     assert analysis.callable_escapes == {"helper"}
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.rows = {
+            "helper": set(),
+            "caller": {"A10-PyTorch-1/test_caller"},
+        }
+
+    def file_has_touch_rows(self, _path: str) -> bool:
+        return True
+
+    def tests_touching_func(self, _path: str, qualname: str) -> set[str]:
+        return set(self.rows.get(qualname, set()))
+
+    def tests_touching_file(self, _path: str) -> set[str]:
+        return {
+            "A10-PyTorch-1/test_caller",
+            "A10-PyTorch-1/test_unrelated",
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+
+    def untrusted_tests(self, *_args) -> set[str]:
+        return set()
+
+
+class _ImportReplacementDB(_FakeDB):
+    def __init__(self) -> None:
+        self.rows_by_symbol = {
+            ("tensorrt_llm/pkg/helpers.py", "old_helper"): {"A10-PyTorch-1/test_old"},
+            ("tensorrt_llm/pkg/helpers.py", "new_helper"): {"A10-PyTorch-1/test_new"},
+            ("tensorrt_llm/pkg/consumer.py", "consumer"): {"A10-PyTorch-1/test_consumer"},
+        }
+
+    def tests_touching_func(self, path: str, qualname: str) -> set[str]:
+        return set(self.rows_by_symbol.get((path, qualname), set()))
+
+    def tests_touching_file(self, path: str) -> set[str]:
+        return {
+            test
+            for (row_path, _), tests in self.rows_by_symbol.items()
+            if row_path == path
+            for test in tests
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "A10-PyTorch": {
+                "test_old",
+                "test_new",
+                "test_consumer",
+                "test_unrelated",
+            }
+        }
+
+
+class _ExternalTestReferenceDB(_FakeDB):
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "CPU-Generic-x86": {
+                "test_unittests.py::test_unittests_v2[unittest/pkg]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py]",
+            },
+            "B300-PyTorch": {
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_one]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_two]",
+                "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py::test_one]",
+            },
+        }
+
+
+def test_coverage_tier_uses_raw_diff_for_comment_only_core_change(tmp_path: Path) -> None:
+    path = "tensorrt_llm/example.py"
+    source_path = tmp_path / path
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("# updated explanation\nVALUE = 521\n")
+    raw_diff = "@@ -1,2 +1,2 @@\n-# old explanation\n+# updated explanation\n VALUE = 521\n"
+    yaml_index = YAMLIndex()
+    yaml_index.blocks = [
+        Block(
+            yaml_stem="l0_a10",
+            block_index=0,
+            condition={},
+            tests=["test_caller", "test_unrelated"],
+        )
+    ]
+    stages = {
+        "A10-PyTorch-1": Stage(
+            name="A10-PyTorch-1",
+            yaml_stem="l0_a10",
+            cpu_arch="x86_64",
+            split_id=1,
+            total_splits=1,
+        )
+    }
+    pr = PRInputs(changed_files=[path], diffs={path: ""}, raw_diffs={path: raw_diff})
+
+    result, note = apply_coverage_tier(pr, [], set(), stages, yaml_index, tmp_path, _FakeDB())
+
+    assert result is not None, note
+    assert result.removed == {("l0_a10", 0): {"test_caller", "test_unrelated"}}
+    assert result.dropped == {"A10-PyTorch-1"}
+
+
+def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\ndef helper():\n    return VALUE\n\ndef caller():\n    return helper()\n"
+    )
+    diff = "@@ -0,0 +1 @@\n+VALUE = 521\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+@pytest.mark.parametrize("reference_api", ("names", "paths"))
+def test_selector_rejects_external_transitive_no_data_caller(reference_api: str) -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 522\n\ndef helper():\n    return VALUE\n\n"
+        "def external():\n    return helper()\n\n"
+        "def caller():\n    return helper(), external()\n"
+    )
+    options = (
+        {"external_references": lambda _path, names: names & {"external"}}
+        if reference_api == "names"
+        else {
+            "external_reference_paths": lambda _path, names: {
+                name: {"tensorrt_llm/consumer.py"} for name in names & {"external"}
+            }
+        }
+    )
+    selector = CoverageSelector(_FakeDB(), REPO_ROOT, read_source=lambda _path: source, **options)
+
+    result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"})
+
+    assert not result.ok
+    assert "external" in result.reason
+
+
+def test_selector_uses_transitive_local_caller_rows_when_no_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 522\n\ndef helper():\n    return VALUE\n\n"
+        "def middle():\n    return helper()\n\n"
+        "def caller():\n    return middle()\n"
+    )
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+@pytest.mark.parametrize("class_scope", (False, True))
+@pytest.mark.parametrize("has_import_rows", (False, True))
+def test_selector_docstring_replacement_preserves_import_rows_or_file_bound(
+    class_scope: bool, has_import_rows: bool
+) -> None:
+    path = "tensorrt_llm/example.py"
+    scope = "Example" if class_scope else "<module>"
+    indent = "    " if class_scope else ""
+    prefix = "class Example:\n" if class_scope else ""
+    source = f'{prefix}{indent}"new docs"\n'
+    diff = (
+        f"@@ -1,{2 if class_scope else 1} +1,{2 if class_scope else 1} @@\n"
+        + (" class Example:\n" if class_scope else "")
+        + f'-{indent}"old docs"\n+{indent}"new docs"\n'
+    )
+    db = _FakeDB()
+    if has_import_rows:
+        db.rows[scope] = {"A10-PyTorch-1/test_caller"}
+    selector = CoverageSelector(
+        db,
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    expected = {"test_caller"} if has_import_rows else {"test_caller", "test_unrelated"}
+    assert result.impacted == {"A10-PyTorch": expected}
+
+
+def test_selector_docstring_replacement_keeps_external_binding_check() -> None:
+    path = "tensorrt_llm/example.py"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: '"new docs"\n',
+        external_references=lambda _path, names: names & {"__doc__"},
+    )
+
+    result = selector.decide([path], {path: '@@ -1 +1 @@\n-"old docs"\n+"new docs"\n'})
+
+    assert not result.ok
+    assert "__doc__" in result.reason
+
+
+def _write_import_replacement_files(
+    tmp_path: Path,
+    *,
+    include_old_binding: bool = True,
+    include_new_helper: bool = True,
+) -> tuple[str, str]:
+    package = tmp_path / "tensorrt_llm/pkg"
+    package.mkdir(parents=True)
+    old_binding = "old_helper = object()\n" if include_old_binding else ""
+    new_helper = "\ndef new_helper():\n    return 2\n" if include_new_helper else ""
+    (package / "helpers.py").write_text(f"{old_binding}{new_helper}")
+    (package / "consumer.py").write_text(
+        "from .helpers import new_helper\n\ndef consumer():\n    return new_helper()\n"
+    )
+    path = "tensorrt_llm/pkg/consumer.py"
+    diff = (
+        "@@ -1,4 +1,4 @@\n"
+        "-from .helpers import old_helper\n"
+        "+from .helpers import new_helper\n"
+        " \n"
+        " def consumer():\n"
+        "-    return old_helper()\n"
+        "+    return new_helper()\n"
+    )
+    return path, diff
+
+
+def test_selector_ignores_old_binding_rows_and_uses_new_function_and_consumer_rows(
+    tmp_path: Path,
+) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"new_helper"}
+
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=external_references,
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_new", "test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_unrelated"}}
+    assert checked_bindings == [{"old_helper"}]
+
+
+def test_selector_keeps_external_check_for_rebound_import_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, names: names & {"old_helper"},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+    assert "old_helper" in result.reason
+
+
+def test_selector_declines_missing_old_static_binding(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_old_binding=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "old import target is not a static binding" in result.reason
+
+
+def test_selector_declines_missing_imported_function(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path, include_new_helper=False)
+    selector = CoverageSelector(
+        _ImportReplacementDB(),
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "import target is not a static function" in result.reason
+
+
+def test_selector_allows_new_imported_function_without_coverage(tmp_path: Path) -> None:
+    path, diff = _write_import_replacement_files(tmp_path)
+    db = _ImportReplacementDB()
+    db.rows_by_symbol[("tensorrt_llm/pkg/helpers.py", "new_helper")] = set()
+    selector = CoverageSelector(
+        db,
+        tmp_path,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_consumer"}}
+    assert result.skippable == {"A10-PyTorch": {"test_old", "test_new", "test_unrelated"}}
+
+
+def test_selector_declines_when_changed_binding_has_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 521\n\ndef helper():\n    return VALUE\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"VALUE"},
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+
+
+def test_selector_uses_pre_image_consumer_for_deleted_literal() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "\ndef helper():\n    return VALUE\n\ndef caller():\n    return helper()\n"
+    diff = "@@ -1,4 +1,3 @@\n-VALUE = 521\n \n def helper():\n     return VALUE\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.no_data_funcs == ["tensorrt_llm/example.py::helper"]
+    assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
+
+
+def test_selector_declines_deleted_literal_with_external_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "\ndef helper():\n    return VALUE\n"
+    diff = "@@ -1,4 +1,3 @@\n-VALUE = 521\n \n def helper():\n     return VALUE\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, names: names & {"VALUE"},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert "external binding reference(s)" in result.reason
+    assert "VALUE" in result.reason
+
+
+def test_selector_selects_registered_external_test_reference() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 522\n"
+    diff = "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"
+    selector = CoverageSelector(
+        _ExternalTestReferenceDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_reference_paths=lambda _path, names: {
+            name: {"tests/unittest/pkg/test_consumer.py"} for name in names
+        },
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    consumer = "test_unittests.py::test_unittests_v2[unittest/pkg]"
+    unrelated = "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py]"
+    assert result.ok
+    assert result.impacted == {
+        "B300-PyTorch": {
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_one]",
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_consumer.py::test_two]",
+        },
+        "CPU-Generic-x86": {consumer},
+    }
+    assert result.skippable == {
+        "B300-PyTorch": {
+            "test_unittests.py::test_unittests_v2[unittest/pkg/test_unrelated.py::test_one]"
+        },
+        "CPU-Generic-x86": {unrelated},
+    }
+
+
+@pytest.mark.parametrize(
+    ("reference_path", "reason"),
+    (
+        ("tensorrt_llm/consumer.py", "non-test external reference"),
+        (
+            "tests/unittest/missing/test_missing.py",
+            "unregistered external test reference",
+        ),
+    ),
+)
+def test_selector_declines_unbounded_external_reference_path(
+    reference_path: str, reason: str
+) -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 522\n"
+    diff = "@@ -1 +1 @@\n-VALUE = 521\n+VALUE = 522\n"
+    selector = CoverageSelector(
+        _ExternalTestReferenceDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_reference_paths=lambda _path, names: {name: {reference_path} for name in names},
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert not result.ok
+    assert reason in result.reason
+
+
+@pytest.mark.parametrize(
+    "entry",
+    (
+        "unittest/pkg -k focused",
+        "unittest/pkg --ignore=unittest/pkg/test_consumer.py",
+        "unittest/pkg --ignore unittest/pkg/test_consumer.py",
+    ),
+)
+def test_unittest_entry_does_not_claim_partial_test_file(entry: str) -> None:
+    assert not CoverageSelector._unittest_entry_covers(entry, "unittest/pkg/test_consumer.py")
+
+
+def test_unittest_entry_matches_file_and_directory_entries() -> None:
+    path = "unittest/pkg/test_consumer.py"
+
+    assert CoverageSelector._unittest_entry_covers(path, path)
+    assert CoverageSelector._unittest_entry_covers(f"{path}::test_one", path)
+    assert CoverageSelector._unittest_entry_covers("unittest/pkg", path)
+    assert not CoverageSelector._unittest_entry_covers("unittest/other", path)
+
+
+def test_selector_ignores_external_reference_for_pure_new_function() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "VALUE = 1\n\ndef helper():\n    return VALUE\n"
+    diff = "@@ -1 +1,4 @@\n VALUE = 1\n+\n+def helper():\n+    return VALUE\n"
+    checked_bindings: list[set[str]] = []
+
+    def external_references(_path: str, names: set[str]) -> set[str]:
+        checked_bindings.append(names)
+        return names & {"helper"}
+
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=external_references,
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok
+    assert checked_bindings == [set()]
+
+
+def test_selector_uses_file_fallback_when_consumer_escapes() -> None:
+    path = "tensorrt_llm/example.py"
+    source = (
+        "VALUE = 521\n\n"
+        "def helper():\n"
+        "    return VALUE\n\n"
+        "def caller():\n"
+        "    alias = helper\n"
+        "    return alias()\n"
+    )
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -0,0 +1 @@\n+VALUE = 521\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
+
+
+def test_ordinary_no_data_function_change_keeps_file_fallback() -> None:
+    path = "tensorrt_llm/example.py"
+    source = "def helper():\n    return 2\n\ndef caller():\n    return helper()\n"
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: "@@ -2 +2 @@\n-    return 1\n+    return 2\n"})
+
+    assert result.ok
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.caller_bounded_funcs == []
 
 
 @pytest.fixture()
@@ -993,6 +2818,61 @@ def test_repository_reference_index_treats_module_escape_as_unresolved(
     )
 
     assert references == {"VALUE", "OTHER"}
+
+
+def test_repository_reference_index_reports_reference_paths(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("VALUE = 1\nOTHER = 2\n")
+    (package / "direct.py").write_text("from pkg.owner import VALUE\n")
+    (package / "opaque.py").write_text("import pkg.owner as owner\nregister(owner)\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"VALUE", "OTHER"}
+    )
+
+    assert references == {
+        "VALUE": {"pkg/direct.py", "pkg/opaque.py"},
+        "OTHER": {"pkg/opaque.py"},
+    }
+
+
+def test_repository_reference_index_respects_static_star_exports(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text('__all__ = ["PUBLIC"]\nPUBLIC = 1\n_PRIVATE = 2\n')
+    (package / "consumer.py").write_text("from pkg.owner import *\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"PUBLIC", "_PRIVATE"}
+    )
+
+    assert references == {"PUBLIC": {"pkg/consumer.py"}}
+
+
+def test_repository_reference_index_keeps_dynamic_star_exports_conservative(
+    reference_root: Path,
+) -> None:
+    package = reference_root / "pkg"
+    package.mkdir()
+    (package / "owner.py").write_text("__all__ = build_exports()\nPUBLIC = 1\n_PRIVATE = 2\n")
+    (package / "consumer.py").write_text("from pkg.owner import *\n")
+    _stage_reference_files(reference_root)
+
+    references = RepositoryReferenceIndex(reference_root).external_reference_paths(
+        "pkg/owner.py", {"PUBLIC", "_PRIVATE"}
+    )
+
+    assert references == {
+        "PUBLIC": {"pkg/consumer.py"},
+        "_PRIVATE": {"pkg/consumer.py"},
+    }
 
 
 def test_repository_reference_index_tracks_simple_module_alias(reference_root: Path) -> None:

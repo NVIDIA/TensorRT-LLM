@@ -15,16 +15,26 @@
 
 from __future__ import annotations
 
+import ast
+import shlex
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from python_change_analysis import (
+    ImportTarget,
+    PythonChangeFacts,
+    analyze_python_changes,
     closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
-from rules._helpers import iter_diff_post_line_numbers
+from repository_reference import RepositoryReferenceIndex
+from rules._helpers import (
+    iter_diff_deleted_post_lines,
+    iter_diff_post_line_numbers,
+    reconstruct_diff_pre_image,
+)
 from touch_db import (
     _LAUNCH_MARKERS,
     _MIN_FUNCS,
@@ -35,6 +45,7 @@ from touch_db import (
     canon,
     split_stage,
     stage_family,
+    unwrap_unittest,
 )
 
 
@@ -50,6 +61,8 @@ class CoverageResult:
     n_untrusted: int = 0
     # functions with no DB rows (new/uninstrumented); bounded per `no_data_policy`
     no_data_funcs: list[str] = field(default_factory=list)
+    # functions with no rows whose statically complete local callers provide the bound
+    caller_bounded_funcs: list[str] = field(default_factory=list)
     # residual file the forge API returned no patch for (binary / rename / oversized); declines
     no_diff_files: list[str] = field(default_factory=list)
 
@@ -72,6 +85,8 @@ class CoverageSelector:
         untrusted_stage_markers: tuple[str, ...] = _UNTRUSTED_STAGE_MARKERS,
         no_data_policy: str = DEFAULT_NO_DATA_POLICY,
         read_source: Callable[[str], str | None] | None = None,
+        external_references: Callable[[str, set[str]], set[str]] | None = None,
+        external_reference_paths: Callable[[str, set[str]], dict[str, set[str]]] | None = None,
     ) -> None:
         self.db = db
         self.repo_root = Path(repo_root)
@@ -83,6 +98,13 @@ class CoverageSelector:
         self._no_data_policy = no_data_policy
         # Defaults to the checkout; callers explaining a past commit inject their own.
         self._read_source = read_source or self._read_head
+        if external_references is None and external_reference_paths is None:
+            reference_index = RepositoryReferenceIndex(self.repo_root)
+            self._external_references = reference_index.external_references
+            self._external_reference_paths = reference_index.external_reference_paths
+        else:
+            self._external_references = external_references
+            self._external_reference_paths = external_reference_paths
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -108,10 +130,11 @@ class CoverageSelector:
 
     def _impacted_tests(
         self, residual_files: list[str], diffs: dict[str, str]
-    ) -> tuple[set[str], list[str], list[str], str | None]:
-        """Return (impacted tests, qualnames with no DB rows, files with no diff, decline reason)."""
+    ) -> tuple[set[str], list[str], list[str], list[str], str | None]:
+        """Return impacted tests, diagnostics, and an optional decline reason."""
         impacted: set[str] = set()
-        no_data: list[str] = []
+        no_data: set[str] = set()
+        caller_bounded: set[str] = set()
         no_diff: list[str] = []
         for path in residual_files:
             cf = canon(path)
@@ -120,32 +143,378 @@ class CoverageSelector:
             if not diff.strip() or source is None:
                 # Patch omitted (binary / renamed / oversized): the changed scope is unknown.
                 no_diff.append(path)
-                return impacted, no_data, no_diff, f"no usable diff: {path}"
+                return (
+                    impacted,
+                    sorted(no_data),
+                    sorted(caller_bounded),
+                    no_diff,
+                    f"no usable diff: {path}",
+                )
             lines = iter_diff_post_line_numbers(diff)
             qualnames, ok = qualnames_for_lines(source, lines)
             if not ok:
-                return impacted, no_data, no_diff, f"unparsable source: {path}"
+                return (
+                    impacted,
+                    sorted(no_data),
+                    sorted(caller_bounded),
+                    no_diff,
+                    f"unparsable source: {path}",
+                )
             if not lines:
                 continue  # comment / blank only: nothing executable changed, so nothing runs
             import_executed = import_executed_qualnames(source)
             closures = closure_attributed_qualnames(source, lines)
+            dependencies = analyze_python_changes(
+                source,
+                lines,
+                iter_diff_deleted_post_lines(diff),
+                pre_source=reconstruct_diff_pre_image(source, diff),
+            )
+            import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
-                    why = f"import-executed change, no sound bound: {path}::{qualname}"
-                    return impacted, no_data, no_diff, why
+                    if dependencies.limitation:
+                        why = (
+                            f"import-executed change, no sound bound: {path}::{qualname} "
+                            f"({dependencies.limitation})"
+                        )
+                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
+                    if not import_resolved:
+                        target_tests, target_limitation = self._import_target_impact(
+                            cf,
+                            dependencies.old_import_targets,
+                            dependencies.new_import_targets,
+                        )
+                        if target_limitation:
+                            why = (
+                                f"import-executed change, no sound bound: {path}::{qualname} "
+                                f"({target_limitation})"
+                            )
+                            return (
+                                impacted,
+                                sorted(no_data),
+                                sorted(caller_bounded),
+                                no_diff,
+                                why,
+                            )
+                        impacted |= target_tests
+                        # A binding that did not exist in the pre-image cannot
+                        # be an existing external dependency.  Keep the
+                        # repository-wide fail-closed check for every removed
+                        # or rebound name, while bounding pure imports and
+                        # declarations through their targets and consumers.
+                        checked_bindings = (
+                            dependencies.changed_bindings
+                            - dependencies.new_import_bindings
+                            - dependencies.new_declaration_bindings
+                        )
+                        external_paths: dict[str, set[str]] = {}
+                        if self._external_reference_paths is not None:
+                            external_paths = self._external_reference_paths(cf, checked_bindings)
+                            external = set(external_paths)
+                        elif self._external_references is not None:
+                            external = self._external_references(cf, checked_bindings)
+                        else:
+                            external = set()
+                        if external:
+                            external_tests, limitation = self._external_test_impact(external_paths)
+                            if limitation:
+                                why = (
+                                    "import-executed change has external binding "
+                                    f"reference(s): {path}::{', '.join(sorted(external))} "
+                                    f"({limitation})"
+                                )
+                                return (
+                                    impacted,
+                                    sorted(no_data),
+                                    sorted(caller_bounded),
+                                    no_diff,
+                                    why,
+                                )
+                            impacted |= external_tests
+                        for consumer in sorted(dependencies.binding_consumers):
+                            if (
+                                not self.db.tests_touching_func(cf, consumer)
+                                and "." not in consumer
+                                and consumer not in dependencies.new_declaration_bindings
+                            ):
+                                consumer_paths: dict[str, set[str]] = {}
+                                if self._external_reference_paths is not None:
+                                    consumer_paths = self._external_reference_paths(cf, {consumer})
+                                    consumer_external = set(consumer_paths)
+                                else:
+                                    consumer_external = self._external_reference_names(
+                                        cf, {consumer}
+                                    )
+                                if consumer_external:
+                                    external_tests, limitation = self._external_test_impact(
+                                        consumer_paths
+                                    )
+                                    if limitation:
+                                        why = (
+                                            "import-derived consumer has external "
+                                            f"reference(s): {path}::{consumer} "
+                                            f"({limitation})"
+                                        )
+                                        return (
+                                            impacted,
+                                            sorted(no_data),
+                                            sorted(caller_bounded),
+                                            no_diff,
+                                            why,
+                                        )
+                                    impacted |= external_tests
+                            tests, bounded, limitation = self._qualname_impact(
+                                cf, consumer, dependencies, allow_caller_bound=True
+                            )
+                            if limitation:
+                                return (
+                                    impacted,
+                                    sorted(no_data),
+                                    sorted(caller_bounded),
+                                    no_diff,
+                                    limitation,
+                                )
+                            impacted |= tests
+                            if not self.db.tests_touching_func(cf, consumer):
+                                no_data.add(f"{cf}::{consumer}")
+                                if bounded:
+                                    caller_bounded.add(f"{cf}::{consumer}")
+                        import_resolved = True
+                    continue
                 if qualname in closures:
                     tests = self._underrecorded_bound(cf, qualname)
                     if tests is None:
                         why = f"closure change, no wider row set: {path}::{qualname}"
-                        return impacted, no_data, no_diff, why
+                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
                     impacted |= tests
                     continue
-                tests = self.db.tests_touching_func(cf, qualname)
+                tests, bounded, limitation = self._qualname_impact(
+                    cf,
+                    qualname,
+                    dependencies,
+                    allow_caller_bound=qualname in dependencies.binding_consumers,
+                )
+                if limitation:
+                    return impacted, sorted(no_data), sorted(caller_bounded), no_diff, limitation
                 impacted |= tests
-                if not tests:
-                    no_data.append(f"{cf}::{qualname}")
-                    impacted |= self._no_data_fallback(cf)
-        return impacted, no_data, no_diff, None
+                if not self.db.tests_touching_func(cf, qualname):
+                    no_data.add(f"{cf}::{qualname}")
+                    if bounded:
+                        caller_bounded.add(f"{cf}::{qualname}")
+        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, None
+
+    def _external_reference_names(self, path: str, names: set[str]) -> set[str]:
+        """Return referenced names through either configured reference API."""
+        if self._external_reference_paths is not None:
+            return set(self._external_reference_paths(path, names))
+        if self._external_references is not None:
+            return self._external_references(path, names)
+        return set()
+
+    def _external_test_impact(self, references: dict[str, set[str]]) -> tuple[set[str], str | None]:
+        """Bound external references when every path is a registered unit test."""
+        paths = {path for binding_paths in references.values() for path in binding_paths}
+        if not paths:
+            return set(), "reference locations unavailable"
+
+        impacted: set[str] = set()
+        known = self.db.known_by_family()
+        for path in sorted(paths):
+            relative = path.removeprefix("tests/")
+            if (
+                relative == path
+                or not relative.startswith("unittest/")
+                or not Path(relative).name.startswith("test_")
+                or not relative.endswith(".py")
+            ):
+                return set(), f"non-test external reference: {path}"
+
+            matched = False
+            for family, nodeids in known.items():
+                for nodeid in nodeids:
+                    entry = unwrap_unittest(nodeid)
+                    if entry is None:
+                        continue
+                    if self._unittest_entry_covers(entry, relative):
+                        impacted.add(f"{family}/{nodeid}")
+                        matched = True
+            if not matched:
+                return set(), f"unregistered external test reference: {path}"
+        return impacted, None
+
+    @staticmethod
+    def _unittest_entry_covers(entry: str, test_path: str) -> bool:
+        """Return whether a unittest entry collects a path without excluding it."""
+        try:
+            tokens = shlex.split(entry)
+        except ValueError:
+            return False
+        if not tokens or "-k" in tokens:
+            return False
+        entry_path = tokens[0].partition("::")[0]
+
+        ignored: set[str] = set()
+        for index, token in enumerate(tokens):
+            if token.startswith("--ignore="):
+                ignored.add(token.partition("=")[2])
+            elif token == "--ignore" and index + 1 < len(tokens):
+                ignored.add(tokens[index + 1])
+        if any(test_path == path or test_path.startswith(f"{path}/") for path in ignored):
+            return False
+
+        if entry_path.endswith(".py"):
+            return entry_path == test_path
+        return test_path.startswith(f"{entry_path.rstrip('/')}/")
+
+    def _import_target_impact(
+        self,
+        defining_path: str,
+        old_targets: set[ImportTarget],
+        new_targets: set[ImportTarget],
+    ) -> tuple[set[str], str | None]:
+        """Validate old bindings and return available tests for new functions."""
+        impacted: set[str] = set()
+        for target in sorted(old_targets):
+            resolved, limitation = self._resolve_import_target(
+                defining_path, target, require_function=False
+            )
+            if limitation:
+                return set(), limitation
+            assert resolved is not None
+
+        for target in sorted(new_targets):
+            resolved, limitation = self._resolve_import_target(
+                defining_path, target, require_function=True
+            )
+            if limitation:
+                return set(), limitation
+            assert resolved is not None
+            target_path, target_name = resolved
+            impacted |= self.db.tests_touching_func(target_path, target_name)
+        return impacted, None
+
+    def _resolve_import_target(
+        self,
+        defining_path: str,
+        target: ImportTarget,
+        *,
+        require_function: bool,
+    ) -> tuple[tuple[str, str] | None, str | None]:
+        """Resolve a relative import to one repository-level binding."""
+        module_parts = list(Path(defining_path).with_suffix("").parts)
+        is_package = bool(module_parts and module_parts[-1] == "__init__")
+        if is_package:
+            module_parts.pop()
+        package_parts = module_parts if is_package else module_parts[:-1]
+        if target.level:
+            trim = target.level - 1
+            if trim > len(package_parts):
+                return None, f"import target escapes repository package: {target.name}"
+            resolved_parts = package_parts[: len(package_parts) - trim]
+        else:
+            resolved_parts = []
+        resolved_parts.extend(target.module.split("."))
+        if not resolved_parts:
+            return None, f"unresolved import target module: {target.name}"
+
+        module_path = "/".join(resolved_parts)
+        candidates = (f"{module_path}.py", f"{module_path}/__init__.py")
+        available = [
+            (candidate, source)
+            for candidate in candidates
+            if (source := self._read_source(candidate)) is not None
+        ]
+        if len(available) != 1:
+            return None, f"unresolved import target module: {'.'.join(resolved_parts)}"
+        target_path, source = available[0]
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None, f"unparsable import target: {target_path}"
+        functions = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        bindings = set(functions)
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                bindings.add(node.name)
+            elif isinstance(node, ast.Assign) or (
+                isinstance(node, ast.AnnAssign) and node.value is not None
+            ):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                bindings.update(item.id for item in targets if isinstance(item, ast.Name))
+            elif isinstance(node, ast.Import):
+                bindings.update(
+                    alias.asname or alias.name.partition(".")[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                bindings.update(
+                    alias.asname or alias.name for alias in node.names if alias.name != "*"
+                )
+        if target.name not in bindings:
+            kind = "static function" if require_function else "static binding"
+            prefix = "import target" if require_function else "old import target"
+            return None, f"{prefix} is not a {kind}: {target_path}::{target.name}"
+        if require_function and target.name not in functions:
+            return None, f"import target is not a static function: {target_path}::{target.name}"
+        return (canon(target_path), target.name), None
+
+    def _qualname_impact(
+        self,
+        cf: str,
+        qualname: str,
+        dependencies: PythonChangeFacts,
+        *,
+        allow_caller_bound: bool = False,
+    ) -> tuple[set[str], bool, str | None]:
+        """Return tests, whether local callers bounded them, and any decline reason."""
+        tests = self.db.tests_touching_func(cf, qualname)
+        if tests:
+            return tests, False, None
+        if allow_caller_bound:
+            caller_tests, limitation = self._caller_bound(
+                cf,
+                qualname,
+                dependencies.callers,
+                dependencies.callable_escapes,
+                set(),
+            )
+            if limitation:
+                return set(), False, limitation
+            if caller_tests is not None:
+                return caller_tests, True, None
+        return self._no_data_fallback(cf), False, None
+
+    def _caller_bound(
+        self,
+        cf: str,
+        qualname: str,
+        callers: dict[str, set[str]],
+        caller_escapes: set[str],
+        visiting: set[str],
+    ) -> tuple[set[str] | None, str | None]:
+        """Resolve every local direct-caller branch to a qualname with DB rows."""
+        if qualname in visiting or qualname in caller_escapes or not callers.get(qualname):
+            return None, None
+        visiting = visiting | {qualname}
+        bound: set[str] = set()
+        for caller in callers[qualname]:
+            tests = self.db.tests_touching_func(cf, caller)
+            if tests:
+                bound |= tests
+                continue
+            if self._external_reference_names(cf, {caller}):
+                return None, f"import-derived caller has external reference(s): {cf}::{caller}"
+            transitive, limitation = self._caller_bound(
+                cf, caller, callers, caller_escapes, visiting
+            )
+            if transitive is None:
+                return None, limitation
+            bound |= transitive
+        return bound or None, None
 
     def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
         """File row set when it is wider than a closure's enclosing qualname's, else None."""
@@ -180,8 +549,8 @@ class CoverageSelector:
                     ok=False, reason=f"zero-touch residual file (new/uninstrumented): {path}"
                 )
 
-        impacted_tests, no_data_funcs, no_diff_files, decline = self._impacted_tests(
-            residual_files, diffs
+        impacted_tests, no_data_funcs, caller_bounded_funcs, no_diff_files, decline = (
+            self._impacted_tests(residual_files, diffs)
         )
         if decline is not None:
             return CoverageResult(ok=False, reason=decline, no_diff_files=no_diff_files)
@@ -212,4 +581,5 @@ class CoverageSelector:
             skippable=skippable,
             n_untrusted=n_untrusted,
             no_data_funcs=no_data_funcs,
+            caller_bounded_funcs=caller_bounded_funcs,
         )
