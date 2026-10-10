@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
 import os
@@ -84,10 +87,6 @@ class RpcExecutorMixin:
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -96,6 +95,13 @@ class RpcExecutorMixin:
             logprob_params=logprob_params,
         )
         self._results[request.id] = result
+
+        try:
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+        except Exception:
+            self._results.pop(request.id, None)
+            raise
 
         return result
 
