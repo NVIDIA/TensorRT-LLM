@@ -164,6 +164,8 @@ class TestModelInfo:
         mock = MagicMock(spec=[])
         mock.architectures = ["LlamaForCausalLM"]
         assert usage_lib._architecture_telemetry_fields(mock) == ("LlamaForCausalLM", "")
+        mock.architectures = ["Kolibri1ForCausalLM"]
+        assert usage_lib._architecture_telemetry_fields(mock) == ("Kolibri1ForCausalLM", "")
 
     def test_unknown_architecture_is_hashed(self) -> None:
         """Unknown names use a stable domain-separated SHA-256 digest."""
