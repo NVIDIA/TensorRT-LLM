@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Run benchmarking with `trtllm-serve`
 
 TensorRT LLM provides the OpenAI-compatible API via `trtllm-serve` command.
@@ -198,7 +203,7 @@ To get more detailed metrics besides the key metrics above, there is an [experim
 
 ## Profile a server with HTTP API endpoints
 
-> **Beta.** PyTorch backend only. No-op on the TensorRT backend.
+> **Beta.** Applies to the PyTorch executor (`PyExecutor`).
 
 `trtllm-serve` exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime — no restart and no env vars required:
 

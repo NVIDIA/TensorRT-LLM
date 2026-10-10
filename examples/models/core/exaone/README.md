@@ -1,18 +1,15 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # EXAONE
 
-> [!WARNING]
-> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
-> below is **legacy** and will not receive new features. New projects should use
-> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
-> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
-
-This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EXAONE) models in TensorRT-LLM.
+This document shows how to run [EXAONE](https://huggingface.co/LGAI-EXAONE) models in TensorRT-LLM.
 
 - [EXAONE](#exaone)
   - [Support Matrix](#support-matrix)
   - [Supported Models](#supported-models)
-    - [EXAONE-3.0](#exaone-30)
-    - [EXAONE-Deep](#exaone-deep)
     - [EXAONE-4.0](#exaone-40)
     - [EXAONE-4.5](#exaone-45)
     - [K-EXAONE](#k-exaone)
@@ -32,13 +29,7 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
       - [Step 1: Set Environment Variables](#step-1-set-environment-variables)
       - [Step 2: Create Configuration Files](#step-2-create-configuration-files)
       - [Step 3: Launch the Disaggregated Server](#step-3-launch-the-disaggregated-server)
-  - [TRT flow](#trt-flow)
-    - [Convert checkpoint and build TensorRT engine(s)](#convert-checkpoint-and-build-tensorrt-engines)
-    - [FP8 Post-Training Quantization](#fp8-post-training-quantization)
-    - [SmoothQuant](#smoothquant)
-    - [Groupwise quantization (AWQ)](#groupwise-quantization-awq)
-      - [W4A16 AWQ with FP8 GEMM (W4A8 AWQ)](#w4a16-awq-with-fp8-gemm-w4a8-awq)
-    - [Run Engine](#run-engine)
+  - [Historical engine-build workflow](#historical-engine-build-workflow)
   - [Troubleshootings](#troubleshootings)
     - [Troubleshootings for EXAONE-4.0](#troubleshootings-for-exaone-40)
     - [Troubleshootings for K-EXAONE](#troubleshootings-for-k-exaone)
@@ -53,36 +44,15 @@ This document shows how to build and run [EXAONE](https://huggingface.co/LGAI-EX
   * Disaggregated Serving
   * MTP (Multi Token Prediction)
   * FP8
-  * INT8 & INT4 Weight-Only
-  * INT8 SmoothQuant
-  * INT4 AWQ & W4A8 AWQ
   * NVFP4 (K-EXAONE only)
 
 ## Supported Models
 
 **Note:**
-- **EXAONE-3.0** & **EXAONE-Deep** are supported using the [TRT Flow](#trt-flow).
+- **EXAONE-3.0** and **EXAONE-Deep** used the removed TensorRT execution backend. See the [historical engine-build workflow](#historical-engine-build-workflow) for versioned instructions.
 - **EXAONE-4.0**, **EXAONE-4.5**, & **K-EXAONE** are supported using the [PyTorch flow](#pytorch-flow).
 
 Please refer to the corresponding sections below for usage instructions and examples for each model.
-
-### EXAONE-3.0
-
-Download the HuggingFace FP32 checkpoints of EXAONE-3.0 model. We support EXAONE-3.0 families but here, we only use the `EXAONE-3.0-7.8B-Instruct` model for the example.
-
-```bash
-export HF_MODEL_DIR=hf_models/exaone
-git clone https://huggingface.co/LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct $HF_MODEL_DIR
-```
-
-### EXAONE-Deep
-
-Download the HuggingFace checkpoints of EXAONE-Deep model. Here, we only use the `EXAONE-Deep-2.4B` model for the example. We can use the same procedure as EXAONE-3.0 to convert the weights and build the TensorRT engine.
-
-```bash
-export HF_MODEL_DIR=hf_models/exaone_deep
-git clone https://huggingface.co/LGAI-EXAONE/EXAONE-Deep-2.4B $HF_MODEL_DIR
-```
 
 ### EXAONE-4.0
 
@@ -391,175 +361,12 @@ trtllm-serve disaggregated -c disagg_config.yaml -t 360 -r 1200 &> log_disagg.lo
 Once all servers are running, you can send requests to `http://localhost:8000/v1/completions` using the OpenAI API format.
 
 
-## TRT flow
+## Historical engine-build workflow
 
-The next section describes how to convert weights from the [HuggingFace (HF) Transformers](https://github.com/huggingface/transformers) format to the TensorRT LLM format. We will use LLaMA's [convert_checkpoint.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/convert_checkpoint.py) for EXAONE models and then build the model with `trtllm-build`.
-
-### Convert checkpoint and build TensorRT engine(s)
-
-```bash
-# Build a single-GPU float16 engine from HF weights.
-
-# Build the EXAONE model using a single GPU and FP16.
-python ../llama/convert_checkpoint.py \
-    --model_dir $HF_MODEL_DIR \
-    --output_dir trt_models/exaone/fp16/1-gpu \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/fp16/1-gpu \
-    --output_dir trt_engines/exaone/fp16/1-gpu \
-    --gemm_plugin auto
-
-# Build the EXAONE model using a single GPU and apply INT8 weight-only quantization.
-python ../llama/convert_checkpoint.py \
-    --model_dir $HF_MODEL_DIR \
-    --output_dir trt_models/exaone/int8_wq/1-gpu \
-    --use_weight_only \
-    --weight_only_precision int8 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/int8_wq/1-gpu \
-    --output_dir trt_engines/exaone/int8_wq/1-gpu \
-    --gemm_plugin auto
-
-# Build the EXAONE model using a single GPU and apply INT4 weight-only quantization.
-python ../llama/convert_checkpoint.py \
-    --model_dir $HF_MODEL_DIR \
-    --output_dir trt_models/exaone/int4_wq/1-gpu \
-    --use_weight_only \
-    --weight_only_precision int4 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/int4_wq/1-gpu \
-    --output_dir trt_engines/exaone/int4_wq/1-gpu \
-    --gemm_plugin auto
-
-# Build the EXAONE model using 2-way tensor parallelism and FP16.
-python ../llama/convert_checkpoint.py \
-    --model_dir $HF_MODEL_DIR \
-    --output_dir trt_models/exaone/fp16/2-gpu \
-    --tp_size 2 \
-    --dtype float16
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/fp16/2-gpu \
-    --output_dir trt_engines/exaone/fp16/2-gpu \
-    --gemm_plugin auto
-```
-> **NOTE**: EXAONE model is not supported with `--load_by_shard`.
-
-### FP8 Post-Training Quantization
-
-The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the EXAONE model using a single GPU and apply FP8 quantization.
-python ../../../quantization/quantize.py \
-    --model_dir $HF_MODEL_DIR \
-    --dtype float16 \
-    --qformat fp8 \
-    --kv_cache_dtype fp8 \
-    --output_dir trt_models/exaone/fp8/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/fp8/1-gpu \
-    --output_dir trt_engines/exaone/fp8/1-gpu \
-    --gemm_plugin auto
-```
-
-### SmoothQuant
-
-The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the EXAONE model using a single GPU and apply INT8 SmoothQuant.
-python ../../../quantization/quantize.py \
-    --model_dir $HF_MODEL_DIR \
-    --dtype float16 \
-    --qformat int8_sq \
-    --output_dir trt_models/exaone/int8_sq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/int8_sq/1-gpu \
-    --output_dir trt_engines/exaone/int8_sq/1-gpu \
-    --gemm_plugin auto
-```
-
-### Groupwise quantization (AWQ)
-
-The examples below use the NVIDIA ModelOpt (AlgorithMic Model Optimization) toolkit for the model quantization process.
-
-First make sure Modelopt toolkit is installed (see [examples/quantization/README.md](/examples/quantization/README.md#preparation))
-
-```bash
-# Build the EXAONE model using a single GPU and apply INT4 AWQ.
-python ../../../quantization/quantize.py \
-    --model_dir $HF_MODEL_DIR \
-    --dtype float16 \
-    --qformat int4_awq \
-    --output_dir trt_models/exaone/int4_awq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/int4_awq/1-gpu \
-    --output_dir trt_engines/exaone/int4_awq/1-gpu \
-    --gemm_plugin auto
-```
-
-#### W4A16 AWQ with FP8 GEMM (W4A8 AWQ)
-For Hopper GPUs, TRT-LLM also supports employing FP8 GEMM for accelerating linear layers. This mode is noted with `w4a8_awq` for Modelopt and TRT-LLM, in which both weights and activations are converted from W4A16 to FP8 for GEMM calculation.
-
-Please make sure your system contains a Hopper GPU before trying the commands below.
-
-```bash
-# Build the EXAONE model using a single GPU and apply W4A8 AWQ.
-python ../../../quantization/quantize.py \
-    --model_dir $HF_MODEL_DIR \
-    --dtype float16 \
-    --qformat w4a8_awq \
-    --output_dir trt_models/exaone/w4a8_awq/1-gpu
-
-trtllm-build \
-    --checkpoint_dir trt_models/exaone/w4a8_awq/1-gpu \
-    --output_dir trt_engines/exaone/w4a8_awq/1-gpu \
-    --gemm_plugin auto
-```
-
-
-### Run Engine
-Test your engine with the [run.py](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/run.py) script:
-
-```bash
-python3 ../../../run.py \
-    --input_text "When did the first world war end?" \
-    --max_output_len=100 \
-    --tokenizer_dir $HF_MODEL_DIR \
-    --engine_dir trt_engines/exaone/fp16/1-gpu
-
-# Run with 2 GPUs
-mpirun -n 2 --allow-run-as-root \
-    python3 ../../../run.py \
-    --input_text "When did the first world war end?" \
-    --max_output_len=100 \
-    --tokenizer_dir $HF_MODEL_DIR \
-    --engine_dir trt_engines/exaone/fp16/2-gpu
-
-python ../../../summarize.py \
-    --test_trt_llm \
-    --data_type fp16 \
-    --hf_model_dir $HF_MODEL_DIR \
-    --engine_dir trt_engines/exaone/fp16/1-gpu
-```
-
-For more examples regarding EXAONE-3.0 & EXAONE-Deep's TRT flow, see [`examples/models/core/llama/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/llama/README.md)
-
-
+The TensorRT execution backend and its conversion, engine-build, and execution
+scripts have been removed. For historical instructions, see the
+[TensorRT-LLM v1.2.0 exaone guide](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.0/examples/models/core/exaone/README.md).
+Use the PyTorch examples above for current releases.
 
 ## Troubleshootings
 

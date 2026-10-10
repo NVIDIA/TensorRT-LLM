@@ -2478,8 +2478,6 @@ class DecodingBaseConfig(StrictBaseModel):
     @property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
-        # Use an alias for the import here to avoid name collisions with the one for the
-        # TRT backend.
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
@@ -4077,8 +4075,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     dynamic_batch_config: Optional[DynamicBatchConfig] = Field(
         default=None,
         description=
-        "The dynamic batch config to use. This only applies for the TensorRT backend and "
-        "cannot currently be used with the PyTorch backend.")
+        "The dynamic batch configuration used by the scheduler to adjust batch size "
+        "and token limits at runtime. This option currently has no effect since the "
+        "scheduler does not support dynamic batch adjustments in the pytorch backend."
+    )
 
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
