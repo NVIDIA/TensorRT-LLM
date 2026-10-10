@@ -1,0 +1,189 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The dep4 DeepSeek-R1 target plans its own KV transfer; prove it equals the default plan."""
+
+import numpy as np
+import pytest
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4.transfer import (  # noqa: E501
+    DeepseekR1Dep4TransferPlanner,
+)
+from tensorrt_llm._torch.disaggregation.base import TokenRange
+from tensorrt_llm._torch.disaggregation.base.planner import PeerIncompatibleError, TransferPlan
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+from tensorrt_llm._torch.disaggregation.resource.page import (
+    BUFFER_ENTRY_DTYPE,
+    AttentionLayerGroup,
+    KVCachePageTable,
+    LocalLayer,
+    PhysicalPool,
+    PhysicalPoolGroup,
+    PoolView,
+)
+
+pytestmark = pytest.mark.cpu_only
+
+NUM_LAYERS = 6
+LAYER_BYTES = 512  # one latent-K region per layer per block
+SLOT_BYTES = NUM_LAYERS * LAYER_BYTES
+TPB = 16
+
+
+def _mla_page_table(base: int, *, num_layers: int = NUM_LAYERS, extra_pool: bool = False):
+    """One PAGED group, one K-only pool: the shape RankInfo.from_kv_cache_manager builds for MLA."""
+    entries = np.array(
+        [(i, i * LAYER_BYTES, LAYER_BYTES) for i in range(num_layers)], dtype=BUFFER_ENTRY_DTYPE
+    )
+    views = [PoolView(pool_idx=0, buffer_entries=entries)]
+    pools = [PhysicalPool(base_address=base, slot_bytes=num_layers * LAYER_BYTES, num_slots=256)]
+    if extra_pool:
+        views.append(PoolView(pool_idx=1, buffer_entries=entries, pool_role=frozenset({"mtp"})))
+        pools.append(
+            PhysicalPool(base_address=base + (1 << 30), slot_bytes=SLOT_BYTES, num_slots=256)
+        )
+    lg = AttentionLayerGroup(
+        pool_group_idx=0,
+        kv_head_num_per_rank=1,
+        sliding_window_size=None,
+        local_layers=[LocalLayer(local_layer_id=i, global_layer_id=i) for i in range(num_layers)],
+        pool_views=views,
+    )
+    return KVCachePageTable(
+        tokens_per_block=TPB, layer_groups=[lg], pool_groups=[PhysicalPoolGroup(pools=pools)]
+    )
+
+
+def _dep4_rank_info(name: str, dp_rank: int, page_table, *, dp_size: int = 4, pp_size: int = 1):
+    return RankInfo(
+        instance_name=name,
+        instance_rank=dp_rank,
+        tp_size=dp_size,
+        tp_rank=dp_rank,
+        pp_size=pp_size,
+        pp_rank=0,
+        dp_size=dp_size,
+        dp_rank=dp_rank,
+        layer_num_per_pp=[len(page_table.layer_groups[0].local_layers)],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+        attention=AttentionInfo(
+            kv_heads_per_rank=1,
+            tokens_per_block=TPB,
+            dims_per_head=512,
+            element_bytes=1,
+            enable_attention_dp=True,
+            is_mla=True,
+        ),
+        page_table=page_table,
+    )
+
+
+def _pair(dp_rank: int = 2):
+    self_pt, peer_pt = _mla_page_table(0x1000_0000), _mla_page_table(0x9000_0000)
+    self_ri = _dep4_rank_info("ctx", dp_rank, self_pt)
+    peer_ri = _dep4_rank_info("gen", dp_rank, peer_pt)
+    ext = KVRegionExtractorV1(self_pt)
+    return (
+        DeepseekR1Dep4TransferPlanner(self_ri, ext),
+        DefaultTransferPlanner(self_ri, ext),
+        self_ri,
+        peer_ri,
+    )
+
+
+def _fragments_at_slot_granularity(plan: TransferPlan) -> set:
+    """Split merged runs into per-slot pieces so plans can be compared as sets."""
+    out = set()
+    for s, d, n in zip(plan.src_ptrs.tolist(), plan.dst_ptrs.tolist(), plan.sizes.tolist()):
+        assert n % SLOT_BYTES == 0
+        for k in range(n // SLOT_BYTES):
+            out.add((s + k * SLOT_BYTES, d + k * SLOT_BYTES, SLOT_BYTES))
+    return out
+
+
+def _tables(src, dst):
+    return [np.array(src, dtype=np.int64)], [np.array(dst, dtype=np.int64)]
+
+
+@pytest.mark.parametrize(
+    "src,dst,dst_start_token",
+    [
+        ([3, 4, 5, 6], [10, 11, 12, 13], None),  # all consecutive both sides
+        ([3, 4, 9, 10], [10, 11, 12, 13], None),  # src breaks a run
+        ([3, 4, 5, 6], [10, 11, 20, 21], None),  # dst breaks a run
+        ([3, -1, 5, 6], [10, 11, -1, 13], None),  # holes on both sides
+        ([3, 4, 5, 6], [10, 11, 12, 13], 2 * TPB),  # receiver prefix reuse
+        ([3, 4, 5, 6], [-1, -1, -1, -1], None),  # peer holds nothing
+    ],
+    ids=["contiguous", "src_break", "dst_break", "holes", "dst_start", "nothing_to_send"],
+)
+def test_plan_matches_default_planner_byte_for_byte(src, dst, dst_start_token):
+    target, default, self_ri, peer_ri = _pair()
+    s, d = _tables(src, dst)
+    tr = TokenRange(0, len(src) * TPB)
+
+    ours = target.plan(self_ri, peer_ri, s, d, tr, len(src) * TPB, dst_start_token, frozenset())
+    ref = default.plan(self_ri, peer_ri, s, d, tr, len(src) * TPB, dst_start_token, frozenset())
+
+    assert _fragments_at_slot_granularity(ours) == _fragments_at_slot_granularity(ref)
+    assert int(ours.sizes.sum()) == int(ref.sizes.sum())
+
+
+def test_contiguous_blocks_merge_into_one_fragment():
+    target, _, self_ri, peer_ri = _pair()
+    s, d = _tables([3, 4, 5, 6], [10, 11, 12, 13])
+    plan = target.plan(self_ri, peer_ri, s, d, TokenRange(0, 4 * TPB), 4 * TPB, None, frozenset())
+    assert plan.sizes.tolist() == [4 * SLOT_BYTES]
+
+
+def test_targets_is_the_matching_dp_rank_only():
+    target, default, self_ri, peer_ri = _pair(dp_rank=2)
+    ours, ref = target.targets(self_ri, peer_ri, 2), default.targets(self_ri, peer_ri, 2)
+    assert ours.ranks == ref.ranks == [2]
+    assert ours.uniform_writers is True
+
+
+def test_check_peer_accepts_the_dep4_twin_and_refuses_everything_else():
+    target, _, self_ri, peer_ri = _pair()
+    target.check_peer(self_ri, peer_ri)  # the supported pair
+    with pytest.raises(PeerIncompatibleError, match="dp_size"):
+        target.check_peer(
+            self_ri, _dep4_rank_info("gen", 0, _mla_page_table(0x9000_0000), dp_size=2)
+        )
+    with pytest.raises(PeerIncompatibleError, match="pool"):
+        target.check_peer(
+            self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000, extra_pool=True))
+        )
+    with pytest.raises(PeerIncompatibleError, match="layer"):
+        target.check_peer(
+            self_ri, _dep4_rank_info("gen", 2, _mla_page_table(0x9000_0000, num_layers=5))
+        )
+
+
+def test_target_class_builds_this_planner():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4 import (  # noqa: E501
+        modeling,
+    )
+
+    cls = modeling.ModelingV2DeepseekR10528Nvfp4Sm103Dep4
+    self_pt = _mla_page_table(0x1000_0000)
+    ri = _dep4_rank_info("ctx", 0, self_pt)
+    planner = cls.build_transfer_planner(object(), None, ri, KVRegionExtractorV1(self_pt))
+    assert isinstance(planner, DeepseekR1Dep4TransferPlanner)
+    assert planner.planner_id == "deepseek_r1_0528_nvfp4_sm103_dep4"
