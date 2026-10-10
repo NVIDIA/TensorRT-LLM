@@ -83,6 +83,9 @@ Developer workflow for code contributions is as follows:
   * If changes are requested, then the reviewer will add the label `Changes Requested` to the PR.
   * Once changes are approved, CI will be launched to validate the change. When CI passes, the reviewer will merge the PR.
   * If CI reports any failures, it's up to the requester to fix any CI failures before requesting another review.
+  * For a first-time contributor, GitHub holds the workflow runs created by the `pull_request` event in
+    `action_required` until a maintainer approves them, so no check starts on its own. If the checks stay
+    idle on a new PR, ask a maintainer on the PR to approve the pending runs.
 
 ### PR Submission Policies
 
