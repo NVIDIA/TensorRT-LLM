@@ -6429,8 +6429,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
+        // In this Kubernetes map only, an optional 6th element `true` attaches the Redis +
+        // ModelExpress server sidecars and the CI ModelExpress env to the pod
+        // (`createKubernetesPodConfig(..., values[5])`). The Slurm maps read slot 6 as the
+        // node count and slot 7 as `runWithSbatch` instead.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
+        // Post-merge only: the `stage: post_merge` rows of l0_model_express, i.e. the TP=1 smoke
+        // rows of the non-representative families and the accuracy canaries.
+        "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
