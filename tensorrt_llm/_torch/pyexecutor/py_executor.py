@@ -1972,11 +1972,12 @@ class PyExecutor:
             for manager in self._sleeping_kv_managers:
                 manager.finish_wakeup()
             for runner, draft_lengths in self._sleeping_padding_dummies:
-                runner.preallocate_padding_dummies(self.resource_manager)
-                if not draft_lengths.issubset(runner.padding_dummy_requests):
-                    raise RuntimeError(
-                        "Could not restore CUDA graph padding requests after wakeup"
-                    )
+                for draft_len in sorted(draft_lengths):
+                    if runner._get_or_create_padding_dummy(
+                            self.resource_manager, draft_len) is None:
+                        raise RuntimeError(
+                            "Could not restore CUDA graph padding requests after wakeup"
+                        )
             if self._sleeping_kv_managers or self._sleeping_padding_dummies:
                 torch.cuda.synchronize()
             self._sleeping_kv_managers.clear()

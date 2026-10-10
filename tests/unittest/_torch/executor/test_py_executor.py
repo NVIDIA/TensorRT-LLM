@@ -2729,9 +2729,15 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
         runner = object.__new__(CUDAGraphRunner)
         runner.padding_dummy_requests = {0: dummy}
         runner._padding_dummy_managers = lambda _: [manager, shared_spec]
-        runner.preallocate_padding_dummies = Mock(
-            side_effect=lambda _: runner.padding_dummy_requests.update({0: dummy})
-        )
+        # Attention-DP can create dummies even when every batch size has a
+        # graph, so warmup preallocation does not necessarily cover them.
+        runner.preallocate_padding_dummies = Mock()
+
+        def create_dummy(_, draft_len):
+            runner.padding_dummy_requests[draft_len] = dummy
+            return dummy
+
+        runner._get_or_create_padding_dummy = Mock(side_effect=create_dummy)
         return runner
 
     main_runner = make_runner(stub.kv_cache_manager)
@@ -2763,13 +2769,16 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     torch.cuda.synchronize.reset_mock()
 
     PyExecutor.finish_wakeup(stub, tags[:1])
-    main_runner.preallocate_padding_dummies.assert_not_called()
-    draft_runner.preallocate_padding_dummies.assert_not_called()
+    main_runner._get_or_create_padding_dummy.assert_not_called()
+    draft_runner._get_or_create_padding_dummy.assert_not_called()
     torch.cuda.synchronize.assert_not_called()
     PyExecutor.finish_wakeup(stub, tags[1:])
     assert not stub._sleeping_memory_tags
     assert main_runner.padding_dummy_requests == {0: dummy}
     assert draft_runner.padding_dummy_requests == {0: dummy}
+    for runner in (main_runner, draft_runner):
+        runner.preallocate_padding_dummies.assert_not_called()
+        runner._get_or_create_padding_dummy.assert_called_once_with(stub.resource_manager, 0)
     torch.cuda.synchronize.assert_called_once_with()
 
 
