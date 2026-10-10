@@ -99,6 +99,9 @@ class _MnnvlWorkspace(TypedDict):
     # An MPI communicator under MPI, the TP ProcessGroup under a non-MPI orchestrator (Ray).
     # None between checkpoint_prepare() and a successful checkpoint_restore().
     comm: Optional[Union[_MpiCommProtocol, "torch.distributed.ProcessGroup"]]
+    # Set once the workspace is handed out during CUDA graph capture: the captured graphs launch on its buffers and
+    # flags, so a larger workspace that replaces it must keep it alive.
+    captured: bool
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -256,12 +259,20 @@ def get_or_scale_allreduce_mnnvl_workspace(
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")
         if workspace["buffer_size_bytes"] >= (buffer_size_bytes or 0):
-            return workspace
+            return _mark_if_capturing(workspace)
 
     workspace_lock = MNNVLAllReduce._get_allreduce_mnnvl_workspace_lock(mapping)
     with workspace_lock:
-        return _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
-                                                       buffer_size_bytes)
+        return _mark_if_capturing(
+            _get_or_scale_allreduce_mnnvl_workspace(mapping, dtype,
+                                                    buffer_size_bytes))
+
+
+def _mark_if_capturing(workspace: _MnnvlWorkspace) -> _MnnvlWorkspace:
+    """Record that a CUDA graph being captured launches on this workspace."""
+    if not workspace["captured"] and torch.cuda.is_current_stream_capturing():
+        workspace["captured"] = True
+    return workspace
 
 
 def _get_or_scale_allreduce_mnnvl_workspace(
@@ -287,6 +298,10 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     if mapping not in allreduce_mnnvl_workspaces or allreduce_mnnvl_workspaces[
             mapping]["buffer_size_bytes"] < (buffer_size_bytes or 0):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "MNNVL all-reduce workspace creation or growth during CUDA graph capture: run each shape once "
+                "outside capture first")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
                                      or 0)
@@ -347,6 +362,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 "buffer_flags": buffer_flags,
                 "buffer_size_bytes": buffer_size_bytes,
                 "comm": comm,
+                "captured": False,
             }
         except Exception as error:
             candidate_error = error
@@ -363,6 +379,13 @@ def _get_or_scale_allreduce_mnnvl_workspace(
         _initialize_allreduce_mnnvl_protocol(candidate_workspace)
         # Hand ownership of the communicator to the workspace.
         pending_comms.pop(mapping, None)
+        previous_workspace = allreduce_mnnvl_workspaces.get(mapping)
+        if previous_workspace is not None and previous_workspace["captured"]:
+            # CUDA graphs captured on the previous workspace keep launching on its buffers and flags. One that no
+            # capture used is released by the replacement below: every rank had synchronized its device before the
+            # protocol reset above returned, so no kernel still uses it.
+            MNNVLAllReduce.allreduce_mnnvl_retired_workspaces.setdefault(
+                mapping, []).append(previous_workspace)
         allreduce_mnnvl_workspaces[mapping] = candidate_workspace
     return allreduce_mnnvl_workspaces[mapping]
 
@@ -754,6 +777,11 @@ class MNNVLAllReduce(nn.Module):
     allreduce_mnnvl_workspaces: typing.ClassVar[dict[Mapping,
                                                      _MnnvlWorkspace]] = {}
 
+    # Workspaces a larger one replaced after a CUDA graph capture used them. Those graphs still launch on their buffers
+    # and flags, so they stay alive with the process. The checkpoint hooks cover only the current workspace.
+    allreduce_mnnvl_retired_workspaces: typing.ClassVar[dict[
+        Mapping, list[_MnnvlWorkspace]]] = {}
+
     # Communicators split for a mapping whose workspace construction has not
     # succeeded yet. Ownership moves to the workspace once it is published, so
     # an entry here is never reachable from allreduce_mnnvl_workspaces.
@@ -786,6 +814,8 @@ class MNNVLAllReduce(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.dtype = dtype
+        self.one_shot_max_bytes = _MNNVL_ONE_SHOT_THRESHOLD_BYTES
+        self.early_trigger = False
         if dtype not in MNNVLAllReduce.get_supported_dtypes() or (
                 mapping.has_cp()):
             # This is safe as we always capture the exception when create this object
@@ -827,12 +857,16 @@ class MNNVLAllReduce(nn.Module):
         return supported and (explicitly_requested or mapping.is_multi_node())
 
     @staticmethod
-    def get_required_workspace_size(num_tokens: int, hidden_dim: int,
-                                    group_size: int, dtype: torch.dtype) -> int:
+    def get_required_workspace_size(
+            num_tokens: int,
+            hidden_dim: int,
+            group_size: int,
+            dtype: torch.dtype,
+            one_shot_max_bytes: int = _MNNVL_ONE_SHOT_THRESHOLD_BYTES) -> int:
         elem_size = torch.tensor([], dtype=dtype).element_size()
         # This should match the heuristic in allreduceOp.cpp.
         is_one_shot = (num_tokens * hidden_dim * group_size * elem_size
-                       <= _MNNVL_ONE_SHOT_THRESHOLD_BYTES)
+                       <= one_shot_max_bytes)
         if is_one_shot:
             # For one-shot, each rank needs to store num_tokens * group_size tokens
             workspace_size = num_tokens * hidden_dim * group_size * elem_size
@@ -913,6 +947,7 @@ class MNNVLAllReduce(nn.Module):
         self,
         input: torch.Tensor,
         all_reduce_params: AllReduceParams,
+        one_shot_max_bytes: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """Forward pass for MNNVL AllReduce.
 
@@ -926,12 +961,15 @@ class MNNVLAllReduce(nn.Module):
             NVFP4 scale-factor output is 1-D).
         """
 
+        if one_shot_max_bytes is None:
+            one_shot_max_bytes = self.one_shot_max_bytes
         fusion_op = all_reduce_params.fusion_op
         hidden_dim = input.shape[-1]
         num_tokens = input.numel() // hidden_dim
 
         workspace_size_bytes = self.get_required_workspace_size(
-            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype)
+            num_tokens, hidden_dim, self.mapping.tp_size, self.dtype,
+            one_shot_max_bytes)
 
         # We use uint32_t to store workspace size related info. Safeguard against overflow.
         if workspace_size_bytes >= 2**32 - 1:
@@ -966,6 +1004,8 @@ class MNNVLAllReduce(nn.Module):
             is_fusion,  # rmsnorm_fusion
             all_reduce_params.scale,  # scale
             int(fusion_op),
+            one_shot_max_bytes,
+            self.early_trigger,
         )
         return tuple(outputs) if is_fusion else outputs[0]
 

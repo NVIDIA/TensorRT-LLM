@@ -46,6 +46,7 @@ Two surfaces:
 import math
 from typing import List, NamedTuple, Optional
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_generation import (
@@ -534,6 +535,158 @@ def _assert_scheduler_buffers(
     torch.testing.assert_close(cu_q_seqlens.cpu(), expected_cu_q)
     torch.testing.assert_close(cu_kv_seqlens.cpu(), expected_cu_kv)
     assert fmha_scheduler_counter.item() == 0
+
+
+def _run_and_check_bf16(
+    env: _MlaEnv,
+    request_ids: List[int],
+    seq_lens: List[int],
+    num_contexts: int,
+    cached_lens: List[int],
+    q_lora_rank: int,
+) -> None:
+    """One P = 1 generation step over a bf16 latent pool, as the bf16 path
+    of the contract states it: the roped q in fused_q's tail, fused_q's head
+    and both inputs bitwise untouched, [compressed_kv | rope(k_pe)] appended
+    at each sequence's position and nothing else in the pool moved, the
+    scheduler buffers filled."""
+    gen_ids = request_ids[num_contexts:]
+    num_gen = len(gen_ids)
+    assert seq_lens[num_contexts:] == [1] * num_gen
+    num_heads = env.num_heads
+    for rid in gen_ids:
+        env.kv_cache_manager.impl.add_token(rid)
+    metadata = env.prepare_metadata(request_ids, seq_lens, num_contexts, cached_lens)
+    kv_lens = [c + s for c, s in zip(cached_lens, seq_lens)]
+    positions = _positions(kv_lens, num_contexts, num_gen, 1)
+
+    fused_q = torch.randn(num_gen, num_heads, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    q_pe = _make_q_pe(num_gen, num_heads, contiguous=False)
+    latent_cache = torch.randn(num_gen, GEN_HEAD_SIZE, dtype=torch.bfloat16, device="cuda")
+    fused_q_orig = fused_q.clone()
+    q_pe_orig = q_pe.clone()
+    latent_orig = latent_cache.clone()
+    cu_q_seqlens = torch.full((num_gen + 1,), -1, dtype=torch.int32, device="cuda")
+    cu_kv_seqlens = torch.full((num_gen + 1,), -1, dtype=torch.int32, device="cuda")
+    fmha_scheduler_counter = torch.full((1,), 7, dtype=torch.uint32, device="cuda")
+    pool = env.pool_tensor()
+    pool_before = pool.clone()
+
+    mla_rope_generation(
+        fused_q,
+        q_pe,
+        latent_cache,
+        env.rotary_cos_sin,
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        fmha_scheduler_counter,
+        None,  # mla_bmm1_scale
+        None,  # mla_bmm2_scale
+        None,  # quant_q_buffer
+        metadata.kv_lens_cuda_runtime,
+        metadata.kv_lens_runtime,
+        metadata.prompt_lens_cpu_runtime,
+        num_contexts,
+        metadata.kv_cache_block_offsets,
+        env.kv_cache_manager.kv_cache_pool_pointers,
+        env.kv_cache_manager.kv_cache_pool_mapping,
+        None,  # kv_scale_orig_quant
+        None,  # kv_scale_quant_orig
+        None,  # kv_cache_scale_orig_quant
+        None,  # out_scale
+        None,  # block_ids_per_seq
+        [None, None],  # helix_tensor_params
+        1,  # predicted_tokens_per_seq
+        0,  # layer_idx
+        num_heads,
+        1,  # num_kv_heads
+        GEN_HEAD_SIZE,
+        0,  # residual_dim
+        env.tokens_per_block,
+        MAX_SEQ_LEN,  # attention_window_size
+        1,  # beam_width
+        0,  # quant_mode
+        1.0,  # q_scaling
+        q_lora_rank,
+        KV_LORA_RANK,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        True,  # rope_append
+    )
+    torch.cuda.synchronize()
+
+    # 1. The roped q in fused_q's tail; its absorbed-q head and both inputs untouched.
+    roped_q = torch.stack([env.rope_ref(q_pe_orig[n], positions[n]) for n in range(num_gen)])
+    _assert_bytes_equal(fused_q[..., KV_LORA_RANK:], roped_q, "fused_q roped tail")
+    _assert_bytes_equal(
+        fused_q[..., :KV_LORA_RANK], fused_q_orig[..., :KV_LORA_RANK], "fused_q head"
+    )
+    _assert_bytes_equal(q_pe, q_pe_orig, "q_pe")
+    _assert_bytes_equal(latent_cache, latent_orig, "latent_cache")
+
+    # 2. The appended rows, and nothing else in the pool.
+    for n in range(num_gen):
+        rid = gen_ids[n]
+        row = env.cache_row(rid, positions[n])
+        want = torch.cat(
+            [
+                latent_orig[n, :KV_LORA_RANK],
+                env.rope_ref(latent_orig[n, KV_LORA_RANK:], positions[n]),
+            ]
+        )
+        _assert_bytes_equal(row, want, f"appended row (request {rid}, position {positions[n]})")
+    changed = (pool.view(torch.int16) != pool_before.view(torch.int16)).nonzero().cpu()
+    got_slots = set(zip(changed[:, 0].tolist(), changed[:, 2].tolist()))
+    expected_slots = {env.slot(gen_ids[n], positions[n]) for n in range(num_gen)}
+    assert got_slots <= expected_slots, (
+        f"op touched pool slots {sorted(got_slots - expected_slots)} outside {sorted(expected_slots)}"
+    )
+
+    # 3. The scheduler buffers, over the generation sequences only.
+    _assert_scheduler_buffers(
+        cu_q_seqlens,
+        cu_kv_seqlens,
+        fmha_scheduler_counter,
+        num_gen,
+        num_heads,
+        kv_lens[num_contexts:],
+        1,
+    )
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_bf16_page64_identity_rope() -> None:
+    """Kimi K3's generation call: bf16 latent pool (quant_mode=0, every fp8 and
+    scale buffer None), page 64, q_lora_rank 1536, q_scaling 1.0, q_pe a
+    strided view of the packed q, the per-rank head counts 6 / 12 / 24 / 96,
+    and its NoPE rope table (every (cos, sin) pair (1, 0)): the "rotation" is a
+    copy, so fused_q's tail is q_pe and each appended row is its latent_cache
+    row, bit for bit. A context sequence leads the batch; the generation
+    slots sit at positions 63 (page 0's last slot), 64 (page 1's first), 127
+    and 500."""
+    torch.manual_seed(27)
+    for heads in (6, 12, 24, 96):
+        env = _MlaEnv(tokens_per_block=TOKENS_PER_BLOCK, num_heads=heads)
+        try:
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            env.kv_cache_manager.add_dummy_requests(
+                [0, 1, 2, 3, 4], token_nums=[40, 63, 64, 127, 500]
+            )
+            _run_and_check_bf16(
+                env,
+                request_ids=[0, 1, 2, 3, 4],
+                seq_lens=[40, 1, 1, 1, 1],
+                num_contexts=1,
+                cached_lens=[0, 63, 64, 127, 500],
+                q_lora_rank=1536,
+            )
+        finally:
+            env.shutdown()
 
 
 def _fp8_env(

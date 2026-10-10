@@ -56,6 +56,7 @@ add_th_common_family(
   inverseRopeFp8QuantOp.cpp
   kdaDecodeOp.cpp
   attnResOp.cpp
+  kimiK3MnnvlOp.cpp
   fusedQKNormRopeOp.cpp
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp

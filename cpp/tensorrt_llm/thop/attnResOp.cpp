@@ -125,7 +125,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> attn_res_fwd(
 }
 
 at::Tensor attn_res_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor block_residual, at::Tensor res_weight,
-    at::Tensor rms_weight, at::Tensor output_rms_weight, double rms_eps, double output_rms_eps)
+    at::Tensor rms_weight, at::Tensor output_rms_weight, double rms_eps, double output_rms_eps, bool early_trigger)
 {
     TORCH_CHECK(layer_residual.dim() == 3, "attn_res_rmsnorm_fwd: layer_residual must be [T, B, H]");
     TORCH_CHECK(block_residual.dim() == 4, "attn_res_rmsnorm_fwd: block_residual must be [K, T, B, H]");
@@ -179,6 +179,7 @@ at::Tensor attn_res_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor block_resi
     params.hiddenSize = H;
     params.rmsEps = static_cast<float>(rms_eps);
     params.outputRmsEps = static_cast<float>(output_rms_eps);
+    params.earlyTrigger = early_trigger;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     kernels::kimiK3AttnRes::invokeAttnResRmsNormFwd(params, stream);
@@ -188,7 +189,7 @@ at::Tensor attn_res_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor block_resi
 
 std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor layer_residual_add,
     at::Tensor block_residual, at::Tensor res_weight, at::Tensor rms_weight, at::Tensor output_rms_weight,
-    double rms_eps, double output_rms_eps)
+    double rms_eps, double output_rms_eps, bool early_trigger)
 {
     TORCH_CHECK(layer_residual.dim() == 3, "attn_res_add_rmsnorm_fwd: layer_residual must be [T, B, H]");
     TORCH_CHECK(layer_residual_add.sizes() == layer_residual.sizes(),
@@ -248,6 +249,7 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_fwd(at::Tensor layer_res
     params.hiddenSize = H;
     params.rmsEps = static_cast<float>(rms_eps);
     params.outputRmsEps = static_cast<float>(output_rms_eps);
+    params.earlyTrigger = early_trigger;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     kernels::kimiK3AttnRes::invokeAttnResAddRmsNormFwd(params, stream);
@@ -364,11 +366,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "attn_res_rmsnorm_fwd(Tensor layer_residual, Tensor block_residual, "
         "Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
-        "float rms_eps, float output_rms_eps) -> Tensor");
+        "float rms_eps, float output_rms_eps, bool early_trigger=False) -> Tensor");
     m.def(
         "attn_res_add_rmsnorm_fwd(Tensor layer_residual, Tensor layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
-        "float rms_eps, float output_rms_eps) -> (Tensor, Tensor)");
+        "float rms_eps, float output_rms_eps, bool early_trigger=False) -> (Tensor, Tensor)");
     m.def(
         "attn_res_add_rmsnorm_persistent_fwd(Tensor layer_residual, Tensor? layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "

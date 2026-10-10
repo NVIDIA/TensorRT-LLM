@@ -22,7 +22,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import copy_to_device_if_changed, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -432,6 +432,34 @@ def dflash_draft_slot_ids(
     return (request_bases.unsqueeze(1) + first_slot + offsets.unsqueeze(0)).flatten()
 
 
+def dflash_noise_block_embedding(
+    embed_tokens: nn.Module,
+    bonus: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    trained_mask_embedding: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The drafter's input block per request, [len(bonus), block_size, hidden]: slot 0 the bonus token's embedding,
+    every other slot the mask token's.
+
+    The mask row is the drafter's own trained one when it has one (``trained_mask_embedding``); otherwise the shared
+    lookup's. Both rows go through ``embed_tokens.forward`` (NOT ``.weight[...]``) so TP-sharded vocabs mask out
+    ranks that don't own the token id and all-reduce, the mask row included, so every rank makes the same call.
+
+    ``trained_mask_embedding`` ([hidden]) is used as given: the drafter casts it to its own dtype and device at load.
+    """
+    num_gens = bonus.shape[0]
+    mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device=bonus.device)
+    combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
+    embed_bonus = combined_embed[:num_gens]
+    embed_mask = combined_embed[num_gens]
+    if trained_mask_embedding is not None:
+        embed_mask = trained_mask_embedding
+    noise_embed_2d = embed_mask.expand(num_gens, block_size, -1).clone()
+    noise_embed_2d[:, 0, :] = embed_bonus
+    return noise_embed_2d
+
+
 def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
     """Positions a drafter that indexes absolute positions must be able to encode.
 
@@ -490,6 +518,8 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
+        # would leave stale values.
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -535,10 +565,7 @@ class DFlashSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(
-            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
+        copy_to_device_if_changed(self.batch_indices_cuda, torch.arange(num_seqs, dtype=torch.int))
 
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
@@ -576,10 +603,8 @@ class DFlashSpecMetadata(SpecMetadata):
             mapping = torch.tensor(
                 [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
                 dtype=torch.long,
-                device="cpu",
-                pin_memory=prefer_pinned(),
             )
-            worker._batch_to_slot[:num_seqs].copy_(mapping, non_blocking=True)
+            copy_to_device_if_changed(worker._batch_to_slot, mapping)
 
     def is_layer_capture(self, layer_id: int) -> bool:
         return layer_id in self._capture_layer_set
@@ -1051,6 +1076,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        # Only copy_to_device_if_changed writes this buffer: it skips values it already copied here, so another write
+        # would leave stale values.
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
@@ -1340,6 +1367,29 @@ class DFlashWorker(SpecWorkerBase):
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
+
+    def _advance_ctx_len(self, slots: torch.Tensor, num_accepted: torch.Tensor) -> None:
+        """Add this step's accepted tokens to the context lengths of ``slots``, on the device.
+
+        Padding, warmup and attention-DP dummy rows share the dummy slot, which no request owns
+        or frees. Emptying it right after the add keeps it at 0 between steps: those rows attend
+        no context, and their next context K / V starts at column 0, inside the padding
+        request's own pages (past them, its page-table row maps page 0, another request's).
+        The store is to a fixed slot, so a captured step replays it.
+        """
+        self._ctx_len[slots] += num_accepted
+        self._ctx_len.clamp_(max=self._max_ctx)
+        self._ctx_len[self._dummy_slot].zero_()
+
+    def _rebuild_batch_to_slot(self, request_ids: List[int]) -> None:
+        """Point _batch_to_slot at each request's slot after prefill assigned new ones.
+
+        Like DFlashSpecMetadata.prepare, this writes through copy_to_device_if_changed,
+        which keeps the values it last copied on the buffer: every write of the buffer
+        must go through it, or a later unchanged batch skips its copy over other values.
+        """
+        mapping = [self._req_to_slot.get(rid, self._dummy_slot) for rid in request_ids]
+        copy_to_device_if_changed(self._batch_to_slot, torch.tensor(mapping, dtype=torch.long))
 
     def _write_ctx_len(self, updates: dict[int, int]) -> None:
         """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
@@ -1636,17 +1686,7 @@ class DFlashWorker(SpecWorkerBase):
             )
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
-                num_seqs = len(spec_metadata.request_ids)
-                mapping = [
-                    self._req_to_slot.get(rid, self._dummy_slot)
-                    for rid in spec_metadata.request_ids
-                ]
-                self._batch_to_slot[:num_seqs].copy_(
-                    torch.tensor(
-                        mapping, dtype=torch.long, device="cpu", pin_memory=prefer_pinned()
-                    ),
-                    non_blocking=True,
-                )
+                self._rebuild_batch_to_slot(spec_metadata.request_ids)
 
         inputs = self.prepare_1st_drafter_inputs(
             input_ids=input_ids,
@@ -1995,14 +2035,15 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            # Go through embed_tokens.forward (NOT .weight[...]) so TP-sharded
-            # vocabs mask out ranks that don't own the token id and all-reduce.
-            mask_tok = torch.full((1,), int(mask_token_id), dtype=torch.long, device="cuda")
-            combined_embed = embed_tokens(torch.cat([bonus, mask_tok], dim=0))
-            embed_bonus = combined_embed[:num_gens]
-            embed_mask = combined_embed[num_gens]
-            noise_embed_2d = embed_mask.expand(num_gens, query_tokens_per_req, -1).clone()
-            noise_embed_2d[:, 0, :] = embed_bonus
+            # The drafter's own trained mask row, if it kept one for the mask id in use.
+            trained_mask_embedding = (
+                getattr(draft_model, "mask_token_embedding", None)
+                if mask_token_id == getattr(draft_model, "mask_token_id", None)
+                else None
+            )
+            noise_embed_2d = dflash_noise_block_embedding(
+                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            )
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
@@ -2061,8 +2102,7 @@ class DFlashWorker(SpecWorkerBase):
                     if v_new is not None:
                         self._ctx_v_buf[slot_long, :, col_long] = v_new
 
-                self._ctx_len[slots] += gen_num_accepted_long
-                self._ctx_len.clamp_(max=self._max_ctx)
+                self._advance_ctx_len(slots, gen_num_accepted_long)
 
             num_ctx_per_req_t = self._ctx_len[slots]
             if self._ctx_block_tables is not None:
