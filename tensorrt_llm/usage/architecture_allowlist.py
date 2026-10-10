@@ -65,6 +65,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "KimiK3ForConditionalGeneration",
         "KimiLinearForCausalLM",
         "LagunaForCausalLM",
+        "LiLiCorrDraftModel",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "LlavaLlamaModel",

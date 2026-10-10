@@ -46,6 +46,27 @@ if TYPE_CHECKING:
     from ...llmapi.llm_args import DFlashDecodingConfig
 
 
+def dflash_context_dtype(draft_model: nn.Module) -> torch.dtype:
+    """Use projection activations for the context cache, not packed weight storage."""
+    projection = getattr(draft_model, "fc", None)
+    if projection is None:
+        return torch.bfloat16
+    return getattr(projection, "dtype", projection.weight.dtype)
+
+
+def last_accepted_hidden(projected_rows: torch.Tensor, num_accepted: torch.Tensor) -> torch.Tensor:
+    """Select the target row that predicted each newly committed anchor.
+
+    Rows are [requests, verification tokens, hidden], after the target projection
+    and hidden normalization: hidden_norm(fc(target_hidden)). Accepted counts
+    include the target's bonus token, so its predicting row is at count minus one.
+    """
+    indices = (num_accepted - 1).clamp_min(0).long()
+    return projected_rows.gather(
+        1, indices[:, None, None].expand(-1, 1, projected_rows.shape[-1])
+    ).squeeze(1)
+
+
 def compute_dflash_ctx_buffer_bytes(
     max_batch_size: int,
     max_ctx_len: int,
@@ -328,7 +349,7 @@ def validate_dflash_ctx_buffer_budget(
     max_ctx = min(_ctx_candidates) if _ctx_candidates else 8192
     num_kv_heads_per_rank = (num_kv_heads + tp_size - 1) // tp_size
     # Config-time approximations of the real allocation's inputs: the lazy
-    # allocation reads draft_model.fc.weight.dtype and _draft_block_width()
+    # allocation reads dflash_context_dtype() and _draft_block_width()
     # (both subclass-overridable), whereas here dtype_bytes is derived from
     # config["torch_dtype"] and the block width is hardcoded to K + 1.
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
@@ -784,6 +805,8 @@ class DFlashWorker(SpecWorkerBase):
                 "DFlash 2 candidate selection requires a shared draft/target vocab "
                 "(d2t vocab mapping is not supported)."
             )
+        if self._d2t is not None and getattr(draft_model, "lilicorr", None) is not None:
+            raise NotImplementedError("LiLiCorr requires a shared draft/target vocabulary")
 
     def _check_ctx_arena_fits(self, capacity, num_slots, L, nkv, hd, dtype, kv_factor=2):
         """Fail with the arithmetic before allocating the drafter context arena.
@@ -1035,7 +1058,7 @@ class DFlashWorker(SpecWorkerBase):
                 "the binding constraint, so requests past it will draft nothing."
             )
 
-        dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
+        dtype = dflash_context_dtype(draft_model)
 
         # Reserve slot index max_batch as a scratch slot for padding/unknown
         # dummies; real requests only draw slots 0..max_batch-1, so dummy
@@ -1698,7 +1721,16 @@ class DFlashWorker(SpecWorkerBase):
 
                 # DFlash 2: replace the independent per-position picks with one
                 # coherent path through the block (absent for plain DFlash).
-                if getattr(draft_model, "has_candidate_selector", False):
+                if getattr(draft_model, "lilicorr", None) is not None:
+                    gen_logits = self._apply_lilicorr(
+                        draft_model,
+                        gen_logits,
+                        gen_hidden_states.reshape(num_gens, K, -1),
+                        inputs["lilicorr_anchor"],
+                        spec_metadata,
+                    )
+                    vocab_size = gen_logits.shape[-1]
+                elif getattr(draft_model, "has_candidate_selector", False):
                     gen_logits = self._apply_dflash2_selector(
                         draft_model,
                         gen_logits,
@@ -1855,6 +1887,38 @@ class DFlashWorker(SpecWorkerBase):
             anchor_tokens.long(),
         )
 
+    def _apply_lilicorr(
+        self,
+        draft_model,
+        gen_logits: torch.Tensor,
+        draft_hidden: torch.Tensor,
+        anchor_hidden: torch.Tensor,
+        spec_metadata,
+    ) -> torch.Tensor:
+        if anchor_hidden is None:
+            raise RuntimeError(
+                "LiLiCorr requires the projected target row that predicted the anchor"
+            )
+        full_vocab = draft_model.config.vocab_size
+        candidate_ids, unary_logits, block_logits = self._dflash2_global_top_k(
+            gen_logits, spec_metadata, draft_model.lilicorr.candidate_topk, full_vocab
+        )
+        # Candidate features use probabilities normalized over the entire vocabulary,
+        # including the mass outside top-k and on other tensor-parallel ranks.
+        log_normalizer = torch.logsumexp(gen_logits.float(), dim=-1, keepdim=True)
+        if gen_logits.shape[-1] != full_vocab:
+            from ..distributed.ops import allgather
+
+            log_normalizer = torch.logsumexp(
+                allgather(log_normalizer, self.mapping, dim=-1), dim=-1, keepdim=True
+            )
+        proposal = draft_model.select_lilicorr_path(
+            candidate_ids, unary_logits.float() - log_normalizer, draft_hidden, anchor_hidden
+        )
+        block_logits.fill_(float("-inf"))
+        block_logits.scatter_(-1, candidate_ids, proposal.to(block_logits.dtype))
+        return block_logits
+
     def _dflash2_global_top_k(
         self,
         gen_logits: torch.Tensor,
@@ -1951,6 +2015,7 @@ class DFlashWorker(SpecWorkerBase):
         hidden_dim = (
             spec_metadata.hidden_size if spec_metadata.hidden_size > 0 else hidden_states.shape[-1]
         )
+        lilicorr_anchor = None
 
         if num_gens > 0:
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
@@ -2012,6 +2077,11 @@ class DFlashWorker(SpecWorkerBase):
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
+                if getattr(draft_model, "lilicorr", None) is not None:
+                    # The last accepted output is predicted by the corresponding input
+                    # row; the newly committed token itself has no target row yet.
+                    projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
+                    lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
@@ -2092,6 +2162,7 @@ class DFlashWorker(SpecWorkerBase):
             bonus = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
+            "lilicorr_anchor": lilicorr_anchor,
             "noise_embedding": noise_embedding,
             "query_positions": query_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
