@@ -648,6 +648,21 @@ if(ENABLE_UCX)
     set(ENABLE_UCX 0)
   else()
     set(ucxx_source_dir ${CMAKE_BINARY_DIR}/_deps/ucxx-src)
+    set(ucxx_build_dir ${CMAKE_BINARY_DIR}/ucxx/build)
+    # UCXX's configure downloads RAPIDS.cmake, which in turn downloads the
+    # rapids-cmake source archive and CPM.cmake. A failed file(DOWNLOAD) leaves
+    # an empty file behind, and both RAPIDS.cmake and CPM.cmake are only
+    # downloaded when the file does not exist yet, so every later configure in
+    # this build dir would include the empty file instead of downloading again.
+    # Drop such leftovers.
+    file(GLOB ucxx_downloaded_files "${ucxx_build_dir}/UCXX_RAPIDS.cmake"
+         "${ucxx_build_dir}/cmake/CPM_*.cmake")
+    foreach(downloaded_file IN LISTS ucxx_downloaded_files)
+      file(SIZE "${downloaded_file}" downloaded_file_size)
+      if(downloaded_file_size EQUAL 0)
+        file(REMOVE "${downloaded_file}")
+      endif()
+    endforeach()
     if(DEFINED ENV{GITHUB_MIRROR} AND NOT "$ENV{GITHUB_MIRROR}" STREQUAL "")
       if(EXISTS "${ucxx_source_dir}/fetch_rapids.cmake")
         file(READ "${ucxx_source_dir}/fetch_rapids.cmake" FILE_CONTENTS)
@@ -655,8 +670,51 @@ if(ENABLE_UCX)
           REPLACE "https://raw.githubusercontent.com/rapidsai/rapids-cmake"
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
+        # RAPIDS.cmake downloads the rapids-cmake source archive from github.com
+        # unless rapids-cmake-url is already set, so point it at the archive of
+        # the same branch on the mirror.
+        if(NOT FILE_CONTENTS MATCHES "rapids-cmake-url"
+           AND FILE_CONTENTS MATCHES
+               "rapids-cmake/raw/refs/heads/([^/]+)/RAPIDS\\.cmake")
+          string(
+            PREPEND
+            FILE_CONTENTS
+            "set(rapids-cmake-url \"$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/archive/refs/heads/${CMAKE_MATCH_1}.zip\")\n"
+          )
+        endif()
         file(WRITE "${ucxx_source_dir}/fetch_rapids.cmake" "${FILE_CONTENTS}")
         message(WARNING "Replace UCXX fetch_rapids.cmake with internal mirror")
+      endif()
+      # rapids-cmake downloads CPM.cmake from a github.com release unless the
+      # file is already in place, so prefetch it from the mirror. Version and
+      # MD5 are the ones pinned in rapids-cmake's cpm/detail/download.cmake. If
+      # rapids-cmake moves to another CPM version, the file name no longer
+      # matches and rapids-cmake downloads that version itself, as before.
+      set(ucxx_cpm_version 0.40.0)
+      set(ucxx_cpm_md5 6c9866a0aa0f804a36fe8c3866fb8a2c)
+      set(ucxx_cpm_file "${ucxx_build_dir}/cmake/CPM_${ucxx_cpm_version}.cmake")
+      if(NOT EXISTS "${ucxx_cpm_file}")
+        foreach(attempt RANGE 1 3)
+          file(
+            DOWNLOAD
+            "$ENV{GITHUB_MIRROR}/cpm-cmake/CPM.cmake/releases/download/v${ucxx_cpm_version}/CPM.cmake"
+            "${ucxx_cpm_file}"
+            INACTIVITY_TIMEOUT 60
+            STATUS ucxx_cpm_status)
+          list(GET ucxx_cpm_status 0 ucxx_cpm_status_code)
+          if(ucxx_cpm_status_code EQUAL 0)
+            file(MD5 "${ucxx_cpm_file}" ucxx_cpm_actual_md5)
+            if(ucxx_cpm_actual_md5 STREQUAL ucxx_cpm_md5)
+              break()
+            endif()
+            set(ucxx_cpm_status "MD5 mismatch: got ${ucxx_cpm_actual_md5}")
+          endif()
+          file(REMOVE "${ucxx_cpm_file}")
+          message(
+            WARNING
+              "Prefetching CPM.cmake from the mirror failed (attempt ${attempt}/3): ${ucxx_cpm_status}"
+          )
+        endforeach()
       endif()
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
@@ -665,7 +723,7 @@ if(ENABLE_UCX)
     # that change in USE_CXX11_ABI will not be ignored.
     execute_process(
       COMMAND
-        ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${CMAKE_BINARY_DIR}/ucxx/build
+        ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${ucxx_build_dir}
         ${ucxx_source_dir}/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
@@ -675,8 +733,7 @@ if(ENABLE_UCX)
       message("ucxx build: ${UCXX_BUILD_OUTPUT}")
       message(FATAL_ERROR "ucxx build failed")
     endif()
-    find_package(ucxx REQUIRED PATHS ${CMAKE_BINARY_DIR}/ucxx/build
-                 NO_DEFAULT_PATH)
+    find_package(ucxx REQUIRED PATHS ${ucxx_build_dir} NO_DEFAULT_PATH)
   endif()
   find_package(NIXL)
 endif()
