@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the mxfp8_quantize catalog entry."""
 
+import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.mxfp8_quantize import (
@@ -76,6 +77,30 @@ def test_linear_layout_bf16() -> None:
             assert sf.shape == (t * padded_k // BLOCK,) and sf.dtype == torch.uint8
             assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
             assert torch.equal(sf.view(t, padded_k // BLOCK), ref_sf)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_routed_hidden() -> None:
+    """Kimi K3's routed-expert input: the latent hidden (3584 = 7 x 512), linear scales, alignment 512.
+
+    3584 is a multiple of every alignment the MXFP8 x MXFP4 runner takes, so nothing is padded; the
+    runner reads the linear buffer as [M, 112]. Decode- through prefill-sized rows.
+    """
+    torch.manual_seed(13)
+    for t in (1, 8, 64, 65, 1024, 8192):
+        x = torch.randn(t, 3584, dtype=torch.bfloat16, device="cuda")
+        data, sf = mxfp8_quantize(x, False, 512)
+        ref_data, ref_sf = _ref(x, 3584)
+        assert data.shape == (t, 3584) and data.dtype == torch.float8_e4m3fn
+        assert sf.shape == (t * 112,) and sf.dtype == torch.uint8
+        assert torch.equal(data.view(torch.uint8), ref_data.view(torch.uint8))
+        assert torch.equal(sf.view(t, 112), ref_sf)
+        # no column padding at this width: alignment 32 gives the same bytes
+        tight_data, tight_sf = mxfp8_quantize(x, False, 32)
+        assert torch.equal(tight_data.view(torch.uint8), data.view(torch.uint8))
+        assert torch.equal(tight_sf, sf)
 
 
 def test_swizzled_layout_bf16() -> None:

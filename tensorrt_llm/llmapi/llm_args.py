@@ -3255,6 +3255,113 @@ class PARDDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.PARD
 
 
+# Backbone fields a speculators drafter nests under transformer_layer_config.
+# The rest of that dict (flex_attention_backend, use_cache, ...) is training
+# configuration.
+_SPECULATORS_BACKBONE_KEYS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "hidden_act",
+    "rms_norm_eps",
+    "max_position_embeddings",
+    "vocab_size",
+    "attention_bias",
+    "attention_dropout",
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "initializer_range",
+    "rope_parameters",
+)
+_SPECULATORS_DSPARK_HEAD_KEYS = (
+    "markov_rank",
+    "markov_head_type",
+    "enable_confidence_head",
+    "confidence_head_with_markov",
+    "draft_vocab_size",
+)
+
+
+def is_speculators_dspark_config(config_dict: dict) -> bool:
+    """Whether a drafter ``config.json`` is a speculators-format DSpark drafter.
+
+    The vLLM speculators format (e.g. RedHatAI/Kimi-K3-speculator.dspark) has
+    no top-level ``model_type``: it names the algorithm in
+    ``speculators_model_type`` and nests the backbone under
+    ``transformer_layer_config``.
+    """
+    return (config_dict.get("speculators_model_type") == "dspark"
+            and isinstance(config_dict.get("transformer_layer_config"), dict))
+
+
+def translate_speculators_dspark_config(config_dict: dict) -> dict:
+    """Translate a speculators-format DSpark ``config.json`` for TRT-LLM.
+
+    The result is the config TRT-LLM's GQA DSpark drafter reads. Any other
+    config is returned unchanged.
+
+    - The qwen3 backbone is flattened from ``transformer_layer_config``.
+    - ``aux_hidden_state_layer_ids`` name the layer whose input is captured;
+      ``target_layer_ids`` name the 0-indexed layer whose output is, so each id
+      is one less.
+    - The sliding window is dropped, because the drafter attention backends
+      reject non-causal windows. That is exact while the context fits in the
+      trained window (2048 tokens for the Kimi K3 drafter).
+    - The checkpoint's ``block_size`` is not carried over: the runtime block
+      follows ``max_draft_len``.
+
+    The weights need no renaming. Every config.json reader of the drafter
+    (model config, spec config resolution, the context-buffer budget) goes
+    through this function, so they all see the same drafter.
+    """
+    if not is_speculators_dspark_config(config_dict):
+        return config_dict
+    layer = config_dict["transformer_layer_config"]
+    if layer.get("model_type") != "qwen3":
+        raise ValueError(
+            "speculators DSpark drafters are supported with a qwen3 backbone; "
+            f"this one has model_type {layer.get('model_type')!r}")
+    aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
+    if not aux_layer_ids or min(aux_layer_ids) < 1:
+        raise ValueError(
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "(layer 0's input is the embedding output, which is not captured); "
+            f"got {aux_layer_ids}")
+    num_layers = layer["num_hidden_layers"]
+    dflash_config = {
+        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+    }
+    if config_dict.get("mask_token_id") is not None:
+        dflash_config["mask_token_id"] = config_dict["mask_token_id"]
+    translated = {
+        key: layer[key]
+        for key in _SPECULATORS_BACKBONE_KEYS if key in layer
+    }
+    translated.update(
+        architectures=["Qwen3ForCausalLM"],
+        model_type="qwen3",
+        tie_word_embeddings=bool(config_dict.get("tie_word_embeddings", False)),
+        torch_dtype=(config_dict.get("dtype") or config_dict.get("torch_dtype")
+                     or "bfloat16"),
+        use_sliding_window=False,
+        sliding_window=None,
+        max_window_layers=num_layers,
+        layer_types=["full_attention"] * num_layers,
+        dflash_config=dflash_config,
+    )
+    rope_theta = (layer.get("rope_parameters") or {}).get("rope_theta")
+    if rope_theta is not None:
+        translated["rope_theta"] = rope_theta
+    for key in _SPECULATORS_DSPARK_HEAD_KEYS:
+        if config_dict.get(key) is not None:
+            translated[key] = config_dict[key]
+    return translated
+
+
 class DFlashDecodingConfig(DecodingBaseConfig):
     """Configuration for DFlash speculative decoding.
 
@@ -3343,7 +3450,8 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         if not os.path.exists(draft_config_path):
             return
         with open(draft_config_path) as f:
-            dflash_cfg = json.load(f).get("dflash_config", {})
+            dflash_cfg = translate_speculators_dspark_config(json.load(f)).get(
+                "dflash_config", {})
 
         if self.target_layer_ids is None:
             layer_ids = dflash_cfg.get("target_layer_ids")
@@ -6802,7 +6910,8 @@ class TorchLlmArgs(BaseLlmArgs):
                                              "config.json")
             if os.path.exists(draft_config_path):
                 with open(draft_config_path) as f:
-                    draft_config = json.load(f)
+                    draft_config = translate_speculators_dspark_config(
+                        json.load(f))
 
         arena_before_pool = self._kv_cache_estimation_runs()
         if spec_cfg.skip_ctx_buffer_budget_check:
@@ -7059,7 +7168,8 @@ class TorchLlmArgs(BaseLlmArgs):
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
-                        draft_cfg = json.load(f)
+                        draft_cfg = translate_speculators_dspark_config(
+                            json.load(f))
                     dspark_cfg = draft_cfg.get("dspark_config") or {}
                     dflash_cfg = draft_cfg.get("dflash_config") or {}
 

@@ -181,8 +181,12 @@ Perf is measured, never gated.
 
 ## Status of every record in this tree
 
-**The catalog is fully certified on sm_103. The targets construct but have
-never executed.**
+**The catalog is certified: 19 entries on sm_103, and 30 on sm_100 (B200 /
+GB200): the 16 Kimi K3 decode entries and the 7 entries of Kimi K3's generic
+path, where their first caller runs; `cublas_mm` and `flashinfer_rmsnorm`; and
+the Kimi K3 cells of five more entries that also hold sm_103 receipts
+(`thop_attention`, the three MLA cache / RoPE ops and the MXFP4 MoE runner).
+The targets construct but have never executed.**
 
 Two things voided every receipt in the move: each catalog test file was
 rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where
@@ -200,9 +204,10 @@ tolerance, and each is written up in its own contract:
   `mla_rope_append_paged_kv_assign_q`). Parameters were renamed and added. The
   wrappers now mirror their schemas argument for argument, so the next drift
   fails loudly rather than shifting a positional list silently.
-* **The MoE FC1 epilogue changed block-scale recipe**, bit-exactly:
-  `floor(log2(amax))-8` on sm_100, `ceil(log2(amax/448))` on sm_103. The
-  reference is architecture-keyed and each arch refutes the other's recipe.
+* **The MoE FC1 epilogue's block-scale recipe is a property of the cubin**,
+  bit-exactly: `ceil(log2(amax/448))` or `floor(log2(amax))-8`. sm_100 and
+  sm_103 both use the first. The reference is architecture-keyed, and the test
+  refutes the recipe not in force.
 * **torch 2.12 made fp32 matmul default to TF32**, so `cublas_mm`'s *reference*
   was the imprecise side; the op is bit-identical to a TF32-disabled product.
 * **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted

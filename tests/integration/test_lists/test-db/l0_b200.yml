@@ -123,6 +123,7 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
@@ -135,10 +136,50 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  # Kimi K3's generic path (prefill, mixed and wide steps) in the modeling_v2 catalog: its own entries
+  # and the sm_100 cells of the shared entries it calls.
+  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_causal_conv1d_fwd.py
+  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_chunk_kda.py
+  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_kda_post_conv.py
+  - unittest/_torch/modeling_v2/ssm/test_modeling_v2_kda_prefill.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_situ_and_mul.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
+  - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_mxe4m3_mxe2m1_block_scale_moe_runner.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_context_bf16_page64
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_thop_attention.py::test_kimi_k3_mla_generation_bf16_page64
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_generation.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_mla_rope_append_paged_kv_assign_q.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_load_paged_kv_cache_for_mla.py
   # CuTe MTP verify kernel parity (trtllm::kda_mtp_decode).
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  # Kimi K3 decode kernels (CuTe DSL): the GEMVs, the head GEMV and the
+  # embedding, and the cluster-wait and tcgen05-fence lints over them.
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_embed.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_ctm_gemv_wide.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_decode_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_head_gemv.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_cluster_waits.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_tcgen05_fences.py
+  # modeling_v2 catalog entries with sm_100 receipts (the K3 ones skip on
+  # other architectures).
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_k3_embed_norm.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
+  - unittest/_torch/modeling_v2/activation/test_modeling_v2_k3_situ_mul.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_swiglu.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_long.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_ctm_gemv_wide.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/gemm/test_modeling_v2_k3_head_gemv.py
   # KDA runtime: host-derived prefill metadata and the bf16 state pool
   # round-trip. Both are single-device cases that use GPU 0 only.
   - unittest/_torch/modules/kimi_kda/test_kda_host_metadata.py
@@ -244,6 +285,10 @@ l0_b200:
   # accuracy deviation found so far is Blackwell-only), so it is not
   # hw-agnostic and needs its own Blackwell run.
   - unittest/_torch/speculative/test_fused_sampling_op.py
+  # One-model speculative decoding step-copy kernels and the engine's decode
+  # step that runs them (SM 100; they skip on other GPUs).
+  - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
+  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial
@@ -385,6 +430,16 @@ l0_b200:
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[t2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[fl2va] TIMEOUT (30)
   - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_diffusers_lpips_and_audio_reference[ref2va] TIMEOUT (30)
+  # ------------- Kimi K3 KDA / MLA decode kernels (sm_100) and their modeling_v2 entries ---------------
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_decode_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_pools_past_2g.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_kda_verify.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_attn.py
+  - unittest/_torch/cute_dsl_kernels/kimi_k3/test_k3_mla_q.py
+  - unittest/_torch/modeling_v2/ssm
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_qkv.py
+  - unittest/_torch/modeling_v2/attention/test_modeling_v2_k3_mla_attn_vb_out.py
   # ------------- Host perf module regression tests (6 representative scenarios) ---------------
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_gen_only_bs8]
   - perf/host_perf/test_module_scheduler.py::test_scheduler_production[production_mixed_32gen_4ctx]
