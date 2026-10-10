@@ -194,6 +194,7 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
+| ModelExpress (MX) checkpoint loading | `docs/source/features/model-express.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |
