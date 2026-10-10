@@ -26,8 +26,7 @@ Two levels, on purpose:
   ``within_bounds`` then reads the *deployment* -- the LLM API arguments as
   the engine will run with them, model defaults included -- and says whether
   that target was certified for it.
-  Reading that single file tells you where any configuration lands, and
-  ``explain.py`` replays both stages to say *why*.
+  Reading that single file tells you where any configuration lands.
 
 Routing modules are imported lazily: resolving a GptOss config never imports
 the DeepSeek tree, and a target's modeling code is imported only once its
@@ -49,15 +48,6 @@ if TYPE_CHECKING:
 
 _PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
 
-#: The switch: ``TorchLlmArgs.modeling_v2``, an LLM API argument.
-#:
-#: An argument rather than an environment variable because the arguments are
-#: what every rank is handed. A variable assigned from a script after MPI
-#: initialized reached the driver and not the worker ranks, and a driver that
-#: resolves a modeling_v2 target while its workers resolve the built-in is
-#: exactly the silent split this package exists to prevent.
-MODELING_V2_ARG = "modeling_v2"
-
 # architectures[0] -> routing module, relative to this package.
 MODELING_V2_ROUTERS = {
     "GptOssForCausalLM": "models.gpt_oss.routing",
@@ -66,16 +56,7 @@ MODELING_V2_ROUTERS = {
 
 
 class ModelingV2Mode(str, enum.Enum):
-    """What to do when a deployment reaches the modeling_v2 resolver.
-
-    Pydantic admits only these three values for ``TorchLlmArgs.modeling_v2``,
-    so a typo is refused when the arguments are built rather than read as
-    "off". Silently reading it as "off" would hand back the built-in
-    implementation while the caller believed they had asked for a modeling_v2
-    target, and a number measured that way is attributed to the wrong system
-    -- the failure the ``require`` mode below exists to prevent, arriving
-    through the door instead of the window.
-    """
+    """What to do when a deployment reaches the modeling_v2 resolver."""
 
     OFF = "off"
     AUTO = "auto"
@@ -83,7 +64,7 @@ class ModelingV2Mode(str, enum.Enum):
 
     @classmethod
     def of(cls, llm_args: "TorchLlmArgs") -> "ModelingV2Mode":
-        return cls(getattr(llm_args, MODELING_V2_ARG))
+        return cls(llm_args.modeling_v2)
 
 
 @dataclass(frozen=True)
@@ -125,25 +106,16 @@ class ModelingV2Context:
     is_disagg: bool
 
     @classmethod
-    def from_model_config(
-        cls, config: "ModelConfig", sm: Optional[Tuple[int, int]] = None
-    ) -> "ModelingV2Context":
-        """Build the context the identity stage routes on.
+    def from_model_config(cls, config: "ModelConfig") -> "ModelingV2Context":
+        """Build the context the identity stage routes on, for the device
+        this process will run on."""
+        import torch
 
-        ``sm`` defaults to the device this process will run on, which is what
-        the engine wants. ``explain`` passes it explicitly so a configuration
-        can be explained from a host with no GPU -- every other field it reads
-        off the same ``ModelConfig`` the engine built, rather than restating
-        one, so the two cannot disagree about what a checkpoint is.
-        """
-        if sm is None:
-            import torch
-
-            assert torch.cuda.is_available(), (
-                "modeling_v2 routes on the SM version of the device it will run on; "
-                "no CUDA device is visible"
-            )
-            sm = torch.cuda.get_device_capability()
+        assert torch.cuda.is_available(), (
+            "modeling_v2 routes on the SM version of the device it will run on; "
+            "no CUDA device is visible"
+        )
+        sm = torch.cuda.get_device_capability()
         return cls(
             pretrained_config=config.pretrained_config,
             mapping=config.mapping,
@@ -155,11 +127,11 @@ class ModelingV2Context:
 
 
 class Trace:
-    """Records the criteria a routing tree evaluated, for ``explain``.
+    """Records the criteria a routing tree evaluated, for ``require``'s error.
 
     Routing modules call ``check``/``resolve`` instead of a bare ``if`` so the
-    same tree that decides can also narrate. ``NULL_TRACE`` makes both a no-op
-    and is the default, so the resolve path pays nothing.
+    error can quote the criterion that did not hold. ``NULL_TRACE`` makes both
+    a no-op and is the default, so ``auto`` pays nothing.
     """
 
     __slots__ = ("steps",)
@@ -205,20 +177,11 @@ def routing_module(arch: str):
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[str]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
-    Returns the target's class name -- a synthetic architecture name no
-    checkpoint declares -- or None for the built-in implementation: when
-    ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
-    architecture, when the identity tree names no target, or when the target
-    it names says the deployment is outside its bounds. In ``auto`` the caller
-    then builds the built-in implementation. In ``require`` every one of those
-    but ``off`` raises instead, because the failure that mode exists to
-    prevent is silent: asking for a target, getting the in-tree
-    implementation, and reading the resulting curve as modeling_v2's.
-
-    The model loader calls this when it is about to build the model, after
-    the built-in model's defaults have been applied to ``llm_args``: a
-    target's ``within_bounds`` therefore judges the deployment as it will
-    actually run, model defaults included.
+    Returns the target's class name, or None for the built-in implementation:
+    when ``llm_args.modeling_v2`` is ``off``, when no routing module claims the
+    architecture, when the identity tree names no target, or when that
+    target's ``within_bounds`` rejects the deployment. In ``require`` every one
+    of those but ``off`` raises instead.
     """
     mode = ModelingV2Mode.of(llm_args)
     if mode is ModelingV2Mode.OFF:
@@ -238,7 +201,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
 
     if not accepted:
         if mode is ModelingV2Mode.REQUIRE:
-            raise ValueError(explain_no_match(arch, routing, trace, target))
+            raise ValueError(no_match_message(arch, routing, trace, target))
         if target is not None:
             logger.info(
                 f"modeling_v2: {target} claims {arch} but this deployment is outside "
@@ -253,14 +216,9 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     return target
 
 
-def explain_no_match(arch: str, routing, trace: Trace, target: Optional[str] = None) -> str:
-    """Say which criterion the configuration failed, not just that it did.
-
-    ``target`` is the name the identity stage selected when the deployment
-    then fell outside that target's bounds; None when identity itself found
-    nothing.
-    """
-    asked = f"{MODELING_V2_ARG}={ModelingV2Mode.REQUIRE.value!r}"
+def no_match_message(arch: str, routing, trace: Trace, target: Optional[str] = None) -> str:
+    """Say which criterion the configuration failed, not just that it did."""
+    asked = "modeling_v2='require'"
     if routing is None:
         known = ", ".join(sorted(MODELING_V2_ROUTERS)) or "(none)"
         return f"{asked}, but no target exists for architecture {arch!r}; routed architectures: {known}"

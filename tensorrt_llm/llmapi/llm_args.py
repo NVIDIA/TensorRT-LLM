@@ -6421,11 +6421,9 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "Whether to build the model from a modeling_v2 target (experimental) "
         "instead of the built-in implementation. 'off' never does. 'auto' "
-        "uses a target when one claims the checkpoint, GPU architecture and "
-        "parallel topology and the deployment is within that target's "
-        "certified bounds, and falls back to the built-in implementation "
-        "otherwise. 'require' raises instead of falling back, so a run that "
-        "asked for a target never silently measures something else.",
+        "uses a target when one claims this deployment and falls back to the "
+        "built-in implementation otherwise. 'require' raises instead of "
+        "falling back.",
         json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
 
     # TODO: remove backend later

@@ -454,13 +454,8 @@ def _resolve_checkpoint_io_policy(
 
 def _record_modeling_v2_decision(config: ModelConfig,
                                  llm_args: TorchLlmArgs) -> None:
-    """Write the modeling_v2 decision for ``llm_args`` onto ``config``.
-
-    Called once, when the model is about to be built: by then
-    ``load_config_and_apply_defaults`` has applied the built-in model's
-    defaults to ``llm_args``, so a target's ``within_bounds`` judges the
-    deployment as it will actually run.
-    """
+    """Record the modeling_v2 decision on ``config``, once model defaults
+    have been applied to ``llm_args`` and the model is about to be built."""
     target = modeling_v2_resolve(config, llm_args)
     if target is None:
         return
@@ -1949,8 +1944,6 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
-        # The modeling_v2 decision: made here, after model defaults, so the
-        # class built below is the one `_resolve_class` reads off `config`.
         _record_modeling_v2_decision(config, self.llm_args)
 
         if uses_mtp_head_checkpoint(self.spec_config):
