@@ -1160,7 +1160,11 @@ def supervise(
     requested_design = design
     design, redirect = resolve_design_dir(design, wanted)
     unready = [t for t in wanted if not established(design, t)]
-    if unready and designer is not None:
+    # Never in a dry run. The designer is told to run end-to-end and submit
+    # without asking, so starting it here would turn "show me the plan" into
+    # the most expensive sweep this flow can launch, while the record still
+    # said `started: false`. A missing design is reported instead, below.
+    if unready and designer is not None and not dry_run:
         # The design is normally an input -- it is reused across campaigns and
         # costs an order of magnitude more than any of them. But "an input"
         # degenerated into "nobody ran it" once already, which is how the two
@@ -1190,6 +1194,12 @@ def supervise(
             f"points from. Establish the design first — it is reused across "
             f"campaigns, so this is paid once — or narrow "
             f"'{DISAGG_SOL_FIELD}.{TRACKS_KEY}' to the halves it already covers."
+            + (
+                " A dry run never establishes a design: it submits cluster jobs. "
+                "Run once without --dry-run to establish it."
+                if dry_run and designer is not None
+                else ""
+            )
         )
 
     record: dict[str, Any] = {

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_flow.workflows.perf_optimize import bench_cli, disagg_sol
+from agent_flow.workflows.perf_optimize import bench_cli, disagg_sol, spawn
 
 FIELD = disagg_sol.DISAGG_SOL_FIELD
 
@@ -595,6 +595,30 @@ def test_a_design_that_was_never_scored_is_refused_not_fallen_back_from(tmp_path
         )
 
 
+def test_a_dry_run_never_starts_the_design_agent(tmp_path):
+    """The reviewer's reproduction: a designer spy, called once by a dry run.
+
+    The designer is told to run end-to-end and submit without asking, so a
+    dry run that reached it launched the most expensive sweep this flow can
+    start -- while the record it wrote still said `started: false`. A missing
+    design is now a refusal that says a real run is what establishes it.
+    """
+    calls: list[str] = []
+    d = _design(tmp_path)
+    spec = {FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}}}
+    with pytest.raises(disagg_sol.DisaggSolError, match="without --dry-run"):
+        disagg_sol.supervise(
+            spec,
+            sweeps={"gen": tmp_path / "g.yaml"},
+            repos={"gen": tmp_path / "r"},
+            workspace_root=tmp_path / "ws",
+            label="t",
+            dry_run=True,
+            designer=calls.append,
+        )
+    assert calls == []
+
+
 def test_a_dry_run_selects_and_writes_every_spec_without_starting_anything(tmp_path):
     """The same code path minus the processes."""
     d, spec = _supervisable(tmp_path)
@@ -734,7 +758,7 @@ def test_a_ctx_sweep_at_the_wrong_worker_shape_is_refused(tmp_path):
         )
 
 
-def test_an_unestablished_design_is_run_rather_than_refused_when_one_can_be(tmp_path):
+def test_an_unestablished_design_is_run_rather_than_refused_when_one_can_be(tmp_path, monkeypatch):
     """An unestablished design is established rather than refused.
 
     Treating it purely as an input degenerated into nobody running it once
@@ -750,6 +774,9 @@ def test_an_unestablished_design_is_run_rather_than_refused_when_one_can_be(tmp_
         FIELD: {"tracks": ["gen"], "design": {"design_dir": str(d), "prefer": "interactive"}},
     }
     seen: list[str] = []
+    # A real run, minus the processes: a dry run no longer reaches the designer.
+    monkeypatch.setattr(spawn, "start_all", lambda launches: [])
+    monkeypatch.setattr(spawn, "wait_all", lambda started: {})
 
     def designer(instruction: str) -> None:
         seen.append(instruction)
@@ -761,7 +788,7 @@ def test_an_unestablished_design_is_run_rather_than_refused_when_one_can_be(tmp_
         repos={"gen": tmp_path / "rg"},
         workspace_root=tmp_path / "wsd",
         label="t",
-        dry_run=True,
+        dry_run=False,
         designer=designer,
     )
     assert len(seen) == 1
@@ -785,7 +812,7 @@ def test_a_designer_that_did_not_establish_the_design_still_refuses(tmp_path):
         )
 
 
-def test_only_the_unready_halves_are_named_to_the_designer(tmp_path):
+def test_only_the_unready_halves_are_named_to_the_designer(tmp_path, monkeypatch):
     """No point re-establishing a half that is already measured."""
     d = _design(tmp_path)
     _ctx_case(d, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.7)
@@ -797,6 +824,9 @@ def test_only_the_unready_halves_are_named_to_the_designer(tmp_path):
         },
     }
     seen: list[str] = []
+    # A real run, minus the processes: a dry run no longer reaches the designer.
+    monkeypatch.setattr(spawn, "start_all", lambda launches: [])
+    monkeypatch.setattr(spawn, "wait_all", lambda started: {})
 
     def designer(instruction: str) -> None:
         seen.append(instruction)
@@ -808,7 +838,7 @@ def test_only_the_unready_halves_are_named_to_the_designer(tmp_path):
         repos={"ctx": tmp_path / "a", "gen": tmp_path / "b"},
         workspace_root=tmp_path / "wsf",
         label="t",
-        dry_run=True,
+        dry_run=False,
         designer=designer,
     )
     assert "['gen']" in seen[0]
