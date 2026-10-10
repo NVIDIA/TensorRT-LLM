@@ -2059,6 +2059,14 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
                     "tensorrt_llm.serve.router_utils."
                     "resolve_model_type_from_config",
                     return_value="gpt_oss") as resolve_model_type:
+        # Tokens are forwarded only to workers that report the router's
+        # rendering fingerprint.
+        router._server_info = {
+            "server1": {
+                "render_fingerprint":
+                router._render_resources(request.model).fingerprint()
+            }
+        }
         router_token_ids = router._tokenize(router_request)[0]
         await server.chat_harmony(server_request, raw_request=None)
 
@@ -2327,6 +2335,10 @@ class _PrefixCacheFakeTokenizer:
 
     _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
 
+    # A stable serialization of the encoding, so the rendering fingerprint can
+    # identify this tokenizer (one without it is never trusted for write-back).
+    backend_tokenizer = SimpleNamespace(to_str=lambda: '{"fake": "prefix-cache"}')
+
     def apply_chat_template(self,
                             messages,
                             add_generation_prompt=False,
@@ -2390,6 +2402,14 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
                                 tokens_per_block=4)
     tok = _PrefixCacheFakeTokenizer()
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        # Tokens are forwarded only to workers that report the router's
+        # rendering fingerprint.
+        router._server_info = {
+            servers[0]: {
+                "render_fingerprint":
+                router._render_resources("mock").fingerprint()
+            }
+        }
         for convo in _grow_conversation():
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(

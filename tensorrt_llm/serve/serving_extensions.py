@@ -19,7 +19,8 @@ a :class:`ServingExtension` here instead of adding name-conditioned branches
 to ``openai_protocol.py`` / ``openai_server.py``. Lookups are keyed two ways:
 
 - by the checkpoint's top-level ``model_type`` for chat-request preprocessing
-  (:func:`apply_model_chat_extensions`), and
+  and the other per-model hooks (:func:`apply_model_chat_extensions`,
+  :func:`get_serving_extension`), and
 - by reasoning-parser name for structured-output placement
   (:func:`structured_output_format_for`).
 
@@ -31,8 +32,21 @@ import is deferred to call time because the built-ins import
 ``openai_protocol``, which imports this module.
 """
 
+import enum
 import importlib
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
+
+if TYPE_CHECKING:
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+
+class OutputMode(enum.Enum):
+    """How a model's generated output is turned into an API response."""
+
+    # Detokenized text goes through the tool and reasoning parsers.
+    TEXT = "text"
+    # Raw token ids go through the Harmony adapter (gpt-oss).
+    HARMONY_TOKENS = "harmony_tokens"
 
 
 class ServingExtension:
@@ -41,6 +55,45 @@ class ServingExtension:
     Subclasses override the hooks they need; the defaults are no-ops that
     match the generic serving path.
     """
+
+    # Part of the rendering fingerprint: bump it when a revision of the extension changes
+    # the prompt it renders, so prepared requests from the older revision are refused.
+    render_version: int = 1
+
+    def render_prompt(
+        self, request: "ChatCompletionRequest", res: Any = None
+    ) -> Optional[List[int]]:
+        """Render ``request`` into prompt token ids, or ``None`` for the default.
+
+        ``None`` means "use the generic chat-template rendering". A model whose
+        prompt is not a chat-template string (gpt-oss/Harmony) returns its own
+        token ids here. ``res`` is the render resources handle of the caller.
+        """
+        return None
+
+    def output_mode(self) -> OutputMode:
+        """How this model's output is consumed; see :class:`OutputMode`."""
+        return OutputMode.TEXT
+
+    def allows_required_tool_choice(self) -> bool:
+        """Whether ``tool_choice="required"`` is honored for this model.
+
+        Models that cannot enforce it reject the request instead of silently
+        degrading to ``"auto"``.
+        """
+        return False
+
+    def serialize_tool(self, tool) -> Dict[str, Any]:
+        """Dump one request tool into the dict handed to the chat template."""
+        return tool.model_dump()
+
+    def dynamic_tools(self, messages) -> List[Dict[str, Any]]:
+        """Tool declarations carried on messages rather than on the request."""
+        return []
+
+    def prompt_tokens_excluded_from_usage(self, request: "ChatCompletionRequest") -> int:
+        """Number of trailing rendered prompt tokens not reported as prompt usage."""
+        return 0
 
     def apply_chat_extensions(self, request) -> None:
         """Preprocess a ``ChatCompletionRequest`` before template rendering.
@@ -69,13 +122,20 @@ _BUILTINS_PACKAGE = "tensorrt_llm.serve.extensions"
 _builtins_loaded = False
 
 
-def _load_builtin_extensions() -> None:
-    """Import the built-in extension package once so it self-registers."""
+def load_builtin_extensions() -> None:
+    """Import the built-in extension package once so it self-registers.
+
+    Servers call this at startup so a broken extension module fails the server
+    start instead of the first request that needs it.
+    """
     global _builtins_loaded
     if _builtins_loaded:
         return
     importlib.import_module(_BUILTINS_PACKAGE)
     _builtins_loaded = True
+
+
+_load_builtin_extensions = load_builtin_extensions
 
 
 def register_serving_extension(
@@ -98,6 +158,20 @@ def register_serving_extension(
         return cls
 
     return decorator
+
+
+_DEFAULT_EXTENSION = ServingExtension()
+
+
+def get_serving_extension(model_type: Optional[str]) -> ServingExtension:
+    """Extension registered for ``model_type``, or the all-defaults extension.
+
+    The default extension matches the generic serving path, so callers can
+    consult the hooks unconditionally instead of branching on a model name.
+    """
+    _load_builtin_extensions()
+    extension = _BY_MODEL_TYPE.get(model_type) if model_type else None
+    return _DEFAULT_EXTENSION if extension is None else extension
 
 
 def apply_model_chat_extensions(request, model_type: Optional[str]) -> None:

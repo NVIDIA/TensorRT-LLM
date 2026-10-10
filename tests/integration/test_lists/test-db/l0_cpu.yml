@@ -157,6 +157,10 @@ l0_cpu:
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
+  - unittest/llmapi/apps/test_render_callers.py
+  - unittest/llmapi/apps/test_render_core.py
+  - unittest/llmapi/apps/test_render_http.py
+  - unittest/llmapi/apps/test_render_standalone.py
   # test_request_metrics.py as a whole is not registered on any list, so only the
   # two cases added with the KV-transfer fix are selected here. Registering the
   # file would also enable a dozen pre-existing cases that have never run in CI,
@@ -168,6 +172,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_streaming_events.py
   - unittest/llmapi/apps/test_responses_streaming_tool_calls.py
   - unittest/llmapi/apps/test_responses_usage.py
+  - unittest/llmapi/apps/test_serve_lazy_import.py
   - unittest/llmapi/apps/test_serving_extensions.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
