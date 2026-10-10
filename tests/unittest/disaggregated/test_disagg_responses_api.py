@@ -227,6 +227,78 @@ def test_a_context_only_response_carries_the_handoff(use_harmony):
     assert (response.finish_reason, response.prompt_token_ids) == ("length", [1, 2])
 
 
+@pytest.mark.parametrize("as_b64", [False, True])
+def test_a_context_worker_with_postprocessing_workers_returns_the_prompt(monkeypatch, as_b64):
+    """A postprocessing worker's result has no prompt ids; the handoff still does."""
+    import tensorrt_llm.serve.openai_server as server_module
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    request = ResponsesRequest(
+        model="m",
+        input="hi",
+        store=False,
+        disaggregated_params=DisaggregatedParams(
+            request_type="context_only", return_prompt_token_ids_b64=as_b64
+        ),
+    )
+    output = SimpleNamespace(
+        index=0, text="", token_ids=[7], finish_reason="length", disaggregated_params=None
+    )
+    # What a postprocessing worker builds: its result carries no prompt_token_ids.
+    postprocessed = create_response_non_store(
+        generation_result=SimpleNamespace(outputs=[output], cached_tokens=0),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="m",
+        use_harmony=False,
+        num_prompt_tokens=3,
+    )
+    assert postprocessed.prompt_token_ids is None
+
+    async def nothing(*args, **kwargs):
+        return None
+
+    promise = SimpleNamespace(
+        outputs=[SimpleNamespace(_postprocess_result=postprocessed)],
+        prompt_token_ids=[5, 6, 7],
+        aresult=nothing,
+    )
+    server = object.__new__(OpenAIServer)
+    server.model = "m"
+    server.enable_store = False
+    server._is_visual_gen = False
+    server.use_harmony = False
+    server.tokenizer = None
+    server.model_config = None
+    server.processor = None
+    server.tool_parser = None
+    server.metrics_collector = None
+    server.conversation_store = None
+    server.generator = SimpleNamespace(
+        args=SimpleNamespace(reasoning_parser=None, num_postprocess_workers=1),
+        generate_async=lambda **kwargs: promise,
+    )
+    server._validate_internal_disagg_request = lambda *args: None
+    server.await_disconnected = nothing
+    server._extract_metrics = nothing
+
+    async def preprocess(**kwargs):
+        return [5, 6, 7], kwargs["request"].to_sampling_params()
+
+    monkeypatch.setattr(server_module, "responses_api_request_preprocess", preprocess)
+    raw_request = SimpleNamespace(
+        state=SimpleNamespace(), headers={}, url=SimpleNamespace(path="/v1/responses")
+    )
+
+    body = json.loads(asyncio.run(server.openai_responses(request, raw_request)).body)
+
+    if as_b64:
+        ids = np.frombuffer(base64.b64decode(body["prompt_token_ids_b64"]), dtype=np.int32)
+        assert (ids.tolist(), body["prompt_token_ids"]) == ([5, 6, 7], None)
+    else:
+        assert body["prompt_token_ids"] == [5, 6, 7]
+
+
 # ---------------------------------------------------------------------------
 # Streaming a request the context phase finished
 # ---------------------------------------------------------------------------

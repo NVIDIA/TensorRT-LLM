@@ -3149,6 +3149,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     num_prompt_tokens=args.num_prompt_tokens,
                     tokenizer=self.tokenizer,
                 )
+            # A postprocessing worker's result has no prompt token ids, and the
+            # context-only handoff needs them, so take them from the promise as
+            # the chat path does.
+            if (request.disaggregated_params is not None
+                    and request.disaggregated_params.request_type
+                    == "context_only"):
+                response.prompt_token_ids = promise.prompt_token_ids
 
             await self._extract_metrics(promise, raw_request)
             return response

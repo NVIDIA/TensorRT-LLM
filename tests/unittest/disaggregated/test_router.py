@@ -15,7 +15,7 @@ import aiohttp
 import msgpack
 import numpy as np
 import pytest
-from utils.llm_data import llm_datasets_root
+from utils.llm_data import llm_datasets_root, llm_models_root
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
 from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
@@ -2632,6 +2632,36 @@ async def test_kv_cache_aware_router_routes_responses_turns(
                                                  enable_store=False,
                                                  use_harmony=True)
         assert router._tokenize(turn2) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_tokens_match_the_worker_for_a_developer_message(
+        servers):
+    """Qwen3's chat template has no developer role; both sides render it as system."""
+    from transformers import AutoConfig
+
+    from tensorrt_llm.tokenizer import tokenizer_factory
+
+    model_dir = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                tokenizer_dir=model_dir,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input=[
+                                   _message("developer", "Answer in French."),
+                                   _message("user", "plan a trip")
+                               ])
+    worker_ids, _ = await request_preprocess(
+        request,
+        None,
+        None,
+        enable_store=False,
+        use_harmony=False,
+        tokenizer=tokenizer_factory(model_dir),
+        model_config=AutoConfig.from_pretrained(model_dir))
+    assert router._tokenize(request) == [worker_ids]
 
 
 @pytest.mark.asyncio

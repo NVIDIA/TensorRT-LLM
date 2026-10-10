@@ -350,10 +350,19 @@ class BlockHashMixin:
             return responses_utils._render_for_completion(
                 responses_utils._construct_harmony_messages(request, None)
             )
+        tools = responses_utils._get_chat_completion_function_tools(request.tools)
+        # As on the worker, developer messages render as system for a chat
+        # template that has no developer role.
+        messages = responses_utils._render_developer_as_system(
+            responses_utils.chat_messages_from_responses_input(request, []),
+            self._get_tokenizer(request.model),
+            None,
+            [tool.model_dump() for tool in tools],
+        )
         chat_request = ChatCompletionRequest.model_construct(
             model=request.model,
-            messages=responses_utils.chat_messages_from_responses_input(request, []),
-            tools=responses_utils._get_chat_completion_function_tools(request.tools),
+            messages=messages,
+            tools=tools,
             chat_template_kwargs=responses_utils.reasoning_chat_template_kwargs(request),
             injected_chat_template_kwargs=list(
                 responses_utils.reasoning_injected_chat_template_keys(request)
