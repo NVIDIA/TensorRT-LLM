@@ -216,7 +216,7 @@ def BOLT_CONSUME = "bolt_consume"
 // `"bolt_consume": true` opts in a single run without one. Either way
 // resolveBoltConsume() still applies the post-merge and branch restrictions.
 @Field
-def ENABLE_BOLT_PREMERGE_CONSUME = false
+def ENABLE_BOLT_PREMERGE_CONSUME = true
 // Version-controlled rollout switch for post-merge BOLT, same idiom as above.
 //
 // Post-merge cannot use the pre-merge shape, where the BOLTed build REPLACES the
