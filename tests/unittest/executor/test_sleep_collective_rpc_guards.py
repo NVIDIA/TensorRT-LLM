@@ -52,6 +52,7 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
     )
     w.engine = SimpleNamespace(
         prepare_sleep=MagicMock(),
+        finish_wakeup=MagicMock(),
         begin_sleep_transition=MagicMock(),
         complete_sleep_transition=MagicMock(),
         abort_sleep_transition=MagicMock(),
@@ -228,6 +229,7 @@ class TestMultiRankSleepWakeupLock:
 
         w.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             _sleep_wakeup_comm=mock_comm,
             control_action=_noop_control_action,
@@ -387,6 +389,7 @@ def _make_proto_worker(recv_responses, world_size=3):
 
     w.engine = SimpleNamespace(
         prepare_sleep=MagicMock(),
+        finish_wakeup=MagicMock(),
         _sleep_wakeup_lock=threading.Lock(),
         _sleep_wakeup_comm=FakeComm(),
         control_action=_noop_control_action,
@@ -481,6 +484,7 @@ class TestMnnvlSleepWakeupCoordination:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor.model_engine = SimpleNamespace(model=SimpleNamespace(modules=lambda: modules))
         executor.draft_model_engine = None
 
@@ -623,6 +627,7 @@ class TestMultiRankSendFailureRecovery:
         )
         w.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -709,6 +714,7 @@ class TestMultiRankSendFailureRecovery:
         )
         w.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -845,6 +851,7 @@ class TestMultiRankSendFailureRecovery:
         )
         w.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=_noop_control_action,
@@ -926,6 +933,7 @@ class TestMultiRankSendFailureRecovery:
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -999,6 +1007,7 @@ class TestMultiRankSendFailureRecovery:
         run_mnnvl = Mock()
         worker.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=threading.Lock(),
             _sleep_wakeup_comm=FakeComm(),
             control_action=control_action,
@@ -1064,6 +1073,7 @@ class TestMultiRankSendFailureRecovery:
         worker._fatal_error = None
         worker.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _fatal_error=None,
             is_shutdown=False,
             fail_sleep_wakeup_transition=MagicMock(),
@@ -1138,6 +1148,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1208,6 +1219,7 @@ class TestListenerAbortAndShutdown:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1272,6 +1284,7 @@ class TestListenerAbortAndShutdown:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1333,6 +1346,7 @@ class TestListenerAbortAndShutdown:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1382,6 +1396,7 @@ class TestListenerAbortAndShutdown:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
         executor.dist = SimpleNamespace(rank=1)
@@ -1425,6 +1440,7 @@ class TestListenerAbortAndShutdown:
 
         executor = object.__new__(PyExecutor)
         executor.prepare_sleep = MagicMock()
+        executor.finish_wakeup = MagicMock()
         executor._sleep_wakeup_comm = FakeComm()
         executor._sleep_wakeup_listener_thread = None
         executor.dist = SimpleNamespace(rank=0, world_size=3)
@@ -1561,6 +1577,7 @@ class TestSingleRankLockAcquired:
 
         w.engine = SimpleNamespace(
             prepare_sleep=MagicMock(),
+            finish_wakeup=MagicMock(),
             _sleep_wakeup_lock=SpyLock(),
             control_action=_noop_control_action,
             begin_sleep_transition=MagicMock(),

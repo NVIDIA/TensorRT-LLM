@@ -849,6 +849,7 @@ class BaseWorker(GenerationExecutor):
                             None) if has_mnnvl_resources else None)
                         if run_mnnvl is not None:
                             run_mnnvl(target_action, tags)
+                        self.engine.finish_wakeup(tags)
             except Exception as exc:
                 local_error = (f"rank 0 '{action}' failed: {exc}\n"
                                f"{traceback.format_exc()}")
@@ -1005,6 +1006,7 @@ class BaseWorker(GenerationExecutor):
                     local_mutation_started = True
                     materialize_with_tag(*tags)
                     torch.cuda.synchronize()
+                    self.engine.finish_wakeup(tags)
         except Exception:
             if local_mutation_started:
                 self.engine.fail_sleep_wakeup_transition()

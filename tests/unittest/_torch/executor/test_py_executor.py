@@ -2705,6 +2705,7 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
     stub = object.__new__(PyExecutor)
+    stub._sleeping_memory_tags = set()
     stub.llm_args = types.SimpleNamespace(
         sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
     )
@@ -2718,6 +2719,7 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     expected = int(release_kv and mode in ("NONE", "MEMSET"))
     assert stub.kv_cache_manager.reset_reuse_state.call_count == expected
     assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected * joint_reuse
+    assert stub._sleeping_memory_tags == set(tags)
 
 
 @pytest.mark.parametrize("entrypoint", ["mpi", "ray"])

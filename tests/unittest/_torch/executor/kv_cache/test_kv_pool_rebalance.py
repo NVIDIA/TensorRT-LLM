@@ -88,6 +88,7 @@ def _make_executor(
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+    exe._sleeping_memory_tags = set()
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.kv_cache_transceiver = kv_cache_transceiver
@@ -190,6 +191,29 @@ class TestCanPauseForRebalance:
     def test_flag_off_returns_false(self):
         exe = _make_executor(enable_kv_pool_rebalance=False)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_sleep_cancels_pending_rebalance_until_all_tags_wake(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+
+        exe = _make_executor(pp_size=2, pp_rebalance_drain_iters=1)
+        exe.llm_args = SimpleNamespace(
+            sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: "CPU"})
+        )
+        kv = [ExecutorMemoryType.KV_CACHE]
+        model = [ExecutorMemoryType.MODEL_ENGINE_MAIN]
+        for _ in range(2):
+            exe._pp_rebalance_drain_iters = 1
+            PyExecutor.prepare_sleep(exe, kv + model)
+            assert not PyExecutor._can_pause_for_rebalance(exe)
+            PyExecutor._maybe_finish_pp_rebalance(exe)
+            exe.kv_cache_manager.impl.adjust.assert_not_called()
+            assert exe._pp_rebalance_drain_iters is None
+            PyExecutor.finish_wakeup(exe, kv)
+            assert not PyExecutor._can_pause_for_rebalance(exe)
+            PyExecutor.finish_wakeup(exe, model)
+            assert PyExecutor._can_pause_for_rebalance(exe)
 
     def test_pp_size_gt_one_is_allowed(self):
         """PP no longer short-circuits the gate.

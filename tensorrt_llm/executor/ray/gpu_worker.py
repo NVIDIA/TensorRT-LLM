@@ -347,6 +347,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             torch.cuda.synchronize()
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
+            self.engine.finish_wakeup(tags)
         except Exception as e:
             logger.error(f"Encountered an error in wakeup")
             raise e

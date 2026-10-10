@@ -548,6 +548,7 @@ class PyExecutor:
         self._pp_rebalance_drain_iters: Optional[int] = None
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
+        self._sleeping_memory_tags: set[ExecutorMemoryType] = set()
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -1936,6 +1937,14 @@ class PyExecutor:
                 ExecutorMemoryType.KV_CACHE]
             if mode in (RestoreMode.NONE, RestoreMode.MEMSET):
                 self.reset_prefix_cache()
+        # Every rank updates this state while the control barrier holds the
+        # executor loop. Rebalance must not touch any released buffers.
+        self._sleeping_memory_tags.update(tags)
+        self._pp_rebalance_drain_iters = None
+
+    def finish_wakeup(self, tags: list[ExecutorMemoryType]) -> None:
+        """Resume maintenance only after every released tag is restored."""
+        self._sleeping_memory_tags.difference_update(tags)
 
     def complete_sleep_transition(self) -> None:
         self.executor_request_queue.complete_sleep_transition()
@@ -3518,6 +3527,7 @@ class PyExecutor:
                                 torch.cuda.synchronize()
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
+                                self.finish_wakeup(tags)
                             else:
                                 error_msg = (
                                     f"unknown target action '{target_action}'")
@@ -4997,6 +5007,8 @@ class PyExecutor:
         return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
+            return False
+        if self._sleeping_memory_tags:
             return False
         if self.kv_cache_transceiver is not None:
             return False
