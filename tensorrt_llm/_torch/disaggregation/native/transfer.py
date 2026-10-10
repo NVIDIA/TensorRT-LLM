@@ -921,6 +921,7 @@ class Sender(SenderBase):
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
         self._registrar = peer_registrar
+        self._planner = peer_registrar.planner
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
@@ -1079,7 +1080,7 @@ class Sender(SenderBase):
             peer_ri = self._registrar.get_peer_rank_info(
                 req_info.instance_name, req_info.instance_rank
             )
-            expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
+            expected_count = self._expected_transfers(peer_ri)
             if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
                     tx_session.receiver_ready = True
@@ -1095,6 +1096,12 @@ class Sender(SenderBase):
                 logger.warning(f"TxSession {unique_rid} has been garbage collected")
             return session
         return session_entry
+
+    def _expected_transfers(self, peer_ri: RankInfo) -> int:
+        """How many writes the peer's DP group expects from this instance."""
+        return len(
+            self._planner.targets(self._registrar.self_rank_info, peer_ri, peer_ri.dp_rank).ranks
+        )
 
     def _begin_task_operation(self, task: SendTaskBase, peer_rank: int) -> Optional[bool]:
         """Return True for admission, None for a duplicate, or False for rejection."""
@@ -1673,153 +1680,43 @@ class Sender(SenderBase):
                 f"AUX send perf logging failed for request {write_meta.unique_rid}: {error}"
             )
 
-    @staticmethod
-    def _pair_ordinals(
-        src_block_ids: np.ndarray,
-        dst_block_ids: np.ndarray,
-        dst_start_block: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Pair src/dst positional block tables ordinal by ordinal.
-
-        Both tables are indexed by block ordinal (see Chunk); an entry is -1
-        where that side has nothing to offer/accept. A block moves only where
-        both sides hold it, so a sender that has not evicted yet, a receiver
-        that already reused a prefix, a receiver with a wider speculative
-        window, or a sender chunk that blanks everything outside its range all
-        fall out of the same intersection without any per-case arithmetic.
-        Ordinals below ``dst_start_block`` are excluded as well.
-        """
-        if src_block_ids.size != dst_block_ids.size:
-            raise ValueError(
-                f"positional block tables differ in length: src={src_block_ids.size} "
-                f"dst={dst_block_ids.size}; both sides must span the same prompt"
-            )
-        mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
-        if dst_start_block > 0:
-            mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
-
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         self_ri = self._registrar.self_rank_info
-        token_range = task._chunk.token_range
-        # Only a piece short of the whole prompt runs the chunk projection below, and that is the
-        # part with no answer under CP; a sole piece covering everything takes the untouched path.
-        is_partial = token_range.start > 0 or token_range.end < task._prompt_len
-        if is_partial and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
-            raise ValueError(
-                "enable_pipelined_transfer is not supported with context parallelism "
-                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
-            )
         timer = task._perf_timer
         if timer:
             timer.record_prepare_args_start(peer_ri.instance_rank)
-        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
-        expected_transfers = len(targets.ranks)
+        expected_transfers = self._expected_transfers(peer_ri)
         # Recorded on the task as well: the count on the write meta settles the task, while the
         # handle has to answer how many writes are still out after one of them has already failed.
         task.expected_transfers = expected_transfers
 
-        # Aggregate fragment pointers from all matching pool pairs.
-        # Each pool pair produces one or more region pairs (rp), each containing
-        # a numpy array of src/dst pointers and a uniform bytes_per_region.
-        src_frag_parts: list[np.ndarray] = []
-        dst_frag_parts: list[np.ndarray] = []
-        # Instead of calling np.full() per region pair to build a size array and
-        # then np.concatenate() all of them, we record (count, bytes_per_region)
-        # tuples and construct the final sizes array with a single np.repeat().
-        # For 48k+ items this avoids many small allocations in the hot loop.
-        size_specs: list[tuple[int, int]] = []
-        dst_device_id = peer_ri.device_id
-        extractor = self._registrar.self_extractor
-        peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
+        # Which of this rank's bytes land where on the peer is the model's planner's call;
+        # an empty plan still goes out so the peer's expected-writer count settles.
+        plan = self._planner.plan(
+            self_ri,
+            peer_ri,
+            task._chunk.block_ids_per_layer_groups,
+            req_info.block_ids_per_layer_groups,
+            task._chunk.token_range,
+            task._prompt_len,
+            req_info.dst_start_token,
+            task._chunk.excluded_pool_views,
         )
-        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-        src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
-
-        # Aggregate fragments from all matching pools using numpy concatenation.
-        # Send ownership is per pool: replicated pools elect one fan-in
-        # owner, sharded pools keep head-duplication routing.
-        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
-                continue
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
-                continue
-
-            lg_info = extractor.page_table.layer_groups[self_lg]
-            src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
-            # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
-            if lg_info.kind == CacheKind.STATE:
-                if src_block_ids.size == 0 or dst_block_ids.size == 0:
-                    continue
-                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
-                    continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
-            else:
-                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
-                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
-                    # Helix: the receiver owns global blocks [cp_rank::cp_size]
-                    # (same protocol as partition_context_for_helix), so its
-                    # table is the strided subset of ours; block reuse is
-                    # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
-                tpb = extractor.page_table.tokens_per_block
-                dst_start_block = (
-                    req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
-                )
-                # Both tables are positional (index == block ordinal, -1 == not
-                # held), so pairing is a plain intersection: SWA eviction, prefix
-                # reuse, and pipelined chunk bounds are all already encoded as
-                # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
-                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
-                )
-                if src_block_ids.size == 0:
-                    continue
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
-
-            # Map and collect fragments (same for all layer types)
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
-                src_frag_parts.append(rp.src.memory.ptrs)
-                dst_frag_parts.append(rp.dst.memory.ptrs)
-                size_specs.append((rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region))
-
-        if src_frag_parts:
-            src_frags = np.concatenate(src_frag_parts)
-            dst_frags = np.concatenate(dst_frag_parts)
-            # Build the kv_sizes array in one shot: np.repeat expands each
-            # bytes_per_region value by its count, e.g.:
-            #   values=[4096, 8192], counts=[100, 200]
-            #   → [4096]*100 ++ [8192]*200
-            counts, values = zip(*size_specs)
-            kv_sizes = np.repeat(np.array(values, dtype=np.int64), counts)
-        else:
-            src_frags = np.array([], dtype=np.int64)
-            dst_frags = np.array([], dtype=np.int64)
-            kv_sizes = np.array([], dtype=np.int64)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+            timer.record_transfer_sizes(
+                peer_ri.instance_rank, int(plan.sizes.sum()), plan.dst_ptrs.size
+            )
 
         return WriteMeta(
             task=task,
-            src_ptrs=src_frags,
-            dst_ptrs=dst_frags,
-            sizes=kv_sizes,
-            dst_device_id=dst_device_id,
+            src_ptrs=plan.src_ptrs,
+            dst_ptrs=plan.dst_ptrs,
+            sizes=plan.sizes,
+            dst_device_id=peer_ri.device_id,
             expected_transfers=expected_transfers,
             peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
             peer_rank=peer_ri.instance_rank,
@@ -1836,7 +1733,7 @@ class Sender(SenderBase):
         timer = task._perf_timer
         if timer:
             timer.record_prepare_args_start(peer_ri.instance_rank)
-        expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
+        expected_transfers = self._expected_transfers(peer_ri)
 
         src_ptrs = np.array([], dtype=np.int64)
         dst_ptrs = np.array([], dtype=np.int64)
@@ -2223,7 +2120,7 @@ class Sender(SenderBase):
         req_info = peer_transfer_req_info
         self._add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-        expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
+        expected_transfers = self._expected_transfers(peer_ri)
         if self._is_req_ready(req_info.unique_rid, expected_transfers):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
@@ -2237,7 +2134,7 @@ class Sender(SenderBase):
 
     def _has_all_peer_req_infos(self, req_info: RecvReqInfo) -> bool:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-        expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
+        expected_transfers = self._expected_transfers(peer_ri)
         return self._is_req_ready(req_info.unique_rid, expected_transfers)
 
     def clear_session(self, unique_rid: int):

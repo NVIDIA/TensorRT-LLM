@@ -27,6 +27,7 @@ import pytest
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVSendTask,
@@ -174,20 +175,30 @@ def _make_projection_sender() -> Sender:
     )
 
     registrar = MagicMock()
-    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0)
+    registrar.self_rank_info = SimpleNamespace(cp_size=1, cp_rank=0, dp_rank=0)
     registrar.self_extractor = extractor
     registrar.get_peer_rank_info.return_value = peer_ri
-    registrar.get_peer_overlap.return_value = SimpleNamespace(ranks=[0])
-    registrar.should_send_kv.return_value = True
-    registrar.get_pool_mapping.return_value = {
-        (0, 0): (0, 0),
-        (1, 0): (1, 0),
-    }
-    registrar.peer_extractor.return_value = extractor
-    registrar.get_kv_map.return_value = mapper
+
+    # The real planner's plan() over mocked pool matching / mappers, so the
+    # ordinal pairing under test is the production code path.
+    planner = DefaultTransferPlanner.__new__(DefaultTransferPlanner)
+    planner._self_ext_cache = extractor
+    planner.peer_extractor = MagicMock(return_value=extractor)
+    planner.get_peer_overlap = MagicMock(
+        return_value=SimpleNamespace(ranks=[0], duplicate_head_factor=1, overlap_pp_size=1)
+    )
+    planner.should_send_pool = MagicMock(return_value=True)
+    planner.get_pool_mapping = MagicMock(
+        return_value={
+            (0, 0): (0, 0),
+            (1, 0): (1, 0),
+        }
+    )
+    planner.get_kv_map = MagicMock(return_value=mapper)
 
     sender = Sender.__new__(Sender)
     sender._registrar = registrar
+    sender._planner = planner
     return sender
 
 

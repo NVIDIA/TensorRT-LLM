@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import AbstractSet, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -206,6 +206,7 @@ class DefaultTransferPlanner(TransferPlanner):
         token_range: TokenRange,
         prompt_len: int,
         dst_start_token: Optional[int],
+        excluded_pool_views: AbstractSet[Tuple[int, int]],
     ) -> TransferPlan:
         # Only a piece short of the whole prompt runs the chunk projection below, and that is the
         # part with no answer under CP; a sole piece covering everything takes the untouched path.
@@ -235,6 +236,8 @@ class DefaultTransferPlanner(TransferPlanner):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            if (self_lg, self_pi) in excluded_pool_views:
+                continue
             if not self.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 

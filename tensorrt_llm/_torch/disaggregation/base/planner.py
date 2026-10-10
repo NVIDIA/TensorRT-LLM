@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, AbstractSet, List, Optional, Tuple
 
 import numpy as np
 
@@ -108,8 +108,13 @@ class TransferPlanner(ABC):
         token_range: "TokenRange",
         prompt_len: int,
         dst_start_token: Optional[int],
+        excluded_pool_views: AbstractSet[Tuple[int, int]],
     ) -> TransferPlan:
-        """Sender side: the bytes this rank writes into ``peer_ri`` for one chunk."""
+        """Sender side: the bytes this rank writes into ``peer_ri`` for one chunk.
+
+        ``excluded_pool_views`` are ``(layer_group, pool_view)`` pairs the cache
+        manager keeps out of this chunk; the plan writes nothing from them.
+        """
 
     @abstractmethod
     def receiver_payload_bytes(

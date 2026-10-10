@@ -39,3 +39,120 @@ def test_transfer_planner_is_abstract():
 def test_peer_incompatible_error_is_value_error():
     assert issubclass(PeerIncompatibleError, ValueError)
     assert PeerTargets(ranks=[0], uniform_writers=True).ranks == [0]
+
+
+# --------------------------------------------------------------------------- #
+# Sender drives the planner
+# --------------------------------------------------------------------------- #
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import Mock  # noqa: E402
+
+from tensorrt_llm import DisaggregatedParams  # noqa: E402
+from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange  # noqa: E402
+from tensorrt_llm._torch.disaggregation.native.transfer import (  # noqa: E402
+    KVSendTask,
+    RecvReqInfo,
+    Sender,
+)
+
+
+class _ToyPlanner(TransferPlanner):
+    """Fixed ranks and a fixed plan; records what the framework handed it."""
+
+    planner_id = "toy"
+
+    def __init__(self, plan: TransferPlan, ranks=(0,)):
+        self._plan = plan
+        self._ranks = list(ranks)
+        self.calls: list = []
+
+    def check_peer(self, self_ri, peer_ri):
+        return None
+
+    def targets(self, self_ri, peer_ri, peer_dp_rank):
+        return PeerTargets(ranks=list(self._ranks), uniform_writers=True)
+
+    def plan(
+        self, self_ri, peer_ri, src, dst, token_range, prompt_len, dst_start_token, excluded
+    ):
+        self.calls.append((src, dst, token_range, prompt_len, dst_start_token, excluded))
+        return self._plan
+
+    def receiver_payload_bytes(self, self_ri, peer_ri, dst):
+        return 0
+
+
+def _sender_with(planner: TransferPlanner) -> Sender:
+    peer_ri = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=3,
+        dp_rank=0,
+        device_id=1,
+        cp_size=1,
+        self_endpoint="tcp://gen:1",
+        page_table=None,
+    )
+    sender = Sender.__new__(Sender)
+    sender._registrar = Mock()
+    sender._registrar.self_rank_info = SimpleNamespace(
+        cp_size=1, instance_name="ctx", instance_rank=0
+    )
+    sender._registrar.get_peer_rank_info.return_value = peer_ri
+    sender._planner = planner
+    return sender
+
+
+def _task_and_req():
+    task = KVSendTask(
+        Chunk(
+            block_ids_per_layer_groups=[np.array([5, 6], dtype=np.int64)],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(0, 64),
+            is_last=True,
+        ),
+        DisaggregatedParams(disagg_request_id=1),
+        slice_id=0,
+        prompt_len=64,
+    )
+    req = RecvReqInfo(
+        sender_req_id=1,
+        instance_name="gen",
+        instance_rank=3,
+        block_ids_per_layer_groups=[np.array([9, 10], dtype=np.int64)],
+        unique_rid=1,
+        dst_start_token=32,
+        slice_id=0,
+    )
+    return task, req
+
+
+def test_build_kv_write_meta_uses_planner_plan():
+    plan = TransferPlan(
+        src_ptrs=np.array([100, 200], dtype=np.int64),
+        dst_ptrs=np.array([300, 400], dtype=np.int64),
+        sizes=np.array([16, 16], dtype=np.int64),
+    )
+    planner = _ToyPlanner(plan, ranks=(3, 4))
+    sender = _sender_with(planner)
+    task, req = _task_and_req()
+
+    wm = sender._build_kv_write_meta(task, req)
+
+    assert wm.src_ptrs is plan.src_ptrs and wm.dst_ptrs is plan.dst_ptrs and wm.sizes is plan.sizes
+    assert wm.expected_transfers == 2 and task.expected_transfers == 2
+    assert wm.dst_device_id == 1 and wm.peer_rank == 3 and wm.peer_endpoint == "tcp://gen:1"
+    ((src, dst, token_range, prompt_len, dst_start, excluded),) = planner.calls
+    assert src is task._chunk.block_ids_per_layer_groups
+    assert dst is req.block_ids_per_layer_groups
+    assert excluded is task._chunk.excluded_pool_views
+    assert (token_range.start, token_range.end, prompt_len, dst_start) == (0, 64, 64, 32)
+
+
+def test_build_kv_write_meta_empty_plan_still_delivers():
+    sender = _sender_with(_ToyPlanner(TransferPlan.empty()))
+    task, req = _task_and_req()
+
+    wm = sender._build_kv_write_meta(task, req)
+
+    assert wm.sizes.size == 0 and wm.src_ptrs.size == 0 and wm.dst_ptrs.size == 0
+    assert wm.expected_transfers == 1 and wm.is_last_slice is True
