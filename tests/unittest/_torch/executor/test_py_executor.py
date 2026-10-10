@@ -2727,6 +2727,10 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
 
     def make_runner(manager):
         runner = object.__new__(CUDAGraphRunner)
+        runner.graphs = {}
+        runner.graph_outputs = {}
+        runner.graph_metadata = {}
+        runner.memory_pool = None
         runner.padding_dummy_requests = {0: dummy}
         runner._padding_dummy_managers = lambda _: [manager, shared_spec]
         # Attention-DP can create dummies even when every batch size has a

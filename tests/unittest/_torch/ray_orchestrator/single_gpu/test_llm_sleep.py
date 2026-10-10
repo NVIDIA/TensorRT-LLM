@@ -215,6 +215,7 @@ def test_ray_sleep_wakeup_failure_is_terminal(
     # finish_wakeup receives tags; model a successful peer publishing full wake.
     engine.finish_wakeup = Mock(side_effect=lambda _: engine._sleeping_memory_tags.clear())
     worker = object.__new__(gpu_worker.RayGPUWorker)
+    worker.doing_shutdown = True
     worker.engine = engine
     worker.llm_args = Mock(spec=TorchLlmArgs, sleep_config=SleepConfig())
     monkeypatch.setattr(gpu_worker, "logger", Mock(), raising=False)
@@ -288,6 +289,7 @@ def test_sleep_validates_registrations_before_closing_admission(
         mutation = stub.executor_request_queue.begin_sleep_transition
     else:
         worker = object.__new__(RayGPUWorker)
+        worker.doing_shutdown = True
         worker.engine = stub
         worker.llm_args = Mock(spec=TorchLlmArgs, sleep_config=SleepConfig())
         worker._sleep = Mock()
