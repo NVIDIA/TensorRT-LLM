@@ -710,3 +710,38 @@ class Fusions:
             max_beam_width,
             fold_pending,
         )
+
+    @staticmethod
+    @torch.compile(
+        dynamic=None,
+        fullgraph=True,
+        options=dict(
+            split_reductions=False,
+        ),
+    )
+    def _gather_masked_inplace_add_impl(
+        summands_cuda: torch.Tensor,
+        summand_indices_cuda: torch.Tensor,
+        output_cuda: torch.Tensor,
+        output_mask_cuda: torch.Tensor,
+    ) -> None:
+        output_cuda[output_mask_cuda, ...] += torch.index_select(
+            summands_cuda, 0, summand_indices_cuda
+        )
+
+    @staticmethod
+    def gather_masked_inplace_add(
+        summands_cuda: torch.Tensor,
+        summand_indices_cuda: torch.Tensor,
+        output_cuda: torch.Tensor,
+        output_mask_cuda: torch.Tensor,
+    ) -> None:
+        # NB: helper function for apply_embedding_bias, torch.compile is expected to reduce
+        #     data movement.
+        torch._dynamo.mark_dynamic(summands_cuda, 0)
+        torch._dynamo.mark_dynamic(summand_indices_cuda, 0)
+        torch._dynamo.mark_dynamic(output_cuda, 0)
+        torch._dynamo.mark_dynamic(output_mask_cuda, 0)
+        Fusions._gather_masked_inplace_add_impl(
+            summands_cuda, summand_indices_cuda, output_cuda, output_mask_cuda
+        )
