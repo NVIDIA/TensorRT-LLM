@@ -2529,10 +2529,11 @@ class TestDeepseekV4CacheManager:
         finally:
             cache_manager.shutdown()
 
+    @pytest.mark.parametrize("materialize_history", [False, True])
     @pytest.mark.parametrize("compress_ratios", [[1], [1, 4, 128]])
     @pytest.mark.parametrize("long_token_num", [127, 128, 129, 513])
     def test_dummy_generation_requests_with_swa_scratch_reuse(
-        self, compress_ratios: list[int], long_token_num: int
+        self, materialize_history: bool, compress_ratios: list[int], long_token_num: int
     ) -> None:
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -2551,6 +2552,7 @@ class TestDeepseekV4CacheManager:
                 request_ids=[0, 1],
                 token_nums=token_nums,
                 is_gen=True,
+                materialize_history=materialize_history,
             )
             assert requests is not None
             assert len(requests) == len(token_nums)
@@ -2561,7 +2563,8 @@ class TestDeepseekV4CacheManager:
             assert not long_kv_cache.enable_swa_scratch_reuse
             assert short_kv_cache.history_length == 0
             assert short_kv_cache.capacity == token_nums[0]
-            assert long_kv_cache.history_length == token_nums[1] - 1
+            expected_history_length = 0 if materialize_history else token_nums[1] - 1
+            assert long_kv_cache.history_length == expected_history_length
             assert long_kv_cache.capacity == token_nums[1]
         finally:
             for req in requests:
