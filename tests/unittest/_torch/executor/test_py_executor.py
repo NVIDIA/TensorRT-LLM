@@ -2718,6 +2718,11 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     stub.enable_joint_kv_cache_reuse = joint_reuse
     stub.resource_manager = types.SimpleNamespace(resource_managers={})
     shared_spec = Mock()
+    cleanup_order = []
+    shared_spec.free_resources.side_effect = lambda _: cleanup_order.append("cleanup")
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", Mock(side_effect=lambda: cleanup_order.append("synchronize"))
+    )
     dummy = types.SimpleNamespace(py_request_id=42)
 
     def make_runner(manager):
@@ -2742,7 +2747,7 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     stub.draft_kv_cache_manager.reset_reuse_state.side_effect = clear_reuse
     tags = [
         ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN,
-        ExecutorMemoryType.EXTRA_RESOURCES,
+        ExecutorMemoryType.SPEC_RESOURCES,
     ]
 
     PyExecutor.prepare_sleep(stub, tags)
@@ -2754,11 +2759,13 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     shared_spec.free_resources.assert_called_once_with(dummy)
     stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
     stub.draft_kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    assert cleanup_order == ["cleanup", "synchronize"]
+    torch.cuda.synchronize.reset_mock()
 
     PyExecutor.finish_wakeup(stub, tags[:1])
     main_runner.preallocate_padding_dummies.assert_not_called()
     draft_runner.preallocate_padding_dummies.assert_not_called()
-    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    torch.cuda.synchronize.assert_not_called()
     PyExecutor.finish_wakeup(stub, tags[1:])
     assert not stub._sleeping_memory_tags
     assert main_runner.padding_dummy_requests == {0: dummy}

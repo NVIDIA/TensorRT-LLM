@@ -1953,6 +1953,9 @@ class PyExecutor:
                         manager is seen for seen in self._sleeping_kv_managers):
                     manager.prepare_sleep()
                     self._sleeping_kv_managers.append(manager)
+            if self._sleeping_kv_managers or self._sleeping_padding_dummies:
+                # Speculative resource cleanup can enqueue device writes.
+                torch.cuda.synchronize()
         if ExecutorMemoryType.KV_CACHE in tags:
             mode = self.llm_args.sleep_config.restore_modes[
                 ExecutorMemoryType.KV_CACHE]

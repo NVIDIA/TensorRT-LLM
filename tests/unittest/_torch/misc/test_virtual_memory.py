@@ -252,7 +252,7 @@ def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
         if restore_mode != virtual_memory.RestoreMode.NONE:
             expected = 0 if restore_mode == virtual_memory.RestoreMode.MEMSET else cycle + 1
             for buffer in buffers:
-                assert torch.all(buffer.float() == expected)
+                assert torch.all(buffer.cpu().float() == expected)
 
     del buffer, buffers
     if manager_cls is KVCacheManagerV2:
