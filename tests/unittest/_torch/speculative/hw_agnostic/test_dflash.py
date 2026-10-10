@@ -33,8 +33,6 @@ PROMPTS = [
     "The future of AI is",
 ]
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-
 
 def test_dflash_metadata_preserves_default_seq_slot_pool_in_graph_copy():
     metadata = DFlashSpecMetadata(
