@@ -47,6 +47,11 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
+from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
+    PeerIncompatibleError,
+    PeerTargets,
+    TransferPlanner,
+)
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     ReceiverBase,
     RxSessionBase,
@@ -61,13 +66,8 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
-from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
-    PeerIncompatibleError,
-    PeerTargets,
-    TransferPlanner,
-)
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
+from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo

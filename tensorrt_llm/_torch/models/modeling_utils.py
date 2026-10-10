@@ -801,7 +801,8 @@ class DecoderModelForCausalLM(nn.Module,
             None.
         """
 
-    def build_transfer_planner(self, kv_cache_manager, self_rank_info, self_extractor):
+    def build_transfer_planner(self, kv_cache_manager, self_rank_info,
+                               self_extractor):
         """The disaggregated KV transfer plan for this model on this rank.
 
         A model whose cache layout the default planner does not understand

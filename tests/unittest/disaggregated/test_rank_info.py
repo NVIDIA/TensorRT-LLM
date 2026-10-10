@@ -230,10 +230,14 @@ def test_rank_info_planner_fields_round_trip():
 
 
 def test_rank_info_from_bytes_without_planner_fields():
-    """A peer serialized before planner_id existed still deserializes, so the
-    mismatch surfaces as the explicit PeerIncompatibleError and not a TypeError."""
-    import msgpack
+    """An old-wire peer without planner fields still deserializes.
+
+    The planner mismatch then surfaces as the explicit PeerIncompatibleError
+    rather than a msgpack TypeError.
+    """
     from dataclasses import asdict
+
+    import msgpack
 
     data = asdict(_minimal_rank_info())
     for key in ("planner_id", "planner_blob", "attention", "aux_meta", "page_table"):

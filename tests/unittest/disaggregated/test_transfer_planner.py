@@ -327,10 +327,13 @@ from tensorrt_llm._torch.disaggregation.native.default_planner import (  # noqa:
 
 
 def test_default_planner_statics_survive_a_wrapping_nvtx_range():
-    """With a profiler attached, nvtx_range wraps the function it decorates. A decorator
+    """The planner's static helpers stay static under a wrapping nvtx_range.
+
+    With a profiler attached, nvtx_range wraps the function it decorates. A decorator
     accidentally stacked on a @staticmethod then turns the gate into a bound method and
     every targets() call fails. Import the module with a wrapping nvtx_range (a fresh
-    interpreter, so this test cannot disturb the others) and check the statics stay static."""
+    interpreter, so this test cannot disturb the others) and check the statics stay static.
+    """
     import subprocess
     import sys
 
@@ -358,8 +361,8 @@ print("STATICS_OK")
 
 def _default_planner_pair():
     """A default planner and a compatible peer over the small real page tables test_peer builds."""
-    from tests.unittest.disaggregated.test_peer import make_page_table, make_rankinfo
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tests.unittest.disaggregated.test_peer import make_page_table, make_rankinfo
 
     self_ri = make_rankinfo(instance_name="gen", tp_size=1, tp_rank=0, page_table=make_page_table())
     peer_ri = make_rankinfo(
@@ -370,8 +373,10 @@ def _default_planner_pair():
 
 
 def test_default_planner_check_peer_wraps_every_value_error(monkeypatch):
-    """Any ValueError raised while vetting a peer must surface as PeerIncompatibleError,
-    so the receiver fails only that peer's requests and caches the verdict."""
+    """Every ValueError raised while vetting a peer becomes PeerIncompatibleError.
+
+    That way the receiver fails only that peer's requests and caches the verdict.
+    """
     planner, self_ri, peer_ri = _default_planner_pair()
     # A head-count mismatch is what sends check_peer into pool matching.
     peer_ri.attention.kv_heads_per_rank = 1
@@ -385,8 +390,11 @@ def test_default_planner_check_peer_wraps_every_value_error(monkeypatch):
 
 
 def test_default_planner_targets_is_cached_per_peer_dp_group(monkeypatch):
-    """The sender asks for targets() on every request; the fan-in gate walks both page
-    tables, so the answer must be computed once per (peer instance, DP group)."""
+    """targets() is computed once per (peer instance, DP group).
+
+    The sender asks on every request and the fan-in gate walks both page tables,
+    so the answer must be cached.
+    """
     planner, self_ri, peer_ri = _default_planner_pair()
     calls = []
     real = DefaultTransferPlanner._fanin_bounce_safe

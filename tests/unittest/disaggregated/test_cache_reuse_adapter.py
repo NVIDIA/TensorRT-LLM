@@ -55,17 +55,23 @@ class TestPairOrdinals:
         np.testing.assert_array_equal(dst, [20, 21, 22])
 
     def test_receiver_prefix_reuse_is_a_dst_hole(self):
-        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(
+            _arr([10, 11, 12, 13]), _arr([-1, -1, 22, 23])
+        )
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 
     def test_sender_chunk_bounds_are_src_holes(self):
-        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(
+            _arr([-1, 11, 12, -1]), _arr([20, 21, 22, 23])
+        )
         np.testing.assert_array_equal(src, [11, 12])
         np.testing.assert_array_equal(dst, [21, 22])
 
     def test_holes_on_both_sides_take_the_intersection(self):
-        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(
+            _arr([10, -1, 12, 13]), _arr([-1, 21, 22, -1])
+        )
         np.testing.assert_array_equal(src, [12])
         np.testing.assert_array_equal(dst, [22])
 
@@ -98,7 +104,9 @@ class TestPairOrdinals:
     def test_receiver_with_wider_speculative_window(self):
         # Only gen runs spec decoding, so its SWA window keeps one more block.
         # That block has no source; it simply is not written.
-        src, dst = DefaultTransferPlanner._pair_ordinals(_arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23]))
+        src, dst = DefaultTransferPlanner._pair_ordinals(
+            _arr([-1, -1, 12, 13]), _arr([-1, 21, 22, 23])
+        )
         np.testing.assert_array_equal(src, [12, 13])
         np.testing.assert_array_equal(dst, [22, 23])
 

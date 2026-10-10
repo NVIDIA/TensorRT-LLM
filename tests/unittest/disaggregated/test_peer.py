@@ -22,6 +22,10 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBufferMeta,
     build_aux_transfer_layout,
 )
+from tensorrt_llm._torch.disaggregation.native.default_planner import (
+    DefaultTransferPlanner,
+    PeerOverlap,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     AttentionPolicy,
     HNDHeadMismatchMapper,
@@ -34,10 +38,6 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     ConvStateMismatchMapper,
     MambaHeadMatchMapper,
     MambaPolicy,
-)
-from tensorrt_llm._torch.disaggregation.native.default_planner import (
-    DefaultTransferPlanner,
-    PeerOverlap,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -208,7 +208,9 @@ def make_rankinfo(
 def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
     pt = make_page_table()
     real_kv_extractor = KVRegionExtractorV1(pt)
-    reg = PeerRegistrar(self_ri, real_kv_extractor, DefaultTransferPlanner(self_ri, real_kv_extractor))
+    reg = PeerRegistrar(
+        self_ri, real_kv_extractor, DefaultTransferPlanner(self_ri, real_kv_extractor)
+    )
     if peer_ri.page_table is None:
         peer_ri = make_rankinfo(
             instance_name=peer_ri.instance_name,

@@ -2018,7 +2018,9 @@ def test_incompatible_peer_fails_only_affected_requests(
 
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(default_planner_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser))
+            mp.setattr(
+                default_planner_mod.MambaPolicy, "validate_peer_compatible", staticmethod(raiser)
+            )
 
             # (a) First request to the incompatible peer: receive() must not
             # raise; the session fails with the diagnostic preserved.

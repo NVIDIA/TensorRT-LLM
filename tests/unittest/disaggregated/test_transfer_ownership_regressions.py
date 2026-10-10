@@ -28,8 +28,8 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base.planner import PeerTargets
 from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base.planner import PeerTargets
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
 from tensorrt_llm._torch.disaggregation.native.transfer import (

@@ -346,8 +346,8 @@ def test_v1_dsa_indexer_replicated_transfer_across_pp(
     """
     import torch
 
-    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import ReplicatedMapper
     from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
+    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import ReplicatedMapper
     from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 

@@ -22,10 +22,7 @@ it and hands it out to the sender and receiver.
 
 from typing import Dict, Optional
 
-from tensorrt_llm._torch.disaggregation.base.planner import (
-    PeerIncompatibleError,
-    TransferPlanner,
-)
+from tensorrt_llm._torch.disaggregation.base.planner import PeerIncompatibleError, TransferPlanner
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxTransferLayout
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1

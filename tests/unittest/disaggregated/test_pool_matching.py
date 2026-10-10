@@ -34,8 +34,8 @@ called out in the refactor commit message.
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (

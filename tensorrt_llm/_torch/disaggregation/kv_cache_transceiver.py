@@ -229,7 +229,9 @@ def create_kv_cache_transceiver(
         # DecoderModelForCausalLM.build_transfer_planner); anything without
         # the hook gets the default planner.
         planner_factory = getattr(model, "build_transfer_planner", None)
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+        return KvCacheTransceiverV2(mapping,
+                                    dist,
+                                    kv_cache_manager,
                                     cache_transceiver_config,
                                     planner_factory=planner_factory)
 

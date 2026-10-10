@@ -55,11 +55,11 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
 )
-from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (

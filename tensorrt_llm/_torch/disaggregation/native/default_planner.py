@@ -276,9 +276,7 @@ class DefaultTransferPlanner(TransferPlanner):
                     # rejected under helix.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
                 tpb = extractor.page_table.tokens_per_block
-                dst_start_block = (
-                    dst_start_token // tpb if dst_start_token is not None else 0
-                )
+                dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
                 # Both tables are positional (index == block ordinal, -1 == not
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
