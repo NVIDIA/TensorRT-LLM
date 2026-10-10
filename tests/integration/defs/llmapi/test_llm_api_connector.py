@@ -1341,11 +1341,13 @@ def test_connector_priorities(enforce_single_worker, model_with_connector,
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
 def test_connector_priorities_default(enforce_single_worker,
-                                      model_with_connector):
+                                      model_with_connector,
+                                      use_kv_cache_manager_v2):
     """Test that priorities are None when no retention config is provided."""
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True)
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
