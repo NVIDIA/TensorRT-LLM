@@ -26,15 +26,15 @@ if TYPE_CHECKING:
 __all__ = ["build_attention_metadata"]
 
 
-def _get_num_heads_per_kv(model_config: ModelConfig) -> int:
+def _get_max_num_heads_per_kv(model_config: ModelConfig) -> int:
+    """Return the largest per-layer GQA ratio for shared mask allocation."""
+    layer_specs = _get_kv_cache_layer_specs(model_config)
+    if layer_specs:
+        return max(spec.num_q_heads // spec.num_kv_heads for spec in layer_specs)
+
     pretrained_config = model_config.pretrained_config
     num_attention_heads = getattr(pretrained_config, "num_attention_heads", None)
-    layer_specs = _get_kv_cache_layer_specs(model_config)
-    num_key_value_heads = (
-        [spec.num_kv_heads for spec in layer_specs]
-        if layer_specs
-        else getattr(pretrained_config, "num_key_value_heads", None)
-    )
+    num_key_value_heads = getattr(pretrained_config, "num_key_value_heads", None)
     if isinstance(num_key_value_heads, (list, tuple)):
         num_key_value_heads = min(
             (heads for heads in num_key_value_heads if heads and heads > 0),
@@ -58,7 +58,7 @@ def build_attention_metadata(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None = None,
     enable_context_mla_with_cached_kv: bool | None = None,
-    num_heads_per_kv: int | None = None,
+    max_num_heads_per_kv: int | None = None,
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
@@ -66,8 +66,8 @@ def build_attention_metadata(
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
             attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
         )
-    if num_heads_per_kv is None:
-        num_heads_per_kv = _get_num_heads_per_kv(model_config)
+    if max_num_heads_per_kv is None:
+        max_num_heads_per_kv = _get_max_num_heads_per_kv(model_config)
 
     sparse_attention_config = model_config.sparse_attention_config
     sparse_metadata_params = (
@@ -86,6 +86,6 @@ def build_attention_metadata(
         enable_flash_mla=model_config.enable_flash_mla,
         enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
         cache_indirection=cache_indirection,
-        num_heads_per_kv=num_heads_per_kv,
+        max_num_heads_per_kv=max_num_heads_per_kv,
         sparse_metadata_params=sparse_metadata_params,
     )
