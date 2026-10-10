@@ -530,7 +530,7 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
         sender._registrar = SimpleNamespace(
             self_rank_info=SimpleNamespace(instance_name="sender", instance_rank=0)
         )
-        sender._get_result_dealer = Mock()
+        sender._get_or_connect_thread_dealer = Mock()
         assert sender._begin_task_operation(task, 7)
         meta = transfer_mod.WriteMeta(
             task,
@@ -552,7 +552,7 @@ def test_final_completion_precedes_delayed_perf_logging(final_piece: str, monkey
 
     def delayed_diagnostic(*args):
         if final_piece.startswith("send"):
-            session._sender._get_result_dealer.return_value.send.assert_called_once()
+            session._sender._get_or_connect_thread_dealer.return_value.send.assert_called_once()
         clock.return_value = 100.0
         watchdog.progress()
         raise RuntimeError("diagnostic failure after transfer completion")

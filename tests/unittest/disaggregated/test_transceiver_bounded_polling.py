@@ -104,6 +104,8 @@ class _FakeSession:
 
 
 class _FakeTask:
+    has_admitted_writes_in_flight = False
+
     def __init__(
         self,
         status: TaskStatus,
