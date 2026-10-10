@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 
 import pytest
@@ -6,9 +9,11 @@ from utils.util import get_current_process_gpu_memory
 
 import tensorrt_llm
 from tensorrt_llm._torch import virtual_memory
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -169,7 +174,14 @@ def test_restore():
     del pool
 
 
-def test_kv_cache_manager(process_gpu_memory_info_available):
+@pytest.mark.parametrize("manager_cls,restore_mode", [
+    (KVCacheManager, virtual_memory.RestoreMode.NONE),
+    *[(KVCacheManagerV2, mode) for mode in
+      (virtual_memory.RestoreMode.NONE, virtual_memory.RestoreMode.MEMSET,
+       virtual_memory.RestoreMode.CPU, virtual_memory.RestoreMode.PINNED)],
+])
+def test_kv_cache_manager(process_gpu_memory_info_available, manager_cls,
+                          restore_mode):
     kv_cache_params = {
         "kv_cache_config": KvCacheConfig(max_tokens=1024),
         "kv_cache_type": CacheType.SELF,
@@ -182,8 +194,11 @@ def test_kv_cache_manager(process_gpu_memory_info_available):
         "mapping": Mapping(world_size=1, tp_size=1, rank=0),
         "dtype": tensorrt_llm.bindings.DataType.FP8,
     }
+    if manager_cls is KVCacheManagerV2:
+        # Exercise the static device-side page-index conversion tables too.
+        kv_cache_params["head_dim"] = [64, 32] * 4
 
-    mgr = KVCacheManager(**kv_cache_params)
+    mgr = manager_cls(**kv_cache_params)
     mgr.shutdown()
     del mgr
 
@@ -202,26 +217,48 @@ def test_kv_cache_manager(process_gpu_memory_info_available):
         device='meta')
 
     alloc_size = cache_size.nelement()
+    if manager_cls is KVCacheManagerV2:
+        alloc_size = alloc_size * 3 // 4
 
-    with virtual_memory.scope(tag) as pool:
-        mgr = KVCacheManager(**kv_cache_params)
+    with virtual_memory.scope(tag, restore_mode) as pool:
+        mgr = manager_cls(**kv_cache_params)
+        assert isinstance(mgr, manager_cls)
+        if manager_cls is KVCacheManagerV2:
+            assert mgr._use_per_layer_page_tables
+            metadata = mgr._device_attention_op_scales
+            expected_metadata = metadata.cpu()
         memory_usage_materialized = get_current_process_gpu_memory()
         if process_gpu_memory_info_available:
-            assert memory_usage_begin + alloc_size == memory_usage_materialized
+            assert memory_usage_materialized >= memory_usage_begin + alloc_size
 
-    torch.cuda.synchronize()
+    buffers = mgr.get_buffers(0)
+    pointers = [buffer.data_ptr() for buffer in buffers]
+    for cycle in range(2):
+        for buffer in buffers:
+            buffer.fill_(cycle + 1)
+        torch.cuda.synchronize()
+        assert virtual_memory.release_with_tag(tag) > 0
+        memory_usage_released = get_current_process_gpu_memory()
+        if process_gpu_memory_info_available:
+            assert memory_usage_materialized - memory_usage_released >= alloc_size
+        assert virtual_memory.materialize_with_tag(tag) > 0
+        torch.cuda.synchronize()
+        memory_usage_rematerialized = get_current_process_gpu_memory()
+        if process_gpu_memory_info_available:
+            assert memory_usage_rematerialized - memory_usage_released >= alloc_size
+        assert [buffer.data_ptr() for buffer in mgr.get_buffers(0)] == pointers
+        if manager_cls is KVCacheManagerV2:
+            assert torch.equal(metadata.cpu(), expected_metadata)
+        if restore_mode != virtual_memory.RestoreMode.NONE:
+            expected = 0 if restore_mode == virtual_memory.RestoreMode.MEMSET else cycle + 1
+            for buffer in buffers:
+                assert torch.all(buffer.float() == expected)
+
+    del buffer, buffers
+    if manager_cls is KVCacheManagerV2:
+        del metadata, expected_metadata
+    # Destruction must also be valid while the physical pages are released.
     virtual_memory.release_with_tag(tag)
-
-    memory_usage_released = get_current_process_gpu_memory()
-    if process_gpu_memory_info_available:
-        assert memory_usage_begin == memory_usage_released
-
-    torch.cuda.synchronize()
-    virtual_memory.materialize_with_tag(tag)
-
-    memory_usage_rematerialized = get_current_process_gpu_memory()
-    if process_gpu_memory_info_available:
-        assert memory_usage_begin + alloc_size == memory_usage_rematerialized
 
     mgr.shutdown()
     del mgr

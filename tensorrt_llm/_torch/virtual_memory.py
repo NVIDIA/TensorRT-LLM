@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import functools
 from contextlib import contextmanager
@@ -37,8 +40,10 @@ class _MultiPoolProxy:
     the proxy.
     """
 
-    def __init__(self):
+    def __init__(self, tag: str, mode: RestoreMode):
         self._pools: list[torch.cuda.MemPool] = []
+        self.tag = tag
+        self.mode = mode
 
     def _add(self, pool: torch.cuda.MemPool):
         self._pools.append(pool)
@@ -76,7 +81,7 @@ def _scope(
         push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
         pushed_allocator = True
 
-        proxy = _MultiPoolProxy()
+        proxy = _MultiPoolProxy(tag, mode)
         pool = torch.cuda.MemPool(
             _get_torch_pluggable_virtual_memory_allocator())
         pool_ctx = torch.cuda.use_mem_pool(pool)
@@ -103,6 +108,25 @@ def _scope(
 
 
 scope = contextmanager(_scope)
+
+
+@contextmanager
+def preserve_contents() -> Generator[None, None, None]:
+    """Preserve metadata allocated inside a scope that discards data on sleep.
+
+    The metadata keeps the parent's tag, so it is released with its owning
+    component, but restores its contents at the same addresses on wakeup.
+    """
+    if not _pool_stack or _pool_stack[-1][1].mode not in (RestoreMode.NONE,
+                                                          RestoreMode.MEMSET):
+        yield
+        return
+    parent = _pool_stack[-1][1]
+    with scope(parent.tag, RestoreMode.CPU) as proxy:
+        try:
+            yield
+        finally:
+            parent._pools.extend(proxy._pools)
 
 
 @contextmanager
