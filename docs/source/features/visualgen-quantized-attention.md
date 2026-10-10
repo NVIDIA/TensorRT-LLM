@@ -32,6 +32,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`algorithm: primsts`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`algorithm: primsts`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals (`algorithm: vc_attention-qk16`, `TLLM_FMHA_LIBS=+prims_ts`) |
+| `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | VC-Attention-QK8 for Blackwell, Hadamard-rotated E4M3 Q/K with per-block scales and the same V treatment (`algorithm: vc_attention-qk8`, `TLLM_FMHA_LIBS=+prims_ts`) |
 | `CUDNN` | `fp8` | `fp8` | `(0, 0, 0)` | cuDNN FP8 |
 | `CUDNN` | `mxfp8` | `mxfp8` | `(0, 0, 0)` | cuDNN MXFP8 |
 | `CUTEDSL` | `bf16` | `fp8` | `(0, 0, 0)` | QK16PV8 |
@@ -52,7 +53,7 @@ Video quality is generally more sensitive to BMM1 accuracy than BMM2 accuracy, s
 - On B300/GB300, start with MXFP8 when optimizing the quality-throughput balance. SageAttention with FP8 Q/K remains an alternative when the `TRTLLM` backend is preferred for the surrounding workload.
 - For SageAttention with INT8 Q/K, the default `(2, 16, 1)` or `(1, 16, 1)` block-size recipes works well for most cases. Use `(1, 4, 1)` when video quality is not satisfactory.
 - The `CUDNN` backend requires Q/K and V to use the same format. Use `fp8` for per-tensor scaling or `mxfp8` for block scaling.
-- For VC-Attention-QK16, `vc_repair_budget: 0.005` (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; `0.005` to `0.02` is the useful range.
+- For VC-Attention (`vc_attention-qk16` and `vc_attention-qk8`), `vc_repair_budget: 0.005` (0.5% of the tokens as repair rows) runs faster than the default tile means at unchanged quality; `0.005` to `0.02` is the useful range.
 - For `CUTEDSL` MXFP8 or NVFP4 recipes, `v_block_size: 1` uses a separate V scale per head and channel, while `v_block_size: 0` uses one tensor-wide V scale. Try the per-channel variant when the tensor-wide scale loses quality.
 
 After a recipe meets the quality target, benchmark its end-to-end throughput with the production workload.
@@ -66,8 +67,8 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `q_block_size` | int ≥ 0 | `0` | Q tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `k_block_size` | int ≥ 0 | `0` | K tokens per SageAttention quantization block. `0` outside SageAttention. |
 | `v_block_size` | int ≥ 0 | `0` | V block size on the hidden dimension. `0` = one tensor-wide V scale; `1` = one scale per channel. Keep `0` if `v_dtype` defines its own scaling format (e.g., `mxfp8` or `nvfp4`) |
-| `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention-QK16 appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention-qk16` only. |
-| `algorithm` | `"primsts" \| "sage" \| "vc_attention-qk16"` | `"sage"` | Kernel family serving the recipe on the `TRTLLM` backend. `sage` quantizes per block; `primsts` quantizes per tensor and `vc_attention-qk16` adds the VC-Attention V treatment (tile means restored in the kernel, V-Smooth over the denoising steps), both served by the `prims_ts` FMHA library. |
+| `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention-qk16` and `vc_attention-qk8` only. |
+| `algorithm` | `"primsts" \| "sage" \| "vc_attention-qk16" \| "vc_attention-qk8"` | `"sage"` | Kernel family serving the recipe on the `TRTLLM` backend. `sage` quantizes per block; `primsts` quantizes per tensor; `vc_attention-qk16` adds the VC-Attention V treatment (tile means restored in the kernel, V-Smooth over the denoising steps) to BF16 Q/K and `vc_attention-qk8` to Hadamard-rotated E4M3 Q/K with per-block scales; all served by the `prims_ts` FMHA library. |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention_backend/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and the dense `CuTeDSLAttention` FMHA backend for `CUTEDSL`.
 

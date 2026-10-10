@@ -500,13 +500,13 @@ class PrimsTSFmha(PhasedFmha):
         recipe = attn.quant_attention_config
         if recipe is not None and recipe.qk_dtype == "bf16" and q.dtype != torch.bfloat16:
             return False, f"the attention recipe keeps Q/K in BF16, got {q.dtype}."
-        if recipe is not None and recipe.algorithm == "vc_attention-qk16":
+        if recipe is not None and recipe.algorithm.startswith("vc_attention"):
             if attn.num_heads != attn.num_kv_heads:
-                return False, "VC-Attention-QK16 requires equal Q and K/V head counts."
+                return False, "VC-Attention requires equal Q and K/V head counts."
             if attn.head_dim != 128:
-                return False, "VC-Attention-QK16 requires head dimension 128."
+                return False, "VC-Attention requires head dimension 128."
             if mask_type != AttentionMaskType.padding:
-                return False, "VC-Attention-QK16 requires a dense mask."
+                return False, "VC-Attention requires a dense mask."
         output = fwd.output
         if output.dtype != q.dtype:
             return False, f"output dtype must match query dtype, got {output.dtype} and {q.dtype}."
@@ -855,7 +855,9 @@ class PrimsTSFmha(PhasedFmha):
         recipe = attn.quant_attention_config
         sm_scale = self._get_bmm1_scale(attn)
         scale_softmax_log2 = None
-        if recipe is not None and recipe.qk_dtype == "fp8":
+        is_vc = recipe is not None and recipe.algorithm.startswith("vc_attention")
+        # VC-Attention-QK8 quantizes Q/K itself (Hadamard rotation, per-block scales).
+        if recipe is not None and recipe.qk_dtype == "fp8" and not is_vc:
             q_bshd, q_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(q_bshd)
             k_bshd, k_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(k_bshd)
             scale_softmax_log2 = (
@@ -866,17 +868,21 @@ class PrimsTSFmha(PhasedFmha):
         output_scale = None
         vc_params = None
         vc_repair_tiles = 0
-        if recipe is not None and recipe.algorithm == "vc_attention-qk16":
-            # VC-Attention-QK16 carries its V scale and tile means in the run operands instead
-            # of a per-tensor output scale. With a repair budget the highest-residual tokens
-            # are appended as repair rows; otherwise the layer-owned preprocessor permutes K
-            # and splits V into tile means and E4M3 residuals on the V-Smooth schedule.
+        if is_vc:
+            # VC-Attention carries its V scale and tile means (and under QK8 the E4M3 Q/K
+            # with their block scales) in the run operands instead of per-tensor scales.
+            # With a repair budget the highest-residual tokens are appended as repair rows;
+            # otherwise the layer-owned preprocessor permutes K and splits V into tile means
+            # and E4M3 residuals on the V-Smooth schedule.
+            vc_q = q_bshd if recipe.algorithm == "vc_attention-qk8" else None
             if recipe.vc_repair_budget:
                 from tensorrt_llm._torch.attention.backends.prims_ts.vc_attention import (
                     vc_quantize_repair,
                 )
 
-                vc_operands = vc_quantize_repair(k_bshd, v_bshd, budget=recipe.vc_repair_budget)
+                vc_operands = vc_quantize_repair(
+                    k_bshd, v_bshd, budget=recipe.vc_repair_budget, q=vc_q
+                )
                 vc_repair_tiles = vc_operands.repair_tiles
             else:
                 from tensorrt_llm._torch.visual_gen.denoise_step import get_denoise_step
@@ -888,9 +894,11 @@ class PrimsTSFmha(PhasedFmha):
 
                     self._vc_preprocessor = VCAttentionPreprocessor()
                 vc_operands = self._vc_preprocessor.prepare(
-                    k_bshd, v_bshd, denoise_step=get_denoise_step()
+                    k_bshd, v_bshd, q=vc_q, denoise_step=get_denoise_step()
                 )
             k_bshd, v_bshd, vc_params = vc_operands.k, vc_operands.v, vc_operands.params
+            if vc_operands.q is not None:
+                q_bshd = vc_operands.q
         elif recipe is not None and recipe.v_dtype == "fp8":
             v_bshd, v_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(v_bshd)
             output_scale = v_dequant_scale.float().reshape(1)

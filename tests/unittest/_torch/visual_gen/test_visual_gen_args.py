@@ -183,10 +183,15 @@ class TestAttentionConfigQuantValidation:
     @pytest.mark.parametrize("sm_ver", [100, 103])
     @pytest.mark.parametrize(
         ("qk_dtype", "algorithm"),
-        [("bf16", "primsts"), ("fp8", "primsts"), ("bf16", "vc_attention-qk16")],
+        [
+            ("bf16", "primsts"),
+            ("fp8", "primsts"),
+            ("bf16", "vc_attention-qk16"),
+            ("fp8", "vc_attention-qk8"),
+        ],
     )
     def test_supported_quant_config_primsts(self, sm_ver, qk_dtype, algorithm):
-        """PrimTS per-tensor and VC-Attention-QK16 recipes validate on Blackwell."""
+        """PrimTS per-tensor and VC-Attention recipes validate on Blackwell."""
         with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=sm_ver):
             attention = AttentionConfig(
                 backend="TRTLLM",

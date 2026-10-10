@@ -1380,6 +1380,8 @@ _CACHE_FREE_CASE = dict(
         ("fp8", "fp8", "primsts", 0.0),
         ("bf16", "fp8", "vc_attention-qk16", 0.0),
         ("bf16", "fp8", "vc_attention-qk16", 0.01),
+        ("fp8", "fp8", "vc_attention-qk8", 0.0),
+        ("fp8", "fp8", "vc_attention-qk8", 0.01),
     ],
 )
 def test_prims_ts_cache_free_fp8_recipes(
@@ -1441,9 +1443,11 @@ def test_prims_ts_cache_free_fp8_recipes(
     def dequant_scale(x: torch.Tensor) -> torch.Tensor:
         return (x.float().abs().amax() / 448.0).reshape(1)
 
-    if algorithm == "vc_attention-qk16":
-        # The VC operands carry the V scale and tile means; no per-tensor scale is folded.
+    if algorithm.startswith("vc_attention"):
+        # The VC operands carry the V scale and tile means (and the Q/K block scales under
+        # QK8); no per-tensor scale is folded.
         assert run_kwargs["vc"] is not None
+        assert (run_kwargs["vc"].q_scale is not None) == (algorithm == "vc_attention-qk8")
         assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
         assert run_kwargs["output_scale"] is None
         assert run_kwargs["scale_softmax_log2"] is None

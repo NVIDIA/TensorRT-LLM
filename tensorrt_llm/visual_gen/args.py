@@ -109,17 +109,19 @@ class QuantAttentionConfig(StrictBaseModel):
         lt=1.0,
         status="prototype",
         description=(
-            "Fraction of tokens VC-Attention-QK16 appends as V repair rows instead of restoring "
+            "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
             "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
-            "fastest setting measured at unchanged quality. vc_attention-qk16 only."
+            "fastest setting measured at unchanged quality. vc_attention-qk16 and "
+            "vc_attention-qk8 only."
         ),
     )
-    algorithm: Literal["primsts", "sage", "vc_attention-qk16"] = Field(
+    algorithm: Literal["primsts", "sage", "vc_attention-qk16", "vc_attention-qk8"] = Field(
         "sage",
         status="prototype",
         description=(
             "TRTLLM kernel family for the recipe. primsts quantizes per tensor, sage per block, "
-            "vc_attention-qk16 adds the VC-Attention V treatment (both via TLLM_FMHA_LIBS=+prims_ts)."
+            "vc_attention-qk16 adds the VC-Attention V treatment to BF16 Q/K and vc_attention-qk8 "
+            "to E4M3 Q/K (Hadamard-rotated, per-block scales); all via TLLM_FMHA_LIBS=+prims_ts."
         ),
     )
 
@@ -188,15 +190,21 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
-        # VC-Attention-QK16 keeps Q/K in BF16 and stores V as E4M3 residuals around tile means.
+        # VC-Attention-QK16 keeps Q/K in BF16 and stores V as E4M3 residuals around tile means;
+        # VC-Attention-QK8 quantizes the Hadamard-rotated Q/K to E4M3 with per-block scales.
         VC_ATTENTION_QK16_RECIPES = {
             100: {("bf16", "fp8", (0, 0, 0))},
             103: {("bf16", "fp8", (0, 0, 0))},
+        }
+        VC_ATTENTION_QK8_RECIPES = {
+            100: {("fp8", "fp8", (0, 0, 0))},
+            103: {("fp8", "fp8", (0, 0, 0))},
         }
         TRTLLM_RECIPES = {
             "primsts": PRIMSTS_RECIPES,
             "sage": SAGE_RECIPES,
             "vc_attention-qk16": VC_ATTENTION_QK16_RECIPES,
+            "vc_attention-qk8": VC_ATTENTION_QK8_RECIPES,
         }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
@@ -238,9 +246,9 @@ class AttentionConfig(StrictBaseModel):
                     f"smooth_k is a SageAttention option and does not apply to "
                     f"algorithm='{q_config.algorithm}'."
                 )
-            if q_config.vc_repair_budget and q_config.algorithm != "vc_attention-qk16":
+            if q_config.vc_repair_budget and not q_config.algorithm.startswith("vc_attention"):
                 raise ValueError(
-                    f"vc_repair_budget is a VC-Attention-QK16 option and does not apply to "
+                    f"vc_repair_budget is a VC-Attention option and does not apply to "
                     f"algorithm='{q_config.algorithm}'."
                 )
         elif q_config.algorithm != "sage":
