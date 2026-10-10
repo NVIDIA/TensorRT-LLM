@@ -1228,6 +1228,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # The lender sharing.attach_staging installs, one per manager for its life; None without one.
+    # On the class so it exists without running __init__.
+    _sharing = None
 
     def __init__(
         self,
@@ -1388,8 +1391,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_joint_kv_cache_reuse = joint_kv_cache_reuse
         # A draft manager only publishes to its radix tree when it is paired.
         self._can_publish_block_reuse = joint_kv_cache_reuse or not self.is_draft
+        # Prompt tokens past a position that one-model draft layers read, kept where a subclass
+        # opts out of the backoff below: a block's reuse key covers no token past its end.
+        self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         # Unsupported adapters keep their main-like reuse endpoint.
-        self.reuse_match_backoff = draft_prompt_lookahead(spec_config) or 0
+        self.reuse_match_backoff = self._draft_prompt_lookahead
         if not self._supports_reuse_match_backoff:
             self.reuse_match_backoff = 0
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
@@ -2171,6 +2177,10 @@ class KVCacheManagerV2(BaseResourceManager):
             state[pool_id] = base.copy()
             if not fresh:
                 continue
+            # Earlier work can still use a page just given to this request: a copy into or out of it
+            # (staging, another tier), its previous owner's last step. The fill writes on the
+            # current stream, which need not follow that work, so the device finishes it first.
+            torch.cuda.synchronize()
             for layer_idx in self.pp_layers:
                 if self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]] != pool_id:
                     continue
@@ -3570,6 +3580,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{req.py_request_id} from {kv_cache.capacity} to "
                 f"{reverted_cap}"
             )
+        self._after_shrink(request_id, kv_cache)
 
     def revert_allocate_context(self, req: LlmRequest) -> bool:
         """Undo this iteration's context resize. False means the cache was dropped,
@@ -3600,6 +3611,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"request {req.py_request_id} from {kv_cache.capacity} "
                 f"to {pre_cap}"
             )
+        self._after_shrink(req.py_request_id, kv_cache)
         if pre_cap > 0:
             kv_cache.suspend()
         return True
@@ -4623,6 +4635,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{req.py_request_id}: could not resize to {capacity} tokens"
                         f"{self._draft_pool_diagnostic()}"
                     )
+                self._after_shrink(req.py_request_id, kv_cache)
 
             for req in scheduled_batch.generation_requests:
                 kv_cache = self._mirror_draft_kv_cache(req)
@@ -5611,12 +5624,21 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
+        if self._sharing is not None:
+            self._sharing._on_free(request.py_request_id, kv_cache)
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
         else:
             self.index_mapper.remove_sequence(request.py_request_id)
+
+    def _after_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
+        """Tell the lender, if one is attached, that ``kv_cache`` may have shrunk in place: blocks
+        past its capacity lost their pages, and growing again does not bring their contents back.
+        Every in-place shrink the manager makes calls this right after it."""
+        if self._sharing is not None:
+            self._sharing._on_shrink(request_id, kv_cache)
 
     def get_layer_page_index_scale(self, layer_idx: int) -> int:
         """Page-index scale of this layer's KV buffer. Layers in one pool can
@@ -5862,6 +5884,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        if self._sharing is not None:
+            self._sharing._on_shutdown()
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
             self.sparse_metadata_batch.close()
@@ -5877,6 +5901,10 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
         self.impl.shutdown()
+        if self._sharing is not None:
+            # After the runtime's shutdown, which raises while any cache is open, in the map or not;
+            # a poisoned runtime returns at once, and a close then does nothing.
+            self._sharing._on_caches_closed()
         # Shut the streaming event manager down last so removals emitted during
         # cache / impl teardown (via the radix tree's own event-manager
         # reference) are still flushed before the publisher stops. Do not null
@@ -6349,6 +6377,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"to capacity {new_capacity} and history length "
                     f"{history_length} tokens at generation update"
                 )
+            # Inline check: without a lender this per-request hot path makes no extra call.
+            if new_capacity is not None and self._sharing is not None:
+                self._after_shrink(req.py_request_id, kv_cache)
             self._allocated_draft_lens.pop(req.py_request_id, None)
 
     def copy_batch_block_offsets(
@@ -6576,3 +6607,5 @@ class KVCacheManagerV2(BaseResourceManager):
         self.impl.clear_reusable_blocks()
         if self.conversation_manager is not None:
             self.conversation_manager.clear()
+        if self._sharing is not None:
+            self._sharing._on_reset()
