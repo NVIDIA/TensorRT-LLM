@@ -662,6 +662,56 @@ def _assert_expected_generation(
     assert token_ids_by_output == expected_token_ids_by_output
 
 
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+def test_t5_v2_decode_beyond_encoder_length(
+    monkeypatch: pytest.MonkeyPatch, disable_overlap_scheduler: bool
+) -> None:
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    model_path = _get_t5_model_path("t5-small")
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    max_new_tokens = 32
+    assert max(len(tokenizer.encode(text)) for text in _MIXED_ENCODER_SOURCE_TEXTS) < max_new_tokens
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0, ignore_eos=True)
+    outputs_by_manager = []
+    for use_v2 in (False, True):
+        with LLM(
+            model_path,
+            backend="pytorch",
+            attn_backend="TRTLLM",
+            cuda_graph_config=_decoder_cuda_graph_config([1, 2]),
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            dtype="bfloat16",
+            enable_chunked_prefill=False,
+            kv_cache_config=KvCacheConfig(
+                use_kv_cache_manager_v2=use_v2,
+                enable_block_reuse=use_v2,
+                max_tokens=_MAX_KV_TOKENS,
+                free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+                cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            ),
+            max_batch_size=2,
+            max_input_len=_MAX_SEQUENCE_LENGTH,
+            max_num_tokens=_MAX_SEQUENCE_LENGTH,
+            max_seq_len=_MAX_SEQUENCE_LENGTH,
+            model_kwargs={"torch_dtype": "bfloat16"},
+            scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        ) as llm:
+            assert not llm._executor.engine.model_engine.attn_runtime_features.cache_reuse
+            rounds = []
+            for _ in range(2):
+                responses = llm.generate(
+                    _MIXED_ENCODER_SOURCE_TEXTS, sampling_params=sampling_params, use_tqdm=False
+                )
+                tokens = [list(response.outputs[0].token_ids) for response in responses]
+                assert all(len(output) == max_new_tokens for output in tokens)
+                rounds.append(tokens)
+            _assert_decoder_cuda_graphs_captured(llm)
+            assert rounds[0] == rounds[1]
+            outputs_by_manager.append(rounds[0])
+    assert outputs_by_manager[0] == outputs_by_manager[1]
+
+
 def _run_t5_pytorch_generate_encoder_decoder(
     monkeypatch: pytest.MonkeyPatch,
     model_name: str,
