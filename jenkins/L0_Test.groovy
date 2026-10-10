@@ -3895,7 +3895,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     securityContext:
                       capabilities:
                         add:
-                        - SYS_ADMIN"""
+                        - SYS_ADMIN
+                        - SYS_PTRACE"""
         break
     }
     if (modelExpress) {
