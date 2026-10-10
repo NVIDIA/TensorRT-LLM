@@ -159,7 +159,7 @@ void VirtMem::push()
     PooledPhysMemAllocator::PooledPhysMem handle;
     if (mSleepAllocator)
     {
-        mSleepAllocator.map(offset, physSize, mPhysMemAllocator.allocationProp());
+        mSleepAllocator.map(offset, physSize, mPhysMemAllocator.allocationProp(), cuCheck);
     }
     else
     {

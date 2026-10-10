@@ -4,12 +4,17 @@
 """Worker-side assertions for the native V2 sleep integration tests."""
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.executor.worker import GenerationExecutorWorker
 
 
 class V2SleepWorkerExtension:
     def assert_v2_cache_manager(self) -> None:
         assert isinstance(self.engine.kv_cache_manager, KVCacheManagerV2)
+
+    def assert_cache_manager_version(self, use_v2: bool) -> None:
+        manager_cls = KVCacheManagerV2 if use_v2 else KVCacheManager
+        assert isinstance(self.engine.kv_cache_manager, manager_cls)
 
 
 class V2SleepWorker(GenerationExecutorWorker):

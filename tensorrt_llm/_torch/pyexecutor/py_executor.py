@@ -1907,8 +1907,17 @@ class PyExecutor:
         return self.executor_request_queue.can_enqueue_request()
 
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.validate_sleep(tags)
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
+
+    def validate_sleep(self, tags: list[ExecutorMemoryType]) -> None:
+        if (ExecutorMemoryType.KV_CACHE in tags and self._is_kv_manager_v2
+                and self.kv_cache_transceiver is not None):
+            raise NotImplementedError(
+                "KV cache sleep with a V2 cache transceiver requires remote "
+                "memory re-registration, which is not supported. "
+                "Sleep tags must exclude KV_CACHE when using this combination.")
 
     def prepare_sleep(self, tags: list[ExecutorMemoryType]) -> None:
         """Invalidate cached prefixes before their contents are discarded.

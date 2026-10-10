@@ -204,13 +204,20 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
     )
 
     sleep_tags = [ExecutorMemoryType.KV_CACHE]
+    prompts = [prompt * 20 for prompt in _PROMPTS]
+    sampling_params = SamplingParams(temperature=0, max_tokens=16, return_perf_metrics=True)
 
     with llm:
         assert llm._executor.worker_cls is V2SleepWorker
-        outputs_before = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
+        outputs_before = llm.generate(prompts, sampling_params)
         generated_before = [o.outputs[0].text for o in outputs_before]
 
         for cycle in range(2):
+            warm_outputs = llm.generate(prompts, sampling_params)
+            assert any(
+                output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks > 0
+                for output in warm_outputs
+            )
             mem_active = _per_device_gpu_memory()
             active_devices = {dev for dev, size in mem_active.items() if size > 0}
             if process_gpu_memory_info_available:
@@ -224,7 +231,11 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
                 for dev in active_devices:
                     assert mem_sleep[dev] < mem_active[dev]
                     assert mem_wakeup[dev] > mem_sleep[dev]
-            outputs_after = llm.generate(_PROMPTS, _SAMPLING_PARAMS)
+            outputs_after = llm.generate(prompts, sampling_params)
+            assert all(
+                output.outputs[0].request_perf_metrics.kv_cache_metrics.num_reused_blocks == 0
+                for output in outputs_after
+            )
             generated_after = [o.outputs[0].text for o in outputs_after]
             assert generated_after == generated_before
 

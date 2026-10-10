@@ -306,7 +306,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
-    @control_action_decorator
     def sleep(self, sleep_tags: List[str]):
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
@@ -315,8 +314,13 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        self.engine.validate_sleep(tags)
+        self._sleep(tags)
+
+    @control_action_decorator
+    def _sleep(self, tags: List[ExecutorMemoryType]):
         try:
-            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
             self.engine.prepare_sleep(tags)

@@ -2700,7 +2700,8 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
 
 @pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
 @pytest.mark.parametrize("release_kv", [False, True])
-def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv):
+@pytest.mark.parametrize("joint_reuse", [False, True])
+def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reuse):
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
     stub = object.__new__(PyExecutor)
@@ -2709,13 +2710,33 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv):
     )
     stub.kv_cache_manager = Mock()
     stub.draft_kv_cache_manager = Mock()
+    stub.enable_joint_kv_cache_reuse = joint_reuse
     tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
 
     PyExecutor.prepare_sleep(stub, tags)
 
     expected = int(release_kv and mode in ("NONE", "MEMSET"))
     assert stub.kv_cache_manager.reset_reuse_state.call_count == expected
-    assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected
+    assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected * joint_reuse
+
+
+@pytest.mark.parametrize("release_kv,has_transceiver", [(True, True), (True, False), (False, True)])
+def test_v2_sleep_validates_registrations_before_closing_admission(release_kv, has_transceiver):
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+
+    stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
+    stub.kv_cache_transceiver = Mock() if has_transceiver else None
+    stub.executor_request_queue = Mock()
+    tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
+
+    if release_kv and has_transceiver:
+        with pytest.raises(NotImplementedError, match="remote memory re-registration"):
+            stub.begin_sleep_transition(tags)
+        stub.executor_request_queue.begin_sleep_transition.assert_not_called()
+    else:
+        stub.begin_sleep_transition(tags)
+        stub.executor_request_queue.begin_sleep_transition.assert_called_once()
 
 
 class TestPendingTransferResponseFlush:

@@ -7,22 +7,6 @@ l0_b200:
         lte: 1
     wildcards:
       gpu:
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: pytorch
-      orchestrator: ray
-  tests:
-  - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
-  - unittest/llmapi/test_async_llm.py::test_async_llm_awaitable
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
       - '*b100*'
       - '*b200*'
       linux_distribution_name: ubuntu*

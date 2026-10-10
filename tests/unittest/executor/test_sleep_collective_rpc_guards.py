@@ -545,17 +545,24 @@ class TestMnnvlSleepWakeupCoordination:
         run_mnnvl = Mock()
         worker.engine._has_mnnvl_checkpoint_resources = lambda tags: False
         worker.engine._run_mnnvl_checkpoint_resources = run_mnnvl
+        events = []
+        worker.engine.prepare_sleep.side_effect = lambda tags: events.append("prepare_sleep")
 
         with (
-            patch("tensorrt_llm._torch.virtual_memory.release_with_tag"),
+            patch(
+                "tensorrt_llm._torch.virtual_memory.release_with_tag",
+                side_effect=lambda *tags: events.append("release"),
+            ),
             patch("tensorrt_llm._torch.virtual_memory.materialize_with_tag"),
-            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.synchronize", side_effect=lambda: events.append("synchronize")),
             patch("gc.collect"),
             patch("torch.cuda.empty_cache"),
         ):
             worker._multi_rank_sleep_wakeup("sleep", [ExecutorMemoryType.KV_CACHE])
 
         run_mnnvl.assert_not_called()
+        worker.engine.prepare_sleep.assert_called_once_with([ExecutorMemoryType.KV_CACHE])
+        assert events.index("synchronize") < events.index("prepare_sleep") < events.index("release")
 
 
 class TestMultiRankSendFailureRecovery:
@@ -1139,6 +1146,10 @@ class TestListenerUncaughtExceptionSendsErrorAck:
         executor.control_action_done = threading.Event()
         executor._active_control_id = None
 
+        def fail_release(*tags):
+            executor.prepare_sleep.assert_called_once_with(["kv_cache"])
+            raise MemoryError("simulated OOM outside except list")
+
         with (
             patch("torch.cuda.set_device"),
             patch("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT"),
@@ -1146,7 +1157,7 @@ class TestListenerUncaughtExceptionSendsErrorAck:
             patch("tensorrt_llm._torch.pyexecutor.py_executor.set_thread_local_mpi_comm"),
             patch(
                 "tensorrt_llm._torch.virtual_memory.release_with_tag",
-                side_effect=MemoryError("simulated OOM outside except list"),
+                side_effect=fail_release,
             ),
             patch("torch.cuda.synchronize"),
         ):
