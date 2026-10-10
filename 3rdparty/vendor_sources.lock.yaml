@@ -3,14 +3,14 @@ vendors:
   flashinfer-prims-ts:
     url: https://github.com/harrisonzhy/flashinfer.git
     branch: harrisonzhy/trtllm-prims-ts-dev_perf-bringup
-    commit: e07d025a28dea210e8e377e01d6ed5ba1aef680f
+    commit: 865ce25081a9608931cc0128fb1b0ce7bcf0aeab
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:f573caea41687e947e9e8b12eab50a4d5f6502cd2ba968fcccf51529ad227c7b
-    digest: sha256-tree-v1:348b54e8651e7576057ab79e1dd38464860062d6acb62d63946c8bd95dd1f3a9
+    patch_digest: sha256:eebe26eee2271795a7e00e75bd849e72bc108bc2f45fa4ce6fc51b4566aeb46b
+    digest: sha256-tree-v1:bcbfa1e2166ad3295e0dc4a8cdd81f266d7923658050255d3e77b78dadbb64f4
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
