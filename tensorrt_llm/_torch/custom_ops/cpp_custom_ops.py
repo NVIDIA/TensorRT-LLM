@@ -309,6 +309,19 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::cublas_mm_tactic")
+    def _(mat_a, mat_b, bias, out_dtype, output_buffer_kind: int,
+          group: Optional[List[int]], tactic: int):
+        shape = list(mat_a.shape)
+        shape[-1] = mat_b.shape[-1]
+        ret = mat_a.new_empty(
+            shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
+        return ret
+
+    @torch.library.register_fake("trtllm::cublas_mm_num_tactics")
+    def _(mat_a, mat_b, bias):
+        return 0
+
     @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
