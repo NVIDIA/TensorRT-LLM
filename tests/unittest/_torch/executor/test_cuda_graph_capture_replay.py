@@ -332,6 +332,85 @@ class TestCaptureReplayStaticTensors:
         torch.testing.assert_close(logits_cuda_graph, logits_eager)
 
 
+class TestEngineBuffersAsStaticInputs:
+    """With static_input_ids / static_position_ids, the graphs' static inputs are views of the engine's own buffers:
+    the engine's writes are the graphs' inputs, and replay copies an input only when it is another tensor."""
+
+    def test_graph_reads_the_engine_buffers(self):
+        batch_size = 1
+        engine_input_ids = torch.zeros((8,), device="cuda", dtype=torch.int32)
+        engine_position_ids = torch.zeros((8,), device="cuda", dtype=torch.int32)
+        runner = create_mock_cuda_graph_runner(
+            batch_size,
+            max_num_tokens=8,
+            static_input_ids=engine_input_ids,
+            static_position_ids=engine_position_ids,
+        )
+        assert runner.shared_static_tensors["input_ids"].data_ptr() == engine_input_ids.data_ptr()
+        assert (
+            runner.shared_static_tensors["position_ids"].data_ptr()
+            == engine_position_ids.data_ptr()
+        )
+        key = KeyType(batch_size=batch_size, draft_len=0, is_first_draft=False)
+        num_tokens = runner._get_num_tokens_for_key(key)
+        attn_metadata = object()
+
+        def forward_fn(inputs):
+            return inputs["input_ids"] * 1000 + inputs["position_ids"][0]
+
+        def engine_inputs():
+            return {
+                "attn_metadata": attn_metadata,
+                "input_ids": engine_input_ids[:num_tokens],
+                "position_ids": engine_position_ids[:num_tokens].unsqueeze(0),
+            }
+
+        engine_input_ids.fill_(3)
+        engine_position_ids.fill_(4)
+        runner.capture(key, forward_fn, engine_inputs())
+        # The captured forward did not run, so the engine's buffers are as they were.
+        assert engine_input_ids.tolist() == [3] * 8
+        assert engine_position_ids.tolist() == [4] * 8
+
+        engine_input_ids[:num_tokens] = 7
+        engine_position_ids[:num_tokens] = 9
+        output = runner.replay(key, engine_inputs())
+        assert output.tolist() == [7009] * num_tokens
+
+        # Another tensor as the input is copied into the engine's buffers, which the graph reads.
+        other = {
+            "attn_metadata": attn_metadata,
+            "input_ids": torch.full((num_tokens,), 5, device="cuda", dtype=torch.int32),
+            "position_ids": torch.full((1, num_tokens), 6, device="cuda", dtype=torch.int32),
+        }
+        output = runner.replay(key, other)
+        assert output.tolist() == [5006] * num_tokens
+        assert engine_input_ids[:num_tokens].tolist() == [5] * num_tokens
+
+    @pytest.mark.parametrize(
+        "input_ids, position_ids, use_mrope",
+        [
+            pytest.param(torch.int64, torch.int32, False, id="int64-input-ids"),
+            pytest.param(torch.int32, None, False, id="no-position-ids"),
+            pytest.param(torch.int32, torch.int32, True, id="mrope"),
+            pytest.param("short", torch.int32, False, id="short"),
+        ],
+    )
+    def test_unusable_engine_buffers_are_rejected(self, input_ids, position_ids, use_mrope):
+        size = 0 if input_ids == "short" else 8  # the graphs need one token here
+        dtype = torch.int32 if input_ids == "short" else input_ids
+        with pytest.raises(ValueError):
+            create_mock_cuda_graph_runner(
+                1,
+                use_mrope=use_mrope,
+                max_num_tokens=8,
+                static_input_ids=torch.zeros((size,), device="cuda", dtype=dtype),
+                static_position_ids=None
+                if position_ids is None
+                else torch.zeros((8,), device="cuda", dtype=position_ids),
+            )
+
+
 class _MetadataStub:
     """Metadata stand-in with one graph-visible CUDA tensor; the strict check walks vars()."""
 
@@ -395,37 +474,44 @@ class TestStrictBufferCheck:
         assert output.item() == 99
 
     @pytest.mark.parametrize(
-        "owner, to_none, in_postprocess",
+        "owner, to_none",
         [
-            ("attn_metadata", False, False),
-            ("attn_metadata", True, False),
-            ("spec_metadata", False, False),
-            ("attn_metadata", False, True),
+            ("attn_metadata", False),
+            ("attn_metadata", True),
+            ("spec_metadata", False),
         ],
-        ids=["rebound_tensor", "non_tensor", "spec_metadata", "postprocess_fn"],
+        ids=["rebound_tensor", "non_tensor", "spec_metadata"],
     )
-    def test_replay_rejects_rebound_graph_attr(self, monkeypatch, owner, to_none, in_postprocess):
+    def test_replay_rejects_rebound_graph_attr(self, monkeypatch, owner, to_none):
         """Rebinding a graph-visible tensor attribute raises, naming the attribute."""
         runner, key, _, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
         if owner == "spec_metadata":
             inputs["spec_metadata"] = _MetadataStub(value=20)
 
-        def rebind(fn_inputs):
-            fn_inputs[owner].some_buf = (
-                None if to_none else torch.full((1,), 99, device="cuda", dtype=torch.int32)
-            )
-
-        runner.capture(
-            key,
-            self._forward_reading_some_buf,
-            inputs,
-            postprocess_fn=rebind if in_postprocess else None,
+        runner.capture(key, self._forward_reading_some_buf, inputs)
+        inputs[owner].some_buf = (
+            None if to_none else torch.full((1,), 99, device="cuda", dtype=torch.int32)
         )
-        if not in_postprocess:
-            rebind(inputs)
 
         with pytest.raises(RuntimeError, match="some_buf"):
             runner.replay(key, inputs)
+
+    def test_postprocess_fn_follows_only_the_warmup_forwards(self, monkeypatch):
+        """capture() calls postprocess_fn after each warmup forward, not after the captured one, so a rebind in it is
+        what the graph bakes in and the strict check accepts it."""
+        runner, key, _, inputs = self._make_runner_and_inputs(monkeypatch, value=10)
+        calls = []
+
+        def rebind(fn_inputs):
+            calls.append(1)
+            fn_inputs["attn_metadata"].some_buf = torch.full(
+                (1,), 99, device="cuda", dtype=torch.int32
+            )
+
+        runner.capture(key, self._forward_reading_some_buf, inputs, postprocess_fn=rebind)
+
+        assert len(calls) == runner.WARMUP_STEPS
+        assert runner.replay(key, inputs).item() == 99
 
     def test_replay_accepts_swapped_attr_with_unchanged_saved_target(self, monkeypatch):
         """A swapped attr is validated via its saved target; clearing the swap flags it."""

@@ -123,6 +123,7 @@ l0_b200:
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
+  - unittest/_torch/modules/test_multi_stream_utils.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
@@ -244,6 +245,10 @@ l0_b200:
   # accuracy deviation found so far is Blackwell-only), so it is not
   # hw-agnostic and needs its own Blackwell run.
   - unittest/_torch/speculative/test_fused_sampling_op.py
+  # One-model speculative decoding step-copy kernels and the engine's decode
+  # step that runs them (SM 100; they skip on other GPUs).
+  - unittest/_torch/cute_dsl_kernels/test_spec_step_copies.py
+  - unittest/_torch/executor/test_pytorch_model_engine.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/thop/serial

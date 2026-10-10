@@ -22,6 +22,7 @@ confidence_proj weights load without being used.
 import math
 import re
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -235,7 +236,9 @@ CTX_LEN = 24  # > SWA_WINDOW so the window binds
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dspark: bool, *, published_spelling: bool = False):
+def _tiny_config(
+    dspark: bool, *, published_spelling: bool = False, mask_token_id: Optional[int] = VOCAB - 2
+):
     """Tiny drafter config.
 
     ``published_spelling`` reproduces the two public K3 DSpark checkpoints
@@ -248,7 +251,9 @@ def _tiny_config(dspark: bool, *, published_spelling: bool = False):
     from transformers import Qwen3Config
 
     cfg = dict(TINY)
-    dflash = {"mask_token_id": VOCAB - 2, "target_layer_ids": [0, 1]}
+    dflash = {"target_layer_ids": [0, 1]}
+    if mask_token_id is not None:
+        dflash["mask_token_id"] = mask_token_id
     if dspark and published_spelling:
         cfg.update(
             markov_rank=RANK,
@@ -330,11 +335,14 @@ def _build_drafter(
     *,
     published_spelling: bool = False,
     dflash_attention_backend: str = "VANILLA",
+    mask_token_id: Optional[int] = VOCAB - 2,
 ):
     from tensorrt_llm._torch.model_config import ModelConfig
 
     model_config = ModelConfig(
-        pretrained_config=_tiny_config(dspark, published_spelling=published_spelling),
+        pretrained_config=_tiny_config(
+            dspark, published_spelling=published_spelling, mask_token_id=mask_token_id
+        ),
         attn_backend="TRTLLM",
     )
     # The DSpark head set lives in the DSpark drafter, not in the DFlash base.
@@ -452,6 +460,151 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
         drafter.confidence_proj_weight.cpu(), weights["confidence_proj.weight"]
     )
     assert drafter.confidence_proj_bias is not None
+
+
+@needs_gpu
+def test_gqa_dspark_keeps_its_trained_mask_row_over_the_target_embedding():
+    """The GQA drafter takes the target's embedding (load_weights_from_target_model), but a checkpoint that ships its
+    own embedding trained the mask token's row, which the target's embedding does not have. The drafter keeps that row
+    as ``mask_token_embedding``, and the worker's noise block puts it in every masked slot; slot 0 stays the bonus
+    token's embedding from the shared lookup.
+    """
+    h = TINY["hidden_size"]
+    weights = _tiny_weights()
+    g = torch.Generator().manual_seed(23)
+    weights["embed_tokens.weight"] = (torch.randn(VOCAB, h, generator=g) * 0.05).to(torch.bfloat16)
+    drafter = _build_drafter(True, weights)
+    target_embed = torch.nn.Embedding(VOCAB, h).to("cuda", torch.bfloat16)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed),
+        lm_head=torch.nn.Linear(h, VOCAB, bias=False),
+    )
+    drafter.load_weights_from_target_model(target)
+
+    mask_id = drafter.mask_token_id
+    trained = weights["embed_tokens.weight"][mask_id]
+    assert not torch.equal(target_embed.weight[mask_id].detach().cpu(), trained)
+    torch.testing.assert_close(drafter.mask_token_embedding.cpu(), trained, rtol=0, atol=0)
+
+    from tensorrt_llm._torch.speculative.dflash import dflash_noise_block_embedding
+
+    bonus = torch.tensor([3, 5], dtype=torch.long, device="cuda")
+    block = 4
+    with torch.no_grad():
+        noise = dflash_noise_block_embedding(
+            drafter.draft_model_full.model.embed_tokens,
+            bonus,
+            mask_id,
+            block,
+            drafter.mask_token_embedding,
+        )
+    assert tuple(noise.shape) == (2, block, h)
+    torch.testing.assert_close(
+        noise[:, 0].cpu(), target_embed.weight[bonus].detach().cpu(), rtol=0, atol=0
+    )
+    for j in range(1, block):
+        torch.testing.assert_close(noise[:, j].cpu(), trained.expand(2, -1), rtol=0, atol=0)
+
+
+@needs_gpu
+def test_gqa_dspark_mask_row_takes_the_drafter_dtype_and_device_at_load():
+    """The kept row is cast once, at load, to the drafter's dtype (bf16 here, from an fp32 checkpoint) and placed on
+    the device of the drafter's own parameters, so the worker's noise block uses it as is."""
+    weights = _tiny_weights()
+    g = torch.Generator().manual_seed(29)
+    weights["embed_tokens.weight"] = torch.randn(VOCAB, TINY["hidden_size"], generator=g) * 0.05
+    drafter = _build_drafter(True, weights)
+
+    row = drafter.mask_token_embedding
+    assert row.dtype == torch.bfloat16
+    assert row.device == drafter.fc.weight.device
+    trained = weights["embed_tokens.weight"][drafter.mask_token_id].to(torch.bfloat16)
+    torch.testing.assert_close(row.cpu(), trained, rtol=0, atol=0)
+
+
+@needs_gpu
+@pytest.mark.parametrize(
+    "width, mask_token_id, message",
+    [
+        (TINY["hidden_size"], VOCAB + 1, f"mask_token_id {VOCAB + 1} is not a row"),
+        (TINY["hidden_size"], -1, "mask_token_id -1 is not a row"),
+        (
+            TINY["hidden_size"] + 8,
+            VOCAB - 2,
+            rf"expected \[rows, hidden_size={TINY['hidden_size']}\]",
+        ),
+    ],
+    ids=["mask_id_past_the_rows", "negative_mask_id", "wrong_width"],
+)
+def test_gqa_dspark_rejects_a_mask_row_the_shipped_embedding_does_not_have(
+    width, mask_token_id, message
+):
+    """A mask id that is not a row of the shipped embedding, or rows that are not hidden_size wide, fail at load,
+    before any weight is copied, with an error that names the problem."""
+    weights = _tiny_weights()
+    weights["embed_tokens.weight"] = torch.zeros(VOCAB, width, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=message):
+        _build_drafter(True, weights, mask_token_id=mask_token_id)
+
+
+@needs_gpu
+def test_gqa_dspark_keeps_no_mask_row_when_its_config_names_no_mask_token():
+    """With no mask token named by the drafter config or a speculative config, the drafter keeps DFlash's default id
+    (vocab_size), one past the shipped rows: it keeps no row and loads."""
+    weights = _tiny_weights()
+    weights["embed_tokens.weight"] = torch.zeros(VOCAB, TINY["hidden_size"], dtype=torch.bfloat16)
+    drafter = _build_drafter(True, weights, mask_token_id=None)
+    assert drafter.mask_token_id == VOCAB
+    assert getattr(drafter, "mask_token_embedding", None) is None
+
+
+@needs_gpu
+def test_gqa_dspark_warns_when_its_shipped_embedding_keeps_no_mask_row():
+    """Keeping no row for DFlash's default id is logged as a warning, since the masked slots then use the shared
+    embedding's row instead of a trained one."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.models import modeling_dspark
+
+    weights = _tiny_weights()
+    weights["embed_tokens.weight"] = torch.zeros(VOCAB, TINY["hidden_size"], dtype=torch.bfloat16)
+    with patch.object(modeling_dspark.logger, "warning") as warning:
+        drafter = _build_drafter(True, weights, mask_token_id=None)
+    assert getattr(drafter, "mask_token_embedding", None) is None
+    messages = [" ".join(map(str, call.args)) for call in warning.call_args_list]
+    assert any("no trained mask row is kept" in m for m in messages), messages
+
+
+@needs_gpu
+def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
+    """A checkpoint that names its mask token only as ``dspark_noise_token_id``: the speculative config resolves that
+    key and the worker embeds its id, while the drafter config resolution falls back to DFlash's default. The builder
+    hands the drafter the speculative config's id, so the drafter keeps that id's trained row and its mask id is the
+    worker's."""
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    mask_id = VOCAB - 2
+    pretrained = _tiny_config(True, mask_token_id=None)
+    pretrained.dspark_noise_token_id = mask_id
+    spec = SimpleNamespace(
+        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+    )
+    drafter = _build_dspark_draft(
+        SimpleNamespace(spec_config=spec),
+        ModelConfig(pretrained_config=pretrained, attn_backend="TRTLLM"),
+        None,
+        None,
+    ).to("cuda")
+    weights = _tiny_weights()
+    g = torch.Generator().manual_seed(31)
+    trained = (torch.randn(VOCAB, TINY["hidden_size"], generator=g) * 0.05).to(torch.bfloat16)
+    weights["embed_tokens.weight"] = trained
+    drafter.load_weights(dict(weights))
+
+    assert isinstance(drafter, GQADSparkForCausalLM)
+    assert drafter.mask_token_id == spec.mask_token_id
+    torch.testing.assert_close(drafter.mask_token_embedding.cpu(), trained[mask_id], rtol=0, atol=0)
 
 
 @needs_gpu

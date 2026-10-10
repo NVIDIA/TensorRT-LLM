@@ -1415,6 +1415,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
+            # The indptrs below are read only by the context MLA kernels, and
+            # every batch with context requests rewrites them.
+            return
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,

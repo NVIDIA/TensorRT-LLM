@@ -2300,8 +2300,11 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        point and is read straight back from there).
     3. use_paged_context_fmha=False on a context call with a cached prefix is
        silently wrong — no exception, an answer far off the reference.
-    4. context_lengths on a context row must be this call's new-token count.
-       The sequence's full KV length and 0 are both far off.
+    4. context_lengths on a context row must be this call's new-token count;
+       0 is far off. A larger value is not probed: the context FMHA then
+       writes past the output buffer, which holds this call's new tokens
+       only (compute-sanitizer memcheck: invalid global writes), and corrupts
+       whatever lies beyond it.
 
     The wrong batch states of (3) and (4) also corrupt the pool, so every
     rival runs against its own freshly prepared copy of one fixed state:
@@ -2387,22 +2390,21 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
         base,
         "cached-prefix context at use_paged_context_fmha=False",
     )
-    for ctx_len in (cached + new, 0):
-        cenv, cq = prepared()
-        _assert_far_outside(
-            cenv.call_op(
-                cq,
-                [new],
-                1,
-                [0],
-                MASK_CAUSAL,
-                record=False,
-                ctx_lens_override=[ctx_len],
-                use_paged_context_fmha=True,
-            ),
-            base,
-            f"context_lengths={ctx_len}",
-        )
+    cenv, cq = prepared()
+    _assert_far_outside(
+        cenv.call_op(
+            cq,
+            [new],
+            1,
+            [0],
+            MASK_CAUSAL,
+            record=False,
+            ctx_lens_override=[0],
+            use_paged_context_fmha=True,
+        ),
+        base,
+        "context_lengths=0",
+    )
 
     # (2) page by page. Pages 0-1 hold the cached prefix and must be read;
     # page 2 holds only tokens 64..83, which this call appends itself.

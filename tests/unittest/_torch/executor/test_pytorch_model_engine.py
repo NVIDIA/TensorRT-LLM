@@ -1762,6 +1762,114 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             [generation.py_seq_slot], 0)
         kv_cache_manager.shutdown()
 
+    def test_spec_decode_graph_step_gather_kernel_matches_torch_path(
+            self) -> None:
+        """A CUDA graph decode step of a speculative engine whose overlap
+        gathers run as one StepInputGather launch writes what the torch path
+        writes."""
+        from tensorrt_llm._torch.attention.backends.trtllm import \
+            TrtllmAttentionMetadata
+        from tensorrt_llm._torch.cute_dsl_kernels.spec_step_copies import \
+            op as spec_step_copies
+        if not spec_step_copies.is_supported():
+            self.skipTest("the step-copy kernels run on SM 100")
+        max_draft_len = 3
+        tokens_per_step = max_draft_len + 1
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            spec_config=SADecodingConfig(max_draft_len=max_draft_len))
+        step_gather = model_engine._runner._step_input_gather
+        self.assertIsNotNone(step_gather)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # Three requests that ran in the previous step, in slots out of order.
+        slots = [5, 2, 7]
+        requests = kv_cache_manager.add_dummy_requests(
+            [1, 2, 3],
+            token_nums=[10, 17, 33],
+            is_gen=True,
+            max_num_draft_tokens=max_draft_len)
+        for request, slot in zip(requests, slots):
+            request.is_dummy_request = False
+            request.py_seq_slot = slot
+        batch = ScheduledRequests()
+        batch.generation_requests = requests
+        attn_metadata = model_engine._runner._set_up_attn_metadata(
+            kv_cache_manager)
+        self.assertIs(type(attn_metadata), TrtllmAttentionMetadata)
+        graph_metadata = attn_metadata.create_cuda_graph_metadata(
+            len(requests), False, max_draft_len)
+        spec_metadata = Mock(
+            _force_non_greedy_for_capture=False,
+            context_prompt_lookahead_tokens=None,
+        )
+
+        # The sampler's slot stores as the previous step left them.
+        num_slots = 8
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        previous = SampleStateTensorsSpec(
+            new_tokens=torch.randint(0,
+                                     1000, (tokens_per_step, num_slots, 1),
+                                     generator=generator,
+                                     dtype=torch.int32,
+                                     device="cuda"),
+            new_tokens_lens=torch.randint(1,
+                                          tokens_per_step + 1, (num_slots, ),
+                                          generator=generator,
+                                          dtype=torch.int32,
+                                          device="cuda"),
+            next_draft_tokens=torch.randint(0,
+                                            1000, (num_slots, max_draft_len),
+                                            generator=generator,
+                                            dtype=torch.int32,
+                                            device="cuda"),
+        )
+
+        def step_inputs(step_input_gather):
+            """The buffers one step writes, from a filler they all start at."""
+            model_engine._runner._step_input_gather = step_input_gather
+            for request, slot in zip(requests, slots):
+                request.py_batch_idx = slot
+            written = (model_engine._runner.input_ids_cuda,
+                       model_engine._runner.position_ids_cuda,
+                       model_engine._runner.draft_tokens_cuda,
+                       model_engine._runner.previous_pos_id_offsets_cuda,
+                       model_engine._runner.previous_kv_lens_offsets_cuda)
+            for buffer in written:
+                buffer.fill_(-3)
+            model_engine._runner._prepare_tp_inputs(
+                scheduled_requests=batch,
+                kv_cache_manager=kv_cache_manager,
+                attn_metadata=graph_metadata,
+                spec_metadata=spec_metadata,
+                new_tensors_device=previous,
+                resource_manager=resource_manager,
+                enable_spec_decode=True,
+                runtime_draft_len=max_draft_len,
+                is_dummy=False)
+            torch.cuda.synchronize()
+            return [buffer.clone() for buffer in written]
+
+        torch_path = step_inputs(None)
+        launched = []
+        launch = step_gather.gather
+
+        def recorded_launch(*args, **kwargs):
+            launched.append(launch(*args, **kwargs))
+            return launched[-1]
+
+        with patch.object(step_gather, "gather", side_effect=recorded_launch):
+            kernel_path = step_inputs(step_gather)
+        self.assertEqual(launched, [True])
+        for expected, actual in zip(torch_path, kernel_path):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        # The previous rows' input ids came from the stores, by slot.
+        num_tokens = len(requests) * tokens_per_step
+        expected_input_ids = previous.new_tokens[:, slots, 0].t().reshape(-1)
+        self.assertEqual(kernel_path[0][:num_tokens].tolist(),
+                         expected_input_ids.tolist())
+        kv_cache_manager.shutdown()
+
     def test_multimodal_encoder_max_seq_len(self) -> None:
 
         class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
