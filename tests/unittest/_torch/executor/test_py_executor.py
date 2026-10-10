@@ -2720,23 +2720,46 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected * joint_reuse
 
 
-@pytest.mark.parametrize("release_kv,has_transceiver", [(True, True), (True, False), (False, True)])
-def test_v2_sleep_validates_registrations_before_closing_admission(release_kv, has_transceiver):
-    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
+@pytest.mark.parametrize("entrypoint", ["mpi", "ray"])
+@pytest.mark.parametrize(
+    "tag,use_v2,has_transceiver,rejected",
+    [
+        ("kv_cache", True, True, True),
+        ("executor_extra", True, True, True),
+        ("executor_extra", False, True, True),
+        ("kv_cache", True, False, False),
+        ("model", True, True, False),
+    ],
+)
+def test_sleep_validates_registrations_before_closing_admission(
+    entrypoint, tag, use_v2, has_transceiver, rejected
+):
+    from tensorrt_llm.executor.ray.gpu_worker import RayGPUWorker
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig, TorchLlmArgs
 
     stub = object.__new__(PyExecutor)
-    stub._is_kv_manager_v2 = True
+    stub._is_kv_manager_v2 = use_v2
     stub.kv_cache_transceiver = Mock() if has_transceiver else None
     stub.executor_request_queue = Mock()
-    tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
-
-    if release_kv and has_transceiver:
-        with pytest.raises(NotImplementedError, match="remote memory re-registration"):
-            stub.begin_sleep_transition(tags)
-        stub.executor_request_queue.begin_sleep_transition.assert_not_called()
+    tags = [ExecutorMemoryType(tag)]
+    if entrypoint == "mpi":
+        run = stub.begin_sleep_transition
+        mutation = stub.executor_request_queue.begin_sleep_transition
     else:
-        stub.begin_sleep_transition(tags)
-        stub.executor_request_queue.begin_sleep_transition.assert_called_once()
+        worker = object.__new__(RayGPUWorker)
+        worker.engine = stub
+        worker.llm_args = Mock(spec=TorchLlmArgs, sleep_config=SleepConfig())
+        worker._sleep = Mock()
+        run = worker.sleep
+        mutation = worker._sleep
+
+    if rejected:
+        with pytest.raises(NotImplementedError, match="remote memory re-registration"):
+            run(tags)
+        mutation.assert_not_called()
+    else:
+        run(tags)
+        mutation.assert_called_once()
 
 
 class TestPendingTransferResponseFlush:

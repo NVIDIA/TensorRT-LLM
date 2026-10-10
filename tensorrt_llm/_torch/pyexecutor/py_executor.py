@@ -1912,12 +1912,16 @@ class PyExecutor:
                                                            for tag in tags)
 
     def validate_sleep(self, tags: list[ExecutorMemoryType]) -> None:
-        if (ExecutorMemoryType.KV_CACHE in tags and self._is_kv_manager_v2
-                and self.kv_cache_transceiver is not None):
+        releases_registered_memory = (ExecutorMemoryType.EXTRA_RESOURCES in tags
+                                      or
+                                      (self._is_kv_manager_v2
+                                       and ExecutorMemoryType.KV_CACHE in tags))
+        if self.kv_cache_transceiver is not None and releases_registered_memory:
             raise NotImplementedError(
-                "KV cache sleep with a V2 cache transceiver requires remote "
+                "Sleep of registered KV cache or transfer buffers requires remote "
                 "memory re-registration, which is not supported. "
-                "Sleep tags must exclude KV_CACHE when using this combination.")
+                "Exclude EXTRA_RESOURCES and, for V2, KV_CACHE when using a "
+                "cache transceiver.")
 
     def prepare_sleep(self, tags: list[ExecutorMemoryType]) -> None:
         """Invalidate cached prefixes before their contents are discarded.
