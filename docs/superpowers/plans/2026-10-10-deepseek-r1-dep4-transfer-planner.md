@@ -64,3 +64,16 @@ Files (outside repo, `/scratch/.../users/fredw/mv2-disagg/twonode/`): `alloc2.sb
 `client_gsm8k.py` (copy of the harness client closure around `run_accuracy_test`).
 Verify: both workers log `planner_id=deepseek_r1_0528_nvfp4_sm103_dep4`... (grep "Resolved" +
 transceiver logs), GSM8K within tolerance of 94.24, no `PeerIncompatibleError`.
+
+## Results (2026-10-10)
+
+- Task 1: planner + parity test committed (9a9b56e485); 33 tests green including the modeling_v2
+  claims and target-contract suites.
+- Task 2: in-repo 8-GPU gate committed (048bd64c25); collected, not runnable on 4-GPU nodes.
+- Task 3: two nodes (ctx dep4 on nvl72d202-T12, gen dep4 on nvl72d202-T16, NIXL over UCX tcp/eth0,
+  static worker URLs, `TRTLLM_MODELING_V2=require`). Both workers log
+  `KV transfer planned by DeepseekR1Dep4TransferPlanner`, no default-planner fallback, no
+  `PeerIncompatibleError`. GSM8K flexible-extract **95.22** against the 94.24 reference, PASSED;
+  1319 requests in 6.5 min. Launcher findings (loopback-only HTTP discovery, `--server_role`
+  crash in static mode, `UCX_TLS=^ib` requirement) are recorded in the dev scripts and memory,
+  not in the repo. Logs: `/scratch/fsw/portfolios/coreai/projects/coreai_comparch_trtllm/users/fredw/mv2-disagg/twonode/logs/run_20261010T182505Z`.
