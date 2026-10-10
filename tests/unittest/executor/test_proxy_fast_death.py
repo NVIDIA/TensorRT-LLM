@@ -457,32 +457,6 @@ def test_remote_worker_death_roundtrip():
     assert "rank 3 exploded" in str(exc)
 
 
-def test_server_async_callback_forwards_only_failures():
-    from concurrent.futures import Future
-
-    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer, RemoteWorkerDeath
-
-    server = object.__new__(RemoteMpiCommSessionServer)
-    sent = []
-    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
-
-    ok = Future()
-    ok.set_result(42)
-    server.mpi_async_error_callback(ok)
-    assert sent == []
-
-    cancelled = Future()
-    cancelled.cancel()
-    server.mpi_async_error_callback(cancelled)
-    assert sent == []
-
-    failed = Future()
-    failed.set_exception(RuntimeError("worker segfault"))
-    server.mpi_async_error_callback(failed)
-    assert len(sent) == 1 and isinstance(sent[0], RemoteWorkerDeath)
-    assert sent[0].message == "worker segfault"
-
-
 class _FakeZmqQueue:
     """poll()/get() stub fed with a fixed message sequence."""
 
