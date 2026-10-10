@@ -258,7 +258,6 @@ unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_input_not_
 unittest/_torch/modeling_v2/quantization/test_modeling_v2_fp4_quantize.py::test_input_not_mutated_and_deterministic SKIP (https://nvbugs/6852473)
 unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_input_not_mutated SKIP (https://nvbugs/6852473)
 unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py SKIP (https://nvbugs/6842831)
-unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)
 unittest/_torch/moe/test_moe_module.py::test_configurable_moe_multi_gpu[parallel=TTP-comm=NVLINK_ONE_SIDED-e8_k1_h512_i512-seq=8-dtype=torch.float16-backend=CUTLASS-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/6843482)
 unittest/_torch/multi_gpu/test_linear.py::test_row_linear_norm_fusion[2-hidden:16-seqlen:2] SKIP (https://nvbugs/6501404)
