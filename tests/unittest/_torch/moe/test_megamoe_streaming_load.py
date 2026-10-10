@@ -265,6 +265,28 @@ def test_helper_slots_widen_only_seven_kernel_planes() -> None:
     assert module.quant_scales.fc2_global is module.fc2_alpha
 
 
+@pytest.mark.parametrize("helper_slots", [0, 2])
+def test_create_weights_supports_meta_init(helper_slots: int) -> None:
+    """The model loader builds MoE layers under MetaInitMode.
+
+    Any op that touches a meta tensor raises there and makes the loader rebuild
+    the whole model on the host, so the large derived planes must stay meta.
+    """
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    mode_cls, method_cls = _load_classes()
+    module = _StreamingMoEModule(mode_cls.VANILLA, helper_slots=helper_slots)
+    with MetaInitMode():
+        method_cls().create_weights(module)
+
+    for name in ("mega_fc1_weight", "mega_fc1_weight_sf", "mega_fc2_weight", "mega_fc2_weight_sf"):
+        assert getattr(module, name).is_meta
+    norm = module.fc1_norm_const
+    assert not norm.is_meta
+    assert norm.shape[0] == NUM_EXPERTS + helper_slots
+    assert torch.equal(norm, torch.ones_like(norm))
+
+
 def test_initial_streaming_load_layer_atomic() -> None:
     method, module, weights = _fresh()
 

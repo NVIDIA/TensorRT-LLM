@@ -4286,10 +4286,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             plane = planes[name]
             return plane.storage_metadata(slots)
 
-        def empty_storage_parameter(name: str) -> nn.Parameter:
+        def storage_parameter(name: str, factory=torch.empty) -> nn.Parameter:
             shape, stride, dtype_name, _, _ = storage_metadata(
                 name, num_compute_slots)
-            tensor = torch.empty(shape, dtype=getattr(torch, dtype_name))
+            tensor = factory(shape, dtype=getattr(torch, dtype_name))
             if tuple(tensor.stride()) != stride:
                 raise RuntimeError(
                     f"{name} canonical storage descriptor is not contiguous")
@@ -4325,13 +4325,14 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                 "mega_fc2_weight",
                 "mega_fc2_weight_sf",
         ):
-            module.register_parameter(name, empty_storage_parameter(name))
+            module.register_parameter(name, storage_parameter(name))
 
         # Per-expert FC1-output (= FC2-input) NVFP4 quantization norm_const is
         # initialized to one and populated after loading from w2.input_scale.
-        norm = empty_storage_parameter("fc1_norm_const")
-        norm.data.fill_(1)
-        module.register_parameter("fc1_norm_const", norm)
+        # The ones come from the factory: MetaInitMode keeps torch.ones tensors
+        # real but rejects any later write into a meta tensor.
+        module.register_parameter(
+            "fc1_norm_const", storage_parameter("fc1_norm_const", torch.ones))
 
         # Alpha Parameters may have been resized or rebound after the parent
         # built its view; refresh it against the final seven-plane identities.
