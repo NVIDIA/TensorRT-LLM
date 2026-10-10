@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Hou Song <hous.ailab@gmail.com>
+Date: Thu, 7 Aug 2026 22:00:00 +0800
+Subject: [PATCH] Return hidden_states as additional output (v1.x, conceptual)
+
+In v1.x, DecoderModelForCausalLM.forward() calls self.model() which returns
+the full hidden_states tensor, then passes it to LogitsProcessor which takes
+only the last token.
+
+The framework's additional_model_outputs contract (handle_additional_outputs.py)
+expects the model forward to return a dict containing the requested keys.
+The model_engine.py invocation passes additional_model_outputs to the forward
+call. To expose hidden_states, modify forward to include it in the returned
+dict before LogitsProcessor compresses it.
+
+NOTE: On the PyTorch backend with remove_input_padding (default), the shape
+is packed [num_tokens, hidden_dim], not [batch, seq_len, hidden_dim].
+
+This is a conceptual patch based on source code analysis of v1.x main branch.
+Not yet runtime tested. The exact integration depends on how model_engine.py
+plumbs the additional_model_outputs parameter into the model forward call.
+
+Related issue: https://github.com/NVIDIA/TensorRT-LLM/issues/4414
