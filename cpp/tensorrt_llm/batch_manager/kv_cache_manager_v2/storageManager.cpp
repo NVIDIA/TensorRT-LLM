@@ -177,8 +177,8 @@ void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>
 {
     for (auto& pages : fallenPages)
     {
-        std::stable_sort(
-            pages.begin(), pages.end(), [](auto const& lhs, auto const& rhs) { return lhs->priority < rhs->priority; });
+        std::stable_sort(pages.begin(), pages.end(),
+            [](auto const& lhs, auto const& rhs) { return lhs->priority() < rhs->priority(); });
     }
 }
 
@@ -229,9 +229,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume)
+    float maxUtilForResume, Priority secondaryOffloadMinPriority)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
+    , mSecondaryOffloadMinPriority(secondaryOffloadMinPriority)
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
     , mSwaScratchReuse(std::move(swaScratchReuse))
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
@@ -754,7 +755,76 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 void StorageManager::scheduleForEviction(Page& page)
 {
     if (isEvictable(page))
+    {
         mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
+        scheduleRetentionExpiry(page);
+    }
+}
+
+void StorageManager::updatePriority(Page& page, Priority priority)
+{
+    TLLM_CHECK_WITH_INFO(
+        kPriorityMin <= priority && priority <= kPriorityMax, "Retention priority must be between 0 and 100");
+    if (priority == page.mPriority)
+    {
+        return;
+    }
+    // Keep ownership across removal: a droppable page may be owned only by its queue.
+    auto const keepAlive = page.sharedFromThis();
+    bool const queued = page.scheduledForEviction();
+    if (queued)
+    {
+        excludeFromEviction(page);
+    }
+    auto const oldPriority = page.mPriority;
+    page.mPriority = priority;
+    if (queued)
+    {
+        mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
+    }
+    if (mEventSink && page.isCommitted())
+    {
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        if (committed.block != nullptr && committed.block->holdsPage(committed))
+        {
+            mEventSink->addPriorityUpdated(committed.block->key, oldPriority, priority, page.lifeCycle);
+        }
+    }
+}
+
+void StorageManager::cancelRetentionExpiry(Page& page)
+{
+    if (page.mRetentionExpiry.has_value())
+    {
+        mRetentionExpiries.erase(*page.mRetentionExpiry);
+        page.mRetentionExpiry.reset();
+    }
+}
+
+void StorageManager::scheduleRetentionExpiry(Page& page)
+{
+    if (page.status() == PageStatus::DROPPABLE && page.mRetentionDuration.has_value()
+        && page.priority() != kPriorityDefault && !page.mRetentionExpiry.has_value())
+    {
+        page.mRetentionExpiry = mRetentionExpiries.emplace(
+            std::chrono::steady_clock::now() + *page.mRetentionDuration, page.sharedFromThis());
+    }
+}
+
+void StorageManager::refreshRetention()
+{
+    auto const now = std::chrono::steady_clock::now();
+    while (!mRetentionExpiries.empty() && mRetentionExpiries.begin()->first <= now)
+    {
+        auto const page = mRetentionExpiries.begin()->second.lock();
+        mRetentionExpiries.erase(mRetentionExpiries.begin());
+        if (page)
+        {
+            page->mRetentionExpiry.reset();
+            TLLM_CHECK_DEBUG(page->status() == PageStatus::DROPPABLE);
+            updatePriority(*page, kPriorityDefault);
+        }
+    }
 }
 
 void StorageManager::excludeFromEviction(Page& page)
@@ -794,6 +864,7 @@ void StorageManager::excludeFromEviction(Page& page)
 void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
+    refreshRetention();
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
     for (CacheLevel lvl{0}; lvl < goals.size(); ++lvl)
     {
@@ -811,6 +882,7 @@ void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex,
 void StorageManager::forceEvict(
     CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages, DropRecorder const& dropRecorder)
 {
+    refreshRetention();
     auto evicted = mLevels.at(level).controller.evict(minNumPages);
     auto rescheduleEvictedPagesOnFailure = makeEvictionRollbackGuard(evicted);
 
@@ -867,6 +939,28 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     CacheLevel lvlId, PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder,
     DropRecorder const& dropRecorder)
 {
+    for (auto& pages : fallenPages)
+    {
+        std::vector<SharedPtr<Page>> dropped;
+        for (auto iter = pages.begin(); iter != pages.end();)
+        {
+            auto const& page = *iter;
+            if (page->cacheLevel == kHotLevel && page->status() == PageStatus::DROPPABLE
+                && page->priority() < mSecondaryOffloadMinPriority)
+            {
+                dropped.push_back(std::move(*iter));
+                iter = pages.erase(iter);
+            }
+            else
+            {
+                ++iter;
+            }
+        }
+        if (dropRecorder && !dropped.empty())
+        {
+            dropRecorder(dropped, kHotLevel);
+        }
+    }
     if (TLLM_UNLIKELY(gDebug))
     {
         TLLM_CHECK_WITH_INFO(goals.size() == numCacheLevels(), "goals.rows must equal numCacheLevels");
@@ -960,7 +1054,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         auto backPriority = [&](LifeCycleId lifeCycle) -> std::optional<Priority>
         {
             auto const& fallen = fallenPages.at(lifeCycle);
-            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority};
+            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority()};
         };
         while (count > 0)
         {
@@ -972,7 +1066,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 auto& fallen = fallenPages.at(lifeCycle);
                 auto matchingBegin = std::lower_bound(fallen.begin(), fallen.end(), bestPriority,
-                    [](auto const& page, Priority priority) { return page->priority < priority; });
+                    [](auto const& page, Priority priority) { return page->priority() < priority; });
                 SlotCount const numAccepted
                     = std::min(count, slotCountValueFromSize(std::distance(matchingBegin, fallen.end())));
                 matchingBegin = fallen.end() - numAccepted;
@@ -1079,6 +1173,11 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
+                if (srcLevel == kHotLevel && page->status() == PageStatus::DROPPABLE)
+                {
+                    // Offloading an unreferenced page ends its released retention interval.
+                    page->claimRetention(std::nullopt, std::nullopt);
+                }
                 if (!isLast || page->status() != PageStatus::HELD)
                 {
                     lvl.controller.scheduleForEviction(*page);
@@ -1706,6 +1805,7 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::shrinkPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
+    refreshRetention();
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;

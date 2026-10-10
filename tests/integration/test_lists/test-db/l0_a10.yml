@@ -161,9 +161,7 @@ l0_a10:
   # by hand. test_connector_runs_on_kv_cache_manager_v2 is what makes the V2
   # entries meaningful -- the creator silently falls back to the V1 manager for
   # combinations it cannot serve, so without it every V2 id below could pass
-  # while running V1. test_connector_priorities[kv_cache_manager_v2] is
-  # xfail(strict=True) in the suite, not omitted here, so the retention gap
-  # stays counted. The two e2e cases below are the only multi-layer-group ones
+  # while running V1. The two e2e cases below are the only multi-layer-group ones
   # that move bytes -- the rest drive a MagicMock and assert routing.
   # test_connector_vswa_e2e_gemma3 is the interleaved-attention run (Gemma-3
   # asks for KVCacheManagerV2 itself, and its layer groups come out different
@@ -212,7 +210,6 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v2-True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
-  - llmapi/test_llm_api_connector.py::test_connector_warns_that_retention_is_ignored_on_v2[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-host_offloading]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-beam_search]

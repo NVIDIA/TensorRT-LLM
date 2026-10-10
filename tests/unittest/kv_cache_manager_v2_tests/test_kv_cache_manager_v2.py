@@ -25,6 +25,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
@@ -81,7 +82,9 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         MemToMemTask,
         copy_device_to_device,
     )
+    from bindings.executor import KvCacheRetentionConfig, KvCacheTransferMode  # isort: skip
 else:
+    from tensorrt_llm.bindings.executor import KvCacheRetentionConfig, KvCacheTransferMode
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
         MemToMemTask,
         copy_device_to_device,
@@ -405,6 +408,180 @@ class TestKVCacheManagerV2(unittest.TestCase):
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
+
+
+class TestRetention(TestKVCacheManagerV2):
+    def setUp(self) -> None:
+        super().setUp()
+        self.caches = []
+        self.stream = CachedCudaStream()
+
+    def tearDown(self) -> None:
+        for cache in reversed(self.caches):
+            cache.close()
+        self.caches.clear()
+        super().tearDown()
+
+    def _cache(self, tokens, config=None, prompt_length=None):
+        cache = self.manager.create_kv_cache(
+            input_tokens=tokens,
+            expected_prompt_length=len(tokens) if prompt_length is None else prompt_length,
+            kv_cache_retention_config=config,
+        )
+        self.caches.append(cache)
+        self.assertTrue(cache.resume(self.stream.handle))
+        self.assertTrue(cache.resize(len(tokens)))
+        remaining = tokens[cache.num_committed_tokens :]
+        if tokens:
+            self.engine.execute(
+                [Step(cache, remaining, tokens[: cache.num_committed_tokens])], self.stream.handle
+            )
+        if remaining:
+            cache.commit(remaining)
+        return cache
+
+    @staticmethod
+    def _config(priority, duration=None):
+        if priority is None:
+            return None
+        return KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, priority, duration)]
+        )
+
+    @parameterized.expand(
+        [(80, 10, False), (80, 10, True), (10, 80, False), (10, 80, True), (80, None, False)]
+    )
+    def test_shared_claim_order_controls_eviction(self, first, second, close_newer_first):
+        self.prepare(2 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+        prompt = [1, 2, 3, 4]
+        older = self._cache(prompt, self._config(first))
+        newer = self._cache(prompt, self._config(second))
+        priority = first if second is None else second
+        self.assertEqual(older.get_page_priorities(0), [priority])
+        self.assertEqual(newer.get_aggregated_page_indices(0), older.get_aggregated_page_indices(0))
+        requests = [newer, older] if close_newer_first else [older, newer]
+        requests[0].close()
+        self.assertEqual(requests[1].get_page_priorities(0), [priority])
+        competitor = self._cache([5, 6, 7, 8], self._config(50))
+        competitor.close()
+        # Referenced pages cannot be permanently evicted, irrespective of priority.
+        free = self.manager.get_storage_statistics()[0].free
+        pin = self._cache([])
+        self.assertTrue(pin.resize((free + 1) * 4))
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4)
+        self.assertEqual(self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0)
+        pin.close()
+        requests[1].close()
+        competitor = self._cache([5, 6, 7, 8], self._config(50))
+        competitor.close()
+        free = self.manager.get_storage_statistics()[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + 1) * 4))
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt), 4 if priority > 50 else 0)
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=[5, 6, 7, 8]), 0 if priority > 50 else 4
+        )
+
+    def test_prompt_decode_duration_and_unconfigured_claim(self):
+        self.prepare(2 << 20, 0, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+        duration = timedelta(milliseconds=20)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, duration)],
+            decode_retention_priority=10,
+            decode_duration_ms=duration,
+        )
+        tokens = list(range(12))
+        # A five-token prompt occupies two blocks; its partial second block stays context.
+        first = self._cache(tokens[:5], config)
+        self.assertTrue(first.resize(len(tokens)))
+        self.engine.execute([Step(first, tokens[5:], tokens[:5])], self.stream.handle)
+        first.commit(tokens[5:])
+        second = self._cache(tokens, config, prompt_length=5)
+        self.assertEqual(first.get_page_priorities(0), [35, 80, 10])
+        first.close()
+        time.sleep(0.04)
+        self.manager.refresh_retention()
+        self.assertEqual(second.get_page_priorities(0), [35, 80, 10])
+        second.close()
+        time.sleep(0.04)
+        self.manager.refresh_retention()
+        reclaimed = self._cache(tokens)
+        self.assertEqual(reclaimed.get_page_priorities(0), [35, 35, 35])
+        reclaimed.close()
+        long_duration = timedelta(seconds=1)
+        config = KvCacheRetentionConfig(
+            [KvCacheRetentionConfig.TokenRangeRetentionConfig(1, None, 80, long_duration)],
+            decode_retention_priority=10,
+            decode_duration_ms=long_duration,
+        )
+        timed = self._cache(tokens, config, prompt_length=5)
+        timed.close()
+        untimed = self._cache(tokens)
+        untimed.close()
+        time.sleep(1.05)
+        self.manager.refresh_retention()
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [35, 80, 10])
+
+    def test_offload_reload_and_error_cleanup(self):
+        self.prepare(2 << 20, 2 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(80))
+        cached.suspend()
+        free = self.manager.get_storage_statistics()[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + 1) * 4))
+        snapshot = cached.get_page_storage_snapshot(0)
+        self.assertEqual(snapshot.cache_levels, [CacheLevel(1)])
+        pressure.close()
+        self.assertTrue(cached.resume(self.stream.handle))
+        self.assertEqual(cached.get_page_priorities(0), [80])
+        self.assertEqual(cached.get_page_storage_snapshot(0).cache_levels, [GPU_LEVEL])
+        self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
+        self.stream.synchronize()
+        capacity = cached.capacity
+        total = self.manager.get_storage_statistics()[0].total
+        self.assertFalse(cached.resize((total + 1) * 4))
+        self.assertEqual(cached.capacity, capacity)
+        self.assertEqual(cached.get_page_priorities(0), [80])
+        self.engine.execute([Step(cached, [], tokens)], self.stream.handle)
+        self.stream.synchronize()
+        cached.close()
+        # Unsupported file-transfer semantics fail before claiming any reusable pages.
+        for mode in (KvCacheTransferMode.GDS, KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
+            config = KvCacheRetentionConfig([], transfer_mode=mode, directory="/tmp")
+            with self.assertRaisesRegex(ValueError, "per-request GDS/POSIX"):
+                self.manager.create_kv_cache(input_tokens=tokens, kv_cache_retention_config=config)
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [80])
+        for cache in self.caches:
+            cache.close()
+        self.manager.clear_reusable_blocks()
+        for level in (GPU_LEVEL, CacheLevel(1)):
+            for stats in self.manager.get_storage_statistics(level):
+                self.assertEqual(stats.free, stats.total)
+                self.assertEqual(stats.evictable, 0)
+
+    @parameterized.expand([(29, 30), (30, 30), (49, 50), (50, 50)])
+    def test_released_offload_threshold_and_duration(self, priority, threshold):
+        self.cfg = create_config(4, 2 << 20, 2 << 20, 0, 1, None, 0, 65536)
+        self.cfg.secondary_offload_min_priority = threshold
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        tokens = [1, 2, 3, 4]
+        cached = self._cache(tokens, self._config(priority, timedelta(seconds=2)))
+        cached.close()
+        free = self.manager.get_storage_statistics()[0].free
+        pressure = self._cache([])
+        self.assertTrue(pressure.resize((free + 1) * 4))
+        retained = priority >= threshold
+        self.assertEqual(self.manager.probe_reuse(input_tokens=tokens), 4 if retained else 0)
+        self.assertEqual(
+            self.manager.get_storage_statistics(CacheLevel(1))[0].evictable, 1 if retained else 0
+        )
+        pressure.close()
+        time.sleep(2.05)
+        self.manager.refresh_retention()
+        # GPU eviction-driven offload clears the old duration, retaining the priority.
+        self.assertEqual(self._cache(tokens).get_page_priorities(0), [priority if retained else 35])
 
 
 class TestStorageStatistics(TestKVCacheManagerV2):

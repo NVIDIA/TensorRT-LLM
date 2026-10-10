@@ -30,8 +30,8 @@ import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorManager,
-    KvCacheConnectorWorker, PrefixLoad, SchedulerOutput)
+    KvCacheConnectorManager, KvCacheConnectorWorker, PrefixLoad,
+    SchedulerOutput)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -40,7 +40,6 @@ from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           KvCacheConfig, KvCacheConnectorConfig,
                                           NGramDecodingConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
-from tensorrt_llm.logger import logger as trtllm_logger_singleton
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..conftest import get_sm_version, llm_models_root
@@ -1235,39 +1234,12 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [
-    pytest.param(False, id="kv_cache_manager_v1"),
-    pytest.param(
-        True,
-        id="kv_cache_manager_v2",
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=
-            "KvCacheRetentionConfig does not reach KVCacheManagerV2 at all "
-            "(per-page priority comes from custom_priority_callback, which "
-            "V2 never overrides), so the connector reports priorities=None."),
-    ),
-],
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
-def test_connector_priorities(enforce_single_worker, model_with_connector):
-    """Test that retention priorities flow through the connector correctly.
-
-    This test verifies that when KvCacheRetentionConfig is provided,
-    the RequestData.priorities field is populated with the correct
-    per-block priorities based on the token ranges.
-
-    KNOWN GAP -- `xfail(strict=True)` on `kv_cache_manager_v2`.
-    `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all: V2's
-    per-page priority comes from `custom_priority_callback`
-    (kv_cache_manager_v2/_core/_kv_cache_manager.py), which KVCacheManagerV2
-    never overrides, so every page carries the default priority and the
-    connector reports `priorities=None`. A user who sets a retention config on
-    V2 silently gets none of it -- not only through the connector. The
-    assertions below stay the correct expectation for both managers rather than
-    being relaxed per manager, so wiring retention into V2 turns this green
-    instead of needing the test rewritten; `strict=True` is what makes it fail
-    loudly on that day rather than passing silently.
-    """
+def test_connector_priorities(enforce_single_worker, model_with_connector,
+                              use_kv_cache_manager_v2):
+    """Native prompt/decode priorities reach the connector's offload filter."""
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
     NUM_TOKENS = 4
@@ -1277,6 +1249,7 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True)
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
@@ -1332,82 +1305,23 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     assert request.priorities[
         1] == LOW_PRIORITY, f"Expected priority {LOW_PRIORITY} for block 1, got {request.priorities[1]}"
 
-
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
-                         ids=["kv_cache_manager_v2"],
-                         indirect=True)
-def test_connector_warns_that_retention_is_ignored_on_v2(
-        enforce_single_worker, model_with_connector, caplog):
-    """A retention config that has no effect must say so.
-
-    `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all, so the
-    connector reports `priorities=None` there. `test_connector_priorities`
-    pins that gap as `xfail(strict=True)`; this pins the diagnostic, which is
-    the only thing standing between a user's retention config and it being
-    dropped in silence.
-
-    V2 only: on V1 the config is honoured and there is nothing to warn about.
-    """
-    model_fn, scheduler, worker = model_with_connector
-    model = model_fn(disable_overlap_scheduler=True)
-
-    scheduler.get_num_new_matched_tokens.return_value = 0, False
-    worker.get_finished.return_value = [], []
-
-    retention_config = KvCacheRetentionConfig(token_range_retention_configs=[
-        KvCacheRetentionConfig.TokenRangeRetentionConfig(token_start=0,
-                                                         token_end=32,
-                                                         priority=80)
-    ],
-                                              decode_retention_priority=10)
-
-    # Two gates sit between `logger.warning_once` and `caplog`, and both are
-    # process-global rather than per-test:
-    #
-    # 1. The TensorRT-LLM logger defaults to `error` (tensorrt_llm/logger.py:163),
-    #    and `Logger.log` drops anything below that before it reaches Python
-    #    logging at all. The LLM constructor raises the level to `info` only
-    #    while it parses arguments and restores it afterwards, so a warning
-    #    emitted during `generate` is discarded unless the level is raised here.
-    # 2. `log_once` records its key before consulting the level, so the key is
-    #    consumed by whichever test drove this path first in the process --
-    #    `test_connector_priorities[kv_cache_manager_v2]` above sets a
-    #    retention config on V2 too, and it runs first.
-    #
-    # Raise the level and clear the key so the assertion below observes this
-    # test's own emission instead of the leftovers of test ordering.
-    previous_level = trtllm_logger_singleton.level
-    trtllm_logger_singleton.set_level("warning")
-    trtllm_logger_singleton._appeared_keys.discard(V2_RETENTION_IGNORED_LOG_KEY)
-
-    # The TensorRT-LLM logger sets `propagate = False`, so caplog only sees its
-    # records once its handler is attached to that logger by name.
-    trtllm_logger = logging.getLogger(TRTLLM_LOGGER_NAME)
-    trtllm_logger.addHandler(caplog.handler)
-    try:
-        with caplog.at_level(logging.WARNING, logger=TRTLLM_LOGGER_NAME):
-            generate_and_wait(model,
-                              scheduler,
-                              worker, [0] * 64,
-                              sampling_params=SamplingParams(max_tokens=4,
-                                                             ignore_eos=True),
-                              kv_cache_retention_config=retention_config)
-    finally:
-        trtllm_logger.removeHandler(caplog.handler)
-        trtllm_logger_singleton.set_level(previous_level)
-
-    assert "KvCacheRetentionConfig has no effect" in caplog.text, (
-        "A retention config was set on KVCacheManagerV2 and nothing said it "
-        "would be ignored. The user's configuration is silently dropped:\n"
-        f"{caplog.text}")
-
-    # The other half: the warning describes what actually happened.
-    request = scheduler.build_connector_meta.call_args_list[0].args[
-        0].new_requests[0]
-    assert request.priorities is None, (
-        "priorities are populated on V2 after all, so the warning is now "
-        "wrong -- revisit it together with `test_connector_priorities`.")
+    # A connector can select blocks from actual scheduler metadata by priority.
+    selected = [
+        block_id
+        for block_id, priority in zip(request.new_block_ids, request.priorities)
+        if priority >= HIGH_PRIORITY
+    ]
+    assert selected == [request.new_block_ids[0]]
+    decode_requests = [
+        request_data
+        for meta_call in scheduler.build_connector_meta.call_args_list[1:]
+        for request_data in meta_call.args[0].cached_requests
+        if request_data.new_block_ids
+    ]
+    assert decode_requests, "generation must allocate a new decode block"
+    for request_data in decode_requests:
+        assert request_data.priorities == [LOW_PRIORITY] * len(
+            request_data.new_block_ids)
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -2137,7 +2051,13 @@ def test_connector_cancel_holds_pages_until_the_save_reads_them(
         cancelled = model.generate_async(
             [100] * CANCELLED_SAVE_PROMPT_TOKENS,
             SamplingParams(max_tokens=CANCELLED_SAVE_MAX_TOKENS,
-                           ignore_eos=True))
+                           ignore_eos=True),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                token_range_retention_configs=[
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        0, None, 0)
+                ],
+                decode_retention_priority=0))
         assert control.decoding.wait(60), "Request never reached generation"
         cancelled.abort()
 

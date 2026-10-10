@@ -55,11 +55,13 @@ int64_t sumSlotBytes(StorageManager const& storage, CacheLevel level, LifeCycleI
 
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
     std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength,
-    std::optional<bool> textOnly, bool enableRequestStats)
+    std::optional<bool> textOnly, bool enableRequestStats,
+    std::optional<executor::KvCacheRetentionConfig> retentionConfig)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
+    , mRetentionConfig(std::move(retentionConfig))
     , mStatus(Status::SUSPENDED)
     , mCommitState(CommitState::ALLOWED)
     , mBeamWidth(BeamIndex{1})
@@ -74,6 +76,26 @@ KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<B
     , mNumCommittedBlocks(0)
     , mTokensPerBlock(manager.tokensPerBlock())
 {
+    if (mRetentionConfig.has_value())
+    {
+        if (mRetentionConfig->getTransferMode() != executor::KvCacheTransferMode::DRAM)
+        {
+            throw std::invalid_argument(
+                "KVCacheManagerV2 does not support per-request GDS/POSIX transfer_mode or directory; "
+                "its offload storage is configured by the manager's cache tiers");
+        }
+        if (!expectedPromptLength.has_value())
+        {
+            throw std::invalid_argument("Retention requires the complete prompt length");
+        }
+        auto const priority = mRetentionConfig->getDecodeRetentionPriority();
+        if (priority < kPriorityMin || priority > kPriorityMax)
+        {
+            throw std::invalid_argument("Decode retention priority must be between 0 and 100");
+        }
+        mPromptRetentions
+            = mRetentionConfig->getPerBlockRetentionPriorityDuration(mTokensPerBlock, *expectedPromptLength);
+    }
     LifeCycleId numLc = manager.storage().numLifeCycles();
 
     // Initialise page index buffers: [beamIdx][lcId] = empty vector
@@ -142,7 +164,42 @@ CachedCudaEvent KvCache::finishEvent() const
 
 Priority KvCache::getPriority(BlockOrdinal ordinal, LifeCycleId lc) const
 {
+    auto const retention = getRetention(ordinal);
+    if (retention.retentionPriority.has_value())
+    {
+        return *retention.retentionPriority;
+    }
     return mPriorityCb(ordinal, lc);
+}
+
+executor::RetentionPriorityAndDuration KvCache::getRetention(BlockOrdinal ordinal) const
+{
+    if (!mRetentionConfig.has_value() || ordinal.value() < 0)
+    {
+        return {std::nullopt, std::nullopt};
+    }
+    if (static_cast<size_t>(ordinal.value()) < mPromptRetentions.size())
+    {
+        return mPromptRetentions.at(ordinal.value());
+    }
+    return {mRetentionConfig->getDecodeRetentionPriority(), mRetentionConfig->getDecodeDurationMs()};
+}
+
+std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, BeamIndex beamIndex) const
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockShared();
+    std::vector<Priority> result;
+    result.reserve(mBlocks.stdSize());
+    for (auto const& block : mBlocks)
+    {
+        auto const* page = beamIndex < block.pages.size()
+            ? blockPageGetPage(block.pages[beamIndex].at(layerGroupId)).get()
+            : nullptr;
+        // Preserve ordinals, including absent pages, just like getAggregatedPageIndices(validOnly=false).
+        result.push_back(page ? page->priority() : kPriorityDefault);
+    }
+    return result;
 }
 
 StorageManager* KvCache::storageManager() const
@@ -1076,6 +1133,8 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
         auto committed = makeShared<CommittedPage>(
             &storageMgr, treeBlock, lcIdx, lvl, numTokensInBlock, getPriority(treeBlock->ordinal(), lcIdx));
+        auto const retention = getRetention(treeBlock->ordinal());
+        committed->claimRetention(retention.retentionPriority, retention.durationMs);
         committed->setSlot(newSlot);
         // Drops the superseded page, deferred until the copy is issued: an
         // OutOfPagesError above must not destroy a usable shorter snapshot.
@@ -2080,6 +2139,8 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
             for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
             {
                 LifeCycleId lc = reuseTasks[ri].lifeCycle;
+                auto const retention = getRetention(BlockOrdinal{ord});
+                locks[ri].page()->claimRetention(retention.retentionPriority, retention.durationMs);
                 sb.pages[kDefaultBeamIndex][lc] = std::move(locks[ri]);
             }
             if (mIsDecoding)
@@ -2610,6 +2671,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             CacheLevel const level = page->cacheLevel;
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
+            auto const retention = getRetention(ordinal);
+            page->claimRetention(retention.retentionPriority, retention.durationMs);
             if (!isAttention)
             {
                 return;
@@ -2680,6 +2743,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
         TLLM_CHECK_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
         ssmLevel = snapshotPage->cacheLevel;
         mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
+        auto const retention = getRetention(snapshotBlock.ordinal());
+        snapshotPage->claimRetention(retention.retentionPriority, retention.durationMs);
     }
 
     _finalizeCachedTokensByLevel(numTokens, attentionLevels, ssmLevel);
