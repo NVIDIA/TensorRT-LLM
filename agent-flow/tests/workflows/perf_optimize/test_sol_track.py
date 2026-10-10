@@ -600,6 +600,40 @@ def test_a_ctx_campaign_is_scored_from_the_field_the_harness_validates_on(tmp_pa
     assert payload["source_field"] == "performance.request_throughput_req_s"
 
 
+def _ctx_case(root, name: str, value: float) -> None:
+    case = root / "baseline" / sol_track.RUN_SUBDIR / "bm_ctx" / name
+    case.mkdir(parents=True)
+    (case / "run_dep4_MTP0.json").write_text(
+        json.dumps({"performance": {"request_throughput_req_s": value}})
+    )
+
+
+def test_repeats_of_one_ctx_configuration_are_averaged_not_refused(tmp_path):
+    """A sweep's `rounds: 3` writes `_test1..3` for ONE configuration.
+
+    The reviewer's reproduction: three otherwise identical ctx cases measuring
+    8, 9 and 10 req/s. Collection used to refuse `_test2` as a second case at
+    the same concurrency, so a successful measurement could not be collected
+    -- and the run this was found on only got a score because the agent
+    submitted the repeats into separate directories by hand.
+    """
+    for n, value in ((1, 8.0), (2, 9.0), (3, 10.0)):
+        _ctx_case(tmp_path, f"ctx_8192_1_ratio08_2_16416_dep4_MTP0_test{n}", value)
+    written = sol_track.collect(_task("ctx"), tmp_path / "baseline")
+    payload = json.loads(written[0].read_text())
+    assert payload["avg_request_throughput_req_s"] == 9.0
+    assert [r["avg_request_throughput_req_s"] for r in payload["repeats"]] == [8.0, 9.0, 10.0]
+    assert payload["case"] == "ctx_8192_1_ratio08_2_16416_dep4_MTP0"
+
+
+def test_different_ctx_configurations_at_one_concurrency_are_still_refused(tmp_path):
+    """Grouping repeats must not turn a real collision into an average."""
+    _ctx_case(tmp_path, "ctx_8192_1_ratio08_2_16416_dep4_MTP0_test1", 8.0)
+    _ctx_case(tmp_path, "ctx_8192_1_ratio08_2_16416_dep4_MTP3_test1", 9.0)
+    with pytest.raises(sol_track.SolTrackError, match="both measure 2"):
+        sol_track.collect(_task("ctx"), tmp_path / "baseline")
+
+
 def test_a_ctx_run_with_nothing_validated_says_which_command_reports_why(tmp_path):
     (tmp_path / "baseline" / sol_track.RUN_SUBDIR / "bm_ctx").mkdir(parents=True)
     with pytest.raises(sol_track.SolTrackError, match="jobs check"):

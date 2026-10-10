@@ -1006,6 +1006,13 @@ def _collect_ctx(directory: Path, into: Path, metric: str) -> list[Path]:
     written: dict[int, Path] = {}
     cases: dict[int, str] = {}
     skipped: list[str] = []
+    # (concurrency, configuration) -> [(run_json, value)]. A sweep's `rounds`
+    # makes the harness write `_test1`, `_test2`, ... for ONE configuration, so
+    # those are repeats of a measurement, not rival operating points. They are
+    # grouped before the one-case-per-concurrency rule is applied, and the
+    # group's mean is the score -- otherwise the second repeat is refused as
+    # a collision and a successful measurement cannot be collected at all.
+    groups: dict[tuple[int, str], list[tuple[Path, float]]] = {}
 
     for result in sorted(directory.rglob("run_*.json")):
         if result.name.endswith("_timing.json"):
@@ -1020,19 +1027,28 @@ def _collect_ctx(directory: Path, into: Path, metric: str) -> list[Path]:
         if concurrency is None:
             skipped.append(f"{result.parent.name} (no batch in the dir name)")
             continue
-        _place(written, cases, concurrency, result.parent.name)
+        groups.setdefault((concurrency, _ctx_config(result.parent.name)), []).append(
+            (result, value)
+        )
+
+    for (concurrency, config), repeats in sorted(groups.items()):
+        # Two different configurations at one concurrency are still refused:
+        # that is a genuine collision, not a repeat.
+        _place(written, cases, concurrency, config)
+        values = [value for _, value in repeats]
         written[concurrency] = _write_result(
             into / f"concurrency_{concurrency}" / SOL_RESULT_NAME,
             {
-                metric: value,
+                metric: sum(values) / len(values),
                 "concurrency": concurrency,
-                "case": result.parent.name,
+                "case": config,
+                "repeats": [{"case": run.parent.name, metric: value} for run, value in repeats],
                 "run_dir": str(directory),
-                "source_run_json": str(result),
+                "source_run_json": [str(run) for run, _ in repeats],
                 "source_field": ".".join(CTX_RESULT_PATH),
             },
         )
-        cases[concurrency] = result.parent.name
+        cases[concurrency] = config
 
     if not written:
         raise SolTrackError(
@@ -1059,6 +1075,16 @@ def _ctx_concurrency(case_dir: str) -> int | None:
         return None
     batch = parts[4]
     return int(batch) if batch.isdigit() else None
+
+
+def _ctx_config(case_dir: str) -> str:
+    """The case directory name without its repeat suffix.
+
+    `..._MTP0_test2` and `..._MTP0_test3` are the same configuration measured
+    twice; everything before `_testN` is what identifies it.
+    """
+    stem, sep, tail = case_dir.rpartition("_test")
+    return stem if sep and tail.isdigit() else case_dir
 
 
 def _read_ctx_result(path: str) -> float | None:
