@@ -234,3 +234,43 @@ def test_indexer_helper_cubins_are_what_the_real_ops_load(tmp_path, kind, next_n
         timeout=900,
     )
     assert _entries(cache) == built, f"real op compiled {sorted(_entries(cache) - built)}"
+
+
+_GPU_MEGA = textwrap.dedent("""
+    import sys, json
+    from tensorrt_llm import deep_gemm
+    s = json.loads(sys.argv[1])
+    built = deep_gemm.compile_only_fp8_fp4_mega_moe(
+        s["num_ranks"], s["num_experts"], s["max_tokens"], s["topk"], s["num_tokens"],
+        s["hidden"], s["inter"], 0, s["activation"], s["clamp"], s["fast_math"],
+        s["situ_beta"], s["situ_linear_beta"])
+    print("BUILT", built)
+""")
+
+
+# MegaMoE has no separate real-op path to reach here without a symmetric
+# memory group, so the check is that the GPU process (real arch and SM count
+# from the device, not set_compile_target) resolves every band to the cubin
+# the GPU-less helper built: build_only reports nothing new to compile.
+@pytest.mark.skipif(not jdg.supports_mega_moe(), reason="needs the MegaMoE compile-only entry")
+def test_mega_moe_helper_builds_every_band(tmp_path):
+    p = jdg.MegaMoEProvider()
+    counts = p.band_token_counts(num_ranks=8, num_experts=256, max_tokens=512, topk=8)
+    assert len(counts) == 6, counts
+    specs = [
+        json.dumps(dict(op="mega_moe", num_ranks=8, num_experts=256, max_tokens=512, topk=8,
+                        num_tokens=n, hidden=7168, inter=2048, activation="swiglu", clamp=None,
+                        fast_math=True, situ_beta=None, situ_linear_beta=None), sort_keys=True)
+        for n in counts
+    ]  # fmt: skip
+    cache = str(tmp_path / "dg")
+    results = _helper_compile(cache, specs)
+    assert all(r["ok"] and r["built"] for r in results), results
+    built = _entries(cache)
+    assert len(built) == len(specs), sorted(built)
+    env = dict(os.environ, DG_JIT_CACHE_DIR=cache)
+    for spec in specs:
+        out = subprocess.run([sys.executable, "-c", _GPU_MEGA, spec], env=env, check=True,
+                             capture_output=True, text=True, timeout=900).stdout  # fmt: skip
+        assert "BUILT False" in out, out
+    assert _entries(cache) == built

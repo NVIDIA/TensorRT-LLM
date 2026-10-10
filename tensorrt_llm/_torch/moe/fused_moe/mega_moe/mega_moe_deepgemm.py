@@ -874,6 +874,16 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 
         y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
+        # Fixed per layer: everything the kernel is compiled with except the
+        # per-rank token count. Read by the JIT prefetcher to build the other
+        # token bands' variants (jit_prefetch_deep_gemm.MegaMoEProvider).
+        MEGA_MOE_LAYER_CONFIGS.add(
+            (buf.group.size(), buf.num_experts, buf.num_max_tokens_per_rank, buf.num_topk,
+             buf.hidden, buf.intermediate_hidden, self.dg_activation,
+             None if self.act_clamp is None else float(self.act_clamp), bool(self.fast_math),
+             None if self.act_alpha is None else float(self.act_alpha),
+             None if self.act_beta is None else float(self.act_beta))
+        )  # fmt: skip
         dg.fp8_fp4_mega_moe(
             y,
             self._t_l1,
@@ -889,6 +899,10 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             situ_linear_beta=self.act_beta,
         )
         return y.to(output_dtype)
+
+
+# Fixed compile-time parameters of every MegaMoE layer this process has run.
+MEGA_MOE_LAYER_CONFIGS: set = set()
 
 
 # An alias, not a base class, so there is no second class to keep in step.

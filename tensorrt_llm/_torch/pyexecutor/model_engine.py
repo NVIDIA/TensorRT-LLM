@@ -1483,7 +1483,10 @@ class PyTorchModelEngine(ModelEngine):
             from ..attention.backends.sparse.dsa import indexer as dsa_indexer
             has_dsa = (bool(dsa_indexer.DG_INDEXER_VARIANTS)
                        and jdg.supports_indexer())
-            if dg_provider or dg_moe or has_dsa:
+            from ..moe.fused_moe.mega_moe import mega_moe_deepgemm as mmd
+            has_mega = bool(
+                mmd.MEGA_MOE_LAYER_CONFIGS) and jdg.supports_mega_moe()
+            if dg_provider or dg_moe or has_dsa or has_mega:
                 prefetcher.enable_deep_gemm(dg_provider, dg_moe)
             if has_dsa:
                 spec_cfg = getattr(self, "spec_config", None)
@@ -1493,6 +1496,9 @@ class PyTorchModelEngine(ModelEngine):
                     max_draft, _dg.get_num_sms())
                 prefetcher.add_deep_gemm_specs(
                     self._jit_dsa_provider.pending_specs(), "dsa_indexer")
+            if has_mega:
+                prefetcher.add_deep_gemm_specs(
+                    jdg.MegaMoEProvider().pending_specs(), "mega_moe")
         from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
         if IS_CUTLASS_DSL_AVAILABLE and get_sm_version() in (100, 103):
             from .. import jit_prefetch_cute_dsl as jcd
@@ -1500,8 +1506,11 @@ class PyTorchModelEngine(ModelEngine):
             if kda_provider:
                 prefetcher.enable_cute_dsl(kda_provider)
         from ..modules.mamba.jit_prefetch_linear_attn import LinearAttnProvider
-        la_provider = LinearAttnProvider(self.model,
-                                         max_num_tokens=self.max_num_tokens)
+        la_provider = LinearAttnProvider(
+            self.model,
+            max_num_tokens=self.max_num_tokens,
+            chunk_size=getattr(self.attn_metadata, "mamba_chunk_size", 0)
+            if getattr(self, "attn_metadata", None) is not None else 0)
         if la_provider and prefetcher.register("linear_attn", la_provider):
             logger.info(f"[JIT prefetch] GDN/KDA provider: "
                         f"{len(la_provider.shapes)} distinct layer shape(s)")

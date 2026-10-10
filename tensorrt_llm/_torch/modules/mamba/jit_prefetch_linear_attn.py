@@ -101,7 +101,7 @@ class LinearAttnProvider:
     (pure generation batches at a captured size) are skipped by the caller.
     """
 
-    def __init__(self, model, max_num_tokens: int = 0):
+    def __init__(self, model, max_num_tokens: int = 0, chunk_size: int = 0):
         from .gdn_mixer import GatedDeltaNet
 
         try:
@@ -119,6 +119,9 @@ class LinearAttnProvider:
             shapes.setdefault(s.key(), s)
         self.shapes = list(shapes.values())
         self.max_num_tokens = int(max_num_tokens)
+        # Mamba2Metadata.chunk_size (the model config's chunk_size, else 128):
+        # sizes the chunk-index kernel the metadata launches for cached prefixes.
+        self.chunk_size = int(chunk_size) or 128
         self.device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
         self._seen: set = set()
         self._num_sms = None
@@ -133,7 +136,15 @@ class LinearAttnProvider:
             self._num_sms = _pdl_device_policy(self.device_index)[1]
         return self._num_sms
 
-    def batch_key(self, ctx_lens: List[int], gen_tokens: int) -> tuple:
+    def _chunk_index_n(self, ctx_lens: List[int]) -> int:
+        from .mamba2_metadata import compute_extra_chunks_cpu
+
+        T = sum(ctx_lens)
+        return -(-T // self.chunk_size) + compute_extra_chunks_cpu(
+            ctx_lens, len(ctx_lens), self.chunk_size
+        )
+
+    def batch_key(self, ctx_lens: List[int], gen_tokens: int, any_cached: bool = False) -> tuple:
         from .layernorm_gated import _MULTIROW_ROWS
 
         p = sum(ctx_lens)
@@ -143,20 +154,29 @@ class LinearAttnProvider:
             heads = s.v_heads if isinstance(s, _GdnShape) else s.heads
             m = t * heads
             pdl.append(-(-m // _MULTIROW_ROWS) < self._sms())
+        # Mamba2Metadata.prepare launches _cu_seqlens_triton_kernel only for a
+        # multi-sequence context batch with some cached prefix; its variant
+        # follows the integer classes of num_seqs and the chunk count N.
+        chunk_idx = None
+        if any_cached and len(ctx_lens) > 1:
+            chunk_idx = (_int_class(len(ctx_lens)), _int_class(self._chunk_index_n(ctx_lens)))
         return (bool(ctx_lens), gen_tokens > 0, _int_class(p), _int_class(gen_tokens),
-                _int_class(t), tuple(pdl))  # fmt: skip
+                _int_class(t), tuple(pdl), chunk_idx)  # fmt: skip
 
     def __call__(self, batch_ctx: Any, seen: Optional[set] = None) -> List[KernelCall]:
         ctx_lens = list(batch_ctx.ctx_chunk_lens)
         gen_tokens = int(getattr(batch_ctx, "gen_tokens", 0))
+        any_cached = bool(getattr(batch_ctx, "any_ctx_cached", False))
         if not ctx_lens and gen_tokens == 0:
             return []
         seen = self._seen if seen is None else seen
-        key = self.batch_key(ctx_lens, gen_tokens)
+        key = self.batch_key(ctx_lens, gen_tokens, any_cached)
         if key in seen:
             return []
         seen.add(key)
         calls: List[KernelCall] = []
+        if key[-1] is not None:
+            calls.extend(self._plan_chunk_indices(ctx_lens))
         for s in self.shapes:
             if isinstance(s, _GdnShape):
                 calls.extend(self._plan_gdn(s, sum(ctx_lens), gen_tokens))
@@ -190,8 +210,34 @@ class LinearAttnProvider:
                     continue
                 seen.add(k)
                 yield SimpleNamespace(ctx_chunk_lens=[p], gen_tokens=g, any_ctx_cached=False)
+        # Cached-prefix multi-sequence batches: one per (num_seqs, N) class.
+        c = self.chunk_size
+        for n in (2, 3, 15, 16, 17, 31, 32, 33):
+            for lens in ([c] * n, [c - 1] + [c] * (n - 1), [1] * n, [16] * n, [17] * n):
+                if sum(lens) > T:
+                    continue
+                k = self.batch_key(lens, 0, True)
+                if k in seen:
+                    continue
+                seen.add(k)
+                yield SimpleNamespace(ctx_chunk_lens=lens, gen_tokens=0, any_ctx_cached=True)
 
     # -- per-layer planners ------------------------------------------------
+    def _plan_chunk_indices(self, ctx_lens: List[int]) -> List[KernelCall]:
+        from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
+
+        n = len(ctx_lens)
+        # Mamba2Metadata.cu_seqlens is an int32 buffer sliced to n + 1 entries.
+        cu = torch.empty(n + 1, dtype=torch.int, device=torch.device("meta"))
+        with shadow_launches() as rec:
+            cu_seqlens_to_chunk_indices_offsets_triton(
+                cu,
+                self.chunk_size,
+                total_seqlens=sum(ctx_lens),
+                extra_chunks=self._chunk_index_n(ctx_lens) - -(-sum(ctx_lens) // self.chunk_size),
+            )
+        return list(rec)
+
     def _gated_norm(self, tokens: int, heads: int, dim: int, z: torch.Tensor, fp8: bool,
                     gate: str):  # fmt: skip
         from .layernorm_gated import rms_norm_gated_token_major

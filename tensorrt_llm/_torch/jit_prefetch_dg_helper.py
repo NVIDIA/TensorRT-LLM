@@ -104,6 +104,13 @@ def main():
                     getattr(torch, s["b"]),
                     tuple(s["recipe"]),
                 )
+            elif s["op"] == "mega_moe":
+                built = dg.compile_only_fp8_fp4_mega_moe(
+                    int(s["num_ranks"]), int(s["num_experts"]), int(s["max_tokens"]),
+                    int(s["topk"]), int(s["num_tokens"]), int(s["hidden"]),
+                    int(s["inter"]), 0, s["activation"], s["clamp"], bool(s["fast_math"]),
+                    s["situ_beta"], s["situ_linear_beta"],
+                )  # fmt: skip
             elif s["op"] == "paged_mqa_logits_metadata":
                 built = dg.compile_only_paged_mqa_logits_metadata(
                     int(s["next_n"]), bool(s["is_varlen"]), int(s["num_sms"])

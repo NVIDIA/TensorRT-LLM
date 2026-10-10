@@ -100,6 +100,12 @@ def supported() -> bool:
     )
 
 
+def supports_mega_moe() -> bool:
+    from tensorrt_llm import deep_gemm
+
+    return supported() and hasattr(deep_gemm, "compile_only_fp8_fp4_mega_moe")
+
+
 def supports_indexer() -> bool:
     """The patched DeepGEMM also has the DSA indexer compile-only entries."""
     from tensorrt_llm import deep_gemm
@@ -197,6 +203,54 @@ class DsaIndexerProvider:
         for n in self.next_ns:
             specs.append(_spec(op="paged_mqa_logits_metadata", next_n=n, is_varlen=False,
                                num_sms=self.num_sms))  # fmt: skip
+        out = [s for s in specs if s not in self._done]
+        self._done.update(out)
+        return out
+
+
+# get_block_config_for_mega_moe switches its tile config at these expected
+# tokens per expert (num_tokens * num_ranks * num_topk / num_experts).
+_MEGA_MOE_BANDS = (8.5, 16.5, 32.5, 64.5, 96.5)
+
+
+class MegaMoEProvider:
+    """DeepGEMM MegaMoE (MEGAMOE_DEEPGEMM backend): one variant per token band.
+
+    The kernel is compiled with the layer's fixed shape and the block config
+    the heuristic picks from the per-rank token count, which changes in six
+    bands; a rank's token count varies per batch (and per rank under
+    attention DP). Each real call records its layer config; this provider
+    queues one representative token count per band for each.
+    """
+
+    def __init__(self):
+        self._done: set = set()
+
+    @staticmethod
+    def band_token_counts(
+        num_ranks: int, num_experts: int, max_tokens: int, topk: int
+    ) -> List[int]:
+        per_token = num_ranks * topk / num_experts
+        out, lo = [], 0.0
+        for hi in _MEGA_MOE_BANDS + (float("inf"),):
+            # Smallest token count whose expected tokens/expert lies in (lo, hi].
+            n = max(1, int(lo / per_token) + 1)
+            if n * per_token <= hi and n <= max_tokens:
+                out.append(n)
+            lo = hi
+        return sorted(set(out))
+
+    def pending_specs(self) -> List[str]:
+        from .moe.fused_moe.mega_moe.mega_moe_deepgemm import MEGA_MOE_LAYER_CONFIGS
+
+        specs = []
+        for cfg in list(MEGA_MOE_LAYER_CONFIGS):
+            ranks, experts, max_tok, topk, hidden, inter, act, clamp, fm, sb, slb = cfg
+            for n in self.band_token_counts(ranks, experts, max_tok, topk):
+                specs.append(_spec(op="mega_moe", num_ranks=ranks, num_experts=experts,
+                                   max_tokens=max_tok, topk=topk, num_tokens=n, hidden=hidden,
+                                   inter=inter, activation=act, clamp=clamp, fast_math=fm,
+                                   situ_beta=sb, situ_linear_beta=slb))  # fmt: skip
         out = [s for s in specs if s not in self._done]
         self._done.update(out)
         return out

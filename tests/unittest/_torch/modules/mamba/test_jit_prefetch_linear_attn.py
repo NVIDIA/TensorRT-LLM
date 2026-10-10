@@ -71,6 +71,7 @@ def _provider(shapes):
     p.device_index = torch.cuda.current_device()
     p._seen = set()
     p._num_sms = None
+    p.chunk_size = 64
     return p
 
 
@@ -148,5 +149,42 @@ def test_kda_planned_keys_cover_real_launches(t):
 def test_enumeration_covers_pdl_threshold():
     s = _gdn()
     p = _provider([s])
-    pdl = {p.batch_key(b.ctx_chunk_lens, b.gen_tokens)[-1] for b in p.enumerate_batches()}
+    pdl = {p.batch_key(b.ctx_chunk_lens, b.gen_tokens)[5] for b in p.enumerate_batches()}
     assert {(True,), (False,)} <= pdl
+
+
+def _real_chunk_indices(ctx_lens, chunk_size):
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+        compute_extra_chunks_cpu,
+        cu_seqlens_to_chunk_indices_offsets_triton,
+    )
+
+    cu = torch.tensor([0, *torch.tensor(ctx_lens).cumsum(0).tolist()], dtype=torch.int,
+                      device="cuda")  # fmt: skip
+    with jp.shadow_launches() as rec:
+        cu_seqlens_to_chunk_indices_offsets_triton(
+            cu, chunk_size, total_seqlens=sum(ctx_lens),
+            extra_chunks=compute_extra_chunks_cpu(ctx_lens, len(ctx_lens), chunk_size),
+        )  # fmt: skip
+    return list(rec)
+
+
+# Cached-prefix multi-sequence prefill (Mamba2Metadata.prepare's chunk-index
+# kernel), across num_seqs and chunk-count classes.
+@pytest.mark.parametrize("ctx_lens", [[64, 64], [100, 37, 200], [1] * 17, [64] * 16, [65] * 33])
+def test_chunk_index_kernel_planned(ctx_lens):
+    p = _provider([_kda()])
+    batch = type("B", (), {"ctx_chunk_lens": ctx_lens, "gen_tokens": 0, "any_ctx_cached": True})()
+    planned = _keys(p(batch))
+    real = _keys(_real_chunk_indices(ctx_lens, p.chunk_size))
+    assert real and real <= planned, f"unplanned: {sorted(real - planned)}"
+
+
+def test_enumeration_covers_chunk_index_classes():
+    p = _provider([_kda()])
+    planned = set()
+    for b in p.enumerate_batches():
+        planned |= _keys(p(b, seen=set()))
+    for lens in ([64, 64], [100, 37, 200], [65] * 33):
+        real = _keys(_real_chunk_indices(lens, p.chunk_size))
+        assert real <= planned, f"{lens}: unplanned {sorted(real - planned)}"

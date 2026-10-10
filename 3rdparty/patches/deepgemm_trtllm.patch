@@ -127,6 +127,126 @@ index 902ae69..8f906f1 100644
  
  #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
      // FP8 FP4 GEMMs
+diff --git a/csrc/apis/mega.hpp b/csrc/apis/mega.hpp
+index 6466f30..bbe258d 100644
+--- a/csrc/apis/mega.hpp
++++ b/csrc/apis/mega.hpp
+@@ -32,6 +32,32 @@ static int get_block_m_for_mega_moe(
+     return block_m;
+ }
+ 
++// Ring capacities of the symmetric buffer: worst-case live pool blocks over all
++// candidate BLOCK_M, and the matching SF ring. Shared by the buffer sizing and
++// the compile-only entry so both see the values the kernel is built with.
++static std::pair<int, int> get_mega_moe_ring_tokens(const int& num_sms, const int& num_experts_per_rank,
++                                                    const int& num_max_routed_tokens,
++                                                    const int& hidden, const int& intermediate_hidden,
++                                                    const bool& with_sf) {
++    int num_ring_tokens = 0;
++    for (const auto& block_m: layout::kCandidateBlockM) {
++        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
++        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
++            num_pool_blocks, num_sms, hidden, intermediate_hidden);
++        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
++    }
++    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
++    int num_sf_ring_tokens = 0;
++    if (with_sf) {
++        for (auto block_m: layout::kCandidateBlockM) {
++            num_sf_ring_tokens = std::max(
++                num_sf_ring_tokens,
++                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
++        }
++    }
++    return {num_ring_tokens, num_sf_ring_tokens};
++}
++
+ static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+@@ -55,29 +81,11 @@ get_symm_buffer_size_for_mega_moe(
+     // Shared
+     const int shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
+ 
+-    // Iterate all block candidates to get the maximum ring size
+-    int num_ring_tokens = 0;
+-    for (const auto& block_m: layout::kCandidateBlockM) {
+-        const auto num_pool_blocks = ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
+-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+-            num_pool_blocks, num_sms, hidden, intermediate_hidden);
+-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
+-    }
+-    num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+-
+     // Parse MMA type
+     const auto mma_kind = parse_mma_kind(mma_type);
+     const auto with_sf = is_mma_with_sf(mma_kind);
+-
+-    // Compute num_sf_ring_tokens (max across all candidate block sizes)
+-    int num_sf_ring_tokens = 0;
+-    if (with_sf) {
+-        for (auto block_m: layout::kCandidateBlockM) {
+-            num_sf_ring_tokens = std::max(
+-                num_sf_ring_tokens,
+-                layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
+-        }
+-    }
++    const auto [num_ring_tokens, num_sf_ring_tokens] = get_mega_moe_ring_tokens(
++        num_sms, num_experts_per_rank, num_max_routed_tokens, hidden, intermediate_hidden, with_sf);
+ 
+     // All buffers
+     const auto mega_buffer = layout::MegaMoEBuffer(
+@@ -155,6 +163,35 @@ get_symm_buffer_size_for_mega_moe(
+     return {mega_buffer.get_num_bytes(), slice_input_buffers};
+ }
+ 
++// Compile-only twin of fp8_fp4_mega_moe for one per-rank token count: same
++// config, ring sizes and activation handling, no tensors.
++static bool compile_only_fp8_fp4_mega_moe(const int& num_ranks, const int& num_experts,
++                                          const int& num_max_tokens_per_rank, const int& num_topk,
++                                          const int& num_tokens, const int& hidden,
++                                          const int& intermediate_hidden,
++                                          const int& num_shared_experts,
++                                          const std::string& activation,
++                                          const std::optional<float>& activation_clamp_opt,
++                                          const bool& fast_math,
++                                          const std::optional<float>& situ_beta_opt,
++                                          const std::optional<float>& situ_linear_beta_opt) {
++    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10 and "compile-only is implemented for SM100 only");
++    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
++    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank and num_experts % num_ranks == 0);
++    const auto num_experts_per_rank = num_experts / num_ranks;
++    const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
++    const auto [num_ring_tokens, num_sf_ring_tokens] = get_mega_moe_ring_tokens(
++        device_runtime->get_num_sms(), num_experts_per_rank,
++        num_max_tokens_per_rank * num_ranks * num_active_topk,
++        hidden, intermediate_hidden, true);
++    return sm100_fp8_fp4_mega_moe_compile_only(
++        num_ranks, num_max_tokens_per_rank, num_experts_per_rank, num_shared_experts,
++        num_tokens, num_topk, hidden, intermediate_hidden,
++        num_ring_tokens, num_sf_ring_tokens,
++        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity()), fast_math,
++        activation == "situ", situ_beta_opt.value_or(0.0f), situ_linear_beta_opt.value_or(0.0f));
++}
++
+ static void fp8_fp4_mega_moe(
+     const torch::Tensor& y,
+     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+@@ -412,6 +449,14 @@ static void register_apis(pybind11::module_& m) {
+     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
+     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
++    m.def("compile_only_fp8_fp4_mega_moe", &compile_only_fp8_fp4_mega_moe,
++          py::arg("num_ranks"), py::arg("num_experts"), py::arg("num_max_tokens_per_rank"),
++          py::arg("num_topk"), py::arg("num_tokens"), py::arg("hidden"),
++          py::arg("intermediate_hidden"), py::arg("num_shared_experts") = 0,
++          py::arg("activation") = "swiglu", py::arg("activation_clamp") = std::nullopt,
++          py::arg("fast_math") = true, py::arg("situ_beta") = std::nullopt,
++          py::arg("situ_linear_beta") = std::nullopt,
++          py::call_guard<py::gil_scoped_release>());
+     m.def("bf16_mega_moe", &bf16_mega_moe);
+ #endif
+ }
 diff --git a/csrc/apis/runtime.hpp b/csrc/apis/runtime.hpp
 index 58fef94..96e1cb0 100644
 --- a/csrc/apis/runtime.hpp
@@ -415,6 +535,52 @@ index 9e4ba58..de11992 100644
  static void sm100_m_grouped_fp8_fp4_gemm_masked_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                                       const torch::Tensor& b, const torch::Tensor& sfb,
                                                       const torch::Tensor& d,
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index b323baa..f649fd1 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -329,4 +329,41 @@ static void sm100_fp8_fp4_mega_moe(
+     SM100FP8FP4MegaMoERuntime::launch(runtime, args);
+ }
+ 
++// Compile-only twin of sm100_fp8_fp4_mega_moe: the generated code depends on
++// the scalars below and on get_mega_moe_config (whose block config follows
++// the per-rank token count, in 6 bands), never on tensor contents. Builds the
++// variant into the on-disk cache without launching or loading it.
++static bool sm100_fp8_fp4_mega_moe_compile_only(
++    const int& num_ranks, const int& num_max_tokens_per_rank,
++    const int& num_experts_per_rank, const int& num_shared_experts,
++    const int& num_tokens, const int& num_topk,
++    const int& hidden, const int& intermediate_hidden,
++    const int& num_ring_tokens, const int& num_sf_ring_tokens,
++    const float& activation_clamp, const bool& fast_math,
++    const bool& use_situ, const float& situ_beta, const float& situ_linear_beta) {
++    const auto num_experts = num_experts_per_rank * num_ranks;
++    const auto config = get_mega_moe_config(
++        num_ranks, num_experts, num_experts_per_rank,
++        num_max_tokens_per_rank, num_tokens, num_topk, hidden, intermediate_hidden,
++        num_ring_tokens, num_sf_ring_tokens,
++        MmaKind::MXFP8FP4);
++    SM100FP8FP4MegaMoERuntime::Args args = {
++        .num_max_tokens_per_rank = num_max_tokens_per_rank,
++        .hidden = hidden, .intermediate_hidden = intermediate_hidden,
++        .num_experts = num_experts, .num_shared_experts = num_shared_experts,
++        .num_topk = num_topk,
++        .num_ranks = num_ranks,
++        .activation_clamp = activation_clamp,
++        .fast_math = fast_math,
++        .use_situ = use_situ,
++        .situ_beta = situ_beta, .situ_linear_beta = situ_linear_beta,
++        .config = config,
++        .launch_args = LaunchArgs(device_runtime->get_num_sms(),
++                                  config.num_dispatch_threads + config.num_non_epilogue_threads + config.num_epilogue_threads,
++                                  config.smem_size, 2)
++    };
++    return compiler->build_only("sm100_fp8_fp4_mega_moe", SM100FP8FP4MegaMoERuntime::generate(args));
++}
++
+ } // namespace deep_gemm
++
 diff --git a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp b/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
 index c594d2b..0406005 100644
 --- a/csrc/jit_kernels/impls/sm100_mqa_logits.hpp
@@ -502,7 +668,7 @@ index c594d2b..0406005 100644
  } // namespace deep_gemm
 +
 diff --git a/deep_gemm/__init__.py b/deep_gemm/__init__.py
-index f5e52b2..e4220f7 100644
+index f5e52b2..7ee5a07 100644
 --- a/deep_gemm/__init__.py
 +++ b/deep_gemm/__init__.py
 @@ -15,6 +15,7 @@ except ImportError:
@@ -532,6 +698,14 @@ index f5e52b2..e4220f7 100644
          fp8_fp4_mqa_logits,
          get_paged_mqa_logits_metadata,
          fp8_fp4_paged_mqa_logits,
+@@ -88,6 +94,7 @@ from .mega import (
+     get_symm_buffer_for_mega_moe,
+     transform_weights_for_mega_moe,
+     fp8_fp4_mega_moe,
++    compile_only_fp8_fp4_mega_moe,
+     bf16_mega_moe,
+ )
+ 
 diff --git a/deep_gemm/include/deep_gemm/comm/barrier.cuh b/deep_gemm/include/deep_gemm/comm/barrier.cuh
 index 50b894e..cc2f65d 100644
 --- a/deep_gemm/include/deep_gemm/comm/barrier.cuh
@@ -577,3 +751,17 @@ index 50b894e..cc2f65d 100644
                      DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
                  }
              }
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index f4233c0..c5bdc9b 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -207,3 +207,9 @@ def bf16_mega_moe(y: torch.Tensor,
+         activation, activation_clamp,
+         fast_math
+     )
++
++
++def compile_only_fp8_fp4_mega_moe(*args, **kwargs) -> bool:
++    """Build the fp8_fp4_mega_moe variant for one per-rank token count into the
++    JIT cache without launching it (SM100). Returns True if it compiled."""
++    return _C.compile_only_fp8_fp4_mega_moe(*args, **kwargs)
