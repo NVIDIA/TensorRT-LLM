@@ -11650,6 +11650,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         @staticmethod
         def get_default_split_kv(B: int, S: int, max_active_blocks: int) -> int:
+            # S is the number of packed 128-row query tiles per request.
             max_split_kv = 32
             blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
             split_kv = min(blocks_per_batch, max_split_kv)
@@ -11696,7 +11697,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # A later capture with a bigger workspace would resize it, so the
             # bound covers every batch size up-front."""
             max_active_blocks = cls._get_max_active_blocks()
-            return (2 * H * (max_active_blocks // 2) * (D + 1) *
+            # Each query tile reserves 128 rows, including its masked tail.
+            # For split_kv > 1, the occupancy heuristic bounds
+            # B * num_q_tiles * split_kv by max_active_blocks / 2 at a tuning
+            # bucket. Runtime batches below the next bucket can use up to
+            # twice that space. split_kv == 1 does not use this workspace.
+            return (2 * max(H, 128) * (max_active_blocks // 2) * (D + 1) *
                     acc_dtype.width // 8)
 
         @classmethod
@@ -11771,8 +11777,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ((128, 128), (128, 256)),
             ]
             max_active_blocks = self._get_max_active_blocks()
+            num_q_tiles = ceil_div(h * seq_len_q, 128)
             split_candidates = self.get_split_kv_candidates(
-                batch_size, seq_len_q, max_active_blocks)
+                batch_size, num_q_tiles, max_active_blocks)
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
@@ -11962,9 +11969,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
+            num_q_tiles = ceil_div(self.num_heads * self.seq_len_q, 128)
             split_kv = self.get_default_split_kv(bucketed_batch_size,
-                                                 self.seq_len_q,
-                                                 max_active_blocks)
+                                                 num_q_tiles, max_active_blocks)
             is_persistent = self.get_default_is_persistent(bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
@@ -11995,6 +12002,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     inputs[8] (softmax_stats): Optional contiguous float32 tensor
                         of shape (B * S_q, H, 2). The kernel writes an equivalent
                         softmax (max, sum) pair for Helix reduction.
+                    inputs[9] (kv_bounds): Optional contiguous int32 per-query
+                        local KV bounds of shape (B * S_q,).
                 tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
                     split_kv, is_persistent).
                 **kwargs: Optional softmax_scale and output_scale values.
@@ -12121,12 +12130,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
                     self._CLUSTER_SHAPE_MNK[2])
 
-                # Fold seq_len_q into the head dimension when the head count
-                # alone does not fill the MMA M tile (num_heads < M) and there
-                # is more than one query token (MTP / spec-decode).
-                fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
-                           and seq_len_q > 1)
-
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
                     cutlass.Float32,  # lse_dtype
@@ -12140,7 +12143,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._IS_VAR_SPLIT_KV,
                     num_heads=self.num_heads,
                     seq_len_q=seq_len_q,
-                    fold_sq=fold_sq,
+                    reducer_max_splits=32,
                     emit_softmax_stats=self.emit_softmax_stats,
                 )
                 q_latent_ct = cute.runtime.from_dlpack(
@@ -12198,6 +12201,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     split_kv,
                     cache_seqs_ct,
                     kv_bounds_ct,
+                    None,  # cum_seq_lens_q: this path uses fixed query lengths
                     block_split_kvs_ct,
                     cutlass.Float32(softmax_scale),
                     cutlass.Float32(output_scale),
@@ -12237,6 +12241,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 split_kv,
                 cache_seqs,
                 kv_bounds,
+                None,  # cum_seq_lens_q: this path uses fixed query lengths
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
                 softmax_scale,
                 output_scale,
