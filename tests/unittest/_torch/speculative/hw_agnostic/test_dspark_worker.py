@@ -33,6 +33,7 @@ from tensorrt_llm._torch.speculative.dspark import (
 )
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import get_spec_metadata
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="DSpark metadata/worker allocate CUDA buffers"
@@ -169,6 +170,10 @@ def test_worker_graph_bucket_uses_full_seq_slot_pool():
         tokens_per_gen_step=6,
         spec_dec_mode=SpeculativeDecodingMode.DSPARK,
         target_layer_ids=[],
+        # The embedded form is the one served by DSv4DSparkWorker and its
+        # DSparkSpecMetadata; the standalone form routes to DFlash metadata.
+        draft_is_embedded_in_target=True,
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
     )
     metadata = get_spec_metadata(
         spec_config,
@@ -321,7 +326,7 @@ def test_seed_context_windows_reads_only_each_chunk_tail(chunks, window, final_w
         written.append(positions.tolist())
 
     draft.write_context_windows = write
-    meta = types.SimpleNamespace(max_num_requests=2, request_ids=[100, 101])
+    meta = types.SimpleNamespace(max_num_requests=2, num_seq_slots=2, request_ids=[100, 101])
     worker._lazy_init(draft, meta)
     expected = []
     total_kept = 0
@@ -633,6 +638,7 @@ def test_disagg_position_bootstrap_uses_actual_positions_and_target_width():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=None,
         verify_lens=None,
     )
@@ -1163,6 +1169,7 @@ def test_ragged_draft_gathers_each_requests_hidden_state():
     draft_model = _RecordingDraftModel()
     metadata = types.SimpleNamespace(
         max_num_requests=2,
+        num_seq_slots=2,
         qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device="cuda"),
         verify_lens=torch.tensor([4, 2], dtype=torch.int32, device="cuda"),
     )
