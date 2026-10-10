@@ -1697,7 +1697,10 @@ def executor_request_to_llm_request(
 def rewind_context_after_cache_drop(request: LlmRequest,
                                     tokens_per_block: int) -> None:
     """Reset context progress after callers release the request's KV caches."""
-    request.set_prepopulated_prompt_len(0, tokens_per_block)
+    # The setter requires prepopulated < promptLen. A Helix CP rank that holds
+    # none of the prompt has promptLen 0, so there is nothing to reset.
+    if request.prompt_len > 0:
+        request.set_prepopulated_prompt_len(0, tokens_per_block)
     # Clearing prepopulation does not rewind the native context cursor.
     request.context_current_position = 0
     request.context_chunk_size = request.prompt_len

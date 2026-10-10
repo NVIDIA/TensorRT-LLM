@@ -38,7 +38,7 @@ from tensorrt_llm.deep_gemm import (
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from ..params import use_self_sampling_gvr
+from ..params import get_indexer_mqa_logits_elem_budget, use_self_sampling_gvr
 from .params import DSAParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
@@ -51,10 +51,10 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # indefinitely in cuMemCreate on the longest-context (attention_dp laggard) rank
 # -> GPU idle -> peers block at the next MoE all-to-all -> watchdog hang. Tiling
 # the query dimension caps the transient to q_tile x kv with identical results
-# (each query row's logits/top-k are independent). Override via env if needed.
-_INDEXER_MQA_LOGITS_ELEM_BUDGET = int(
-    os.environ.get("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", 1 << 31)
-)
+# (each query row's logits/top-k are independent). Override via env if needed;
+# the KV cache budget reserves the same cap (see KvCacheCreator), so both read it
+# through one helper.
+_INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 
 if TYPE_CHECKING:
     from .metadata import DSAtrtllmAttentionMetadata

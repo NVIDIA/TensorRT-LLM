@@ -49,9 +49,15 @@ class CuteDslMlaFmha(PhasedFmha):
             logger.debug("CuTe DSL MLA FMHA is unavailable: nvidia-cutlass-dsl is not installed.")
             return False
 
+        # SM107 (Rubin) also relies on the tcgen05 arch branches inside
+        # mla_decode_fp{16,8}.py covering it; widening this gate alone makes the
+        # kernel run but emit all-NaN (the softmax row_max LdRed atom falls
+        # through to the wrong branch).
         sm = get_sm_version()
-        if sm not in (100, 103):
-            logger.debug(f"CuTe DSL MLA FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
+        if sm not in (100, 103, 107):
+            logger.debug(
+                f"CuTe DSL MLA FMHA is unavailable: requires SM100, SM103 or SM107, got SM{sm}."
+            )
             return False
 
         if not attn.is_mla_enable:

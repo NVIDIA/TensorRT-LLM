@@ -182,3 +182,57 @@ def test_destroy_drops_workspace_when_cft_release_fails(
     assert workspace_key not in NVLinkOneSided._WORKSPACES
     assert NVLinkOneSided._WORKSPACE is None
     assert workspace_state == {}
+
+
+def test_destroy_releases_only_its_own_cft_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Each workspace owns its own CFT manager, so teardown is per workspace.
+
+    Releasing one workspace must pass exactly that workspace to
+    ``moe_a2a_cft_release`` (which erases only its manager) and leave another
+    CFT workspace, and its endpoint, untouched.
+    """
+    released_key, kept_key = ("cft-workspace-a",), ("cft-workspace-b",)
+    released_workspace, kept_workspace = object(), object()
+    released_state = {
+        "cft_initialized": True,
+        "workspace": released_workspace,
+        "ep_rank": 1,
+        "mnnvl_mem": object(),
+    }
+    kept_state = {
+        "cft_initialized": True,
+        "workspace": kept_workspace,
+        "ep_rank": 1,
+        "mnnvl_mem": object(),
+    }
+    monkeypatch.setattr(
+        NVLinkOneSided,
+        "_WORKSPACES",
+        {released_key: released_state, kept_key: kept_state},
+    )
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE_REFCOUNTS", {released_key: 1, kept_key: 1})
+    monkeypatch.setattr(NVLinkOneSided, "_WORKSPACE", kept_state)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    release_cft_manager = MagicMock()
+    monkeypatch.setattr(torch.ops.trtllm, "moe_a2a_cft_release", release_cft_manager, raising=False)
+
+    comm = NVLinkOneSided.__new__(NVLinkOneSided)
+    comm._destroyed = False
+    comm._workspace_key = released_key
+    comm._workspace_state = released_state
+    comm._workspace_lifecycle = None
+    comm._workspace_registered = True
+    comm.mnnvl_mem = released_state["mnnvl_mem"]
+    comm.workspace = released_workspace
+    comm._dispatch_state = {"phase": "idle"}
+
+    comm.destroy()
+
+    release_cft_manager.assert_called_once_with(released_workspace, 1)
+    assert released_key not in NVLinkOneSided._WORKSPACES
+    assert NVLinkOneSided._WORKSPACES[kept_key] is kept_state
+    assert kept_state["cft_initialized"] is True
+    assert NVLinkOneSided._WORKSPACE is kept_state
+    assert NVLinkOneSided._WORKSPACE_REFCOUNTS == {kept_key: 1}
