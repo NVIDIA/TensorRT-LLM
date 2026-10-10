@@ -6265,6 +6265,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # the scheduler next iteration.
             if not kv_cache.is_active:
                 continue
+            if self.kv_cache_type == CacheTypeCpp.CROSS:
+                # The first decoder context writes the entire encoder K/V,
+                # independently of the decoder's context chunk boundaries.
+                self._resize_context_history(req, kv_cache, req.encoder_output_len)
+                kv_cache.enable_swa_scratch_reuse = False
+                continue
             should_block_reuse = (
                 self.enable_block_reuse
                 and self._can_publish_block_reuse
@@ -6300,6 +6306,9 @@ class KVCacheManagerV2(BaseResourceManager):
         attn_metadata: "AttentionMetadata" = None,
         kv_cache_dtype_byte_size: float = None,
     ):
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            # Encoder K/V remains fixed throughout decoder generation.
+            return
         if not self.is_draft:
             _update_kv_cache_draft_token_location(
                 self, scheduled_batch, attn_metadata, kv_cache_dtype_byte_size

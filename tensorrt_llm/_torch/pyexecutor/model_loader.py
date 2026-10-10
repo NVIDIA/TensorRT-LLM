@@ -249,6 +249,15 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
             raise ValueError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."
             )
+        if (kv_cache_config.use_kv_cache_manager_v2 is True
+                and kv_cache_config.enable_block_reuse):
+            # Both self- and cross-attention K/V depend on the full encoder
+            # input, which is not part of V2's prefix reuse identity.
+            logger.warning(
+                "Disabling KV cache block reuse for encoder-decoder models "
+                "with KV cache manager V2: reuse requires the full encoder "
+                "input identity.")
+            kv_cache_config.enable_block_reuse = False
         return
 
     if kv_cache_config.cross_kv_cache_fraction is not None:

@@ -802,6 +802,9 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # Model loading can disable reuse after runtime features were created.
+    _set_model_engines_cache_reuse([model_engine],
+                                   kv_cache_config.enable_block_reuse)
     validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()

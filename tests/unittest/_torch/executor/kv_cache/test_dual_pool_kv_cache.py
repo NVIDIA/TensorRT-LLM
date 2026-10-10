@@ -34,6 +34,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_loader import validate_encoder_decoder_kv_cache_config
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
@@ -985,3 +988,117 @@ class TestV1DualPoolSmoke:
         cross_kwargs = create_mock.call_args.kwargs
         assert cross_kwargs["kv_cache_manager_cls"] is KVCacheManager
         assert cross_kwargs["kv_cache_type"] == cache_type_cross
+
+
+class TestCrossCacheV2Lifecycle:
+    @staticmethod
+    def _make_manager(encoder_length: int) -> tuple[KVCacheManagerV2, Mock]:
+        cache = Mock(capacity=encoder_length, history_length=0, is_active=True)
+
+        def resize(capacity: int | None, history_length: int | None = None) -> bool:
+            new_capacity = cache.capacity if capacity is None else capacity
+            new_history = cache.history_length if history_length is None else history_length
+            if not cache.history_length <= new_history <= new_capacity:
+                raise ValueError("Invalid KV cache history")
+            cache.capacity = new_capacity
+            cache.history_length = new_history
+            return True
+
+        cache.resize.side_effect = resize
+        manager = object.__new__(KVCacheManagerV2)
+        manager.kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+        manager.kv_cache_map = {1: cache}
+        manager.enable_block_reuse = False
+        manager._can_publish_block_reuse = True
+        manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+        manager.conversation_manager = None
+        manager.is_draft = False
+        manager._allocated_draft_lens = {}
+        manager.kv_compression_manages_history = False
+        manager._has_cp_helix = False
+        return manager, cache
+
+    @pytest.mark.parametrize("decoder_length", [1, 16])
+    def test_context_records_all_encoder_kv(self, decoder_length: int) -> None:
+        manager, cache = self._make_manager(encoder_length=8)
+        request = SimpleNamespace(
+            py_request_id=1,
+            encoder_output_len=8,
+            context_current_position=decoder_length,
+            context_remaining_length=0,
+        )
+        manager.update_context_resources(SimpleNamespace(context_requests=[request]))
+
+        assert cache.history_length == 8
+        assert cache.capacity == 8
+        cache.commit.assert_not_called()
+
+    def test_decoder_chunks_do_not_advance_cross_history(self) -> None:
+        manager, cache = self._make_manager(encoder_length=8)
+        request = SimpleNamespace(py_request_id=1, encoder_output_len=8)
+        for position in (4, 8, 12):
+            request.context_current_position = position
+            request.context_remaining_length = 12 - position
+            manager.update_context_resources(SimpleNamespace(context_requests=[request]))
+            assert cache.history_length == cache.capacity == 8
+
+    @pytest.mark.parametrize("rewind_len", [0, 3])
+    def test_generation_keeps_fixed_encoder_cache(self, rewind_len: int) -> None:
+        manager, cache = self._make_manager(encoder_length=8)
+        cache.history_length = 8
+        request = SimpleNamespace(
+            py_request_id=1,
+            py_num_accepted_draft_tokens=0,
+            py_rewind_len=rewind_len,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            max_beam_num_tokens=17,
+        )
+        batch = SimpleNamespace(context_requests=[], generation_requests=[request])
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2."
+            "_update_kv_cache_draft_token_location"
+        ) as relocate:
+            manager.update_resources(batch)
+
+        assert cache.history_length == cache.capacity == 8
+        cache.resize.assert_not_called()
+        relocate.assert_not_called()
+
+    @pytest.mark.parametrize("with_cross", [False, True])
+    @pytest.mark.parametrize("with_draft", [False, True])
+    def test_executor_updates_cross_context(self, with_cross: bool, with_draft: bool) -> None:
+        cross_manager = Mock(spec=KVCacheManagerV2) if with_cross else None
+        executor = SimpleNamespace(
+            kv_cache_manager=Mock(spec=KVCacheManagerV2),
+            draft_kv_cache_manager=Mock(spec=KVCacheManagerV2),
+            enable_joint_kv_cache_reuse=with_draft,
+            resource_manager=Mock(),
+        )
+        executor.resource_manager.get_resource_manager.return_value = cross_manager
+        batch = SimpleNamespace(context_requests=[], generation_requests=[])
+        PyExecutor._update_v2_context_resources(executor, batch)
+
+        executor.kv_cache_manager.update_context_resources.assert_called_once_with(batch)
+        if with_draft:
+            executor.draft_kv_cache_manager.update_context_resources.assert_called_once_with(batch)
+        else:
+            executor.draft_kv_cache_manager.update_context_resources.assert_not_called()
+        if with_cross:
+            cross_manager.update_context_resources.assert_called_once_with(batch)
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+@pytest.mark.parametrize("is_encoder_decoder", [False, True])
+def test_v2_encoder_decoder_reuse_requires_source_identity(
+    use_v2: bool, is_encoder_decoder: bool
+) -> None:
+    model_config = _make_model_config(is_encoder_decoder=is_encoder_decoder)
+    cache_config = KvCacheConfig(
+        use_kv_cache_manager_v2=use_v2,
+        enable_block_reuse=True,
+        cross_kv_cache_fraction=0.5 if is_encoder_decoder else None,
+    )
+    validate_encoder_decoder_kv_cache_config(model_config, cache_config)
+
+    assert cache_config.enable_block_reuse is not (use_v2 and is_encoder_decoder)
+    assert cache_config.use_kv_cache_manager_v2 is use_v2
