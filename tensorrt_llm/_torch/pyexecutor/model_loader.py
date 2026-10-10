@@ -163,6 +163,17 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
+    if (model_config.is_encoder_decoder
+            and effective_kv_cache_quant in (QuantAlgo.FP8, QuantAlgo.NVFP4)):
+        quant_source = ("the checkpoint" if pyt_kv_cache_dtype == "auto" else
+                        f"kv_cache_config.dtype='{pyt_kv_cache_dtype}'")
+        raise ValueError(
+            f"{effective_kv_cache_quant} KV cache quantization from "
+            f"{quant_source} is not supported for encoder-decoder models "
+            "in the PyTorch backend. Use a checkpoint without KV cache "
+            "quantization and set kv_cache_config.dtype='auto'. "
+            "'auto' preserves checkpoint quantization; it does not disable it.")
+
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
             and torch.cuda.is_available() and get_sm_version() == 107):
