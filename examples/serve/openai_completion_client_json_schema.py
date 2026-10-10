@@ -36,11 +36,13 @@ response = client.chat.completions.create(
                 },
             },
             "required": ["name", "population"],
-            "chat_template_kwargs": {
-                "enable_thinking": False
-            }
         }
     },
+    # The OpenAI client has no chat_template_kwargs argument; send it in the
+    # request body so the chat template actually receives it.
+    extra_body={"chat_template_kwargs": {
+        "enable_thinking": False
+    }},
 )
 
 content = response.choices[0].message.content
