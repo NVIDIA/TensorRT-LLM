@@ -318,13 +318,14 @@ class ModelConfig(Generic[TConfig]):
         However, we allow modification of 'extra_attrs' attributes for torch.compile
         and 'pretrained_config' attributes for mutimodal models.
         'quant_config' is allowed to be modified to set different quantization for VLM.
+        'modeling_v2_target' is set by the model loader once it has decided.
         All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
             if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
-                           'quant_config'):
+                           'quant_config', 'modeling_v2_target'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)

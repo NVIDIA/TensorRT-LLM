@@ -452,19 +452,6 @@ def _resolve_checkpoint_io_policy(
     return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
 
 
-def _record_modeling_v2_decision(config: ModelConfig,
-                                 llm_args: TorchLlmArgs) -> None:
-    """Record the modeling_v2 decision on ``config``, once model defaults
-    have been applied to ``llm_args`` and the model is about to be built."""
-    target = modeling_v2_resolve(config, llm_args)
-    if target is None:
-        return
-    frozen = config._frozen
-    config._frozen = False
-    config.modeling_v2_target = target
-    config._frozen = frozen
-
-
 def _construct_checkpoint_loader(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
@@ -1944,7 +1931,7 @@ class ModelLoader:
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
 
-        _record_modeling_v2_decision(config, self.llm_args)
+        config.modeling_v2_target = modeling_v2_resolve(config, self.llm_args)
 
         if uses_mtp_head_checkpoint(self.spec_config):
             # `load_config_and_apply_defaults` already ran this, but against a
