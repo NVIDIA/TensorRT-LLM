@@ -191,6 +191,7 @@ class CodexBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        required_tools: tuple[str, ...] = (),
     ) -> AsyncIterator[BackendClient]:
         if self._transport is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")

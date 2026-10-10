@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import claude_agent_sdk
 import jsonschema
 import pytest
@@ -16,11 +17,15 @@ from claude_agent_sdk.types import (
     RateLimitInfo,
     ResultMessage,
     SystemMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
 )
 
+from agent_flow import AgentLayer, AgentLayerConfig
 from agent_flow.backends import claude_code as cc_mod
 from agent_flow.backends import codex as codex_mod
 from agent_flow.backends import create_backend
@@ -98,11 +103,11 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message([_make_tool_use_block("Bash", {"command": "ls"})])
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hello")]
@@ -122,7 +127,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield SystemMessage(
                 subtype="init",
                 data={
@@ -150,7 +155,7 @@ class TestClaudeBackend:
             yield _make_assistant_message([_make_tool_use_block("Bash", {"command": "ls"})])
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -171,11 +176,11 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield SystemMessage(subtype="other", data={"skills": ["should"]})
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -185,7 +190,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             # Main agent spawns an Explore subagent via the Task tool.
             yield _make_assistant_message(
                 [
@@ -213,7 +218,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
@@ -241,7 +246,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message(
                 [
                     _make_tool_use_block(
@@ -257,7 +262,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
@@ -268,7 +273,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             # Bash call references a parent the client never observed.
             yield _make_assistant_message(
                 [_make_tool_use_block("Bash", {"command": "ls"}, id="t-1")],
@@ -276,7 +281,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
@@ -292,7 +297,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message(
                 [
                     _make_tool_use_block(
@@ -312,7 +317,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("go")]
@@ -331,7 +336,7 @@ class TestClaudeBackend:
             }
         )
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_result_message(
                 "done",
                 usage={
@@ -345,7 +350,7 @@ class TestClaudeBackend:
                 duration_ms=1500,
             )
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -371,10 +376,10 @@ class TestClaudeBackend:
         sdk_client.query = AsyncMock()
         sdk_client.get_context_usage = AsyncMock(side_effect=RuntimeError("boom"))
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_result_message("done", usage={"input_tokens": 1})
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -447,7 +452,7 @@ class TestClaudeBackend:
     async def test_client_reports_no_skill_list_when_sdk_lacks_server_info(self):
         # An older SDK without the control request degrades to "cannot
         # say" rather than raising on the workflow's launch path.
-        sdk_client = MagicMock(spec=["query", "receive_response"])
+        sdk_client = MagicMock(spec=["query", "receive_messages"])
         client = ClaudeCodeClient(sdk_client)
 
         assert await client.list_available_skills() is None
@@ -456,7 +461,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message(
                 [
                     ThinkingBlock(thinking="  reasoning step  ", signature="sig"),
@@ -465,7 +470,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("answer")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -482,11 +487,11 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message([ThinkingBlock(thinking="   ", signature="sig")])
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -496,7 +501,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_assistant_message(
                 [
                     ServerToolUseBlock(
@@ -508,7 +513,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -526,7 +531,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield RateLimitEvent(
                 rate_limit_info=RateLimitInfo(
                     status="allowed_warning",
@@ -539,7 +544,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -554,7 +559,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield SystemMessage(
                 subtype="compact_boundary",
                 data={
@@ -564,7 +569,7 @@ class TestClaudeBackend:
             )
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -577,11 +582,11 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield SystemMessage(subtype="compact_boundary", data={})
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -593,14 +598,14 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield AssistantMessage(
                 content=[],
                 model="test-model",
                 error="billing_error",
             )
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         with pytest.raises(RuntimeError, match="Claude Code turn failed: billing_error"):
@@ -615,7 +620,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_result_message("done")
             yield AssistantMessage(
                 content=[],
@@ -623,7 +628,7 @@ class TestClaudeBackend:
                 error="rate_limit",
             )
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -638,7 +643,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield AssistantMessage(
                 content=[TextBlock(text="partial answer")],
                 model="claude-test",
@@ -649,7 +654,7 @@ class TestClaudeBackend:
                 session_id="sess-1",
             )
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         with pytest.raises(RuntimeError) as excinfo:
@@ -699,7 +704,7 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_result_message(
                 "",
                 is_error=True,
@@ -707,7 +712,7 @@ class TestClaudeBackend:
                 permission_denials=[{"tool": "Bash"}],
             )
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -720,10 +725,10 @@ class TestClaudeBackend:
         sdk_client = MagicMock()
         sdk_client.query = AsyncMock()
 
-        async def receive_response():
+        async def receive_messages():
             yield _make_result_message("done")
 
-        sdk_client.receive_response = receive_response
+        sdk_client.receive_messages = receive_messages
         client = ClaudeCodeClient(sdk_client)
 
         events = [event async for event in client.send_message("hi")]
@@ -748,6 +753,345 @@ _RECURSIVE_NODE_SCHEMA = {
         }
     },
 }
+
+
+def _session_state(state: str) -> SystemMessage:
+    return SystemMessage(subtype="session_state_changed", data={"state": state})
+
+
+def _task_started(task_id: str, task_type: str) -> TaskStartedMessage:
+    return TaskStartedMessage(
+        subtype="task_started",
+        data={},
+        task_id=task_id,
+        task_type=task_type,
+        description="bg",
+        uuid="u",
+        session_id="s",
+    )
+
+
+def _task_notification(task_id: str) -> TaskNotificationMessage:
+    return TaskNotificationMessage(
+        subtype="task_notification",
+        data={},
+        task_id=task_id,
+        status="completed",
+        output_file="/tmp/out",
+        summary="done",
+        uuid="u",
+        session_id="s",
+    )
+
+
+def _background_run(tool_name: str, task_type: str, *, idle_before_result: bool = False):
+    """The stream the CLI sends when the model backgrounds work in one turn.
+
+    The first turn launches the task and ends with a result while the task is
+    still running. Its completion wakes the session for a second turn whose
+    result carries the real answer; only then does the CLI report "idle".
+    """
+    final_turn = [
+        _make_assistant_message([TextBlock(text="background work merged")]),
+        _make_result_message("final answer", num_turns=1),
+    ]
+    tail = [_session_state("idle")]
+    if idle_before_result:
+        final_turn, tail = final_turn[:1] + tail, final_turn[1:]
+    return [
+        _session_state("running"),
+        _make_assistant_message(
+            [_make_tool_use_block(tool_name, {"run_in_background": True}, id="bg-1")]
+        ),
+        _task_started("t1", task_type),
+        _make_result_message("launched, waiting", num_turns=1),
+        _task_notification("t1"),
+        *final_turn,
+        *tail,
+    ]
+
+
+_UNTIL_STOPPED = object()
+
+
+class FakeBackgroundSdkClient:
+    """``ClaudeSDKClient`` stand-in that replays one background run.
+
+    ``_UNTIL_STOPPED`` in the script blocks the stream until ``stop_task`` is
+    called. The stream stays open after the script ends, as the CLI's does;
+    ``closed_after`` records how much of it had been consumed when the
+    session was torn down.
+    """
+
+    def __init__(self, messages):
+        self.messages = messages
+        self.consumed = 0
+        self.closed_after: int | None = None
+        self.stopped: list[str] = []
+        self._stop = anyio.Event()
+
+    async def query(self, message):
+        pass
+
+    async def stop_task(self, task_id):
+        self.stopped.append(task_id)
+        self._stop.set()
+
+    async def receive_messages(self):
+        while self.consumed < len(self.messages):
+            message = self.messages[self.consumed]
+            if message is _UNTIL_STOPPED:
+                await self._stop.wait()
+                self.consumed += 1
+                continue
+            self.consumed += 1
+            yield message
+        await anyio.sleep_forever()
+
+
+class TestClaudeBackgroundWork:
+    @pytest.fixture(autouse=True)
+    def _short_settle(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_SETTLE_S", 0.05)
+
+    @pytest.mark.parametrize(
+        ("tool_name", "task_type", "idle_before_result"),
+        [("Agent", "local_agent", False), ("Workflow", "local_workflow", True)],
+    )
+    async def test_send_message_waits_for_background_task(
+        self, tool_name, task_type, idle_before_result
+    ):
+        sdk_client = FakeBackgroundSdkClient(
+            _background_run(tool_name, task_type, idle_before_result=idle_before_result)
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        events = [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.consumed == len(sdk_client.messages)
+        results = [e for e in events if isinstance(e, ResultEvent)]
+        assert len(results) == 1
+        assert results[0].text == "final answer"
+        assert results[0].usage.num_turns == 2
+        texts = [e.text for e in events if isinstance(e, AgentTextEvent)]
+        assert texts == ["background work merged"]
+
+    async def test_send_message_waits_for_shell_a_subagent_left_running(self):
+        # Recorded from CLI 2.1.286: the subagent backgrounds a shell and
+        # finishes, the session goes "idle", then the shell's completion wakes
+        # the subagent and the session again for the real answer.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Agent", {}, id="bg-1")]),
+                _task_started("agent", "local_agent"),
+                _make_result_message("LAUNCHED"),
+                _task_started("shell", "local_bash"),
+                _task_notification("agent"),
+                _make_assistant_message([TextBlock(text="still waiting")]),
+                _make_result_message("waiting for the shell"),
+                _session_state("idle"),
+                _task_notification("shell"),
+                _task_started("agent", "local_agent"),
+                _task_notification("agent"),
+                _session_state("running"),
+                _make_assistant_message([TextBlock(text="FINAL: BG_OK")]),
+                _make_result_message("FINAL: BG_OK"),
+                _session_state("idle"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        events = [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.consumed == len(sdk_client.messages)
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["FINAL: BG_OK"]
+
+    async def test_send_message_stops_tasks_left_running_past_the_ceiling(self, monkeypatch):
+        monkeypatch.setattr(cc_mod, "_BACKGROUND_WAIT_CEILING_S", 0.01)
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Bash", {}, id="srv")]),
+                _task_started("server", "local_bash"),
+                _make_result_message("server is up"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                TaskUpdatedMessage(
+                    subtype="task_updated",
+                    data={},
+                    task_id="server",
+                    patch={"status": "killed"},
+                    status="killed",
+                ),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        events = [event async for event in client.send_message("serve")]
+
+        assert sdk_client.stopped == ["server"]
+        assert sdk_client.consumed == len(sdk_client.messages)
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["server is up"]
+
+    async def test_send_message_stops_leftover_waiters_once_the_role_delivered(self):
+        # The opt-010 case: the role called its deliverable tool and ended its
+        # turn, leaving a shell waiter whose pattern never appears. It is
+        # stopped at once rather than after the ceiling.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Bash", {}, id="w")]),
+                _task_started("waiter", "local_bash"),
+                _make_assistant_message(
+                    [_make_tool_use_block("mcp__agent-tools__append_optimizer_progress", {})]
+                ),
+                _make_result_message("done"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("waiter"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+
+        with anyio.fail_after(5):
+            events = [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.stopped == ["waiter"]
+        assert sdk_client.consumed == len(sdk_client.messages)
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["done"]
+
+    async def test_send_message_keeps_waiting_on_workflow_after_delivery(self):
+        # Delivery stops only shells and monitors; a workflow still running is
+        # pending work whose result the parent has to handle.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Workflow", {}, id="wf")]),
+                _task_started("wf", "local_workflow"),
+                _task_started("waiter", "local_bash"),
+                _make_assistant_message([_make_tool_use_block("append_qa_progress", {})]),
+                _make_result_message("launched"),
+                _session_state("idle"),
+                _task_notification("wf"),
+                _session_state("running"),
+                _make_assistant_message([TextBlock(text="merged")]),
+                _make_result_message("final"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("waiter"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_qa_progress",))
+
+        with anyio.fail_after(5):
+            events = [event async for event in client.send_message("qa")]
+
+        assert sdk_client.stopped == ["waiter"]
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["final"]
+
+    async def test_send_message_waits_on_waiters_before_delivery(self, monkeypatch):
+        # Before the deliverable tool is called a waiter may be how the role
+        # gets woken, so it is only stopped at the ceiling.
+        monkeypatch.setattr(cc_mod, "_BACKGROUND_WAIT_CEILING_S", 0.2)
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Monitor", {}, id="m")]),
+                _task_started("monitor", "monitor"),
+                _make_result_message("waiting for the job"),
+                _session_state("idle"),
+                _UNTIL_STOPPED,
+                _task_notification("monitor"),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+
+        start = anyio.current_time()
+        events = [event async for event in client.send_message("optimize")]
+
+        assert anyio.current_time() - start >= 0.2
+        assert sdk_client.stopped == ["monitor"]
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["waiting for the job"]
+
+    async def test_subagent_delivery_does_not_count_for_the_role(self):
+        sdk_client = FakeBackgroundSdkClient([])
+        client = ClaudeCodeClient(sdk_client, required_tools=("append_optimizer_progress",))
+        sdk_client.messages = [
+            _session_state("running"),
+            _make_assistant_message([_make_tool_use_block("Agent", {}, id="sub")]),
+            _make_assistant_message(
+                [_make_tool_use_block("append_optimizer_progress", {})], parent_tool_use_id="sub"
+            ),
+            _task_started("waiter", "local_bash"),
+            _make_result_message("waiting"),
+            _session_state("idle"),
+        ]
+
+        with anyio.move_on_after(0.3):
+            [event async for event in client.send_message("optimize")]
+
+        assert sdk_client.stopped == []
+
+    async def test_send_message_raises_on_a_continuation_error(self):
+        # A result that only ends the first turn must not mask a failure in
+        # the turn its background work wakes up.
+        sdk_client = FakeBackgroundSdkClient(
+            [
+                _session_state("running"),
+                _make_assistant_message([_make_tool_use_block("Agent", {}, id="bg-1")]),
+                _task_started("t1", "local_agent"),
+                _make_result_message("launched, waiting"),
+                _task_notification("t1"),
+                AssistantMessage(
+                    content=[], model="test-model", parent_tool_use_id=None, error="billing_error"
+                ),
+            ]
+        )
+        client = ClaudeCodeClient(sdk_client)
+
+        with pytest.raises(RuntimeError, match="billing_error"):
+            [event async for event in client.send_message("optimize")]
+
+    async def test_send_message_ends_at_result_without_session_state(self):
+        sdk_client = FakeBackgroundSdkClient([_make_result_message("done")])
+        client = ClaudeCodeClient(sdk_client)
+        # Without session state nothing says the run is over but the result.
+
+        events = [event async for event in client.send_message("hi")]
+
+        assert [e.text for e in events if isinstance(e, ResultEvent)] == ["done"]
+
+    @pytest.mark.parametrize(
+        ("tool_name", "task_type"), [("Agent", "local_agent"), ("Workflow", "local_workflow")]
+    )
+    def test_layer_keeps_session_until_background_task_finishes(
+        self, monkeypatch, tool_name, task_type
+    ):
+        sdk_client = FakeBackgroundSdkClient(_background_run(tool_name, task_type))
+
+        class FakeSdkClientContext:
+            def __init__(self, options):
+                pass
+
+            async def __aenter__(self):
+                return sdk_client
+
+            async def __aexit__(self, *args):
+                sdk_client.closed_after = sdk_client.consumed
+
+        monkeypatch.setattr(cc_mod, "ClaudeSDKClient", FakeSdkClientContext)
+        layer = AgentLayer(
+            AgentLayerConfig(
+                name="analyzer",
+                system_prompt="You are helpful.",
+                backend=BackendConfig(kind="claude-code", model="test-model"),
+                print_activity=False,
+            )
+        )
+
+        assert layer("optimize") == "final answer"
+        assert sdk_client.closed_after == len(sdk_client.messages)
 
 
 class TestClaudeBackendCreateClient:
@@ -850,6 +1194,27 @@ class TestClaudeBackendCreateClient:
         # or the network without restrictions.
         options = await self._capture_options(monkeypatch)
         assert options.sandbox == {"enabled": False}
+
+    async def test_create_client_hands_required_tools_to_the_client(self, monkeypatch):
+        class FakeSdkClient:
+            def __init__(self, options):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+        monkeypatch.setattr(cc_mod, "ClaudeSDKClient", FakeSdkClient)
+        async with ClaudeCodeBackend().create_client(
+            system_prompt="hi", model="claude-test", required_tools=("append_qa_progress",)
+        ) as client:
+            assert client._required_tools == ("append_qa_progress",)
+
+    async def test_create_client_asks_cli_for_session_state(self, monkeypatch):
+        options = await self._capture_options(monkeypatch)
+        assert options.env["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] == "1"
 
     async def test_create_client_uses_bypass_permission_mode(self, monkeypatch):
         # ``bypassPermissions`` is the SDK setting that suppresses every
