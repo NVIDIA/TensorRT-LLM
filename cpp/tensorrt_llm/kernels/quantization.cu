@@ -343,7 +343,6 @@ __device__ float getMaxAbs(float4& vec)
     {
         absMaxVal = static_cast<float>(cuda_max(absMaxVec.x, absMaxVec.y));
     }
-    tensorrt_llm::common::blockReduceMaxV2<float, 1>(&absMaxVal);
     return absMaxVal;
 }
 
@@ -365,6 +364,11 @@ __global__ void computePerTokenGlobalScaleForFP4QuantizationKernel(
             float maxAbsVal = getMaxAbs<T>(vec);
             perTokenMaxAbsVal = cuda_max(perTokenMaxAbsVal, maxAbsVal);
         }
+        // Hoist the block reduction out of the per-thread loop: threads can run a different number of vector
+        // iterations, and a block-wide collective must not be re-entered while a previous call can still be
+        // reading its shared staging buffer. The barrier below fences that buffer before the next token's call.
+        tensorrt_llm::common::blockReduceMaxV2<float, 1>(&perTokenMaxAbsVal);
+        __syncthreads();
         float globalScaleVal = 448.f * 6.f / perTokenMaxAbsVal;
         if (threadIdx.x == 0)
         {
