@@ -2000,6 +2000,8 @@ class PyExecutor:
         self.executor_request_queue.abort_wakeup_transition()
 
     def fail_sleep_wakeup_transition(self) -> None:
+        self._sleeping_memory_tags.update(ExecutorMemoryType)
+        self._pp_rebalance_drain_iters = None
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
     def get_request_admission_state(self) -> RequestAdmissionState:

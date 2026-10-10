@@ -2773,6 +2773,69 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     torch.cuda.synchronize.assert_called_once_with()
 
 
+@pytest.mark.parametrize(
+    "method,mutation", [("sleep", "release_with_tag"), ("wakeup", "materialize_with_tag")]
+)
+@pytest.mark.parametrize("world_size,local_failure", [(1, True), (2, True), (2, False)])
+def test_ray_sleep_wakeup_failure_is_terminal(
+    method, mutation, world_size, local_failure, monkeypatch
+):
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+        ExecutorRequestQueue,
+        RequestAdmissionState,
+    )
+    from tensorrt_llm.executor.ray import gpu_worker
+    from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig, TorchLlmArgs
+
+    engine = object.__new__(PyExecutor)
+    engine.executor_request_queue = ExecutorRequestQueue(Mock(), 4, False, 0.0)
+    engine._sleeping_memory_tags = {ExecutorMemoryType.KV_CACHE}
+    engine._pp_rebalance_drain_iters = 1
+    engine.enable_kv_pool_rebalance = True
+    engine.control_action = Mock(return_value=nullcontext())
+    engine.validate_sleep = Mock()
+    engine.prepare_sleep = Mock()
+    # finish_wakeup receives tags; model a successful peer publishing full wake.
+    engine.finish_wakeup = Mock(side_effect=lambda _: engine._sleeping_memory_tags.clear())
+    worker = object.__new__(gpu_worker.RayGPUWorker)
+    worker.engine = engine
+    worker.llm_args = Mock(spec=TorchLlmArgs, sleep_config=SleepConfig())
+    monkeypatch.setattr(gpu_worker, "logger", Mock(), raising=False)
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
+    action = Mock(
+        side_effect=RuntimeError("injected allocation failure") if local_failure else None
+    )
+    monkeypatch.setattr(gpu_worker, mutation, action)
+
+    def agree_failure(failed, op):
+        assert failed.device.type == "cpu"
+        assert failed.item() == int(local_failure)
+        assert op == torch.distributed.ReduceOp.MAX
+        failed.fill_(1)
+
+    agreement = Mock(side_effect=agree_failure)
+    monkeypatch.setattr(torch.distributed, "all_reduce", agreement)
+    tags = [ExecutorMemoryType.KV_CACHE]
+    message = "injected allocation failure" if local_failure else "failed on another rank"
+    with pytest.raises(RuntimeError, match=message):
+        getattr(worker, method)(tags)
+    assert agreement.call_count == int(world_size > 1)
+    assert engine.get_request_admission_state() is RequestAdmissionState.FAILED
+    assert not engine._can_pause_for_rebalance()
+    assert engine._pp_rebalance_drain_iters is None
+    if method == "wakeup" and local_failure:
+        engine.finish_wakeup.assert_not_called()
+    with pytest.raises(RuntimeError, match="failed"):
+        engine.executor_request_queue.enqueue_request(Mock())
+    for retry in (worker.sleep, worker.wakeup):
+        with pytest.raises(RuntimeError, match="previously failed"):
+            retry(tags)
+    engine.control_action.assert_called_once_with()
+    action.assert_called_once_with(*tags)
+
+
 @pytest.mark.parametrize("entrypoint", ["mpi", "ray"])
 @pytest.mark.parametrize(
     "tag,use_v2,has_transceiver,rejected",
