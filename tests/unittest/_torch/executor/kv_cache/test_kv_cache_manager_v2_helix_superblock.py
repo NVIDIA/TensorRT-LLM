@@ -230,6 +230,9 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         kv_compression_manages_history=False,
         _has_cp_helix=True,
     )
+    mgr._completed_generation_history = types.MethodType(
+        KVCacheManagerV2._completed_generation_history, mgr
+    )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
     assert resizes == [(100, None)]

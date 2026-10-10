@@ -17,6 +17,7 @@ l0_dgx_b200:
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_offload.py::test_deepseek_v4_runtime_offload_ranks
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
