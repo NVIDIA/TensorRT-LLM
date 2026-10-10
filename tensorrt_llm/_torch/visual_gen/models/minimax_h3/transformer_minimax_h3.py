@@ -36,6 +36,9 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+    apply_minimax_h3_qk_norm_rope_bf16,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -73,7 +76,7 @@ def apply_minimax_h3_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]``."""
+    """Apply MiniMax-H3's partial split-half RoPE to ``[B, S, H, D]`` (eager path)."""
 
     rotary_dim = cos.shape[-1]
     if rotary_dim > hidden_states.shape[-1] or rotary_dim % 2:
@@ -137,14 +140,53 @@ class MiniMaxH3Attention(Attention):
             qk_norm_mode="per_head",
             eps=qk_norm_eps,
             bias=False,
-            # H3 rotates a leading split-half region and passes the tail through.
-            # The shared fused kernel currently implements a different layout.
-            fuse_qk_norm_rope=False,
+            # H3 rotates a leading split-half region and passes the tail through, which
+            # the shared fused kernel does not implement; the flag drives H3's own kernel
+            # (fused_rope.py) through the override of forward() below.
+            fuse_qk_norm_rope=True,
             interleave=False,
             config=model_config,
             layer_idx=layer_idx,
             module_name=module_name,
         )
+
+    def _use_fused_qk_norm_rope(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Decide between the fused per-head RMSNorm + RoPE kernel and the eager path.
+
+        Only what selects the path is checked here: the per-instance flag, the packed-QKV
+        layout the kernel reads (equal Q/K head counts, head dimension 128), an un-sharded
+        plain RMSNorm with BF16 weights, CUDA BF16 activations, a rotary width that is a
+        multiple of 32 and no autograd. ``apply_minimax_h3_qk_norm_rope_bf16`` raises on
+        anything else.
+        """
+        if not self.fuse_qk_norm_rope or not self.qk_norm or self.qkv_mode != QKVMode.FUSE_QKV:
+            return False
+        if self.local_num_attention_heads != self.local_num_key_value_heads or self.head_dim != 128:
+            return False
+        for norm in (self.norm_q, self.norm_k):
+            if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
+                return False
+        cos, sin = rotary_emb
+        if (
+            not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.ndim != 3
+            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
+            or sin.shape != cos.shape
+            or cos.shape[-1] % 32
+            or cos.shape[-1] > self.head_dim
+        ):
+            return False
+        if torch.is_grad_enabled() and any(
+            t.requires_grad
+            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
+        ):
+            return False
+        return True
 
     def forward(
         self,
@@ -154,19 +196,36 @@ class MiniMaxH3Attention(Attention):
         timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
-        query, key, value = self.get_qkv(hidden_states)
-        query = query.view(
-            batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
-        )
-        key = key.view(batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim)
-        query, key = self.apply_qk_norm(query, key)
-
-        if rotary_emb is not None:
-            query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
-            key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
-
-        query = query.flatten(2)
-        key = key.flatten(2)
+        if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
+            # One launch normalizes and rotates Q and K from the packed projection
+            # output; V stays a view of the same buffer.
+            qkv = self.qkv_proj(hidden_states)
+            value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
+            cos, sin = rotary_emb
+            query, key = apply_minimax_h3_qk_norm_rope_bf16(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                self.norm_q.variance_epsilon,
+                self.local_num_attention_heads,
+                self.head_dim,
+            )
+        else:
+            query, key, value = self.get_qkv(hidden_states)
+            query = query.view(
+                batch_size, sequence_length, self.local_num_attention_heads, self.head_dim
+            )
+            key = key.view(
+                batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim
+            )
+            query, key = self.apply_qk_norm(query, key)
+            if rotary_emb is not None:
+                query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
+                key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+            query = query.flatten(2)
+            key = key.flatten(2)
         hidden_states = self._attn_impl(
             query,
             key,
