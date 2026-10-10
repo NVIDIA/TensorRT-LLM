@@ -252,8 +252,8 @@ def _cached_replay_kernel(
         if USE_QK_L2NORM_IN_KERNEL:
             b_kf = b_k.to(tl.float32)
             b_qf = b_q.to(tl.float32)
-            inv_k = 1.0 / (tl.sqrt(tl.sum(b_kf * b_kf, 1)) + 1e-6)
-            inv_q = scale / (tl.sqrt(tl.sum(b_qf * b_qf, 1)) + 1e-6)
+            inv_k = 1.0 / tl.sqrt(tl.sum(b_kf * b_kf, 1) + 1e-6)
+            inv_q = scale / tl.sqrt(tl.sum(b_qf * b_qf, 1) + 1e-6)
             b_kn = (b_kf * inv_k[:, None]).to(b_k.dtype)
             b_qn = (b_qf * inv_q[:, None]).to(b_q.dtype)
         else:
