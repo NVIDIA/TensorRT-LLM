@@ -4829,8 +4829,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             f"State-index batch size {n} exceeds max_batch_size "
             f"{self._host_state_indices.shape[0]}")
         self._host_state_indices.zero_()
-        get_many = (getattr(self.impl, "get_ssm_block_base_indices", None)
-                    if os.environ.get("TLLM_KV_V2_BATCHED_CALLS", "1") != "0" else None)
+        get_many = (getattr(getattr(self, "impl", None),
+                            "get_ssm_block_base_indices", None)
+                    if os.environ.get("TLLM_KV_V2_BATCHED_CALLS", "1") != "0"
+                    else None)
         if n > 0 and get_many is not None:
             # Native core: one nanobind call fills the pinned host buffer in
             # place (no per-request GIL hand-off, no per-element tensor
