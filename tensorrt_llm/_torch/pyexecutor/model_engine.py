@@ -367,7 +367,9 @@ class PyTorchModelEngine(ModelEngine):
             mapping,
             llm_args.disable_overlap_scheduler,
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
-                llm_args.kv_cache_config, self.max_beam_width),
+                llm_args.kv_cache_config,
+                self.max_beam_width,
+                enable_sleep=llm_args.sleep_config is not None),
             is_hybrid=is_hybrid_linear(pretrained_config),
             has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
                 self.model) is not None)

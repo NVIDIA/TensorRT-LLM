@@ -108,7 +108,9 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
 
 
 def kv_cache_manager_v2_incompatible_features(
-        max_beam_width: Optional[int]) -> List[str]:
+        max_beam_width: Optional[int],
+        *,
+        enable_sleep: bool = False) -> List[str]:
     """Runtime features a V2 manager cannot serve.
 
     ``KvCacheCreator._validate_or_fallback_kv_cache_manager_v2`` demotes a plain
@@ -124,11 +126,14 @@ def kv_cache_manager_v2_incompatible_features(
     """
     # The C++ backend supports beam search. Model-specific restrictions are
     # validated by KvCacheCreator before constructing the manager.
-    return []
+    # V2's native allocations are not tracked by release_with_tag.
+    return ["SleepConfig"] if enable_sleep else []
 
 
 def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
-                                    max_beam_width: Optional[int]) -> bool:
+                                    max_beam_width: Optional[int],
+                                    *,
+                                    enable_sleep: bool = False) -> bool:
     """Whether the executor will actually hold a V2 manager.
 
     ``use_kv_cache_manager_v2`` is a request, not the outcome: model loading has
@@ -137,7 +142,8 @@ def resolved_kv_cache_manager_is_v2(kv_cache_config: KvCacheConfig,
     a pool from the request would leave V2 geometry on a V1 executor.
     """
     return (kv_cache_config.use_kv_cache_manager_v2 is True
-            and not kv_cache_manager_v2_incompatible_features(max_beam_width))
+            and not kv_cache_manager_v2_incompatible_features(
+                max_beam_width, enable_sleep=enable_sleep))
 
 
 def _resolve_disagg_transceiver_route(
@@ -933,7 +939,8 @@ class KvCacheCreator:
                        and quant_config is not None
                        and quant_config.quant_mode.has_fp4_kv_cache())
             incompat = kv_cache_manager_v2_incompatible_features(
-                self._max_beam_width)
+                self._max_beam_width,
+                enable_sleep=self._llm_args.sleep_config is not None)
             # Sparse attention: ModelEngine only forwards cache_indirection when
             # the metadata type is exactly TrtllmAttentionMetadata, and every
             # sparse backend uses a subclass, so beams would read beam 0's
@@ -974,10 +981,22 @@ class KvCacheCreator:
                         "features to run FP4 MLA.")
                 if is_hybrid_linear(config):
                     raise NotImplementedError(
-                        "Hybrid Mamba cache managers do not support "
-                        f"{incompat_str}; CppMambaHybridCacheManager does not "
-                        "provide a compatible fallback. Use max_beam_width=1 "
-                        "to run hybrid linear models.")
+                        "Hybrid Mamba KVCacheManagerV2 does not support "
+                        f"{incompat_str}; automatic fallback is unavailable "
+                        "for hybrid linear models. Disable the "
+                        "incompatible features to run hybrid linear models.")
+                if kv_cache_config is None:
+                    kv_cache_config = self._kv_cache_config
+                if kv_cache_config.block_reuse_config.policy != "all_reusable":
+                    raise NotImplementedError(
+                        "Non-default block_reuse_config.policy requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
+                if kv_cache_config.block_reuse_config.swa_endpoint_rewind_tokens > 0:
+                    raise NotImplementedError(
+                        "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.
