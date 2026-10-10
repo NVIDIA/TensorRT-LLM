@@ -60,11 +60,15 @@ def test_prepare_buffers_allocates_when_enabled():
     assert m.draft_probs_vocab_size == V
 
 
-def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch():
-    # Distinct draft vocab: full_draft_probs (d2t-expanded) is allocated.
-    m = _alloc_meta(draft_vocab_size=V - 1)
+@pytest.mark.parametrize("num_seq_slots", [0, 2 * R], ids=["default_pool", "larger_pool"])
+def test_prepare_buffers_allocates_full_draft_probs_on_vocab_mismatch(num_seq_slots: int) -> None:
+    """Expanded probabilities use batch capacity while draft state spans the slot pool."""
+    m = _alloc_meta(draft_vocab_size=V - 1, num_seq_slots=num_seq_slots)
     SpecMetadata.prepare_rejection_sampling_buffers(m)
-    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R + 1, K, V)
+    assert m.full_draft_probs is not None and tuple(m.full_draft_probs.shape) == (R, K, V)
+    slot_capacity = num_seq_slots or R
+    assert m.draft_probs is not None and tuple(m.draft_probs.shape) == (slot_capacity + 1, K, V)
+    assert m.dummy_slot_row == slot_capacity
 
 
 def test_prepare_buffers_span_seq_slot_pool():
