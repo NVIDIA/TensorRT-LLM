@@ -208,14 +208,23 @@ class Qwen3Model(DecoderModel):
         config = self.model_config
         self.mapping_with_cp = mapping_with_cp
 
-        self.embed_tokens = Embedding(
-            config.pretrained_config.vocab_size,
-            config.pretrained_config.hidden_size,
-            dtype=config.pretrained_config.torch_dtype,
-            mapping=config.mapping,
-            tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
-        )
+        # Under attention DP each rank embeds its own tokens, so the embedding
+        # is replicated like the attention-DP lm_head it may be tied to.
+        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+            )
+        else:
+            self.embed_tokens = Embedding(
+                config.pretrained_config.vocab_size,
+                config.pretrained_config.hidden_size,
+                dtype=config.pretrained_config.torch_dtype,
+                mapping=config.mapping,
+                tensor_parallel_mode=TensorParallelMode.COLUMN,
+                gather_output=True,
+            )
         self.layers = nn.ModuleList([
             Qwen3DecoderLayer(
                 model_config,
