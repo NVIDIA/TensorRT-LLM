@@ -175,14 +175,9 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         cls = DeviceMeshTopologyImpl
 
         if self.world_size == 1:
-            # A single-rank mapping. Its dimensions are the mesh's only where
-            # the mesh dimension also has a single rank; otherwise the mesh
-            # belongs to a larger job and this mapping reports rank 0 of a
-            # size-1 group on its own.
-            mesh = cls.device_mesh
-            if mesh is not None and name in mesh.mesh_dim_names and mesh[
-                    name].size() == 1:
-                return mesh[name]
+            # A single-rank mapping reports rank 0 of a size-1 group for every
+            # dimension, whatever mesh the job built: the mesh belongs to the
+            # job, not to this mapping.
             return SingleProcessGroup()
 
         if name == 'tp':
