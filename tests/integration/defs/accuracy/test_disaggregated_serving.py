@@ -1202,10 +1202,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     # pre-existing case stays Blackwell-only as before.
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2, mocker):
-        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager v1 and v2 (ctx tp2 + gen tp2)."""
+        """GPT-OSS disagg, NIXL Python transceiver (v2), KV cache manager V2 (ctx tp2 + gen tp2)."""
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -1617,14 +1617,14 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU"])
 
     @pytest.mark.skip_less_device(2)
-    def test_gen_first_kv_cache_v1(self):
-        """Gen-first smoke test on the legacy V1 KV cache manager with block reuse."""
+    def test_gen_first_with_block_reuse(self):
+        """Gen-first V2 smoke test with block reuse and no partial reuse."""
         transceiver_runtime = "PYTHON"
         transceiver_backend = "NIXL"
         kv_cache_config = {
             "enable_block_reuse": True,
             "enable_partial_reuse": False,
-            "use_kv_cache_manager_v2": False,
+            "use_kv_cache_manager_v2": True,
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1784,24 +1784,19 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
 @skip_pre_hopper
 class TestGPTOSS20B(LlmapiAccuracyTestHarness):
-    # Beam-search disagg coverage: GPT-OSS is not a hybrid-Mamba model, so
-    # (unlike Qwen3.5, see TestQwen3_5_4B) it never hits the hybrid-linear
-    # max_beam_width > 1 rejection in
-    # _util.py's _validate_or_fallback_kv_cache_manager_v2. That gate still
-    # rejects KVCacheManagerV2 with max_beam_width > 1 in general, so V2 is
-    # disabled explicitly below.
     MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-20b"
 
     @pytest.mark.skip_less_device(2)
     def test_beam_search(self):
         max_beam_width = 2
-        kv_cache_config = {"use_kv_cache_manager_v2": False}
+        kv_cache_config = {"use_kv_cache_manager_v2": True}
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "max_beam_width": max_beam_width,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -1811,6 +1806,7 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -2243,8 +2239,8 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
     @pytest.mark.skip_less_device(8)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_nvfp4_nixl(self, use_kv_cache_manager_v2):
         kv_cache_config = {
             "free_gpu_memory_fraction": 0.7,
@@ -2253,6 +2249,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
         }
         moe_config = {"backend": "CUTEDSL"}
         speculative_config = {
@@ -2659,10 +2656,10 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1/DeepSeek-R1-0528-FP4-v2"
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
-                             ids=["cache_mgr_v1"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                             ids=["cache_mgr_v2"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        """Test with KV cache manager v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         max_num_tokens = 8192
         moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
