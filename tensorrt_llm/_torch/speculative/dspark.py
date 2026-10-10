@@ -192,6 +192,7 @@ class DSparkSpecMetadata(SpecMetadata):
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
+                    worker._confidence_incarnations.pop(rid, None)
                     worker._ctx_len[slot] = 0
                     worker._valid_len[slot] = 0
                     worker._position_initialized[slot] = False
@@ -342,6 +343,13 @@ class DSv4DSparkWorker(SpecWorkerBase):
         # gen path (set on the host in prepare(), so the captured forward indexes
         # the rolling windows through a tensor instead of a python dict lookup).
         self._req_to_slot = {}  # request_id -> slot index
+        # Enabled only for admitted host-mixed scheduling. Slot reuse cannot
+        # authenticate a different request incarnation with an older snapshot.
+        self._mixed_confidence_tracking = bool(
+            getattr(spec_config, "confidence_mixed_evidence", None) is not None
+        )
+        self._confidence_incarnations: dict[int, int] = {}
+        self._confidence_incarnation_sequence = 0
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
         # Index of the throwaway "scratch" window row that absorbs padded /
@@ -503,16 +511,16 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._scratch_slot = max_batch
             num_rows = max_batch + 1
 
-            # CUDA-graph padding requests carry ids in
-            # ``[CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, CUDA_GRAPH_DUMMY_REQUEST_ID]``,
-            # while real request ids start at ``max_batch_size`` and grow, so a simple
-            # floor cleanly separates them. Together with ``ATTENTION_DP_DUMMY_REQUEST_ID``
-            # (0) these dummies must route to the scratch row (see ``prepare()``) and
-            # never consume a real slot. Imported lazily to break the
-            # dspark -> cuda_graph_runner -> speculative.utils -> dspark import cycle.
-            from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+            # Cover both primary and secondary graph-padding ID families.
+            # The secondary variant represents non-divisible zero-real exact
+            # cells; neither variant may consume a real rolling-window slot.
+            # Derive the inclusive floor from the graph runner's authoritative
+            # namespace helper instead of duplicating its arithmetic.
+            from ..pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
 
-            self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+            self._graph_dummy_id_floor = cuda_graph_dummy_request_id(
+                self.max_draft_len, variant=1, max_draft_len=self.max_draft_len
+            )
 
             self._kv_windows = torch.zeros(
                 (num_rows, num_stages, self._win, head_dim),
@@ -645,6 +653,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
         """Get (or refresh) the slot for a request; reset clears its window."""
         if reset and req_id in self._req_to_slot:
             old = self._req_to_slot.pop(req_id)
+            self._confidence_incarnations.pop(req_id, None)
             self._ctx_len[old] = 0
             self._valid_len[old] = 0
             self._position_initialized[old] = False
@@ -658,6 +667,9 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot
+            if self._mixed_confidence_tracking:
+                self._confidence_incarnation_sequence += 1
+                self._confidence_incarnations[req_id] = self._confidence_incarnation_sequence
             self._ctx_len[slot] = 0
             self._valid_len[slot] = 0
             self._position_initialized[slot] = False
@@ -668,6 +680,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 # the full block.
                 self._confidence_logits[slot].fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         return self._req_to_slot[req_id]
+
+    def confidence_incarnation_for(self, req_id: int) -> int | None:
+        """Host ownership generation, independent of a recycled device slot."""
+        return self._confidence_incarnations.get(req_id)
 
     def _seed_context_windows(
         self,

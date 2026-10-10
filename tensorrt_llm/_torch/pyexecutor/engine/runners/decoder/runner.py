@@ -445,11 +445,41 @@ class DecoderRunner(ScheduledModelRunner):
         self._dspark_confidence_enabled = bool(
             spec_config is not None and getattr(spec_config, "enable_confidence_scheduling", False)
         )
+        self._dspark_fused_scheduler_enabled = bool(
+            spec_config is not None
+            and getattr(spec_config, "enable_fused_confidence_scheduler", False)
+        )
         self._dspark_trims_submitted_tokens = self._dspark_confidence_enabled
         self._dspark_device_windows = bool(
             self._dspark_trims_submitted_tokens
             and getattr(spec_config, "enable_fused_confidence_scheduler", False)
         )
+        self._dspark_device_window_workspace = None
+        self._dspark_host_window_step = False
+        self._dspark_mixed_runtime = None
+        mixed_config = getattr(spec_config, "confidence_mixed_evidence", None)
+        if (
+            self._dspark_confidence_enabled
+            and mixed_config is not None
+            and self._config.max_draft_len == 3
+            and self.mapping.tp_size == 8
+            and self.mapping.pp_size == self.mapping.cp_size == 1
+            and self._config.enable_attention_dp
+        ):
+            from tensorrt_llm._torch.pyexecutor.dspark_mixed_runtime import MixedRuntime
+            from tensorrt_llm._torch.speculative.dspark_mixed_evidence import load_mixed_evidence
+
+            resolution = load_mixed_evidence(mixed_config)
+            self._dspark_mixed_runtime = MixedRuntime(self, resolution.costs)
+            logger.info(f"DSpark mixed evidence: {resolution.reason}")
+        if self._dspark_device_windows:
+            from tensorrt_llm._torch.speculative.dspark_device_select import DeviceWindowWorkspace
+
+            self._dspark_device_window_workspace = DeviceWindowWorkspace.allocate(
+                max_rows=self._config.max_batch_size + 1,
+                max_tokens=self._config.max_num_tokens,
+                device=self.input_ids_cuda.device,
+            )
         self._dspark_sps_cost_table = None
         self._dspark_exact_candidate_cells = ()
         self._dspark_exact_identity_words = (0,) * 8
@@ -855,6 +885,7 @@ class DecoderRunner(ScheduledModelRunner):
         with self._warmup_timer.phase("dsa_prewarm"):
             self._ensure_dsa_attn_metadata_for_warmup(resource_manager)
             self._warmup_dspark_ragged_compressor_metadata()
+            self._warmup_dspark_fused_scheduler()
             with timing_metric("dg_paged_mqa_warmup_seconds", self._metrics):
                 self._warmup_dg_paged_mqa_logits_metadata()
             log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
@@ -2754,6 +2785,7 @@ class DecoderRunner(ScheduledModelRunner):
             else None,
             kv_cache_manager=kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
+            enable_ragged_verification=self._dspark_confidence_enabled,
         )
         if isinstance(kv_cache_manager, BaseMambaCacheManager):
             self.attn_metadata.mamba_chunk_size = getattr(
@@ -3068,6 +3100,90 @@ class DecoderRunner(ScheduledModelRunner):
         self.iter_states["cached_kv_tokens_cuda_graph_padding"] = sum(
             num_cached_tokens_per_seq
         ) - sum(counts)
+
+    @torch.inference_mode()
+    def _warmup_dspark_fused_scheduler(self) -> None:
+        """Compile the optional policy-neutral scheduler before live requests.
+
+        The device-window prologue is deliberately skipped during whole-model
+        CUDA-graph capture, so its Triton rank/finalize kernels would otherwise
+        compile on the first live compact step.  Compile every authenticated
+        exact-SPS graph row count on every rank and record only successful
+        shapes.  Unsupported shapes retain the established tensor fallback.
+        """
+        self._dspark_fused_schedule_ready_sizes = set()
+        if (
+            not self._dspark_fused_scheduler_enabled
+            or not self._dspark_confidence_enabled
+            or not self._dspark_trims_submitted_tokens
+            or not self._dspark_device_windows
+        ):
+            return
+
+        worker = self._get_spec_worker()
+        planner = getattr(worker, "verify_planner", None)
+        exact_table = planner.exact_cost_table if planner is not None else None
+        if exact_table is None:
+            return
+
+        from tensorrt_llm._torch.speculative.dspark_schedule import (
+            schedule_verify_lens_topk_fused_fill,
+        )
+
+        cfg = planner.cfg
+        if cfg.survival_eps <= 0.0:
+            logger.warning_once(
+                "DSpark fused scheduler requires survival_eps > 0; using the "
+                "tensor scheduler for every graph size",
+                key="dspark_fused_scheduler_zero_epsilon",
+            )
+            return
+        ready = []
+        with torch.inference_mode():
+            for graph_bs in sorted(int(g) for g in exact_table.tables):
+                if graph_bs > 256:
+                    logger.warning_once(
+                        "DSpark fused scheduler supports at most "
+                        f"256 rows; G={graph_bs} will use the tensor fallback",
+                        key=(f"dspark_fused_scheduler_unsupported_{graph_bs}"),
+                    )
+                    continue
+                survival = torch.ones(
+                    (graph_bs, int(cfg.block_size)),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                try:
+                    warmup_budget = min(1, graph_bs * int(cfg.schedulable_per_request))
+                    graph_num_tokens = graph_bs * (int(cfg.min_verify_len) + 1) + warmup_budget
+                    schedule_verify_lens_topk_fused_fill(
+                        survival=survival,
+                        budget=warmup_budget,
+                        num_real=graph_bs,
+                        pad_len=1,
+                        cfg=cfg,
+                        graph_num_tokens=graph_num_tokens,
+                    )
+                except Exception as exc:
+                    logger.warning_once(
+                        "DSpark fused scheduler prewarm failed for "
+                        f"G={graph_bs}; using the tensor fallback. "
+                        f"{type(exc).__name__}: {exc}",
+                        key=(f"dspark_fused_scheduler_prewarm_failure_{graph_bs}"),
+                    )
+                    continue
+                try:
+                    torch.cuda.synchronize()
+                except Exception as exc:
+                    # An asynchronous kernel failure may poison the context;
+                    # continuing with the tensor fallback is not safe.
+                    raise RuntimeError(
+                        f"DSpark fused scheduler failed its startup CUDA gate for G={graph_bs}"
+                    ) from exc
+                ready.append(graph_bs)
+
+        self._dspark_fused_schedule_ready_sizes = set(ready)
+        logger.info(f"DSpark fused scheduler prewarm complete for graph batch sizes {ready}")
 
     @torch.inference_mode()
     def _warmup_dspark_ragged_compressor_metadata(self) -> None:
@@ -3431,6 +3547,41 @@ class DecoderRunner(ScheduledModelRunner):
             request.py_verify_len = int(tokens) - 1
         return int(bucket)
 
+    def _select_dspark_windows_with_fused_fallback(
+        self,
+        *,
+        select_fn: Callable[..., Any],
+        selector_kwargs: dict[str, Any],
+        padded_bs: int,
+    ) -> Any:
+        """Run the optional scheduler once, retiring only a failed graph G."""
+        from tensorrt_llm._torch.speculative.dspark_schedule import DSparkFusedScheduleError
+
+        ready_sizes = getattr(self, "_dspark_fused_schedule_ready_sizes", set())
+        use_fused_exact = padded_bs in ready_sizes
+        try:
+            return select_fn(**selector_kwargs, use_fused_exact=use_fused_exact)
+        except DSparkFusedScheduleError as exc:
+            if not use_fused_exact:
+                raise
+            self._retire_dspark_fused_shape(padded_bs, exc, "scheduler")
+            return select_fn(**selector_kwargs, use_fused_exact=False)
+
+    def _retire_dspark_fused_shape(self, padded_bs: int, exc: Exception, component: str) -> None:
+        """Permanently route one failed graph-row shape to the tensor oracle."""
+        ready_sizes = set(getattr(self, "_dspark_fused_schedule_ready_sizes", set()))
+        ready_sizes.discard(padded_bs)
+        self._dspark_fused_schedule_ready_sizes = ready_sizes
+        failure_counts = getattr(self, "_dspark_fused_schedule_failure_counts", {})
+        failure_counts[padded_bs] = failure_counts.get(padded_bs, 0) + 1
+        self._dspark_fused_schedule_failure_counts = failure_counts
+        logger.warning_once(
+            f"DSpark fused {component} failed for G={padded_bs}; disabling "
+            "that shape and rerunning the exact tensor fallback. "
+            f"{type(exc).__name__}: {exc}",
+            key=f"dspark_fused_{component}_runtime_failure_{padded_bs}",
+        )
+
     def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
@@ -3450,12 +3601,16 @@ class DecoderRunner(ScheduledModelRunner):
         """
         from tensorrt_llm._torch.speculative.dspark_device_select import (
             gather_packed_draft_tokens,
+            materialize_compact_layout,
             select_windows_device,
         )
+        from tensorrt_llm._torch.speculative.dspark_schedule import DSparkFusedScheduleError
 
         runner = self.cuda_graph_runner
         budget = self._dspark_device_budget
         self._dspark_device_budget = None
+        if self._dspark_host_window_step:
+            return False
         if budget is None or runner.agreed_ragged_bucket is None:
             return False
         if not getattr(self, "_dspark_prev_covers_batch", False):
@@ -3498,18 +3653,12 @@ class DecoderRunner(ScheduledModelRunner):
         # the published split; the fill tops up any shortfall.
         budget = max(0, min(int(budget), real_tokens - n_real * (cfg.min_verify_len + 1)))
 
-        # Snapshot the shape split BEFORE overwriting: past_seen per row is
-        # the staged position at each row's first token, and the kv delta
-        # needs the split the host baked into kv_lens_cuda.
         lens_buf = self.ragged_verify_lens_cuda
         qo_buf = self.ragged_qo_indptr_cuda
-        split_lens = lens_buf[:padded_bs].clone()
-        split_qo = qo_buf[: padded_bs + 1].to(torch.long)
-        past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
 
         expected_stamp = worker.verified_draft_seq_cuda()
         stamps = worker.confidence_stamp_buffer() if expected_stamp is not None else None
-        result = select_windows_device(
+        selector_kwargs = dict(
             confidence_logits=worker.staged_confidence_buffer(),
             slot_idx=worker.batch_slot_view(padded_bs),
             num_real=n_real,
@@ -3520,26 +3669,67 @@ class DecoderRunner(ScheduledModelRunner):
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+            workspace=getattr(self, "_dspark_device_window_workspace", None),
         )
+        result = self._select_dspark_windows_with_fused_fallback(
+            select_fn=select_windows_device,
+            selector_kwargs=selector_kwargs,
+            padded_bs=padded_bs,
+        )
+
+        fused_snapshot_valid = False
+        if result.workspace is not None:
+            try:
+                materialize_compact_layout(
+                    result=result,
+                    old_verify_lens=lens_buf[:padded_bs],
+                    old_qo_indptr=qo_buf[: padded_bs + 1],
+                    batch_slots=self.previous_batch_indices_cuda[:n_real],
+                    new_tokens=new_tensors_device.new_tokens,
+                    new_tokens_lens=new_tensors_device.new_tokens_lens,
+                    next_draft_tokens=new_tensors_device.next_draft_tokens,
+                    input_ids=self.input_ids_cuda[:bucket],
+                    position_ids=self.position_ids_cuda[:bucket],
+                    previous_pos_indices=self.previous_pos_indices_cuda[:real_tokens],
+                    previous_pos_id_offsets=self.previous_pos_id_offsets_cuda[:real_tokens],
+                    draft_tokens=self.draft_tokens_cuda[: real_tokens - n_real],
+                    kv_lens=attn_metadata.kv_lens_cuda[:padded_bs],
+                    previous_kv_lens_offsets=self.previous_kv_lens_offsets_cuda[:padded_bs],
+                    num_real=n_real,
+                    real_tokens=real_tokens,
+                )
+            except DSparkFusedScheduleError as exc:
+                # Row state commits in the final kernel, so a synchronous
+                # launch failure before it is safe to rerun from the original
+                # shape split. Every token output is overwritten below.
+                self._retire_dspark_fused_shape(padded_bs, exc, "layout materializer")
+                fused_snapshot_valid = bool(getattr(exc, "past_seen_valid", False))
+                result = select_windows_device(**selector_kwargs, use_fused_exact=False)
+            else:
+                req_idx = result.req_idx
+                spec_metadata.remap_expanded_sampling_params(req_idx, bucket)
+                apply_device_layout(result.verify_lens, req_idx, result.kv_correction)
+                return True
+
+        # Tensor oracle/fallback: keep the previous independently implemented
+        # materialization unchanged. It also repairs every token output if an
+        # optional fused launch failed synchronously above.
+        split_lens = lens_buf[:padded_bs].clone()
+        split_qo = qo_buf[: padded_bs + 1].to(torch.long)
+        if fused_snapshot_valid:
+            # The first fused launch saved these values before any token write.
+            past_seen = self._dspark_device_window_workspace.past_seen[:padded_bs]
+        else:
+            past_seen = self.position_ids_cuda[split_qo[:-1]].clone()
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
         qo_buf[: padded_bs + 1].copy_(result.qo_indptr)
-        # The host stages kv_lens as num_cached + seq_lens_kv, and BOTH terms
-        # bake the per-request token window (num_cached = past + tokens;
-        # seq_lens_kv = tokens), so kv_lens = past + 2*S -- the window counts
-        # TWICE. Moving to the true windows therefore needs 2*(w - S), not
-        # (w - S): the single-delta variant left every re-ranked request's
-        # kv_len off by (w - S), which shifted the indexer K-cache slot
-        # mapping (slot_mapping_fp8) and silently wrote K entries into the
-        # wrong cache slots. Established empirically by an A/B tensor diff
-        # against a full host restage with the same windows.
+        # Host staging includes the window in both num_cached and seq_lens_kv:
+        # kv_lens = past + 2*shape_lens. Fresh windows therefore require twice
+        # the row delta here and its negative in the replay overlap offset.
         window_delta = result.verify_lens - split_lens
         attn_metadata.kv_lens_cuda[:padded_bs] += 2 * window_delta
-        # The graph adds previous_kv_lens_offsets (staged as new_tokens_lens -
-        # shape_lens, per request) to kv_lens during replay; host-with-w
-        # stages new_tokens_lens - w there, so the offsets move by -(w - S).
-        # Combined: (past + 2S) + 2(w-S) + (new - S) - (w-S) = past + w + new,
-        # exactly the host-with-w in-graph sum.
+        # After replay adds its offset, the sum is past + fresh_window + new_len.
         self.previous_kv_lens_offsets_cuda[:padded_bs] -= window_delta.to(
             self.previous_kv_lens_offsets_cuda.dtype
         )
@@ -3571,10 +3761,8 @@ class DecoderRunner(ScheduledModelRunner):
         self.previous_pos_id_offsets_cuda[:real_tokens].copy_(
             new_tokens_lens_device[slots_tok[:real_tokens]]
         )
-        # Draft tokens pack compactly, omitting each request's bonus/anchor.
-        # Build the draft-only row owners at the statically known real-draft
-        # size.  The previous scheme parked anchors at ``real_draft``; at a
-        # full K / full batch that index is exactly one past the allocation.
+        # Draft-token storage excludes every bonus/anchor position, including
+        # the last row's anchor when the allocation is full.
         real_draft = real_tokens - n_real
         if real_draft > 0:
             self.draft_tokens_cuda[:real_draft].copy_(
@@ -3605,7 +3793,12 @@ class DecoderRunner(ScheduledModelRunner):
         return [1 + int(v) for v in verify_lens]
 
     def _publish_gen_token_layout(
-        self, attn_metadata, generation_requests, *, runtime_draft_len: int
+        self,
+        attn_metadata,
+        generation_requests,
+        *,
+        runtime_draft_len: int,
+        host_authoritative: bool = False,
     ) -> None:
         """Hand the attention metadata this step's gen-token layout, before it
         prepares.
@@ -3636,7 +3829,9 @@ class DecoderRunner(ScheduledModelRunner):
             # shape split (bounds only); the true windows land on device
             # through apply_device_ragged_layout after prepare.
             attn_metadata.device_windows_mode = (
-                self._dspark_trims_submitted_tokens and self._dspark_device_windows
+                self._dspark_trims_submitted_tokens
+                and self._dspark_device_windows
+                and not host_authoritative
             )
 
     def _pinned_host(self, key: str, values, dtype) -> torch.Tensor:
@@ -4871,6 +5066,7 @@ class DecoderRunner(ScheduledModelRunner):
                 attn_metadata,
                 scheduled_requests.generation_requests,
                 runtime_draft_len=runtime_draft_len,
+                host_authoritative=bool(getattr(self, "_dspark_host_window_step", False)),
             )
         refresh_seq_lens = not attn_metadata.is_cuda_graph
         if (

@@ -851,6 +851,13 @@ class PyTorchModelEngine(ModelEngine):
             return None
         return getattr(self._runner, "_dspark_device_budget", None)
 
+    @property
+    def _dspark_mixed_runtime(self):
+        """Optional mixed controller owned by the actual decoder runner."""
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return self._runner._dspark_mixed_runtime
+
     @_dspark_device_budget.setter
     def _dspark_device_budget(self, value) -> None:
         if isinstance(self._runner, DecoderRunner):

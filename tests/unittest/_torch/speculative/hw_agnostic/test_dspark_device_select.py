@@ -6,10 +6,40 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.speculative.dspark_device_select import (
+    DeviceWindowWorkspace,
     gather_packed_draft_tokens,
     select_windows_device,
 )
 from tensorrt_llm._torch.speculative.dspark_schedule import DSparkScheduleConfig
+
+
+def test_workspace_slices_keep_persistent_storage():
+    workspace = DeviceWindowWorkspace.allocate(max_rows=4, max_tokens=16, device="cpu")
+    owners = [
+        workspace.verify_lens,
+        workspace.qo_indptr,
+        workspace.req_idx,
+        workspace.kv_correction,
+        workspace.past_seen,
+    ]
+    addresses = [tensor.data_ptr() for tensor in owners]
+    workspace.validate(device=torch.device("cpu"), num_rows=2, num_tokens=8)
+    workspace.validate(device=torch.device("cpu"), num_rows=4, num_tokens=16)
+    assert [tensor.data_ptr() for tensor in owners] == addresses
+
+
+@pytest.mark.parametrize("num_rows,num_tokens", [(5, 16), (4, 17)])
+def test_workspace_rejects_out_of_capacity_shape(num_rows, num_tokens):
+    workspace = DeviceWindowWorkspace.allocate(max_rows=4, max_tokens=16, device="cpu")
+    with pytest.raises(ValueError, match="capacity"):
+        workspace.validate(device=torch.device("cpu"), num_rows=num_rows, num_tokens=num_tokens)
+
+
+def test_workspace_rejects_wrong_row_extent_dtype():
+    workspace = DeviceWindowWorkspace.allocate(max_rows=4, max_tokens=16, device="cpu")
+    workspace.verify_lens = workspace.verify_lens.to(torch.int64)
+    with pytest.raises(TypeError, match="verify_lens must have dtype"):
+        workspace.validate(device=torch.device("cpu"), num_rows=4, num_tokens=16)
 
 
 def test_fresh_confidence_spends_budget_on_the_best_real_row():

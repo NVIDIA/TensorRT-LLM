@@ -357,6 +357,11 @@ class CUDAGraphRunner:
                 and batch.num_generation_requests > 0)
 
     def _can_run_cuda_graph_batch(self, batch: ScheduledRequests) -> bool:
+        # A peer may be prefilling while this rank contains only generation.
+        # Host-authoritative windows use the common BREAKABLE body, never a
+        # rank-local full-generation graph or its device layout prologue.
+        if getattr(self, "_dspark_host_window_batch", None) is batch:
+            return False
         return (batch.can_run_cuda_graph
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
