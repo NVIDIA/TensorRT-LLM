@@ -182,6 +182,41 @@ def test_cudnn_graph_cache_reuses_plans():
     assert len(CuDNNAttention._graph_cache) == 2
 
 
+@pytest.mark.parametrize("quant_dtype", [None, "fp8"], ids=["unquantized", "fp8"])
+def test_cudnn_plan_autotune_matches_default(quant_dtype, monkeypatch):
+    """TRTLLM_CUDNN_SDPA_AUTOTUNE picks a timed plan once per graph and keeps the numerics."""
+    _require_cudnn(quant_dtype)
+    device = torch.device("cuda")
+    q, k, v = _make_qkv(1, 8, 8, 1024, 1024, 128, device)
+
+    def run():
+        attention = CuDNNAttention(
+            num_heads=8,
+            head_dim=128,
+            dtype=torch.bfloat16,
+            quant_attention_config=QUANT_CONFIGS[quant_dtype],
+        )
+        return attention.forward(q, k, v)
+
+    CuDNNAttention.clear_graph_cache()
+    monkeypatch.setenv("TRTLLM_CUDNN_SDPA_AUTOTUNE", "0")
+    expected = run()
+
+    CuDNNAttention.clear_graph_cache()
+    monkeypatch.setenv("TRTLLM_CUDNN_SDPA_AUTOTUNE", "1")
+    first = run()
+    (bundle,) = CuDNNAttention._graph_cache.values()
+    assert bundle.plan_index is not None
+    chosen = bundle.plan_index
+    second = run()
+    assert bundle.plan_index == chosen
+
+    cosine = F.cosine_similarity(first.float().flatten(), expected.float().flatten(), dim=0).item()
+    assert cosine > MIN_COSINE[quant_dtype]
+    torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+    CuDNNAttention.clear_graph_cache()
+
+
 def test_cudnn_backend_wires_validated_quant_dtype():
     """create_attention("CUDNN") wires the validated quantization dtype into the backend."""
     _require_cudnn("mxfp8")

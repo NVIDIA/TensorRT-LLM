@@ -333,7 +333,7 @@ public:
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
         algoFilterForCubinPath(options);
-        auto [hashId, info] = hashFromFmhaOptions(options);
+        auto [hashId, info] = hashFromFmhaOptions(options, params.mFp16Softmax);
 
         auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
         if (functions.find(hashId) == functions.end())
@@ -616,7 +616,7 @@ public:
         else
         {
             algoFilterForCubinPath(options);
-            auto [hashId, info] = hashFromFmhaOptions(options);
+            auto [hashId, info] = hashFromFmhaOptions(options, params.mFp16Softmax);
 
             // load from cubin
             auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
@@ -783,7 +783,8 @@ private:
             kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
     }
 
-    std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
+    std::pair<uint64_t, std::string> hashFromFmhaOptions(
+        FmhaOptions const& options, bool fp16SoftmaxRequest = false) const
     {
         // uses2CtaMma: "2CTA MMA kernel variant" (MLA KeepsMmaAb with clusterDimX=2).
         // CGA scaling (clusterDimX *= mMaxNumCtasKv) is applied only at launch time in launchFmhaKernel,
@@ -825,7 +826,9 @@ private:
         bool const fp16Softmax = options.mEnablesFp16Softmax;
         bool const usesSpcompress = options.mUsesSpcompress;
 #else
-        bool const fp16Softmax = false;
+        // Without TLLM_RUBIN_FEATURES the option field does not exist; the runner flag still selects the
+        // precompiled Sm107a fp16-softmax cubins (registered with the same hash bit).
+        bool const fp16Softmax = fp16SoftmaxRequest;
         bool const usesSpcompress = false;
 #endif
         return std::make_pair(
@@ -1156,6 +1159,10 @@ private:
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
         options.mSkipsSoftmaxWhenPossible = params.mSkipSoftmaxThresholdScaleFactor != 0.0f;
+#ifdef TLLM_RUBIN_FEATURES
+        // hashFromFmhaOptions reads this field with TLLM_RUBIN_FEATURES.
+        options.mEnablesFp16Softmax = params.mFp16Softmax;
+#endif // TLLM_RUBIN_FEATURES
 
         // Paged KV cache
         options.mMaxNumPagesPerSeqKv = params.mMaxNumPagesPerSeqKv;
