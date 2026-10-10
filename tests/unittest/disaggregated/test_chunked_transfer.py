@@ -183,6 +183,7 @@ def _make_projection_sender() -> Sender:
     # ordinal pairing under test is the production code path.
     planner = DefaultTransferPlanner.__new__(DefaultTransferPlanner)
     planner._self_ext_cache = extractor
+    planner._targets_cache = {}
     planner.peer_extractor = MagicMock(return_value=extractor)
     planner.get_peer_overlap = MagicMock(
         return_value=SimpleNamespace(ranks=[0], duplicate_head_factor=1, overlap_pp_size=1)

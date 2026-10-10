@@ -316,3 +316,87 @@ def test_worker_defaults_to_default_planner(monkeypatch):
 
     assert isinstance(worker._peer_registrar.planner, DefaultTransferPlanner)
     assert worker._rank_info.planner_id == DefaultTransferPlanner.planner_id
+
+
+# --------------------------------------------------------------------------- #
+# DefaultTransferPlanner contract pins (from the whole-branch review)
+# --------------------------------------------------------------------------- #
+from tensorrt_llm._torch.disaggregation.native.default_planner import (  # noqa: E402
+    DefaultTransferPlanner,
+)
+
+
+def test_default_planner_statics_survive_a_wrapping_nvtx_range():
+    """With a profiler attached, nvtx_range wraps the function it decorates. A decorator
+    accidentally stacked on a @staticmethod then turns the gate into a bound method and
+    every targets() call fails. Import the module with a wrapping nvtx_range (a fresh
+    interpreter, so this test cannot disturb the others) and check the statics stay static."""
+    import subprocess
+    import sys
+
+    code = """
+import functools
+import tensorrt_llm._utils as u
+def wrapping_nvtx_range(*_a, **_k):
+    def deco(func):
+        @functools.wraps(func)
+        def inner(*args, **kwargs):
+            return func(*args, **kwargs)
+        return inner
+    return deco
+u.nvtx_range = wrapping_nvtx_range
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner as P
+for name in ("_fanin_bounce_safe", "_pair_ordinals", "_get_mamba_slot", "_get_buffers_per_layer", "_find_overlap"):
+    assert isinstance(P.__dict__[name], staticmethod), name
+print("STATICS_OK")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+    )
+    assert "STATICS_OK" in result.stdout, result.stdout[-2000:] + result.stderr[-4000:]
+
+
+def _default_planner_pair():
+    """A default planner and a compatible peer over the small real page tables test_peer builds."""
+    from tests.unittest.disaggregated.test_peer import make_page_table, make_rankinfo
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+
+    self_ri = make_rankinfo(instance_name="gen", tp_size=1, tp_rank=0, page_table=make_page_table())
+    peer_ri = make_rankinfo(
+        instance_name="ctx", instance_rank=0, tp_size=1, tp_rank=0, page_table=make_page_table()
+    )
+    planner = DefaultTransferPlanner(self_ri, KVRegionExtractorV1(self_ri.page_table))
+    return planner, self_ri, peer_ri
+
+
+def test_default_planner_check_peer_wraps_every_value_error(monkeypatch):
+    """Any ValueError raised while vetting a peer must surface as PeerIncompatibleError,
+    so the receiver fails only that peer's requests and caches the verdict."""
+    planner, self_ri, peer_ri = _default_planner_pair()
+    # A head-count mismatch is what sends check_peer into pool matching.
+    peer_ri.attention.kv_heads_per_rank = 1
+
+    def boom(_peer_ri):
+        raise ValueError("pool view spans multiple peer layer groups")
+
+    monkeypatch.setattr(planner, "get_pool_mapping", boom)
+    with pytest.raises(PeerIncompatibleError, match="multiple peer layer groups"):
+        planner.check_peer(self_ri, peer_ri)
+
+
+def test_default_planner_targets_is_cached_per_peer_dp_group(monkeypatch):
+    """The sender asks for targets() on every request; the fan-in gate walks both page
+    tables, so the answer must be computed once per (peer instance, DP group)."""
+    planner, self_ri, peer_ri = _default_planner_pair()
+    calls = []
+    real = DefaultTransferPlanner._fanin_bounce_safe
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(planner, "_fanin_bounce_safe", counting)
+    first = planner.targets(self_ri, peer_ri, 0)
+    second = planner.targets(self_ri, peer_ri, 0)
+    assert first == second and first.ranks == [0]
+    assert len(calls) == 1

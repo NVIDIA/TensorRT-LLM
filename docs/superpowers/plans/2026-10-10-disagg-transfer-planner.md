@@ -16,6 +16,12 @@
 3. The model hook is a factory with the inputs the worker actually has: `build_transfer_planner(kv_cache_manager, self_rank_info, self_extractor) -> TransferPlanner`, not `build_transfer_planner(kv_cache_manager)`. `RankInfo` and the extractor are built by `TransferWorker` from the cache manager; the default planner consumes them, and duplicating that derivation in every planner would be wrong.
 4. `PeerOverlap` moves with the engine into `default_planner.py` (it is the default planner's internal overlap record). Tests import it from there.
 5. `TransferPlanner.forget_peer(peer_ri)` is added (default no-op) so `PeerRegistrar.unregister` can drop planner-side caches. It is cache hygiene the current `unregister` already does for `_kv_map_cache`/`_lg_pool_mapping_cache`.
+6. The receiver's first-contact gate now runs the planner's full `check_peer` (attention
+   geometry, both layout validators, layer-count and NHD warnings), where before it ran only
+   the two layout validators and left geometry mismatches to the sender's listener thread,
+   whose logged error left the generation request hanging until its timeout. A mismatched
+   pair now fails fast on the generation side with a cached diagnostic. This is a deliberate
+   behavior improvement, recorded here because Phase 1 is otherwise zero-change.
 
 ## Global Constraints
 

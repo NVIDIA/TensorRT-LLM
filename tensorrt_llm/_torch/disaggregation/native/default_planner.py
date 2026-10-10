@@ -30,7 +30,6 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from tensorrt_llm import logger
-from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm._torch.disaggregation.base.backend import TokenRange
 from tensorrt_llm._torch.disaggregation.base.planner import (
     PeerIncompatibleError,
@@ -98,6 +97,7 @@ class DefaultTransferPlanner(TransferPlanner):
             tuple, RegionMapperBase
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._overlap_cache: Dict[str, PeerOverlap] = {}
+        self._targets_cache: Dict[str, PeerTargets] = {}
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
         ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
@@ -118,22 +118,22 @@ class DefaultTransferPlanner(TransferPlanner):
     # ---- TransferPlanner protocol -------------------------------------------------
 
     def check_peer(self, self_ri: RankInfo, peer_ri: RankInfo) -> None:
-        if self_ri.bounded_replay_on_generation != peer_ri.bounded_replay_on_generation:
-            raise PeerIncompatibleError(
-                "DefaultTransferPlanner.check_peer: bounded_replay_on_generation must match "
-                f"between peers (local={self_ri.bounded_replay_on_generation}, "
-                f"peer={peer_ri.bounded_replay_on_generation})"
-            )
-        if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
-            raise PeerIncompatibleError(
-                "DefaultTransferPlanner.check_peer: attention geometry differs from the peer "
-                f"(peer={peer_ri.instance_name}, rank={peer_ri.instance_rank})"
-            )
-        # Recurrent-state (Mamba/KDA) layout gate. Raises with a field-level
-        # diagnostic instead of returning False, so the precise mismatch
-        # reaches the caller.
-        self_page_table = self._self_ext_cache.page_table
+        """Vet a peer. Every layout or geometry mismatch surfaces as PeerIncompatibleError
+        so the caller fails only that peer's requests and caches the verdict."""
         try:
+            if self_ri.bounded_replay_on_generation != peer_ri.bounded_replay_on_generation:
+                raise ValueError(
+                    "bounded_replay_on_generation must match between peers "
+                    f"(local={self_ri.bounded_replay_on_generation}, "
+                    f"peer={peer_ri.bounded_replay_on_generation})"
+                )
+            if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
+                raise ValueError(
+                    "attention geometry differs from the peer "
+                    f"(peer={peer_ri.instance_name}, rank={peer_ri.instance_rank})"
+                )
+            # Recurrent-state (Mamba/KDA) layout gate, with a field-level diagnostic.
+            self_page_table = self._self_ext_cache.page_table
             MambaPolicy.validate_peer_compatible(
                 self._ri,
                 peer_ri,
@@ -141,21 +141,25 @@ class DefaultTransferPlanner(TransferPlanner):
                 peer_ri.page_table,
             )
             AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
-        except ValueError as e:
-            raise PeerIncompatibleError(str(e)) from e
 
-        self_layers = sum(self._ri.layer_num_per_pp)
-        peer_layers = sum(peer_ri.layer_num_per_pp)
-        if self_layers != peer_layers:
-            # Allow mismatch when one side has speculative (e.g. MTP) layers
-            # that the other side doesn't. The pool_mapping logic will only
-            # transfer layers that exist on both sides.
-            logger.warning(
-                "DefaultTransferPlanner: layer count differs "
-                f"(local={self_layers}, peer={peer_layers}), "
-                "allowing partial layer transfer."
-            )
-        self._warn_nhd_head_mismatch(peer_ri)
+            self_layers = sum(self._ri.layer_num_per_pp)
+            peer_layers = sum(peer_ri.layer_num_per_pp)
+            if self_layers != peer_layers:
+                # Allow mismatch when one side has speculative (e.g. MTP) layers
+                # that the other side doesn't. The pool_mapping logic will only
+                # transfer layers that exist on both sides.
+                logger.warning(
+                    "DefaultTransferPlanner: layer count differs "
+                    f"(local={self_layers}, peer={peer_layers}), "
+                    "allowing partial layer transfer."
+                )
+            # Pool matching runs here too; a peer that groups layers differently
+            # raises from it and must be refused like any other mismatch.
+            self._warn_nhd_head_mismatch(peer_ri)
+        except PeerIncompatibleError:
+            raise
+        except ValueError as e:
+            raise PeerIncompatibleError(f"DefaultTransferPlanner.check_peer: {e}") from e
 
     def _warn_nhd_head_mismatch(self, peer_ri: RankInfo) -> None:
         head_match, _ = self._get_policy(CacheKind.PAGED).head_match(peer_ri)
@@ -186,6 +190,13 @@ class DefaultTransferPlanner(TransferPlanner):
                 )
 
     def targets(self, self_ri: RankInfo, peer_ri: RankInfo, peer_dp_rank: int) -> PeerTargets:
+        # The sender asks on every request; the fan-in gate walks both page
+        # tables, so the answer is kept per (peer instance, DP group) like the
+        # overlap it derives from.
+        key = self._unique_key(peer_ri.instance_name, peer_dp_rank)
+        cached = self._targets_cache.get(key)
+        if cached is not None:
+            return cached
         overlap = self.get_peer_overlap(peer_ri, peer_dp_rank)
         # Helix writers contribute unequal shares (one KV owner, one state
         # sender, the rest empty), so CP on either side rules out the equal
@@ -195,7 +206,9 @@ class DefaultTransferPlanner(TransferPlanner):
             and peer_ri.cp_size == 1
             and self._fanin_bounce_safe(overlap, peer_ri, self._self_ext_cache.page_table)
         )
-        return PeerTargets(ranks=list(overlap.ranks), uniform_writers=uniform)
+        targets = PeerTargets(ranks=list(overlap.ranks), uniform_writers=uniform)
+        self._targets_cache[key] = targets
+        return targets
 
     def plan(
         self,
@@ -364,8 +377,6 @@ class DefaultTransferPlanner(TransferPlanner):
             mask[:dst_start_block] = False
         idx = np.flatnonzero(mask)
         return src_block_ids[idx], dst_block_ids[idx]
-
-    @nvtx_range("_build_kv_write_meta")
 
     @staticmethod
     def _fanin_bounce_safe(
