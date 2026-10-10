@@ -126,6 +126,7 @@ if TYPE_CHECKING:
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
 
 _UNBOUNDED_STATS_MAX_LEN = -1
+_V2_RETENTION_IGNORED_LOG_KEY = "kv_cache_manager_v2_retention_config_ignored"
 
 
 class _ADPForwardIntent(IntEnum):
@@ -5934,6 +5935,15 @@ class PyExecutor:
                     f"beam_width={request.py_beam_width}).")
 
     def _validate_request(self, request: LlmRequest):
+        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
+                and request.kv_cache_retention_config is not None):
+            logger.warning_once(
+                "KvCacheRetentionConfig has no effect with KV cache manager V2; "
+                "retention priorities and durations are ignored. Set "
+                "kv_cache_config.use_kv_cache_manager_v2=False to use retention "
+                "with KV cache manager V1.",
+                key=_V2_RETENTION_IGNORED_LOG_KEY)
+
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
