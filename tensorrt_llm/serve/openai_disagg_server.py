@@ -61,14 +61,16 @@ from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, CompletionRequest,
-    ConversationParams, ErrorResponse, UCompletionRequest, UCompletionResponse,
-    ensure_request_chat_template_allowed)
+    ConversationParams, ErrorResponse, ResponsesRequest, UCompletionRequest,
+    UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+                                                get_steady_clock_now_in_seconds,
+                                                guard_responses_stream,
+                                                stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -344,6 +346,8 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
+        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -436,10 +440,18 @@ class OpenAIDisaggServer:
                 response_or_generator = await entry_point(req, hooks)
                 self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
+                    stream = response_or_generator
+                    if isinstance(req, ResponsesRequest):
+                        # A relayed Responses stream that fails early ends with
+                        # an `error` event; other protocols end on a sentinel.
+                        stream = guard_responses_stream(stream,
+                                                        stream_error_event)
                     return StreamingResponse(
-                        content=response_or_generator,
+                        content=stream,
                         media_type="text/event-stream")
-                return JSONResponse(content=response_or_generator.model_dump())
+                # by_alias: e.g. text.format.schema goes out under its wire name.
+                return JSONResponse(
+                    content=response_or_generator.model_dump(by_alias=True))
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
@@ -495,6 +507,26 @@ class OpenAIDisaggServer:
                                             "api_error", 500)
         return JSONResponse(content=anthropic_response.model_dump(
             exclude_none=True))
+
+    async def get_model(self) -> Response:
+        """List the served model, as a context worker reports it."""
+        try:
+            return JSONResponse(
+                content=(await self._service.get_model()).model_dump())
+        except aiohttp.ClientResponseError as error:
+            status, message = error.status or 500, _upstream_error_message(
+                error)
+        except (RuntimeError, ValueError) as error:
+            # No context worker yet; the client may retry.
+            status, message = 503, str(error)
+        return JSONResponse(
+            status_code=status,
+            content=ErrorResponse(
+                message=message,
+                type=("invalid_request_error"
+                      if 400 <= status < 500 else "api_error"),
+                code=status,
+            ).model_dump())
 
     async def anthropic_count_tokens(
             self, request: AnthropicCountTokensRequest) -> Response:

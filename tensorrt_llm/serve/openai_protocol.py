@@ -43,7 +43,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent, ResponseStatus, ResponseTextConfig,
     ResponseWebSearchCallCompletedEvent, ResponseWebSearchCallInProgressEvent,
     ResponseWebSearchCallSearchingEvent)
-from openai.types.responses.response import ToolChoice
+from openai.types.responses.response import IncompleteDetails, ToolChoice
 from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
@@ -1533,11 +1533,38 @@ class ResponsesRequest(OpenAIBaseModel):
                 return {**part, "annotations": []}
             return part
 
+        def _degrade_image(part: Any) -> Any:
+            """Replace an ``input_image`` part with a text placeholder.
+
+            The vendored input union has no image member, so an image would
+            fail the whole request; the placeholder says what was dropped.
+            """
+            if isinstance(part, dict) and part.get("type") == "input_image":
+                url = part.get("image_url") or ""
+                if isinstance(url, dict):
+                    url = url.get("url") or ""
+                if not isinstance(url, str):
+                    url = ""
+                kind = url.split(";", 1)[0].removeprefix("data:") or "image"
+                return {
+                    "type":
+                    "input_text",
+                    "text":
+                    "[image omitted: %s, %d bytes as sent; this "
+                    "model accepts text only]" % (kind, len(url)),
+                }
+            return part
+
         cleaned = []
         for item in value:
             # A client may send a bare content part as a top-level item, not
             # only nested inside a message.
-            item = _with_annotations(item)
+            item = _with_annotations(_degrade_image(item))
+            # Message parts live under "content", tool-result parts under
+            # "output".
+            for key in ("content", "output"):
+                if isinstance(item, dict) and isinstance(item.get(key), list):
+                    item = {**item, key: [_degrade_image(p) for p in item[key]]}
             if isinstance(item, dict) and item.get("type") in (None, "message"):
                 role = item.get("role")
                 if "id" in item and role in _ID_STRIPPED_ROLES:
@@ -1617,6 +1644,34 @@ class ResponsesRequest(OpenAIBaseModel):
             "through out the inference process and return in response."),
     )
 
+    # doc: begin-responses-extra-params
+    # TensorRT-LLM extensions carrying the disaggregated-serving handoff between
+    # the orchestrator and the workers; clients do not set them.
+    disaggregated_params: Optional[DisaggregatedParams] = Field(
+        default=None,
+        description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
+    # The context worker's tokenized prompt, so the generation worker does not
+    # render it again; the _b64 form is a base64 int32 buffer.
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+
+    # doc: end-responses-extra-params
+
+    def relayed_prompt_token_ids(self) -> Optional[List[int]]:
+        """The prompt the orchestrator relayed from the context worker, if any."""
+        if self.prompt_token_ids is not None:
+            return self.prompt_token_ids
+        if not self.prompt_token_ids_b64:
+            return None
+        import numpy as np
+        return np.frombuffer(base64.b64decode(self.prompt_token_ids_b64),
+                             dtype=np.int32).tolist()
+
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -1671,6 +1726,38 @@ class ResponsesRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
         return {k: v for k, v in data.items() if v is not None}
+
+    @model_validator(mode="before")
+    @classmethod
+    def hoist_additional_tools(cls, data: Any) -> Any:
+        """Move the tools of an ``additional_tools`` input item into ``tools``.
+
+        Codex declares its tools that way; hoisted here, they are validated as
+        tools and resolve when the reply's calls are parsed. Malformed shapes
+        are left in place for validation to reject.
+        """
+        if not isinstance(data, dict):
+            return data
+        items = data.get("input")
+        tools = data.get("tools")
+        if not isinstance(items, list) or not isinstance(
+                tools, (list, type(None))):
+            return data
+        hoisted = []
+        kept = []
+        for item in items:
+            if (isinstance(item, dict)
+                    and item.get("type") == "additional_tools"
+                    and isinstance(item.get("tools"), list)):
+                hoisted.extend(item["tools"])
+            else:
+                kept.append(item)
+        if not hoisted:
+            return data
+        data = dict(data)
+        data["input"] = kept
+        data["tools"] = list(data.get("tools") or []) + hoisted
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -1741,7 +1828,7 @@ class ResponsesResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"resp_{str(uuid.uuid4().hex)}")
     created_at: int = Field(default_factory=lambda: int(time.time()))
     # error: Optional[ResponseError] = None
-    # incomplete_details: Optional[IncompleteDetails] = None
+    incomplete_details: Optional[IncompleteDetails] = None
     instructions: Optional[str] = None
     metadata: Optional[Metadata] = None
     model: str
@@ -1765,6 +1852,15 @@ class ResponsesResponse(OpenAIBaseModel):
     truncation: Literal["auto", "disabled"]
     usage: Optional[ResponseUsage] = None
     user: Optional[str] = None
+
+    # TensorRT-LLM extensions, set only on a context-only response: the
+    # disaggregated handoff, and the engine's raw finish reason, which tells the
+    # orchestrator whether a generation phase is pending ("length" and
+    # "not_finished" both map to status "incomplete").
+    disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    prompt_token_ids: Optional[List[int]] = None
+    prompt_token_ids_b64: Optional[str] = None
+    finish_reason: Optional[str] = None
 
     @classmethod
     def from_request(

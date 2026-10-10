@@ -48,6 +48,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     CompletionRequest,
     CompletionResponse,
+    ResponsesRequest,
+    ResponsesResponse,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -80,7 +82,20 @@ MSGPACK_HEADERS = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
 # returned object to the type the caller asked for, so a mismatch is a type
 # error rather than an Any that silently propagates.
 class _SerializableRequest(Protocol):
-    def model_dump(self, *, mode: str = ..., exclude_unset: bool = ...) -> dict: ...
+    def model_dump(
+        self, *, mode: str = ..., exclude_unset: bool = ..., by_alias: bool = ...
+    ) -> dict: ...
+
+
+def _encode_request_body(request: _SerializableRequest) -> bytes:
+    """Encode a request forwarded to a worker.
+
+    Fields go out under their wire names, e.g. ``schema``, which the model
+    holds as ``schema_``.
+    """
+    return _msgpack_encoder.encode(
+        request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+    )
 
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)
@@ -110,6 +125,10 @@ class OpenAIClient(ABC):
                 server,
                 hooks,
                 req_id,
+            )
+        elif isinstance(request, ResponsesRequest):
+            return await self._send_request(
+                "v1/responses", request, ResponsesResponse, server, hooks, req_id
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
@@ -149,6 +168,16 @@ class OpenAIClient(ABC):
         touch the router's in-flight accounting: it is for side endpoints such
         as token counting, which need a worker's tokenizer but no KV transfer.
         """
+        ...
+
+    @abstractmethod
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        """GET a worker endpoint, outside routing state, like post_json."""
         ...
 
     async def shutdown(self) -> None: ...
@@ -231,9 +260,29 @@ class OpenAIHttpClient(OpenAIClient):
         # same way -- hence the same msgpack transport as _send_request. The
         # worker decodes it because _MsgspecRoute is the app's route_class, so
         # it covers every route rather than just the completion ones.
-        body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+        body = _encode_request_body(request)
         headers = dict(MSGPACK_HEADERS)
         async with self._session.post(url, data=body, headers=headers) as response:
+            if response.status >= 400:
+                error_body = await response.text()
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=f"{response.reason}: {error_body[:2048]}",
+                    headers=response.headers,
+                )
+            return response_type(**await response.json())
+
+    async def get_json(
+        self,
+        endpoint: str,
+        response_type: Type[_ResponseT],
+        server: str,
+    ) -> _ResponseT:
+        server_url = server if server.startswith("http") else f"http://{server}"
+        url = f"{server_url.rstrip('/')}/{endpoint}"
+        async with self._session.get(url) as response:
             if response.status >= 400:
                 error_body = await response.text()
                 raise aiohttp.ClientResponseError(
@@ -331,7 +380,7 @@ class OpenAIHttpClient(OpenAIClient):
             # Serialize once on the orchestrator's single event-loop thread.
             # Content-Type stays application/json so FastAPI still routes the
             # body through Request.json(); the header picks the decoder.
-            body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+            body = _encode_request_body(request)
             headers = dict(MSGPACK_HEADERS)
             if self._request_perf_metrics:
                 headers[RETURN_METRICS_HEADER] = "1"

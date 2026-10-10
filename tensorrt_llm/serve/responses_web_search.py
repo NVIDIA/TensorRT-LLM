@@ -63,8 +63,16 @@ _WEB_SEARCH_TYPE_PREFIX = "web_search"
 _QUERY_ARG = "query"
 
 
+def _tool_field(tool: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a tool that may be an object or a plain dict."""
+    value = getattr(tool, name, None)
+    if value is None and isinstance(tool, dict):
+        value = tool.get(name)
+    return default if value is None else value
+
+
 def is_web_search_tool(tool: Any) -> bool:
-    tool_type = getattr(tool, "type", None)
+    tool_type = _tool_field(tool, "type")
     return bool(tool_type) and str(tool_type).startswith(_WEB_SEARCH_TYPE_PREFIX)
 
 
@@ -73,13 +81,13 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
     for tool in tools or []:
         if not is_web_search_tool(tool):
             continue
-        filters = getattr(tool, "filters", None)
-        allowed = getattr(filters, "allowed_domains", None) if filters else None
-        blocked = getattr(filters, "blocked_domains", None) if filters else None
+        filters = _tool_field(tool, "filters")
+        allowed = _tool_field(filters, "allowed_domains") if filters else None
+        blocked = _tool_field(filters, "blocked_domains") if filters else None
         return WebSearchToolSpec(
-            name=getattr(tool, "name", None) or WEB_SEARCH_PUBLIC_NAME,
-            type=str(getattr(tool, "type", "")) or None,
-            max_uses=getattr(tool, "max_uses", None),
+            name=_tool_field(tool, "name") or WEB_SEARCH_PUBLIC_NAME,
+            type=str(_tool_field(tool, "type", "")) or None,
+            max_uses=_tool_field(tool, "max_uses"),
             allowed_domains=tuple(allowed or ()),
             blocked_domains=tuple(blocked or ()),
         )
@@ -96,17 +104,25 @@ def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]
     the model never searched. Rejecting is recoverable (drop the tool and
     retry); a silently unsearched answer is not.
     """
-    if web_search_tool_spec(tools) is None:
+    spec = web_search_tool_spec(tools)
+    if spec is None:
         return None
+    tool = next(tool for tool in tools if is_web_search_tool(tool))
+    external = _tool_field(tool, "external_web_access")
+    # A client that turns external access off is not waiting on live results
+    # (Codex attaches the tool that way to models without search).
+    if external is False:
+        return None
+    seen = f" (tool type {spec.type!r}, external_web_access={external!r})"
     if load_web_search_config().enabled:
         # A provider is configured, so the operator does expect live search,
         # but the per-request search loop is not wired into this endpoint yet -
         # the pieces live here and in web_search.py without a driver.
         return (
             "a provider is configured but the per-request search loop is "
-            "not wired into this endpoint yet"
+            f"not wired into this endpoint yet{seen}"
         )
-    return "no web search provider is configured on this server"
+    return f"no web search provider is configured on this server{seen}"
 
 
 def server_executes_web_search(tools: Optional[Sequence[Any]]) -> bool:

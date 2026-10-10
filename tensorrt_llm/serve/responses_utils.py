@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -10,14 +11,18 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from copy import copy
-from typing import Any, List, Literal, Optional, OrderedDict, Tuple, Union
+from dataclasses import dataclass
+from typing import (Any, Callable, List, Literal, Optional, OrderedDict, Tuple,
+                    Union)
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
                                     ResponseContentPartDoneEvent,
                                     ResponseCreatedEvent,
-                                    ResponseCustomToolCall,
+                                    ResponseCustomToolCall, ResponseErrorEvent,
+                                    ResponseFailedEvent,
                                     ResponseFunctionToolCall,
+                                    ResponseIncompleteEvent,
                                     ResponseInProgressEvent, ResponseOutputItem,
                                     ResponseOutputItemAddedEvent,
                                     ResponseOutputItemDoneEvent,
@@ -27,10 +32,13 @@ from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseReasoningTextDoneEvent,
                                     ResponseTextDeltaEvent,
                                     ResponseTextDoneEvent)
+from openai.types.responses.response import IncompleteDetails
 from openai.types.responses.response_content_part_added_event import \
     PartReasoningText
 from openai.types.responses.response_content_part_done_event import \
     Part as ResponseContentPart
+from openai.types.responses.response_content_part_done_event import \
+    PartReasoningText as PartReasoningTextDone
 from openai.types.responses.response_function_web_search import (
     ActionFind, ActionOpenPage, ActionSearch, ResponseFunctionWebSearch)
 from openai.types.responses.response_reasoning_item import Content
@@ -44,9 +52,12 @@ from transformers import AutoProcessor, PretrainedConfig
 from tensorrt_llm._utils import \
     get_steady_clock_now_in_seconds  # noqa: F401  (re-export)
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import async_apply_chat_template
+from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
+                                   RequestError)
+from tensorrt_llm.inputs.utils import (async_apply_chat_template,
+                                       resolve_hf_chat_template)
 from tensorrt_llm.llmapi import SamplingParams
+from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
                                                   ReasoningParserFactory,
@@ -70,13 +81,16 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ResponseUsage,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
-                                                UCompletionResponse)
+                                                UCompletionResponse,
+                                                to_disaggregated_params)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.web_search import load_web_search_config
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
 
@@ -101,9 +115,31 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 CUSTOM_TOOL_INPUT_ARG = "input"
 
 
+@dataclass
+class StreamedItem:
+    """One reasoning/message output item as the stream published it.
+
+    ``text`` holds every delta emitted for the item, so the final snapshot can
+    repeat exactly what the client received (see ``_create_output_content``).
+    """
+    item_type: str
+    item_id: str
+    text: str = ""
+
+
 def _responses_debug_log(msg):
     if ENABLE_RESPONSES_DEBUG_MSG:
         logger.info(msg)
+
+
+def _is_context_only(request: ResponsesRequest) -> bool:
+    """Whether this request is the context half of a disaggregated split.
+
+    Such a request comes from the orchestrator rather than a client, and its
+    response is consumed by the orchestrator alone.
+    """
+    params = request.disaggregated_params
+    return params is not None and params.request_type == "context_only"
 
 
 _harmony_encoding = None
@@ -317,7 +353,9 @@ class ConversationHistoryStore:
 
             _responses_debug_log(
                 f" * storing at conversation: {conversation_id}")
-            self.conversations[conversation_id] = msgs
+            # A copy: trimming the stored conversation must not shorten the
+            # caller's list, which is rendered next.
+            self.conversations[conversation_id] = list(msgs)
 
             self.response_to_conversation[resp_id] = conversation_id
             self.conversation_to_response[conversation_id] = resp_id
@@ -482,8 +520,9 @@ def _get_developer_message(instructions: Optional[str] = None,
     if tools is not None:
         function_tools = []
         for tool in tools:
-            if tool.type in ("web_search_preview", "code_interpreter"):
-                # These are built-in tools that are added to the system message.
+            if tool.type == "code_interpreter" or tool.type.startswith(
+                    "web_search"):
+                # Built-in tools, described in the system message if enabled.
                 pass
             elif tool.type == "function":
                 function_tools.append(tool)
@@ -553,8 +592,9 @@ def _construct_harmony_messages(
 
 def _render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
-    _responses_debug_log("Rendering conversation:")
-    _responses_debug_log(conversation.to_json())
+    if ENABLE_RESPONSES_DEBUG_MSG:
+        _responses_debug_log("Rendering conversation:")
+        _responses_debug_log(conversation.to_json())
     token_ids = _get_encoding().render_conversation_for_completion(
         conversation, Role.ASSISTANT)
     return token_ids
@@ -672,8 +712,12 @@ def finish_reason_mapping(finish_reason: str) -> str:
             return 'failed'
         case 'cancelled':
             return 'cancelled'
+        case 'not_finished':
+            # A disaggregated context worker handing the request off.
+            return 'incomplete'
 
-    raise RuntimeError("Should never reach here!")
+    raise RuntimeError(
+        f"Unhandled finish reason {finish_reason!r} in finish_reason_mapping")
 
 
 def _item_text(item: dict) -> str:
@@ -682,10 +726,19 @@ def _item_text(item: dict) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [
-            part.get("text") for part in content
-            if isinstance(part, dict) and part.get("text")
-        ]
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if not text and part.get("type") == "encrypted_content":
+                # Some clients carry readable text in an `encrypted_content`
+                # part; only a string value is taken as text.
+                value = part.get("encrypted_content")
+                if isinstance(value, str):
+                    text = value
+            if text:
+                parts.append(text)
         return "\n".join(parts)
     return item.get("text") or ""
 
@@ -713,6 +766,67 @@ def _qualified_tool_name(item: dict) -> str:
     return f"{namespace}.{name}" if namespace else name
 
 
+# Responses text parts, which the chat-completions content parser knows as `text`.
+_RESPONSES_TEXT_PART_TYPES = frozenset(("input_text", "output_text"))
+
+
+def _chat_content_parts(content: list) -> list:
+    """Rewrite Responses text parts as chat text parts; keep the others."""
+    parts = []
+    for part in content:
+        part_type = part.get("type") if isinstance(part, dict) else getattr(
+            part, "type", None)
+        if part_type in _RESPONSES_TEXT_PART_TYPES:
+            text = part.get("text") if isinstance(part, dict) else getattr(
+                part, "text", None)
+            parts.append({"type": "text", "text": text or ""})
+        else:
+            parts.append(part)
+    return parts
+
+
+def _tool_output_content(output):
+    """A tool result's payload in the vocabulary the chat parser knows.
+
+    ``output`` is a string or a list of Responses content parts.
+    """
+    if isinstance(output, list):
+        return _chat_content_parts(output)
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    return str(output)
+
+
+def _render_developer_as_system(
+    messages: list[ChatCompletionMessageParam],
+    tokenizer: Optional[TokenizerBase],
+    processor: Optional[AutoProcessor],
+    tools: Optional[list[dict[str, Any]]],
+) -> list[ChatCompletionMessageParam]:
+    """Render ``developer`` messages as ``system`` where the template lacks them.
+
+    A chat template without a ``developer`` branch renders those messages to
+    nothing. The DeepSeek tokenizers render ``developer`` themselves.
+    """
+    if not any(message.get("role") == "developer" for message in messages):
+        return messages
+    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
+        return messages
+    template = resolve_hf_chat_template(getattr(tokenizer, "tokenizer",
+                                                tokenizer),
+                                        processor,
+                                        chat_template=None,
+                                        tools=tools)
+    if not isinstance(template, str) or "developer" in template:
+        return messages
+    return [{
+        **message, "role": "system"
+    } if message.get("role") == "developer" else message
+            for message in messages]
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem]
 ) -> Optional[ChatCompletionMessageParam]:
@@ -723,12 +837,21 @@ def _response_output_item_to_chat_completion_message(
 
     match item_type:
         case "":
-            if "role" in item:
-                return item
-            else:
+            if "role" not in item:
                 raise ValueError(f"Invalid input message item: {item}")
+            content = item.get("content")
+            if isinstance(content, list):
+                return {**item, "content": _chat_content_parts(content)}
+            return item
         case "message" | "reasoning":
-            content = item.get("content") or []
+            content = item.get("content")
+            if isinstance(content, str):
+                content = [{"text": content}]
+            elif item_type == "reasoning" and not content:
+                # Reasoning may carry only a summary, or nothing readable.
+                content = item.get("summary")
+                if not content:
+                    return None
             if not content:
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
@@ -754,6 +877,8 @@ def _response_output_item_to_chat_completion_message(
             # role; a plain string input never reaches this function.
             role = item.get("role") or "assistant"
             return {"role": role, "content": text}
+        case "output_text":
+            return {"role": "assistant", "content": item.get("text") or ""}
         case "function_call":
             # An assistant message carrying tool_calls, which is how the chat
             # completions path represents a call and what chat templates
@@ -778,7 +903,7 @@ def _response_output_item_to_chat_completion_message(
         case "function_call_output":
             return {
                 "role": "tool",
-                "content": item["output"],
+                "content": _tool_output_content(item["output"]),
                 "tool_call_id": item["call_id"],
             }
         case "custom_tool_call":
@@ -810,7 +935,7 @@ def _response_output_item_to_chat_completion_message(
             # turn that still renders, not a KeyError surfacing as a 500.
             return {
                 "role": "tool",
-                "content": item.get("output") or "",
+                "content": _tool_output_content(item.get("output")),
                 "tool_call_id": item.get("call_id") or "",
             }
         case "agent_message":
@@ -839,10 +964,49 @@ def _response_output_item_to_chat_completion_message(
             return None
 
 
+def _fold_tool_calls_into_open_assistant_turn(
+        messages: list[ChatCompletionMessageParam],
+        message: ChatCompletionMessageParam, turn_start: int) -> bool:
+    """Attach a converted tool-call item to the assistant message before it.
+
+    The N calls of one assistant turn arrive as N ``function_call`` items. Kept
+    in one assistant message, as chat completions does, they let the chat
+    template bind each tool result to its call by id; templates that align
+    results with the last assistant message only (GLM) lose that binding when
+    the calls are split across messages.
+
+    Only messages from ``turn_start`` on, converted from this request's input,
+    are extended; a tool result or user message in between ends the turn.
+    """
+    if message.get("role") != "assistant" or not message.get("tool_calls"):
+        return False
+    if message.get("content") is not None:
+        # A message with content of its own is a turn of its own.
+        return False
+    if len(messages) <= turn_start:
+        return False
+    last = messages[-1]
+    if last.get("role") != "assistant":
+        return False
+    # Rebuilt: the target's list may be None or owned by the caller.
+    last["tool_calls"] = [
+        *(last.get("tool_calls") or []), *message["tool_calls"]
+    ]
+    return True
+
+
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
 ) -> list[ChatCompletionMessageParam]:
+    return chat_messages_from_responses_input(request, prev_msgs)
+
+
+def chat_messages_from_responses_input(
+    request: ResponsesRequest,
+    prev_msgs: list[ChatCompletionMessageParam],
+) -> list[ChatCompletionMessageParam]:
+    """Convert a Responses request's instructions, history and input to chat messages."""
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
@@ -851,20 +1015,34 @@ async def _create_input_messages(
         })
 
     # Prepend the conversation history.
-    # Skip the reasoning output.
+    # Skip the reasoning output, but keep the tool calls a reasoning message
+    # carries: the tool results that follow answer them.
     for msg in prev_msgs:
         if "reasoning" not in msg:
             messages.append(msg)
+            continue
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            })
 
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
     if isinstance(request.input, str):
         messages.append({"role": "user", "content": request.input})
     else:
+        turn_start = len(messages)
         for inp in request.input:
             message = _response_output_item_to_chat_completion_message(inp)
-            if message is not None:
-                messages.append(message)
+            if message is None:
+                continue
+            if _fold_tool_calls_into_open_assistant_turn(
+                    messages, message, turn_start):
+                continue
+            messages.append(message)
 
     return messages
 
@@ -898,7 +1076,9 @@ def _create_output_messages(
     """
     Convert output contents to chat completion messages for conversation store.
 
-    Reasoning content is not included in the output messages to reduce the token usage.
+    Reasoning is stored and stripped on replay (_create_input_messages). Tool
+    calls go on the reasoning message, else the text message, else a bare
+    assistant message.
 
     Input:
         output_contents: dict[str, str]
@@ -911,12 +1091,25 @@ def _create_output_messages(
     """
     messages: list[ChatCompletionMessageParam] = []
 
+    tool_calls = output_contents.get("tool_calls") or []
+    tool_call_msgs = [{
+        "id": call.call_id,
+        "function": {
+            "arguments": _stored_tool_arguments(call),
+            "name": _stored_tool_name(call),
+        },
+        "type": "function",
+    } for call in tool_calls]
+    _responses_debug_log(f"tool_call_msgs: {tool_call_msgs}")
+
     text_content = output_contents.get("text_content", None)
+    text_msg: Optional[ChatCompletionMessageParam] = None
     if text_content:
-        messages.append({
+        text_msg = {
             "role": "assistant",
             "content": text_content,
-        })
+        }
+        messages.append(text_msg)
 
     reasoning_content = output_contents.get("reasoning_content", None)
     if reasoning_content:
@@ -924,21 +1117,17 @@ def _create_output_messages(
             role="assistant",
             reasoning=reasoning_content,
         )
-
-        tool_calls = output_contents.get("tool_calls", [])
-        tool_call_msgs = [{
-            "id": call.call_id,
-            "function": {
-                "arguments": _stored_tool_arguments(call),
-                "name": _stored_tool_name(call),
-            },
-            "type": "function",
-        } for call in tool_calls]
-
-        _responses_debug_log(f"tool_call_msgs: {tool_call_msgs}")
         reasoning_msg["tool_calls"] = tool_call_msgs
-
         messages.append(reasoning_msg)
+    elif tool_call_msgs:
+        if text_msg is not None:
+            text_msg["tool_calls"] = tool_call_msgs
+        else:
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_call_msgs,
+            })
 
     return messages
 
@@ -1006,8 +1195,8 @@ def _get_chat_completion_function_tools(
                 # A custom tool nested in a namespace needs the same freeform
                 # schema as a top-level one. It carries no `parameters`, so
                 # passing them straight through would describe it with an empty
-                # object schema - while _custom_tool_names still classifies the
-                # qualified name as custom, so the output path goes looking for
+                # object schema - while _tool_resolution still classifies the
+                # tool as custom, so the output path goes looking for
                 # CUSTOM_TOOL_INPUT_ARG the prompt never mentioned.
                 if getattr(inner, "type", None) == "custom":
                     inner_parameters = custom_parameters()
@@ -1088,12 +1277,14 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
-    conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
-        messages, model_config)
     tools_dict = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
+    messages = _render_developer_as_system(messages, tokenizer, processor,
+                                           tools_dict)
+    conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
+        messages, model_config)
     # Carry the request's reasoning configuration into the chat template.
     #
     # Chat templates that support thinking are opt-in: DeepSeek-V4's custom
@@ -1185,7 +1376,12 @@ async def request_preprocess(
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
-    if use_harmony:
+    # A generation worker in disaggregated serving gets the context worker's
+    # tokens: rendering again could produce a prompt that was never prefilled.
+    pretokenized = request.relayed_prompt_token_ids()
+    if pretokenized is not None:
+        input_tokens = pretokenized
+    elif use_harmony:
         input_tokens = await _create_input_tokens_harmony(
             request=request,
             prev_response=prev_response,
@@ -1206,9 +1402,10 @@ async def request_preprocess(
             processor=processor,
         )
 
-    _responses_debug_log("======= Complete Inputs to model =======")
-    _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
-    _responses_debug_log("========================================")
+    if ENABLE_RESPONSES_DEBUG_MSG:  # decoding is not free; skip it otherwise
+        _responses_debug_log("======= Complete Inputs to model =======")
+        _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
+        _responses_debug_log("========================================")
     add_thinking_budget_logits_processor(
         sampling_params,
         reasoning_parser=reasoning_parser,
@@ -1298,6 +1495,47 @@ def _apply_reasoning_parser(
     return content, reasoning_content
 
 
+def _whole_text_tool_calls(
+    output: RequestOutput,
+    request: ResponsesRequest,
+    helper: "ResponsesStreamingEventsHelper",
+    reasoning_parser_id: Optional[str],
+    tool_parser_id: str,
+    tools: list[ChatCompletionToolsParam],
+) -> Tuple[str, list[ToolCallItem]]:
+    """Tool calls from one whole-text parse at end of stream.
+
+    Also returns the normal text the stream still owes: what that parse reads
+    as normal text beyond the message text already streamed. Markup the
+    incremental parser withheld is never released this way.
+    """
+    content, _ = _apply_reasoning_parser(
+        reasoning_parser_id,
+        output.index,
+        output.text,
+        streaming=False,
+        chat_template_kwargs=reasoning_chat_template_kwargs(request))
+    normal_text, calls = _apply_tool_parser(tool_parser_id, tools, output.index,
+                                            content, False)
+    streamed = "".join(item.text for item in helper.emitted_item_ids
+                       if item.item_type == "message")
+    owed = normal_text[len(streamed):] if normal_text.startswith(
+        streamed) else ""
+    return owed, calls
+
+
+def _effective_tool_parser(tool_parser_id: Optional[str],
+                           request: ResponsesRequest) -> Optional[str]:
+    """The tool parser to run: none for ``tool_choice="none"``.
+
+    Not parsing keeps any call markup in the visible text verbatim, in the
+    stream and the final snapshot alike.
+    """
+    if request.tool_choice == "none":
+        return None
+    return tool_parser_id
+
+
 def _apply_tool_parser(
     tool_parser_id: Optional[str],
     tools: Optional[list[Tool]],
@@ -1332,16 +1570,67 @@ def _apply_tool_parser(
     return normal_text, calls
 
 
+def _streamed_items_cover(streamed_items: list[StreamedItem],
+                          reasoning_text: Optional[str],
+                          text: Optional[str]) -> bool:
+    """Whether the streamed items hold the same characters as the re-parse.
+
+    Item boundaries and edge whitespace may differ (the whole-text parse can
+    strip what the stream already sent); anything else means the two views
+    diverged and the re-parsed items are used instead.
+    """
+    streamed_reasoning = "".join(item.text for item in streamed_items
+                                 if item.item_type == "reasoning")
+    streamed_message = "".join(item.text for item in streamed_items
+                               if item.item_type == "message")
+    return (streamed_reasoning.strip() == (reasoning_text or "").strip()
+            and streamed_message.strip() == (text or "").strip())
+
+
 def _create_output_content(
     final_res: RequestOutput,
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     tools: Optional[list[Tool]] = None,
     chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam]]:
+    streamed_tool_calls: Optional[list[ResponseOutputItem]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
+) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
+           list[str]]:
+    """Build the output items for a finished generation.
+
+    For a streamed request (``streamed_item_ids``/``streamed_tool_calls`` not
+    None) the snapshot repeats what the stream published: its reasoning and
+    message items when they cover the re-parsed text, and its tool-call items
+    as emitted. Otherwise items are derived from a whole-text parse, reusing
+    streamed ids positionally where a stream ran.
+    """
     output_items: list[ResponseOutputItem] = []
     output_messages: list[ChatCompletionMessageParam] = []
+    # Raw reasoning per output, for counting reasoning tokens.
+    reasoning_texts: list[str] = []
     available_tools = _get_chat_completion_function_tools(tools)
+
+    # A stream only runs over a single output.
+    single_output = len(final_res.outputs) == 1
+    streamed_ids_by_type: dict[str, list[str]] = {
+        "reasoning": [],
+        "message": []
+    }
+    for record in streamed_item_ids or []:
+        if record.item_type in streamed_ids_by_type:
+            streamed_ids_by_type[record.item_type].append(record.item_id)
+    used_ids_by_type = {"reasoning": 0, "message": 0}
+    used_streamed_assembly = False
+
+    def _streamed_or_fresh_id(item_type: str) -> str:
+        pool = streamed_ids_by_type[item_type]
+        index = used_ids_by_type[item_type]
+        used_ids_by_type[item_type] = index + 1
+        if index < len(pool):
+            return pool[index]
+        prefix = "rs" if item_type == "reasoning" else "msg"
+        return f"{prefix}_{_random_uuid()}"
 
     for output in final_res.outputs:
         calls = []
@@ -1356,65 +1645,113 @@ def _create_output_content(
             output.text,
             False,
             chat_template_kwargs=chat_template_kwargs)
+        reasoning_texts.append(reasoning_text or "")
 
         if text:
             text, calls = _apply_tool_parser(tool_parser, available_tools,
                                              output.index, text, False)
 
-        text_item = None
-        reasoning_item = None
-        tool_calls_item = []
-        # Check again after tool parsing to avoid empty text
-        if text:
-            output_text = ResponseOutputText(
-                text=text.strip(),
-                annotations=[],
-                type="output_text",
-                logprobs=None,
-            )
+        stored_text: Optional[str] = None
+        stored_reasoning: Optional[str] = None
+        # Reasoning first, then the answer, then any tool calls: the stream's
+        # order.
+        if (streamed_item_ids is not None
+                and single_output and _streamed_items_cover(
+                    streamed_item_ids, reasoning_text, text)):
+            used_streamed_assembly = True
+            for record in streamed_item_ids:
+                if record.item_type == "reasoning":
+                    output_items.append(
+                        ResponseReasoningItem(
+                            id=record.item_id,
+                            summary=[],
+                            type="reasoning",
+                            content=[
+                                Content(text=record.text, type="reasoning_text")
+                            ],
+                            status=None,
+                        ))
+                else:
+                    output_items.append(
+                        ResponseOutputMessage(
+                            id=record.item_id,
+                            content=[
+                                ResponseOutputText(
+                                    text=record.text,
+                                    annotations=[],
+                                    type="output_text",
+                                    logprobs=None,
+                                )
+                            ],
+                            role="assistant",
+                            status="completed",
+                            type="message",
+                        ))
+            stored_reasoning = "".join(
+                record.text for record in streamed_item_ids
+                if record.item_type == "reasoning") or None
+            stored_text = "".join(record.text for record in streamed_item_ids
+                                  if record.item_type == "message") or None
+        else:
+            if reasoning_text:
+                output_items.append(
+                    ResponseReasoningItem(
+                        id=_streamed_or_fresh_id("reasoning"),
+                        summary=[],
+                        type="reasoning",
+                        content=[
+                            Content(text=reasoning_text, type="reasoning_text")
+                        ],
+                        status=None,
+                    ))
+                stored_reasoning = reasoning_text
 
-            text_item = ResponseOutputMessage(
-                id=f"msg_{_random_uuid()}",
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
+            # Check again after tool parsing to avoid empty text
+            if text:
+                output_items.append(
+                    ResponseOutputMessage(
+                        id=_streamed_or_fresh_id("message"),
+                        content=[
+                            ResponseOutputText(
+                                text=text,
+                                annotations=[],
+                                type="output_text",
+                                logprobs=None,
+                            )
+                        ],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    ))
+                stored_text = text
 
-            output_items.append(text_item)
-
-        if reasoning_text:
-            reasoning_item = ResponseReasoningItem(
-                id=f"rs_{_random_uuid()}",
-                summary=[],
-                type="reasoning",
-                content=[
-                    Content(text=reasoning_text.strip(), type="reasoning_text")
-                ],
-                status=None,
-            )
-            output_items.append(reasoning_item)
-
-        if calls:
-            custom_tool_names = _custom_tool_names(tools)
-            namespaced_tool_names = _namespaced_tool_names(tools)
+        if streamed_tool_calls is not None and single_output:
+            tool_calls_item = list(streamed_tool_calls)
+        else:
+            tool_resolution = _tool_resolution(tools)
             tool_calls_item = [
-                _tool_call_output_item(call, custom_tool_names,
-                                       namespaced_tool_names) for call in calls
+                _tool_call_output_item(call, tool_resolution) for call in calls
             ]
-            output_items.extend(tool_calls_item)
+        output_items.extend(tool_calls_item)
 
         output_messages.extend(
             _create_output_messages({
-                "text_content":
-                text_item.content[0].text if text_item else None,
-                "reasoning_content":
-                reasoning_item.content[0].text if reasoning_item else None,
-                "tool_calls":
-                tool_calls_item,
+                "text_content": stored_text,
+                "reasoning_content": stored_reasoning,
+                "tool_calls": tool_calls_item,
             }))
 
-    return output_items, output_messages
+    if streamed_item_ids is not None and not used_streamed_assembly:
+        for item_type in ("reasoning", "message"):
+            streamed = len(streamed_ids_by_type[item_type])
+            rebuilt = used_ids_by_type[item_type]
+            if streamed != rebuilt:
+                logger.warning(
+                    f"final response rebuilt {rebuilt} {item_type} item(s) but "
+                    f"the stream published {streamed}; ids beyond the "
+                    f"streamed ones are new")
+
+    return output_items, output_messages, reasoning_texts
 
 
 def _create_output_content_harmony(
@@ -1434,56 +1771,53 @@ def _create_output_content_harmony(
     return output_content, output_messages
 
 
-def _custom_tool_names(tools: Optional[list[Tool]]) -> set[str]:
-    """Names of the tools the request declared as freeform custom tools.
+def _tool_resolution(
+        tools: Optional[list[Tool]]
+) -> dict[str, Tuple[Optional[str], str, bool]]:
+    """Every spelling a parsed call may carry -> (namespace, bare name, custom).
 
-    Tools inside a namespace are keyed by the qualified name they are
-    offered to the model under, which is what a parsed call carries.
+    A chat template can only describe a flat list of functions, so a namespaced
+    tool is offered to the model as "namespace.tool" and has to be reported back
+    with the two parts separated again - that is how the client identifies it.
+    Models write the name back both ways, so the bare name resolves too, but
+    only when exactly one declared tool answers to it.
     """
-    names: set[str] = set()
+    resolved: dict[str, Tuple[Optional[str], str, bool]] = {}
+    bare_claims: dict[str, list[str]] = {}
+
+    def claim(exposed: str, namespace: Optional[str], bare: str,
+              is_custom: bool) -> None:
+        resolved[exposed] = (namespace, bare, is_custom)
+        if exposed != bare:
+            bare_claims.setdefault(bare, []).append(exposed)
+
     for tool in tools or []:
         tool_type = getattr(tool, "type", None)
         name = getattr(tool, "name", None)
         if not name:
             continue
-        if tool_type == "custom":
-            names.add(name)
-        elif tool_type == "namespace":
+        if tool_type == "namespace":
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
-                if inner_name and getattr(inner, "type", None) == "custom":
-                    names.add(f"{name}.{inner_name}")
-    return names
+                if inner_name:
+                    claim(f"{name}.{inner_name}", name, inner_name,
+                          getattr(inner, "type", None) == "custom")
+        else:
+            claim(name, None, name, tool_type == "custom")
 
-
-def _namespaced_tool_names(
-        tools: Optional[list[Tool]]) -> dict[str, Tuple[str, str]]:
-    """Qualified name -> (namespace, bare name) for namespaced tools.
-
-    A chat template can only describe a flat list of functions, so a
-    namespaced tool is offered as "namespace.tool". The call has to be
-    reported back with the two parts separated again, since that is how the
-    client identifies the tool; a call named "collaboration.spawn_agent"
-    matches nothing it knows and comes back as "unsupported call".
-    """
-    mapping: dict[str, Tuple[str, str]] = {}
-    for tool in tools or []:
-        if getattr(tool, "type", None) != "namespace":
+    for bare, exposed_names in bare_claims.items():
+        # A top-level tool owning the spelling wins; it is what the model was
+        # shown under that exact name.
+        if bare in resolved:
             continue
-        namespace = getattr(tool, "name", None)
-        if not namespace:
-            continue
-        for inner in getattr(tool, "tools", None) or []:
-            inner_name = getattr(inner, "name", None)
-            if inner_name:
-                mapping[f"{namespace}.{inner_name}"] = (namespace, inner_name)
-    return mapping
+        if len(exposed_names) == 1:
+            resolved[bare] = resolved[exposed_names[0]]
+    return resolved
 
 
 def _tool_call_output_item(
     call,
-    custom_tool_names: set[str],
-    namespaced_tool_names: Optional[dict[str, Tuple[str, str]]] = None,
+    tool_resolution: dict[str, Tuple[Optional[str], str, bool]],
     item_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> Union[ResponseFunctionToolCall, ResponseCustomToolCall]:
@@ -1499,10 +1833,15 @@ def _tool_call_output_item(
     arguments = call.parameters or "{}"
     call_id = f"call_{_random_uuid()}"
 
-    is_custom = name in custom_tool_names
-    namespace = None
-    if namespaced_tool_names and name in namespaced_tool_names:
-        namespace, name = namespaced_tool_names[name]
+    resolved = (tool_resolution or {}).get(name)
+    if resolved is not None:
+        namespace, name, is_custom = resolved
+    else:
+        namespace, is_custom = None, False
+        logger.warning(
+            f"tool call {name!r} matches no declared tool; reporting it as a "
+            f"function call. If it is in fact a custom tool, the client will "
+            f"reject it.")
 
     if is_custom:
         # Unwrap the single string argument the tool was described with. A
@@ -1543,9 +1882,38 @@ def _tool_call_output_item(
     return item
 
 
+def _count_reasoning_tokens(
+    tokenizer: Optional[TokenizerBase],
+    reasoning_texts: list[str],
+    output_tokens: int,
+) -> int:
+    """How many of the generated tokens went into reasoning.
+
+    The engine does not track this, so the text the reasoning parser claimed is
+    re-encoded, which keeps the count consistent with the parser's rules. The
+    result is clamped to ``output_tokens``: re-encoding a substring need not
+    reproduce its original tokenization. 0 without a tokenizer.
+    """
+    if tokenizer is None:
+        return 0
+
+    total = 0
+    for text in reasoning_texts:
+        if not text:
+            continue
+        try:
+            total += len(tokenizer.encode(text, add_special_tokens=False))
+        except TypeError:
+            # Not every tokenizer accepts the keyword.
+            total += len(tokenizer.encode(text))
+    return min(total, output_tokens)
+
+
 def _create_usage(
         final_res: GenerationResult,
-        num_prompt_tokens: Optional[int] = None) -> Optional[ResponseUsage]:
+        num_prompt_tokens: Optional[int] = None,
+        tokenizer: Optional[TokenizerBase] = None,
+        reasoning_texts: Optional[list[str]] = None) -> Optional[ResponseUsage]:
     """Build the Responses-API usage block from a finished generation.
 
     Clients such as the Codex CLI rely on this to track how much of the
@@ -1569,13 +1937,23 @@ def _create_usage(
     output_tokens = sum(len(output.token_ids) for output in final_res.outputs)
     cached_tokens = getattr(final_res, "cached_tokens", None) or 0
 
+    # Under disaggregated serving the whole prompt reached this worker as
+    # transferred KV; the context phase's usage, carried with the handoff,
+    # says what was actually reused.
+    from tensorrt_llm.serve.postprocess_handlers import _ctx_usage_from_outputs
+    ctx_prompt_tokens, ctx_cached_tokens = get_usage_tokens_from_ctx(
+        _ctx_usage_from_outputs(final_res.outputs))
+    if ctx_prompt_tokens is not None:
+        input_tokens = ctx_prompt_tokens
+        cached_tokens = ctx_cached_tokens
+
     return ResponseUsage(
         input_tokens=input_tokens,
         input_tokens_details=InputTokensDetails(cached_tokens=cached_tokens),
         output_tokens=output_tokens,
-        # The reasoning tokens are not accounted separately from the
-        # generated ones, so report them as zero rather than guessing.
-        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        output_tokens_details=OutputTokensDetails(
+            reasoning_tokens=_count_reasoning_tokens(tokenizer, reasoning_texts
+                                                     or [], output_tokens)),
         total_tokens=input_tokens + output_tokens,
     )
 
@@ -1590,6 +1968,9 @@ def _create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    streamed_tool_calls: Optional[list[ResponseOutputItem]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> tuple[ResponsesResponse, list[Message | ChatCompletionMessageParam]]:
     _responses_debug_log("================================================")
     _responses_debug_log("RAW MODEL OUTPUT:")
@@ -1598,26 +1979,48 @@ def _create_response(
 
     # prepare responses output
     output_content = []
+    reasoning_texts: list[str] = []
     if use_harmony:
-        output_content, output_messages = _create_output_content_harmony(
-            final_res)
+        # A context-only output is a single handoff token, not a complete
+        # Harmony message, so there is nothing to parse.
+        output_content, output_messages = (
+            ([], []) if _is_context_only(request) else
+            _create_output_content_harmony(final_res))
     else:
-        output_content, output_messages = _create_output_content(
+        output_content, output_messages, reasoning_texts = _create_output_content(
             final_res,
             reasoning_parser,
-            tool_parser,
+            _effective_tool_parser(tool_parser, request),
             request.tools,
-            chat_template_kwargs=reasoning_chat_template_kwargs(request))
+            chat_template_kwargs=reasoning_chat_template_kwargs(request),
+            streamed_tool_calls=streamed_tool_calls,
+            streamed_item_ids=streamed_item_ids)
 
+    finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
         request=request,
         sampling_params=sampling_params,
         model_name=model_name,
         created_time=response_creation_time,
         output=output_content,
-        status=finish_reason_mapping(final_res.outputs[0].finish_reason),
-        usage=_create_usage(final_res, num_prompt_tokens),
+        status=finish_reason_mapping(finish_reason),
+        usage=_create_usage(final_res,
+                            num_prompt_tokens,
+                            tokenizer=tokenizer,
+                            reasoning_texts=reasoning_texts),
     )
+    # Only a token-budget cut is explained; "not_finished" (a disaggregated
+    # context worker handing off) also maps to "incomplete".
+    if finish_reason == "length":
+        response.incomplete_details = IncompleteDetails(
+            reason="max_output_tokens")
+    # The disaggregated handoff fields are set only on a context-only response,
+    # which the orchestrator reads and strips before anything reaches a client.
+    if _is_context_only(request):
+        response.finish_reason = finish_reason
+        response.disaggregated_params = to_disaggregated_params(
+            final_res.outputs[0].disaggregated_params)
+        response.prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
 
     _responses_debug_log("========== Response ===========")
     _responses_debug_log(response)
@@ -1640,6 +2043,7 @@ async def create_response(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
 
     final_res: Optional[RequestOutput] = None
@@ -1666,6 +2070,7 @@ async def create_response(
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
+        tokenizer=tokenizer,
     )
 
     if enable_store and request.store:
@@ -1686,6 +2091,9 @@ def create_response_non_store(
     reasoning_parser: Optional[str] = None,
     tool_parser: Optional[str] = None,
     num_prompt_tokens: Optional[int] = None,
+    streamed_tool_calls: Optional[list[ResponseOutputItem]] = None,
+    streamed_item_ids: Optional[list[StreamedItem]] = None,
+    tokenizer: Optional[TokenizerBase] = None,
 ) -> ResponsesResponse:
     response_creation_time = create_time if create_time is not None else int(
         time.time())
@@ -1701,6 +2109,9 @@ def create_response_non_store(
         reasoning_parser=reasoning_parser,
         tool_parser=tool_parser,
         num_prompt_tokens=num_prompt_tokens,
+        streamed_tool_calls=streamed_tool_calls,
+        streamed_item_ids=streamed_item_ids,
+        tokenizer=tokenizer,
     )
 
     return response
@@ -1717,15 +2128,28 @@ class ResponsesStreamingStateTracker:
     reasoning_sent: bool = False
     # Deltas already streamed for the item currently open, so it can be closed
     # with its full text if generation ends before the parser says it is done.
-    emitted_tool_calls: int = 0
     text_buffer: str = ""
     reasoning_buffer: str = ""
+
+    def __init__(self) -> None:
+        # Incremental tool-call fragments, by output index, then tool index.
+        self.tool_call_fragments: dict[int, dict[int, dict[str, Any]]] = {}
+        # Items already streamed, in emission order; the final snapshot
+        # repeats them.
+        self.emitted_tool_call_items: list[ResponseOutputItem] = []
+        self.emitted_item_ids: list[StreamedItem] = []
 
 
 class ResponsesStreamingEventsHelper:
 
     def __init__(self):
         self.state_tracker = ResponsesStreamingStateTracker()
+
+    def tool_call_fragments(self,
+                            output_index: int) -> dict[int, dict[str, Any]]:
+        """The call fragments accumulated so far for one output."""
+        return self.state_tracker.tool_call_fragments.setdefault(
+            output_index, {})
 
     def content_index_increment(self):
         self.state_tracker.current_content_index += 1
@@ -1734,18 +2158,28 @@ class ResponsesStreamingEventsHelper:
         self.state_tracker.current_output_index += 1
 
     @property
-    def emitted_tool_calls(self) -> int:
-        return self.state_tracker.emitted_tool_calls
+    def emitted_tool_call_items(self) -> list[ResponseOutputItem]:
+        """The tool-call items already streamed, in order."""
+        return self.state_tracker.emitted_tool_call_items
 
-    @emitted_tool_calls.setter
-    def emitted_tool_calls(self, count: int) -> None:
-        self.state_tracker.emitted_tool_calls = count
+    @property
+    def emitted_item_ids(self) -> list[StreamedItem]:
+        """The reasoning/message items streamed, in order; see StreamedItem."""
+        return self.state_tracker.emitted_item_ids
+
+    def _record_item_delta(self, item_type: str, delta: str) -> None:
+        # The open item is the last one announced.
+        records = self.state_tracker.emitted_item_ids
+        if records and records[-1].item_type == item_type:
+            records[-1].text += delta
 
     def append_text(self, delta: str) -> None:
         self.state_tracker.text_buffer += delta
+        self._record_item_delta("message", delta)
 
     def append_reasoning(self, delta: str) -> None:
         self.state_tracker.reasoning_buffer += delta
+        self._record_item_delta("reasoning", delta)
 
     def take_text(self) -> str:
         text = self.state_tracker.text_buffer
@@ -1905,6 +2339,10 @@ class ResponsesStreamingEventsHelper:
         if not self.is_output_item_added_sent:
             self.is_output_item_added_sent = True
 
+            self.state_tracker.emitted_item_ids.append(
+                StreamedItem(item_type=output_item.type,
+                             item_id=output_item.id))
+
             if output_item.type == "message":
                 content_part = ResponseOutputText(
                     type="output_text",
@@ -1961,103 +2399,55 @@ class ResponsesStreamingEventsHelper:
         ))
 
 
-def _should_send_done_events(
-    output: RequestOutput,
-    output_index: int,
-    reasoning_parser_id: Optional[str] = None,
-    tool_parser_id: Optional[str] = None,
-    tools: Optional[list[Tool]] = None,
-    reasoning_parser_dict: Optional[dict[int, BaseReasoningParser]] = None,
-    tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
-    streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
-    finished_generation: bool = False,
-    chat_template_kwargs: Optional[dict[str, Any]] = None,
-) -> Tuple[bool, bool, Optional[str], Optional[str]]:
+def _accumulate_tool_call_fragments(fragments: dict[int, dict[str, Any]],
+                                    calls: list[ToolCallItem]) -> None:
+    """Fold the incremental parser's call fragments into whole calls.
+
+    A call arrives as its name with empty parameters and then argument pieces;
+    fragments are keyed by the parser's tool index, in the order calls start.
     """
-    Determine if done events should be sent for text or reasoning items.
+    for call in calls:
+        fragment = fragments.get(call.tool_index)
+        if fragment is None:
+            fragment = fragments[call.tool_index] = {
+                "name": None,
+                "parameters": [],
+            }
+        # Only the first fragment carries the name.
+        if call.name:
+            fragment["name"] = call.name
+        if call.parameters:
+            fragment["parameters"].append(call.parameters)
 
-    Analyzes the complete output text to detect when reasoning or text sections
-    have been completed and should receive done events.
 
-    Args:
-        output: RequestOutput containing full generated text in output.text
-        output_index: Index of the output being processed
-        reasoning_parser_id: Parser ID for extracting reasoning content
-        tool_parser_id: Parser ID for extracting tool calls
-        tools: Available tools for tool parsing
-        reasoning_parser_dict: Dictionary of reasoning parsers
-        tool_parser_dict: Dictionary of tool parsers
-        streaming_events_helper: Helper tracking current streaming state
+def _reject_json_constant(name: str) -> None:
+    raise ValueError(f"{name} is not valid JSON")
 
-    Returns:
-        Tuple of (should_send_reasoning_done, should_send_text_done,
-                  reasoning_content, text_content)
+
+def _assembled_tool_calls(
+        fragments: dict[int, dict[str, Any]]) -> list[ToolCallItem]:
+    """The accumulated fragments as whole calls, in the order they started.
+
+    Skips a call with no name or whose arguments do not assemble into valid
+    JSON: a client can run neither.
     """
-    should_send_reasoning_done = False
-    should_send_text_done = False
-    reasoning_content = ""
-    text_content = ""
-
-    # TODO(JunyiXu-nv): find a more efficient way to decide if we need to send done events
-    # Parse complete output using non-streaming mode to get full content
-    full_text, full_reasoning = _apply_reasoning_parser(
-        reasoning_parser_id=reasoning_parser_id,
-        output_index=output_index,
-        text=output.text,
-        streaming=False,
-        reasoning_parser_dict=reasoning_parser_dict,
-        chat_template_kwargs=chat_template_kwargs,
-    )
-
-    # Apply tool parsing to get tool calls
-    tool_calls = []
-    if full_text:
-        full_text, tool_calls = _apply_tool_parser(
-            tool_parser_id=tool_parser_id,
-            tools=tools,
-            output_index=output_index,
-            text=full_text,
-            streaming=False,
-            tool_parser_dict=tool_parser_dict,
-        )
-
-    # Detect reasoning -> text transition
-    # Reasoning is done when we have sent reasoning content and now have text content
-    if full_reasoning and full_text:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent and not streaming_events_helper.is_text_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_reasoning
-
-    # Detect text -> tool call transition
-    # Text is done when we have sent text content and now have tool calls
-    if full_text and tool_calls:
-        if streaming_events_helper and streaming_events_helper.is_text_sent:
-            should_send_text_done = True
-            text_content = full_text
-
-    # Also check if text is done because generation finished (no tool calls case)
-    # Text is done when generation completes and we've sent text
-    if full_text and not tool_calls and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_text_sent:
-            should_send_text_done = True
-            text_content = full_text
-
-    # Similarly, reasoning is done if generation finished with only reasoning (no text case)
-    if full_reasoning and not full_text and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_reasoning
-
-    # No closing tag: reasoning was streamed but re-parse shows everything as
-    # content (no </think> found). Close the reasoning section so the text
-    # section can be properly opened and closed.
-    if not full_reasoning and full_text and finished_generation:
-        if streaming_events_helper and streaming_events_helper.is_reasoning_sent:
-            should_send_reasoning_done = True
-            reasoning_content = full_text
-
-    return (should_send_reasoning_done, should_send_text_done,
-            reasoning_content, text_content, tool_calls)
+    calls: list[ToolCallItem] = []
+    for tool_index, fragment in fragments.items():
+        if not fragment["name"]:
+            continue
+        arguments = "".join(fragment["parameters"])
+        try:
+            json.loads(arguments, parse_constant=_reject_json_constant)
+        except ValueError as exc:
+            logger.warning(
+                f"Dropping the tool call to {fragment['name']!r}: its "
+                f"arguments are not valid JSON ({exc}): {arguments[:200]!r}")
+            continue
+        calls.append(
+            ToolCallItem(tool_index=tool_index,
+                         name=fragment["name"],
+                         parameters=arguments))
+    return calls
 
 
 def _close_open_item(helper):
@@ -2081,6 +2471,8 @@ def _close_open_item(helper):
             status="completed",
         )
         yield helper.get_reasoning_text_done_event(text)
+        yield helper.get_content_part_done_event(
+            PartReasoningTextDone(type="reasoning_text", text=text))
         yield helper.get_output_item_done_event(item)
         helper.is_reasoning_sent = False
     else:
@@ -2113,6 +2505,7 @@ def _generate_streaming_event(
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
 ):
     available_tools = _get_chat_completion_function_tools(request.tools)
+    tool_parser_id = _effective_tool_parser(tool_parser_id, request)
     output_idx = output.index
     delta_text = output.text_diff
     calls = []
@@ -2139,7 +2532,6 @@ def _generate_streaming_event(
     )
 
     if delta_text:
-        # TODO(JunyiXu-nv): handle tool calls in streaming mode
         delta_text, calls = _apply_tool_parser(
             tool_parser_id=tool_parser_id,
             tools=available_tools,
@@ -2148,218 +2540,90 @@ def _generate_streaming_event(
             streaming=True,
             tool_parser_dict=tool_parser_dict,
         )
+    tool_parser = (tool_parser_dict or {}).get(output_idx)
+    # Calls are assembled from the parser's increments only when those match its
+    # whole-text parse; otherwise they come from a whole-text parse at the end.
+    incremental_calls = (tool_parser is not None
+                         and tool_parser.streaming_matches_whole_parse)
 
     _responses_debug_log(
         repr(
             f" ---------> delta text: {delta_text}, reasoning delta text: {reasoning_delta_text}, calls: {calls}"
         ))
 
-    # Send delta events for ongoing content BEFORE any done events.
-    #
-    # The done-event block below closes the item that is currently open. If it
-    # ran first, the final chunk's delta would arrive after that close and open
-    # a brand new output item for the tail of the same message - splitting one
-    # assistant turn across two items, sometimes mid-word, and clients that
-    # render the last item alone show only that fragment. The chat completions
-    # path has the same shape: it appends the content delta to the chunk and
-    # only then stamps finish_reason.
-    # Send delta events for ongoing content
-    # The item must be opened before *any* delta, including a whitespace-only
-    # one. Gating the added-events on delta_text.strip() while emitting the
-    # delta unconditionally sends output_text.delta with no item open, and a
-    # client that keys on the active item drops the whole turn: Codex CLI
-    # reports "OutputTextDelta without active item" and prints nothing. Short
-    # replies are the ones that hit it, because a leading whitespace token is
-    # more likely to be the first delta of the message.
-    #
-    # get_*_output_added_events is idempotent - it is guarded internally by
-    # sent_output_item_added - so calling it for every delta is safe.
-    if delta_text:
-        # Reasoning has ended and the answer is starting: close the reasoning
-        # item so the message deltas are not attributed to it.
-        if streaming_events_helper.is_reasoning_sent:
-            yield from _close_open_item(streaming_events_helper)
-        if not streaming_events_helper.is_text_sent:
-            streaming_events_helper.is_text_sent = True
-        yield from streaming_events_helper.get_message_output_added_events()
-        streaming_events_helper.append_text(delta_text)
-        yield streaming_events_helper.get_text_delta_event(delta_text, [])
-    elif reasoning_delta_text:
+    # Deltas go out before any done event, so each lands in the item it belongs
+    # to, and an item is opened before its first delta (whitespace included).
+    if reasoning_delta_text:
         if streaming_events_helper.is_text_sent:
             yield from _close_open_item(streaming_events_helper)
-        if not streaming_events_helper.is_reasoning_sent:
-            streaming_events_helper.is_reasoning_sent = True
+        streaming_events_helper.is_reasoning_sent = True
         yield from streaming_events_helper.get_reasoning_output_added_events()
         streaming_events_helper.append_reasoning(reasoning_delta_text)
         yield streaming_events_helper.get_reasoning_text_delta_event(
             reasoning_delta_text)
-
-    # Check if we need to send done events for completed sections
-    (should_send_reasoning_done, should_send_text_done, reasoning_full_content,
-     text_full_content, done_tool_calls) = _should_send_done_events(
-         output=output,
-         output_index=output_idx,
-         reasoning_parser_id=reasoning_parser_id,
-         tool_parser_id=tool_parser_id,
-         tools=available_tools,
-         reasoning_parser_dict=reasoning_parser_dict,
-         tool_parser_dict=tool_parser_dict,
-         streaming_events_helper=streaming_events_helper,
-         finished_generation=finished_generation,
-         chat_template_kwargs=reasoning_chat_template_kwargs(request),
-     )
-
-    # Send done events if needed
-    if should_send_reasoning_done and reasoning_full_content:
-        reasoning_item = ResponseReasoningItem(
-            id=streaming_events_helper.item_id,
-            summary=[],
-            type="reasoning",
-            content=[
-                Content(text=reasoning_full_content, type="reasoning_text")
-            ],
-            status="completed",
-        )
-        yield streaming_events_helper.get_reasoning_text_done_event(
-            reasoning_full_content)
-        yield streaming_events_helper.get_output_item_done_event(reasoning_item)
-        streaming_events_helper.take_reasoning()
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_reasoning_sent = False
-
-    if should_send_text_done and text_full_content:
-        text_content = ResponseOutputText(
-            text=text_full_content,
-            annotations=[],
-            type="output_text",
-            logprobs=None,
-        )
-        text_item = ResponseOutputMessage(
-            id=streaming_events_helper.item_id,
-            content=[text_content],
-            role="assistant",
-            status="completed",
-            type="message",
-        )
-        yield streaming_events_helper.get_text_done_event(text_full_content, [])
-        yield streaming_events_helper.get_content_part_done_event(text_content)
-        yield streaming_events_helper.get_output_item_done_event(text_item)
-        streaming_events_helper.take_text()
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_text_sent = False
-
-    # Handle no-closing-tag case: reasoning was streamed but finish() moved
-    # all accumulated reasoning to content. Emit the full text section
-    # lifecycle (added → delta → done) since the reasoning section was just
-    # closed and generation is finished.
-    if (finished_generation and delta_text and should_send_reasoning_done
-            and not should_send_text_done):
+    if delta_text:
+        if streaming_events_helper.is_reasoning_sent:
+            yield from _close_open_item(streaming_events_helper)
         streaming_events_helper.is_text_sent = True
         yield from streaming_events_helper.get_message_output_added_events()
+        streaming_events_helper.append_text(delta_text)
         yield streaming_events_helper.get_text_delta_event(delta_text, [])
-        text_content_obj = ResponseOutputText(
-            text=delta_text,
-            annotations=[],
-            type="output_text",
-            logprobs=None,
-        )
-        text_item = ResponseOutputMessage(
-            id=streaming_events_helper.item_id,
-            content=[text_content_obj],
-            role="assistant",
-            status="completed",
-            type="message",
-        )
-        yield streaming_events_helper.get_text_done_event(delta_text, [])
-        yield streaming_events_helper.get_content_part_done_event(
-            text_content_obj)
-        yield streaming_events_helper.get_output_item_done_event(text_item)
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
-        streaming_events_helper.is_text_sent = False
-        delta_text = ""
 
-    # Close whatever item is still open once generation has finished.
-    #
-    # The done-event block above runs *before* the delta block, so the last
-    # chunk of a generation closes the previous item and then opens a new one
-    # for its own delta - leaving that final item with no output_text.done,
-    # content_part.done or output_item.done. Clients then receive an item with
-    # no terminal state: Codex CLI renders it but echoes it back on the next
-    # turn without a `status`, and ResponseOutputMessageParam requires one, so
-    # the following request is rejected outright.
-    #
-    # The chat completions path has no equivalent problem because it finalises
-    # on `output.finish_reason is not None` rather than on parser state. This
-    # mirrors that: when generation is finished, any open item is closed.
-    if finished_generation and streaming_events_helper.is_output_item_added_sent:
+    # A call has started, so the open item ends here; only the incremental
+    # parser knows this while the call is still being generated.
+    if calls:
+        yield from _close_open_item(streaming_events_helper)
+
+    if incremental_calls:
+        call_fragments = streaming_events_helper.tool_call_fragments(output_idx)
+        _accumulate_tool_call_fragments(call_fragments, calls)
+
+    if not finished_generation:
+        return
+
+    final_calls: list[ToolCallItem] = []
+    released_text = ""
+    if incremental_calls:
+        # finish() reports the calls the parser still holds and releases the
+        # rest as text, as the whole-text parse reads it.
+        flushed = tool_parser.finish(available_tools)
+        released_text = flushed.normal_text
+        _accumulate_tool_call_fragments(call_fragments, flushed.calls)
+        final_calls = _assembled_tool_calls(call_fragments)
+    elif tool_parser is not None:
+        released_text, final_calls = _whole_text_tool_calls(
+            output, request, streaming_events_helper, reasoning_parser_id,
+            tool_parser_id, available_tools)
+
+    # Text the parser still held follows everything the last chunk carried.
+    if released_text:
         if streaming_events_helper.is_reasoning_sent:
-            reasoning_text = streaming_events_helper.take_reasoning()
-            reasoning_item = ResponseReasoningItem(
-                id=streaming_events_helper.item_id,
-                summary=[],
-                type="reasoning",
-                content=[Content(text=reasoning_text, type="reasoning_text")],
-                status="completed",
-            )
-            yield streaming_events_helper.get_reasoning_text_done_event(
-                reasoning_text)
-            yield streaming_events_helper.get_output_item_done_event(
-                reasoning_item)
-            streaming_events_helper.is_reasoning_sent = False
-        else:
-            text = streaming_events_helper.take_text()
-            text_content = ResponseOutputText(
-                text=text,
-                annotations=[],
-                type="output_text",
-                logprobs=None,
-            )
-            text_item = ResponseOutputMessage(
-                id=streaming_events_helper.item_id,
-                content=[text_content],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-            yield streaming_events_helper.get_text_done_event(text, [])
-            yield streaming_events_helper.get_content_part_done_event(
-                text_content)
-            yield streaming_events_helper.get_output_item_done_event(text_item)
-            streaming_events_helper.is_text_sent = False
-        streaming_events_helper.output_index_increment()
-        streaming_events_helper.is_output_item_added_sent = False
+            yield from _close_open_item(streaming_events_helper)
+        streaming_events_helper.is_text_sent = True
+        yield from streaming_events_helper.get_message_output_added_events()
+        streaming_events_helper.append_text(released_text)
+        yield streaming_events_helper.get_text_delta_event(released_text, [])
 
-    # Emit any tool calls the parser found, as function_call output items.
-    #
-    # Without this the call is stripped out of the text by the tool parser and
-    # then dropped, so the client receives prose - or, when the whole
-    # generation was a tool call, an empty message - and no indication that a
-    # tool should run. Codex CLI shows the model announcing an action and then
-    # nothing happening at all.
-    #
-    # Emitted after any open text item has been closed, so a call item is
-    # never nested inside a message item. The counter keeps this idempotent:
-    # _should_send_done_events re-parses the accumulated text on every chunk,
-    # so the same calls reappear on each one.
-    if finished_generation and done_tool_calls:
-        pending = done_tool_calls[streaming_events_helper.emitted_tool_calls:]
-        custom_tool_names = _custom_tool_names(request.tools)
-        namespaced_tool_names = _namespaced_tool_names(request.tools)
+    # Nothing transitions after the last item, so it is closed here.
+    yield from _close_open_item(streaming_events_helper)
+
+    # Calls go out once generation finishes, after every other item. Already
+    # emitted calls are skipped, so a finished output seen twice is harmless.
+    emitted = streaming_events_helper.emitted_tool_call_items
+    pending = final_calls[len(emitted):]
+    if pending:
+        tool_resolution = _tool_resolution(request.tools)
         for call in pending:
             tool_call_item = _tool_call_output_item(call,
-                                                    custom_tool_names,
-                                                    namespaced_tool_names,
+                                                    tool_resolution,
                                                     status="completed")
             streaming_events_helper.item_id = tool_call_item.id
             yield streaming_events_helper.get_output_item_added_event(
                 tool_call_item)
             yield streaming_events_helper.get_output_item_done_event(
                 tool_call_item)
+            emitted.append(tool_call_item)
             streaming_events_helper.output_index_increment()
-        streaming_events_helper.emitted_tool_calls = len(done_tool_calls)
         streaming_events_helper.is_output_item_added_sent = False
 
 
@@ -2479,6 +2743,37 @@ def _generate_streaming_event_harmony(
                 parser.last_content_delta)
 
 
+def _stream_terminal_event(
+    final_response: ResponsesResponse,
+    sequence_number: int = -1,
+) -> Union[ResponseCompletedEvent, ResponseIncompleteEvent,
+           ResponseFailedEvent]:
+    """The terminal event matching the response's status.
+
+    "incomplete" ends in ``response.incomplete`` and "failed" in
+    ``response.failed``; everything else, including the client-initiated
+    "cancelled", ends in ``response.completed``.
+    """
+    payload = final_response.model_dump(by_alias=True)
+    if final_response.status == "incomplete":
+        return ResponseIncompleteEvent(
+            type="response.incomplete",
+            sequence_number=sequence_number,
+            response=payload,
+        )
+    if final_response.status == "failed":
+        return ResponseFailedEvent(
+            type="response.failed",
+            sequence_number=sequence_number,
+            response=payload,
+        )
+    return ResponseCompletedEvent(
+        type="response.completed",
+        sequence_number=sequence_number,
+        response=payload,
+    )
+
+
 class ResponsesStreamingProcessor:
 
     def __init__(
@@ -2496,7 +2791,10 @@ class ResponsesStreamingProcessor:
         self.model_name = model_name
         self.request = request
         self.sampling_params = sampling_params
-        self.sequence_number = 0
+        # get_initial_responses numbers the opening pair 0 and 1, so every
+        # later event continues from 2 -- also in a postprocessing worker,
+        # which receives a copy of this object before the pair is sent.
+        self.sequence_number = 2
         self.streaming_events_helper = ResponsesStreamingEventsHelper()
         self.response_creation_time = create_time if create_time is not None else int(
             time.time())
@@ -2511,14 +2809,10 @@ class ResponsesStreamingProcessor:
         self.tool_parser = tool_parser
 
     def _send_event(self, event: OpenAIBaseModel):
-        # Set sequence_number if the event has this attribute
         if hasattr(event, 'sequence_number'):
             event.sequence_number = self.sequence_number
         self.sequence_number += 1
-        # Get event type from the event's type field if it exists
-        event_type = getattr(event, 'type', 'unknown')
-        return (f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n")
+        return _format_sse_event(event)
 
     def get_initial_responses(self) -> List[str]:
         initial_response = ResponsesResponse.from_request(
@@ -2529,15 +2823,14 @@ class ResponsesStreamingProcessor:
             output=[],
             status="in_progress",
             usage=None,
-        ).model_dump()
-
-        resp_created = self._send_event(
-            self.streaming_events_helper.get_response_created_event(
-                initial_response))
-        resp_in_progress = self._send_event(
-            self.streaming_events_helper.get_response_in_progress_event(
-                initial_response))
-        return [resp_created, resp_in_progress]
+        ).model_dump(by_alias=True)
+        created = self.streaming_events_helper.get_response_created_event(
+            initial_response)
+        in_progress = self.streaming_events_helper.get_response_in_progress_event(
+            initial_response)
+        created.sequence_number = 0
+        in_progress.sequence_number = 1
+        return [_format_sse_event(created), _format_sse_event(in_progress)]
 
     async def get_final_response(
         self,
@@ -2570,7 +2863,13 @@ class ResponsesStreamingProcessor:
         self,
         final_res: RequestOutput,
         num_prompt_tokens: Optional[int] = None,
+        tokenizer: Optional[TokenizerBase] = None,
     ) -> str:
+        """The terminal event; its snapshot repeats the items already streamed.
+
+        ``tokenizer`` (for counting reasoning tokens) is an argument because a
+        postprocessing worker holds a pickled copy of this object.
+        """
         final_response = create_response_non_store(
             generation_result=final_res,
             request=self.request,
@@ -2581,14 +2880,12 @@ class ResponsesStreamingProcessor:
             reasoning_parser=self.reasoning_parser,
             tool_parser=self.tool_parser,
             num_prompt_tokens=num_prompt_tokens,
+            streamed_tool_calls=self.streaming_events_helper.
+            emitted_tool_call_items,
+            streamed_item_ids=self.streaming_events_helper.emitted_item_ids,
+            tokenizer=tokenizer,
         )
-
-        return self._send_event(
-            ResponseCompletedEvent(
-                type="response.completed",
-                sequence_number=-1,
-                response=final_response.model_dump(),
-            ))
+        return self._send_event(_stream_terminal_event(final_response))
 
     def process_single_output(self, res: GenerationResult) -> list[str]:
         event_generator = None
@@ -2618,6 +2915,155 @@ class ResponsesStreamingProcessor:
             raise RuntimeError("Failed to generate streaming events")
 
         return [self._send_event(event) for event in event_generator]
+
+    def get_stream_failed_events(
+            self,
+            cause: str,
+            detail: str,
+            events_sent: Optional[int] = None) -> List[str]:
+        """``error`` and ``response.failed`` for a stream that stopped early.
+
+        ``events_sent`` is the number of frames that reached the wire, which
+        the terminal events are numbered after; without it they continue this
+        processor's own numbering.
+        """
+        if events_sent is not None:
+            self.sequence_number = events_sent
+        error_event = self._send_event(
+            ResponseErrorEvent(
+                type="error",
+                sequence_number=-1,
+                code=cause,
+                message=detail,
+                param=None,
+            ))
+        snapshot = ResponsesResponse.from_request(
+            request=self.request,
+            sampling_params=self.sampling_params,
+            model_name=self.model_name,
+            created_time=self.response_creation_time,
+            output=[],
+            status="failed",
+            usage=None,
+        ).model_dump(by_alias=True)
+        # Set on the dump: the SDK Response carries `error`, ResponsesResponse
+        # does not.
+        snapshot["error"] = {"code": "server_error", "message": detail}
+        failed_event = self._send_event(
+            ResponseFailedEvent(
+                type="response.failed",
+                sequence_number=-1,
+                response=snapshot,
+            ))
+        return [error_event, failed_event]
+
+
+# --------------------------------------------------------------------------
+# Abnormal stream termination
+# --------------------------------------------------------------------------
+
+# Why a stream stopped before its terminal event, sent as the `error` code.
+STREAM_TERMINATION_ENGINE_ERROR = "engine_error"
+STREAM_TERMINATION_UPSTREAM_ERROR = "upstream_error"
+STREAM_TERMINATION_INTERNAL_ERROR = "internal_error"
+
+_SSE_EVENT_DELIMITER = "\n\n"
+# A terminal event frame always follows another frame, and JSON payloads
+# escape newlines, so these match only at a frame boundary.
+_TERMINAL_FRAME_STARTS = tuple(f"{_SSE_EVENT_DELIMITER}event: response.{kind}"
+                               for kind in ("completed", "incomplete",
+                                            "failed"))
+_TERMINAL_FRAME_STARTS_BYTES = tuple(marker.encode()
+                                     for marker in _TERMINAL_FRAME_STARTS)
+_SSE_TAIL_LENGTH = max(len(marker) for marker in _TERMINAL_FRAME_STARTS)
+
+
+def _sse_delimiter_and_markers(sample: Any) -> Tuple[Any, tuple]:
+    if isinstance(sample, bytes):
+        return _SSE_EVENT_DELIMITER.encode(), _TERMINAL_FRAME_STARTS_BYTES
+    return _SSE_EVENT_DELIMITER, _TERMINAL_FRAME_STARTS
+
+
+def classify_stream_termination(exc: Exception) -> str:
+    """Attribute a stream-ending exception to a cause."""
+    if isinstance(exc, (RequestError, EngineDeadError)):
+        return STREAM_TERMINATION_ENGINE_ERROR
+    # By module, to keep the HTTP client library out of this layer.
+    if type(exc).__module__.split(".")[0] in ("aiohttp", "httpx", "httpcore"):
+        return STREAM_TERMINATION_UPSTREAM_ERROR
+    return STREAM_TERMINATION_INTERNAL_ERROR
+
+
+def describe_stream_termination(exc: Exception, cause: str) -> str:
+    """The client-facing detail of a stream-ending exception.
+
+    Only engine errors carry their message; transport and internal errors can
+    name internal hosts.
+    """
+    if cause == STREAM_TERMINATION_ENGINE_ERROR and str(exc):
+        return f"{type(exc).__name__}: {exc}"
+    return type(exc).__name__
+
+
+def stream_error_event(cause: str, detail: str,
+                       events_sent: int) -> List[bytes]:
+    """A bare ``error`` event, for a relay that holds no response to snapshot."""
+    return [
+        _sse_event(
+            ResponseErrorEvent(
+                type="error",
+                sequence_number=events_sent,
+                code=cause,
+                message=detail,
+                param=None,
+            ))
+    ]
+
+
+async def guard_responses_stream(
+    stream: AsyncGenerator[Any, None],
+    terminal_events: Callable[[str, str, int], List[Any]],
+) -> AsyncGenerator[Any, None]:
+    """End a stream that fails before its terminal event with events saying so.
+
+    The exception is re-raised and frames pass through untouched. A client hangup (CancelledError or
+    GeneratorExit) is not caught: there is nobody left to tell.
+    """
+    events_sent = 0
+    tail = None
+    completed = False
+    try:
+        async for chunk in stream:
+            if not completed:
+                if tail is None:
+                    tail = chunk[:0]
+                text = tail + chunk
+                delimiter, markers = _sse_delimiter_and_markers(text)
+                events_sent += text.count(delimiter) - tail.count(delimiter)
+                completed = any(marker in text for marker in markers)
+                tail = text[-_SSE_TAIL_LENGTH:]
+            yield chunk
+    except Exception as exc:
+        if completed:
+            raise
+        cause = classify_stream_termination(exc)
+        logger.error("Responses stream terminated before completion "
+                     f"({cause}): {type(exc).__name__}: {exc}")
+        try:
+            frames = terminal_events(cause,
+                                     describe_stream_termination(exc, cause),
+                                     events_sent)
+        except Exception as report_error:  # noqa: BLE001 - keep the original error
+            logger.error(f"Failed to build the terminal event: {report_error}")
+            frames = []
+        if frames and tail:
+            delimiter, _ = _sse_delimiter_and_markers(tail)
+            if not tail.endswith(delimiter):
+                # A relay can fail mid-frame; end that frame before ours.
+                yield delimiter
+        for frame in frames:
+            yield frame
+        raise
 
 
 async def process_streaming_events(
@@ -2766,6 +3212,39 @@ class ResponseHooks(ABC):
 
 async def done_generator() -> AsyncGenerator[bytes, None]:
     yield "data: [DONE]\n\n".encode('utf-8')
+
+
+def _format_sse_event(event: OpenAIBaseModel) -> str:
+    # by_alias: fields such as text.format.schema go out under their wire name.
+    return (f"event: {getattr(event, 'type', 'unknown')}\n"
+            f"data: {event.model_dump_json(indent=None, by_alias=True)}\n\n")
+
+
+def _sse_event(event: StreamingResponsesResponse) -> bytes:
+    return _format_sse_event(event).encode("utf-8")
+
+
+async def responses_done_generator(
+        response: ResponsesResponse) -> AsyncGenerator[bytes, None]:
+    """Stream an already-complete response as a well-formed SSE run.
+
+    Used for a response the context worker finished; Responses has no
+    ``[DONE]``.
+    """
+    payload = response.model_dump(by_alias=True)
+    yield _sse_event(
+        ResponseCreatedEvent(
+            type="response.created",
+            response=payload,
+            sequence_number=0,
+        ))
+    yield _sse_event(
+        ResponseInProgressEvent(
+            type="response.in_progress",
+            response=payload,
+            sequence_number=1,
+        ))
+    yield _sse_event(_stream_terminal_event(response, sequence_number=2))
 
 
 UCompletionResponseOrGenerator = Union[UCompletionResponse,
