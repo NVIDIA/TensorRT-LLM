@@ -2,7 +2,8 @@
 # examples/disaggregated/slurm/benchmark/submit.py, modeled on
 # examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml with K3's
 # constraints baked in (EP-only DEP16 on both sides, no chunked prefill,
-# no KV block reuse, tokens_per_block 64, NIXL + Python V2 transceiver).
+# no KV block reuse, NIXL + Python V2 transceiver) plus the historically
+# validated tokens_per_block 64.
 # Fill in the <...> placeholders for your cluster before submitting.
 #
 # Usage (from the repository root):
@@ -97,7 +98,7 @@ worker_config:
     print_iter_log: true
     kv_cache_config:
       enable_block_reuse: false   # mandatory for K3 (KDA state)
-      tokens_per_block: 64        # mandatory for K3 MLA kernels
+      tokens_per_block: 64        # historical: older TRTLLM-Gen MLA kernels required 64
       free_gpu_memory_fraction: 0.25
     cache_transceiver_config:
       backend: NIXL
