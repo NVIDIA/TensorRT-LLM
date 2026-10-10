@@ -12,6 +12,7 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
@@ -84,7 +85,16 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"active memory ({memory_usage_active:.2f} GB)"
                 )
 
-            await llm.resume(tags)
+            with pytest.raises(RequestError, match="Cannot enqueue"):
+                await asyncio.wait_for(llm.generate_async(prompt, sampling_params), timeout=10)
+
+            if cycle == 0:
+                await llm.resume(tags[:1])
+                with pytest.raises(RequestError, match="Cannot enqueue"):
+                    await asyncio.wait_for(llm.generate_async(prompt, sampling_params), timeout=10)
+                await llm.resume(tags[1:])
+            else:
+                await llm.resume(tags)
             memory_usage_resumed = get_current_process_gpu_memory(True) / 1024**3
             print(f"[Cycle {cycle + 1}] Memory usage after resume: {memory_usage_resumed:.2f} GB")
             if process_gpu_memory_info_available:
@@ -93,8 +103,9 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"released memory ({memory_usage_released:.2f} GB)"
                 )
 
-        output_after = await llm.generate_async(prompt, sampling_params)
-        text_after = output_after.outputs[0].text
+            output_after = await llm.generate_async(prompt, sampling_params)
+            text_after = output_after.outputs[0].text
+            assert baseline_text == text_after
 
         print(f"[Cycle {num_cycles}] Generated text after release/resume: {text_after}")
         assert baseline_text == text_after, (

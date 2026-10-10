@@ -14,11 +14,13 @@
 # limitations under the License.
 
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm.executor.base_worker import AwaitResponseHelper
+from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
 from tensorrt_llm.executor.rpc_worker_mixin import RpcWorkerMixin
+from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 
 pytestmark = pytest.mark.cpu_only
 
@@ -62,3 +64,36 @@ def test_fetch_responses_processes_and_filters_engine_responses():
     assert worker.callback_responses == ["forward", "consume", None]
     assert worker.handler_responses == ["processed-forward", "temporary-error"]
     assert responses == ["processed-forward", "temporary-error"]
+
+
+@pytest.mark.parametrize("postproc", [False, True])
+def test_rejected_submission_reaches_response_stream(postproc, monkeypatch):
+    worker = _RpcWorkerStub()
+    worker._results = {}
+    worker._client_id_to_request_id = {}
+    worker._pop_result = BaseWorker._pop_result.__get__(worker)
+    worker.result_queue = worker._response_queue
+    worker.frontend_result_queues = None
+    worker.postproc_queues = [Queue()] if postproc else None
+    worker.postproc_config = SimpleNamespace(num_postprocess_workers=int(postproc))
+    worker._await_response_helper.enable_postprocprocess_parallel = postproc
+    del worker._await_response_helper.responses_handler
+
+    def reject(self, request):
+        self._results[request.id] = object()
+        raise RequestError("Cannot enqueue requests while executor admission is parked")
+
+    monkeypatch.setattr(_WorkerBaseStub, "submit", reject, raising=False)
+    monkeypatch.setattr(_WorkerBaseStub, "await_responses", lambda self, timeout: [])
+    with pytest.raises(RequestError, match="Cannot enqueue"):
+        worker.submit(SimpleNamespace(id=42))
+
+    responses = worker.fetch_responses()
+    assert responses == [
+        ErrorResponse(42, "Cannot enqueue requests while executor admission is parked", 42)
+    ]
+    assert not worker._results
+    assert not worker._client_id_to_request_id
+    assert worker.fetch_responses() == []
+    if postproc:
+        assert worker.postproc_queues[0].empty()
