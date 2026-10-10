@@ -2045,7 +2045,12 @@ class MuseSparkOpenMoE(nn.Module):
         expanded_idx_to_permuted_idx: torch.Tensor,
         routing_weights: torch.Tensor,
         num_tokens: int,
+        token_selected_slots: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # ``token_selected_slots`` is part of the ``unfinalized_combine_fn``
+        # contract for per-expert transforms; the post-expert norm is the same
+        # for every expert, so this finalize does not consult it.
+        del token_selected_slots
         if self.mapping.moe_tp_size > 1:
             # Backend row permutations are rank-local. Reduce in canonical
             # (token, selected-expert) order, never in GEMM scratch order.

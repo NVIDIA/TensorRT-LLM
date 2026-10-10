@@ -238,6 +238,50 @@ def test_scheduler_rejects_chunked_unfinalized_forward():
         )
 
 
+def _scheduler_finalize_hook_keywords() -> set:
+    """Keyword names the scheduler passes to ``unfinalized_combine_fn``.
+
+    Read from the source of ``_finalize_before_combine`` so the contract the
+    model's finalize must satisfy is the one actually in the tree.
+    """
+    import ast
+    import inspect
+
+    from tensorrt_llm._torch.moe.fused_moe import moe_scheduler
+
+    module = ast.parse(inspect.getsource(moe_scheduler))
+    for func in ast.walk(module):
+        if not (isinstance(func, ast.FunctionDef) and func.name == "_finalize_before_combine"):
+            continue
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "finalize_fn"
+            ):
+                return {kw.arg for kw in node.keywords if kw.arg is not None}
+    raise AssertionError("no finalize_fn(...) call found in _finalize_before_combine")
+
+
+def test_model_finalize_accepts_scheduler_hook_keywords():
+    """The registered finalize must bind every keyword the scheduler passes.
+
+    A keyword the scheduler adds that the model's override does not accept
+    only shows up as a TypeError inside engine warmup; check the signatures
+    against each other here instead.
+    """
+    import inspect
+
+    from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
+
+    keywords = _scheduler_finalize_hook_keywords()
+    assert keywords, "scheduler passes no keywords to finalize_fn"
+    signature = inspect.signature(MuseSparkOpenMoE.finalize)
+    # ``self`` plus one placeholder per scheduler keyword; bind() raises
+    # TypeError on an unexpected or missing-required name.
+    signature.bind(None, **{name: None for name in keywords})
+
+
 # ---------------------------------------------------------------------------
 # Backend knob wiring
 # ---------------------------------------------------------------------------
