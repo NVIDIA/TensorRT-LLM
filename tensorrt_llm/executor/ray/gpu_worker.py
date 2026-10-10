@@ -322,35 +322,51 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         self._sleep(tags)
 
     @contextmanager
-    def _sleep_wakeup_action(self) -> Iterator[None]:
+    def _sleep_wakeup_action(self, tags: list[ExecutorMemoryType], *,
+                             waking: bool) -> Iterator[None]:
         if self.engine.get_request_admission_state(
         ) is RequestAdmissionState.FAILED:
             raise RuntimeError(
                 "Sleep/wakeup previously failed; recreate the executor")
-        with self.engine.control_action():
-            error = None
-            try:
-                yield
-            except Exception as exc:
-                error = exc
-            # A failed materialization removes the affected native allocation.
-            # All ranks must reject further work, including wakeup retries.
-            failed = torch.tensor(int(error is not None),
-                                  dtype=torch.int32,
-                                  device="cpu")
-            if torch.distributed.get_world_size() > 1:
-                torch.distributed.all_reduce(failed,
-                                             op=torch.distributed.ReduceOp.MAX)
-            if failed.item():
-                self.engine.fail_sleep_wakeup_transition()
-                if error is not None:
-                    raise error
-                raise RuntimeError(
-                    "Sleep/wakeup failed on another rank; recreate the executor"
-                )
+        begin = (self.engine.begin_wakeup_transition
+                 if waking else self.engine.begin_sleep_transition)
+        complete = (self.engine.complete_wakeup_transition
+                    if waking else self.engine.complete_sleep_transition)
+        abort = (self.engine.abort_wakeup_transition
+                 if waking else self.engine.abort_sleep_transition)
+        begin(tags)
+        entered = False
+        try:
+            with self.engine.control_action():
+                entered = True
+                error = None
+                try:
+                    yield
+                except Exception as exc:
+                    error = exc
+                # A failed materialization removes the affected native allocation.
+                # All ranks must reject further work, including wakeup retries.
+                failed = torch.tensor(int(error is not None),
+                                      dtype=torch.int32,
+                                      device="cpu")
+                if torch.distributed.get_world_size() > 1:
+                    torch.distributed.all_reduce(
+                        failed, op=torch.distributed.ReduceOp.MAX)
+                if failed.item():
+                    self.engine.fail_sleep_wakeup_transition()
+                    if error is not None:
+                        raise error
+                    raise RuntimeError(
+                        "Sleep/wakeup failed on another rank; recreate the executor"
+                    )
+                complete()
+        except Exception:
+            if not entered:
+                abort()
+            raise
 
     def _sleep(self, tags: List[ExecutorMemoryType]):
-        with self._sleep_wakeup_action():
+        with self._sleep_wakeup_action(tags, waking=False):
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
             self.engine.prepare_sleep(tags)
@@ -368,7 +384,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                 "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
-        with self._sleep_wakeup_action():
+        with self._sleep_wakeup_action(tags, waking=True):
             logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
             materialize_with_tag(*tags)

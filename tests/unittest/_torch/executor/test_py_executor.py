@@ -2789,6 +2789,10 @@ def test_ray_sleep_wakeup_failure_is_terminal(
 
     engine = object.__new__(PyExecutor)
     engine.executor_request_queue = ExecutorRequestQueue(Mock(), 4, False, 0.0)
+    tags = [ExecutorMemoryType.KV_CACHE]
+    if method == "wakeup":
+        engine.executor_request_queue.begin_sleep_transition(tags)
+        engine.executor_request_queue.complete_sleep_transition()
     engine._sleeping_memory_tags = {ExecutorMemoryType.KV_CACHE}
     engine._pp_rebalance_drain_iters = 1
     engine.enable_kv_pool_rebalance = True
@@ -2804,9 +2808,18 @@ def test_ray_sleep_wakeup_failure_is_terminal(
     monkeypatch.setattr(torch.cuda, "synchronize", Mock())
     monkeypatch.setattr(torch.cuda, "empty_cache", Mock())
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
-    action = Mock(
-        side_effect=RuntimeError("injected allocation failure") if local_failure else None
-    )
+
+    def mutate(*_):
+        expected_state = (
+            RequestAdmissionState.WAKING if method == "wakeup" else RequestAdmissionState.PARKING
+        )
+        assert engine.get_request_admission_state() is expected_state
+        with pytest.raises(RuntimeError, match="Cannot enqueue"):
+            engine.executor_request_queue.enqueue_request(Mock())
+        if local_failure:
+            raise RuntimeError("injected allocation failure")
+
+    action = Mock(side_effect=mutate)
     monkeypatch.setattr(gpu_worker, mutation, action)
 
     def agree_failure(failed, op):
@@ -2817,7 +2830,6 @@ def test_ray_sleep_wakeup_failure_is_terminal(
 
     agreement = Mock(side_effect=agree_failure)
     monkeypatch.setattr(torch.distributed, "all_reduce", agreement)
-    tags = [ExecutorMemoryType.KV_CACHE]
     message = "injected allocation failure" if local_failure else "failed on another rank"
     with pytest.raises(RuntimeError, match=message):
         getattr(worker, method)(tags)
