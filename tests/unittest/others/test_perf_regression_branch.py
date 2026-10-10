@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for how perf_regression_utils handles s_branch.
+"""Tests for perf_regression_utils branch and runtime-image provenance.
 
 Two concerns, both of which fail open (a green run with no regression check) if
 they break:
@@ -102,6 +102,7 @@ _INHERITED_CI_VARS = (
     "BUILD_URL",
     "JOB_NAME",
     "PERF_BASELINE_BRANCH",
+    "TRTLLM_CI_RUNTIME_IMAGE",
 )
 
 
@@ -196,6 +197,50 @@ def test_unparsable_global_vars_does_not_raise(monkeypatch):
     info = get_job_info()
     assert info["s_branch"] == ""
     assert info["s_job_url"] == ""
+
+
+@pytest.mark.parametrize(
+    "image, digest, identity_strength",
+    [
+        ("registry.example/trtllm:pytorch-26.08", "unknown", "reference_only"),
+        ("registry.example/trtllm", "unknown", "reference_only"),
+        (
+            "registry.example/trtllm@sha256:" + "a" * 64,
+            "sha256:" + "a" * 64,
+            "digest_pinned",
+        ),
+        (
+            "registry.example/trtllm:26.08@sha256:" + "b" * 64,
+            "sha256:" + "b" * 64,
+            "digest_pinned",
+        ),
+        ("registry.example/trtllm@sha256:short", "unknown", "reference_only"),
+        ("registry.example/trtllm:sha256-" + "a" * 64, "unknown", "reference_only"),
+    ],
+)
+def test_runtime_image_uses_explicit_launcher_provenance(
+    monkeypatch: pytest.MonkeyPatch, image: str, digest: str, identity_strength: str
+) -> None:
+    monkeypatch.setenv("TRTLLM_CI_RUNTIME_IMAGE", image)
+    info = _job_info(monkeypatch, {"dockerImage": "dispatcher.example/image:other"})
+    assert info["s_runtime_image"] == image
+    assert info["s_runtime_image_source"] == "TRTLLM_CI_RUNTIME_IMAGE"
+    assert info["s_runtime_image_digest"] == digest
+    assert info["s_runtime_image_identity_strength"] == identity_strength
+
+
+@pytest.mark.parametrize("image", [None, "", "   "])
+def test_missing_runtime_image_is_unknown_never_guessed(
+    monkeypatch: pytest.MonkeyPatch, image: str | None
+) -> None:
+    if image is not None:
+        monkeypatch.setenv("TRTLLM_CI_RUNTIME_IMAGE", image)
+    monkeypatch.setenv("dockerImage", "dispatcher.example/image:other")
+    info = _job_info(monkeypatch, {"dockerImage": "dispatcher.example/image:other"})
+    assert info["s_runtime_image"] == "unknown"
+    assert info["s_runtime_image_source"] == "unknown"
+    assert info["s_runtime_image_digest"] == "unknown"
+    assert info["s_runtime_image_identity_strength"] == "unknown"
 
 
 # --------------------------------------------------------------------------- #
