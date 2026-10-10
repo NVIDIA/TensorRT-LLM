@@ -64,16 +64,22 @@ import torch
 from mpi4py import MPI
 
 import tensorrt_llm as tllm
-import tensorrt_llm._mnnvl_utils as mnnvl
-from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+import tensorrt_llm._torch.distributed.mnnvl_memory as mnnvl
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.communication.allgather_reducescatter import (
     AllGatherReduceScatter,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
-from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
+    FORCE_CFT_ENV,
+    NVLinkOneSided,
+)
+from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
+    MnnvlMoe,
+    NVLinkTwoSided,
+)
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided_flashinfer import (
     NVLinkTwoSidedFlashinfer,
 )
@@ -257,15 +263,15 @@ def _read_nvlink_topk_target_ranks(
     return raw.view(torch.int32).view(max_num_tokens, top_k).cpu()
 
 
-def _read_nvlink_topk_send_indices(
+def _read_nvlink_topk_target_indices(
     comm: NVLinkOneSided,
     max_num_tokens: int,
     top_k: int,
 ) -> torch.Tensor:
-    """Read topk_send_indices[max_num_tokens, top_k] from NVLinkOneSided workspace."""
+    """Read topk_target_indices[max_num_tokens, top_k] from NVLinkOneSided workspace."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
-    offset_index = int(_tllm_internal.thop.MOE_A2A_TOPK_SEND_INDICES_OFFSET_INDEX)
+    offset_index = int(_tllm_internal.thop.MOE_A2A_TOPK_TARGET_INDICES_OFFSET_INDEX)
     offset = comm.moe_a2a_metainfo[offset_index].item()
     raw = comm.workspace[
         comm.ep_rank,
@@ -303,12 +309,12 @@ def _run_nvlink_rank_mask_dispatch(
         runtime_max_tokens_per_rank,
         comm.top_k,
     )
-    topk_send_indices = _read_nvlink_topk_send_indices(
+    topk_target_indices = _read_nvlink_topk_target_indices(
         comm,
         runtime_max_tokens_per_rank,
         comm.top_k,
     )
-    return recv_tensors, int(combine_payload_offset), topk_target_ranks, topk_send_indices
+    return recv_tensors, int(combine_payload_offset), topk_target_ranks, topk_target_indices
 
 
 def _run_nvlink_rank_mask_combine(
@@ -347,7 +353,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, topk_target_ranks, topk_send_indices = (
+    recv_tensors, combine_payload_offset, topk_target_ranks, topk_target_indices = (
         _run_nvlink_rank_mask_dispatch(
             comm,
             token_selected_experts,
@@ -366,14 +372,14 @@ def _run_nvlink_rank_mask_dispatch_combine(
         enable_rank_mask,
         active_rank_mask,
     )
-    return combined.cpu(), topk_target_ranks, topk_send_indices
+    return combined.cpu(), topk_target_ranks, topk_target_indices
 
 
 def _expected_nvlink_rank_mask_combine_output(
     comm: NVLinkOneSided,
     payload: torch.Tensor,
     topk_target_ranks: torch.Tensor,
-    topk_send_indices: torch.Tensor,
+    topk_target_indices: torch.Tensor,
     local_num_tokens: int,
     runtime_max_tokens_per_rank: int,
 ) -> torch.Tensor:
@@ -386,7 +392,7 @@ def _expected_nvlink_rank_mask_combine_output(
         dtype=torch.float32,
         device=payload.device,
     )
-    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
+    payload_offset_index = int(_tllm_internal.thop.MOE_A2A_DISPATCH_PAYLOAD_OFFSET_INDEX)
     payload_offset = comm.moe_a2a_metainfo[payload_offset_index].item()
     bytes_per_rank = (
         comm.ep_size * runtime_max_tokens_per_rank * hidden_size * payload.element_size()
@@ -395,7 +401,7 @@ def _expected_nvlink_rank_mask_combine_output(
     for token_idx in range(local_num_tokens):
         for k in range(comm.top_k):
             target_rank = int(topk_target_ranks[token_idx, k].item())
-            dst_idx = int(topk_send_indices[token_idx, k].item())
+            dst_idx = int(topk_target_indices[token_idx, k].item())
             if dst_idx < 0:
                 continue
             raw = comm.workspace[target_rank, payload_offset : payload_offset + bytes_per_rank]
@@ -580,7 +586,7 @@ def create_comm_object(
         # Reset class-level singleton to avoid assertion failures when
         # test params change across MPI process reuse.
         NVLinkOneSided._WORKSPACE = None
-        os.environ["TRTLLM_MOE_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
+        os.environ["TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"] = NVLINK_WORKSPACE_MB
 
         return NVLinkOneSided(
             mapping=mapping,
@@ -1223,9 +1229,12 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             moe_output_for_ref=moe_output_for_ref,
         )
     except Exception:
-        _destroy_cached_worker_comm()
         traceback.print_exc()
         raise
+    finally:
+        # A CFT workspace holds a process-global binding only destroy() frees,
+        # and the cache does not survive to the next pool task.
+        _destroy_cached_worker_comm()
 
 
 def _nccl_ep_replay_slots(
@@ -1498,7 +1507,7 @@ def _worker_rank_mask_one_rank_masked(
         token_selected_experts = live_expert_ids[live_expert_indices]
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
 
-        combined, topk_target_ranks, topk_send_indices = _run_nvlink_rank_mask_dispatch_combine(
+        combined, topk_target_ranks, topk_target_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
@@ -1515,7 +1524,7 @@ def _worker_rank_mask_one_rank_masked(
             comm,
             payload,
             topk_target_ranks,
-            topk_send_indices,
+            topk_target_indices,
             local_num_tokens,
             local_num_tokens,
         )
@@ -1950,7 +1959,7 @@ def _build_combine_reference(
         # scaling: per-row global fp32 scale + per-group-of-16 fp8 scale,
         # with E2M1 quantization. After NVLink transfer,
         # dequantize_nvfp4_sharedmem reverses the process. The top_k
-        # reduction is then done in bf16 by torch.sum in _mnnvl_utils.py. The
+        # reduction is then done in bf16 by torch.sum in nvlink_two_sided.py. The
         # NVFP4 round-trip is precomputed on the worker GPU.
         for proc_result in all_results:
             nvfp4_out = proc_result["moe_output_for_ref"]
@@ -2700,7 +2709,11 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         moe_ep_size=config.ep_size,
         world_size=config.ep_size,
     )
-    communication = create_comm_object(config.comm_type, mapping, config)
+    with pytest.MonkeyPatch.context() as patch:
+        # Pin worker-side policy: CFT binds the workspace for the life of the
+        # process, so checkpointing is refused while it is on.
+        patch.setenv(FORCE_CFT_ENV, "0")
+        communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
     finally:
@@ -2733,7 +2746,11 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         moe_ep_size=world_size,
         world_size=world_size,
     )
-    communication = create_comm_object(config.comm_type, mapping, config)
+    with pytest.MonkeyPatch.context() as patch:
+        # Pin worker-side policy: CFT binds the workspace for the life of the
+        # process, so checkpointing is refused while it is on.
+        patch.setenv(FORCE_CFT_ENV, "0")
+        communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()
 

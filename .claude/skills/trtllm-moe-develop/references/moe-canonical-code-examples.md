@@ -371,7 +371,7 @@ Use these examples when wrapper forward policy grows complicated:
     should move into the scheduler.
 - `tests/unittest/_torch/moe/test_moe_module.py`
   - Module-level multi-GPU, chunking, routing, and EPLB cases.
-- `tests/unittest/_torch/moe/multi_gpu/test_moe_a2a.py`
+- `tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py`
   - Multi-GPU all-to-all behavior when relevant.
 
 Good uses:

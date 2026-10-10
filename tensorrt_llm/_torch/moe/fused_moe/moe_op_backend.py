@@ -210,7 +210,9 @@ class TRTLLMOpBackend(MoEOpBackend):
     """TRTLLM native op backend implementation."""
 
     def __init__(self):
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+
+        from .communication.nvlink_two_sided import MnnvlMoe
 
         self._MnnvlMemory = MnnvlMemory
         self._MnnvlMoe = MnnvlMoe
