@@ -214,3 +214,105 @@ def test_dispatch_task_payload_none_disables_bounce():
     recv._bounce.reserve.assert_not_called()
     recv._request_sender_data.assert_called_once_with("tcp://s0", b"req")
     assert task.expected_transfers == 1
+
+
+# --------------------------------------------------------------------------- #
+# Same planner on both sides; the worker takes the model's planner
+# --------------------------------------------------------------------------- #
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar  # noqa: E402
+from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo  # noqa: E402
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker  # noqa: E402
+
+
+def _minimal_rank_info(**overrides) -> RankInfo:
+    fields = dict(
+        instance_name="ctx",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        self_endpoint="",
+        transfer_engine_info=b"",
+    )
+    fields.update(overrides)
+    return RankInfo(**fields)
+
+
+def test_registrar_rejects_planner_id_mismatch():
+    self_ri = _minimal_rank_info(planner_id="toy")
+    peer_ri = _minimal_rank_info(instance_name="gen", planner_id="trtllm.default")
+    reg = PeerRegistrar(self_ri, Mock(), _ToyPlanner(TransferPlan.empty()))
+
+    with pytest.raises(PeerIncompatibleError, match="toy"):
+        reg.register("gen", 0, peer_ri)
+    with pytest.raises(KeyError):
+        reg.get_peer_rank_info("gen", 0)
+
+
+def test_receiver_rejects_planner_id_mismatch(monkeypatch):
+    recv = Receiver.__new__(Receiver)
+    recv._incompatible_peers = {}
+    recv._sender_ep_instance_map = {}
+    recv._registrar = SimpleNamespace(self_rank_info=_minimal_rank_info(planner_id="toy"))
+    recv._planner = _ToyPlanner(TransferPlan.empty())
+    sender_info = _minimal_rank_info(
+        instance_name="ctx", planner_id="trtllm.default", sender_endpoints=["tcp://ctx:1"]
+    )
+    messenger = Mock()
+    messenger.receive.return_value = [sender_info.to_bytes()]
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock(return_value=messenger))
+    recv._get_or_connect_dealer = Mock()
+    params = SimpleNamespace(ctx_info_endpoint="tcp://ctx:9")
+
+    with pytest.raises(PeerIncompatibleError, match="trtllm.default"):
+        recv._get_sender_info(params)
+
+    recv._get_or_connect_dealer.assert_not_called()  # REGISTER_RANK_INFO never sent
+    assert "tcp://ctx:9" in recv._incompatible_peers  # verdict cached
+    with pytest.raises(PeerIncompatibleError):  # and fails fast next time
+        recv._get_sender_info(params)
+
+
+def test_worker_uses_model_planner_factory(monkeypatch):
+    worker = TransferWorker.__new__(TransferWorker)
+    worker._rank_info = _minimal_rank_info()
+    made = _ToyPlanner(TransferPlan.empty())
+    seen = {}
+
+    def factory(kvm, ri, ext):
+        seen["args"] = (kvm, ri, ext)
+        return made
+
+    worker._config = SimpleNamespace(planner_factory=factory)
+    kvm = Mock()
+    kvm.mapping.rank = 1
+    extractor = Mock()
+    monkeypatch.setattr(transfer_mod, "KVRegionExtractorV1", Mock(return_value=extractor))
+    monkeypatch.setattr(transfer_mod, "RankInfoServer", Mock())
+
+    worker._setup_peer_infrastructure(kvm)
+
+    assert worker._peer_registrar.planner is made
+    assert seen["args"] == (kvm, worker._rank_info, extractor)
+    assert worker._rank_info.planner_id == "toy"
+    assert worker._rank_info.planner_blob == b""
+
+
+def test_worker_defaults_to_default_planner(monkeypatch):
+    from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
+
+    worker = TransferWorker.__new__(TransferWorker)
+    worker._rank_info = _minimal_rank_info()
+    worker._config = SimpleNamespace(planner_factory=None)
+    kvm = Mock()
+    kvm.mapping.rank = 0
+    monkeypatch.setattr(transfer_mod, "KVRegionExtractorV1", Mock(return_value=Mock()))
+    monkeypatch.setattr(transfer_mod, "RankInfoServer", Mock())
+
+    worker._setup_peer_infrastructure(kvm)
+
+    assert isinstance(worker._peer_registrar.planner, DefaultTransferPlanner)
+    assert worker._rank_info.planner_id == DefaultTransferPlanner.planner_id

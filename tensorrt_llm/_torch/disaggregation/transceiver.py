@@ -48,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.native.publish import PeerPublish
 from tensorrt_llm._torch.disaggregation.native.retirement import QuiescenceFatalEvent
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     RxSession,
+    TransferPlannerFactory,
     TransferWorker,
     TransferWorkerConfig,
 )
@@ -241,6 +242,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
+        planner_factory: Optional["TransferPlannerFactory"] = None,
     ):
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -317,6 +319,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                planner_factory=planner_factory,
             )
         )
         if enforce_physical_ownership:

@@ -65,7 +65,9 @@ from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, de
 from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
     PeerIncompatibleError,
     PeerTargets,
+    TransferPlanner,
 )
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -4323,6 +4325,12 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    # Builds the model's TransferPlanner from what the worker derives from the
+    # cache manager. None -> DefaultTransferPlanner.
+    planner_factory: Optional["TransferPlannerFactory"] = None
+
+
+TransferPlannerFactory = Callable[[KVCacheManager, RankInfo, KVRegionExtractorV1], TransferPlanner]
 
 
 class TransferWorker:
@@ -4411,7 +4419,16 @@ class TransferWorker:
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
         self._kv_extractor = KVRegionExtractorV1(kvm)
-        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
+        factory = self._config.planner_factory or (
+            lambda _kvm, ri, ext: DefaultTransferPlanner(ri, ext)
+        )
+        self._planner = factory(kvm, self._rank_info, self._kv_extractor)
+        # The envelope says who planned this rank's transfers and carries what
+        # that planner wants the peer's planner to know. RankInfoServer holds
+        # the object and serializes on request, so setting it here is in time.
+        self._rank_info.planner_id = self._planner.planner_id
+        self._rank_info.planner_blob = self._planner.describe()
+        self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor, self._planner)
 
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
