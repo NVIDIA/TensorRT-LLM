@@ -76,8 +76,10 @@ When requests share a page, the latest claim with an explicit priority sets its
 priority. Releasing an older request does not restore that request's priority.
 A claim without an explicit priority preserves the existing priority, but replaces
 the duration, including clearing it when no duration is supplied. The duration
-starts when the last reference is released. Expired pages return to priority 35;
-pages still referenced by a request cannot be permanently evicted.
+starts when a page has no request references. An independently published
+snapshot can reach this state before its originating request finishes. Prefetch
+preserves the existing expiry. Expired pages return to priority 35; pages still
+referenced by a request cannot be permanently evicted.
 
 On GPU eviction, unreferenced pages below `secondary_offload_min_priority`
 (default 30) are discarded. Pages at or above it can be offloaded. Offloading
