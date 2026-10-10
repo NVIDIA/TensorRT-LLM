@@ -179,3 +179,29 @@ def test_a_benchmark_key_beside_a_test_case_is_rejected(tmp_path, repo):
 def test_a_benchmark_block_is_still_fine_without_a_test_case(tmp_path, repo):
     data = _load(_task(tmp_path, repo, benchmark={"concurrency": 128}))
     assert data["benchmark"]["concurrency"] == 128
+
+
+@pytest.mark.parametrize("case_id", [SANITY_ID, PERF_ID])
+def test_a_test_case_spec_carries_no_defaulted_benchmark(tmp_path, repo, case_id):
+    """The DEFAULTS must go too, not just a user-set block.
+
+    Rejecting a user-set key is only half the guarantee: the base validation
+    merges BENCHMARK_DEFAULTS afterwards, so a spec that correctly omitted the
+    block still reached the agents carrying ISL 1024 / OSL 128 / concurrency 64.
+    Every role's prompt calls task.yaml the source of truth and tells it to
+    resolve `benchmark`, so the agent took the id from its prompt and the
+    conditions from the file, then measured a workload nobody asked for and
+    reported a plausible number for it. Silent, and wrong.
+    """
+    data = _load(_task(tmp_path, repo, test_case={"name": case_id}))
+    assert "benchmark" not in data, (
+        f"a defaulted benchmark block survived beside the test case: {data.get('benchmark')!r}"
+    )
+
+
+def test_a_plain_spec_still_gets_its_benchmark_defaults(tmp_path, repo):
+    """The removal is scoped to test-case specs, not a global change."""
+    from agent_flow.workflows.perf_analyze.task_schema import BENCHMARK_DEFAULTS
+
+    data = _load(_task(tmp_path, repo))
+    assert data["benchmark"] == BENCHMARK_DEFAULTS

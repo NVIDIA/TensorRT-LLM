@@ -536,6 +536,18 @@ def load_and_validate_task_yaml(
             **data[TEST_CASE_FIELD],
             TEST_CASE_RESOLVED_KEY: resolved_test_case,
         }
+        # Drop the defaulted ``benchmark`` block, which the base validation
+        # merges unconditionally (``BENCHMARK_DEFAULTS`` in perf_analyze's
+        # task_schema). Rejecting a *user-set* benchmark key above is only half
+        # the guarantee: the defaults land afterwards, so a test-case spec that
+        # correctly omitted the block still reached the agents carrying
+        # ISL 1024 / OSL 128 / concurrency 64. Every role's prompt calls
+        # task.yaml the source of truth and tells it to resolve ``benchmark``,
+        # so the agent got the id from its prompt and the conditions from the
+        # file -- and measured a workload nobody asked for, at a plausible
+        # number nothing flagged. The id is the only authority here, so the
+        # weaker one is removed rather than left to be read.
+        data.pop("benchmark", None)
     # Disagg next: the harness config is the source of truth for the
     # measurement conditions, so the backfill has to land before the
     # blocks that are validated against them (focus_concurrencies against
