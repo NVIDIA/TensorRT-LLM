@@ -81,7 +81,7 @@ if TYPE_CHECKING:
     # code paths so plain LLM serving never pays its import cost.
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-# Global variable to store the Popen object of the child process
+# Popen for the disaggregated proxy's process guard.
 _child_p_global: Optional[subprocess.Popen] = None
 
 
@@ -2648,9 +2648,14 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # 1. Run the LLM-API Proxy in a separate process for streaming performance.
     #      The Proxy will create a RemoteMpiSessionClient as mpi_session in LLM
     #      class.
+    guard_path = Path(
+        __file__).resolve().parents[1] / "llmapi" / "_llmapi_process_guard.py"
     command = [
-        "python3", sys.argv[0], "disaggregated_mpi_worker", "-c", config_file,
-        "--log_level", log_level
+        sys.executable, "-S",
+        str(guard_path), "--parent-pid",
+        str(os.getpid()), "--term-grace", "5", "--autonomous", "--role",
+        "proxy", "--", "python3", sys.argv[0], "disaggregated_mpi_worker", "-c",
+        config_file, "--log_level", log_level
     ]
     logger.info(
         f"rank {mpi_rank()} step1: preparing to launch command: {command}")
@@ -2663,7 +2668,11 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     signal.signal(signal.SIGTERM, _command_telemetry.raise_signal_exit)
     signal.signal(signal.SIGINT, _command_telemetry.raise_signal_exit)
 
+    _child_p_global = None
+    failure_pending = False
     try:
+        # MPI_Abort and SIGKILL bypass finally. The guard remains the owner of
+        # the proxy group and reclaims it when this leader disappears.
         _child_p_global = subprocess.Popen(
             command,
             env=non_mpi_env,
@@ -2672,7 +2681,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
             start_new_session=True)
 
         logger.info(
-            f"Parent process (PID {os.getpid()}) launched child process (PID {_child_p_global.pid})."
+            f"Parent process (PID {os.getpid()}) launched proxy guard (PID {_child_p_global.pid})."
         )
 
         logger.info(f"rank {mpi_rank()} step2: start the mpi session server")
@@ -2682,6 +2691,9 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
         # This is a blocking call
         launch_remote_mpi_session_server(sub_comm)
 
+    except BaseException:
+        failure_pending = True
+        raise
     finally:
         # Restore original signal handlers
         signal.signal(signal.SIGTERM, original_sigterm_handler)
@@ -2689,26 +2701,23 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
 
         if _child_p_global:  # If Popen was successful and object exists
             logger.info(
-                f"Parent process (PID {os.getpid()}) in finally block. Cleaning up child process (PID: {_child_p_global.pid})."
+                f"Parent process (PID {os.getpid()}) in finally block. Stopping proxy guard (PID: {_child_p_global.pid})."
             )
             # Check if child is still running
             if _child_p_global.poll() is None:
                 _child_p_global.terminate()
                 try:
                     _child_p_global.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    logger.warning(
-                        f"Child process {_child_p_global.pid} timed out on terminate (30s), killing."
+                except subprocess.TimeoutExpired as error:
+                    message = (
+                        f"Proxy guard {_child_p_global.pid} cleanup is "
+                        "still pending after 30s; retaining its process-group ownership"
                     )
-                    _child_p_global.kill()
-                    try:
-                        _child_p_global.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        logger.error(
-                            f"Child process {_child_p_global.pid} failed to be killed even after 30s."
-                        )
-            assert _child_p_global.poll(
-            ) is not None, f"the subprocess should be terminated"
+                    logger.error(message)
+                    # Killing the guard could strand its payload. Leave it
+                    # responsible for cleanup and preserve an existing failure.
+                    if not failure_pending:
+                        raise RuntimeError(message) from error
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,
