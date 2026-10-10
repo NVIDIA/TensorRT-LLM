@@ -6428,14 +6428,6 @@ class TorchLlmArgs(BaseLlmArgs):
         "asked for a target never silently measures something else.",
         json_schema_extra={"type": "Literal['off', 'auto', 'require']"})
 
-    # The modeling_v2 decision for this instance, made once by
-    # `modeling_v2_resolve` before model defaults are applied (its bounds read
-    # the arguments as configured) and carried to model construction on
-    # `ModelConfig.modeling_v2_target`. Not user-tunable: the switch is
-    # `modeling_v2` above.
-    _modeling_v2_resolved: bool = PrivateAttr(default=False)
-    _modeling_v2_target: Optional[str] = PrivateAttr(default=None)
-
     # TODO: remove backend later
     backend: Literal["pytorch"] = Field(
         default="pytorch",

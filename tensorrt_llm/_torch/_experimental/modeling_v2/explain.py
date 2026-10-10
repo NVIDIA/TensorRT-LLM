@@ -17,7 +17,10 @@ cannot: an answer to "why did I not get the target I expected".
 The deployment is given the way ``trtllm-serve`` takes it: ``--config`` is
 the same YAML of LLM API arguments, and ``--tp``, ``--pp``, ``--ep``,
 ``--moe-tp`` and ``--attention-dp`` are shorthands for the corresponding
-arguments. ``--sm`` defaults to the local device but can be given explicitly,
+arguments. The bounds stage sees the arguments as the engine will run with
+them: the built-in model's defaults are applied first, by the loader's own
+code, so a bound on a defaulted field reads the same value here as in the
+engine. ``--sm`` defaults to the local device but can be given explicitly,
 so a configuration can be explained from a machine that has no GPU.
 """
 
@@ -107,8 +110,19 @@ def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
     from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.model_loader import (
+        ModelLoader,
+        _construct_checkpoint_loader,
+    )
 
     llm_args = llm_args_from(args)
+    # What the engine does before it decides: the built-in model's defaults,
+    # and the "auto" knobs the loader resolves, land on the arguments first.
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        args.model,
+        llm_args,
+        _construct_checkpoint_loader(llm_args.checkpoint_loader, llm_args.checkpoint_format),
+    )
     mapping = llm_args.parallel_config.to_mapping()
 
     # The engine's own loader, not a second reading of the checkpoint. It is

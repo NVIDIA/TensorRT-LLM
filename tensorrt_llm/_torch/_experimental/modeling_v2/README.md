@@ -40,27 +40,15 @@ topology -- and names a target. `within_bounds` then reads the *deployment* --
 the LLM API arguments it was configured with, `max_batch_size`,
 `max_num_tokens`, speculative decoding, anything the target's gates did or did
 not exercise -- and says whether the target was certified for it. The model
-loader decides once per deployment, before model defaults are applied, and
-carries the answer on `ModelConfig.modeling_v2_target`. `explain.py` replays
-both stages; pass it the same `--config` YAML `trtllm-serve` takes.
+loader decides when it is about to build the model, after the built-in model's
+defaults have been applied to the arguments, and carries the answer on
+`ModelConfig.modeling_v2_target`. `explain.py` replays both stages the same
+way; pass it the same `--config` YAML `trtllm-serve` takes.
 
 **Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
 a configuration that misses a target's criteria silently gets the built-in
 implementation — and a performance curve measured that way reads as
 modeling_v2's. That is the single most expensive mistake available here.
-
-**Export it before the ranks start**, not merely before `LLM(...)`. Worker
-ranks receive the environment as it stood when MPI initialized, and long-lived
-ranks under `trtllm-llmapi-launch` receive it once at launch, so a value set
-later reaches the driver and not them -- and a driver resolving a target while
-its workers resolve the built-in is the silent split this package exists to
-prevent.
-
-An environment variable rather than an LLM-API field is a deliberate trade: it
-keeps the entire concept inside this package, so the only change modeling_v2
-needs anywhere else is the `_resolve_class` hook. The cost is that the switch
-does not appear in a run's recorded `llm.args` and cannot be set through
-`--extra_llm_api_options`.
 
 The predecessor `MODELING_V2_TARGET` is gone. It named a *target*; this names
 only a mode, and routing picks the target from the configuration.
@@ -71,13 +59,18 @@ The checkpoint is read exactly as published, with no target-owned
 ## How a config finds its target
 
 ```
-LLM(model=...)  ->  ModelLoader  ->  AutoModelForCausalLM._resolve_class
+LLM(model=..., modeling_v2=...)  ->  ModelLoader
+                                        |  model defaults applied to llm_args
                                         |
-                                        +-- modeling_v2_resolve(config)
+                                        +-- modeling_v2_resolve(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- one forward-reading decision tree
-                                              +-- returns a synthetic class name
+                    models/<x>/routing.py     +-- route(ctx): identity -> target name
+                                              +-- within_bounds(target, llm_args, ctx)
+                                        |
+                                     config.modeling_v2_target = name
+                                        |
+                    AutoModelForCausalLM._resolve_class(config)
                                         |
                                      get_registered_model_class(name)
 ```

@@ -79,11 +79,12 @@ def within_bounds(
     raises quoting the trace. Criteria are written as
     ``trace.check(label, value, ok)`` so ``explain`` replays them.
 
-    Bounds are evaluated on the arguments as the user configured them,
-    before model defaults. A value the engine derives later -- an inferred
-    ``max_seq_len``, a resolved MoE backend -- is not available here, and an
-    ``"auto"`` the target itself resolves through the model-class preference
-    hooks needs no bound: the target is the model class that decides it.
+    Bounds are evaluated when the model is about to be built, on the
+    arguments as the engine will run with them: the built-in model's
+    defaults have been applied and the ``"auto"`` knobs the loader resolves
+    (KV cache manager version, transceiver runtime) hold their resolved
+    values. A value the engine derives only after construction -- an
+    inferred ``max_seq_len`` -- is not available here.
 
     No target in this family bounds anything yet: every deployment the
     identity stage routes here is accepted. The hook exists so that a bound
