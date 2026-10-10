@@ -153,6 +153,7 @@ class _HeterogeneousGemma4TextConfig(Gemma4TextConfig):
         "head_dim",
         "num_global_key_value_heads",
         "num_key_value_heads",
+        "num_attention_heads",
     }
 
     def __getattribute__(self, name: str) -> object:
@@ -171,12 +172,14 @@ class _HeterogeneousGemma4TextConfig(Gemma4TextConfig):
 
 def _make_heterogeneous_model_config(
     config_dict: dict[str, object] = GEMMA4_SMALL_CONFIG,
+    num_q_heads: list[int] | None = None,
 ) -> ModelConfig:
     """Build a Gemma4 config with only concrete per-layer geometry readable."""
     cfg = _HeterogeneousGemma4TextConfig(**deepcopy(config_dict))
     if getattr(cfg, "per_layer_attributes", None) is None:
         cfg.per_layer_config = [
             SimpleNamespace(
+                num_attention_heads=config_dict["num_attention_heads"],
                 head_dim=(
                     config_dict["head_dim"]
                     if layer_type == "sliding_attention"
@@ -192,6 +195,21 @@ def _make_heterogeneous_model_config(
             for layer_type in cfg.layer_types
         ]
         cfg.per_layer_attributes = {"head_dim", "num_key_value_heads"}
+    if num_q_heads is not None:
+        if isinstance(cfg.per_layer_config, list):
+            for layer_config, heads in zip(cfg.per_layer_config, num_q_heads, strict=True):
+                layer_config.num_attention_heads = heads
+        else:
+            cfg.per_layer_config = {
+                layer_idx: {
+                    "head_dim": layer_config.head_dim,
+                    "num_key_value_heads": layer_config.num_key_value_heads,
+                    "num_attention_heads": heads,
+                }
+                for layer_idx, (layer_config, heads) in enumerate(
+                    zip(cfg.per_layer_config, num_q_heads, strict=True)
+                )
+            }
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     model_config = ModelConfig(pretrained_config=cfg, mapping=mapping)
     cfg._reject_global_geometry = True
@@ -292,6 +310,31 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             self.assertEqual(layer.self_attn.num_key_value_heads, expected_num_kv_heads)
             self.assertEqual(layer_specs[layer_idx].head_dim, expected_head_dim)
             self.assertEqual(layer_specs[layer_idx].num_kv_heads, expected_num_kv_heads)
+
+    def test_model_instantiation_with_heterogeneous_query_heads(self) -> None:
+        """Attention modules and cache specs must agree on per-layer query heads."""
+        num_q_heads = [
+            8 if layer_idx % 2 == 0 else 4
+            for layer_idx in range(GEMMA4_SMALL_CONFIG["num_hidden_layers"])
+        ]
+        model_config = _make_heterogeneous_model_config(num_q_heads=num_q_heads)
+        model = Gemma4ForCausalLM(model_config)
+        layer_specs = model.model_config.kv_cache_layer_specs
+
+        for layer_idx, layer in enumerate(model.model.layers):
+            self.assertEqual(layer.self_attn.num_heads, num_q_heads[layer_idx])
+            self.assertEqual(layer_specs[layer_idx].num_q_heads, num_q_heads[layer_idx])
+
+    def test_attention_requires_layer_idx_with_per_layer_config(self) -> None:
+        """A per-layer config must not silently select the first matching layer."""
+        for per_layer_attributes in (None, set()):
+            with self.subTest(per_layer_attributes=per_layer_attributes):
+                config = SimpleNamespace(per_layer_config=[GEMMA4_SMALL_CONFIG])
+                if per_layer_attributes is not None:
+                    config.per_layer_attributes = per_layer_attributes
+                model_config = SimpleNamespace(pretrained_config=config)
+                with self.assertRaisesRegex(ValueError, "requires layer_idx"):
+                    Gemma4Attention(model_config, is_sliding=True)
 
     def test_model_instantiation_moe(self):
         """Create with MoE enabled and verify MoE layers exist."""
@@ -1026,7 +1069,6 @@ class TestGemma4HeterogeneousKVCacheLayout(unittest.TestCase):
             model_config=model_config,
             dtype=torch.bfloat16,
             is_draft=False,
-            kv_cache_type=object(),
         )
 
         layer_types = model_config.pretrained_config.layer_types
@@ -2750,6 +2792,10 @@ class TestGemma4ModelDefaults(unittest.TestCase):
         for is_sm100f, expected_class in expected_classes:
             with (
                 self.subTest(is_sm100f=is_sm100f),
+                unittest.mock.patch(
+                    "tensorrt_llm._torch.attention.backends.utils.IS_FLASHINFER_AVAILABLE",
+                    True,
+                ),
                 unittest.mock.patch(
                     "tensorrt_llm._torch.models.modeling_gemma4.is_sm_100f",
                     return_value=is_sm100f,
