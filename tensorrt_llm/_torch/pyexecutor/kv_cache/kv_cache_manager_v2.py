@@ -6596,6 +6596,8 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse:
             return False
+        if not self.can_evict:
+            return True
         # Prefetch holds storage without claiming a request's retention interval.
         success = True
         for req in requests:
