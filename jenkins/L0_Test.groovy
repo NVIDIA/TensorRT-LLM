@@ -5821,6 +5821,21 @@ def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltP
         if (rc != 0) {
             error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
         }
+        // apply_latest.sh returning 0 means llvm-bolt wrote a file, not that the
+        // file loads. Check that before the bolted wheel becomes THE wheel: the
+        // upload is a few lines below and the first import is a stage later, so
+        // without this the first thing to find out is a consumer, and by then the
+        // broken wheel is published. Only a crash fails here; see the script.
+        def verifyRc = sh(returnStatus: true, script: """
+            python3 tensorrt_llm/scripts/bolt/internal/verify_bolted_wheel.py '${wheel}.bolted'
+        """)
+        if (verifyRc != 0) {
+            error("[bolt-wheel] the BOLTed wheel does not load (rc=${verifyRc}); refusing to " +
+                  "publish it. Profiles came from ${appliedFrom}/${cpu_arch}" +
+                  (boltProfileRef ? ", bundle ${boltProfileRef}" : " (unpinned, i.e. whatever " +
+                   "latest.tar.gz is right now)") + ". The un-BOLTed wheel is intact on disk; " +
+                  "re-run with BOLT off to publish it.")
+        }
         sh "mv -f ${wheel}.bolted ${wheel}"
         echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch}" +
              (boltProfileRef ? ", bundle ${boltProfileRef})" : ")")
