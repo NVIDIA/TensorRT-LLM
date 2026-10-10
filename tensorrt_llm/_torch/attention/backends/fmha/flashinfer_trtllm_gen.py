@@ -406,9 +406,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if sm not in (100, 103):
+        # SM107 (Rubin) kernels ship in the FlashInfer trtllm-gen artifact since 0.6.18.
+        if sm not in (100, 103, 107):
             logger.debug(
-                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100, SM103 or SM107, "
+                f"got SM{sm}."
             )
             return False
 
@@ -702,6 +704,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         if kv_cache_dtype not in self.SUPPORTED_KV_CACHE_DTYPES:
             return False, f"KV cache dtype {kv_cache_dtype}. Supported: FP16, BF16, FP8, NVFP4."
+        # FlashInfer <0.7.1 raises on NVFP4 KV cache on SM107 (stale guard, removed in
+        # flashinfer-ai/flashinfer#5308); drop this once the pin includes that fix.
+        if has_fp4_kv and get_sm_version() == 107:
+            return False, "NVFP4 KV cache on SM107."
         if o_dtype not in self.SUPPORTED_OUT_DTYPES:
             return False, f"output dtype {o_dtype}. Supported: FP16, BF16, FP8."
 
