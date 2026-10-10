@@ -50,7 +50,7 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from agent_flow.workflows.perf_optimize.bench_cli import GEN_ONLY_MODULE
+from agent_flow.workflows.perf_optimize.disagg.bench_cli import GEN_ONLY_MODULE
 
 
 class SweepDesignError(ValueError):

@@ -28,6 +28,16 @@ from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_res
 
 from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
 from .disagg import disagg_config_path, has_disagg, load_disagg_config, worker_config_yaml
+from .disagg.sol_track import (
+    GEN_TRACK,
+    WORKSPACE_SWEEP_DIR,
+    adopt_sweep,
+    ctx_json_path,
+    has_sol_track,
+    sweep_path,
+    track_name,
+    tuning_seed_yaml,
+)
 from .progress import (
     EVALUATOR_DECISIONS,
     INTEGRATOR_DECISIONS,
@@ -42,16 +52,6 @@ from .progress import (
 from .prompts import DEFAULT_PROMPTS, PromptBundle
 from .roadmap_schema import RoadmapError
 from .roles import ROLES
-from .sol_track import (
-    GEN_TRACK,
-    WORKSPACE_SWEEP_DIR,
-    adopt_sweep,
-    ctx_json_path,
-    has_sol_track,
-    sweep_path,
-    track_name,
-    tuning_seed_yaml,
-)
 from .state import (
     ROUND_STAGES,
     STAGE_ANALYZER,

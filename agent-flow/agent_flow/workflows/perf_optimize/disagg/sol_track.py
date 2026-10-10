@@ -70,7 +70,7 @@ import yaml
 # The full dotted name, not `from ... import bench_cli`: the dashboard
 # loads these modules by path with `agent_flow` itself unimportable, and
 # only the submodule form resolves from the sys.modules cache.
-from agent_flow.workflows.perf_optimize.bench_cli import (
+from agent_flow.workflows.perf_optimize.disagg.bench_cli import (
     IBC_BENCH,
     BenchCliError,
     frontier_points,

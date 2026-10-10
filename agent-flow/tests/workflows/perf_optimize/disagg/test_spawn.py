@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_flow.workflows.perf_optimize import disagg_sol, spawn
+from agent_flow.workflows.perf_optimize.disagg import sol as disagg_sol
+from agent_flow.workflows.perf_optimize.disagg import spawn
 
 POINT = {"shape": "tep_4_eplb0_mtp3", "concurrency": 1, "prefer": "interactive"}
 

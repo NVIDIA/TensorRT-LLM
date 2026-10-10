@@ -1576,7 +1576,7 @@ python -m ibc_trtllm_harness.process_data.get_gen_only_perf -i $R
 #    describing a deployment whose two halves never served one traffic.
 
 # 6. Land the score where every later stage reads results from.
-python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> \\
+python -m agent_flow.workflows.perf_optimize.disagg.sol_track --workspace <workspace> \\
     --collect <the --result-dir this stage was told to write into>
 
 # The **sol-postprocess** skill is the runbook for 5(a) and worth reading
@@ -1611,7 +1611,7 @@ _SOL_SCORING_CTX = """\
 #    case's `run_*.json`, the field the harness itself validated it on.
 
 # 6. Land the score where every later stage reads results from.
-python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> \\
+python -m agent_flow.workflows.perf_optimize.disagg.sol_track --workspace <workspace> \\
     --collect <the --result-dir this stage was told to write into>
 
 # It reads that `run_*.json` for you and files it at the case's `max_batch`,
@@ -1632,7 +1632,7 @@ R=<the --result-dir this stage was told to write into>/run
 #    created from the campaign's copy on first use, so items running in
 #    parallel never overwrite each other's overlay or build source. The file
 #    the task.yaml was written against is never modified.
-python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> --tuning $T
+python -m agent_flow.workflows.perf_optimize.disagg.sol_track --workspace <workspace> --tuning $T
 S=<the "sweep" path that command printed>
 
 # 1. approach: code ONLY -- declare how the change reaches the workers, in

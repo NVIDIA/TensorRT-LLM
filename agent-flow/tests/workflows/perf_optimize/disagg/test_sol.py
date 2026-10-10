@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_flow.workflows.perf_optimize import bench_cli, disagg_sol, spawn
+from agent_flow.workflows.perf_optimize.disagg import bench_cli, spawn
+from agent_flow.workflows.perf_optimize.disagg import sol as disagg_sol
 
 FIELD = disagg_sol.DISAGG_SOL_FIELD
 
@@ -881,7 +882,7 @@ def test_a_campaign_cannot_run_the_whole_measured_space(tmp_path):
     """
     import yaml as _yaml
 
-    from agent_flow.workflows.perf_optimize import bench_cli
+    from agent_flow.workflows.perf_optimize.disagg import bench_cli
 
     cases = bench_cli.gen_cases(_yaml.safe_load(_design_sweep(tmp_path).read_text()))
     at_64 = [c for c in cases if (c["config"] or {}).get("concurrency") == 64]
