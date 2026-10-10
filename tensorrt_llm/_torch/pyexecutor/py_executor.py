@@ -549,6 +549,8 @@ class PyExecutor:
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
         self._sleeping_memory_tags: set[ExecutorMemoryType] = set()
+        self._sleeping_padding_dummies = []
+        self._sleeping_kv_managers: list[KVCacheManagerV2] = []
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -1932,6 +1934,25 @@ class PyExecutor:
         """
         from tensorrt_llm._torch.virtual_memory import RestoreMode
 
+        if self._is_kv_manager_v2 and not self._sleeping_memory_tags:
+            # Release shared speculative slots before any tag is unmapped.
+            # Suspended caches still prevent V2 from clearing its reuse tree.
+            released_resources = set()
+            for engine in (self.model_engine, self.draft_model_engine):
+                runner = getattr(engine, "cuda_graph_runner", None)
+                if runner is not None and runner.padding_dummy_requests:
+                    draft_lengths = set(runner.padding_dummy_requests)
+                    for draft_len in draft_lengths:
+                        runner.release_padding_dummy(self.resource_manager,
+                                                     draft_len,
+                                                     released_resources)
+                    self._sleeping_padding_dummies.append(
+                        (runner, draft_lengths))
+            for manager in self.resource_manager.resource_managers.values():
+                if isinstance(manager, KVCacheManagerV2) and not any(
+                        manager is seen for seen in self._sleeping_kv_managers):
+                    manager.prepare_sleep()
+                    self._sleeping_kv_managers.append(manager)
         if ExecutorMemoryType.KV_CACHE in tags:
             mode = self.llm_args.sleep_config.restore_modes[
                 ExecutorMemoryType.KV_CACHE]
@@ -1944,6 +1965,19 @@ class PyExecutor:
 
     def finish_wakeup(self, tags: list[ExecutorMemoryType]) -> None:
         """Resume maintenance only after every released tag is restored."""
+        if not self._sleeping_memory_tags.difference(tags):
+            for manager in self._sleeping_kv_managers:
+                manager.finish_wakeup()
+            for runner, draft_lengths in self._sleeping_padding_dummies:
+                runner.preallocate_padding_dummies(self.resource_manager)
+                if not draft_lengths.issubset(runner.padding_dummy_requests):
+                    raise RuntimeError(
+                        "Could not restore CUDA graph padding requests after wakeup"
+                    )
+            if self._sleeping_kv_managers or self._sleeping_padding_dummies:
+                torch.cuda.synchronize()
+            self._sleeping_kv_managers.clear()
+            self._sleeping_padding_dummies.clear()
         self._sleeping_memory_tags.difference_update(tags)
 
     def complete_sleep_transition(self) -> None:

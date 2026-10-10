@@ -2701,18 +2701,49 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
 @pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
 @pytest.mark.parametrize("release_kv", [False, True])
 @pytest.mark.parametrize("joint_reuse", [False, True])
-def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reuse):
+def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reuse, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
     from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
     stub = object.__new__(PyExecutor)
+    stub._is_kv_manager_v2 = True
     stub._sleeping_memory_tags = set()
+    stub._sleeping_padding_dummies = []
+    stub._sleeping_kv_managers = []
     stub.llm_args = types.SimpleNamespace(
         sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
     )
     stub.kv_cache_manager = Mock()
     stub.draft_kv_cache_manager = Mock()
     stub.enable_joint_kv_cache_reuse = joint_reuse
-    tags = [ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN]
+    stub.resource_manager = types.SimpleNamespace(resource_managers={})
+    shared_spec = Mock()
+    dummy = types.SimpleNamespace(py_request_id=42)
+
+    def make_runner(manager):
+        runner = object.__new__(CUDAGraphRunner)
+        runner.padding_dummy_requests = {0: dummy}
+        runner._padding_dummy_managers = lambda _: [manager, shared_spec]
+        runner.preallocate_padding_dummies = Mock(
+            side_effect=lambda _: runner.padding_dummy_requests.update({0: dummy})
+        )
+        return runner
+
+    main_runner = make_runner(stub.kv_cache_manager)
+    draft_runner = make_runner(stub.draft_kv_cache_manager)
+    stub.model_engine = types.SimpleNamespace(cuda_graph_runner=main_runner, route_capture=None)
+    stub.draft_model_engine = types.SimpleNamespace(cuda_graph_runner=draft_runner)
+
+    def clear_reuse():
+        assert not main_runner.padding_dummy_requests
+        assert not draft_runner.padding_dummy_requests
+
+    stub.kv_cache_manager.reset_reuse_state.side_effect = clear_reuse
+    stub.draft_kv_cache_manager.reset_reuse_state.side_effect = clear_reuse
+    tags = [
+        ExecutorMemoryType.KV_CACHE if release_kv else ExecutorMemoryType.MODEL_ENGINE_MAIN,
+        ExecutorMemoryType.EXTRA_RESOURCES,
+    ]
 
     PyExecutor.prepare_sleep(stub, tags)
 
@@ -2720,6 +2751,19 @@ def test_prepare_sleep_invalidates_only_discarded_kv(mode, release_kv, joint_reu
     assert stub.kv_cache_manager.reset_reuse_state.call_count == expected
     assert stub.draft_kv_cache_manager.reset_reuse_state.call_count == expected * joint_reuse
     assert stub._sleeping_memory_tags == set(tags)
+    shared_spec.free_resources.assert_called_once_with(dummy)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(dummy)
+    stub.draft_kv_cache_manager.free_resources.assert_called_once_with(dummy)
+
+    PyExecutor.finish_wakeup(stub, tags[:1])
+    main_runner.preallocate_padding_dummies.assert_not_called()
+    draft_runner.preallocate_padding_dummies.assert_not_called()
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    PyExecutor.finish_wakeup(stub, tags[1:])
+    assert not stub._sleeping_memory_tags
+    assert main_runner.padding_dummy_requests == {0: dummy}
+    assert draft_runner.padding_dummy_requests == {0: dummy}
+    torch.cuda.synchronize.assert_called_once_with()
 
 
 @pytest.mark.parametrize("entrypoint", ["mpi", "ray"])

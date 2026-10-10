@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import os
@@ -1110,8 +1113,11 @@ class CUDAGraphRunner:
                 managers.append(manager)
         return managers
 
-    def release_padding_dummy(self, resource_manager: ResourceManager,
-                              runtime_draft_len: int) -> bool:
+    def release_padding_dummy(
+            self,
+            resource_manager: ResourceManager,
+            runtime_draft_len: int,
+            released_resources: Optional[set[Tuple[int, int]]] = None) -> bool:
         """Releases the padding dummy for ``runtime_draft_len`` from every
         manager that allocated part of it, and drops it from the runner so a
         later padded step re-creates it.
@@ -1123,13 +1129,21 @@ class CUDAGraphRunner:
         the ID, and re-creation reuses the same
         ``CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len``.
 
+        Pass the same ``released_resources`` set when releasing multiple
+        runners: target and draft runners can share a speculative slot.
+
         Returns True if a dummy was held for that draft length.
         """
         dummy_request = self.padding_dummy_requests.pop(runtime_draft_len, None)
         if dummy_request is None:
             return False
         for manager in self._padding_dummy_managers(resource_manager):
+            key = (id(manager), dummy_request.py_request_id)
+            if released_resources is not None and key in released_resources:
+                continue
             manager.free_resources(dummy_request)
+            if released_resources is not None:
+                released_resources.add(key)
         return True
 
     def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:

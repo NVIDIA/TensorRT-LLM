@@ -7,7 +7,7 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
-from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, ExecutorMemoryType, SleepConfig
 
 
 @pytest.mark.parametrize(
@@ -35,6 +35,7 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
         max_seq_len=512,
         max_batch_size=4,
         max_num_tokens=512,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4], enable_padding=True),
         ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     )
 
@@ -45,11 +46,11 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
         "The future of AI is",
     ]
 
-    prompts = [prompt * 20 for prompt in prompts]
+    prompts = [prompt * 20 for prompt in prompts[:3]]
     sampling_params = SamplingParams(temperature=0, max_tokens=16, return_perf_metrics=True)
 
     with llm:
-        llm._collective_rpc("assert_cache_manager_version", (use_v2,))
+        llm._collective_rpc("assert_cache_manager_version", (use_v2, True))
         outputs = llm.generate(prompts, sampling_params)
         generated_before_sleep = [output.outputs[0].text for output in outputs]
 
@@ -78,6 +79,7 @@ def test_llm_sleep(process_gpu_memory_info_available, sleep_tags, restore_mode, 
         memory_usage_wakeup = get_current_process_gpu_memory(True)
         if process_gpu_memory_info_available:
             assert memory_usage_wakeup > memory_usage_sleep
+        llm._collective_rpc("assert_cache_manager_version", (use_v2, True))
 
         outputs = llm.generate(prompts, sampling_params)
         generated_after_sleep = [output.outputs[0].text for output in outputs]

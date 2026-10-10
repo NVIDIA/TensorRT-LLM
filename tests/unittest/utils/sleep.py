@@ -12,9 +12,13 @@ class V2SleepWorkerExtension:
     def assert_v2_cache_manager(self) -> None:
         assert isinstance(self.engine.kv_cache_manager, KVCacheManagerV2)
 
-    def assert_cache_manager_version(self, use_v2: bool) -> None:
+    def assert_cache_manager_version(self, use_v2: bool, check_padding: bool = False) -> None:
         manager_cls = KVCacheManagerV2 if use_v2 else KVCacheManager
         assert isinstance(self.engine.kv_cache_manager, manager_cls)
+        if check_padding:
+            runner = self.engine.model_engine.cuda_graph_runner
+            assert runner.enabled and runner.padding_enabled
+            assert runner.padding_dummy_requests
 
 
 class V2SleepWorker(GenerationExecutorWorker):

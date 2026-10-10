@@ -3090,6 +3090,7 @@ def _make_guard_manager(
     manager._guard_page_fill = "nan"
     manager._guard_page_value = float("nan")
     manager._guard_page_by_layer = {}
+    manager._sleep_guard_page_pending = False
     manager.num_extra_kv_tokens = 0
     manager.pp_layers = [0]
     manager._stream = SimpleNamespace(cuda_stream=None)
@@ -3125,6 +3126,25 @@ def test_reserve_guard_page_fills_and_publishes_the_page(
     # Never committed: the reuse tree must never hand this page to a request.
     assert kv_cache.committing_stopped
     assert not kv_cache.closed
+
+    manager.prepare_sleep()
+    assert kv_cache.closed
+    assert not manager.guard_page_indices()
+    assert not manager.kv_cache_map
+
+    restored_cache = _GuardKVCache()
+
+    def recreate(request_id, *args, **kwargs):
+        manager.kv_cache_map[request_id] = restored_cache
+        return restored_cache
+
+    manager._create_kv_cache = recreate
+    buffer.fill_(1)
+    manager.finish_wakeup()
+    assert torch.isnan(buffer[3]).all()
+    assert torch.equal(buffer[2], torch.ones(2))
+    assert manager.guard_page_indices() == frozenset({3})
+    assert not restored_cache.closed
 
 
 @pytest.mark.parametrize("failure", ["create", "resume", "resize", "no_layer"])
