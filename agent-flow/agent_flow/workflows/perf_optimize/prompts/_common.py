@@ -1622,23 +1622,28 @@ _SOL_TRACK_SHARED = """\
 ### Per attempt
 
 ```bash
-S=<workspace>/sweep/<the sweep file>     # this campaign's copy, not the original
+T=<the live tuning file YOUR stage instruction names>   # an item's own file when it has one
 R=<the --result-dir this stage was told to write into>/run
 
-# 0. approach: code ONLY -- declare how the change reaches the workers, in
-#    the sweep. The harness runs whatever the image ships unless you do,
-#    so a source edit alone measures the image and comes back at baseline.
-#    Take the cheapest rung that fits:
+# 0. Put that tuning file into a sweep, and use the sweep it prints. Never
+#    skip it and never pass a different tuning file: either one measures a
+#    configuration other than the candidate and books it as the candidate.
+#    The overlay goes into the sweep copy BESIDE $T (`<dir of $T>/../sweep/`),
+#    created from the campaign's copy on first use, so items running in
+#    parallel never overwrite each other's overlay or build source. The file
+#    the task.yaml was written against is never modified.
+python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace> --tuning $T
+S=<the "sweep" path that command printed>
+
+# 1. approach: code ONLY -- declare how the change reaches the workers, in
+#    $S (your copy, so the checkout it names is YOUR stage's). The harness
+#    runs whatever the image ships unless you do, so a source edit alone
+#    measures the image and comes back at baseline. Cheapest rung that fits:
 #      trtllm_patch:  single files, applied in-container, seconds, no rebuild
 #      trtllm_install.trtllm_repo:  python-only editable install, minutes
 #      trtllm_install.build_wheel:  full C++ rebuild
 #    Validation refuses `code` against a sweep that names none of them.
-
-# 1. Put the live tuning file into the sweep. Never skip: forgetting it does
-#    not fail, it measures the PREVIOUS attempt's configuration.
-#    It edits <workspace>/sweep/ -- this campaign's own copy. The file the
-#    task.yaml was written against is never modified.
-python -m agent_flow.workflows.perf_optimize.sol_track --workspace <workspace>
+#    Re-run step 0 after any edit to $T; it rewrites only the overlay key.
 
 # 2. See what you are actually overriding, BEFORE spending an allocation.
 #    --dry-run materializes every case's worker config and queues nothing.

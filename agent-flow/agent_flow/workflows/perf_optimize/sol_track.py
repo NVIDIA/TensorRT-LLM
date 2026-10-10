@@ -771,6 +771,38 @@ def apply_overlay(task_data: Mapping[str, Any], tuning: Path) -> Path:
     return stage_config
 
 
+def sweep_for_tuning(task_data: Mapping[str, Any], tuning: Path) -> dict[str, Any]:
+    """``task_data`` re-pointed at the sweep copy that belongs to ``tuning``.
+
+    The workflow gives every roadmap item its own tuning file,
+    ``rounds/round_N/item_K/tuning/extra_llm_api_options.yaml``, and its own
+    checkout. One campaign-wide sweep copy cannot serve them: with the root
+    tuning file applied, an item's candidate is never what gets measured, and
+    with items running in parallel each one's overlay -- and its build-source
+    rung -- overwrites the others'. So the sweep travels with the tuning file,
+    ``<dir of tuning>/../sweep/``, copied from the campaign's own copy the first
+    time an item asks for it.
+
+    For the campaign's root tuning file that rule lands on ``<workspace>/sweep/``
+    itself, so a run without per-item tuning behaves exactly as before.
+    """
+    campaign_sweep = sweep_path(task_data)
+    if campaign_sweep is None:
+        raise SolTrackError(f"'{SOL_TRACK_FIELD}.{SWEEP_KEY}' is required")
+    own_dir = Path(tuning).resolve().parent.parent / WORKSPACE_SWEEP_DIR
+    if own_dir == campaign_sweep.resolve().parent:
+        return dict(task_data)
+    if not own_dir.exists():
+        shutil.copytree(
+            campaign_sweep.parent,
+            own_dir,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"),
+        )
+    block = dict(task_data.get(SOL_TRACK_FIELD) or {})
+    block[SWEEP_KEY] = str(own_dir / campaign_sweep.name)
+    return {**task_data, SOL_TRACK_FIELD: block}
+
+
 # --------------------------------------------------------------- the score
 
 
@@ -1116,6 +1148,15 @@ def _main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin entr
         default="latest",
         help="with --collect: a snapshot id, 'latest', or 'baseline' (default: latest)",
     )
+    parser.add_argument(
+        "--tuning",
+        metavar="TUNING_FILE",
+        default=None,
+        help="the live tuning file THIS stage was given (an item's own "
+        "rounds/.../tuning/extra_llm_api_options.yaml). Its overlay is written "
+        "into the sweep copy beside it, whose path is printed as 'sweep'. "
+        "Default: <workspace>/tuning/extra_llm_api_options.yaml and <workspace>/sweep/",
+    )
     args = parser.parse_args(argv)
     workspace = Path(args.workspace)
     task_data = yaml.safe_load((workspace / "task.yaml").read_text(encoding="utf-8"))
@@ -1123,8 +1164,12 @@ def _main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin entr
         results = collect(task_data, Path(args.collect), snapshot=args.snapshot)
         print(json.dumps({"ok": True, "results": [str(path) for path in results]}))
         return 0
-    written = apply_overlay(task_data, workspace / "tuning" / "extra_llm_api_options.yaml")
-    print(json.dumps({"ok": True, "stage_config": str(written)}))
+    tuning = (
+        Path(args.tuning) if args.tuning else workspace / "tuning" / "extra_llm_api_options.yaml"
+    )
+    own = sweep_for_tuning(task_data, tuning)
+    written = apply_overlay(own, tuning)
+    print(json.dumps({"ok": True, "stage_config": str(written), "sweep": str(sweep_path(own))}))
     return 0
 
 
