@@ -294,7 +294,8 @@ def test_v1_helix_capacity_config_rejected() -> None:
         KvCacheCreator.configure_kv_cache_capacity(c)
 
 
-def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "VANILLA"])
+def test_estimation_prepare_promotes_skip_est_for_v2(attn_backend: str) -> None:
     """Helix disables estimation; with a V2 manager it must also promote
     _skip_est so build_managers() calls configure_kv_cache_capacity().
     Other CP types must NOT be promoted: configure_kv_cache_capacity has no
@@ -309,7 +310,9 @@ def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
             _is_kv_cache_manager_v2=is_v2,
             _model_engine=SimpleNamespace(
                 model=SimpleNamespace(
-                    model_config=SimpleNamespace(attn_backend="TRTLLM", is_encoder_decoder=False)
+                    model_config=SimpleNamespace(
+                        attn_backend=attn_backend, is_encoder_decoder=False
+                    )
                 )
             ),
         )

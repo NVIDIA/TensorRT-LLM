@@ -6,7 +6,7 @@ import dataclasses
 import math
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -1677,6 +1677,13 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 )
 class Qwen3VLModel(Qwen3VLModelBase):
     supports_encoder_cache = True
+
+    @classmethod
+    def get_preferred_kv_cache_manager_version(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["V2"]:
+        """Prefer KV cache manager V2 for Qwen3-VL."""
+        return "V2"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.

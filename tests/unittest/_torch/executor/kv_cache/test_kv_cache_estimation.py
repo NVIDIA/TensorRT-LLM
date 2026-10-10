@@ -1310,6 +1310,59 @@ def test_manager_estimation_clamps_only_temporary_avg_seq_len(
     assert kv_cache_config.avg_seq_len == 2055
 
 
+def test_vanilla_v2_sets_fraction_quota_before_manager_construction() -> None:
+    """A backend without profiling still needs a byte budget before creating V2."""
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+    model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(attn_backend="VANILLA", is_encoder_decoder=False)
+        )
+    )
+    with patch.object(
+        KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=KVCacheManagerV2
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            draft_model_engine=None,
+            mapping=Mapping(),
+            net_max_seq_len=2048,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=2048,
+            max_batch_size=8,
+            kv_cache_config=kv_cache_config,
+            llm_args=SimpleNamespace(
+                cache_transceiver_config=None,
+                disable_overlap_scheduler=True,
+                enable_chunked_prefill=False,
+                kv_cache_compression_config=None,
+            ),
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+
+    def create_manager(*args, kv_cache_config_override, **kwargs):
+        assert kv_cache_config_override.max_gpu_total_bytes == int(768 * 0.8)
+        assert kv_cache_config_override.max_tokens is None
+
+    with (
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        patch.object(creator, "_create_kv_cache_manager", side_effect=create_manager) as construct,
+    ):
+        estimating = creator.try_prepare_estimation()
+        assert estimating is False
+        creator.build_managers({}, estimating)
+
+    construct.assert_called_once()
+
+
 def test_separate_one_model_draft_normalizes_target_pool_ratio() -> None:
     creator = object.__new__(KvCacheCreator)
     creator._model_engine = Mock(_max_cuda_graph_batch_size=4)
