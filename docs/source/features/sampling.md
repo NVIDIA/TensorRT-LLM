@@ -198,13 +198,14 @@ modes.
 
 ### Performance
 
-The Torch Sampler leverages the optimized sampling kernels provided by
-[FlashInfer](https://docs.flashinfer.ai/api/sampling.html), which is a required
-dependency for the Torch Sampler. The sampler also uses the
-[sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
-whenever possible. This optimization does not compute the complete set of token sampling probabilities
-(after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
-required for speculative decoding (rejection sampling).
+The Torch Sampler samples every non-greedy strategy (temperature, top-k, top-p, min-p and their
+combinations) with one fused kernel, which applies all the filters in a single launch and takes
+the sampling parameters and the random seed and offset per row. A seeded request's random stream
+therefore depends only on its own seed and how far it has decoded, not on where it sits in the
+batch. The sampled tokens can still differ across batch sizes, because the kernel picks its
+algorithm by the number of rows. The kernel computes the complete set of token sampling
+probabilities (after top-k / top-p masking etc.) only when the user requests them or speculative
+decoding (rejection sampling) requires them.
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised

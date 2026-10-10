@@ -12,28 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pinned host slots that stand in for GPU pages when the pool cannot reach them.
+"""Pinned host slots that every page passes through on its way to the pool.
 
-The connector's default path registers the KV pools themselves with Mooncake, so
-the store reads and writes device memory directly. That needs the HCA to be able
-to pin GPU pages, which means GPUDirect RDMA via `nvidia_peermem` or dma-buf.
-Where that is unavailable, `ibv_reg_mr` fails on every pool range and the
-connector cannot start.
+Registering the KV pools themselves needs the HCA to pin GPU pages, which means
+GPUDirect RDMA via `nvidia_peermem` or dma-buf, and one registration per pool
+mapping. Staging trades a copy for both: Mooncake is given a pinned host buffer
+instead of the pools, and each page passes through a slot in it, gathered from
+its device regions before a write and scattered back after a read.
 
-Staging trades a copy for that dependency. Mooncake is given a pinned host
-buffer instead of the pools, and each page passes through a slot in it: gathered
-from its device regions before a write, scattered back to them after a read. The
-store then only ever registers host memory.
-
-A slot holds the page's regions concatenated in region order, which is exactly
-the payload the zero-copy path produces from the same regions. The stored bytes
-are therefore identical either way, so a pool written by one path is readable by
-the other, including by another engine sharing the pool.
+A slot holds the page's regions concatenated in region order, which is the same
+payload a registered pool would produce, so a pool written by one path is
+readable by the other.
 
 Copies go through `cudaMemcpyAsync` rather than the batched Triton kernel in
-`disaggregation/native/bounce/gather_scatter.py`. That kernel is the better tool
-for device-to-device gather, but here one side is host memory, which the copy
-engines move over the host link by DMA.
+`disaggregation/native/bounce/gather_scatter.py`, since one side here is host
+memory and the copy engines move that over the host link by DMA.
 """
 
 from typing import List, Optional, Sequence, Tuple
@@ -48,7 +41,12 @@ except ImportError:
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
-__all__ = ["HostStagingPool", "plan_slot_geometry", "sync_stream"]
+__all__ = ["MAX_STAGING_BUFFER_BYTES", "HostStagingPool", "plan_slot_geometry", "sync_stream"]
+
+#: Ceiling on the pinned allocation per direction, bounding what a large page
+#: times a large batch could demand. The memory is pinned for the process's
+#: lifetime and comes out of the DRAM the pool segment is charged against.
+MAX_STAGING_BUFFER_BYTES = 1 << 30
 
 #: Stated explicitly rather than inferred from the pointers, which would be
 #: wrong for a host pointer outside the unified address space.
@@ -82,18 +80,18 @@ def sync_stream(stream: int) -> None:
 def plan_slot_geometry(
     max_bytes_per_page: int,
     transfer_batch_size: int,
-    budget_bytes: int,
+    budget_bytes: int = MAX_STAGING_BUFFER_BYTES,
 ) -> Tuple[int, int]:
     """Choose how many pages may be staged at once, and how wide a slot is.
 
-    A slot has to hold the largest page any layer group produces, so the page size
-    is a floor on the allocation: a budget below one page is raised to one rather
-    than refused, since the alternative is not starting.
+    The geometry follows from the layout rather than from configuration: a slot
+    has to hold the largest page any layer group produces, and there is no
+    point holding more slots than a transfer batch has pages. A budget below
+    one page is raised to one rather than refused.
 
     Args:
         max_bytes_per_page: Largest page payload across layer groups.
-        transfer_batch_size: Pages the connector puts in one store call. There is
-            no point staging more than that.
+        transfer_batch_size: Pages the connector puts in one store call.
         budget_bytes: Ceiling on this pool's pinned allocation.
 
     Returns:
@@ -113,8 +111,8 @@ class HostStagingPool:
     """A registered pinned buffer, sliced into per-page slots.
 
     One pool serves one direction. Loads run on the executor thread and saves
-    on the connector's background thread, so sharing slots between them would
-    need a lock on the transfer path for no benefit.
+    on the connector's background thread, so sharing slots would need a lock on
+    the transfer path for no benefit.
     """
 
     def __init__(
@@ -147,7 +145,7 @@ class HostStagingPool:
                 f"memory registration failing points at the pool or the fabric "
                 f"rather than at GPUDirect, which is what staging avoids."
             )
-        logger.info(
+        logger.warning(
             f"mooncake-store {label} staging: {self._num_slots} slots x "
             f"{self._slot_bytes} B = {self._buffer.numel() / 1024**2:.1f} MiB pinned "
             f"(pinned={pin})"
@@ -156,11 +154,10 @@ class HostStagingPool:
     def close(self) -> None:
         """Hand the registration back before the buffer is freed.
 
-        The store registers an address range rather than the tensor, so a buffer
-        freed while it still holds one leaves the fabric able to reach memory the
-        allocator has since handed out again. Called once the connector's pending
-        transfers have drained. Idempotent, and a failed unregistration keeps the
-        buffer rather than freeing memory the store may still reach.
+        The store registers an address range rather than the tensor, so a
+        buffer freed while it still holds one leaves the fabric able to reach
+        memory the allocator has since handed out again. Idempotent, and a
+        failed unregistration keeps the buffer.
         """
         if self._buffer is None:
             return
@@ -213,8 +210,8 @@ class HostStagingPool:
             stream: CUDA stream handle the copies are issued on.
 
         Returns:
-            The slot's address and the total bytes written, ready to hand to the
-            store as a single buffer.
+            The slot's address and the total bytes written, ready to hand to
+            the store as a single buffer.
         """
         total = sum(sizes)
         self._check_fits(total)
@@ -285,8 +282,8 @@ def describe_batch_for_get(
     """Describe slots for the store to read a batch into, before scattering.
 
     Unlike the put direction there is nothing to copy first: the slots are the
-    destination, and :func:`unstage_batch_after_get` moves the bytes on once the
-    store has filled them.
+    destination, and :func:`unstage_batch_after_get` moves the bytes on once
+    the store has filled them.
     """
     if len(sizes) > pool.num_slots:
         raise ValueError(f"batch of {len(sizes)} pages exceeds {pool.num_slots} staging slots")
@@ -316,8 +313,8 @@ def unstage_batch_after_get(
         stream: Stream the copies are issued on. The caller must synchronize it
             before the pages are read.
         only: Slot indices to scatter. Defaults to all of them; a caller that
-            knows some reads failed passes the rest so a failed page is not
-            written over its device slot with whatever the slot held.
+            knows some reads failed passes the rest, so no device page is
+            overwritten with whatever a failed slot held.
     """
     indices = range(len(addresses)) if only is None else only
     for index in indices:

@@ -898,34 +898,25 @@ class TestWarmupCleanup(unittest.TestCase):
                 "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sampling_module",
                 side_effect=lambda: events.append("sampling"),
             ) as warmup_sampling,
-            patch(
-                "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.warmup_sample_from_logits_op",
-                side_effect=lambda *args: events.append("in_graph_sampling"),
-            ) as warmup_in_graph_sampling,
             _capture_tllm_logs() as logs,
         ):
             for enabled in (False, True):
                 with self.subTest(enable_in_graph_sampling=enabled):
                     events.clear()
                     warmup_sampling.reset_mock()
-                    warmup_in_graph_sampling.reset_mock()
                     runner._config.enable_in_graph_sampling = enabled
                     runner._eager_workspace_reclaimer = object()
                     model_engine._warmup_impl(resource_manager)
                     self.assertEqual(
                         events,
-                        [("enter", "sampling_warmup_seconds"), "sampling"]
-                        + (["in_graph_sampling"] if enabled else [])
-                        + [("exit", "sampling_warmup_seconds")],
+                        [
+                            ("enter", "sampling_warmup_seconds"),
+                            "sampling",
+                            ("exit", "sampling_warmup_seconds"),
+                        ],
                     )
                     self.assertIsNone(runner._eager_workspace_reclaimer)
                     warmup_sampling.assert_called_once_with()
-                    if enabled:
-                        warmup_in_graph_sampling.assert_called_once_with(
-                            128, torch.device("cuda"), torch.float16, [1, 4]
-                        )
-                    else:
-                        warmup_in_graph_sampling.assert_not_called()
 
         self.assertTrue(
             any("Skipping warm up as no KV Cache manager allocated." in log for log in logs)
