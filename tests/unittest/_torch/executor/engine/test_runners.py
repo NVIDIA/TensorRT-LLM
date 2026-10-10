@@ -379,7 +379,7 @@ def test_no_kv_cache_runner_owns_and_reuses_attention_metadata() -> None:
     assert first.kv_cache_manager is None
     assert first.max_num_requests == 4
     assert first.max_num_sequences == 4
-    assert first.num_heads_per_kv == 4
+    assert first.max_num_heads_per_kv == 4
     assert first.block_ids_per_seq is None
     assert first.kv_block_ids_per_seq is None
 

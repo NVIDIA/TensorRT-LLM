@@ -1599,7 +1599,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         request_ids=request_ids,
         prompt_lens=list(s.past_kv_lens),
         num_sparse_topk=num_sparse_topk,
-        num_heads_per_kv=s.q_heads_per_kv_head,
+        max_num_heads_per_kv=s.q_heads_per_kv_head,
         runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=s.has_draft_tokens),
         is_spec_decoding_enabled=s.has_draft_tokens,
         use_spec_decoding=s.has_draft_tokens,

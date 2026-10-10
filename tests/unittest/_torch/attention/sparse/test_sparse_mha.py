@@ -261,7 +261,7 @@ def create_generation_inputs(scenario: MhaGenerationScenario) -> MhaGenerationIn
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=list(scenario.past_kv_lens),
-            num_heads_per_kv=1,
+            max_num_heads_per_kv=1,
             runtime_features=AttentionRuntimeFeatures(
                 has_speculative_draft_tokens=scenario.has_draft_tokens
             ),

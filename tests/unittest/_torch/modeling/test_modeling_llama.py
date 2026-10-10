@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
@@ -473,7 +476,7 @@ class TestLlama(unittest.TestCase):
             kv_cache_manager=kv_cache_manager,
             request_ids=request_ids,
             prompt_lens=prompt_lens,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
 
         position_ids = [torch.arange(0, input_ids.size(-1))]
@@ -547,7 +550,7 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=is_spec_dec_dynamic_tree,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
         attn_metadata_gen_phase_0.prepare()
         attn_metadata_gen_phase_0.update_spec_dec_param(
@@ -669,7 +672,7 @@ class TestLlama(unittest.TestCase):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             is_spec_dec_dynamic_tree=False,
-            num_heads_per_kv=num_heads_per_kv,
+            max_num_heads_per_kv=num_heads_per_kv,
         )
 
         attn_metadata_ref.spec_decoding_position_offsets = None

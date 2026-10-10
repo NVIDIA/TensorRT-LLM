@@ -185,8 +185,8 @@ class AttentionMetadata:
 
     _saved_tensors: Dict[str, torch.Tensor] = field(init=False,
                                                     default_factory=dict)
-    # The number of heads per kv head.
-    num_heads_per_kv: Optional[int] = 1
+    # The largest query-to-KV head ratio across layers sharing this metadata.
+    max_num_heads_per_kv: Optional[int] = 1
 
     multi_item_part_lens: Optional[list[list[int]]] = None
     """Additional token layout information for multi-item scoring.

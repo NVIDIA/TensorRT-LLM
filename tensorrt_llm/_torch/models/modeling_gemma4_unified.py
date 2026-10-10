@@ -315,8 +315,7 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4MultimodalModelBase):
                 .to(self._device)
             )
 
-        # Surface the text (LLM) config so KV-cache sizing + is_gemma4_hybrid
-        # (global head dim differs from the per-layer head dim) read the text geometry.
+        # Surface the text (LLM) config and its normalized KV-cache geometry.
         self.post_config()
         self.is_loaded = True
 
