@@ -67,7 +67,7 @@ _HF_BEAM_OUTPUT_TOKEN_IDS_BY_MODEL_AND_BEAMS = {
     ],
     ("t5-large", 2): [
         [644, 4598, 229, 19250],
-        [644, 4598, 229, 3],
+        [644, 4598, 229, 26820],
     ],
     ("flan-t5-small", 2): [
         [644, 4598, 229, 9685],
@@ -155,166 +155,98 @@ def _test_case(
 
 
 _TEST_CASES = [
-    # Primary coverage: v1 cache manager and beam search across model sizes.
+    # Primary coverage: V2 cache manager and beam search across model sizes.
     # CUDA graphs are enabled everywhere except one eager greedy smoke case
     # because deployments almost always enable them.
     _test_case(
         model_name="flan-t5-small",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="t5-base",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="t5-large",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="flan-t5-base",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="flan-t5-large",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="flan-t5-xl",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
     ),
     _test_case(
         model_name="flan-t5-xxl",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
         cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
         marks=pytest.mark.skip_less_device_memory(_FLAN_T5_XXL_MIN_GPU_MEMORY_MB),
     ),
-    # Eager (non-CUDA-graph) greedy smoke for the priority v1 path.
+    # Eager (non-CUDA-graph) greedy smoke.
     _test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=False,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
-        feature_id="bf16-kv-v1-cuda-graph-off-greedy",
+        feature_id="bf16-kv-v2-cuda-graph-off-greedy",
     ),
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-greedy",
-    ),
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2",
-    ),
-    # V1 precision coverage for beam search.
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="float16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        feature_id="fp16-kv-v1-cuda-graph-on-beam2",
-    ),
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="float32",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        feature_id="fp32-kv-v1-cuda-graph-on-beam2",
-    ),
-    _test_case(
-        model_name="flan-t5-small",
-        torch_dtype="float16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        feature_id="fp16-kv-v1-cuda-graph-on-beam2",
-    ),
-    _test_case(
-        model_name="flan-t5-small",
-        torch_dtype="float32",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        feature_id="fp32-kv-v1-cuda-graph-on-beam2",
-    ),
-    # Precision coverage for v2 on its supported greedy path.
     _test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",
@@ -326,6 +258,63 @@ _TEST_CASES = [
         cuda_graph_batch_sizes=[2],
         feature_id="bf16-kv-v2-cuda-graph-on-greedy",
     ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2",
+    ),
+    # Precision coverage for beam search.
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="float16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="fp16-kv-v2-cuda-graph-on-beam2",
+    ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="float32",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="fp32-kv-v2-cuda-graph-on-beam2",
+    ),
+    _test_case(
+        model_name="flan-t5-small",
+        torch_dtype="float16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="fp16-kv-v2-cuda-graph-on-beam2",
+    ),
+    _test_case(
+        model_name="flan-t5-small",
+        torch_dtype="float32",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        feature_id="fp32-kv-v2-cuda-graph-on-beam2",
+    ),
+    # Precision coverage for greedy decoding.
     _test_case(
         model_name="t5-small",
         torch_dtype="float16",
@@ -401,30 +390,6 @@ _TEST_CASES = [
     _test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        cuda_graph_batch_sizes=[2],
-        disable_overlap_scheduler=False,
-        feature_id="bf16-kv-v1-cuda-graph-on-greedy-overlap",
-    ),
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        enable_cuda_graph=True,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        cuda_graph_batch_sizes=[2],
-        disable_overlap_scheduler=False,
-        feature_id="bf16-kv-v1-cuda-graph-on-beam2-overlap",
-    ),
-    _test_case(
-        model_name="t5-small",
-        torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=1,
@@ -434,17 +399,29 @@ _TEST_CASES = [
         disable_overlap_scheduler=False,
         feature_id="bf16-kv-v2-cuda-graph-on-greedy-overlap",
     ),
+    _test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        cuda_graph_batch_sizes=[2],
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v2-cuda-graph-on-beam2-overlap",
+    ),
     # Tensor parallelism (TP=2) coverage
     _test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         enable_cuda_graph=True,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
         tensor_parallel_size=2,
-        feature_id="bf16-kv-v1-cuda-graph-on-greedy-tp2",
+        feature_id="bf16-kv-v2-cuda-graph-on-greedy-tp2",
         marks=pytest.mark.skip_less_device(2),
     ),
 ]
@@ -482,41 +459,14 @@ _MIXED_BATCH_TEST_CASES = [
     _mixed_batch_test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
+        use_kv_cache_manager_v2=True,
         num_beams=2,
         num_return_sequences=2,
         exact_match=False,
-        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2",
     ),
     _mixed_batch_test_case(
         model_name="flan-t5-small",
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        num_beams=2,
-        num_return_sequences=2,
-        exact_match=False,
-        feature_id="bf16-kv-v1-decoder-cuda-graph-on-beam2-batch2",
-    ),
-    _mixed_batch_test_case(
-        model_name="t5-small",
-        torch_dtype="bfloat16",
-        use_kv_cache_manager_v2=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        feature_id="bf16-kv-v1-decoder-cuda-graph-on-greedy-batch2",
-    ),
-    _mixed_batch_test_case(
-        model_name="t5-small",
-        torch_dtype="float32",
-        use_kv_cache_manager_v2=False,
-        num_beams=1,
-        num_return_sequences=1,
-        exact_match=True,
-        feature_id="fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2",
-    ),
-    _mixed_batch_test_case(
-        model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         num_beams=2,
@@ -532,6 +482,15 @@ _MIXED_BATCH_TEST_CASES = [
         num_return_sequences=1,
         exact_match=True,
         feature_id="bf16-kv-v2-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
+        torch_dtype="float32",
+        use_kv_cache_manager_v2=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="fp32-kv-v2-decoder-cuda-graph-on-greedy-batch2",
     ),
 ]
 
@@ -950,7 +909,7 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
             max_tokens=_MAX_KV_TOKENS,
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=True,
         ),
         max_batch_size=3,
         max_beam_width=1,
@@ -1044,49 +1003,42 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
         assert replayed_mixed_keys <= captured_mixed_keys
 
 
-def test_t5_pytorch_block_reuse_is_refused_for_relative_position(
+def test_t5_pytorch_block_reuse_is_disabled_for_v2(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """KV block reuse with T5 must fail with a message about relative position.
-
-    Block reuse turns on paged-context attention, which needs the fused context
-    FMHA kernel to attend to cached KV. T5 self attention uses relative position
-    embedding, for which no fused kernel exists on any build, so the attention
-    op refuses the combination up front instead of silently running the unfused
-    path and dropping the cached prefix. The refusal must name the real cause
-    (relative position embedding), not a missing kernel or the build's
-    architecture list, which cannot help here.
-    """
+    """V2 disables encoder-decoder prefix reuse while preserving generation."""
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
-    # Keep the worker in-process so the C++ error message reaches pytest intact.
+    # Keep the worker in-process to inspect the effective attention features.
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     model_path = _get_t5_model_path("t5-small")
     sampling_params = _sampling_params(num_beams=1, num_return_sequences=1)
 
-    # Warmup during construction may already run a forward, so the refusal can
-    # come from either the constructor or the first generate call.
-    with pytest.raises(Exception, match="relative position embedding"):
-        with LLM(
-            model_path,
-            backend="pytorch",
-            attn_backend="TRTLLM",
-            cuda_graph_config=None,
-            disable_overlap_scheduler=True,
-            dtype="bfloat16",
-            enable_chunked_prefill=False,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=True,
-                max_tokens=_MAX_KV_TOKENS,
-                free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
-                cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
-            ),
-            max_batch_size=1,
-            max_beam_width=1,
-            max_input_len=_MAX_SEQUENCE_LENGTH,
-            max_num_tokens=_MAX_SEQUENCE_LENGTH,
-            max_seq_len=_MAX_SEQUENCE_LENGTH,
-            model_kwargs={"torch_dtype": "bfloat16"},
-            scheduler_config=SchedulerConfig(use_python_scheduler=True),
-        ) as llm:
-            llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)
+    with LLM(
+        model_path,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            use_kv_cache_manager_v2=True,
+            enable_block_reuse=True,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        assert not llm._executor.engine.model_engine.attn_runtime_features.cache_reuse
+        response = llm.generate(_SOURCE_TEXT, sampling_params=sampling_params, use_tqdm=False)
+        assert (
+            list(response.outputs[0].token_ids) == _EXPECTED_OUTPUT_TOKEN_IDS_BY_MODEL["t5-small"]
+        )
