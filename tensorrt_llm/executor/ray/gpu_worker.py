@@ -352,17 +352,10 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             mutation_started = True
             materialize_with_tag(*tags)
             torch.cuda.synchronize()
-        except Exception:
-            if mutation_started:
-                self.engine.fail_sleep_wakeup_transition()
-            self.engine.abort_wakeup_transition()
-            logger.exception("Encountered an error in wakeup")
-            raise
-        try:
-            self.engine.complete_wakeup_transition()
-        except Exception:
-            self.engine.fail_sleep_wakeup_transition()
-            raise
+            self.engine.finish_wakeup(tags)
+        except Exception as e:
+            logger.error(f"Encountered an error in wakeup")
+            raise e
 
     def start(self):
         pass
