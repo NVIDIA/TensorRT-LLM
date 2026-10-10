@@ -1783,7 +1783,7 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
 
 @pytest.mark.parametrize(
     "global_prompt,local_prompt,rank,range_end,expected",
-    [(256, 128, 0, 128, [35, 80]), (64, 0, 1, 128, [10]), (130, 65, 0, 65, [35, 80])],
+    [(256, 128, 0, 128, [35, 80]), (64, 0, 1, 128, [10]), (130, 66, 0, 65, [35, 80])],
 )
 def test_helix_retention_uses_rank_local_ranges(
     monkeypatch: pytest.MonkeyPatch,

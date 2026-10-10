@@ -279,7 +279,7 @@ class KVCacheManagerConfig:
     enable_stats: bool = True
     text_only: bool = False
     enable_partial_commit: bool = True
-    secondary_offload_min_priority: Priority = 30
+    secondary_offload_min_priority: int = 30
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

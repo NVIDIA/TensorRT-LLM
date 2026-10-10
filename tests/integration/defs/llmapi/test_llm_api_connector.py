@@ -263,13 +263,9 @@ def generate_and_wait(model, scheduler, worker, *args, **kwargs):
 def test_v2_connector_contract_does_not_reuse_the_v1_methods():
     """The V2 connector path implements none of the V1 accessors, by design.
 
-    Something depends on that, and it does not ask: `update_and_build_data`
-    reports `block_hashes` and `priorities` empty on V2 by branching on
-    `isinstance(manager, KVCacheManagerV2)`, not on `hasattr`. Those
-    short-circuits are only correct while V2 genuinely has no such accessor -
-    the day one is added (retention priorities are a known gap; see
-    `test_connector_priorities`) the branch keeps reporting nothing while the
-    data exists, and this is what says so.
+    The V2 branch of `update_and_build_data` reads native page priorities and
+    reports page indices per layer group. It must not call the V1 accessors,
+    which assume one flat block-id space across all layers.
 
     A static check rather than an end-to-end run: under V2 the connector would
     die at the *first* method it reached, so no run can report more than one at
