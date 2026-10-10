@@ -1,14 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from multiprocessing import Event, Process
 from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
 from typing import Optional, Union
 
-from zmq import PULL, Context
+from zmq import POLLIN, PULL, Context
 
 from tensorrt_llm import logger
+
+_ITERATION_WRITER_JOIN_TIMEOUT_SEC = 5.0
+_ITERATION_WRITER_POLL_MS = 100
+# Allow queued tail messages to bridge transient empty polls after shutdown.
+_ITERATION_WRITER_IDLE_TIMEOUT_SEC = 1.0
 
 
 # The IterationWriter class implements a multi-process logging system that captures and writes
@@ -47,8 +67,11 @@ class IterationWriter:
                                      logging is disabled and capture() will be a no-op.
         """
         self.log_path = log_path
-        self._socket_path = Path(
-            tempfile.mkstemp()[1]) if log_path is not None else None
+        self._socket_path = None
+        if log_path is not None:
+            fd, socket_path = tempfile.mkstemp()
+            os.close(fd)
+            self._socket_path = Path(socket_path)
 
     @property
     def full_address(self) -> Union[str, None]:
@@ -95,6 +118,10 @@ class IterationWriter:
             yield
         else:
             logger.info(f"Logging iterations to {self.log_path}...")
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Surface file errors in the parent before starting the benchmark.
+            with self.log_path.open("a"):
+                pass
             stop = Event()
             process = Process(name="IterationWriter",
                               target=self.run,
@@ -104,7 +131,15 @@ class IterationWriter:
                 yield
             finally:
                 stop.set()
-                process.join()
+                process.join(timeout=_ITERATION_WRITER_JOIN_TIMEOUT_SEC)
+                if process.is_alive():
+                    logger.warning("Iteration writer timed out; the iteration "
+                                   "log may be incomplete.")
+                    process.kill()
+                    process.join()
+                elif process.exitcode != 0:
+                    logger.warning("Iteration writer failed; the iteration "
+                                   "log may be incomplete.")
 
     def __del__(self) -> None:
         if self._socket_path is not None:
@@ -135,33 +170,35 @@ class IterationWriter:
         socket = None
 
         try:
-            # Create a ZeroMQ context and socket for inter-process communication
-            logger.debug(f"Iteration logging: Binding to {address}...")
-            context = Context(io_threads=1)
-            socket = context.socket(PULL)
-            socket.bind(address)
-
-            # Open the log file for writing and start listening for messages
-            logger.debug(
-                f"Iteration logging: Listening for messages on {address}...")
             with open(log_path, "w") as f:
                 logger.info(f"Iteration logging: Opened log file {log_path}...")
-                # Receive the first message from the socket
-                message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received initial message")
-                # Continue receiving messages until the stop event is set or an
-                # "end" message is received
-                while not stop_event.is_set() and "end" not in message:
-                    f.write(f"{message}\n")
+                context = Context(io_threads=1)
+                socket = context.socket(PULL)
+                socket.bind(address)
+                drain_deadline = None
+                while True:
+                    if stop_event.is_set() and drain_deadline is None:
+                        drain_deadline = (time.monotonic() +
+                                          _ITERATION_WRITER_IDLE_TIMEOUT_SEC)
+                    if not socket.poll(_ITERATION_WRITER_POLL_MS, POLLIN):
+                        if (drain_deadline is not None
+                                and time.monotonic() >= drain_deadline):
+                            logger.warning(
+                                "Iteration writer stopped without receiving the "
+                                "end marker; the iteration log may be incomplete."
+                            )
+                            break
+                        continue
                     message = socket.recv_json()
-                logger.debug(f"Iteration logging: Received end message")
+                    if "end" in message:
+                        break
+                    f.write(f"{message}\n")
+                    if stop_event.is_set():
+                        # Keep draining while queued tail messages are arriving.
+                        drain_deadline = (time.monotonic() +
+                                          _ITERATION_WRITER_IDLE_TIMEOUT_SEC)
         except KeyboardInterrupt:
-            # Handle keyboard interrupt by continuing to receive
-            # messages until "None" is received. LlmManager will
-            # send "None" when it is finished.
             logger.info("Keyboard interrupt, exiting iteration logging...")
-            while message != b"None":
-                message = socket.recv_json()
         finally:
             # Finalize the logging process by closing the socket and terminating
             # the context
