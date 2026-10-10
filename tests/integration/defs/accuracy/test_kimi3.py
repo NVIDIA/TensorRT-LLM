@@ -46,7 +46,7 @@ from .accuracy_core import (
 class TestKimiK3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "moonshotai/Kimi-K3"
     MODEL_PATH = f"{llm_models_root()}/Kimi-K3"
-    DSPARK_MODEL_PATH = f"{llm_models_root()}/Kimi-K3-DSpark"
+    DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(16)
