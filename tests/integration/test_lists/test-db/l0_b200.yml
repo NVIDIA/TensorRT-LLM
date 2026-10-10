@@ -269,6 +269,7 @@ l0_b200:
   - unittest/kv_cache_manager_v2_tests
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
   - unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
+  - unittest/_torch/executor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v1]
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]

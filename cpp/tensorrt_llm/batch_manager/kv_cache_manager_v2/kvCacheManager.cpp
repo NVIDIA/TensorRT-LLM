@@ -224,6 +224,8 @@ bool KvCacheManager::prefetchReuse(ReuseScope reuseScope, TokenSpan inputTokens,
 {
     KVCM2_API_GUARD();
     auto const apiLock = lockExclusive();
+    if (target < kHotLevel || target >= mStorage->numCacheLevels())
+        throw std::out_of_range("Prefetch target is outside the configured cache tiers");
     auto reuseMatch = matchReuse(reuseScope, inputTokens, knownNoDigest);
     auto cache = std::make_shared<KvCache>(*this, std::move(reuseScope), std::move(reuseMatch), std::nullopt,
         KvCache::PriorityCb{}, std::nullopt, knownNoDigest, false, std::nullopt, /*isPrefetch=*/true);

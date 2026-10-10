@@ -513,6 +513,10 @@ class TestRetention(TestKVCacheManagerV2):
         first.commit(tokens[5:])
         second = self._cache(tokens, config, prompt_length=5)
         self.assertEqual(first.get_page_priorities(0), [35, 80, 10])
+        with self.assertRaises(IndexError):
+            first.get_page_priorities(0, -1)
+        with self.assertRaises(IndexError):
+            self.manager.prefetch_reuse(ReuseScope(), tokens, CacheLevel(-1))
         first.close()
         time.sleep(0.04)
         self.manager.refresh_retention()
@@ -537,6 +541,26 @@ class TestRetention(TestKVCacheManagerV2):
         time.sleep(1.05)
         self.manager.refresh_retention()
         self.assertEqual(self._cache(tokens).get_page_priorities(0), [35, 80, 10])
+
+        for shared in (False, True):
+            with self.subTest(shared_swa_page=shared):
+                for cache in self.caches:
+                    cache.close()
+                self.caches.clear()
+                self.manager.shutdown()
+                self.prepare(2 << 20, 0, 0, 1, 4, 0, tokens_per_block=4, kv_buf_size=65536)
+                config = self._config(80, duration)
+                source = self._cache(tokens[:4], config)
+                sharer = self._cache(tokens[:4], config) if shared else None
+                self.assertTrue(source.resize(8))
+                self.engine.execute([Step(source, tokens[4:8], tokens[:4])], self.stream.handle)
+                source.commit(tokens[4:8])
+                source.close()
+                if sharer is not None:
+                    sharer.close()
+                time.sleep(0.04)
+                self.manager.refresh_retention()
+                self.assertEqual(self._cache(tokens[:4]).get_page_priorities(0), [80])
 
     def test_offload_reload_and_error_cleanup(self):
         self.prepare(2 << 20, 2 << 20, 0, 1, None, 0, tokens_per_block=4, kv_buf_size=65536)
@@ -3620,7 +3644,11 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache = self.manager.create_kv_cache(
             expected_prompt_length=len(prompt),
             kv_cache_retention_config=KvCacheRetentionConfig(
-                [KvCacheRetentionConfig.TokenRangeRetentionConfig(0, None, 80)]
+                [
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        0, None, 80, timedelta(milliseconds=20)
+                    )
+                ]
             ),
         )
         kv_cache.resume(stream)
@@ -3634,7 +3662,10 @@ class TestSSMSupport(unittest.TestCase):
         ssm_slot = kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lc_id))
 
         kv_cache.commit(prompt, is_end=True)
-        kv_cache.close()
+        try:
+            self.assertEqual(kv_cache.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 80)
+        finally:
+            kv_cache.close()
 
         _, attn_pages = _introspection.reuse_match_pages(
             self.manager, ReuseScope(), prompt, attn_lc_id, self.manager.enable_partial_match
@@ -3651,9 +3682,14 @@ class TestSSMSupport(unittest.TestCase):
         self.assertEqual(attn_page[0], attn_tail_slot)
         self.assertEqual(ssm_page[0], ssm_slot)
         self.assertEqual(ssm_page[1], 16)
+        time.sleep(0.04)
+        self.assertTrue(self.manager.prefetch_reuse(ReuseScope(), prompt, GPU_LEVEL))
+        self.manager.refresh_retention()
         probe = self.manager.create_kv_cache(input_tokens=prompt)
-        self.assertEqual(probe.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 80)
-        probe.close()
+        try:
+            self.assertEqual(probe.get_page_priorities(LayerGroupId(ssm_lc_id))[-1], 35)
+        finally:
+            probe.close()
 
     def test_ssm_snapshot_moves_to_covering_block(self) -> None:
         """A snapshot on a partial block survives the full sibling that replaces it."""

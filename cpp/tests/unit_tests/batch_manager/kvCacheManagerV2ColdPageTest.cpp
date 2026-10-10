@@ -542,24 +542,42 @@ TEST(KvCacheManagerV2ColdPageTest, ForceEvictFailureReschedulesFallenPage)
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     auto codec = std::make_unique<AsyncRejectingColdPageCodec>(AsyncRejectingColdPageCodec::Operation::kEncode);
     auto* codecPtr = codec.get();
-    auto manager = std::make_shared<KvCacheManager>(makeTieredConfig(), nullptr, std::move(codec));
+    auto config = makeSplitColdGroupingConfig();
+    std::get<AttentionLayerConfig>(config.layers[1]).buffers.front().size *= 2;
+    auto manager = std::make_shared<KvCacheManager>(std::move(config), nullptr, std::move(codec));
     auto releaseCodecGuard = FuncGuard([codecPtr]() { codecPtr->release(); });
     auto& storage = manager->storage();
-    LifeCycleId const lifeCycle{0};
-    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{1}, 1);
+    LifeCycleId const lifeCycle{1};
+    TypedVec<LifeCycleId, SlotCount> oneSlot(LifeCycleId{2}, 1);
 
     auto hotSlots = storage.newGpuSlots(oneSlot);
-    auto sourcePage = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[lifeCycle].front());
+    auto sourcePage = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[lifeCycle].front(), lifeCycle, 80);
+    auto lowPage
+        = makeCommittedPage(*manager, storage, kHotLevel, hotSlots[LifeCycleId{0}].front(), LifeCycleId{0}, 10);
+    SlotId const lowSlotId = lowPage->slotId();
+    WeakPtr<CommittedPage> lowPageRef = lowPage;
+    lowPage.reset();
     SlotId const sourceSlotId = sourcePage->slotId();
     TypedVec<PoolGroupIndex, SlotCount> evictOne(storage.numPoolGroups(kHotLevel), 0);
     evictOne[storage.getPoolGroupIndex(kHotLevel, lifeCycle)] = 1;
+    evictOne[storage.getPoolGroupIndex(kHotLevel, LifeCycleId{0})] = 1;
+    size_t dropped = 0;
+    auto recordDrop = [&](std::vector<SharedPtr<Page>> const& pages, CacheLevel) { dropped += pages.size(); };
 
-    EXPECT_THROW(storage.forceEvict(kHotLevel, evictOne), TllmException);
+    EXPECT_THROW(storage.forceEvict(kHotLevel, evictOne, recordDrop), TllmException);
     ASSERT_TRUE(codecPtr->launched());
     EXPECT_EQ(sourcePage->cacheLevel, kHotLevel);
     EXPECT_EQ(sourcePage->slotId(), sourceSlotId);
     EXPECT_TRUE(sourcePage->scheduledForEviction());
     EXPECT_FALSE(sourcePage->queryReady());
+    EXPECT_EQ(sourcePage->priority(), 80);
+    EXPECT_EQ(dropped, 0);
+    lowPage = lowPageRef.lock();
+    ASSERT_TRUE(lowPage);
+    EXPECT_EQ(lowPage->cacheLevel, kHotLevel);
+    EXPECT_EQ(lowPage->slotId(), lowSlotId);
+    EXPECT_TRUE(lowPage->scheduledForEviction());
+    EXPECT_EQ(lowPage->priority(), 10);
 
     codecPtr->release();
     sourcePage->readyEvent.synchronize();

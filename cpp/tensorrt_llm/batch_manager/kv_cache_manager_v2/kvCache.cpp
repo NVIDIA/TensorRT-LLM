@@ -189,6 +189,8 @@ std::vector<Priority> KvCache::getPagePriorities(LayerGroupId layerGroupId, Beam
 {
     KVCM2_REJECT_IF_POISONED();
     auto const apiLock = mManager->lockShared();
+    if (beamIndex < BeamIndex{0} || beamIndex >= mBeamWidth)
+        throw std::out_of_range("Beam index is outside the request's beam width");
     std::vector<Priority> result;
     result.reserve(mBlocks.stdSize());
     bool const isSsm
@@ -2776,8 +2778,11 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
         TLLM_CHECK_WITH_INFO(snapshotPage, "Last matched block must have SSM snapshot after truncation");
         ssmLevel = snapshotPage->cacheLevel;
         mSsmBlocks[kDefaultBeamIndex][*ssmLcId] = snapshotPage->hold();
-        auto const retention = getRetention(snapshotBlock.ordinal());
-        snapshotPage->claimRetention(retention.retentionPriority, retention.durationMs);
+        if (claimRetention)
+        {
+            auto const retention = getRetention(snapshotBlock.ordinal());
+            snapshotPage->claimRetention(retention.retentionPriority, retention.durationMs);
+        }
     }
 
     _finalizeCachedTokensByLevel(numTokens, attentionLevels, ssmLevel);
