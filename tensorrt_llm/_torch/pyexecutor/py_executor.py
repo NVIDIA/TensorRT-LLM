@@ -1812,9 +1812,12 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
-    def shutdown(self):
-        """
-        Signals the server to shutdown.
+    def shutdown(self, *, release_nvmmh_policy: bool = True):
+        """Signal the server to shut down.
+
+        Args:
+            release_nvmmh_policy: Keep false when the model engine will be
+                reused by the final executor after KV-cache estimation.
         """
         self.executor_request_queue.enqueue_shutdown_request()
         self.shutdown_event.wait()
@@ -1882,9 +1885,11 @@ class PyExecutor:
         # to compute kv_cache_max_memory. cleanup() would set
         # model_engine.model = None, breaking that read with
         # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
+        if release_nvmmh_policy:
+            for engine in (self.model_engine, self.draft_model_engine):
+                if engine is not None and hasattr(
+                        engine, '_release_autotuner_nvmmh_policy'):
+                    engine._release_autotuner_nvmmh_policy()
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine

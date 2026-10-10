@@ -33,9 +33,10 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils import fp8_quantize
 
-from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
-                         DynamicTensorSpec, OptimizationProfile, TunableRunner,
-                         TuningConfig, autotune)
+from ..autotuner import (_TORCH_PROFILER_TIMER_KEY, AutoTuner, ConstraintSpec,
+                         DistributedTuningStrategy, DynamicTensorSpec,
+                         OptimizationProfile, TunableRunner, TuningConfig,
+                         autotune)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
@@ -57,8 +58,8 @@ from ..utils import (ActivationType, deep_gemm_jit_warmup_buckets,
                      next_positive_power_of_2)
 
 if IS_CUTLASS_DSL_AVAILABLE:
-    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
-        CuteDSLNVFP4BlackwellRunner
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4BlackwellRunner, _cutedsl_nvmmh_tactic_search_cache_key)
 
 # BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -1490,6 +1491,22 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                         tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
+
+    def use_torch_profiler(self, tactic) -> bool:
+        """Use CUPTI for a mixed-backend sweep only when explicitly requested."""
+        return ("cutedsl" in self.allowed_backends and os.getenv(
+            "TLLM_PROFILING_TIMER", "").lower() == _TORCH_PROFILER_TIMER_KEY)
+
+    def profiling_timer_cache_key(self) -> Optional[str]:
+        """Tag mixed-backend results ranked with the opt-in CUPTI timer."""
+        return _TORCH_PROFILER_TIMER_KEY if self.use_torch_profiler(
+            None) else None
+
+    def tactic_search_cache_key(self):
+        """Distinguish candidate sets affected by the active NVMMH policy."""
+        if "cutedsl" not in self.allowed_backends or not IS_CUTLASS_DSL_AVAILABLE:
+            return None
+        return _cutedsl_nvmmh_tactic_search_cache_key()
 
 
 @fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
