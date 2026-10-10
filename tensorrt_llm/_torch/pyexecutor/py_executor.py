@@ -33,6 +33,7 @@ from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
+from tensorrt_llm.bindings import executor as executor_bindings
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -6363,15 +6364,16 @@ class PyExecutor:
 
     def _validate_request(self, request: LlmRequest):
         self._configure_csa2_remote_tail(request)
-        if (isinstance(self.kv_cache_manager, KVCacheManagerV2)
-                and request.kv_cache_retention_config is not None):
-            logger.warning_once(
-                "KvCacheRetentionConfig has no effect with KV cache manager V2; "
-                "retention priorities and durations are ignored. Set "
-                "kv_cache_config.use_kv_cache_manager_v2=False to use retention "
-                "with KV cache manager V1.",
-                key=_V2_RETENTION_IGNORED_LOG_KEY)
-
+        retention = request.kv_cache_retention_config
+        if self._is_kv_manager_v2 and retention is not None:
+            if retention.transfer_mode != executor_bindings.KvCacheTransferMode.DRAM:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support per-request GDS/POSIX "
+                    "transfer_mode or directory; configure the manager's cache tiers instead."
+                )
+            if not 0 <= retention.decode_retention_priority <= 100:
+                raise ValueError(
+                    "Decode retention priority must be between 0 and 100")
         # Validate context-side pipelined-transfer constraints.
         disagg_params = request.py_disaggregated_params
         if (self.kv_cache_transceiver is not None
