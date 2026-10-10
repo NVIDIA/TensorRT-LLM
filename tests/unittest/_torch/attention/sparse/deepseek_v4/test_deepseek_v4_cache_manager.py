@@ -30,6 +30,7 @@ from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
     DeepseekV4AttentionType,
     compress_ratio_has_attention,
 )
+from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
@@ -1968,13 +1969,16 @@ class TestDeepseekV4CacheManager:
         try:
             ctx_rank_info = RankInfo.from_kv_cache_manager("ctx", ctx_cache_manager, 0)
             gen_rank_info = RankInfo.from_kv_cache_manager("gen", gen_cache_manager, 0)
-            registrar = PeerRegistrar(gen_rank_info, KVRegionExtractorV1(gen_cache_manager))
+            gen_ext = KVRegionExtractorV1(gen_cache_manager)
+            planner = DefaultTransferPlanner(gen_rank_info, gen_ext)
+            registrar = PeerRegistrar(gen_rank_info, gen_ext, planner)
+            ctx_rank_info.planner_id = planner.planner_id
             registrar.register("ctx", 0, ctx_rank_info)
 
-            pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
+            pool_mapping = planner.get_pool_mapping(ctx_rank_info)
             assert pool_mapping
             for self_pool_key, peer_pool_key in pool_mapping.items():
-                registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
+                planner.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
         finally:
             ctx_cache_manager.shutdown()
             gen_cache_manager.shutdown()

@@ -233,10 +233,10 @@ def test_fanin_bounce_safe_gate() -> None:
     some ranks don't send KV yet count in expected_transfers) must fall back to
     the per-fragment path.
     """
-    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
     from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 
-    safe = tfr.Receiver._fanin_bounce_safe
+    safe = DefaultTransferPlanner._fanin_bounce_safe
 
     def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
         return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))

@@ -67,7 +67,8 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
     mamba_receiver_payload_bytes,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.default_planner import PeerOverlap
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.base.planner import (  # noqa: F401  (re-exported)
     PeerIncompatibleError,
 )
