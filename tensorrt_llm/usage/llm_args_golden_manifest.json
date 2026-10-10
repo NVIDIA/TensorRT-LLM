@@ -566,11 +566,25 @@
     },
     {
       "allowed_values": [
+        0,
+        64
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.nvfp4_residual_dim"
+    },
+    {
+      "allowed_values": [
         "nvfp4"
       ],
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "kv_cache_compression_config.quant"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_compression_config.skip_rope_quantization"
     },
     {
       "capture_policy": "int",
