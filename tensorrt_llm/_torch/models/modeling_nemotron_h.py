@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
@@ -40,16 +38,12 @@ from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.linear import (Linear, NVFP4LinearMethod, TensorParallelMode,
-                              W4A16NVFP4LinearMethod)
+from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoEWeightLoadingMode, SimpleActivation, create_moe
-from ..moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
-from ..moe.fused_moe.quantization import (NVFP4CutlassFusedMoEMethod,
-                                          W4A16NVFP4CutlassFusedMoEMethod)
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
@@ -813,87 +807,6 @@ class NemotronHModel(DecoderModel):
         return hidden_states
 
 
-def _force_moe_backend_for_w4a16_on_hopper(
-        model_config: NemotronHModelConfig) -> None:
-    """SM<100 + NVFP4: force ``moe_backend=CUTLASS`` (only backend with the
-    W4A16 fallback) and disable attention FP4 output fusion.
-    """
-    if get_sm_version() >= 100:
-        return
-
-    # NVFP4 may live in global quant_config OR per-layer quant_config_dict
-    # (MIXED_PRECISION ckpts).
-    qcfg = model_config.quant_config
-    has_nvfp4 = qcfg is not None and qcfg.layer_quant_mode.has_nvfp4()
-    if not has_nvfp4 and model_config.quant_config_dict is not None:
-        has_nvfp4 = any(cfg.quant_mode.has_nvfp4()
-                        for cfg in model_config.quant_config_dict.values())
-    if not has_nvfp4:
-        return
-
-    # o_proj.has_nvfp4 stays True under W4A16 -- the property reads quant_config.
-    # Use the documented env override to keep attention output in bf16.
-    if os.environ.get("TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT") != "0":
-        logger.warning(
-            f"Nemotron-H SM{get_sm_version()}: TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT=0"
-        )
-        os.environ["TRTLLM_ENABLE_ATTENTION_NVFP4_OUTPUT"] = "0"
-
-    if model_config.moe_backend.upper() in ('CUTLASS', 'AUTO'):
-        return
-
-
-@contextmanager
-def _use_w4a16_for_nvfp4_on_hopper():
-    """SM<100 + NVFP4: swap NVFP4 quant methods -> W4A16 fallback,
-    loosen MoE SM constraint, and disable MLP's fused relu2+FP4 quant.
-    Class-level patches; model construction is single-threaded today.
-    """
-    if get_sm_version() >= 100:
-        yield
-        return
-
-    original_linear = Linear.get_quant_method
-    original_moe = CutlassFusedMoE._get_quant_method
-    original_mlp_create_weights = MLP.create_weights
-    nvfp4_entry = CutlassFusedMoE._QUANT_SUPPORT_TABLE[QuantAlgo.NVFP4]
-    original_sm_constraint = nvfp4_entry["sm_constraint"]
-
-    def _patched_linear(self, quant_config):
-        method = original_linear(self, quant_config)
-        if type(method) is NVFP4LinearMethod:
-            return W4A16NVFP4LinearMethod()
-        return method
-
-    def _patched_moe(self):
-        method = original_moe(self)
-        if type(method) is NVFP4CutlassFusedMoEMethod:
-            return W4A16NVFP4CutlassFusedMoEMethod()
-        return method
-
-    def _patched_mlp_create_weights(self):
-        # Original sets _use_fused_relu2_quant=True for NVFP4 ckpts; off here
-        # so MLP.forward emits bf16 (the SM100+ only fused kernel never runs).
-        original_mlp_create_weights(self)
-        self._use_fused_relu2_quant = False
-
-    # Allow SM 90 through can_implement(); existing entries preserved.
-    constraint_type, constraint_set = original_sm_constraint
-    nvfp4_entry["sm_constraint"] = (constraint_type,
-                                    frozenset(constraint_set) | {90})
-
-    Linear.get_quant_method = _patched_linear
-    CutlassFusedMoE._get_quant_method = _patched_moe
-    MLP.create_weights = _patched_mlp_create_weights
-    try:
-        yield
-    finally:
-        Linear.get_quant_method = original_linear
-        CutlassFusedMoE._get_quant_method = original_moe
-        MLP.create_weights = original_mlp_create_weights
-        nvfp4_entry["sm_constraint"] = original_sm_constraint
-
-
 @register_auto_model("NemotronHPuzzleForCausalLM")
 @register_auto_model("NemotronHForCausalLM")
 class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
@@ -945,12 +858,10 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             }
             model_config._frozen = True
 
-        _force_moe_backend_for_w4a16_on_hopper(model_config)
-        with _use_w4a16_for_nvfp4_on_hopper():
-            super().__init__(
-                model=NemotronHModel(model_config),
-                model_config=model_config,
-            )
+        super().__init__(
+            model=NemotronHModel(model_config),
+            model_config=model_config,
+        )
         self.model_nextn = 0
         if (model_config.spec_config is not None
                 and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
@@ -987,16 +898,6 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             self.model.layers.extend(self.draft_model.mtp_layers)
             self.epilogue.extend(self.draft_model.mtp_layers)
             self.epilogue.append(self.spec_worker)
-
-    def __post_init__(self):
-        # PostInitCaller metaclass invokes __post_init__ AFTER __init__ returns,
-        # so our W4A16 context manager from __init__ has already exited. For
-        # MIXED_PRECISION checkpoints, ``apply_layerwise_quant_config`` rebinds
-        # per-layer ``quant_config`` to NVFP4 and then re-runs ``create_weights``
-        # (see modeling_utils.py:543). Re-enter the context manager so the
-        # patched ``_get_quant_method`` catches that second pass.
-        with _use_w4a16_for_nvfp4_on_hopper():
-            super().__post_init__()
 
     @staticmethod
     def _normalize_puzzle_config(config):
