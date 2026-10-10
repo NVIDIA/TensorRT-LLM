@@ -848,7 +848,6 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -1087,6 +1086,67 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
+// Cap on GPUs used concurrently on gcp-iad across all Jenkins instances. Every
+// submission goes through GCP_IAD_GPU_BUDGET_SCRIPT on the frontend, which keeps a
+// ledger of {slurm job id, gpus} under GCP_IAD_GPU_BUDGET_DIR and serializes the
+// check-and-submit step with flock, so concurrent submitters cannot overbook. Usage is
+// the ledger entries whose job is still queued/running in Slurm (squeue is the source of
+// truth, so jobs that died without cleanup stop counting by themselves).
+GCP_IAD_GPU_LIMIT = 144
+GCP_IAD_GPU_BUDGET_DIR = "/home/svc_tensorrt/gpu_budget/gcp-iad"
+// Args: <gpus> <limit> <state dir> <base64 submit command>
+GCP_IAD_GPU_BUDGET_SCRIPT = '''
+gpus=$1
+limit=$2
+dir=$3
+cmd=$(printf %s "$4" | base64 -d)
+if [ "$gpus" -gt "$limit" ]; then
+    echo "[gpu-budget] request of $gpus GPUs exceeds the limit of $limit" >&2
+    exit 1
+fi
+mkdir -p "$dir"
+ledger="$dir/ledger"
+touch "$ledger"
+exec 9>>"$dir/lock"
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+while true; do
+    flock -x 9
+    # Drop ledger entries whose job left the queue. If squeue fails, keep every entry.
+    if active=$(squeue -h -u "$(id -un)" -t R,PD,CF,CG -o %i 2>/dev/null); then
+        printf '%s\n' "$active" | awk 'NR==FNR {a[$1]=1; next} ($1 in a)' - "$ledger" > "$ledger.tmp" && mv "$ledger.tmp" "$ledger"
+    fi
+    used=$(awk '{s+=$2} END {print s+0}' "$ledger")
+    if [ $((used + gpus)) -le "$limit" ]; then
+        echo "[gpu-budget] using $used/$limit GPUs, submitting $gpus more" >&2
+        rc=0
+        # Close the lock fd for the command so background children cannot hold the lock.
+        bash -c "$cmd" > "$out" 2>&1 9>&- || rc=$?
+        cat "$out"
+        if [ "$rc" -eq 0 ]; then
+            id=$(grep -oE '(Submitted batch job |srun: job |SLURM_JOB_ID=|SLURM_JOBID=)[0-9]+' "$out" | grep -oE '[0-9]+$' | tail -1)
+            if [ -n "$id" ]; then
+                echo "$id $gpus" >> "$ledger"
+            fi
+        fi
+        exit "$rc"
+    fi
+    flock -u 9
+    echo "[gpu-budget] $used/$limit GPUs in use, need $gpus; waiting" >&2
+    sleep $((45 + RANDOM % 30))
+done
+'''
+
+// Wrap a Slurm submission command in the gcp-iad GPU budget check (see above). Other
+// platforms get the command back unchanged.
+def withGpuBudget(platform, String command, gpuCount) {
+    if (!platform.toString().contains("gcp-iad")) {
+        return command
+    }
+    def b64 = { String text -> java.util.Base64.getEncoder().encodeToString(text.getBytes("UTF-8")) }
+    return "bash <(echo ${b64(GCP_IAD_GPU_BUDGET_SCRIPT)} | base64 -d) ${gpuCount as int} ${GCP_IAD_GPU_LIMIT} ${GCP_IAD_GPU_BUDGET_DIR} ${b64(command)}"
+}
+
 def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
@@ -1186,6 +1246,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = withGpuBudget(platform, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -1661,6 +1722,10 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // GB200 stages run on gcp-iad, which needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200")) {
+        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
+    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
@@ -2410,7 +2475,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_attempt=1
                     while true; do
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
+                        sbatch_output=\$(${withGpuBudget(platform, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
                         printf '%s\\n' "\${sbatch_output}"
                         printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
                         if [ "\${sbatch_rc}" -eq 0 ]; then
@@ -6591,12 +6656,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
         // .test_durations_<clusterName> baseline for load-balanced sharding.
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-2": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-3": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-4": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-5": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
@@ -6606,12 +6671,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // pre-merge gating is one stage on one node: the two DeepSeek-V4-Pro ctx_only cases.
         "GB300-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 1, 4, 1, true, false],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 6, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 6, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 6, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 6, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 6, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 1, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 2, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 3, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 4, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 5, 6, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 6, 6, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
@@ -6624,11 +6689,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     multiNodesSBSAConfigs = [
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 2, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 1, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 2, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 3, 3, 8, 2],
         // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
         // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
         // stage <-> test by list name with a line-based parser, so a shared list or a helper's
@@ -6640,7 +6705,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
         3,
         8,
@@ -6650,7 +6715,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
         1,
         8,
@@ -6658,7 +6723,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     )
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
         6,
         8,
@@ -6667,7 +6732,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
         2,
         12,
@@ -6675,7 +6740,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     )
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
         1,
         12,
@@ -6684,7 +6749,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 4 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
         1,
         16,
@@ -6693,7 +6758,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 5 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
         1,
         20,
@@ -6702,7 +6767,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
         3,
         8,
@@ -6711,7 +6776,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_gen1_node4_gpu16",
         1,
         16,
