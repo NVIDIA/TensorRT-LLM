@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper, BaseWorker
+from tensorrt_llm.executor.rpc_worker import RpcWorker
 from tensorrt_llm.executor.rpc_worker_mixin import RpcWorkerMixin
 from tensorrt_llm.executor.utils import ErrorResponse, RequestError
 from tensorrt_llm.executor.worker import GenerationExecutorWorker
@@ -102,8 +103,14 @@ def test_rejected_submission_reaches_response_stream(postproc, monkeypatch):
         assert worker.postproc_queues[0].empty()
 
 
-def test_mpi_worker_leaves_submission_errors_to_caller(monkeypatch):
-    worker = object.__new__(GenerationExecutorWorker)
+@pytest.mark.parametrize("use_rpc", [False, True], ids=["mpi_or_in_process", "rpc"])
+def test_submission_error_uses_owning_transport(use_rpc, monkeypatch):
+    def init_base(self, **kwargs):
+        self.postproc_queues = None
+        self.frontend_result_queues = None
+
+    monkeypatch.setattr(BaseWorker, "__init__", init_base)
+    worker = RpcWorker(engine=None) if use_rpc else object.__new__(GenerationExecutorWorker)
     worker.doing_shutdown = True
     worker._await_response_helper = SimpleNamespace(temp_error_responses=Queue())
 
@@ -114,6 +121,10 @@ def test_mpi_worker_leaves_submission_errors_to_caller(monkeypatch):
     with pytest.raises(RequestError, match="Cannot enqueue"):
         worker.submit(SimpleNamespace(id=42))
 
-    # The MPI caller queues its own error; in-process callers receive it
-    # synchronously. Neither uses the mixin's generation response stream.
+    if use_rpc:
+        assert worker._await_response_helper.temp_error_responses.get_nowait() == ErrorResponse(
+            42, "Cannot enqueue requests while executor admission is parked", 42
+        )
+    # MPI and in-process callers own the exception; RPC queues exactly one
+    # error because its one-way submission cannot deliver the exception.
     assert worker._await_response_helper.temp_error_responses.empty()

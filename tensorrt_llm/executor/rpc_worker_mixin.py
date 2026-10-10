@@ -44,6 +44,11 @@ class RpcWorkerMixin:
     NUM_WORKERS = 6
     _rpc_response_stream_enabled = False
 
+    def _init_rpc_response_stream(self):
+        self._response_queue = Queue()
+        self.set_result_queue(self._response_queue)
+        self._rpc_response_stream_enabled = True
+
     def init_rpc_worker(self, rank: int, rpc_addr: Optional[str], hmac_key: bytes):
         if rpc_addr is None:
             raise RuntimeError("RPC mode enabled but no rpc_addr provided to worker")
@@ -51,9 +56,7 @@ class RpcWorkerMixin:
         self.hmac_key = hmac_key
         self.rank = rank
         self.shutdown_event = Event()
-        self._response_queue = Queue()
-        self.set_result_queue(self._response_queue)
-        self._rpc_response_stream_enabled = True
+        self._init_rpc_response_stream()
 
         self.rpc_server = None
         self.rpc_addr = rpc_addr
