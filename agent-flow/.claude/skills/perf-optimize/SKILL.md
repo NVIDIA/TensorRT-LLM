@@ -89,12 +89,37 @@ Run these checks; fix or ask only where noted.
    the user doesn't want the degraded stage, write
    `sol: {enabled: false}` to skip its wall-clock outright. Never work
    around a missing skill by having an agent recall hardware peaks.
-7. **Disaggregated deployment?** A `disagg:` block in `task.yaml` makes the
-   workflow drive the checkout's own harness
-   (`examples/disaggregated/slurm/benchmark/submit.py`) instead of launching
-   `trtllm-serve`, so this host must be able to `sbatch` **and** see the
-   cluster paths the harness config names. Everything else about the mode
-   is documented on the `disagg` block in `task.example.yaml`.
+7. **Disaggregated deployment?** There are three shapes, and the user's goal
+   picks one — ask if it is not clear which:
+
+   | Goal | Block in `task.yaml` | What one campaign measures |
+   |---|---|---|
+   | Optimize the whole disagg cluster end to end | `disagg:` | ctx + gen together, through the checkout's own harness |
+   | Optimize ONE half at a fixed operating point | `sol_track:` | ctx (prefill-only aggregate) **or** gen (1-ctx-1-gen, decode only) |
+   | Pick the operating point first, then optimize both halves | `disagg_sol:` | a supervisor starts one `sol_track` campaign per half, in parallel |
+
+   - **`disagg:`** drives `examples/disaggregated/slurm/benchmark/submit.py`
+     instead of launching `trtllm-serve`, so this host must be able to
+     `sbatch` **and** see the cluster paths the harness config names.
+   - **`sol_track:`** drives the `ibc-bench` harness against a sweep the user
+     names. A gen campaign without `sol_track.ctx_json` is scored anchor-free
+     (`throughput_per_user` from decode iterations alone) — valid, but the
+     end-to-end view (`output_tput_per_gpu`, the ctx:gen ratio) is ABSENT,
+     not zero.
+   - **`disagg_sol:`** reads an established operating-point *design* (the
+     `create-sweep` skill's measured sweep) and freezes each half on the point
+     it selects. If the design is not established and `config_repo` is set, a
+     real run starts a design agent first — the most expensive step this flow
+     has, paid once per (model, cluster, workload). Run
+     `perf-optimize --task <spec> --workspace <ws> --dry-run` first: it shows
+     the selected points and writes each half's `task.yaml` without starting
+     anything, and it refuses (rather than designs) when the design is missing.
+
+   Whichever shape: the two halves are separate measurements on different
+   metrics. **Never add or combine their gains into one "disagg improvement"**
+   — no ctx measurement is rate-matched against the gen points, so that
+   number does not exist. Each block is documented on its key in
+   `task.example.yaml`.
 
 ## 2. Write task.yaml (if the user didn't provide one)
 
