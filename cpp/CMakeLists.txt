@@ -721,10 +721,27 @@ if(ENABLE_UCX)
     # error, thus using their installation script to isolate the installation
     # process until the issue is understood. And always trigger the build so
     # that change in USE_CXX11_ABI will not be ignored.
+    #
+    # TEST ONLY, DO NOT MERGE: route everything except the internal mirror to a
+    # dead proxy, so the UCXX build can only pass if none of its downloads go to
+    # github.com. The probe shows that github.com is unreachable under this env.
+    set(ucxx_block_github_env
+        https_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9
+        http_proxy=http://127.0.0.1:9 HTTP_PROXY=http://127.0.0.1:9
+        no_proxy=urm.nvidia.com NO_PROXY=urm.nvidia.com)
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env ${ucxx_block_github_env} curl -sS -o
+              /dev/null https://github.com
+      RESULT_VARIABLE github_probe_result
+      ERROR_VARIABLE github_probe_error)
+    message(
+      WARNING
+        "TEST ONLY: github.com probe under the UCXX build env: exit=${github_probe_result} ${github_probe_error}"
+    )
     execute_process(
       COMMAND
         ${CMAKE_COMMAND} -E env LIB_BUILD_DIR=${ucxx_build_dir}
-        ${ucxx_source_dir}/build.sh libucxx -n
+        ${ucxx_block_github_env} ${ucxx_source_dir}/build.sh libucxx -n
         --cmake-args=\"-DBUILD_SHARED_LIBS=OFF
         -DCMAKE_CXX_FLAGS=-D_GLIBCXX_USE_CXX11_ABI=${USE_CXX11_ABI}\"
       OUTPUT_VARIABLE UCXX_BUILD_OUTPUT
