@@ -6,8 +6,7 @@ Both optimized KDA kernels are source-integrated into TensorRT-LLM: the
 chunked prefill (CuTe DSL ``trtllm::kda_prefill``, see
 ``tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_custom_ops.py``) and the
 fused CUDA C++ single-token decode (``trtllm::kda_decode`` thop op wrapped
-by ``_kda_decode``). Neither requires the external
-``exisiting_optimization_work`` collection at runtime.
+by ``_kda_decode``).
 
 On Blackwell (sm_100/sm_103) with the CuTe DSL toolchain available the
 dispatch runs the optimized kernels. On any other arch (or when the in-tree

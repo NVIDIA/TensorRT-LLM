@@ -5,8 +5,7 @@
 # Kimi K3 ACCURACY sweep (GSM8K) for the serving recipes measured by
 # perf_sweep.sbatch: same per-mode yaml, same env, same tp/batch/token CLI
 # flags (keep the mode blocks below in sync with perf_sweep.sbatch by hand).
-# One in-process trtllm-eval run per job; expect ~96.5 +/- 0.5 on the full
-# 1319-question set.
+# One in-process trtllm-eval run per job on the full 1319-question set.
 #
 # Usage:
 #   sbatch [--nodes=N ...] acc_sweep.sbatch \
@@ -41,8 +40,7 @@ done
     echo "error: --mode, --model and --image are required" >&2; exit 2; }
 [[ -e "$MODEL" && -e "$CONTAINER_IMAGE" ]] || { echo "error: bad model/image path" >&2; exit 2; }
 
-# Same batch shape and tuned env as perf_sweep.sbatch (see that script
-# for the per-knob rationale).
+# Same batch shape and tuned env as perf_sweep.sbatch.
 case "$MODE" in
     dep16)
         TP_SIZE=16; MAX_BATCH_SIZE=64
@@ -52,7 +50,7 @@ case "$MODE" in
         TP_SIZE=16; MAX_BATCH_SIZE=16
         MODE_ENV=""
         # Attention formats follow the checkpoint. Shared gate_up stays
-        # BF16 under TP; historical timings with forced FP8 need remeasurement.
+        # BF16 under TP.
         ;;
     tep8)
         TP_SIZE=8; MAX_BATCH_SIZE=16
