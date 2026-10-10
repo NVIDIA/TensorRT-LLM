@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -76,7 +78,7 @@ def _reference(q, k, v, is_causal):
         seq_q, seq_kv = q.shape[2], k.shape[2]
         causal_mask = torch.ones(seq_q, seq_kv, device=q.device, dtype=torch.bool)
         logits = logits.masked_fill(causal_mask.triu(seq_kv - seq_q + 1), float("-inf"))
-    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1).transpose(1, 2)
+    return out.transpose(1, 2), torch.logsumexp(logits, dim=-1)
 
 
 @pytest.mark.parametrize("quant_dtype", list(QUANT_CONFIGS), ids=["unquantized", "fp8", "mxfp8"])
@@ -105,7 +107,7 @@ def test_cudnn_attention(quant_dtype, shape, is_causal):
     ref_out, ref_lse = _reference(q, k, v, is_causal)
     assert output.shape == (batch, seq_q, num_heads, head_dim)
     assert output.dtype == torch.bfloat16
-    assert lse.shape == (batch, seq_q, num_heads)
+    assert lse.shape == (batch, num_heads, seq_q)
 
     cosine = F.cosine_similarity(output.float().flatten(), ref_out.flatten(), dim=0).item()
     assert cosine > MIN_COSINE[quant_dtype], (
@@ -163,6 +165,35 @@ def test_mxfp8_scale_factor_layout_roundtrip(seq_len, head_dim):
     dequantized_v = v_q.float() * v_scale.permute(0, 1, 3, 2)
     rel_err_v = ((dequantized_v - x_v.float()).norm() / x_v.float().norm()).item()
     assert rel_err_v < 0.05, f"V MXFP8 round-trip error {rel_err_v} exceeds e4m3 block noise"
+
+
+_SM_VERSION = "tensorrt_llm._torch.visual_gen.attention_backend.cudnn._device_sm_version"
+
+
+@pytest.mark.parametrize("sm_version", [100, 103, 107])
+@pytest.mark.parametrize("quant_dtype", ["fp8", "mxfp8"])
+def test_cudnn_quantized_attention_allowed_on_supported_sm(sm_version, quant_dtype):
+    """Quantized attention passes the hardware gate on Blackwell and Rubin (SM107)."""
+    with patch(_SM_VERSION, return_value=sm_version):
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), quant_dtype)
+
+
+@pytest.mark.parametrize("sm_version", [90, 120])
+def test_cudnn_quantized_attention_rejected_on_unsupported_sm(sm_version):
+    """Quantized attention fails fast on other SMs; unquantized attention is not gated."""
+    with patch(_SM_VERSION, return_value=sm_version):
+        with pytest.raises(RuntimeError, match="SM 100, 103 or 107"):
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), "fp8")
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), None)
+
+
+def test_cudnn_hardware_gate_checks_target_device():
+    """On a mixed-GPU host the gate follows the tensors' device, not CUDA device 0."""
+    sm_by_index = {0: 90, 1: 107}
+    with patch(_SM_VERSION, side_effect=lambda device: sm_by_index[device.index]):
+        CuDNNAttention.check_hardware_compatibility(torch.device("cuda:1"), "fp8")
+        with pytest.raises(RuntimeError, match="SM 100, 103 or 107"):
+            CuDNNAttention.check_hardware_compatibility(torch.device("cuda:0"), "fp8")
 
 
 def test_cudnn_graph_cache_reuses_plans():
