@@ -264,6 +264,228 @@ def copy_kda_replay_conv_window(
         )
 
 
+@triton.jit
+def _store_kda_replay_conv_window_kernel(
+    conv_ptr,
+    q_cache_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    state_indices_ptr,
+    num_accepted_ptr,
+    conv_stride_slot,
+    conv_stride_dim,
+    conv_stride_window,
+    cache_stride_slot,
+    cache_stride_dim,
+    cache_stride_window,
+    PROJECTION_SIZE: tl.constexpr,
+    COMMITTED: tl.constexpr,
+    NUM_SPEC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < PROJECTION_SIZE * COMMITTED
+    dim = offsets // COMMITTED
+    window = offsets % COMMITTED
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    # The window after the accepted drafts starts at their count, clamped
+    # like the verify kernels clamp it.
+    shift = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
+
+    conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
+    cache_offset = (
+        slot * cache_stride_slot + dim * cache_stride_dim + (window + shift) * cache_stride_window
+    )
+    section_offset = PROJECTION_SIZE * conv_stride_dim
+    tl.store(conv_ptr + conv_offset, tl.load(q_cache_ptr + cache_offset, mask=mask), mask=mask)
+    tl.store(
+        conv_ptr + conv_offset + section_offset,
+        tl.load(k_cache_ptr + cache_offset, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        conv_ptr + conv_offset + 2 * section_offset,
+        tl.load(v_cache_ptr + cache_offset, mask=mask),
+        mask=mask,
+    )
+
+
+def store_kda_replay_conv_window(
+    conv_pool: torch.Tensor,
+    q_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """Store each selected slot's conv window after its accepted drafts in
+    the live convolution pool.
+
+    The replay caches hold the window before the golden token in columns
+    ``[0, W - 1)`` and the raw inputs of the round's drafts after it, so the
+    ``W - 1`` columns starting at the request's ``num_accepted_tokens`` entry
+    are the window the next verify would start from. They are raw
+    convolution inputs, so storing them in a bf16 pool is exact.
+    """
+    projection_size = conv_pool.shape[1] // 3
+    committed = conv_pool.shape[2]
+    caches = (q_cache, k_cache, v_cache)
+    if any(cache.shape[1] != projection_size or cache.shape[2] < committed for cache in caches):
+        raise ValueError("KDA replay convolution caches do not match the live pool geometry")
+    if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
+        raise ValueError("KDA replay convolution caches must share one layout")
+    if num_accepted_tokens.shape != state_indices.shape:
+        raise ValueError("Expected one accepted-draft count per state index")
+    if state_indices.numel() == 0:
+        return
+
+    block_size = 256
+    grid = (
+        state_indices.numel(),
+        triton.cdiv(projection_size * committed, block_size),
+    )
+    with torch.cuda.device(conv_pool.device.index):
+        _store_kda_replay_conv_window_kernel[grid](
+            conv_pool,
+            q_cache,
+            k_cache,
+            v_cache,
+            state_indices,
+            num_accepted_tokens,
+            conv_pool.stride(0),
+            conv_pool.stride(1),
+            conv_pool.stride(2),
+            q_cache.stride(0),
+            q_cache.stride(1),
+            q_cache.stride(2),
+            PROJECTION_SIZE=projection_size,
+            COMMITTED=committed,
+            NUM_SPEC=q_cache.shape[2] - committed,
+            BLOCK_SIZE=block_size,
+        )
+
+
+@triton.jit
+def _replay_kda_token_records_kernel(
+    state_ptr,
+    records_ptr,
+    state_indices_ptr,
+    num_accepted_ptr,
+    state_stride_slot,
+    records_stride_slot,
+    NUM_SPEC: tl.constexpr,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    request = tl.program_id(0)
+    head = tl.program_id(1)
+    rows = tl.program_id(2) * BLOCK_V + tl.arange(0, BLOCK_V)
+    keys = tl.arange(0, K)
+    slot = tl.load(state_indices_ptr + request).to(tl.int64)
+    accepted = tl.minimum(tl.maximum(tl.load(num_accepted_ptr + request), 0), NUM_SPEC)
+    state_ptrs = (
+        state_ptr + slot * state_stride_slot + (head * V + rows[:, None]) * K + keys[None, :]
+    )
+    state = tl.load(state_ptrs)
+    records = records_ptr + slot * records_stride_slot
+    for t in range(0, accepted):
+        vn = tl.load(records + (t * H + head) * V + rows)
+        beta_k = tl.load(records + NUM_SPEC * H * V + (t * H + head) * K + keys)
+        decay = tl.load(records + NUM_SPEC * H * (V + K) + (t * H + head) * K + keys)
+        state = tl.fma(decay[None, :], state, vn[:, None] * beta_k[None, :])
+    tl.store(state_ptrs, state)
+
+
+def replay_kda_token_records(
+    recurrent_state: torch.Tensor,
+    state_tok: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+) -> None:
+    """Replay each selected slot's accepted drafts onto its pool state from
+    the per-draft records the Kimi K3 verify kernels keep in the slot's
+    per-token state region.
+
+    A slot's region of ``state_tok`` (``[slots, num_spec, H, V, K]`` fp32)
+    starts with the records of the last round's drafts: the row innovations
+    ``vn`` ``[num_spec][H][V]``, then ``beta * k`` and the decay
+    ``[num_spec][H][K]``. Draft ``t`` updates the state as the kernels do,
+    ``S = fma(decay, S, vn (beta * k))``, so the result is bit-identical to the
+    state their next verify starts from.
+    """
+    num_spec, num_heads, v_dim, k_dim = state_tok.shape[1:]
+    if state_indices.numel() == 0:
+        return
+    block_v = 32
+    grid = (state_indices.numel(), num_heads, v_dim // block_v)
+    with torch.cuda.device(recurrent_state.device.index):
+        _replay_kda_token_records_kernel[grid](
+            recurrent_state,
+            state_tok,
+            state_indices,
+            num_accepted_tokens,
+            recurrent_state.stride(0),
+            state_tok.stride(0),
+            NUM_SPEC=num_spec,
+            H=num_heads,
+            V=v_dim,
+            K=k_dim,
+            BLOCK_V=block_v,
+        )
+
+
+def commit_kda_pending_drafts(
+    recurrent_state: torch.Tensor,
+    conv_pool: torch.Tensor,
+    conv_q: torch.Tensor,
+    conv_k: torch.Tensor,
+    conv_v: torch.Tensor,
+    qkg_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    state_tok: Optional[torch.Tensor] = None,
+) -> None:
+    """Commit one layer's pending accepted drafts into its live pools.
+
+    ``num_accepted_tokens[n]`` is the number of drafts of slot
+    ``state_indices[n]`` the last verify accepted, which the next verify
+    would take up first. Afterwards ``recurrent_state`` and ``conv_pool``
+    hold the state and the conv window that verify would start from, bit for
+    bit, and the caller clears the slot's count:
+
+    * with per-token states (``state_tok``), the drafts are replayed from the
+      per-draft records the Kimi K3 verify kernels keep there
+      (``replay_kda_token_records``);
+    * otherwise they are replayed from the replay caches by the fused verify
+      kernel's own replay steps (``kda_mtp_commit_pending_drafts``).
+    """
+    num_spec = conv_q.shape[2] - conv_pool.shape[2]
+    if state_tok is not None:
+        replay_kda_token_records(recurrent_state, state_tok, state_indices, num_accepted_tokens)
+    else:
+        _load_mtp_module().kda_mtp_commit_pending_drafts(
+            recurrent_state,
+            conv_q,
+            conv_k,
+            conv_v,
+            qkg_cache,
+            v_cache,
+            beta_cache,
+            state_indices,
+            num_accepted_tokens,
+            num_spec,
+            conv_width=conv_pool.shape[2] + 1,
+        )
+    store_kda_replay_conv_window(
+        conv_pool, conv_q, conv_k, conv_v, state_indices, num_accepted_tokens
+    )
+
+
 # ---------------------------------------------------------------------------
 # In-tree KDA prefill op (CuTe DSL, trtllm::kda_prefill).
 # ---------------------------------------------------------------------------

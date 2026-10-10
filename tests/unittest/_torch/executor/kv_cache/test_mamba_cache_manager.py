@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests for Python, Cpp, and V2 Mamba cache managers."""
 
+import contextlib
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2354,6 +2355,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_n_groups=1,
     mamba_ssm_cache_dtype=torch.float16,
     kda_replay_num_spec=None,
+    enable_kv_pool_rebalance=False,
 ):
     """Construct a real MambaHybridCacheManagerV2."""
     mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
@@ -2381,6 +2383,7 @@ def _build_v2_hybrid_with_mamba_layer(
             enable_branch_snapshot=enable_branch_snapshot,
         ),
         dtype=kv_cache_dtype,
+        enable_kv_pool_rebalance=enable_kv_pool_rebalance,
     )
     return MambaHybridCacheManagerV2(
         mamba_d_state=8,
@@ -3677,6 +3680,25 @@ def test_v2_kda_replay_validates_configuration(
         )
 
 
+@pytest.mark.parametrize("kda_replay", [True, False], ids=["kda_replay", "no_replay"])
+def test_v2_kda_replay_refuses_kv_pool_rebalance(kda_replay):
+    """The KDA replay caches and prev_num_accepted_tokens hold one entry per SSM slot the pool keeps at construction,
+    and a KV pool rebalance can grow that pool past them, so the manager refuses enable_kv_pool_rebalance with them;
+    without them the rebalance stays allowed."""
+    if not kda_replay:
+        _build_v2_hybrid_with_mamba_layer(enable_kv_pool_rebalance=True).shutdown()
+        return
+    with pytest.raises(ValueError, match="enable_kv_pool_rebalance=False"):
+        _build_v2_hybrid_with_mamba_layer(
+            spec_config=MTPDecodingConfig(max_draft_len=2),
+            conv_state_layout="q_k_v",
+            mamba_n_groups=4,
+            mamba_ssm_cache_dtype=torch.float32,
+            kda_replay_num_spec=2,
+            enable_kv_pool_rebalance=True,
+        )
+
+
 def test_mamba_cache_manager_delegates_kda_replay_capability() -> None:
     mgr = object.__new__(MambaCacheManager)
     mgr._impl = SimpleNamespace(use_kda_replay_update=True)
@@ -3720,6 +3742,7 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
     mgr._record_kda_replay_in_update_resources = True
     mgr._request_id_to_state_index = {101: 1, 303: 2}
     mgr._request_id_to_is_dummy = {101: False, 303: True}
+    mgr._kda_replay_acceptance_pending = {101, 202, 404}
     mgr.prev_num_accepted_tokens = torch.tensor([7, 8, 9], dtype=torch.int32)
     base_update = MagicMock()
     monkeypatch.setattr(KVCacheManagerV2, "update_resources", base_update)
@@ -3744,6 +3767,359 @@ def test_v2_kda_replay_host_drafter_records_active_requests(monkeypatch):
 
     base_update.assert_called_once_with(scheduled_batch, None, None)
     assert mgr.prev_num_accepted_tokens.tolist() == [7, 2, 9]
+    # The batch's acceptances are recorded; another batch's are still pending.
+    assert mgr._kda_replay_acceptance_pending == {404}
+
+
+_KDA_REPLAY_BUFFERS = (
+    "kda_conv_q",
+    "kda_conv_k",
+    "kda_conv_v",
+    "kda_qkg_cache",
+    "kda_v_cache",
+    "kda_beta_cache",
+)
+
+
+class _SlotCache:
+    """A V2 KV cache stand-in that reports one SSM slot and can be suspended."""
+
+    def __init__(self, slot: int) -> None:
+        self.slot = slot
+        self.is_active = True
+
+    def get_ssm_block_base_index(self, _layer_group_id) -> int:
+        return self.slot
+
+    def suspend(self) -> None:
+        self.is_active = False
+
+
+def _v2_kda_replay_stub(num_slots=4):
+    """A V2 hybrid manager stub with CPU KDA replay buffers and one layer's V2 conv states ([Q | K | V] sections of 2
+    channels, a committed window of 3), for the state-index setup that prepare_resources runs. Committing pending drafts
+    is recorded instead of run (it needs the GPU kernels)."""
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.local_num_mamba_layers = 1
+    mgr._use_kda_replay_update = True
+    mgr._use_replay_state_update = False
+    mgr._record_kda_replay_in_update_resources = False
+    mgr._request_id_to_state_index = {}
+    mgr._request_id_to_is_dummy = {}
+    mgr._kda_replay_suspended = set()
+    mgr._kda_replay_acceptance_pending = set()
+    mgr._host_state_indices = torch.zeros(num_slots, dtype=torch.int32)
+    mgr.cuda_state_indices = torch.zeros(num_slots, dtype=torch.int32)
+    mgr._dummy_request_mask = None
+    mgr.mamba_ssm_rand_seed = None
+    mgr.kv_cache_map = {}
+    mgr.ssm_layer_group_id = 0
+    mgr.prev_num_accepted_tokens = torch.zeros(num_slots, dtype=torch.int32)
+    for name in _KDA_REPLAY_BUFFERS:
+        setattr(mgr, name, torch.zeros(1, num_slots, 2, 4))
+    mgr.conv_state_shape = [6, 3]
+    mgr.conv_section_dims = [2, 2, 2]
+    mgr.all_conv_states = [torch.zeros(num_slots, 6, 3)]
+    mgr.committed_slots = []
+    mgr._commit_kda_pending_drafts = mgr.committed_slots.append
+    mgr._on_kv_cache_stream = contextlib.nullcontext
+    return mgr
+
+
+def _write_kda_replay_slot(mgr, slot, accepted, value):
+    """What a verify step leaves in its request's slot for the next one."""
+    mgr.prev_num_accepted_tokens[slot] = accepted
+    for name in _KDA_REPLAY_BUFFERS:
+        getattr(mgr, name)[:, slot] = value
+
+
+def _kda_replay_slot(mgr, slot):
+    return int(mgr.prev_num_accepted_tokens[slot]), [
+        float(getattr(mgr, name)[0, slot].flatten()[0]) for name in _KDA_REPLAY_BUFFERS
+    ]
+
+
+@pytest.mark.parametrize("resume_slot", [1, 0], ids=["new_slot", "old_slot"])
+def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(resume_slot):
+    """A suspend commits the request's pending drafts and conv window into its slot's V2 states and forgets the slot,
+    which can then go to another request. The request resumes in a new slot, or in its old one after that request has
+    finished. Either way its replay caches are seeded from the V2 conv state it resumes with, nothing is pending, and
+    the other request's replay state is left alone."""
+    mgr = _v2_kda_replay_stub()
+    first = SimpleNamespace(py_request_id=1, is_dummy=False)
+    second = SimpleNamespace(py_request_id=2, is_dummy=False)
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    mgr._setup_state_indices([first], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=2, value=1.0)
+    mgr.suspend_request(first)
+    assert mgr.committed_slots == [0]
+    assert 1 not in mgr._request_id_to_state_index
+    assert not mgr.kv_cache_map[1].is_active
+
+    mgr.kv_cache_map[2] = _SlotCache(0)
+    mgr._setup_state_indices([second], num_contexts=1)
+    mgr._reset_context_mamba_slots(1)
+    mgr._setup_state_indices([second], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=3, value=7.0)
+    resumed = [first]
+    if resume_slot == 0:
+        del mgr.kv_cache_map[2]
+        del mgr._request_id_to_state_index[2]
+    else:
+        resumed.append(second)
+    # The V2 conv state the runtime brings back with the request's page.
+    window = torch.arange(18.0).view(6, 3)
+    mgr.all_conv_states[0][resume_slot] = window
+    mgr.kv_cache_map[1].slot = resume_slot
+    mgr.kv_cache_map[1].is_active = True
+    mgr._setup_state_indices(resumed, num_contexts=0)
+
+    assert int(mgr.prev_num_accepted_tokens[resume_slot]) == 0
+    for section, name in enumerate(("kda_conv_q", "kda_conv_k", "kda_conv_v")):
+        cache = getattr(mgr, name)[0, resume_slot]
+        assert torch.equal(cache[:, :3], window[2 * section : 2 * section + 2])
+        assert not cache[:, 3:].any()
+    for name in ("kda_qkg_cache", "kda_v_cache", "kda_beta_cache"):
+        assert not getattr(mgr, name)[0, resume_slot].any()
+    if resume_slot != 0:
+        assert _kda_replay_slot(mgr, 0) == (3, [7.0] * len(_KDA_REPLAY_BUFFERS))
+    assert not mgr._kda_replay_suspended
+
+
+@pytest.mark.parametrize("recorded_by", ["update_resources", "revert_allocate_generation"])
+def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
+    monkeypatch, recorded_by
+):
+    """With a host drafter, update_resources records the acceptance of a batch's verify, and a suspend needs it to
+    commit the request's pending drafts. A suspend between the batch's prepare_resources and its update_resources
+    raises instead of committing a stale count. Once update_resources has recorded it, or the batch is reverted without
+    running, the suspend commits."""
+    mgr = _v2_kda_replay_stub()
+    mgr._record_kda_replay_in_update_resources = True
+    for method in ("prepare_resources", "update_resources", "revert_allocate_generation"):
+        monkeypatch.setattr(KVCacheManagerV2, method, MagicMock())
+    request = SimpleNamespace(
+        py_request_id=1, is_dummy=False, py_draft_tokens=[11, 12], py_num_accepted_draft_tokens=2
+    )
+    mgr.kv_cache_map[1] = _SlotCache(0)
+    batch = SimpleNamespace(context_requests=[], generation_requests=[request])
+    mgr.prepare_resources(batch)
+
+    with pytest.raises(RuntimeError, match="acceptance"):
+        mgr.suspend_request(request)
+    assert not mgr.committed_slots
+    assert mgr.kv_cache_map[1].is_active
+
+    if recorded_by == "update_resources":
+        mgr.update_resources(batch)
+        assert int(mgr.prev_num_accepted_tokens[0]) == 2
+    else:
+        mgr.revert_allocate_generation(request)
+    mgr.suspend_request(request)
+    assert mgr.committed_slots == [0]
+    assert not mgr.kv_cache_map[1].is_active
+
+
+def _v2_kda_replay_manager_with_large_slots():
+    """A real V2 hybrid manager at Kimi K3's per-rank KDA shapes (6 heads, K = V = 128, conv width 4) on 6 layers. An
+    SSM slot (~2.25 MiB) is larger than the 2 MiB allocation grain, so the SSM pool holds a handful of slots and runs
+    out before the attention pages do. max_util_for_resume 1.0 lets resume admit caches until the pool is full."""
+    num_mamba_layers = 6
+    return MambaHybridCacheManagerV2(
+        mamba_d_state=128,
+        mamba_d_conv=4,
+        mamba_num_heads=6,
+        mamba_n_groups=6,
+        mamba_head_dim=128,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=[True] * num_mamba_layers + [False],
+        mamba_cache_dtype=torch.bfloat16,
+        mamba_ssm_cache_dtype=torch.float32,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=4096, enable_block_reuse=False, max_util_for_resume=1.0
+        ),
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=1,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        spec_config=MTPDecodingConfig(max_draft_len=2),
+        layer_mask=[False] * num_mamba_layers + [True],
+        vocab_size=1024,
+        conv_state_layout="q_k_v",
+        kda_replay_num_spec=2,
+    )
+
+
+def _take_ssm_slot(mgr, slot, others):
+    """Create caches until the V2 runtime gives one of them ``slot``, moving the suspended owner's SSM page to the host
+    tier; keep that one and close the rest."""
+    holder = None
+    for _ in range(mgr.prev_num_accepted_tokens.shape[0] + 1):
+        cache = mgr.impl.create_kv_cache()
+        assert cache.resume(mgr._stream.cuda_stream)
+        others.append(cache)
+        assert cache.resize(1)
+        if cache.get_ssm_block_base_index(mgr.ssm_layer_group_id) == slot:
+            holder = cache
+            break
+    assert holder is not None, "no cache took the suspended request's SSM slot"
+    for cache in others:
+        if cache is not holder:
+            cache.close()
+    others[:] = [holder]
+
+
+def _fill_kda_slot(mgr, slot, generator):
+    """Random V2 states and replay state at ``slot``: a new owner's prefill and verify rounds."""
+    for layer_offset, (ssm_states, conv_states) in enumerate(
+        zip(mgr.all_ssm_states, mgr.all_conv_states)
+    ):
+        ssm_states[slot] = torch.randn(ssm_states.shape[1:], generator=generator, device="cuda")
+        conv_states[slot] = torch.randn(conv_states.shape[1:], generator=generator, device="cuda")
+        for name in _KDA_REPLAY_BUFFERS:
+            buffer = getattr(mgr, name)[layer_offset]
+            buffer[slot] = torch.randn(buffer.shape[1:], generator=generator, device="cuda")
+    mgr.prev_num_accepted_tokens[slot] = 1
+
+
+def _kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec):
+    """One verify of 1 + num_spec tokens on every KDA layer for the request in ``slot``, as the KDA mixer runs it; the
+    inputs depend only on the round. Returns the outputs."""
+    tokens = 1 + num_spec
+    pending = mgr.prev_num_accepted_tokens[slot : slot + 1].clone()
+    slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    cu_seqlens[:1].sub_(pending)
+    outputs = []
+    for layer_offset, weights in enumerate(layer_weights):
+        generator = torch.Generator(device="cuda").manual_seed(1000 * round_idx + layer_offset)
+        num_heads, head_dim = weights["A_log"].shape[0], 128
+
+        def inputs(*shape):
+            return torch.randn(shape, generator=generator, device="cuda").bfloat16()
+
+        outputs.append(
+            torch.ops.trtllm.kda_mtp_decode(
+                x_q=inputs(1, tokens, num_heads, head_dim),
+                x_k=inputs(1, tokens, num_heads, head_dim),
+                x_v=inputs(1, tokens, num_heads, head_dim),
+                w_q=weights["w_q"],
+                w_k=weights["w_k"],
+                w_v=weights["w_v"],
+                cs_q=mgr.kda_conv_q[layer_offset],
+                cs_k=mgr.kda_conv_k[layer_offset],
+                cs_v=mgr.kda_conv_v[layer_offset],
+                g=inputs(1, tokens, num_heads, head_dim),
+                beta=inputs(1, tokens, num_heads),
+                A_log=weights["A_log"],
+                dt_bias=weights["dt_bias"],
+                recurrent_state=mgr.all_ssm_states[layer_offset],
+                qkg_cache=mgr.kda_qkg_cache[layer_offset],
+                v_cache=mgr.kda_v_cache[layer_offset],
+                beta_cache=mgr.kda_beta_cache[layer_offset],
+                ssm_state_indices=slots,
+                cu_seqlens=cu_seqlens,
+                num_spec=num_spec,
+                num_accepted_tokens=pending,
+                lower_bound=-5.0,
+                scale=head_dim**-0.5,
+            )
+        )
+    return torch.stack(outputs)
+
+
+def _run_kda_verify_rounds(accepted_per_round, suspend_after=None, slot_taken=False):
+    """Verify rounds of one request on a V2 manager at Kimi K3's per-rank KDA shapes, each accepting the given number
+    of drafts. With ``suspend_after``, the request is suspended after that round's acceptance and resumed, its slot
+    taken and overwritten by another cache meanwhile when ``slot_taken``. Returns every round's outputs and the
+    request's final SSM states."""
+    num_spec = 2
+    mgr = _v2_kda_replay_manager_with_large_slots()
+    others = []
+    request = None
+    try:
+        (request,) = mgr.add_dummy_requests(
+            [1], token_nums=[8], is_gen=True, max_num_draft_tokens=num_spec
+        )
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        num_heads, head_dim, width = 6, 128, 4
+        layer_weights = [
+            {
+                "w_q": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "w_k": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "w_v": torch.randn(num_heads * head_dim, width, generator=generator, device="cuda")
+                * 0.5,
+                "A_log": torch.randn(num_heads, generator=generator, device="cuda"),
+                "dt_bias": torch.randn(num_heads * head_dim, generator=generator, device="cuda"),
+            }
+            for _ in mgr.all_ssm_states
+        ]
+        # The state a prefill leaves: the V2 states, and the replay caches seeded from them with nothing pending.
+        slot = mgr._request_id_to_state_index[1]
+        for ssm_states, conv_states in zip(mgr.all_ssm_states, mgr.all_conv_states):
+            ssm_states[slot] = 0.1 * torch.randn(
+                ssm_states.shape[1:], generator=generator, device="cuda"
+            )
+            conv_states[slot] = torch.randn(
+                conv_states.shape[1:], generator=generator, device="cuda"
+            )
+        mgr.seed_kda_replay_caches_for_disagg_gen([1])
+
+        outputs = []
+        for round_idx, accepted in enumerate(accepted_per_round):
+            slot = mgr._request_id_to_state_index[1]
+            outputs.append(_kda_verify_round(mgr, slot, layer_weights, round_idx, num_spec))
+            mgr.prev_num_accepted_tokens[slot] = accepted
+            if round_idx == suspend_after:
+                mgr.suspend_request(request)
+                if slot_taken:
+                    _take_ssm_slot(mgr, slot, others)
+                    _fill_kda_slot(mgr, slot, generator)
+                assert mgr.resume_request(request)
+                mgr._setup_state_indices([request], num_contexts=0)
+                if slot_taken:
+                    assert mgr._request_id_to_state_index[1] != slot
+        slot = mgr._request_id_to_state_index[1]
+        states = torch.stack([ssm_states[slot] for ssm_states in mgr.all_ssm_states])
+        torch.cuda.synchronize()
+        return outputs, states
+    finally:
+        for cache in others:
+            cache.close()
+        if request is not None:
+            mgr.free_resources(request)
+        mgr.shutdown()
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("slot_taken", [True, False], ids=["slot_taken", "slot_kept"])
+def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
+    """A request is suspended with two accepted drafts pending and resumes; every later verify gives the outputs and
+    leaves the states of the same request never suspended, bit for bit, so its tokens cannot change.
+
+    slot_taken: while the request is suspended, new caches fill the SSM pool, so the V2 runtime moves its SSM page to
+    the host tier and gives its slot to one of them, which overwrites the slot's states; the request resumes in
+    another slot. slot_kept: nothing else runs while it is suspended."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import is_kda_mtp_verify_available
+
+    if not is_kda_mtp_verify_available():
+        pytest.skip("needs the fused KDA verify kernel (sm_100 / sm_103 with the CuTe DSL)")
+    accepted_per_round = [2, 1, 2, 0, 2, 1]
+    expected_outputs, expected_states = _run_kda_verify_rounds(accepted_per_round)
+    outputs, states = _run_kda_verify_rounds(
+        accepted_per_round, suspend_after=2, slot_taken=slot_taken
+    )
+
+    for round_idx, (actual, expected) in enumerate(zip(outputs, expected_outputs)):
+        assert torch.equal(actual, expected), f"verify round {round_idx}"
+    assert torch.equal(states, expected_states)
 
 
 @skip_no_cuda
