@@ -17,6 +17,7 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import math
 import time
 from io import BytesIO
 from typing import Any, Optional
@@ -24,6 +25,12 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from diffusers import AutoencoderKLMiniMaxH3Audio, MiniMaxH3Scheduler
+from diffusers.modular_pipelines.minimax_h3.references import (
+    MiniMaxH3AudioReference,
+    MiniMaxH3ImageReference,
+    MiniMaxH3Reference,
+    MiniMaxH3VideoReference,
+)
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
@@ -40,6 +47,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
+from tensorrt_llm.visual_gen.args import ReferenceWarmupVariant
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -287,18 +295,8 @@ class MiniMaxH3Pipeline(BasePipeline):
     def resolution_multiple_of(self) -> tuple[int, int]:
         return (MINIMAX_H3_CANVAS_MULTIPLE, MINIMAX_H3_CANVAS_MULTIPLE)
 
-    def _run_warmup(
-        self,
-        height: int,
-        width: int,
-        num_frames: int,
-        steps: int,
-    ) -> None:
-        # Ref2VA needs real reference geometry; its first request initializes
-        # attention for that packed layout instead of issuing a text-only request.
-        if self.workflow == "ref2va":
-            return
-        self.forward(
+    def _warmup_forward_kwargs(self, height: int, width: int, num_frames: int, steps: int) -> dict:
+        return dict(
             prompt="warmup",
             seed=42,
             height=height,
@@ -307,6 +305,225 @@ class MiniMaxH3Pipeline(BasePipeline):
             frame_rate=float(MINIMAX_H3_FPS),
             num_inference_steps=steps,
         )
+
+    def _run_warmup(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        steps: int,
+    ) -> None:
+        # Ref2VA requests always carry references, so the text-only layout is
+        # unreachable; reference warmup covers it via _run_reference_warmup.
+        if self.workflow == "ref2va":
+            return
+        self.forward(**self._warmup_forward_kwargs(height, width, num_frames, steps))
+
+    def request_warmup_cache_key(self, req: Any) -> tuple:
+        """Key capturing how this request's references change the compiled shape.
+
+        FL2VA keyframes are resized to the output canvas, so only their count
+        matters. Ref2VA references keep their own normalized geometry and are
+        packed as extra token rows, so the key carries each reference's packed
+        composition in order.
+        """
+        base_key = super().request_warmup_cache_key(req)
+        if self.workflow == "ref2va":
+            references = req.prepared_inputs.get("references") or []
+            return (
+                *base_key,
+                tuple(
+                    self._reference_key_entry(reference, req.params.num_frames)
+                    for reference in references
+                ),
+            )
+        keyframes = req.prepared_inputs.get("keyframes") or []
+        return (*base_key, len(keyframes))
+
+    def default_warmup_reference_variants(
+        self, height: int, width: int, num_frames: int
+    ) -> list[ReferenceWarmupVariant]:
+        if self.workflow == "ref2va":
+            # Canonical case: one image reference at the output canvas. Video,
+            # audio and multi-reference mixes come from
+            # ``compilation.reference_variants``.
+            return [ReferenceWarmupVariant(images=[(height, width)])]
+        # FL2VA accepts a first- and a last-frame keyframe; warm both counts.
+        return [
+            ReferenceWarmupVariant(images=[(height, width)]),
+            ReferenceWarmupVariant(images=[(height, width), (height, width)]),
+        ]
+
+    def validate_reference_variant(self, variant: ReferenceWarmupVariant) -> bool:
+        if not super().validate_reference_variant(variant):
+            return False
+        if self.workflow != "ref2va":
+            return True
+        total = len(variant.images) + len(variant.videos) + len(variant.audio)
+        if total > 12:
+            logger.warning(
+                f"Skipping reference warmup variant: MiniMax-H3 ref2va accepts at "
+                f"most 12 references in total, got {total}."
+            )
+            return False
+        if variant.audio and not (variant.images or variant.videos):
+            logger.warning(
+                "Skipping reference warmup variant: MiniMax-H3 ref2va requires at "
+                "least one image or video reference alongside audio."
+            )
+            return False
+        if variant.order is not None:
+            expected = {
+                f"{kind}:{i}"
+                for kind, count in (
+                    ("image", len(variant.images)),
+                    ("video", len(variant.videos)),
+                    ("audio", len(variant.audio)),
+                )
+                for i in range(count)
+            }
+            try:
+                order = validate_reference_order(list(variant.order))
+            except ValueError:
+                order = None
+            if order is None or set(order) != expected:
+                logger.warning(
+                    "Skipping reference warmup variant: order must name every "
+                    "reference exactly once as 'image:N', 'video:N', 'audio:N'."
+                )
+                return False
+        return True
+
+    def reference_warmup_cache_key(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        variant: ReferenceWarmupVariant,
+    ) -> Optional[tuple]:
+        if self.workflow == "ref2va":
+            references = self._synthesize_references(variant)
+            if not references:
+                return None
+            return (
+                height,
+                width,
+                num_frames,
+                tuple(self._reference_key_entry(reference, num_frames) for reference in references),
+            )
+        if not variant.images:
+            return None
+        return (height, width, num_frames, len(variant.images))
+
+    def warmup_cache_keys(self, shapes: list[tuple[int, int, int]]) -> set[tuple]:
+        # In ref2va the text-only pass is skipped, so only reference-variant
+        # keys correspond to graphs warmup really ran.
+        if self.workflow != "ref2va":
+            return super().warmup_cache_keys(shapes)
+        keys = set()
+        for h, w, f in shapes:
+            for variant in self.resolve_warmup_reference_variants(h, w, f):
+                key = self.reference_warmup_cache_key(h, w, f, variant)
+                if key is not None:
+                    keys.add(key)
+        return keys
+
+    def _run_reference_warmup(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        steps: int,
+        variant: ReferenceWarmupVariant,
+    ) -> None:
+        forward_kwargs = self._warmup_forward_kwargs(height, width, num_frames, steps)
+        if self.workflow == "ref2va":
+            references = self._synthesize_references(variant)
+            if references:
+                self.forward(**forward_kwargs, references=references)
+            return
+        keyframes = [Image.new("RGB", (w, h)) for h, w in variant.images]
+        if keyframes:
+            self.forward(
+                **forward_kwargs,
+                keyframes=keyframes,
+                keyframe_anchors=("first", "last")[: len(keyframes)],
+            )
+
+    def _synthesize_references(self, variant: ReferenceWarmupVariant) -> list:
+        """Build zero-valued ref2va references matching a warmup variant.
+
+        Sizes, frame rates and soundtracks follow the variant so the synthesized
+        references normalize to the same packed shapes as the requests the
+        variant is meant to warm; ``variant.order`` gives the cross-modality
+        order (the request key retains it).
+        """
+        sample_rate = self.audio_vae.config.sampling_rate
+        by_kind = {"image": [], "video": [], "audio": []}
+        for height, width in variant.images:
+            by_kind["image"].append(MiniMaxH3ImageReference(Image.new("RGB", (width, height))))
+        for spec in variant.videos:
+            height, width = spec.size
+            audio = (
+                torch.zeros(2, int(spec.audio_seconds * sample_rate))
+                if spec.audio_seconds is not None
+                else None
+            )
+            by_kind["video"].append(
+                MiniMaxH3VideoReference(
+                    frames=np.zeros((spec.num_frames, height, width, 3), dtype=np.uint8),
+                    fps=spec.fps if spec.fps is not None else float(MINIMAX_H3_FPS),
+                    audio=audio,
+                    sample_rate=sample_rate if audio is not None else None,
+                )
+            )
+        for seconds in variant.audio:
+            by_kind["audio"].append(
+                MiniMaxH3AudioReference(
+                    audio=torch.zeros(2, int(seconds * sample_rate)),
+                    sample_rate=sample_rate,
+                )
+            )
+        if variant.order is None:
+            return by_kind["image"] + by_kind["video"] + by_kind["audio"]
+        # Format and coverage were checked by validate_reference_variant().
+        return [
+            by_kind[kind][int(index)]
+            for kind, index in (entry.split(":") for entry in variant.order)
+        ]
+
+    def _reference_key_entry(self, reference: MiniMaxH3Reference, num_frames: int) -> tuple:
+        """Packed-shape signature of one decoded ref2va reference.
+
+        Mirrors the geometry math of ``normalize_references`` without running
+        any encoder, so a request key and a warmup key computed from equal
+        inputs are identical.
+        """
+        audio_samples = self._reference_audio_samples(reference, num_frames)
+        if reference.kind == "image":
+            width, height = reference.image.size
+            scale = 2048 / min(width, height)
+            multiple = MINIMAX_H3_CANVAS_MULTIPLE
+            normalized = tuple(
+                max(multiple, round(axis * scale / multiple) * multiple) for axis in (width, height)
+            )
+            return ("image", *normalized, audio_samples)
+        if reference.kind == "video":
+            scale = MINIMAX_H3_FPS / float(reference.fps)
+            frames = min(math.floor(reference.frames.shape[0] * scale + 0.5), num_frames)
+            canvas = resolve_canvas_size(reference.frames.shape[2], reference.frames.shape[1])
+            return ("video", frames, *canvas, audio_samples)
+        return ("audio", audio_samples)
+
+    def _reference_audio_samples(self, reference: MiniMaxH3Reference, num_frames: int) -> int:
+        """Sample count a reference's soundtrack contributes after normalization."""
+        if not reference.has_audio:
+            return 0
+        target_rate = self.audio_vae.config.sampling_rate
+        sample_rate = reference.sample_rate or target_rate
+        max_duration = num_frames / MINIMAX_H3_FPS
+        samples = min(reference.audio.shape[-1], int(max_duration * sample_rate))
+        return round(samples * target_rate / sample_rate)
 
     def _init_transformer(self) -> None:
         self.transformer = MiniMaxH3Transformer3DModel(

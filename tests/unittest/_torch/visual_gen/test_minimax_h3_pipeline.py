@@ -19,10 +19,17 @@ import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 from diffusers import MiniMaxH3Scheduler
+from diffusers.modular_pipelines.minimax_h3.references import (
+    MiniMaxH3AudioReference,
+    MiniMaxH3ImageReference,
+    MiniMaxH3VideoReference,
+)
 from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.config import (
@@ -38,7 +45,13 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
-from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import (
+    CompilationConfig,
+    ReferenceVideoSpec,
+    ReferenceWarmupVariant,
+    TorchCompileConfig,
+    VisualGenArgs,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -397,6 +410,202 @@ def test_modular_manifest_discovers_h3_pipeline_and_transformer_config(tmp_path:
 
     assert components == {"transformer": tmp_path / "transformer" / "config.json"}
     assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == ("MiniMaxH3ModularPipeline")
+
+
+def _make_warmup_key_pipeline(workflow: str) -> MiniMaxH3Pipeline:
+    """Weightless MiniMaxH3Pipeline shell for warmup-key tests (no GPU)."""
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    pipeline.workflow = workflow
+    pipeline.pipeline_config = SimpleNamespace(compilation=CompilationConfig())
+    pipeline.audio_vae = SimpleNamespace(config=SimpleNamespace(sampling_rate=32000))
+    return pipeline
+
+
+def _req(prepared_inputs: dict, num_frames: int = 124) -> SimpleNamespace:
+    return SimpleNamespace(
+        params=SimpleNamespace(height=768, width=1344, num_frames=num_frames),
+        prepared_inputs=prepared_inputs,
+    )
+
+
+def test_fl2va_warmup_key_tracks_keyframe_count() -> None:
+    pipeline = _make_warmup_key_pipeline("fl2va")
+
+    assert pipeline.request_warmup_cache_key(_req({})) == (768, 1344, 124, 0)
+    assert pipeline.request_warmup_cache_key(
+        _req({"keyframes": [Image.new("RGB", (1344, 768))]})
+    ) == (768, 1344, 124, 1)
+    assert pipeline.request_warmup_cache_key(
+        _req({"keyframes": [Image.new("RGB", (1344, 768))] * 2})
+    ) == (768, 1344, 124, 2)
+
+
+def test_fl2va_default_variants_cover_both_keyframe_counts() -> None:
+    pipeline = _make_warmup_key_pipeline("fl2va")
+
+    variants = pipeline.resolve_warmup_reference_variants(768, 1344, 124)
+    assert [len(v.images) for v in variants] == [1, 2]
+    assert pipeline.warmup_cache_keys([(768, 1344, 124)]) == {
+        (768, 1344, 124),
+        (768, 1344, 124, 1),
+        (768, 1344, 124, 2),
+    }
+
+
+def test_ref2va_warmup_key_carries_reference_composition() -> None:
+    pipeline = _make_warmup_key_pipeline("ref2va")
+    image = MiniMaxH3ImageReference(Image.new("RGB", (1024, 1024)))
+    video = MiniMaxH3VideoReference(frames=np.zeros((48, 240, 426, 3), dtype=np.uint8), fps=24.0)
+    audio = MiniMaxH3AudioReference(audio=torch.zeros(2, 64000), sample_rate=32000)
+
+    image_key = pipeline.request_warmup_cache_key(_req({"references": [image]}))
+    assert image_key == (768, 1344, 124, (("image", 2048, 2048, 0),))
+
+    video_key = pipeline.request_warmup_cache_key(_req({"references": [video]}))
+    canvas = resolve_canvas_size(426, 240)
+    assert video_key == (768, 1344, 124, (("video", 48, *canvas, 0),))
+
+    mixed_key = pipeline.request_warmup_cache_key(_req({"references": [image, audio]}))
+    assert mixed_key == (
+        768,
+        1344,
+        124,
+        (("image", 2048, 2048, 0), ("audio", 64000)),
+    )
+
+    # Order and per-reference sizes are part of the compiled shape.
+    other = pipeline.request_warmup_cache_key(
+        _req({"references": [MiniMaxH3ImageReference(Image.new("RGB", (512, 1024)))]})
+    )
+    assert other != image_key
+
+
+def test_ref2va_variant_key_matches_request_key() -> None:
+    """A warmup variant and an equal request produce the same cache key.
+
+    The request side is built independently (not via _synthesize_references):
+    a 60-frame 30 fps video with a 44.1 kHz soundtrack, then an image, in that
+    order — the variant must carry the rate, the soundtrack, and the order to
+    warm this request.
+    """
+    pipeline = _make_warmup_key_pipeline("ref2va")
+    variant = ReferenceWarmupVariant(
+        images=[(1024, 1024)],
+        videos=[ReferenceVideoSpec(size=(240, 426), num_frames=60, fps=30.0, audio_seconds=2.0)],
+        order=["video:0", "image:0"],
+    )
+    request_references = [
+        MiniMaxH3VideoReference(
+            frames=np.zeros((60, 240, 426, 3), dtype=np.uint8),
+            fps=30.0,
+            audio=torch.zeros(2, 88200),
+            sample_rate=44100,
+        ),
+        MiniMaxH3ImageReference(Image.new("RGB", (1024, 1024))),
+    ]
+
+    variant_key = pipeline.reference_warmup_cache_key(768, 1344, 124, variant)
+    request_key = pipeline.request_warmup_cache_key(_req({"references": request_references}))
+    assert variant_key == request_key
+
+    # Without the rate, soundtrack, or order, the variant warms a different shape.
+    assert (
+        pipeline.reference_warmup_cache_key(
+            768,
+            1344,
+            124,
+            ReferenceWarmupVariant(
+                images=[(1024, 1024)],
+                videos=[ReferenceVideoSpec(size=(240, 426), num_frames=60)],
+            ),
+        )
+        != request_key
+    )
+
+
+def test_ref2va_run_reference_warmup_forwards_synthesized_references() -> None:
+    """_run_reference_warmup must actually run forward with the synthesized refs."""
+    pipeline = _make_warmup_key_pipeline("ref2va")
+    pipeline.forward = MagicMock()
+    variant = ReferenceWarmupVariant(
+        images=[(1024, 1024)],
+        videos=[ReferenceVideoSpec(size=(240, 426), num_frames=48, fps=30.0)],
+        audio=[2.0],
+        order=["audio:0", "image:0", "video:0"],
+    )
+
+    pipeline._run_reference_warmup(768, 1344, 124, 2, variant)
+
+    pipeline.forward.assert_called_once()
+    references = pipeline.forward.call_args.kwargs["references"]
+    assert [r.kind for r in references] == ["audio", "image", "video"]
+    assert references[0].audio.shape == (2, 64000)
+    assert references[1].image.size == (1024, 1024)
+    assert references[2].frames.shape == (48, 240, 426, 3)
+    assert references[2].fps == 30.0
+
+
+def test_fl2va_run_reference_warmup_forwards_keyframes() -> None:
+    pipeline = _make_warmup_key_pipeline("fl2va")
+    pipeline.forward = MagicMock()
+
+    pipeline._run_reference_warmup(
+        768, 1344, 124, 2, ReferenceWarmupVariant(images=[(768, 1344), (768, 1344)])
+    )
+
+    pipeline.forward.assert_called_once()
+    kwargs = pipeline.forward.call_args.kwargs
+    assert len(kwargs["keyframes"]) == 2
+    assert kwargs["keyframe_anchors"] == ("first", "last")
+
+
+def test_ref2va_warmup_keys_exclude_the_unreachable_plain_key() -> None:
+    pipeline = _make_warmup_key_pipeline("ref2va")
+
+    keys = pipeline.warmup_cache_keys([(768, 1344, 124)])
+
+    assert (768, 1344, 124) not in keys
+    # The default variant is one image at the output canvas (768, 1344),
+    # normalized to a 2048 short edge: (768, 1344) -> (2048, 3584).
+    assert (768, 1344, 124, (("image", 3584, 2048, 0),)) in keys
+
+
+def test_ref2va_reference_variant_validation() -> None:
+    pipeline = _make_warmup_key_pipeline("ref2va")
+
+    assert pipeline.validate_reference_variant(ReferenceWarmupVariant(images=[(64, 64)]))
+    # Audio-only is not a valid ref2va request.
+    assert not pipeline.validate_reference_variant(ReferenceWarmupVariant(audio=[1.0]))
+    # Slot limits come from ref_slot_specs: at most 9 images.
+    assert not pipeline.validate_reference_variant(ReferenceWarmupVariant(images=[(64, 64)] * 10))
+    # Ref2va also caps the combined count at 12 references.
+    assert pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(
+            images=[(64, 64)] * 9,
+            videos=[ReferenceVideoSpec(size=(64, 64), num_frames=8)] * 3,
+        )
+    )
+    assert not pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(
+            images=[(64, 64)] * 9,
+            videos=[ReferenceVideoSpec(size=(64, 64), num_frames=8)] * 3,
+            audio=[1.0],
+        )
+    )
+    # order must name every reference exactly once.
+    assert pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(
+            images=[(64, 64)],
+            videos=[ReferenceVideoSpec(size=(64, 64), num_frames=8)],
+            order=["video:0", "image:0"],
+        )
+    )
+    assert not pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(images=[(64, 64)], order=["image:0", "image:0"])
+    )
+    assert not pipeline.validate_reference_variant(
+        ReferenceWarmupVariant(images=[(64, 64)], order=["image:1"])
+    )
 
 
 def test_public_visual_gen_lists_minimax_h3() -> None:

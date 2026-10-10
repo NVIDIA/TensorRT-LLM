@@ -31,6 +31,7 @@ from tensorrt_llm.inputs.media_io import MediaModality
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.visual_gen.args import ReferenceWarmupVariant
 from tensorrt_llm.visual_gen.params import MediaRole
 
 from .cache import CacheDiTAccelerator, TeaCacheAccelerator
@@ -259,6 +260,104 @@ class BasePipeline(nn.Module):
         The executor uses this to check whether a request shape was warmed up.
         """
         return (height, width, num_frames)
+
+    def warmup_cache_keys(self, shapes: List[Tuple[int, int, int]]) -> Set[tuple]:
+        """Return every cache key the warmup pass compiled for ``shapes``.
+
+        Combines the plain per-shape keys with one key per configured reference
+        variant (see :meth:`resolve_warmup_reference_variants`). Keys reported
+        here must correspond to graphs warmup really ran, or the executor's
+        un-warmed-shape warning goes quiet on shapes that still recompile.
+        """
+        keys = {self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes}
+        for h, w, f in shapes:
+            for variant in self.resolve_warmup_reference_variants(h, w, f):
+                key = self.reference_warmup_cache_key(h, w, f, variant)
+                if key is not None:
+                    keys.add(key)
+        return keys
+
+    def default_warmup_reference_variants(
+        self, height: int, width: int, num_frames: int
+    ) -> List[ReferenceWarmupVariant]:
+        """Model-specific default reference warmup variants for one planned shape.
+
+        Subclasses whose references change the compiled shape override. Used
+        only when ``compilation.reference_variants`` is not set.
+        """
+        return []
+
+    def resolve_warmup_reference_variants(
+        self, height: int, width: int, num_frames: int
+    ) -> List[ReferenceWarmupVariant]:
+        """Resolve reference warmup variants for one planned shape.
+
+        Priority: user-specified ``compilation.reference_variants`` (``[]``
+        disables reference warmup), then model defaults. Variants exceeding the
+        pipeline's accepted reference slots are skipped with a warning.
+        """
+        configured = self.pipeline_config.compilation.reference_variants
+        variants = (
+            list(configured)
+            if configured is not None
+            else list(self.default_warmup_reference_variants(height, width, num_frames))
+        )
+        return [v for v in variants if self.validate_reference_variant(v)]
+
+    def validate_reference_variant(self, variant: ReferenceWarmupVariant) -> bool:
+        """Check a reference variant's per-modality counts against ref_slot_specs."""
+        specs = self.ref_slot_specs
+        for slot, count in (
+            ("image_reference", len(variant.images)),
+            ("video_reference", len(variant.videos)),
+            ("audio_reference", len(variant.audio)),
+        ):
+            if count == 0:
+                continue
+            spec = specs.get(slot)
+            maxes = [role.max for role in spec.roles] if spec is not None else []
+            if not maxes:
+                logger.warning(
+                    f"Skipping reference warmup variant: {self.__class__.__name__} "
+                    f"accepts no {slot}, but the variant carries {count}."
+                )
+                return False
+            if all(m is not None for m in maxes) and count > sum(maxes):
+                logger.warning(
+                    f"Skipping reference warmup variant: {count} {slot} entries exceed "
+                    f"the {sum(maxes)} accepted by {self.__class__.__name__}."
+                )
+                return False
+        return True
+
+    def reference_warmup_cache_key(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        variant: ReferenceWarmupVariant,
+    ) -> Optional[tuple]:
+        """Cache key compiled by one reference warmup variant, or None.
+
+        Subclasses whose references change the compiled shape override; the
+        returned key must equal :meth:`request_warmup_cache_key` for a request
+        carrying matching references.
+        """
+        return None
+
+    def _run_reference_warmup(
+        self,
+        height: int,
+        width: int,
+        num_frames: int,
+        steps: int,
+        variant: ReferenceWarmupVariant,
+    ) -> None:
+        """Run warmup for one reference-carrying variant. Subclasses override."""
+        logger.warning(
+            f"{self.__class__.__name__} does not implement _run_reference_warmup(); "
+            "skipping reference warmup variant."
+        )
 
     def request_warmup_cache_key(self, req: Any) -> tuple:
         """Return the warmup cache key for a prepared inference request."""
@@ -897,9 +996,7 @@ class BasePipeline(nn.Module):
         finally:
             self._is_warmup = False
 
-        self._warmed_up_shapes = set(
-            self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
-        )
+        self._warmed_up_shapes = self.warmup_cache_keys(shapes)
         elapsed = time.time() - warmup_start
         logger.info(f"Warmup completed in {elapsed:.2f}s")
 
@@ -907,6 +1004,8 @@ class BasePipeline(nn.Module):
         """Run one warmup pass over all shapes (denoise loop with dummy inputs)."""
         for height, width, num_frames in shapes:
             self._run_warmup(height, width, num_frames, steps)
+            for variant in self.resolve_warmup_reference_variants(height, width, num_frames):
+                self._run_reference_warmup(height, width, num_frames, steps, variant)
             torch.cuda.synchronize()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:

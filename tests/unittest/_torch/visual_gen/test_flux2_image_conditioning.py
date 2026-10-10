@@ -14,6 +14,22 @@ import torch
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 
 from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux2 import Flux2Pipeline
+from tensorrt_llm.visual_gen.args import CompilationConfig, ReferenceWarmupVariant
+
+
+def _make_warmup_stub(reference_variants=None) -> Flux2Pipeline:
+    """Weightless Flux2Pipeline shell for warmup-key tests (CPU, no GPU)."""
+    pipeline = Flux2Pipeline.__new__(Flux2Pipeline)
+    pipeline.vae_scale_factor = 8
+    pipeline.image_processor = Flux2ImageProcessor(vae_scale_factor=16)
+    pipeline.pipeline_config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        compilation=CompilationConfig(reference_variants=reference_variants),
+    )
+    pipeline.transformer = SimpleNamespace(parameters=lambda: iter([torch.empty(0)]))
+    pipeline._device = torch.device("cpu")
+    pipeline.forward = MagicMock()
+    return pipeline
 
 
 def _png_bytes() -> bytes:
@@ -139,6 +155,81 @@ def test_reference_warmup_cache_key_preserves_count_and_ordered_shapes() -> None
         2,
         ((32, 48), (64, 80)),
     )
+
+
+@pytest.mark.parametrize(
+    "height,width,reference_shape",
+    [(1024, 1024, (1024, 1024)), (70, 100, (64, 96)), (1024, 2048, (720, 1440))],
+)
+def test_warmup_runs_and_records_reference_request_shape(
+    height: int,
+    width: int,
+    reference_shape: tuple[int, int],
+) -> None:
+    pipeline = _make_warmup_stub()
+
+    pipeline._run_warmup(height, width, num_frames=1, steps=2)
+    (variant,) = pipeline.resolve_warmup_reference_variants(height, width, 1)
+    pipeline._run_reference_warmup(height, width, 1, 2, variant)
+
+    assert pipeline.forward.call_count == 2
+    text_call, reference_call = pipeline.forward.call_args_list
+    assert "_condition_images" not in text_call.kwargs
+    assert text_call.kwargs["height"] == reference_call.kwargs["height"] == height
+    assert text_call.kwargs["width"] == reference_call.kwargs["width"] == width
+    (reference,) = reference_call.kwargs["_condition_images"]
+    assert reference.shape == (1, 3, *reference_shape)
+
+    warmed = pipeline.warmup_cache_keys([(height, width, 1)])
+    req = SimpleNamespace(
+        params=SimpleNamespace(height=height, width=width, num_frames=None),
+        prepared_inputs={
+            "condition_images": pipeline._preprocess_reference_images(
+                [PIL.Image.new("RGB", (width, height))]
+            )
+        },
+    )
+    assert pipeline.request_warmup_cache_key(req) in warmed
+    req.prepared_inputs = {}
+    assert pipeline.request_warmup_cache_key(req) in warmed
+
+
+def test_multi_reference_variant_warms_and_records_each_reference_shape() -> None:
+    """A configured two-reference variant warms one pass carrying both
+    references and records the key a matching two-reference request produces."""
+    pipeline = _make_warmup_stub(
+        reference_variants=[ReferenceWarmupVariant(images=[(70, 100), (480, 832)])]
+    )
+
+    pipeline._run_warmup(1024, 1024, num_frames=1, steps=2)
+    (variant,) = pipeline.resolve_warmup_reference_variants(1024, 1024, 1)
+    pipeline._run_reference_warmup(1024, 1024, 1, 2, variant)
+
+    reference_call = pipeline.forward.call_args_list[-1]
+    condition_images = reference_call.kwargs["_condition_images"]
+    assert len(condition_images) == 2
+    assert [tuple(image.shape[-2:]) for image in condition_images] == [
+        (64, 96),
+        (480, 832),
+    ]
+
+    warmed = pipeline.warmup_cache_keys([(1024, 1024, 1)])
+    req = SimpleNamespace(
+        params=SimpleNamespace(height=1024, width=1024, num_frames=None),
+        prepared_inputs={
+            "condition_images": pipeline._preprocess_reference_images(
+                [PIL.Image.new("RGB", (100, 70)), PIL.Image.new("RGB", (832, 480))]
+            )
+        },
+    )
+    assert pipeline.request_warmup_cache_key(req) in warmed
+
+
+def test_empty_reference_variants_disables_reference_warmup() -> None:
+    pipeline = _make_warmup_stub(reference_variants=[])
+
+    assert pipeline.resolve_warmup_reference_variants(1024, 1024, 1) == []
+    assert pipeline.warmup_cache_keys([(1024, 1024, 1)]) == {(1024, 1024)}
 
 
 @pytest.mark.parametrize("cache_backend", ["teacache", "cache_dit"])
