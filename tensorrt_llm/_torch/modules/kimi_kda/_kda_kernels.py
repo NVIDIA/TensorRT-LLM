@@ -169,101 +169,6 @@ def fused_kda_post_conv(
     return q_out, k_out, v_out
 
 
-@triton.jit
-def _copy_kda_replay_conv_window_kernel(
-    conv_ptr,
-    q_cache_ptr,
-    k_cache_ptr,
-    v_cache_ptr,
-    state_indices_ptr,
-    conv_stride_slot,
-    conv_stride_dim,
-    conv_stride_window,
-    cache_stride_slot,
-    cache_stride_dim,
-    cache_stride_window,
-    PROJECTION_SIZE: tl.constexpr,
-    COMMITTED: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    request = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < PROJECTION_SIZE * COMMITTED
-    dim = offsets // COMMITTED
-    window = offsets % COMMITTED
-    slot = tl.load(state_indices_ptr + request).to(tl.int64)
-
-    conv_offset = slot * conv_stride_slot + dim * conv_stride_dim + window * conv_stride_window
-    cache_offset = slot * cache_stride_slot + dim * cache_stride_dim + window * cache_stride_window
-    section_offset = PROJECTION_SIZE * conv_stride_dim
-    tl.store(q_cache_ptr + cache_offset, tl.load(conv_ptr + conv_offset, mask=mask), mask=mask)
-    tl.store(
-        k_cache_ptr + cache_offset,
-        tl.load(conv_ptr + conv_offset + section_offset, mask=mask),
-        mask=mask,
-    )
-    tl.store(
-        v_cache_ptr + cache_offset,
-        tl.load(conv_ptr + conv_offset + 2 * section_offset, mask=mask),
-        mask=mask,
-    )
-
-
-def copy_kda_replay_conv_window(
-    conv_pool: torch.Tensor,
-    q_cache: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    state_indices: torch.Tensor,
-) -> None:
-    """Copy selected packed ``W - 1`` rows into KDA replay caches.
-
-    The live convolution pool is ``[slots, 3D, W - 1]``. Replay caches are
-    ``[slots, D, W - 1 + num_spec]`` with a dim-contiguous inner layout.
-    """
-    if conv_pool.ndim != 3 or conv_pool.shape[1] % 3:
-        raise ValueError(f"Expected packed rank-3 KDA convolution pool, got {conv_pool.shape}")
-    projection_size = conv_pool.shape[1] // 3
-    committed = conv_pool.shape[2]
-    caches = (q_cache, k_cache, v_cache)
-    expected_prefix = (conv_pool.shape[0], projection_size)
-    if any(cache.ndim != 3 or cache.shape[:2] != expected_prefix for cache in caches):
-        raise ValueError("KDA replay convolution caches do not match the live pool geometry")
-    if any(cache.shape[2] < committed for cache in caches):
-        raise ValueError("KDA replay convolution caches are shorter than the committed window")
-    if any(cache.stride() != q_cache.stride() for cache in caches[1:]):
-        raise ValueError("KDA replay convolution caches must share one layout")
-    if state_indices.ndim != 1 or state_indices.dtype not in (torch.int32, torch.int64):
-        raise ValueError("KDA replay state indices must be a rank-1 int32 or int64 tensor")
-    if any(tensor.device != conv_pool.device for tensor in (*caches, state_indices)):
-        raise ValueError("KDA replay convolution tensors must be on one device")
-    if state_indices.numel() == 0:
-        return
-
-    block_size = 256
-    grid = (
-        state_indices.numel(),
-        triton.cdiv(projection_size * committed, block_size),
-    )
-    with torch.cuda.device(conv_pool.device.index):
-        _copy_kda_replay_conv_window_kernel[grid](
-            conv_pool,
-            q_cache,
-            k_cache,
-            v_cache,
-            state_indices,
-            conv_pool.stride(0),
-            conv_pool.stride(1),
-            conv_pool.stride(2),
-            q_cache.stride(0),
-            q_cache.stride(1),
-            q_cache.stride(2),
-            PROJECTION_SIZE=projection_size,
-            COMMITTED=committed,
-            BLOCK_SIZE=block_size,
-        )
-
-
 # ---------------------------------------------------------------------------
 # In-tree KDA prefill op (CuTe DSL, trtllm::kda_prefill).
 # ---------------------------------------------------------------------------
@@ -300,7 +205,7 @@ def is_intree_prefill_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# In-tree KDA multi-token verify op (CuTe DSL, trtllm::kda_mtp_decode).
+# In-tree KDA multi-token replay kernel (CuTe DSL).
 # ---------------------------------------------------------------------------
 
 _MTP_MODULE: Optional[ModuleType] = None
@@ -308,7 +213,7 @@ _MTP_IMPORT_ERROR: Optional[Exception] = None
 
 
 def _load_mtp_module() -> ModuleType:
-    """Import the in-tree MTP verify custom-op module (registers the op)."""
+    """Import the in-tree Conv4 + KDA replay module."""
     global _MTP_MODULE, _MTP_IMPORT_ERROR
     if _MTP_MODULE is not None:
         return _MTP_MODULE
@@ -316,7 +221,7 @@ def _load_mtp_module() -> ModuleType:
         raise _MTP_IMPORT_ERROR
     try:
         module = importlib.import_module(
-            "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops"
+            "tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_replay"
         )
     except Exception as exc:  # typically ImportError when CuTe DSL is unavailable
         _MTP_IMPORT_ERROR = exc
@@ -359,10 +264,9 @@ class KDAKernelDispatch:
     decode_kernel_path : str
         Selected decode path: ``"optimized"`` or ``"fla"``.
     verify_kernel_path : str
-        Selected multi-token verify path: ``"optimized"`` (fused
-        ``trtllm::kda_mtp_decode`` replay kernel) or ``"fla"`` (sequential
-        per-step ``fused_recurrent_kda`` with intermediate-buffer state
-        promotion).
+        Selected multi-token verify path: ``"optimized"`` (fused Conv4 and
+        KDA replay) or ``"fla"`` (sequential per-step
+        ``fused_recurrent_kda`` with intermediate-buffer state promotion).
     Notes
     -----
     Prefill, decode, and verify dispatch are decided independently. All
@@ -403,22 +307,14 @@ class KDAKernelDispatch:
                     f"verify={self.verify_kernel_path}"
                 )
 
-    def mtp_verify(self, **kwargs) -> torch.Tensor:
-        """Run the fused KDA multi-token verify kernel.
-
-        Thin passthrough to ``trtllm::kda_mtp_decode`` (see
-        ``custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py`` for the full
-        argument and state-management contract). Only defined on the
-        optimized path; the FLA fallback is the module's sequential
-        per-step loop with intermediate-buffer promotion.
-        """
+    def mtp_verify(self, **kwargs) -> None:
+        """Run the fused Conv4 + KDA multi-token replay kernel."""
         if self.verify_kernel_path != "optimized":
             raise RuntimeError(
                 "mtp_verify called on non-optimized path; use the module's "
                 "sequential FLA verify fallback instead."
             )
-        _load_mtp_module()  # registers trtllm::kda_mtp_decode
-        return torch.ops.trtllm.kda_mtp_decode(**kwargs)
+        return _load_mtp_module().kda_mtp_replay(**kwargs)
 
     def can_use_indexed_prefill(
         self,

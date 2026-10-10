@@ -19,7 +19,6 @@ from tensorrt_llm._torch.modules.kimi_kda import (
     _kda_kernels,  # noqa: E402
 )
 from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (  # noqa: E402
-    copy_kda_replay_conv_window,
     fused_kda_post_conv,
     is_kda_optimized_supported,
 )
@@ -270,63 +269,6 @@ def test_packed_gdn_convolution_matches_three_fla_convolutions() -> None:
     untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
     untouched[state_indices_long] = False
     assert torch.equal(conv_pool[untouched], conv_pool_before[untouched])
-
-
-@torch.no_grad()
-def test_copy_kda_replay_conv_window_preserves_slot_padding() -> None:
-    """Committed Q/K/V rows copy across both strided production layouts."""
-    slots, dim, committed, num_spec = 6, 11, 3, 2
-    slot_stride = 3 * dim * committed + 17
-    storage = torch.arange(slots * slot_stride, dtype=torch.float32, device="cuda").to(
-        torch.bfloat16
-    )
-    conv_pool = torch.as_strided(
-        storage,
-        size=(slots, 3 * dim, committed),
-        stride=(slot_stride, committed, 1),
-    )
-
-    def replay_cache() -> torch.Tensor:
-        return torch.full(
-            (slots, committed + num_spec, dim),
-            -1,
-            dtype=torch.float32,
-            device="cuda",
-        ).transpose(-1, -2)
-
-    q_cache, k_cache, v_cache = replay_cache(), replay_cache(), replay_cache()
-    state_indices = torch.tensor([4, 1], dtype=torch.int32, device="cuda")
-    copy_kda_replay_conv_window(
-        conv_pool,
-        q_cache,
-        k_cache,
-        v_cache,
-        state_indices,
-    )
-
-    state_indices_long = state_indices.long()
-    for section, cache in enumerate((q_cache, k_cache, v_cache)):
-        expected = conv_pool.index_select(0, state_indices_long)[
-            :, section * dim : (section + 1) * dim
-        ].float()
-        torch.testing.assert_close(
-            cache.index_select(0, state_indices_long)[:, :, :committed],
-            expected,
-        )
-        assert torch.equal(
-            cache.index_select(0, state_indices_long)[:, :, committed:],
-            torch.full(
-                (state_indices.numel(), dim, num_spec),
-                -1,
-                dtype=cache.dtype,
-                device=cache.device,
-            ),
-        )
-    untouched = torch.ones(slots, dtype=torch.bool, device="cuda")
-    untouched[state_indices_long] = False
-    assert torch.equal(q_cache[untouched], replay_cache()[untouched])
-    assert torch.equal(k_cache[untouched], replay_cache()[untouched])
-    assert torch.equal(v_cache[untouched], replay_cache()[untouched])
 
 
 @torch.no_grad()

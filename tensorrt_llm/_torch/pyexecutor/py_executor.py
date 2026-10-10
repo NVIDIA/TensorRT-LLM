@@ -7469,21 +7469,17 @@ class PyExecutor:
         self.resource_manager.resource_managers[
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
-        # KDA fused-verify replay caches: the ctx->gen state transfer
-        # populates only the base mamba conv/ssm pools; with one-model
-        # spec decoding (e.g. SA) the first forward for these requests
-        # takes the fused verify path, which reads the per-slot
-        # kda_conv_* replay caches instead of the conv pool. Seed them
-        # from the transferred conv states before the first step
-        # (otherwise the recurrent state is permanently contaminated by
-        # a zero/stale conv window; K3 SA-in-disagg GSM8K -0.6pp).
+        # A ctx->gen transfer supplies authoritative KDA Conv and recurrent
+        # checkpoints but no pending replay history. Reset the history
+        # length before the first speculative generation step so stale rows
+        # from a previous slot occupant cannot participate in reconstruction.
         if self.model_engine.enable_spec_decode:
             kv_mgr = self.resource_manager.resource_managers.get(
                 ResourceManagerType.KV_CACHE_MANAGER)
-            seed = getattr(kv_mgr, 'seed_kda_replay_caches_for_disagg_gen',
-                           None)
-            if seed is not None:
-                seed([
+            reset = getattr(kv_mgr, 'reset_kda_replay_history_for_disagg_gen',
+                            None)
+            if reset is not None:
+                reset([
                     req.py_request_id for req in cache_trans_complete_requests
                 ])
 
