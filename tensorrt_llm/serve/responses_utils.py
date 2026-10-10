@@ -2620,45 +2620,6 @@ class ResponsesStreamingProcessor:
         return [self._send_event(event) for event in event_generator]
 
 
-async def process_streaming_events(
-    generator,
-    request: ResponsesRequest,
-    sampling_params: SamplingParams,
-    model_name: str,
-    conversation_store: ConversationHistoryStore,
-    enable_store: bool = False,
-    use_harmony: bool = True,
-    create_time: Optional[int] = None,
-    reasoning_parser: Optional[str] = None,
-    tool_parser: Optional[str] = None,
-) -> AsyncGenerator[str, None]:
-    streaming_processor = ResponsesStreamingProcessor(
-        request=request,
-        sampling_params=sampling_params,
-        model_name=model_name,
-        create_time=create_time,
-        conversation_store=conversation_store,
-        enable_store=enable_store,
-        use_harmony=use_harmony,
-        reasoning_parser=reasoning_parser,
-        tool_parser=tool_parser,
-    )
-
-    initial_responses = streaming_processor.get_initial_responses()
-    for initial_response in initial_responses:
-        yield initial_response
-
-    async for res in generator:
-        final_res = res
-        events = streaming_processor.process_single_output(res)
-        for event in events:
-            yield event
-
-    final_response = await streaming_processor.get_final_response(final_res)
-
-    yield final_response
-
-
 class ServerArrivalTimeMiddleware:
     """
     Custom ASGI middleware to track server arrival time.

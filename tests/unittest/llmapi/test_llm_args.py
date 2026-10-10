@@ -3484,8 +3484,11 @@ class TestServeDefaults:
         with (
                 patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
                       return_value=False),
-                pytest.raises(click.UsageError,
-                              match="num_serve_frontends must be 1"),
+                pytest.raises(
+                    click.UsageError,
+                    match=
+                    "Multiple gRPC frontends require --grpc-protocol openengine"
+                ),
         ):
             serve_main(
                 args=[
@@ -3493,6 +3496,24 @@ class TestServeDefaults:
                 ],
                 standalone_mode=False,
             )
+
+    def test_serve_set_grpc_openengine_uses_multiple_frontends(self) -> None:
+        with (
+                patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                      return_value=False),
+                patch("tensorrt_llm.grpc.openengine.server.launch_server") as
+                mock_launch_server,
+        ):
+            serve_main(
+                args=[
+                    "dummy/model", "--grpc", "--grpc-protocol", "openengine",
+                    "--gpus_per_node", "1", "--set", "num_serve_frontends=2"
+                ],
+                standalone_mode=False,
+            )
+
+        mock_launch_server.assert_called_once()
+        assert mock_launch_server.call_args.args[2]["num_serve_frontends"] == 2
 
     def test_serve_set_does_not_capture_misspelled_options(self) -> None:
         with pytest.raises(click.NoSuchOption):
@@ -3994,6 +4015,8 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
     assert cold_config.model_dump() == {
         "algorithm": "quantization_for_cold_page",
         "quant": "nvfp4",
+        "skip_rope_quantization": False,
+        "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
     }
     assert not cold_config.changes_physical_kv_length
@@ -4009,6 +4032,35 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         },
     ).kv_cache_compression_config
     assert cold_config_with_scales.scale_checkpoint_path == "/tmp/nvfp4-kv-scales"
+
+    for options, expected in [
+        ({
+            "skip_rope_quantization": True
+        }, (True, 64)),
+        ({
+            "nvfp4_residual_dim": 0
+        }, (False, 0)),
+    ]:
+        config = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_compression_config={
+                "algorithm": "quantization_for_cold_page",
+                **options
+            },
+        ).kv_cache_compression_config
+        assert (config.skip_rope_quantization,
+                config.nvfp4_residual_dim) == expected
+        assert ColdPageQuantizationCompressionConfig.model_validate_json(
+            config.model_dump_json()) == config
+    for option in ("skip_rope_quantization", "nvfp4_residual_dim"):
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(
+                model="/tmp/dummy_model",
+                kv_cache_compression_config={
+                    "algorithm": "quantization_for_cold_page",
+                    option: "maybe"
+                },
+            )
 
     with pytest.raises(ValidationError):
         TorchLlmArgs(
