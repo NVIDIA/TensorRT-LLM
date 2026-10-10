@@ -959,8 +959,14 @@ class TestKvCacheManagerV2AutoResolution:
                 backend=backend, transceiver_runtime=runtime),
         )
 
-        with pytest.raises(ValueError, match="requires KV cache manager v2"):
+        with pytest.raises(ValueError) as excinfo:
             _resolve_kv_cache_manager_v2_auto(llm_args, self._RequireV2)
+
+        message = str(excinfo.value)
+        assert self._RequireV2.__name__ in message
+        assert "requires KV cache manager v2" in message
+        assert "backend='NIXL'" in message
+        assert "transceiver_runtime='PYTHON'" in message
 
     def test_required_v2_rejects_explicit_v1(self):
         llm_args = TorchLlmArgs(
