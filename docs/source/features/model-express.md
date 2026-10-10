@@ -29,6 +29,7 @@ profiles:
 | `qwen2-for-causal-lm-bf16-target-v1` | `Qwen2ForCausalLM` | `Qwen2ForCausalLM` / `qwen2` | Target model | 1 | `trtllm-qwen2-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `qwen3-for-causal-lm-bf16-target-v1` | `Qwen3ForCausalLM` | `Qwen3ForCausalLM` / `qwen3` | Target model | 1 | `trtllm-qwen3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused QK-norm/RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 | `mistral-for-causal-lm-bf16-target-v1` | `MistralForCausalLM` | `MistralForCausalLM` / `mistral` | Target model | 1 | `trtllm-mistral-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, no sliding window, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
+| `phi3-for-causal-lm-bf16-target-v1` | `Phi3ForCausalLM` | `Phi3ForCausalLM` / `phi3` | Target model | 1 | `trtllm-phi3-dense-target-layout-v1` | Single-node dense BF16, unquantized weights and KV cache, TRTLLM attention, default fused RoPE, untied embeddings, TP=1 or 2, PP/CP=1, no LoRA, sparse attention, attention DP, speculative mode, or separately loaded draft model |
 
 The registry matches the exact root class, the architecture/model type captured
 from the resolved config before model construction, and any runtime constraints
@@ -53,6 +54,24 @@ model type to `mistral_common`; it cannot be combined with the MX loading path.
 The unregistered Llama-based `MistralForCausalLM` class in `modeling_llama.py`
 shares components with the qualified root but is not qualified.
 
+The Phi3 identity covers dense Hugging Face-format checkpoints that resolve to
+the exact `Phi3ForCausalLM` / `phi3` pair; Phi-4 is the qualified canary.
+Phi-4-reasoning-plus, Phi-3-mini-4k-instruct, and Phi-3-medium-4k-instruct
+declare the same identity with BF16 weights, default RoPE, and untied
+embeddings, so they match the profile under the same runtime constraints. The
+Phi-3 4k configurations set `sliding_window`, but the Phi3 root does not apply
+it: every Phi3 checkpoint runs full attention in TensorRT LLM, so this profile
+does not constrain the sliding window. The 128k-context Phi-3 checkpoints and
+Phi-3.5-mini-instruct use LongRoPE scaling, and Phi-4-mini-instruct also ties
+its embeddings, so these checkpoints do not match the profile. Phi-3-small
+(`Phi3SmallForCausalLM`), the Phi-3 and Phi-3.5 vision models
+(`Phi3VForCausalLM`), Phi-3.5-MoE (`PhiMoEForCausalLM`), and
+Phi-4-multimodal (`Phi4MMForCausalLM`, including its quantized variants) use
+other roots. Phi4MM builds a Phi3 language model internally, but qualification
+matches the outer root, so these checkpoints fall back as well. Phi3 also
+records the runtime `max_seq_len` in its model configuration, so a donor and a
+receiver must use the same `max_seq_len` to match in `SourceIdentity`.
+
 TensorRT LLM applies two independent compatibility gates:
 
 - The qualification profile records that a model/config/lifecycle combination
@@ -71,14 +90,14 @@ standard checkpoint path. Target-plus-draft post-transform transfer remains
 disabled until layout state is tracked and qualified independently for each
 submodel.
 
-The Llama, Qwen2, Qwen3, and Mistral profiles are text-only and do not enable
-reward-model, embedding, MoE, or vision-language roots. FP16, quantized weights
-or KV cache, alternate attention backends, YaRN, tied embeddings, TP greater
-than 2, PP greater than 1, CP greater than 1, LoRA, sparse attention, attention
-DP, multi-node transfer, and speculative decoding require separate
-qualification rows. Each profile also pins its qualified RoPE realization:
-Llama, Qwen2, and Mistral require the default fused RoPE path, so unfused RoPE
-requires separate qualification for them, while Qwen3 fuses RoPE into the
+The Llama, Qwen2, Qwen3, Mistral, and Phi3 profiles are text-only and do not
+enable reward-model, embedding, MoE, or vision-language roots. FP16, quantized
+weights or KV cache, alternate attention backends, YaRN or LongRoPE scaling,
+tied embeddings, TP greater than 2, PP greater than 1, CP greater than 1, LoRA,
+sparse attention, attention DP, multi-node transfer, and speculative decoding
+require separate qualification rows. Each profile also pins its qualified RoPE realization:
+Llama, Qwen2, Mistral, and Phi3 require the default fused RoPE path, so unfused
+RoPE requires separate qualification for them, while Qwen3 fuses RoPE into the
 QK-norm kernel and therefore requires `rope_fusion=False` in the realized
 configuration. The Mistral profile additionally pins the realized attention
 window: every attention layer must run without a sliding window, so
@@ -170,10 +189,12 @@ durations.
 
 Run the TP=2 rank-mapping qualification on four GPUs by selecting
 `llama-bf16-tp2`. `TRTLLM_MX_LLAMA_MODEL` can override the default TinyLlama
-checkpoint path. The Qwen2, Qwen3, and Mistral profile rows use
-`qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`, and
-`mistral-bf16-tp1` / `mistral-bf16-tp2`, with optional model path overrides in
-`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, and `TRTLLM_MX_MISTRAL_MODEL`.
+checkpoint path. The Qwen2, Qwen3, Mistral, and Phi3 profile rows use
+`qwen2-bf16-tp1` / `qwen2-bf16-tp2`, `qwen3-bf16-tp1` / `qwen3-bf16-tp2`,
+`mistral-bf16-tp1` / `mistral-bf16-tp2`, and `phi3-bf16-tp1` /
+`phi3-bf16-tp2`, with optional model path overrides in
+`TRTLLM_MX_QWEN2_MODEL`, `TRTLLM_MX_QWEN3_MODEL`, `TRTLLM_MX_MISTRAL_MODEL`,
+and `TRTLLM_MX_PHI3_MODEL`.
 `TRTLLM_MX_E2E_REQUIRED=1` converts missing service, model, or NIXL
 prerequisites from skips into failures and must be set by a CI qualification
 stage. That stage must also allocate the GPUs declared by the selected test
@@ -316,13 +337,17 @@ path.
 ## Notes and Limitations
 
 - Post-transform MX reception is currently limited to the exact Llama,
-  Qwen2/Qwen2.5 dense, Qwen3 dense, and Mistral dense profiles above. Other
-  roots and variants that do not match the documented identity and runtime
-  envelope safely fall back to Hugging Face loading until explicitly qualified.
+  Qwen2/Qwen2.5 dense, Qwen3 dense, Mistral dense, and Phi3 dense profiles
+  above. Other roots and variants that do not match the documented identity and
+  runtime envelope safely fall back to Hugging Face loading until explicitly
+  qualified.
 - Mistral checkpoints served through the native `mistral` checkpoint format
   (`mistral_common` model type), sliding-window or Ministral `layer_types`
   variants, YaRN variants, Mistral3 vision-language roots, and Mistral Large 3
   are not qualified and use the Hugging Face fallback.
+- Phi LongRoPE variants (128k-context Phi-3, Phi-3.5-mini, and Phi-4-mini),
+  tied-embedding variants, and the Phi-3-small, vision, MoE, and Phi4MM
+  multimodal roots are not qualified and use the Hugging Face fallback.
 - The MX server and Redis lifecycle is external to TensorRT LLM. Every
   TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.

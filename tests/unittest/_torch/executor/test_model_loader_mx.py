@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for MX-specific ModelLoader branches."""
 
+import ast
+import re
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -12,8 +14,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+import yaml
 from torch import nn
-from transformers import LlamaConfig, MistralConfig, Qwen2Config, Qwen3Config
+from transformers import LlamaConfig, MistralConfig, Phi3Config, Qwen2Config, Qwen3Config
 from utils.post_transform_qualification import (
     PostTransformQualificationCase,
     assert_post_transform_lifecycle_equivalent,
@@ -26,6 +29,7 @@ from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
 from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
+from tensorrt_llm._torch.models import modeling_phi3 as modeling_phi3_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
@@ -36,10 +40,12 @@ from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     WEIGHT_MANIFEST_DIR_ENV,
     WEIGHT_MANIFEST_ROLE_ENV,
     ArtifactIdentity,
+    IdentityCheckPolicy,
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
@@ -47,6 +53,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
     PostTransformTransferScope,
+    SourceIdentity,
+    check_weight_sharing_compatibility,
     load_weight_manifest,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -168,6 +176,10 @@ class _UnqualifiedQwen3ForCausalLM(modeling_qwen3_mod.Qwen3ForCausalLM):
 
 
 class _UnqualifiedMistralForCausalLM(modeling_mistral_mod.MistralForCausalLM):
+    pass
+
+
+class _UnqualifiedPhi3ForCausalLM(modeling_phi3_mod.Phi3ForCausalLM):
     pass
 
 
@@ -416,7 +428,71 @@ def _tiny_mistral_model(
     return model
 
 
+def _tiny_phi3_model(
+    *,
+    model_class: type[nn.Module] = modeling_phi3_mod.Phi3ForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
+    sliding_window: int | None = None,
+    max_seq_len: int = 16,
+    rope_scaling: dict[str, object] | None = None,
+    tie_word_embeddings: bool = False,
+) -> nn.Module:
+    """Build a tiny deterministic `Phi3ForCausalLM` for the staged-lifecycle tests.
+
+    Defaults mirror the Phi-4 checkpoint structure: GQA attention, bias-free
+    fused QKV and gate-up projections, default RoPE, and untied embeddings.
+    """
+    phi3_config = Phi3Config(
+        architectures=["Phi3ForCausalLM"],
+        attention_bias=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        hidden_act="silu",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        original_max_position_embeddings=16,
+        pad_token_id=0,
+        rms_norm_eps=1e-5,
+        rope_scaling=rope_scaling,
+        sliding_window=sliding_window,
+        tie_word_embeddings=tie_word_embeddings,
+        torch_dtype=torch.bfloat16,
+        vocab_size=32,
+    )
+    model = model_class(
+        ModelConfig(
+            pretrained_config=phi3_config,
+            mapping=mapping_mod.Mapping(
+                world_size=tp_size,
+                rank=rank,
+                tp_size=tp_size,
+            ),
+            max_num_tokens=16,
+            max_seq_len=max_seq_len,
+        )
+    )
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            values = torch.arange(
+                parameter.numel(),
+                dtype=torch.float32,
+                device=parameter.device,
+            ).reshape(parameter.shape)
+            parameter.copy_(((values + index) % 17).to(parameter.dtype) / 17)
+    return model
+
+
 def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    """Return the runtime config a qualified BF16 dense tiny model realizes at TP1.
+
+    Keyword arguments override individual fields, for example the TP sizes of a
+    TP2 rank or a dimension that a negative test expects the registry to reject.
+    """
     values = {
         "dtype": "bfloat16",
         "quant_algorithm": "none",
@@ -439,8 +515,8 @@ def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "tied_word_embeddings": False,
         "rope_type": "default",
         "rope_fusion": True,
-        # Llama and Qwen attention modules expose no window state, so their real
-        # tiny models realize `None`; Mistral tests override this to `"none"`.
+        # Llama, Qwen, and Phi3 attention modules expose no window state, so their
+        # real tiny models realize `None`; Mistral tests override this to `"none"`.
         "sliding_window": None,
     }
     values.update(overrides)
@@ -492,6 +568,27 @@ def _mistral_layout_state(model: nn.Module) -> dict[str, object]:
         "rope_fusion": layer.self_attn.rope_fusion,
         "rotary_embedding_present": layer.self_attn.rotary_emb is not None,
         "attention_window_size": layer.self_attn.attention_window_size,
+        "tied_lm_head": model.lm_head.weight is model.model.embed_tokens.weight,
+    }
+
+
+def _phi3_layout_state(model: nn.Module) -> dict[str, object]:
+    """Return the Phi3 layout and derived state that a staged receiver must reproduce."""
+    layer = model.model.layers[0]
+    return {
+        "attention_type": type(layer.self_attn).__name__,
+        "qkv_weight_mode": layer.self_attn.qkv_proj.weights_loading_config.weight_mode,
+        "qkv_weight_shape": tuple(layer.self_attn.qkv_proj.weight.shape),
+        "gate_up_weight_mode": layer.mlp.gate_up_proj.weights_loading_config.weight_mode,
+        "gate_up_weight_shape": tuple(layer.mlp.gate_up_proj.weight.shape),
+        "qkv_bias": layer.self_attn.qkv_proj.bias is not None,
+        "rope_fusion": layer.self_attn.rope_fusion,
+        "rotary_embedding_present": layer.self_attn.rotary_emb is not None,
+        # `GatedMLP.post_load_weights()` derives this flag on the full path only;
+        # the staged receiver must keep the same value on every layer.
+        "share_gate_up_quantize": tuple(
+            decoder_layer.mlp._maybe_share_gate_up_quantize for decoder_layer in model.model.layers
+        ),
         "tied_lm_head": model.lm_head.weight is model.model.embed_tokens.weight,
     }
 
@@ -705,6 +802,133 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
             f"{_documented_dense_constraints(profile)} |"
         )
         assert expected_row in table_rows
+
+
+def _repository_text(relative_path: str) -> str:
+    """Read a text file given its path relative to the repository root."""
+    return (Path(__file__).parents[4] / relative_path).read_text(encoding="utf-8")
+
+
+def _mx_e2e_cases() -> dict[str, dict[str, object]]:
+    """Read the donor/receiver `_MX_CASES` rows without importing the integration harness."""
+    module = ast.parse(
+        _repository_text("tests/integration/defs/model_express/test_model_express.py")
+    )
+    (cases,) = (
+        statement.value
+        for statement in module.body
+        if isinstance(statement, ast.Assign)
+        and [ast.unparse(target) for target in statement.targets] == ["_MX_CASES"]
+    )
+    rows: dict[str, dict[str, object]] = {}
+    for param in cases.elts:
+        (case,) = param.args
+        options = {keyword.arg: keyword.value for keyword in param.keywords}
+        row = {keyword.arg: ast.literal_eval(keyword.value) for keyword in case.keywords}
+        assert ast.unparse(options["marks"].func) == "pytest.mark.skip_less_device"
+        row["min_devices"] = ast.literal_eval(options["marks"].args[0])
+        case_id = ast.literal_eval(options["id"])
+        assert case_id not in rows
+        rows[case_id] = row
+    return rows
+
+
+def _l0_model_express_case_ids() -> dict[int, list[str]]:
+    """Map each `l0_model_express.yml` GPU count to its donor/receiver case IDs."""
+    test_db = yaml.safe_load(
+        _repository_text("tests/integration/test_lists/test-db/l0_model_express.yml")
+    )
+    prefix = "model_express/test_model_express.py::test_mx_donor_receiver["
+    case_ids: dict[int, list[str]] = {}
+    for block in test_db["l0_model_express"]:
+        gpu_count = block["condition"]["ranges"]["system_gpu_count"]
+        assert gpu_count["gte"] == gpu_count["lte"]
+        assert gpu_count["gte"] not in case_ids
+        case_ids[gpu_count["gte"]] = [
+            test.removeprefix(prefix).removesuffix("]")
+            for test in block["tests"]
+            if test.startswith(prefix)
+        ]
+    return case_ids
+
+
+def _documented_names(text: str, start: str, end: str) -> set[str]:
+    """Return the leading name of each item enumerated between `start` and `end`."""
+    stop = text.index(end)
+    enumeration = text[text.rindex(start, 0, stop) + len(start) : stop]
+    return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
+
+
+@pytest.mark.cpu_only
+def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
+    """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
+
+    The `_MX_CASES` rows must follow the shared naming scheme, and
+    `l0_model_express.yml` must list each row in the block whose GPU count
+    matches the row's two TP groups.
+    """
+    cases = _mx_e2e_cases()
+    ci_case_ids = _l0_model_express_case_ids()
+    expected_case_ids = set()
+    for profile in ModelLoader._post_transform_profile_registry().profiles:
+        family = profile.profile_id.split("-for-causal-lm-")[0]
+        for tp_size in (1, 2):
+            case_id = f"{family}-bf16-tp{tp_size}"
+            expected_case_ids.add(case_id)
+            assert cases[case_id] == {
+                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
+                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
+                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
+                "tp_size": tp_size,
+                # The donor and the receiver each hold one TP group.
+                "min_devices": 2 * tp_size,
+            }
+            assert case_id in ci_case_ids[2 * tp_size]
+
+    assert set(cases) == expected_case_ids
+    assert set(ci_case_ids) == {2, 4}
+    assert sorted(ci_case_ids[2] + ci_case_ids[4]) == sorted(expected_case_ids)
+
+
+@pytest.mark.cpu_only
+def test_documentation_prose_matches_qualified_profile_registry() -> None:
+    """The ModelExpress doc names exactly the families, cases, and overrides in the registry.
+
+    Checks the text-only family list, the fused-RoPE family list, the
+    limitations list, and the case IDs and `TRTLLM_MX_*_MODEL` variables named
+    in the "Qualification Test" section.
+    """
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+    families = {profile.architecture.removesuffix("ForCausalLM") for profile in profiles}
+    fused_rope_families = {
+        profile.architecture.removesuffix("ForCausalLM")
+        for profile in profiles
+        if profile.runtime_constraints.rope_fusion == frozenset({True})
+    }
+    documentation = _repository_text("docs/source/features/model-express.md")
+    text = " ".join(documentation.split())
+
+    assert _documented_names(text, "The ", " profiles are text-only") == families
+    assert (
+        _documented_names(
+            text,
+            "pins its qualified RoPE realization: ",
+            " require the default fused RoPE path",
+        )
+        == fused_rope_families
+    )
+    assert _documented_names(text, "currently limited to the exact ", " profiles above") == families
+
+    qualification_test = documentation[
+        documentation.index("### Qualification Test") : documentation.index(
+            "### Transform-Layout ABI Rules"
+        )
+    ]
+    cases = _mx_e2e_cases()
+    assert set(re.findall(r"\b[a-z][a-z0-9]*-bf16-tp\d+\b", qualification_test)) == set(cases)
+    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9]+_MODEL\b", qualification_test)) == {
+        row["model_env"] for row in cases.values()
+    }
 
 
 @pytest.mark.cpu_only
@@ -1380,6 +1604,214 @@ def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
     assert decision.reason is PostTransformQualificationReason.MODEL_TYPE_NOT_REGISTERED
 
 
+def test_phi3_dense_profile_qualifies_full_staged_lifecycle() -> None:
+    """A TP1 Phi3 staged receiver matches the full post-load producer and qualifies."""
+    case = PostTransformQualificationCase(
+        profile_id="phi3-for-causal-lm-bf16-target-v1",
+        model_factory=_tiny_phi3_model,
+        unqualified_model_factory=lambda: _tiny_phi3_model(model_class=_UnqualifiedPhi3ForCausalLM),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _phi3_layout_state),),
+        output_probes=(
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        producer,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+    assert decision.transform_abi_id == PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert (
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
+        == _bf16_dense_runtime_config()
+    )
+    assert _phi3_layout_state(producer) == {
+        "attention_type": modeling_phi3_mod.Phi3Attention.__name__,
+        "qkv_weight_mode": WeightMode.FUSED_QKV_LINEAR,
+        "qkv_weight_shape": (32, 16),
+        "gate_up_weight_mode": WeightMode.FUSED_GATE_UP_LINEAR,
+        "gate_up_weight_shape": (64, 16),
+        "qkv_bias": False,
+        "rope_fusion": True,
+        "rotary_embedding_present": False,
+        "share_gate_up_quantize": (False, False),
+        "tied_lm_head": False,
+    }
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_phi3_dense_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+) -> None:
+    """Each TP2 rank's Phi3 staged receiver matches its full post-load producer."""
+    monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(distributed_mod, "AllReduce", _AllReduceStub)
+    case = PostTransformQualificationCase(
+        profile_id="phi3-for-causal-lm-bf16-target-v1",
+        model_factory=lambda: _tiny_phi3_model(tp_size=2, rank=rank),
+        unqualified_model_factory=lambda: _tiny_phi3_model(
+            model_class=_UnqualifiedPhi3ForCausalLM,
+            tp_size=2,
+            rank=rank,
+        ),
+        qualify_model=lambda model: ModelLoader._qualify_post_transform_profile(
+            model,
+            speculative_mode=None,
+            loads_draft_weights=False,
+        ),
+        state_probes=(("layout", _phi3_layout_state),),
+        output_probes=(
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("fused-gate-up", _dense_fused_gate_up_output),
+        ),
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert producer.model_config.mapping.tp_rank == rank
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _bf16_dense_runtime_config(
+        tp_size=2,
+        moe_tp_size=2,
+        attention_tp_size=2,
+    )
+    assert _phi3_layout_state(producer)["qkv_weight_shape"] == (16, 16)
+    assert _phi3_layout_state(producer)["gate_up_weight_shape"] == (32, 16)
+
+
+def test_phi3_dense_profile_rejects_unregistered_subclass_root() -> None:
+    """An otherwise identical subclass must not inherit the exact-root profile."""
+    decision = ModelLoader._qualify_post_transform_profile(
+        _tiny_phi3_model(model_class=_UnqualifiedPhi3ForCausalLM),
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+
+
+def test_phi3_dense_profile_realizes_configured_window_as_full_attention() -> None:
+    """A configured `sliding_window` still realizes full attention and qualifies.
+
+    Phi-3 4k checkpoints configure `sliding_window`, but the Phi3 root runs full
+    attention, so their realized runtime matches the qualified profile.
+    """
+    model = _tiny_phi3_model(sliding_window=8)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert model.config.sliding_window == 8
+    assert (
+        PostTransformRuntimeConfig.from_model_config(model.model_config, model=model)
+        == _bf16_dense_runtime_config()
+    )
+    assert decision.qualified
+    assert decision.profile is not None
+    assert decision.profile.profile_id == "phi3-for-causal-lm-bf16-target-v1"
+
+
+@pytest.mark.parametrize(
+    "variant, expected_dimension",
+    [
+        pytest.param(
+            # Phi-3 128k, Phi-3.5-mini, and Phi-4-mini checkpoints use LongRoPE.
+            {
+                "rope_scaling": {
+                    "rope_type": "longrope",
+                    "short_factor": [1.0, 1.0],
+                    "long_factor": [2.0, 2.0],
+                }
+            },
+            "rope_type",
+            id="longrope",
+        ),
+        pytest.param({"tie_word_embeddings": True}, "tied_word_embeddings", id="tied-embeddings"),
+    ],
+)
+def test_phi3_dense_profile_rejects_longrope_and_tied_embedding_variants(
+    variant: dict[str, object],
+    expected_dimension: str,
+) -> None:
+    """LongRoPE and tied-embedding Phi3 variants fall outside the profile's constraints."""
+    model = _tiny_phi3_model(**variant)
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset({expected_dimension})
+
+
+def test_phi3_source_identity_binds_runtime_max_seq_len() -> None:
+    """Phi3 donors and receivers with different `max_seq_len` values do not share.
+
+    `Phi3Attention` records the runtime `max_seq_len` in the pretrained config,
+    which `SourceIdentity` hashes, so a donor and a receiver must agree on it.
+    """
+    identities = []
+    for max_seq_len in (16, 32):
+        model = _tiny_phi3_model(max_seq_len=max_seq_len)
+        assert model.config.max_seq_len == max_seq_len
+        identities.append(
+            SourceIdentity.from_model_config(
+                model.model_config,
+                model,
+                artifact_identity=_SOURCE_IDENTITY.artifact_identity,
+                transform_abi_id=PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+            )
+        )
+
+    decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
+
+    assert not decision.should_share
+    assert "model_fingerprint" in decision.match_result.mismatched_fields
+
+
+@pytest.mark.cpu_only
+def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
+    """The Phi4MM root does not qualify through its nested Phi3 language model.
+
+    Phi4MM builds a nested `Phi3ForCausalLM` language model under its own root,
+    and qualification matches the outer root class.
+    """
+    phi4mm_root = get_registered_model_class("Phi4MMForCausalLM")
+    assert phi4mm_root is not None
+
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=phi4mm_root,
+        architecture="Phi3ForCausalLM",
+        model_type="phi3",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_bf16_dense_runtime_config(),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "overrides, expected_dimensions",
@@ -1478,6 +1910,14 @@ def test_mistral_dense_profile_rejects_native_format_model_type() -> None:
             "none",
             id="mistral",
         ),
+        pytest.param(
+            modeling_phi3_mod.Phi3ForCausalLM,
+            "Phi3ForCausalLM",
+            "phi3",
+            True,
+            None,
+            id="phi3",
+        ),
     ],
 )
 def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
@@ -1489,6 +1929,7 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
+    """Each dense profile rejects runtime variants outside its qualified constraints."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -1552,6 +1993,14 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
             "sliding_window",
             id="mistral-sliding-window",
         ),
+        pytest.param(
+            modeling_phi3_mod.Phi3ForCausalLM,
+            "Phi3ForCausalLM",
+            "phi3",
+            {"rope_fusion": False},
+            "rope_fusion",
+            id="phi3-unfused-rope",
+        ),
     ],
 )
 def test_bf16_dense_profiles_reject_wrong_realized_dimension(
@@ -1561,6 +2010,7 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
     realized_overrides: dict[str, object],
     expected_dimension: str,
 ) -> None:
+    """Each dense profile rejects a realized RoPE fusion or window it was not qualified for."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -1627,6 +2077,14 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
             "none",
             id="mistral",
         ),
+        pytest.param(
+            modeling_phi3_mod.Phi3ForCausalLM,
+            "Phi3ForCausalLM",
+            "phi3",
+            True,
+            None,
+            id="phi3",
+        ),
     ],
 )
 def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
@@ -1637,6 +2095,7 @@ def test_bf16_dense_profiles_ignore_moe_only_runtime_dimensions(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
+    """Dense profiles still qualify when only MoE-specific runtime dimensions differ."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
