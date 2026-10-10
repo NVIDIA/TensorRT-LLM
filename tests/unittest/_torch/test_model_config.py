@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import struct
 import types
@@ -115,6 +118,7 @@ def _make_kv_cache_config(
     return types.SimpleNamespace(
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         cross_kv_cache_fraction=cross_kv_cache_fraction,
+        enable_block_reuse=True,
     )
 
 

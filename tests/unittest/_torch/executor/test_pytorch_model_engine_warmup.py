@@ -108,6 +108,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         trust_remote_code=False,
         disable_overlap_scheduler=True,
         kv_cache_config=KvCacheConfig(),
+        sleep_config=None,
         enable_layerwise_nvtx_marker=False,
         cuda_graph_config=None,
         torch_compile_config=compile_config if compile_enabled else None,

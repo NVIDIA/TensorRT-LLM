@@ -59,14 +59,6 @@ if TYPE_CHECKING:
     from .kv_cache_layout import KvCacheLayout
 
 
-# `logger.warning_once` key for the KVCacheManagerV2 retention diagnostic
-# emitted by `KvCacheConnectorSchedulerOutputRequest.update_and_build_data`.
-# `log_once` marks a key as seen before consulting the log level
-# (tensorrt_llm/logger.py:284-287), so the key survives a run that printed
-# nothing; a test that wants to observe the warning has to clear it first.
-V2_RETENTION_IGNORED_LOG_KEY = "kv_connector_v2_retention_config_ignored"
-
-
 # Used to store data for a single inflight request.
 @dataclass
 class RequestData:
@@ -628,28 +620,13 @@ class KvCacheConnectorSchedulerOutputRequest:
                 req
             )  # Specdec with draft tokens is not supported yet.
 
-        # Get retention priority for each new block only if retention config is
-        # provided (for priority-based offload filtering). Priorities stay None
-        # under KVCacheManagerV2, which honours no `KvCacheRetentionConfig`:
-        # every page carries the default there, so reporting a priority would
-        # misdescribe what the user asked for. Warn rather than report nothing
-        # in silence -- the user configured retention and it is not in effect.
+        # V2 does not honour KvCacheRetentionConfig, so it cannot provide
+        # per-block retention priorities for connector offload filtering.
         priorities = None
-        if req.kv_cache_retention_config is not None:
-            if is_v2:
-                logger.warning_once(
-                    "KvCacheRetentionConfig has no effect in this configuration: no "
-                    "per-block retention priority is honoured, so RequestData.priorities is "
-                    "reported as None and a connector cannot filter offloads by priority. Set "
-                    "kv_cache_config.use_kv_cache_manager_v2=False to keep retention "
-                    "priorities on the connector path.",
-                    key=V2_RETENTION_IGNORED_LOG_KEY,
-                )
-            else:
-                priorities = [
-                    kv_cache_manager.get_priority_by_block_id(block_id)
-                    for block_id in new_block_ids
-                ]
+        if not is_v2 and req.kv_cache_retention_config is not None:
+            priorities = [
+                kv_cache_manager.get_priority_by_block_id(block_id) for block_id in new_block_ids
+            ]
 
         return RequestData(
             req.request_id,

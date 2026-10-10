@@ -870,10 +870,8 @@ class TestKvCacheManagerV2AutoResolution:
         with pytest.raises(AttributeError, match="instance is frozen"):
             config.attn_backend = "TRTLLM"
 
-    @pytest.mark.parametrize("explicit_auto", [False, True])
-    def test_auto_uses_model_preference(self, explicit_auto):
-        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
-                           if explicit_auto else KvCacheConfig())
+    def test_auto_uses_model_preference(self):
+        kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2="auto")
         llm_args = TorchLlmArgs(model="/tmp/dummy_model",
                                 kv_cache_config=kv_cache_config)
 
@@ -882,7 +880,10 @@ class TestKvCacheManagerV2AutoResolution:
         assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
 
     def test_auto_without_preference_falls_back_to_v1(self):
-        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
+        )
 
         _resolve_kv_cache_manager_v2_auto(llm_args)
 
@@ -899,6 +900,7 @@ class TestKvCacheManagerV2AutoResolution:
     def test_auto_v2_falls_back_for_incompatible_disagg(self, backend, runtime):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(
                 backend=backend, transceiver_runtime=runtime),
         )
@@ -910,6 +912,7 @@ class TestKvCacheManagerV2AutoResolution:
     def test_auto_v2_keeps_python_nixl_preference(self):
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(
                 backend="NIXL", transceiver_runtime="PYTHON"),
         )
@@ -1042,7 +1045,7 @@ def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_config == BlockReuseConfig()
     assert KvCacheConfig().enable_swa_scratch_reuse is False
-    assert KvCacheConfig().use_kv_cache_manager_v2 == "auto"
+    assert KvCacheConfig().use_kv_cache_manager_v2 is True
     assert KvCacheConfig(
         use_kv_cache_manager_v2=True).use_kv_cache_manager_v2 is True
     assert KvCacheConfig(
@@ -1173,8 +1176,9 @@ def test_KvCacheConfig_swa_endpoint_rewind_requires_reuse_and_v2(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("preference", [None, "V1", "V2"])
-def test_swa_endpoint_rewind_auto_manager_selection(
-        preference: str | None) -> None:
+@pytest.mark.parametrize("auto_select", [False, True], ids=["default", "auto"])
+def test_swa_endpoint_rewind_manager_selection(preference: str | None,
+                                               auto_select: bool) -> None:
 
     class Model:
 
@@ -1183,11 +1187,16 @@ def test_swa_endpoint_rewind_auto_manager_selection(
                 config: object) -> str | None:
             return preference
 
-    args = TorchLlmArgs(
-        model="dummy",
-        kv_cache_config=KvCacheConfig(block_reuse_config=BlockReuseConfig(
-            swa_endpoint_rewind_tokens=1024)))
-    if preference == "V2":
+    config: dict[str, Any] = {
+        "block_reuse_config": {
+            "swa_endpoint_rewind_tokens": 1024
+        }
+    }
+    if auto_select:
+        config["use_kv_cache_manager_v2"] = "auto"
+    args = TorchLlmArgs(model="dummy",
+                        kv_cache_config=KvCacheConfig.model_validate(config))
+    if not auto_select or preference == "V2":
         assert _resolve_kv_cache_manager_v2_auto(args, Model) is True
     else:
         with pytest.raises(ValueError, match="swa_endpoint_rewind_tokens"):
@@ -4680,15 +4689,17 @@ class TestTransceiverRuntimeAutoResolution:
     """Tests for the transceiver_runtime 'auto' selection mechanism."""
 
     def _disagg_args(self, backend="NIXL", **cfg_kwargs):
+        cfg_kwargs.setdefault("transceiver_runtime", "auto")
         return TorchLlmArgs(
             model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
             cache_transceiver_config=CacheTransceiverConfig(backend=backend,
                                                             **cfg_kwargs),
         )
 
-    def test_default_is_auto(self):
+    def test_default_is_python(self):
         cfg = CacheTransceiverConfig(backend="NIXL")
-        assert cfg.transceiver_runtime == "auto"
+        assert cfg.transceiver_runtime == "PYTHON"
 
     def test_auto_no_model_preference_defaults_to_python(self) -> None:
         """'auto' with no model preference resolves to the Python transceiver."""
@@ -4696,11 +4707,9 @@ class TestTransceiverRuntimeAutoResolution:
         _resolve_transceiver_runtime_auto(args)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
-    @pytest.mark.parametrize("explicit_auto", [False, True])
-    def test_model_preference_adopted(self, explicit_auto):
-        """Model preference applies whether 'auto' is implicit or explicit."""
-        cfg_kwargs = {"transceiver_runtime": "auto"} if explicit_auto else {}
-        args = self._disagg_args(**cfg_kwargs)
+    def test_explicit_auto_adopts_model_preference(self):
+        """An explicit 'auto' adopts the model preference."""
+        args = self._disagg_args()
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
@@ -4818,7 +4827,7 @@ class TestTransceiverRuntimeAutoResolution:
         )
         _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
         assert args.cache_transceiver_config.backend is None
-        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
     def test_invalid_model_preference_raises(self):
 
@@ -5083,7 +5092,8 @@ class TestDeepseekRuntimePreferences:
             DeepseekV3ForCausalLM
         args = TorchLlmArgs(
             model="/tmp/dummy_model",
-            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="auto"),
         )
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)

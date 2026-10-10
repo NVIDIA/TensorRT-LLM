@@ -802,6 +802,9 @@ def _create_py_executor(
             model_weights_restore_mode=model_weights_restore_mode,
         )
 
+    # Model loading can disable reuse after runtime features were created.
+    _set_model_engines_cache_reuse([model_engine],
+                                   kv_cache_config.enable_block_reuse)
     validate_feature_combination(llm_args, model_engine)
 
     calibrator = get_calibrator()
@@ -1000,11 +1003,11 @@ def _create_py_executor(
             f"Initializing kv connector with config: {kv_connector_config}")
 
         # `use_kv_cache_manager_v2` is tri-state and under "auto" the manager is
-        # not chosen until model loading, so the manager-dependent rejections
-        # below fire here only when the config names the manager outright,
-        # sparing an explicit config a model load it cannot use.
-        # `_maybe_init_kv_connector_manager` repeats them against the manager
-        # that was actually built.
+        # not chosen until model loading, so the manager-dependent
+        # rejections below fire here when the config selects a boolean value,
+        # including the default True, sparing it a model load it cannot use.
+        # `_maybe_init_kv_connector_manager` repeats them against the
+        # manager that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
         # Rejected draft tokens shrink a request's page list, and the freed slot

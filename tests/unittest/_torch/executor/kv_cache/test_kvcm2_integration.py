@@ -1488,6 +1488,7 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
 def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     """A manager wired just far enough to run the publish/history bookkeeping."""
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELFKONLY
     manager.enable_block_reuse = True
     manager.is_draft = False
     manager._can_publish_block_reuse = True

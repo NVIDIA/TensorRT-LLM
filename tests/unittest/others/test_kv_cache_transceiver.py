@@ -8,6 +8,8 @@ import sys
 import time
 import uuid
 import weakref
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,14 +22,16 @@ os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._torch.disaggregation import \
+    kv_cache_transceiver as transceiver_module
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     create_kv_cache_transceiver,
     maybe_enable_fabric_memory_for_python_transceiver)
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import \
-    MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -88,6 +92,88 @@ def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
                                     attention_type=AttentionTypeCpp.DEFAULT,
                                     cache_transceiver_config=config,
                                     mamba_cache_manager=mixed_manager)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime", [None, "CPP", "auto"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"])
+@pytest.mark.parametrize("manager_cls",
+                         [KVCacheManagerV2, MambaHybridCacheManagerV2])
+def test_cpp_transceiver_rejects_v2_manager(monkeypatch, runtime, backend,
+                                            manager_cls) -> None:
+    config = CacheTransceiverConfig(backend=backend,
+                                    transceiver_runtime=runtime)
+    manager = object.__new__(manager_cls)
+    constructor = Mock()
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
+                        constructor)
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+
+    with pytest.raises(ValueError,
+                       match=r"kv_cache_config.use_kv_cache_manager_v2=False"):
+        create_kv_cache_transceiver(
+            mapping=None,
+            dist=None,
+            kv_cache_manager=manager,
+            attention_type=AttentionTypeCpp.DEFAULT,
+            cache_transceiver_config=config,
+            mamba_cache_manager=(manager if manager_cls
+                                 is MambaHybridCacheManagerV2 else None))
+
+    constructor.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("runtime,manager_cls", [
+    ("CPP", KVCacheManager),
+    (None, KVCacheManager),
+    ("PYTHON", KVCacheManager),
+    ("PYTHON", KVCacheManagerV2),
+])
+def test_transceiver_accepts_compatible_manager(monkeypatch, runtime,
+                                                manager_cls) -> None:
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=runtime)
+    manager = object.__new__(manager_cls)
+    cpp_constructor = Mock()
+    python_constructor = Mock()
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver",
+                        cpp_constructor)
+    monkeypatch.setitem(
+        sys.modules, "tensorrt_llm._torch.disaggregation.transceiver",
+        SimpleNamespace(KvCacheTransceiverV2=python_constructor))
+    monkeypatch.delenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", raising=False)
+    monkeypatch.setattr(transceiver_module,
+                        "_disagg_inflight_cancel_enabled_cache", None)
+
+    result = create_kv_cache_transceiver(
+        mapping=None,
+        dist=None,
+        kv_cache_manager=manager,
+        attention_type=AttentionTypeCpp.DEFAULT,
+        cache_transceiver_config=config)
+
+    expected = python_constructor if runtime == "PYTHON" else cpp_constructor
+    unused = cpp_constructor if runtime == "PYTHON" else python_constructor
+    assert result is expected.return_value
+    expected.assert_called_once()
+    unused.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+def test_python_transceiver_backend_error_explains_v1(backend) -> None:
+    config = CacheTransceiverConfig(backend=backend)
+
+    with pytest.raises(
+            ValueError,
+            match=r"transceiver_runtime='CPP'.*use_kv_cache_manager_v2=False"):
+        create_kv_cache_transceiver(mapping=None,
+                                    dist=None,
+                                    kv_cache_manager=None,
+                                    attention_type=AttentionTypeCpp.DEFAULT,
+                                    cache_transceiver_config=config)
 
 
 def create_kv_cache_manager(mapping,
@@ -415,6 +501,7 @@ def test_cancel_request_in_transmission(attention_type):
     kv_cache_manager_gen = create_kv_cache_manager(mapping, gen_kv_cache_dtype)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
 
     kv_cache_transceiver_ctx = create_kv_cache_transceiver(
@@ -486,6 +573,7 @@ def test_async_transfer_keeps_llm_request_alive():
     kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -612,7 +700,10 @@ def test_kv_transfer_timeout_warns_once_per_request(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(
-        backend="DEFAULT", max_tokens_in_buffer=512, kv_transfer_timeout_ms=100)
+        backend="DEFAULT",
+        transceiver_runtime="CPP",
+        max_tokens_in_buffer=512,
+        kv_transfer_timeout_ms=100)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
                                                   AttentionTypeCpp.DEFAULT,
@@ -661,6 +752,7 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
     kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
 
     cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+                                                      transceiver_runtime="CPP",
                                                       max_tokens_in_buffer=512)
     transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
                                                   kv_cache_manager_ctx,
@@ -698,6 +790,7 @@ def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
 
     cache_transceiver_config = CacheTransceiverConfig(
         backend="DEFAULT",
+        transceiver_runtime="CPP",
         max_tokens_in_buffer=512,
         kv_transfer_timeout_ms=100,
         kv_transfer_sender_future_timeout_ms=10)

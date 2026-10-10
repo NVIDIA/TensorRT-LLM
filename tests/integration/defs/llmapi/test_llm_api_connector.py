@@ -30,10 +30,12 @@ import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorManager,
-    KvCacheConnectorWorker, PrefixLoad, SchedulerOutput)
+    KvCacheConnectorManager, KvCacheConnectorWorker, PrefixLoad,
+    SchedulerOutput)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.py_executor import \
+    _V2_RETENTION_IGNORED_LOG_KEY
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           CapacitySchedulerPolicy,
@@ -1379,7 +1381,8 @@ def test_connector_warns_that_retention_is_ignored_on_v2(
     # test's own emission instead of the leftovers of test ordering.
     previous_level = trtllm_logger_singleton.level
     trtllm_logger_singleton.set_level("warning")
-    trtllm_logger_singleton._appeared_keys.discard(V2_RETENTION_IGNORED_LOG_KEY)
+    trtllm_logger_singleton._appeared_keys.discard(
+        _V2_RETENTION_IGNORED_LOG_KEY)
 
     # The TensorRT-LLM logger sets `propagate = False`, so caplog only sees its
     # records once its handler is attached to that logger by name.
