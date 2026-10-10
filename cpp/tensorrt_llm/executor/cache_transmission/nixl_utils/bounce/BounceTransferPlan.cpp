@@ -19,7 +19,11 @@
 
 #include "tensorrt_llm/common/assert.h"
 
+#include <algorithm>
+#include <iterator>
 #include <limits>
+#include <utility>
+#include <vector>
 
 namespace tensorrt_llm::executor::kv_cache::bounce
 {
@@ -29,10 +33,32 @@ namespace
 // 32-byte alignment is enough for memory-coalesced vectorized copies and imposes no stricter
 // requirement than the underlying registered memory already has.
 constexpr std::uint64_t kAlignment = 32ULL;
+constexpr std::uint64_t kMaxDescBytes = std::numeric_limits<std::uint32_t>::max();
+// Caps the per-desc arrays reserved up front for a new chunk (16384 descs ~ 448 KiB over the four arrays).
+// The plan lives until the request's last ACK, so finish() trims arrays the estimate left under half full.
+constexpr std::size_t kMaxReservedDescsPerChunk = 16384;
 
 constexpr std::uint64_t alignUp(std::uint64_t value, std::uint64_t align) noexcept
 {
     return (value + align - 1ULL) / align * align;
+}
+
+template <typename T>
+void shrinkIfUnderHalfFull(std::vector<T>& v)
+{
+    if (v.capacity() > 2 * v.size())
+    {
+        v.shrink_to_fit();
+    }
+}
+
+template <typename Fn>
+void forEachDescArray(BounceChunk& chunk, Fn&& fn)
+{
+    fn(chunk.srcPtrs);
+    fn(chunk.dstPtrs);
+    fn(chunk.sizes);
+    fn(chunk.bounceOffsets);
 }
 
 // Build the chunk's coalesced scatter view (see BounceScatterRun). Greedy single pass; per desc,
@@ -88,10 +114,147 @@ void buildScatterRuns(BounceChunk& chunk)
         chunk.scatterRuns.push_back(BounceScatterRun{bounce, dst, 0, 0, size, 1});
     }
 }
+
+struct PlanLimits
+{
+    std::size_t maxChunkSizeBytes;
+    std::size_t maxDescsPerChunk;
+    std::uint32_t sourceDeviceId;
+    std::uint32_t destinationDeviceId;
+};
+
+bool fitsLimits(MemoryDesc const& src, MemoryDesc const& dst, PlanLimits const& limits)
+{
+    return src.getLen() == dst.getLen() && src.getDeviceId() == limits.sourceDeviceId
+        && dst.getDeviceId() == limits.destinationDeviceId && src.getLen() <= limits.maxChunkSizeBytes;
+}
+
+void throwLimitViolation(MemoryDesc const& src, MemoryDesc const& dst, std::size_t index, PlanLimits const& limits)
+{
+    TLLM_CHECK_WITH_INFO(src.getLen() == dst.getLen(), "BounceTransferPlan: src/dst len mismatch at idx %zu", index);
+    TLLM_CHECK_WITH_INFO(src.getDeviceId() == limits.sourceDeviceId,
+        "BounceTransferPlan: mixed source device ids are unsupported (idx %zu has %u, expected %u)", index,
+        src.getDeviceId(), limits.sourceDeviceId);
+    TLLM_CHECK_WITH_INFO(dst.getDeviceId() == limits.destinationDeviceId,
+        "BounceTransferPlan: mixed destination device ids are unsupported (idx %zu has %u, expected %u)", index,
+        dst.getDeviceId(), limits.destinationDeviceId);
+    TLLM_CHECK_WITH_INFO(src.getLen() <= limits.maxChunkSizeBytes,
+        "BounceTransferPlan: single desc (%zu B) exceeds maxChunkSizeBytes (%zu B)", src.getLen(),
+        limits.maxChunkSizeBytes);
+}
+
+void appendDesc(
+    BounceChunk& chunk, std::uint64_t srcAddr, std::uint64_t dstAddr, std::size_t len, std::uint64_t bounceOffset)
+{
+    chunk.srcPtrs.push_back(srcAddr);
+    chunk.dstPtrs.push_back(dstAddr);
+    chunk.sizes.push_back(static_cast<std::uint32_t>(len));
+    chunk.bounceOffsets.push_back(bounceOffset);
+    chunk.totalBytes += len;
+    chunk.packedBytes = bounceOffset + len;
+}
+
+// One desc instead of two shrinks the gather plan, the scatter runs and the wire messages.
+void extendLastDesc(BounceChunk& chunk, std::size_t len)
+{
+    chunk.sizes.back() += static_cast<std::uint32_t>(len);
+    chunk.totalBytes += len;
+    chunk.packedBytes += len;
+}
+
+// Descs a new chunk will likely hold, assuming the descs ahead look like its first one (KV transfers are
+// uniform). Sizes the chunk's arrays once instead of growing them by doubling; a wrong guess costs a
+// regrow or slack, never correctness.
+std::size_t estimateDescsInChunk(std::size_t firstDescLen, std::size_t descsLeft, PlanLimits const& limits)
+{
+    std::size_t const fitByBytes = limits.maxChunkSizeBytes / alignUp(firstDescLen, kAlignment) + 1;
+    return std::min({limits.maxDescsPerChunk, descsLeft, fitByBytes, kMaxReservedDescsPerChunk});
+}
+
+// Completes `chunk`, hands it over and leaves `chunk` empty for the next one.
+BounceChunk finishChunk(BounceChunk& chunk, PlanLimits const& limits)
+{
+    chunk.dstDeviceId = limits.destinationDeviceId;
+    chunk.maxDescBytes = *std::max_element(chunk.sizes.begin(), chunk.sizes.end());
+    buildScatterRuns(chunk);
+    forEachDescArray(chunk, [](auto& descArray) { shrinkIfUnderHalfFull(descArray); });
+    return std::exchange(chunk, BounceChunk{});
+}
+
+struct RangePlan
+{
+    std::vector<BounceChunk> chunks;
+    std::uint64_t totalBytes{0};
+    std::size_t totalDescs{0};
+};
+
+// Plans descs [begin, end) from a fresh chunk, so the plans of consecutive ranges concatenate into a valid
+// plan (only a merge across the boundary is lost). Throws at the range's first desc that breaks a limit.
+RangePlan planRange(std::vector<MemoryDesc> const& srcVec, std::vector<MemoryDesc> const& dstVec, std::size_t begin,
+    std::size_t end, PlanLimits const& limits)
+{
+    RangePlan out;
+    BounceChunk chunk;
+    // The packing state stays in locals: held in an object next to the chunk's vectors (a ChunkBuilder
+    // class was tried), it made the plan build ~12% slower per desc.
+    std::uint64_t cursor = 0; // aligned offset of the next desc in the chunk's bounce region
+    std::uint64_t lastSrcEnd = 0;
+    std::uint64_t lastDstEnd = 0;
+    for (std::size_t i = begin; i < end; ++i)
+    {
+        MemoryDesc const& src = srcVec[i];
+        MemoryDesc const& dst = dstVec[i];
+        if (TLLM_UNLIKELY(!fitsLimits(src, dst, limits)))
+        {
+            throwLimitViolation(src, dst, i, limits);
+        }
+        std::size_t const len = src.getLen();
+        out.totalDescs += 1;
+        out.totalBytes += len;
+        if (len == 0)
+        {
+            continue;
+        }
+        std::uint64_t const srcAddr = src.getAddr();
+        std::uint64_t const dstAddr = dst.getAddr();
+        bool const fitsInChunk = cursor + len <= limits.maxChunkSizeBytes;
+        bool const noPaddingAfterLastDesc = cursor == chunk.packedBytes;
+        bool const continuesLastDesc = !chunk.srcPtrs.empty() && fitsInChunk && srcAddr == lastSrcEnd
+            && dstAddr == lastDstEnd && noPaddingAfterLastDesc
+            && std::uint64_t{chunk.sizes.back()} + len <= kMaxDescBytes;
+        if (continuesLastDesc)
+        {
+            extendLastDesc(chunk, len);
+        }
+        else
+        {
+            bool const chunkFull = !fitsInChunk || chunk.srcPtrs.size() >= limits.maxDescsPerChunk;
+            if (!chunk.srcPtrs.empty() && chunkFull)
+            {
+                out.chunks.push_back(finishChunk(chunk, limits));
+                cursor = 0;
+            }
+            if (chunk.srcPtrs.empty())
+            {
+                std::size_t const expectedDescs = estimateDescsInChunk(len, /*descsLeft=*/end - i, limits);
+                forEachDescArray(chunk, [expectedDescs](auto& descArray) { descArray.reserve(expectedDescs); });
+            }
+            appendDesc(chunk, srcAddr, dstAddr, len, /*bounceOffset=*/cursor);
+        }
+        cursor = alignUp(chunk.packedBytes, kAlignment);
+        lastSrcEnd = srcAddr + len;
+        lastDstEnd = dstAddr + len;
+    }
+    if (!chunk.srcPtrs.empty())
+    {
+        out.chunks.push_back(finishChunk(chunk, limits));
+    }
+    return out;
+}
 } // namespace
 
 BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-    std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk)
+    std::size_t maxChunkSizeBytes, std::size_t maxDescsPerChunk, std::size_t segments, HostWorkerPool* pool)
 {
     BounceTransferPlan plan;
 
@@ -99,8 +262,8 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     auto const& dstVec = dstDescs.getDescs();
     TLLM_CHECK_WITH_INFO(srcVec.size() == dstVec.size(), "BounceTransferPlan: src/dst desc count mismatch (%zu vs %zu)",
         srcVec.size(), dstVec.size());
-    TLLM_CHECK_WITH_INFO(maxChunkSizeBytes > 0 && maxDescsPerChunk > 0,
-        "BounceTransferPlan: maxChunkSizeBytes/maxDescsPerChunk must be > 0");
+    TLLM_CHECK_WITH_INFO(maxChunkSizeBytes > 0 && maxDescsPerChunk > 0 && segments > 0,
+        "BounceTransferPlan: maxChunkSizeBytes/maxDescsPerChunk/segments must be > 0");
     // A chunk's packed size flows through 32-bit fields on the wire (Grant.len, WANT chunk sizes,
     // scatter entry size, Posted.writeBytes), so a chunk must fit in 32 bits. Arena offsets are
     // 64-bit (arena may exceed 4 GiB) but a single staging chunk above 4 GiB is nonsensical.
@@ -108,93 +271,32 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
         "BounceTransferPlan: maxChunkSizeBytes (%zu) must be <= 4 GiB (chunk size is 32-bit on the wire)",
         maxChunkSizeBytes);
 
-    if (srcVec.empty())
+    std::size_t const descCount = srcVec.size();
+    if (descCount == 0)
     {
-        return plan; // 0 descs -> 0 chunks
+        return plan;
     }
 
-    auto const sourceDeviceId = srcVec.front().getDeviceId();
-    auto const destinationDeviceId = dstVec.front().getDeviceId();
-    BounceChunk current;
-    current.dstDeviceId = destinationDeviceId;
-    std::uint64_t cursor = 0; // running write offset within the current chunk region (aligned)
+    PlanLimits const limits{
+        maxChunkSizeBytes, maxDescsPerChunk, srcVec.front().getDeviceId(), dstVec.front().getDeviceId()};
+    std::size_t const segmentCount = std::min(segments, descCount);
+    std::vector<RangePlan> parts(segmentCount);
+    forEachSegment(pool, descCount, segmentCount,
+        [&](std::size_t segment, std::size_t begin, std::size_t end)
+        { parts[segment] = planRange(srcVec, dstVec, begin, end, limits); });
 
-    auto flush = [&]()
+    std::size_t chunkCount = 0;
+    for (auto const& part : parts)
     {
-        if (!current.srcPtrs.empty())
-        {
-            buildScatterRuns(current);
-            plan.mChunks.emplace_back(std::move(current));
-            current = BounceChunk{};
-            cursor = 0;
-        }
-    };
-
-    for (std::size_t i = 0; i < srcVec.size(); ++i)
-    {
-        auto const& src = srcVec[i];
-        auto const& dst = dstVec[i];
-        std::size_t const len = src.getLen();
-        TLLM_CHECK_WITH_INFO(len == dst.getLen(), "BounceTransferPlan: src/dst len mismatch at idx %zu", i);
-        TLLM_CHECK_WITH_INFO(src.getDeviceId() == sourceDeviceId,
-            "BounceTransferPlan: mixed source device ids are unsupported (idx %zu has %u, expected %u)", i,
-            src.getDeviceId(), sourceDeviceId);
-        TLLM_CHECK_WITH_INFO(dst.getDeviceId() == destinationDeviceId,
-            "BounceTransferPlan: mixed destination device ids are unsupported (idx %zu has %u, expected %u)", i,
-            dst.getDeviceId(), destinationDeviceId);
-        TLLM_CHECK_WITH_INFO(len <= maxChunkSizeBytes,
-            "BounceTransferPlan: single desc (%zu B) exceeds maxChunkSizeBytes (%zu B)", len, maxChunkSizeBytes);
-        TLLM_CHECK_WITH_INFO(len < (1ULL << 32U), "BounceTransferPlan: single desc (%zu B) exceeds 4 GiB", len);
-
-        // A zero-length desc carries no data; skip it so it never forces an empty chunk.
-        if (len == 0)
-        {
-            plan.mTotalDescs += 1;
-            continue;
-        }
-
-        bool const overflow = (cursor + len > maxChunkSizeBytes);
-        bool const tooManyDescs = (current.srcPtrs.size() >= maxDescsPerChunk);
-
-        // Extend the previous desc in place when src, dst AND the bounce cursor all advance
-        // contiguously (the aligned cursor left no gap): one desc instead of two shrinks the gather
-        // plan, the scatter runs and the wire messages. Only within the current chunk (`!overflow`)
-        // and staying within the u32 per-desc size field.
-        bool const srcDstContig = !current.srcPtrs.empty() && !overflow
-            && src.getAddr() == current.srcPtrs.back() + current.sizes.back()
-            && dst.getAddr() == current.dstPtrs.back() + current.sizes.back()
-            && cursor == current.bounceOffsets.back() + current.sizes.back()
-            && static_cast<std::uint64_t>(current.sizes.back()) + len <= std::numeric_limits<std::uint32_t>::max();
-        if (srcDstContig)
-        {
-            current.sizes.back() += static_cast<std::uint32_t>(len);
-            current.totalBytes += len;
-            current.packedBytes = current.bounceOffsets.back() + current.sizes.back();
-            cursor = alignUp(current.packedBytes, kAlignment);
-            plan.mTotalBytes += len;
-            plan.mTotalDescs += 1;
-            continue;
-        }
-
-        if (overflow || tooManyDescs)
-        {
-            flush();
-            current.dstDeviceId = destinationDeviceId;
-        }
-
-        current.srcPtrs.push_back(static_cast<std::uint64_t>(src.getAddr()));
-        current.dstPtrs.push_back(static_cast<std::uint64_t>(dst.getAddr()));
-        current.sizes.push_back(static_cast<std::uint32_t>(len));
-        current.bounceOffsets.push_back(cursor);
-        current.totalBytes += len;
-        current.packedBytes = cursor + len; // extent to transfer (this desc is the furthest so far)
-        cursor = alignUp(cursor + len, kAlignment);
-
-        plan.mTotalBytes += len;
-        plan.mTotalDescs += 1;
+        chunkCount += part.chunks.size();
     }
-    flush();
-
+    plan.mChunks.reserve(chunkCount);
+    for (auto& part : parts)
+    {
+        std::move(part.chunks.begin(), part.chunks.end(), std::back_inserter(plan.mChunks));
+        plan.mTotalBytes += part.totalBytes;
+        plan.mTotalDescs += part.totalDescs;
+    }
     return plan;
 }
 

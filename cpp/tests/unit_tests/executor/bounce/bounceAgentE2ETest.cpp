@@ -25,12 +25,14 @@
 
 #include "bounceTestNixlNode.h"
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/HostWorkerPool.h"
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 
 #include <gtest/gtest.h>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
@@ -104,11 +106,12 @@ int runConcurrentFlows(
 
 // Bounce-enabled agent config: agentBufferSizeMb switches bounce on, and the expert knobs ride
 // bounceParams (dict > env > default) with thresholds tuned so a modest transfer engages bounce
-// (small regions -> recycling). sizeMb == 0 keeps bounce off (no knobs attached).
+// (small regions -> recycling). arenaSizeMb == 0 keeps bounce off (no knobs attached).
 kvc::BaseAgentConfig makeBounceConfig(
     std::string name, std::size_t arenaSizeMb = 2, char const* granularityBytes = "256")
 {
-    kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    kvc::BaseAgentConfig cfg{std::move(name), /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/true};
+    cfg.backendParams = bounce_test::transceiverBackendParams();
     cfg.agentBufferSizeMb = arenaSizeMb;
     if (arenaSizeMb > 0)
     {
@@ -149,12 +152,14 @@ TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
     }
     try
     {
-        EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cfgOffAgent", 0))->isBounceEnabled());
-        EXPECT_TRUE(std::make_unique<kvc::NixlTransferAgent>(makeBounceConfig("cfgOnAgent", 2))->isBounceEnabled());
+        auto const bounceOff = makeBounceConfig("cfgOffAgent", /*arenaSizeMb=*/0);
+        auto const bounceOn = makeBounceConfig("cfgOnAgent", /*arenaSizeMb=*/2);
+        EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(bounceOff)->isBounceEnabled());
+        EXPECT_TRUE(std::make_unique<kvc::NixlTransferAgent>(bounceOn)->isBounceEnabled());
         // size 0 + non-empty params: the params must be ignored (warned about, not honored) and
         // bounce must stay off. (The llm_args validator rejects this combination upfront; this
         // covers the direct BaseAgentConfig entry point.)
-        auto orphanParams = makeBounceConfig("cfgOrphanAgent", 0);
+        auto orphanParams = makeBounceConfig("cfgOrphanAgent", /*arenaSizeMb=*/0);
         orphanParams.bounceParams = {{"copy_stream_count", "2"}};
         EXPECT_FALSE(std::make_unique<kvc::NixlTransferAgent>(orphanParams)->isBounceEnabled());
     }
@@ -164,16 +169,26 @@ TEST(BounceAgentE2E, AgentBufferSizeControlsBounce)
     }
 }
 
-TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
+namespace
+{
+// One bounce transfer A -> B through submitTransferRequests, wired as production disagg does, with
+// `backendParams` as both agents' NIXL backend params.
+void runSubmitUsesBounce(
+    std::string const& tag, bounce_test::BackendParams const& backendParams = bounce_test::transceiverBackendParams())
 {
     if (!hasCuda())
     {
         GTEST_SKIP() << "no CUDA device";
     }
+    std::string const nameA = tag + "A";
+    std::string const nameB = tag + "B";
+    auto cfgA = makeBounceConfig(nameA, /*arenaSizeMb=*/1, /*granularityBytes=*/"4096");
+    auto cfgB = makeBounceConfig(nameB, /*arenaSizeMb=*/1, /*granularityBytes=*/"4096");
+    cfgA.backendParams = backendParams;
+    cfgB.backendParams = backendParams;
     std::string skipMsg;
-    auto a = tryMakeAgent(makeBounceConfig("bAgentA", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg);
-    auto b = a ? tryMakeAgent(makeBounceConfig("bAgentB", /*arenaSizeMb=*/1, /*granularityBytes=*/"4096"), skipMsg)
-               : nullptr;
+    auto a = tryMakeAgent(std::move(cfgA), skipMsg);
+    auto b = a ? tryMakeAgent(std::move(cfgB), skipMsg) : nullptr;
     if (!a || !b)
     {
         GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
@@ -185,16 +200,135 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     // bounce control endpoint rides inside that AgentDesc. B's reverse control path (GRANT/ACK back
     // to A) is self-bootstrapped from A's WANT (BounceReceiver::onWant) — exercising it
     // here is the whole point. (We deliberately do NOT touch the connection-info path.)
-    a->loadRemoteAgent("bAgentB", b->getLocalAgentDesc());
+    a->loadRemoteAgent(nameB, b->getLocalAgentDesc());
 
     auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/7);
-    auto req = makeReq(bufs, "bAgentB");
+    auto req = makeReq(bufs, nameB.c_str());
     auto status = a->submitTransferRequests(req);
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
         << "bounce transfer via submitTransferRequests did not succeed";
+    EXPECT_EQ(a->getBounceSubmitCount(), 1u);
     EXPECT_TRUE(verifyXferBufs(bufs));
 
+    a->shutdown();
+    b->shutdown();
+    freeXferBufs(bufs);
+}
+} // namespace
+
+TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
+{
+    runSubmitUsesBounce("bAgent");
+}
+
+// 8 is the production default (TRTLLM_NIXL_NUM_THREADS).
+TEST(BounceAgentE2E, SubmitUsesBounceWithEightNixlThreads)
+{
+    runSubmitUsesBounce("b8ThrAgent", {{"num_threads", "8"}});
+}
+
+TEST(BounceAgentE2E, SubmitUsesBounceWithExplicitSplitBatchSize)
+{
+    runSubmitUsesBounce("bSbsAgent", {{"num_threads", bounce_test::kTestNixlThreads}, {"split_batch_size", "1024"}});
+}
+
+TEST(BounceAgentE2E, SubmitUsesBounceWithoutNixlThreads)
+{
+    runSubmitUsesBounce("bNoThrAgent", {{"num_threads", "0"}});
+}
+
+namespace
+{
+// From this many descriptors on, the transport admits and plans a request in segments on its host worker
+// pool.
+constexpr std::uint32_t kLargeRequestDescs = static_cast<std::uint32_t>(kvc::bounce::kBulkSegmentItems);
+constexpr std::uint32_t kLargeRequestDescBytes = 64;
+constexpr std::uint32_t kLargeRequestChunkBytes = 64U << 10;
+
+// makeBounceConfig with kLargeRequestChunkBytes chunks in a 4 MiB arena.
+kvc::BaseAgentConfig makeLargeRequestConfig(std::string name)
+{
+    auto cfg = makeBounceConfig(std::move(name), /*arenaSizeMb=*/4, /*granularityBytes=*/"4096");
+    cfg.bounceParams["max_chunk_size"] = std::to_string(kLargeRequestChunkBytes);
+    cfg.bounceParams["max_inflight_chunks_per_request"] = "4";
+    return cfg;
+}
+} // namespace
+
+TEST(BounceAgentE2E, RequestAtBulkSegmentThresholdIsByteExact)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    ASSERT_GT(kvc::bounce::bulkSegmentCount(kLargeRequestDescs), 1u);
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeLargeRequestConfig("lrAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeLargeRequestConfig("lrAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    a->loadRemoteAgent("lrAgentB", b->getLocalAgentDesc());
+
+    auto bufs = makeXferBufs(kLargeRequestDescs, kLargeRequestDescBytes, /*seed=*/70);
+    auto req = makeReq(bufs, "lrAgentB");
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 1u);
+    EXPECT_TRUE(verifyXferBufs(bufs));
+
+    a->shutdown();
+    b->shutdown();
+    freeXferBufs(bufs);
+}
+
+// The same request with one descriptor larger than the chunk cap, in the last segment of the parallel
+// admission scan: bounce must reject it (kDescriptorShape) and the standard NIXL path must still
+// deliver it byte-exact (the src/dst buffers are registered for that path).
+TEST(BounceAgentE2E, LargeRequestWithOversizedDescFallsBackToStandardNixl)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    std::size_t const segments = kvc::bounce::bulkSegmentCount(kLargeRequestDescs);
+    std::uint32_t const lastSegmentIdx = kLargeRequestDescs - 3;
+    ASSERT_GT(segments, 1u);
+    ASSERT_GE(lastSegmentIdx, kvc::bounce::segmentBegin(kLargeRequestDescs, segments, /*segment=*/segments - 1));
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeLargeRequestConfig("lrbAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeLargeRequestConfig("lrbAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+
+    constexpr std::uint32_t kOversizedDescBytes = 2 * kLargeRequestChunkBytes; // still fine for standard NIXL
+    std::vector<std::uint32_t> sizes(kLargeRequestDescs, kLargeRequestDescBytes);
+    sizes[lastSegmentIdx] = kOversizedDescBytes;
+    auto bufs = bounce_test::makeXferBufsSized(sizes, /*seed=*/71);
+    kvc::RegisterDescs const srcRegion{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{bufs.src, bufs.total, 0}}};
+    kvc::RegisterDescs const dstRegion{kvc::MemoryType::kVRAM, {kvc::MemoryDesc{bufs.dst, bufs.total, 0}}};
+    a->registerMemory(srcRegion);
+    b->registerMemory(dstRegion);
+    a->loadRemoteAgent("lrbAgentB", b->getLocalAgentDesc());
+
+    auto req = makeReq(bufs, "lrbAgentB");
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(waitTerminal(status, 60), kvc::TransferState::kSUCCESS);
+    EXPECT_EQ(a->getBounceSubmitCount(), 0u);
+    auto const bucket = static_cast<std::size_t>(kvc::bounce::BounceRejectReason::kDescriptorShape);
+    EXPECT_EQ(a->getBounceRejectCounts()[bucket], 1u);
+    EXPECT_TRUE(verifyXferBufs(bufs));
+    EXPECT_TRUE(status->release());
+    status.reset();
+
+    a->deregisterMemory(srcRegion);
+    b->deregisterMemory(dstRegion);
     a->shutdown();
     b->shutdown();
     freeXferBufs(bufs);
@@ -241,7 +375,7 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     auto status = a->submitTransferRequests(req);
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS);
-    EXPECT_EQ(a->getBounceSubmitCount(), 0);
+    EXPECT_EQ(a->getBounceSubmitCount(), 0u);
     // The one declined request is counted per reason (descriptor_shape: len > effective chunk cap),
     // so a deployment can tell "bounce silently bypassed" from "bounce engaged" without log parsing.
     EXPECT_EQ(a->getBounceRejectCount(), 1u);
