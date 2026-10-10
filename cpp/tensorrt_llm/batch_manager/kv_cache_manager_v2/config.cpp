@@ -39,6 +39,10 @@ void DiskCacheTierConfig::assertValid() const
 
 void KVCacheManagerConfig::validate() const
 {
+    if (secondaryOffloadMinPriority < kPriorityMin || secondaryOffloadMinPriority > kPriorityMax)
+    {
+        throw AssertionError("secondary_offload_min_priority must be between 0 and 100");
+    }
     if (swaScratchReuse.has_value())
     {
         swaScratchReuse->validate();

@@ -37,8 +37,8 @@ Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
     : manager(mgr)
     , lifeCycle(lc)
     , cacheLevel(level)
-    , priority(prio)
     , nodeRef(std::nullopt)
+    , mPriority(prio)
 {
 }
 
@@ -52,6 +52,7 @@ Page::~Page()
     KVCM2_POISON_ON_EXCEPT(
         [this]()
         {
+            manager->cancelRetentionExpiry(*this);
             TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE && !scheduledForEviction(),
                 "Page destroyed while still held or scheduled for eviction");
             if (hasValidSlot())
@@ -77,6 +78,7 @@ PageStatus Page::status() const noexcept
 
 SharedPtr<PageHolder> Page::hold()
 {
+    manager->cancelRetentionExpiry(*this);
     // Return existing holder if any.
     auto h = holder.lock();
     if (h)
@@ -96,6 +98,16 @@ SharedPtr<PageHolder> Page::hold()
         }
     }
     return h;
+}
+
+void Page::claimRetention(std::optional<Priority> priority, std::optional<std::chrono::milliseconds> duration)
+{
+    manager->cancelRetentionExpiry(*this);
+    if (priority.has_value())
+    {
+        manager->updatePriority(*this, *priority);
+    }
+    mRetentionDuration = duration;
 }
 
 SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
@@ -165,6 +177,8 @@ UncommittedPage::UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc,
     , ordinal(ord)
     , beamIndex(bi)
 {
+    auto const retention = kvc.getRetention(ord);
+    claimRetention(retention.retentionPriority, retention.durationMs);
 }
 
 UncommittedPage::~UncommittedPage()
@@ -219,7 +233,9 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority);
+    auto committed = makeShared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, numTokensInBlock, priority());
+    auto const retention = kvCache->getRetention(blk->ordinal());
+    committed->claimRetention(retention.retentionPriority, retention.durationMs);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -257,6 +273,7 @@ PageHolder::~PageHolder()
             // If it's a committed page, schedule for eviction (if evictable).
             if (page->isCommitted())
             {
+                manager->scheduleRetentionExpiry(*page);
                 if (!page->scheduledForEviction())
                     manager->scheduleForEviction(*page);
 
