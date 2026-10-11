@@ -499,8 +499,6 @@ class BaseWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
-                multimodal_embedding=None,
                 mrope_config=None,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
@@ -1052,6 +1050,19 @@ class BaseWorker(GenerationExecutor):
             return {}
 
         startup_metrics = {}
+        executor_metrics = dict(getattr(self.engine, "metrics", {}))
+        for model_engine_stage in (
+                "initial_model_engine",
+                "final_model_engine",
+                "initial_draft_model_engine",
+                "final_draft_model_engine",
+        ):
+            model_engine_metrics = executor_metrics.pop(model_engine_stage,
+                                                        None)
+            if model_engine_metrics is not None:
+                startup_metrics[model_engine_stage] = dict(model_engine_metrics)
+        startup_metrics["py_executor"] = executor_metrics
+
         model_engine = getattr(self.engine, "model_engine", None)
         model_loader = getattr(model_engine, "model_loader", None)
         if model_loader is not None:

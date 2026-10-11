@@ -269,8 +269,7 @@ _TEST_CASES = [
         cuda_graph_batch_sizes=[2],
         feature_id="bf16-kv-v1-cuda-graph-on-beam2",
     ),
-    # Precision coverage for beam search. KVCacheManagerV2 currently requires
-    # max_beam_width == 1, so beam-search precision coverage uses v1.
+    # V1 precision coverage for beam search.
     _test_case(
         model_name="t5-small",
         torch_dtype="float16",
@@ -520,6 +519,15 @@ _MIXED_BATCH_TEST_CASES = [
         model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
+        num_beams=2,
+        num_return_sequences=2,
+        exact_match=False,
+        feature_id="bf16-kv-v2-decoder-cuda-graph-on-beam2-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
         num_beams=1,
         num_return_sequences=1,
         exact_match=True,
@@ -585,7 +593,7 @@ def _assert_decoder_cuda_graphs_captured(llm: LLM) -> None:
     """
     model_engine = llm._executor.engine.model_engine
     assert isinstance(model_engine._runner, EncoderDecoderRunner)
-    assert not model_engine._runner._encoder_cuda_graph_runner.enabled
+    assert not model_engine._runner._encoder_stage._encoder_cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.enabled
     assert model_engine.cuda_graph_runner.graphs
 
@@ -905,7 +913,7 @@ def test_t5_pytorch_continuous_admission_replays_encoder_and_mixed_cuda_graphs(
     ) as llm:
         model_engine = llm._executor.engine.model_engine
         assert isinstance(model_engine._runner, EncoderDecoderRunner)
-        encoder_runner = model_engine._runner._encoder_cuda_graph_runner
+        encoder_runner = model_engine._runner._encoder_stage._encoder_cuda_graph_runner
         decoder_runner = model_engine.cuda_graph_runner
 
         assert encoder_runner.enabled

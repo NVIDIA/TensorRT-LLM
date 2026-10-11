@@ -63,6 +63,7 @@ from blocks import Stage, YAMLIndex, _entry_target
 
 from ._helpers import resolve_affected_stages, stages_by_yaml_stem
 from .base import PRInputs, Rule, RuleResult
+from .docs_rule import is_docs_path
 
 # Source-path prefixes the rule may claim. Tests under tests/** are left
 # to TestsDefRule; the two scopes combine via _TESTSONLY_FAMILY.
@@ -83,14 +84,15 @@ _MV2_ENTRY_PATTERNS: tuple[str, ...] = (
 def _is_mv2_claim(path: str) -> bool:
     """Decide whether ModelingV2Rule claims `path`.
 
-    `*.md` is excluded so a contract-only edit does not force GPU stages
-    -- `OutOfScopeRule` claims those as noop instead. Other suffixes are
-    NOT excluded: a data file under this subtree could be a fixture, so
-    the rule keeps claiming it and re-runs the stages (safe over-run).
+    Documentation files are excluded so a contract-only edit does not force
+    GPU stages; `DocsRule` routes them to the docs build instead. Other
+    suffixes are NOT excluded: a data file under this subtree could be a
+    fixture, so the rule keeps claiming it and re-runs the stages (safe
+    over-run).
     """
     if not path.startswith(_MV2_SRC_PREFIXES):
         return False
-    if path.endswith(".md"):
+    if is_docs_path(path):
         return False
     return True
 

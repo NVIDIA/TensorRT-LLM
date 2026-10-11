@@ -1,7 +1,6 @@
 .devcontainer/make_env.py
 .github/scripts/label_community_user.py
 .github/scripts/pr_checklist_check.py
-cpp/conanfile.py
 cpp/kernels/fmha_v2/conftest.py
 cpp/kernels/fmha_v2/fmha_test.py
 cpp/kernels/fmha_v2/setup.py
@@ -20,7 +19,6 @@ cpp/kernels/fmha_v2/train_ops/train_setup.py
 cpp/kernels/xqa/gen_cpp_header.py
 cpp/kernels/xqa/gen_cubins.py
 cpp/kernels/xqa/ref.py
-cpp/libnuma_conan.py
 cpp/micro_benchmarks/gen-moe-benchmark-file.py
 cpp/tensorrt_llm/deep_ep/strip_nvshmem_helper.py
 cpp/tensorrt_llm/kernels/cutlass_kernels/python/generate_kernels.py

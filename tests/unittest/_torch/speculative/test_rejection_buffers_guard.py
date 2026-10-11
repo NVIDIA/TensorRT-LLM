@@ -90,6 +90,7 @@ def test_prepare_buffers_noop_when_disabled():
 
 def _valid_state():
     return types.SimpleNamespace(
+        is_ragged_verify=False,
         draft_probs=torch.empty((R, K, V), device="cuda"),
         batch_slot_ids=torch.arange(R, device="cuda", dtype=torch.long),
     )
@@ -208,6 +209,7 @@ class _Worker(SpecWorkerBase):
 
 def _dispatch_meta(**over):
     base = dict(
+        is_ragged_verify=False,
         use_rejection_sampling=True,
         is_all_greedy_sample=False,
         draft_probs_vocab_size=V,

@@ -784,37 +784,6 @@ def extract_mamba_kv_cache_params(
     )
 
 
-def is_qwen_image_bench_config(config_dict: dict) -> bool:
-    """Detect Qwen-Image-Bench's composite VLM checkpoint config.
-
-    The checkpoint advertises the generic Qwen3.5 VLM architecture, but
-    TRT-LLM needs a dedicated architecture key to route it to
-    QwenImageBenchModel. Generic Qwen3.5 text checkpoints can also publish
-    composite text/vision metadata, so require the explicit
-    `language_model_only: false` marker from Qwen-Image-Bench before
-    rewriting the architecture.
-
-    The text-config normalization itself lives on
-    `modeling_qwen3_5.Qwen35ConfigCompat`; this stays here because it is pure
-    dispatch detection over the raw config dict and keeps the model module out
-    of the hot path until a Qwen3.5 checkpoint is actually loaded.
-    """
-    architectures = config_dict.get("architectures") or []
-    text_config = config_dict.get("text_config")
-    vision_config = config_dict.get("vision_config")
-    required_multimodal_token_ids = {
-        "image_token_id",
-        "video_token_id",
-        "vision_start_token_id",
-        "vision_end_token_id",
-    }
-    return (config_dict.get("language_model_only") is False
-            and architectures[:1] == ["Qwen3_5ForConditionalGeneration"]
-            and isinstance(text_config, dict) and bool(text_config)
-            and isinstance(vision_config, dict) and bool(vision_config)
-            and required_multimodal_token_ids.issubset(config_dict))
-
-
 def _resolve_composite_torch_dtype(*config_dicts: dict) -> torch.dtype:
     """Resolve a concrete torch dtype from one or more raw config dicts.
 
@@ -852,7 +821,7 @@ def _build_minicpmv4_6_config(
     # Extract + normalize the Qwen3.5 dense text tower (rope flatten,
     # quantization inheritance, architectures -> Qwen3_5ForCausalLM). MiniCPM-V
     # 4.6 always nests its language model under ``text_config``, so force
-    # extraction of that nested config (same path Qwen-Image-Bench uses).
+    # extraction of that nested config.
     text_dict = Qwen35ConfigCompat.normalize(config_dict,
                                              require_text_config=True)
     text_config = transformers.Qwen3NextConfig.from_dict(text_dict)
@@ -1018,18 +987,6 @@ def load_pretrained_config(model_name_or_path: str,
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
             model_name_or_path).pretrained_config
-    elif is_qwen_image_bench_config(config_dict):
-        from tensorrt_llm._torch.models.modeling_qwen3_5 import (
-            Qwen35ConfigCompat, _normalize_qwen35_quantization_config)
-        model_config = transformers.AutoConfig.from_pretrained(
-            model_name_or_path, trust_remote_code=trust_remote_code)
-        # Keep the composite VLM config so the vision encoder and multimodal
-        # token IDs remain available, but normalize the text side to the
-        # Qwen3Next-compatible shape used by TRT-LLM's Qwen3.5 decoder.
-        model_config.architectures = ["QwenImageBenchForConditionalGeneration"]
-        model_config.text_config = transformers.Qwen3NextConfig.from_dict(
-            Qwen35ConfigCompat.normalize(config_dict, require_text_config=True))
-        _normalize_qwen35_quantization_config(model_config)
     elif model_type in ("glm5_next", "glm5_next_text"):
         from tensorrt_llm._torch import configs
         config_name = ("Glm5NextConfig"
@@ -1116,6 +1073,30 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("deepseek_v41", "deepseek_v41_text"):
+        # Preserve the composite config and propagate its dtype to the text tower.
+        # Vision checkpoints use the internal ConditionalGeneration dispatch alias.
+        from tensorrt_llm._torch.configs import (DeepseekV41Config,
+                                                 DeepseekV41TextConfig)
+        nested_text = config_dict.get("text_config")
+        if isinstance(nested_text, dict) and nested_text:
+            resolved_dtype = _resolve_composite_torch_dtype(
+                config_dict, nested_text)
+            model_config = DeepseekV41Config.from_dict(config_dict, **kwargs)
+            model_config.text_config.architectures = ["DeepseekV41ForCausalLM"]
+            model_config.text_config.torch_dtype = resolved_dtype
+            model_config.torch_dtype = resolved_dtype
+        else:
+            # ``dict(config_dict)`` already carries the top-level
+            # ``quantization_config``, and ``DeepseekV41TextConfig`` propagates it
+            # in ``__init__`` (see the note above), so the flat branch needs no
+            # hoisting step of its own.
+            model_config = DeepseekV41TextConfig.from_dict(
+                dict(config_dict), **kwargs)
+        model_config.architectures = ["DeepseekV41ForCausalLM"]
+        vision_config = getattr(model_config, "vision_config", None)
+        if getattr(vision_config, "num_hidden_layers", 0) > 0:
+            model_config.architectures = ["DeepseekV41ForConditionalGeneration"]
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

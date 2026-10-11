@@ -11,12 +11,33 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. `.md`) |
-| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. `.md`) |
-| `modeling_v2_rule.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. `.md`) |
-| `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. `.md`) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
-| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. `.md`) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
+| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
+| `spec_dec_rule.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
+| `modeling_v2_rule.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
+| `agent_flow_rule.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
+| `openengine_rule.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
+| `docs_rule.py` | `DocsRule` | `docsonly` | `docs/**` → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `.github/CODEOWNERS`, `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**` (image suffixes intentionally not claimed — fall back to baseline since fixtures and doc diagrams are indistinguishable by location) |
+
+## DocsRule
+
+Claims every file under `docs/` plus Markdown and reStructuredText files
+anywhere in the repository. Every claim contributes the literal
+`CPU-Build_Docs` stage, which runs Doxygen and Sphinx `make html`. Changes under
+`docs/` additionally keep every block and entry in `l0_cpu.yml`, because CPU
+tests directly read documentation sources such as `model-express.md` and import
+the telemetry extension under `docs/source/_ext/`. If the CPU test-db blocks or
+stages cannot be resolved for a `docs/` change, the rule forces fallback instead
+of silently running docs alone. Markdown and reStructuredText outside `docs/`
+run only the docs build, matching the legacy Docs path without adding unrelated
+CPU tests.
+
+On a docs-only PR, `L0_MergeRequest.groovy` skips the SBSA build track, so the
+resolved `CPU-Generic-arm-*` stage is recorded in `affected_stages` but is not
+launched; the x86 CPU stage supplies the CPU validation. Mixed PRs continue to
+follow the normal architecture gates. Documentation files inside another rule's
+source prefix remain excluded from that source rule, and mixed documentation
+and targeted-test changes combine by unioning their stages.
 
 ## WaivesRule
 
@@ -210,7 +231,7 @@ Path-only rule. Claims source files under `tensorrt_llm/_torch/speculative/`,
 `tensorrt_llm/models/{eagle,medusa,redrafter}/`,
 `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/`, and the
 single file `examples/llm-api/llm_speculative_decoding.py` (excluding
-`.md`, which `OutOfScopeRule` claims as noop). Other suffixes —
+documentation paths, which `DocsRule` routes to `CPU-Build_Docs`). Other suffixes —
 including images — are NOT excluded: a binary asset under a spec-dec
 path could be a test fixture, so the rule keeps claiming them and
 forces spec-dec stages to re-run.
@@ -332,7 +353,6 @@ in any subtree neither pre-merge nor post-merge L0 consumes:
   consumer.
 - `tests/integration/defs/.test_durations` — pytest-split timing cache.
 - `tests/microbenchmarks/` — benchmarking scripts, no L0 stage.
-- Any `*.md` file (docs anywhere in the repo cannot affect L0 tests).
 
 Image extensions (`.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`) are
 intentionally NOT claimed: image files anywhere in the repo can be test
@@ -342,9 +362,9 @@ distinguish a fixture from a doc diagram. Image edits therefore fall
 back to baseline unless a more specific rule (AD / VG / spec-dec)
 claims them inside its source subtree.
 
-Excludes `*.txt` (`requirements.txt` / `constraints.txt` are
-runtime-relevant). `OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_SUFFIXES`
-in `out_of_scope_rule.py` list the patterns.
+Excludes `*.txt` (`requirements.txt` / `constraints.txt` are runtime-relevant).
+`OUT_OF_SCOPE_EXACT_PATHS` and `OUT_OF_SCOPE_PREFIXES` in
+`out_of_scope_rule.py` list the patterns.
 
 ## Helpers (`_helpers.py`)
 

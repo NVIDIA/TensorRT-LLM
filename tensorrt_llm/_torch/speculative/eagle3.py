@@ -120,7 +120,13 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.slot_ids = []
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A padding dummy (e.g. the attention-DP idle-rank dummy) may
+                # already hold a slot from add_dummy_requests -- reuse it
+                # instead of re-adding, which SlotManager.add_slot only
+                # tolerates for the CUDA-graph dummy id.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.relaxed_delta_pool[slot_id].fill_(0)
@@ -819,8 +825,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
                 # the flattened token sequence to find the last accepted one.
-                # From step 1 onwards every sequence has length 1, so
-                # ``batch_indices_cuda`` is sufficient.
+                # From step 1 onwards the loop feeds exactly one token per
+                # request, in request order, so every per-request row
+                # selection is the prefix slice [0, batch_size); each
+                # ``[gather_ids]`` site below takes a slice as readily as an
+                # index tensor.
                 if i == 0:
                     start_ids_gen = (
                         spec_metadata.batch_indices_cuda[:num_gens] *
@@ -831,7 +840,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     gather_ids = torch.concat(
                         [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
                 else:
-                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+                    gather_ids = slice(0, batch_size)
 
                 if self.guided_decoder is not None:
                     new_tokens = inputs["input_ids"][gather_ids]
@@ -871,22 +880,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 use_lm_head_tp_in_adp = (lm_head_tp_in_adp_configured
                                          and not advanced_draft_sampling)
                 if self.is_mtp_eagle:
+                    # One row per request: the LM-head input on this step and
+                    # the draft input on the next.
+                    request_hidden_states = hidden_states[gather_ids]
                     if use_lm_head_tp_in_adp:
-                        hidden_states_gathered = hidden_states[gather_ids]
-                        token_count = hidden_states_gathered.view(
-                            -1, hidden_states_gathered.shape[-1]).shape[0]
+                        token_count = request_hidden_states.view(
+                            -1, request_hidden_states.shape[-1]).shape[0]
                         max_num_requests = spec_metadata.max_num_requests
                         pad_len = max_num_requests - token_count
                         if pad_len > 0:
                             padded_hidden_states = F.pad(
-                                hidden_states_gathered.view(
-                                    -1, hidden_states_gathered.shape[-1]),
+                                request_hidden_states.view(
+                                    -1, request_hidden_states.shape[-1]),
                                 (0, 0, 0, pad_len),
                                 mode="constant",
                                 value=0)
                         elif pad_len == 0:
-                            padded_hidden_states = hidden_states_gathered.view(
-                                -1, hidden_states_gathered.shape[-1])
+                            padded_hidden_states = request_hidden_states.view(
+                                -1, request_hidden_states.shape[-1])
                         else:
                             raise ValueError(
                                 "Eagle3OneModelWorker (MTP Eagle mode): "
@@ -906,18 +917,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         local_full_vocab_forward = getattr(
                             shared_head, "forward_local_full_vocab", None)
                         if local_full_vocab_forward is None:
-                            logits = draft_model.lm_head(
-                                hidden_states[gather_ids])
+                            logits = draft_model.lm_head(request_hidden_states)
                         else:
                             logits = local_full_vocab_forward(
-                                hidden_states[gather_ids],
+                                request_hidden_states,
                                 draft_model.lm_head,
                                 attn_metadata,
                                 True,
                             )
                     else:
                         logits = draft_model.mtp_layers[0].shared_head(
-                            hidden_states[gather_ids], draft_model.lm_head,
+                            request_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
                 else:
                     logits = draft_model.logits_processor(
@@ -959,17 +969,26 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
-                # Update hidden states for the next iteration.
-                # MTP Eagle: the MTP layer returns a single tensor; slice by
-                #   gather_ids to get one hidden state per request.
+                # Build the next iteration's inputs; the last iteration has
+                # none to build.
+                # MTP Eagle: the MTP layer returns a single tensor; the rows
+                #   selected above for the LM head carry over as they are.
                 # Eagle3: the EAGLE draft model returns a secondary
                 #   ``hidden_states_to_save`` specifically for this purpose.
-                if self.is_mtp_eagle:
-                    hidden_states = hidden_states[gather_ids]
-                else:
-                    hidden_states = hidden_states_to_save[gather_ids]
-                position_ids = (_select_mtp_position_ids(
-                    inputs["position_ids"], gather_ids) + 1)
+                if i + 1 < runtime_draft_len:
+                    if self.is_mtp_eagle:
+                        hidden_states = request_hidden_states
+                    else:
+                        hidden_states = hidden_states_to_save[gather_ids]
+                    position_ids = (_select_mtp_position_ids(
+                        inputs["position_ids"], gather_ids) + 1)
+                    inputs = {
+                        "input_ids": new_draft_token,
+                        "position_ids": position_ids,
+                        "hidden_states": hidden_states,
+                        "attn_metadata": attn_metadata,
+                        "spec_metadata": spec_metadata,
+                    }
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
@@ -1006,14 +1025,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
                         attn_metadata.kv_lens_cuda[:batch_size] += 1
                         attn_metadata.update_for_spec_dec()
-
-                inputs = {
-                    "input_ids": new_draft_token,
-                    "position_ids": position_ids,
-                    "hidden_states": hidden_states,
-                    "attn_metadata": attn_metadata,
-                    "spec_metadata": spec_metadata,
-                }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all draft layers have run,

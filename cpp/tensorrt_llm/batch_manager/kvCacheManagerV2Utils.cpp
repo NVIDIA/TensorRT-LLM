@@ -192,9 +192,13 @@ void IndexMapper::removeSequence(LlmRequest::RequestIdType requestId)
     indexMap_.erase(iter);
 }
 
-at::Tensor IndexMapper::getCopyIndex(
-    std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth)
+at::Tensor IndexMapper::getCopyIndex(std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext,
+    SizeType32 beamWidth, bool replicateBeamZero)
 {
+    TLLM_CHECK_WITH_INFO(beamWidth <= maxCopyBeamWidth_, "Requested beam width %d exceeds the copy-index capacity %d",
+        beamWidth, maxCopyBeamWidth_);
+    TLLM_CHECK_WITH_INFO(replicateBeamZero || beamWidth <= maxBeamWidth_,
+        "Requested beam width %d exceeds the source page-table width %d", beamWidth, maxBeamWidth_);
     int numSeqs = numContext + beamWidth * (requestIds.size() - numContext);
     SizeType32 batchSize = static_cast<SizeType32>(requestIds.size());
     SizeType32 idx = 0;
@@ -208,7 +212,8 @@ at::Tensor IndexMapper::getCopyIndex(
         {
             for (SizeType32 j = 0; j < beamWidth; j++)
             {
-                copyIndex_[idx++] = this->getIndex(requestIds[i]) * maxBeamWidth_ + j;
+                auto const sourceBeam = replicateBeamZero ? 0 : j;
+                copyIndex_[idx++] = this->getIndex(requestIds[i]) * maxBeamWidth_ + sourceBeam;
             }
         }
     }
@@ -252,17 +257,21 @@ void IndexMapper::gatherKBlockOffsets(at::Tensor const& source, at::Tensor desti
     }
 }
 
-IndexMapper::IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth)
+IndexMapper::IndexMapper(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxCopyBeamWidth)
     : maxBeamWidth_(maxBeamWidth)
+    , maxCopyBeamWidth_(maxCopyBeamWidth == 0 ? maxBeamWidth : maxCopyBeamWidth)
 {
+    TLLM_CHECK_WITH_INFO(maxCopyBeamWidth_ >= maxBeamWidth_,
+        "Copy-index beam width %d must be at least the source page-table beam width %d", maxCopyBeamWidth_,
+        maxBeamWidth_);
     indexMap_.reserve(maxBatchSize);
     for (SizeType32 i = 0; i < maxBatchSize; i++)
     {
         freeIndices_.insert(i);
     }
     // Allocate copyIndex_ memory as pinned (page-locked) host memory
-    copyIndex_
-        = at::empty({maxBatchSize * maxBeamWidth}, at::TensorOptions().dtype(at::ScalarType::Int).pinned_memory(true));
+    copyIndex_ = at::empty(
+        {maxBatchSize * maxCopyBeamWidth_}, at::TensorOptions().dtype(at::ScalarType::Int).pinned_memory(true));
 }
 
 IndexMapper::~IndexMapper()

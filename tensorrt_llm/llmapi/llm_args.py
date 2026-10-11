@@ -291,8 +291,163 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
         return merged
 
 
+# Symbolic dim names allowed in EncodeExtraInputSpec.shape; a spec uses exactly
+# one. "num_tokens" resolves to the padded token bucket, "batch_size" to the
+# padded request count (per-request features that ignore sequence length).
+_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS: Tuple[str,
+                                         ...] = ("num_tokens", "batch_size")
+
+# Encode-only inputs the encoder runner builds itself; callers cannot supply them
+# as model_kwargs.
+ENCODER_RUNNER_MANAGED_INPUTS: frozenset[str] = frozenset({
+    "input_ids",
+    "seq_lens",
+    "multi_item_part_lens",
+    "attn_metadata",
+    "return_context_logits",
+})
+# Names that may not be declared as extra model inputs. position_ids may be
+# passed through (the runner consumes it) but cannot name an extra input.
+ENCODER_RESERVED_INPUT_NAMES: frozenset[str] = (ENCODER_RUNNER_MANAGED_INPUTS
+                                                | {"position_ids"})
+
+
+class EncodeExtraInputSpec(StrictBaseModel):
+    """Declares an extra encoder-forward tensor kwarg for CUDA graph capture.
+
+    One spec is required for every tensor kwarg passed to
+    `LLM.encode(..., **model_kwargs)` (e.g. `token_type_ids` for BERT). The
+    runner backs each with a static buffer sized at the bucket maximum, and
+    warmup captures every bucket with a zero-filled stand-in so the graph sees
+    the full forward signature before the first real call.
+
+    Only tensors can be declared: a non-tensor kwarg cannot be captured and
+    instead forces that `encode()` call onto the eager path. Device is not part
+    of the spec: pass tensors where they already live. Each replay copies them
+    into the graph's buffer asynchronously, H2D for host tensors and D2D for
+    device tensors.
+    """
+
+    name: str = Field(
+        description="Kwarg name as it appears in the encoder forward() "
+        "signature (e.g. \"token_type_ids\").")
+
+    shape: Tuple[Union[Literal["num_tokens", "batch_size"], PositiveInt],
+                 ...] = Field(
+                     description="Tensor shape. Use exactly one symbolic dim "
+                     "from {\"num_tokens\", \"batch_size\"}: \"num_tokens\" "
+                     "scales with the packed token bucket (e.g. "
+                     "token_type_ids), \"batch_size\" scales with the request "
+                     "bucket (e.g. per-request features that are independent "
+                     "of sequence length). Remaining dims must be positive "
+                     "integer literals (e.g. hidden_size).")
+
+    dtype: str = Field(
+        description="Tensor dtype string accepted by tensorrt_llm "
+        "(e.g. \"int32\", \"float32\", \"bfloat16\"). See "
+        "`tensorrt_llm._utils._str_to_torch_dtype_dict` for the full list.")
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        if not value or not value.isidentifier():
+            raise ValueError(
+                f"EncodeExtraInputSpec.name must be a non-empty Python "
+                f"identifier, got {value!r}")
+        if value in ENCODER_RESERVED_INPUT_NAMES:
+            raise ValueError(
+                f"EncodeExtraInputSpec.name {value!r} is reserved by the "
+                f"encode-only path. Reserved names: "
+                f"{sorted(ENCODER_RESERVED_INPUT_NAMES)}")
+        return value
+
+    @field_validator("shape")
+    @classmethod
+    def _validate_shape(
+            cls, value: Tuple[Union[str, int],
+                              ...]) -> Tuple[Union[str, int], ...]:
+        if not value:
+            raise ValueError(
+                "EncodeExtraInputSpec.shape must contain at least one "
+                "dimension")
+        symbolic_count = sum(
+            1 for d in value
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS)
+        if symbolic_count != 1:
+            raise ValueError(
+                f"EncodeExtraInputSpec.shape must contain exactly one "
+                f"symbolic dim from {_ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS} "
+                f"(a tensor may use \"num_tokens\" OR \"batch_size\", never "
+                f"both), got shape={value} with {symbolic_count} symbolic dims")
+        return value
+
+    @field_validator("dtype")
+    @classmethod
+    def _validate_dtype(cls, value: str) -> str:
+        if value not in _str_to_torch_dtype_dict:
+            raise ValueError(
+                f"EncodeExtraInputSpec.dtype {value!r} is not supported. "
+                f"Supported dtypes: {sorted(_str_to_torch_dtype_dict)}")
+        return value
+
+    def resolve_shape(self, num_tokens: int,
+                      batch_size: int) -> Tuple[int, ...]:
+        """Substitute the symbolic dim with the matching size, leaving literals alone.
+
+        Each spec uses exactly one symbolic dim (validated). The caller passes
+        both candidate sizes; only the one this spec actually uses is consumed.
+        """
+        resolved: List[int] = []
+        for d in self.shape:
+            if d == "num_tokens":
+                resolved.append(num_tokens)
+            elif d == "batch_size":
+                resolved.append(batch_size)
+            else:
+                resolved.append(int(d))
+        return tuple(resolved)
+
+    def symbolic_dim(self) -> Tuple[str, int]:
+        """Return ``(name, axis)`` of the spec's single symbolic dim.
+
+        The shape validator guarantees exactly one symbolic dim is present.
+        """
+        for axis, d in enumerate(self.shape):
+            if isinstance(d, str) and d in _ENCODE_EXTRA_INPUT_SYMBOLIC_DIMS:
+                return d, axis
+        # Unreachable: validator enforces exactly-one occurrence.
+        raise ValueError(
+            f"EncodeExtraInputSpec.shape={self.shape} has no symbolic dim")
+
+    def torch_dtype(self) -> torch.dtype:
+        return _str_to_torch_dtype_dict[self.dtype]
+
+
 class EncodeCudaGraphConfig(BaseCudaGraphConfig):
-    """CUDA graph configuration for encode-only requests."""
+    """CUDA graph configuration for encode-only requests (``LLM.encode()``).
+
+    A graph is captured at startup for every feasible combination of
+    ``batch_sizes``, ``num_tokens`` and ``seq_lens``. A batch runs the graph
+    for its (batch size, total tokens, longest request) shape, rounded up when
+    ``enable_padding`` is set, and runs eagerly if no graph matches.
+
+    Example::
+
+        cuda_graph_config = EncodeCudaGraphConfig(
+            batch_sizes=[1, 2, 4, 8],
+            num_tokens=[128, 256, 512],
+            seq_lens=[64, 128],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(name="token_type_ids",
+                                     shape=("num_tokens",),
+                                     dtype="int32"),
+            ],
+        )
+        llm = LLM(model, encode_only=True, cuda_graph_config=cuda_graph_config)
+        # token_type_ids: one value per token, prompts packed in order.
+        outputs = llm.encode(prompts, token_type_ids=token_type_ids)
+    """
 
     mode: Literal["encode"] = Field(
         default="encode", description="CUDA graph configuration mode.")
@@ -332,6 +487,18 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         "`seq_lens` is generated from this value. Ignored by a fixed-shape "
         "feature encoder.")
 
+    extra_model_inputs: List[EncodeExtraInputSpec] = Field(
+        default_factory=list,
+        description=
+        "Tensor kwargs (beyond input_ids / position_ids) that LLM.encode() "
+        "passes to the encoder forward() under CUDA graphs. Each is backed "
+        "by a static buffer sized along its symbolic dim at the bucket "
+        "maximum (`num_tokens` → `max(num_tokens)`, `batch_size` → "
+        "`max(batch_sizes)`). With encoder CUDA graphs enabled, every tensor "
+        "kwarg passed to encode() must be declared here, and every declared "
+        "input must be passed on every call. Tensors may be on host or "
+        "device.")
+
     @model_validator(mode='after')
     def validate_encoder_cuda_graph_config(self) -> 'EncodeCudaGraphConfig':
         # Encoder fields — only generate defaults when the user opted in by
@@ -370,6 +537,15 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
         elif self.max_seq_len > 0:
             self.seq_lens = self._generate_cuda_graph_seq_lens(
                 self.max_seq_len, self.enable_padding)
+
+        if self.extra_model_inputs:
+            seen_names: Set[str] = set()
+            for spec in self.extra_model_inputs:
+                if spec.name in seen_names:
+                    raise ValueError(
+                        f"EncodeCudaGraphConfig.extra_model_inputs contains "
+                        f"duplicate name {spec.name!r}")
+                seen_names.add(spec.name)
 
         return self
 
@@ -621,11 +797,15 @@ class MultimodalConfig(StrictBaseModel):
     encoder_cache_max_bytes: NonNegativeInt = Field(
         default=134_217_728,  # 128 MiB.
         description=
-        ("Maximum bytes for the opt-in multimodal encoder embedding cache; 0 "
-         "disables it. String values such as '512MB' and '1GiB' use binary "
-         "units. Inline encoding caches whole single-modality requests; item "
-         "scheduling caches individual items. Compatible with side-stream "
-         "prefetch; their memory limits are additive."),
+        ("Target capacity in bytes for reusable multimodal encoder embeddings; "
+         "0 disables cross-request reuse. The capacity applies per rank; ranks "
+         "do not share a cache. With item scheduling, encoder outputs "
+         "still use the model-owned cache and its capacity is at least one legal "
+         "encoder iteration; this value can make that cache larger. String values "
+         "such as '512MB' and '1GiB' use binary units. Both inline encoding and "
+         "item scheduling cache individual items; inline caching supports only "
+         "single-modality parameters. "
+         "Compatible with side-stream prefetch."),
         status="prototype",
     )
 
@@ -637,7 +817,10 @@ class MultimodalConfig(StrictBaseModel):
             "scheduling and its byte budget off). DEFAULT: item scheduling. "
             "EAGER: item scheduling that advances encoder work for active "
             "requests before LLM capacity filtering. Ignored for models that "
-            "do not support item scheduling."),
+            "do not support item scheduling. Item scheduling does not support "
+            "pipeline parallelism yet: with pipeline_parallel_size > 1, "
+            "DEFAULT (explicit or unset) logs a warning and falls back to "
+            "legacy inline encode, while EAGER raises an error."),
         status="prototype",
     )
 
@@ -1351,6 +1534,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         "`fp4` to reduce the per-token indexer K footprint on Blackwell+ "
         "(SM>=100). Set to `fp8` for the legacy FP8 indexer K cache path.",
     )
+
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
         description=
@@ -1474,6 +1658,42 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             window_size=self.window_size,
             enable_kv_cache_offload=self.enable_kv_cache_offload,
         )
+
+
+class CSA2SparseAttentionConfig(BaseSparseAttentionConfig):
+    """Use checkpoint-owned CSA2 geometry with the PyTorch sparse backend."""
+    algorithm: Literal["csa2"] = "csa2"
+    use_fp8_staging: Optional[bool] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Stage CSA2 KV as E4M3 for native trtllm-gen on SM100-family. The "
+        "per-tensor staging scale is a power of two derived every forward from "
+        "the persistent pools' own group scales, so staged rows keep the E4M3 "
+        "range they decode to. Left unset, staging turns on wherever that path "
+        "is available: attn_backend=TRTLLM on an SM100-family GPU, an FP8 "
+        "kv_cache_config.dtype, and no packed sparse attention. Set True to "
+        "require it, which rejects a configuration that cannot serve it instead "
+        "of falling back, or False to pin BF16 staging.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def to_sparse_params(self, **kwargs):
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+            CSA2Layout, CSA2Params)
+
+        return CSA2Params(
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")),
+            use_fp8_staging=self.use_fp8_staging,
+        )
+
+    def to_sparse_metadata_params(self, **kwargs):
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
+            CSA2Layout, CSA2MetadataParams)
+
+        return CSA2MetadataParams(
+            layout=CSA2Layout.from_hf_config(kwargs.get("pretrained_config")))
 
 
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
@@ -2326,6 +2546,105 @@ class DecodingBaseConfig(StrictBaseModel):
         return 0
 
 
+class MooncakeStoreConfig(StrictBaseModel):
+    """How this server joins a Mooncake store pool.
+
+    The settings every participant shares come from the master named by
+    `pool`; what is left here is per-server. Setting this makes
+    `trtllm-serve` render the Mooncake client config and export
+    `MOONCAKE_CONFIG_PATH`; an inherited `MOONCAKE_CONFIG_PATH` wins.
+    """
+    pool: str = Field(
+        ...,
+        description="The pool to join: 'file://<path>' naming a manifest "
+        "published by 'trtllm-serve mooncake_master --pool_file', or a "
+        "master's 'host:port'. The manifest form also carries the settings "
+        "every participant must agree on.")
+    role: Literal["both", "producer", "consumer", "capacity"] = Field(
+        "both",
+        description="What this server does with the pool. 'both' reads and "
+        "writes, 'producer' only writes, 'consumer' only reads, and "
+        "'capacity' does neither: its ranks lend memory without moving any "
+        "KV, so they pin no staging buffers and pay no per-request cost.")
+    segment_size: Union[int, str] = Field(
+        "16GiB",
+        description="Host memory each of this server's ranks contributes to "
+        "the pool, as a binary size ('16GiB') or a byte count; ambiguous "
+        "units such as 'GB' are refused. A node's demand is ranks_on_node x "
+        "segment_size, checked against available memory at startup. Zero "
+        "lends nothing, leaving the server to use only capacity its peers "
+        "hold.")
+    transfer_batch_size: PositiveInt = Field(
+        64, telemetry=False, description="Page keys per store call.")
+    namespace: Optional[str] = Field(
+        None,
+        description="Key namespace, isolating this deployment's cache from "
+        "others on the same pool. Bump it after any change to page layout or "
+        "contents. Defaults to the pool manifest's.")
+    model_key: str = Field(
+        ...,
+        telemetry=False,
+        description="What the pool keys identify this checkpoint by. Two "
+        "engines share cache only when they agree on it, and two that "
+        "disagree read each other's pages as their own, so it has no default "
+        "and must be unique per checkpoint.")
+    stage_through_host: bool = Field(
+        True,
+        telemetry=False,
+        description="Copy pages through a pinned host buffer instead of "
+        "registering the KV pools with Mooncake. The only transfer path "
+        "supported today, so 'false' is ignored with a warning. Costs a copy "
+        "each way and needs no GPUDirect RDMA.")
+    local_hostname: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Address this server's ranks register their segments "
+        "under, for peers to reach them at. Derived by default from the "
+        "interface that routes to the master. One value covers every rank, so "
+        "only set it on a server whose ranks share a node.")
+    run_dir: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Where this server keeps the Mooncake client config it "
+        "renders and each rank's record of the segment it mounted. Required "
+        "when a launcher starts one task per rank, as trtllm-llmapi-launch "
+        "does, and must not be shared between servers. Defaults to a "
+        "temporary directory removed at shutdown.")
+    master_timeout: float = Field(
+        60.0,
+        telemetry=False,
+        description="Seconds to wait for the pool manifest to appear and the "
+        "master to accept connections. Raise it when the wait spans a "
+        "container start on another node. Expiring fails the server at "
+        "startup.")
+
+    @field_validator("stage_through_host", mode="after")
+    @classmethod
+    def _force_host_staging(cls, value):
+        """Say here what the workers would otherwise each say after bringup."""
+        if not value:
+            logger.warning(
+                "Ignoring mooncake_store.stage_through_host=False: pages pass "
+                "through pinned host memory, which is the only transfer path "
+                "this connector supports today.")
+        return True
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _check_segment_size(cls, value):
+        """Reject a bad size here rather than in every rank after bringup."""
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"mooncake_store.segment_size: {exc}")
+        if parsed < 0:
+            raise ValueError(f"mooncake_store.segment_size: {value!r} is "
+                             f"{parsed} bytes; it cannot be negative.")
+        return value
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -2340,7 +2659,8 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Named connector preset (e.g. 'lmcache'). "
         "When set, connector_module/scheduler_class/worker_class are "
         "auto-populated from the preset registry.",
-        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm'))
+        telemetry=TelemetryField.categorical('lmcache', 'lmcache-mp', 'kvbm',
+                                             'mooncake-store'))
     connector_module: Optional[str] = Field(
         None,
         description=
@@ -2355,11 +2675,16 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="URL for an external connector server "
         "(e.g. 'tcp://localhost:5555'). Connectors that run in "
         "multi-process mode use this to reach the cache server.")
+    mooncake_store: Optional[MooncakeStoreConfig] = Field(
+        None,
+        description="Pool topology for the 'mooncake-store' connector. When "
+        "set, trtllm-serve provisions the pool during bringup instead of "
+        "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
-        from tensorrt_llm._torch.pyexecutor.connectors.registry import \
-            CONNECTOR_REGISTRY
+        from tensorrt_llm._torch.pyexecutor.connectors.registry import (
+            CONNECTOR_REGISTRY, uses_connector)
         if self.connector is not None:
             preset = CONNECTOR_REGISTRY.get(self.connector)
             if preset is None:
@@ -2377,6 +2702,12 @@ class KvCacheConnectorConfig(StrictBaseModel):
             raise ValueError("connector_scheduler_class is required")
         if self.connector_worker_class is None:
             raise ValueError("connector_worker_class is required")
+        if self.mooncake_store is not None and not uses_connector(
+                self, "mooncake-store"):
+            raise ValueError(
+                "mooncake_store describes a Mooncake pool, but this config "
+                f"resolves to connector_module={self.connector_module!r}. "
+                "Set connector: mooncake-store, or drop mooncake_store.")
         return self
 
 
@@ -2996,6 +3327,26 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         "for cross-attention in the draft model. If None, read from the draft "
         "model config (dflash_config.target_layer_ids).")
 
+    context_recompute_tail: Optional[int] = Field(
+        default=0,
+        description=
+        "Number of prompt-tail tokens to recompute through the target forward "
+        "when a request takes a KV-cache prefix hit, so the drafter's "
+        "hidden-state context covers them (reused tokens never pass a target "
+        "forward, which otherwise degrades acceptance length exactly when "
+        "prefix caching helps most). 0 (the default) disables the recompute: "
+        "the feature is opt-in, because recomputing reused tokens trades TTFT "
+        "and prefill throughput for acceptance length and disables "
+        "KV-connector prefix loads for the recomputed span. None resolves "
+        "from the draft model config: dflash_config.swa_window_size when the "
+        "drafter's context attention is windowed (a tail of the window size "
+        "reproduces the no-reuse drafter inputs exactly), else -1. -1 forces "
+        "a full re-prefill on a hit. Prefix reuse ahead of the recomputed "
+        "tail is kept. Requires chunked prefill and the all_reusable "
+        "block-reuse policy, and sliding-window attention layers are "
+        "unsupported on the V1 KV cache manager; the KV cache managers "
+        "disable it with a warning otherwise.")
+
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
     attention_backend: Literal["VANILLA", "TRTLLM", "FA4"] = Field(
@@ -3046,6 +3397,20 @@ class DFlashDecodingConfig(DecodingBaseConfig):
             mask_id = dflash_cfg.get("mask_token_id")
             if mask_id is not None:
                 self.mask_token_id = mask_id
+        if self.context_recompute_tail is None:
+            # Reached only when the user explicitly set None (the default is 0,
+            # recompute off): auto-resolve the tail from the drafter geometry.
+            # A windowed drafter can never attend to prompt context beyond
+            # the most recent swa_window_size tokens (context K/V come
+            # straight from projected target hidden states, so the receptive
+            # field does not grow with drafter depth): recomputing that tail
+            # reproduces the no-reuse drafter inputs exactly. A non-windowed
+            # drafter needs the whole prompt, hence full re-prefill.
+            swa_window = dflash_cfg.get("swa_window_size")
+            if dflash_cfg.get("use_swa") and swa_window:
+                self.context_recompute_tail = int(swa_window)
+            else:
+                self.context_recompute_tail = -1
 
         # The drafter is trained for one block size. Another size still runs,
         # but acceptance length drops, so warn rather than silently serving a
@@ -3225,7 +3590,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         if os.path.isfile(config_path):
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    return json.load(f).get("model_type") == "deepseek_v4"
+                    return json.load(f).get("model_type") in (
+                        "deepseek_v4", "deepseek_v41", "deepseek_v41_text")
             except (OSError, ValueError):
                 return False
         return False
@@ -3877,6 +4243,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
+        CSA2SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
     ],
@@ -3919,6 +4286,24 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
     quant: Literal["nvfp4"] = Field(
         default="nvfp4",
         description="Quantization format stored in the compressed cache tier.")
+    skip_rope_quantization: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "True: preserve the position-encoded (RoPE) part of each K vector in "
+        "its original active-cache precision and quantize the rest to NVFP4. "
+        "False (default): quantize both parts, using residual RoPE quantization "
+        "for DeepSeek-V4 when nvfp4_residual_dim is 64. "
+        "An option to explore; measure its accuracy effect on your model.")
+    nvfp4_residual_dim: Literal[0, 64] = Field(
+        default=64,
+        status="prototype",
+        description=
+        "64 (default): use two independently scaled FP4 components for the 64 "
+        "DeepSeek-V4 target cold-page RoPE values: a main component and its "
+        "residual. 0: use a single NVFP4 component. Only 0 and 64 are supported. "
+        "Ignored for other models, draft caches, and when skip_rope_quantization "
+        "preserves the original RoPE precision.")
     scale_checkpoint_path: Optional[str] = Field(
         default=None,
         min_length=1,
@@ -5146,7 +5531,7 @@ class BaseLlmArgs(StrictBaseModel):
         # test_multi_frontend_routing pins the two together.
         le=64,
         description=
-        "The number of HTTP frontend processes serving one executor. Used by "
+        "The number of HTTP or OpenEngine frontend processes serving one executor. Used by "
         "trtllm-serve: values > 1 run additional attached frontend processes "
         "that share the serving port via SO_REUSEPORT (classic IPC executor "
         "path only).",
@@ -5161,7 +5546,7 @@ class BaseLlmArgs(StrictBaseModel):
                                              'qwen3_5', 'minimax_m2',
                                              'minimax_m2_append_think',
                                              'nano-v3', 'gemma4', 'kimi_k2',
-                                             'kimi_k25'))
+                                             'kimi_k25', 'k-exaone'))
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
@@ -5200,6 +5585,17 @@ class BaseLlmArgs(StrictBaseModel):
         description=
         "Allow serving responses to include per-request performance metrics when "
         "the request sets X-TRTLLM-return-metrics: 1.",
+        status="prototype")
+
+    per_request_spec_decode_stats: bool = Field(
+        default=False,
+        description=
+        "Include per-request speculative-decoding acceptance statistics on each "
+        "response choice. Server-side opt-in only: unlike return_perf_metrics "
+        "this needs no per-request header, so benchmarking clients that "
+        "discover the payload by shape do not have to know they are talking to "
+        "TensorRT-LLM. Deliberately independent of return_perf_metrics, which "
+        "also mounts the Prometheus endpoint. PyTorch backend only.",
         status="prototype")
 
     perf_metrics_output_dir: Optional[str] = Field(
@@ -5915,6 +6311,27 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
         status="prototype")
 
+    iter_perf_stats_interval: PositiveInt = Field(
+        default=1,
+        description=
+        "Build an iteration statistics record only every N executor iterations "
+        "when enable_iter_perf_stats is true, which reduces the host overhead "
+        "of collecting the statistics (including the per-request statistics of "
+        "enable_iter_req_stats). A value of 1 builds a record every iteration. "
+        "With N > 1, numCompletedRequests, numNewActiveRequests and the KV "
+        "cache iteration deltas of skipped iterations are carried into a later "
+        "record, so their totals stay exact but can be reported late. Without "
+        "attention DP, one extra record is emitted when the last active "
+        "request finishes in a skipped iteration; with attention DP, what is "
+        "left after the last record of a busy period is reported when the "
+        "executor resumes. All other fields describe only the sampled "
+        "iteration, so Prometheus counters built from them (e.g. speculative "
+        "decoding draft and accepted token totals) reach only about 1/N of the "
+        "true totals, and gauges such as KV cache utilization refresh every N "
+        "iterations. With enable_iter_req_stats, requests that finish in a "
+        "skipped iteration get no requestStats entry.",
+        status="prototype")
+
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
@@ -5938,6 +6355,14 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
         status="prototype")
+
+    bounded_replay_on_generation: bool = Field(
+        default=False,
+        description=
+        ("Run the DeepSeek-V4.1 bounded decoder replay tail on the generation "
+         "worker in disaggregated serving. Configure both worker roles alike."),
+        status="prototype",
+        telemetry=False)
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
@@ -6675,7 +7100,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 _ = spec_cfg.draft_is_embedded_in_target
                 # Resolve target_layer_ids / mask_token_id / block_size /
                 # markov_rank from the draft (or main) model config if not set.
-                # Three checkpoint spellings are in the wild for the same knobs
+                # Several checkpoint spellings are in the wild for the same knobs
                 # and all are accepted here, because a key the reader misses is
                 # not an error -- it silently falls back to a default and the
                 # drafter degrades (a markov_rank read as 0 skips the Markov
@@ -6684,22 +7109,28 @@ class TorchLlmArgs(BaseLlmArgs):
                 #   - nested ``dflash_config``  (SpecForge / RadixArk drafters)
                 #   - nested ``dspark_config``  (forward compatibility)
                 #   - plain top-level keys  (TorchSpec drafters)
+                # V4.1 wraps the language model settings in ``text_config``;
+                # prefer that scope, retaining the top-level legacy fallback.
                 draft_config_path = os.path.join(spec_cfg.speculative_model,
                                                  "config.json")
                 if os.path.exists(draft_config_path):
                     with open(draft_config_path) as f:
                         draft_cfg = json.load(f)
-                    dspark_cfg = draft_cfg.get("dspark_config") or {}
-                    dflash_cfg = draft_cfg.get("dflash_config") or {}
+                    text_cfg = draft_cfg.get("text_config") or {}
 
-                    def _dspark_get(key, top_level_key):
-                        for source, name in ((dspark_cfg, key), (dflash_cfg,
-                                                                 key),
-                                             (draft_cfg,
-                                              top_level_key), (draft_cfg, key)):
-                            value = source.get(name)
-                            if value is not None:
-                                return value
+                    def _dspark_get(
+                            key: str, top_level_key: str
+                    ) -> Optional[Union[List[int], int]]:
+                        for scope in (text_cfg, draft_cfg):
+                            for source, name in ((scope.get("dspark_config")
+                                                  or {}, key),
+                                                 (scope.get("dflash_config")
+                                                  or {}, key),
+                                                 (scope, top_level_key), (scope,
+                                                                          key)):
+                                value = source.get(name)
+                                if value is not None:
+                                    return value
                         return None
 
                     # The checkpoint's ``dspark_target_layer_ids`` is

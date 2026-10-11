@@ -1558,7 +1558,7 @@ class Qwen2_5_VLVisionAttention(Attention):
         # for the LM, `forward_impl` would otherwise dispatch vision
         # through `attn_custom_op_inplace`, which looks
         # `attention_metadata` up in the global `extra_attrs` --
-        # that slot is populated by `model_engine.model_forward` with
+        # that slot is populated by `DecoderRunner.model_forward` with
         # the LM decoder's metadata, so vision FMHA receives the LM's
         # S/num_contexts with vision's head_dim and dispatch fails
         # (`FMHA kernels are not found ... D: <vision_head_dim>`).
@@ -2189,7 +2189,7 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         # The LM's attention modules look themselves up in the global
-        # `extra_attrs` that `model_engine.model_forward` binds via
+        # `extra_attrs` that `DecoderRunner.model_forward` binds via
         # `with_model_extra_attrs(self.model.extra_attrs)` -- the
         # outer wrapper's dict. Without sharing, `llm_model_config`
         # carries a deep-copied dict, so LM `attn_custom_op_inplace`

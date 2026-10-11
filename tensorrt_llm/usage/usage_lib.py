@@ -48,7 +48,9 @@ import json
 import logging
 import os
 import platform
+import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +60,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from tensorrt_llm.usage import schema
+from tensorrt_llm.usage._startup import REPORT_CONTEXT, bounded_gpu_fields, requested_fields
 from tensorrt_llm.usage.architecture_allowlist import PUBLIC_MODEL_ARCHITECTURES
 from tensorrt_llm.usage.config import UsageContext
 from tensorrt_llm.usage.llmapi_config import _failure_llm_api_config_payloads
@@ -345,28 +348,13 @@ def _collect_gpu_info() -> Dict[str, Any]:
 def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
     """Extract the architecture class name from a pretrained model config.
 
-    Handles three config formats:
-
-    1. **HF PretrainedConfig** (from ``transformers.PretrainedConfig``):
-       Has ``.architectures`` — a *list* of strings, e.g. ``["LlamaForCausalLM"]``.
-       This is the standard format when loading from a HuggingFace model dir.
-
-    2. [DEPRECATED] **TRT-LLM PretrainedConfig** (from ``tensorrt_llm.models.modeling_utils``):
-       Has ``.architecture`` — a *singular string*, e.g. ``"LlamaForCausalLM"``.
-       This is the format used in TRT-LLM checkpoint ``config.json`` files.
-
-    3. [DEPRECATED] **Engine config loaded by HF** (``transformers.PretrainedConfig.from_pretrained``
-       reading a TRT-LLM engine dir):
-       The engine ``config.json`` has top-level keys ``pretrained_config`` (dict)
-       and ``build_config`` (dict). HF's loader puts these as attributes on a
-       generic ``PretrainedConfig`` object. The architecture string is at
-       ``pretrained_config["architecture"]``.
+    Hugging Face model configs expose an ``architectures`` list. The first
+    entry is the architecture name when it is a non-empty string.
     """
     if pretrained_config is None:
         return None
     try:
-        # Case 1: HF PretrainedConfig — .architectures (plural list). The
-        # first item is authoritative; later entries are intentionally ignored.
+        # The first item is authoritative; later entries are intentionally ignored.
         architectures = getattr(pretrained_config, "architectures", None)
         if isinstance(architectures, (list, tuple)) and architectures:
             architecture = architectures[0]
@@ -374,22 +362,9 @@ def _extract_architecture_class_name(pretrained_config: Any) -> Optional[str]:
                 return architecture
             return None
 
-        # Case 2: TRT-LLM PretrainedConfig — .architecture (singular str)
-        architecture = getattr(pretrained_config, "architecture", None)
-        if isinstance(architecture, str) and architecture.strip():
-            return architecture
-
-        # Case 3: HF from_pretrained on engine dir — nested pretrained_config dict
-        nested_config = getattr(pretrained_config, "pretrained_config", None)
-        if isinstance(nested_config, dict) and "architecture" in nested_config:
-            architecture = nested_config["architecture"]
-            if isinstance(architecture, str) and architecture.strip():
-                return architecture
-
-        # Preserve the legacy fallback when no explicit architecture is present.
-        # The caller still applies the plaintext allowlist before reporting it.
+        # The caller still applies the plaintext allowlist to the class-name fallback.
         return type(pretrained_config).__name__
-    except (AttributeError, TypeError, KeyError, IndexError):
+    except (AttributeError, TypeError):
         return None
 
 
@@ -423,7 +398,7 @@ def _extract_trtllm_config(llm_args: Any) -> Dict[str, Any]:
     """Extract TRT-LLM configuration from LlmArgs.
 
     Args:
-        llm_args: The args object from BaseLLM (TrtLlmArgs, TorchLlmArgs, etc.)
+        llm_args: The args object from BaseLLM.
 
     Returns:
         Dict of config values, with None for unavailable fields.
@@ -441,11 +416,6 @@ def _extract_trtllm_config(llm_args: Any) -> Dict[str, Any]:
         backend = getattr(llm_args, "backend", None)
         if backend is not None:
             config["backend"] = str(backend)
-        else:
-            # Infer backend from args class when not explicitly set
-            cls_name = type(llm_args).__name__
-            if "TrtLlm" in cls_name:
-                config["backend"] = "tensorrt"
 
         # Parallelism
         parallel_config = getattr(llm_args, "parallel_config", None)
@@ -529,7 +499,7 @@ def _collect_features(llm_args: Any) -> str:
     GXT event schema (``stringVariableLength``).
 
     Args:
-        llm_args: The args object from BaseLLM (TrtLlmArgs, TorchLlmArgs, etc.)
+        llm_args: The args object from BaseLLM.
                   May be None.
 
     Returns:
@@ -563,18 +533,9 @@ def _collect_features(llm_args: Any) -> str:
             if block_reuse is not None:
                 features["prefix_caching"] = bool(block_reuse)
 
-        # CUDA graphs: two different config paths depending on backend.
-        # PyTorch backend: cuda_graph_config (TorchLlmArgs only).
-        #   None = disabled; CudaGraphConfig() = enabled (default).
-        # TRT backend: extended_runtime_perf_knob_config.cuda_graph_mode (TrtLlmArgs only).
+        # CUDA graphs are enabled when a CUDA graph configuration is present.
         cuda_graph_config = getattr(llm_args, "cuda_graph_config", None)
-        ext_config = getattr(llm_args, "extended_runtime_perf_knob_config", None)
-        if cuda_graph_config is not None:
-            # PyTorch path: presence of config object means enabled
-            features["cuda_graphs"] = True
-        elif ext_config is not None:
-            # TRT path: explicit cuda_graph_mode flag
-            features["cuda_graphs"] = bool(getattr(ext_config, "cuda_graph_mode", False))
+        features["cuda_graphs"] = cuda_graph_config is not None
 
         # Chunked context / chunked prefill: defined on BaseLlmArgs.
         features["chunked_context"] = bool(getattr(llm_args, "enable_chunked_prefill", False))
@@ -816,9 +777,11 @@ class _TelemetrySession:
         self.disabled = False
         self.initial_reported = False
         self.terminal_reported = False
+        self.llm_startup = False
+        self.startup_context: dict = {}
         self.terminal_ready = threading.Event()
         self.terminal_completion = threading.Event()
-        self.terminal_payload: Optional[dict] = None
+        self.terminal_payload: Optional[_PendingTerminal] = None
         self.terminal_thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.refresh_metadata()
@@ -874,6 +837,9 @@ class _TelemetrySession:
             if self.disabled or self.terminal_reported:
                 return False
             self.llm_initialization_attempts = self._increment(self.llm_initialization_attempts)
+            self.llm_startup = True
+            # Multiple attempts cannot be attributed from a process-exit snapshot.
+            self.startup_context = {}
             self.lifecycle_phase = "model_initialization"
             if self.component == "unknown":
                 self.component = "llm"
@@ -968,7 +934,7 @@ class _TelemetrySession:
             return self.observed_signal
 
     def claim_terminal(
-        self, outcome: TerminalOutcome
+        self, outcome: TerminalOutcome, lifecycle_phase: Optional[schema.LifecyclePhase] = None
     ) -> Optional[tuple[dict[str, Any], TerminalOutcome]]:
         """Atomically merge causal context and claim the terminal slot."""
         with self.lock:
@@ -976,7 +942,44 @@ class _TelemetrySession:
                 return None
             outcome = outcome.with_observation(self.observed_outcome)
             self.terminal_reported = True
-            return self._snapshot_unlocked(), outcome
+            snapshot = self._snapshot_unlocked()
+            if lifecycle_phase is not None:
+                snapshot["lifecyclePhase"] = lifecycle_phase
+            if (
+                self.llm_startup
+                and not self.initial_reported
+                and self.llm_instances_created == 0
+                and outcome.reporting_source == "self"
+                and outcome.component in (None, self.component)
+                and snapshot["lifecyclePhase"]
+                in ("cli_parsing", "config_validation", "model_initialization")
+                and not (
+                    outcome.termination_kind == "clean" and self.llm_initialization_attempts == 0
+                )
+            ):
+                self.initial_reported = True
+                snapshot["startup_context"] = (
+                    self.startup_context.copy() if self.llm_initialization_attempts <= 1 else {}
+                )
+            return snapshot, outcome
+
+    def mark_llm_startup(self) -> None:
+        """Enable partial LLM startup reporting without collecting any data."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            self.llm_startup = True
+
+    def capture_startup(self, fields: dict, *, begin: bool) -> None:
+        """Keep sanitized context only for the sole attributable construction attempt."""
+        with self.lock:
+            if self.disabled or self.terminal_reported or self.llm_instances_created:
+                return
+            if self.llm_initialization_attempts > 1:
+                return
+            if begin:
+                self.startup_context = {}
+            self.startup_context.update(fields)
 
     def claim_initial(self) -> bool:
         """Claim the success-only initial report before network delivery."""
@@ -986,8 +989,8 @@ class _TelemetrySession:
             self.initial_reported = True
             return True
 
-    def is_delivery_allowed(self) -> bool:
-        """Return whether the session still permits telemetry delivery."""
+    def is_session_telemetry_enabled(self) -> bool:
+        """Return whether telemetry is enabled for this session."""
         with self.lock:
             return not self.disabled
 
@@ -997,6 +1000,16 @@ class _TelemetrySession:
             self.disabled = True
         self.terminal_ready.set()
         self.terminal_completion.set()
+
+
+@dataclass(frozen=True)
+class _PendingTerminal:
+    """Terminal payload and optional context for the independent exit sender."""
+
+    session: _TelemetrySession
+    payload: dict
+    startup_context: Optional[dict] = None
+    deadline: float = 0.0
 
 
 _SESSION: Optional[_TelemetrySession] = None
@@ -1272,6 +1285,48 @@ def record_llm_initialization_failure() -> None:
     _session_call(lambda session: session.record_llm_initialization_failure(), None)
 
 
+def _mark_llm_startup() -> None:
+    """Mark an existing session as an LLM startup path without collecting any data."""
+    _session_call(lambda session: session.mark_llm_startup(), None)
+
+
+def _capture_startup_context(
+    *,
+    requested: Optional[dict] = None,
+    llm_args: Any = None,
+    pretrained_config: Any = None,
+) -> None:
+    """Snapshot LLM-only startup context at normal parsing/loading hooks; retain no raw objects."""
+    try:
+        session = _get_session()
+        if (
+            session is None
+            or not is_usage_stats_enabled()
+            or not session.is_session_telemetry_enabled()
+        ):
+            return
+        fields = {}
+        if requested is not None:
+            fields = requested_fields(requested)
+        if llm_args is not None:
+            if not apply_usage_session_config(getattr(llm_args, "telemetry_config", None)):
+                return
+            fields = requested_fields(_extract_trtllm_config(llm_args))
+            config_json, meta_json = _collect_llm_api_config_payloads(llm_args)
+            meta = json.loads(meta_json)
+            meta["source"] = "validated_pre_initialization"
+            fields.update(llmApiConfigJson=config_json, llmApiConfigMetaJson=json.dumps(meta))
+        if pretrained_config is not None:
+            name, hashed = _architecture_telemetry_fields(pretrained_config)
+            if name:
+                fields["architectureClassName"] = name
+            if hashed:
+                fields["architectureClassHash"] = hashed
+        session.capture_startup(fields, begin=requested is not None)
+    except Exception:
+        pass
+
+
 def record_llm_initialized() -> bool:
     """Record one successfully constructed LLM object."""
     return _session_call(lambda session: session.record_llm_initialized(), False)
@@ -1322,7 +1377,7 @@ def _send_if_session_active(
     payload: dict,
 ) -> bool:
     """Start delivery only if process opt-out has not already won."""
-    if not session.is_delivery_allowed():
+    if not session.is_session_telemetry_enabled():
         return False
     _send_to_gxt(payload)
     return True
@@ -1340,10 +1395,10 @@ def _terminal_sender(session: _TelemetrySession) -> None:
     try:
         session.terminal_ready.wait()
         with _REPORTER_LOCK:
-            payload = session.terminal_payload
+            pending = session.terminal_payload
             session.terminal_payload = None
-        if payload is not None:
-            _send_if_session_active(session, payload)
+        if pending is not None:
+            _send_terminal(pending)
     except Exception:
         pass  # Telemetry must not surface transport errors during shutdown.
     finally:
@@ -1352,7 +1407,7 @@ def _terminal_sender(session: _TelemetrySession) -> None:
 
 def _start_terminal_sender(session: _TelemetrySession) -> None:
     """Start the exit sender if not already started; caller must hold _REPORTER_LOCK."""
-    if session.terminal_thread is not None or not session.is_delivery_allowed():
+    if session.terminal_thread is not None or not session.is_session_telemetry_enabled():
         return
     try:
         thread = threading.Thread(
@@ -1365,6 +1420,72 @@ def _start_terminal_sender(session: _TelemetrySession) -> None:
         session.terminal_thread = thread
     except Exception:
         pass  # Exit-sender setup must not prevent normal usage reporting.
+
+
+def _send_terminal(pending: _PendingTerminal) -> None:
+    """Attach optional partial context without delaying exit beyond the shared deadline."""
+    payload = pending.payload
+    try:
+        if pending.startup_context is not None and pending.session.is_session_telemetry_enabled():
+            fields = dict(pending.startup_context)
+            meta = json.loads(fields.pop("llmApiConfigMetaJson", "{}"))
+            source = meta.get("source", "requested_pre_initialization" if fields else "unavailable")
+            fields.update(
+                pythonVersion=platform.python_version(),
+            )
+            for key, value in (
+                ("trtllmVersion", pending.session.trtllm_version),
+                ("cpuArchitecture", platform.machine()),
+            ):
+                if value and value != "unknown":
+                    fields[key] = _clamp_str(value, schema._SHORT_STR)
+            cpu_count = os.cpu_count()
+            if cpu_count is not None:
+                fields["cpuCount"] = cpu_count
+            # Build version is not the driver's supported CUDA version.
+            torch = sys.modules.get("torch")
+            cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+            if isinstance(cuda_version, str):
+                fields["cudaVersion"] = _clamp_str(cuda_version, schema._SHORT_STR)
+            gpu_fields = bounded_gpu_fields(pending.deadline)
+            gpu_source = gpu_fields.pop(
+                "_source", "nvml_visible_hardware" if gpu_fields else "unavailable"
+            )
+            fields.update(gpu_fields)
+            terminal = payload["events"][0]
+            meta.update(
+                report_context=REPORT_CONTEXT,
+                capture_phase=terminal["parameters"]["lifecyclePhase"],
+                source=source,
+                known_fields=sorted(
+                    key
+                    for key in fields
+                    if key != "llmApiConfigJson" or meta.get("capture_succeeded")
+                ),
+                gpu_source=gpu_source,
+                attempt_attribution="sole_attempt"
+                if terminal["parameters"]["llmInitializationAttempts"] == 1
+                else "unavailable",
+            )
+            event_fields = _session_event_fields(terminal["parameters"])
+            defaults = dict(tensorParallelSize=0, pipelineParallelSize=0, contextParallelSize=0)
+            initial = schema.TrtllmInitialReport(
+                **(defaults | fields),
+                llmApiConfigMetaJson=json.dumps(meta, sort_keys=True),
+                **event_fields,
+            )
+            context_event = schema.GxtEvent(
+                ts=terminal["ts"],
+                name="trtllm_initial_report",
+                parameters=initial.model_dump(by_alias=True),
+            ).model_dump(by_alias=True)
+            payload = dict(payload, events=[context_event, terminal])
+    except Exception:
+        # Optional context must never displace the authoritative exit event.
+        pass
+    if not is_usage_stats_enabled():
+        pending.session.disable()
+    _send_if_session_active(pending.session, payload)
 
 
 def report_exit(
@@ -1381,6 +1502,7 @@ def report_exit(
     this call claimed the slot, not whether network delivery succeeded.
     """
     claimed = False
+    deadline = time.monotonic() + _TERMINAL_FLUSH_TIMEOUT
     try:
         disabled, _ = _telemetry_settings(
             telemetry_config,
@@ -1399,7 +1521,7 @@ def report_exit(
         if not _is_reporting_rank():
             return False
 
-        terminal = session.claim_terminal(outcome)
+        terminal = session.claim_terminal(outcome, lifecycle_phase)
         if terminal is None:
             return False
         snapshot, outcome = terminal
@@ -1445,16 +1567,18 @@ def report_exit(
         )
 
         with _REPORTER_LOCK:
-            if not session.is_delivery_allowed():
+            if not session.is_session_telemetry_enabled():
                 return True
             _start_terminal_sender(session)
             _HEARTBEAT_STOP.set()
             if session.terminal_thread is None:
                 return True
-            session.terminal_payload = payload
+            session.terminal_payload = _PendingTerminal(
+                session, payload, snapshot.get("startup_context"), deadline
+            )
             session.terminal_ready.set()
 
-        session.terminal_completion.wait(timeout=_TERMINAL_FLUSH_TIMEOUT)
+        session.terminal_completion.wait(timeout=max(0, deadline - time.monotonic()))
         return True
     except Exception:
         return claimed
