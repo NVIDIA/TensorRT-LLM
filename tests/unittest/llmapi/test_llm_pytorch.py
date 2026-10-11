@@ -1361,14 +1361,18 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend=backend, transceiver_runtime=transceiver_runtime),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend=backend, transceiver_runtime=transceiver_runtime),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:
@@ -1536,14 +1540,18 @@ async def test_llm_disagg_streaming_gen_cancelled(transceiver_runtime):
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend=backend, transceiver_runtime=transceiver_runtime),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     llm_gen = LLM(model=llama_model_path,
                   kv_cache_config=global_kvcache_config_no_reuse,
                   tensor_parallel_size=tp_size,
                   cache_transceiver_config=CacheTransceiverConfig(
-                      backend=backend, transceiver_runtime=transceiver_runtime),
+                      backend=backend,
+                      kv_transfer_timeout_ms=1000,
+                      transceiver_runtime=transceiver_runtime),
                   **llm_args_extra)
 
     try:
