@@ -97,5 +97,9 @@ targets from different cores. Implemented instead:
   to zero transfer-related lines.
 - Tests: `tests/unittest/_torch/modeling_v2/transfers/` (binding direction, lookup, duplicate
   coverage, bind; planner parity/merge/targets/pair refusal/describe). 74 tests green with the
-  claims, routing and disaggregation planner suites. The two-node GSM8K gate was run before the
-  redesign; the plan arithmetic is unchanged and the parity test still pins it.
+  claims, routing and disaggregation planner suites.
+- Two-node re-gate with the new binding (ctx dep4 on nvl72d185-T13, gen dep4 on nvl72d185-T16,
+  same launcher): all four ranks log
+  `KV transfer planned by DeepseekMlaLatentTransferPlanner (planner_id='modeling_v2.deepseek_mla_latent')`,
+  no `PeerIncompatibleError`; GSM8K flexible-extract **95.07** against the 94.24 reference, PASSED.
+  Logs: `mv2-disagg/twonode/logs/run_20261011T084450Z`.
