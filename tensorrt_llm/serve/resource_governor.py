@@ -40,7 +40,6 @@ from tensorrt_llm.serve.openai_protocol import (
     ensure_request_chat_template_allowed,
 )
 from tensorrt_llm.serve.render import RenderResources, legacy_render_enabled, render_conversation
-from tensorrt_llm.serve.serving_extensions import get_serving_extension
 
 
 class ResourceGovernor:
@@ -122,13 +121,12 @@ class ResourceGovernor:
             if self.model_config is not None
             else None
         )
-        resources = RenderResources(
+        resources = RenderResources.from_parts(
             tokenizer=self.tokenizer,
             model_type=model_type,
-            processor=self.processor,
             hf_config=self.model_config,
+            processor=self.processor,
             default_chat_template=getattr(self, "chat_template", None),
-            extension=get_serving_extension(model_type),
         )
         return resources.legacy_view() if legacy_render_enabled() else resources
 

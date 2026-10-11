@@ -17,24 +17,25 @@
 from __future__ import annotations
 
 import os
-from typing import List
+from typing import Any, List, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .prompt_types import GenerateRequest
+from .resources import RenderResources
 from .serving import RenderRequestError, ServingRender
 
 CHAT_RENDER_PATH = "/v1/chat/completions/render"
 COMPLETION_RENDER_PATH = "/v1/completions/render"
 
-# The render and generate routes are a separate exposed surface; a normal
-# ``trtllm-serve`` worker mounts them only when this is set.
+# The render routes are a separate exposed surface; a normal ``trtllm-serve``
+# worker mounts them only when this is set.
 ENABLE_ENV = "TRTLLM_ENABLE_RENDER_ENDPOINTS"
 
 
 def render_endpoints_enabled() -> bool:
-    """Whether a serving worker mounts the render and generate routes."""
+    """Whether a serving worker mounts the render routes."""
     return os.getenv(ENABLE_ENV, "0") == "1"
 
 
@@ -90,3 +91,18 @@ def attach_render_routes(app: FastAPI, serving: ServingRender) -> None:
         methods=["POST"],
         response_model=List[GenerateRequest],
     )
+
+
+def mount_render_endpoints(app: FastAPI, server: Any, *, enabled: Optional[bool] = None) -> bool:
+    """Mount the render routes on a serving worker's app.
+
+    They are a separate exposed surface, so a worker mounts them only when
+    ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1`` (or ``enabled`` says so). Returns
+    whether they were mounted. A consumer that wants the worker to execute the
+    ids it got back uses the worker's existing token-in routes (see
+    :class:`~.prompt_types.GenerateRequest`).
+    """
+    if not (render_endpoints_enabled() if enabled is None else enabled):
+        return False
+    attach_render_routes(app, ServingRender(lambda: RenderResources.from_server(server)))
+    return True

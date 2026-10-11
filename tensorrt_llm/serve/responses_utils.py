@@ -73,7 +73,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
 from tensorrt_llm.serve.render import (RenderResources, legacy_render_enabled,
                                        render_conversation)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
-from tensorrt_llm.serve.serving_extensions import get_serving_extension
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -1095,15 +1094,12 @@ async def _create_input_tokens(
         messages, model_config)
     # Same pipeline as the chat route: the server template and the model
     # extension's tool serialization apply here too.
-    model_type = resolve_top_level_model_type(model_config)
-    render_resources = RenderResources(
+    render_resources = RenderResources.from_parts(
         tokenizer=tokenizer,
-        model_type=model_type,
-        processor=processor,
+        model_type=resolve_top_level_model_type(model_config),
         hf_config=model_config,
-        default_chat_template=chat_template,
-        extension=get_serving_extension(model_type),
-    )
+        processor=processor,
+        default_chat_template=chat_template)
     if legacy_render_enabled():
         render_resources = render_resources.legacy_view()
     tools_dict = [

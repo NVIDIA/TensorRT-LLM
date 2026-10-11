@@ -42,10 +42,6 @@ def _sha256(value: Any) -> Optional[str]:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 # Tokenizer init options that change the ids a text encodes to (an allowlist: the rest of
 # ``init_kwargs`` is loading provenance such as paths).
 _ENCODING_INIT_KWARGS = (
