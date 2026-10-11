@@ -89,6 +89,30 @@ def test_native_block_key_hasher_matches_python_v1_with_lora(
         assert block_key_hasher(toks, parent, lora_task_id=lora_task_id) == ref
 
 
+@pytest.mark.parametrize("hash_algo", [
+    KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
+    KV_CACHE_HASH_ALGO_V2_SHA256_64
+])
+@pytest.mark.parametrize("lora_task_id,wrapped", [(-1, 2**64 - 1),
+                                                  (2**64 + 5, 5)])
+def test_block_hashes_wrap_out_of_range_lora_id(servers, hash_algo,
+                                                lora_task_id, wrapped) -> None:
+    """Every algo reduces the LoRA id modulo 2**64 instead of raising.
+
+    The worker's LoRA id is a uint64 on both the V1 ``BlockKey`` and the V2
+    ``ReuseScope``, so an id outside [0, 2**64) must hash as its wrapped value
+    rather than make the native binding reject the request.
+    """
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4)
+    tokens = [list(range(1, 34))]
+    assert router._compute_block_hashes(
+        tokens, hash_algo=hash_algo,
+        lora_task_id=lora_task_id) == router._compute_block_hashes(
+            tokens, hash_algo=hash_algo, lora_task_id=wrapped)
+
+
 def test_block_key_hasher_python_fallback_only_for_cache_salt(
         monkeypatch) -> None:
     """LoRA-only requests take the native path; only a cache salt falls back."""

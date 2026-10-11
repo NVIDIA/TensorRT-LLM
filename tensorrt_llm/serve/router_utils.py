@@ -49,6 +49,12 @@ truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
 _UINT64_MASK = (1 << 64) - 1
 
+
+def _to_uint64(value: Optional[int]) -> Optional[int]:
+    """Reduce an id modulo 2**64, as the native uint64 LoRA id fields hold it."""
+    return None if value is None else value & _UINT64_MASK
+
+
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
 
@@ -169,9 +175,8 @@ def block_key_hasher(
     # hash_v1_block_key masks it), but its binding exposes no cache salt, so
     # only salted requests take the Python path.
     if cache_salt_id is None:
-        native_lora_id = None if lora_task_id is None else lora_task_id & _UINT64_MASK
         return _NativeBlockKeyHasher.hash(
-            _NativeBlockKey(token_ids, lora_task_id=native_lora_id), parent
+            _NativeBlockKey(token_ids, lora_task_id=_to_uint64(lora_task_id)), parent
         )
     return hash_v1_block_key(
         token_ids, parent_hash=parent, lora_task_id=lora_task_id, cache_salt_id=cache_salt_id
@@ -329,7 +334,7 @@ class BlockHashMixin:
             # V2 keys chain from a reuse-scope root, which is exactly what
             # sequence_to_blockchain_keys yields; its first pair is the root itself, so
             # skip it. In KvCacheManager the last token is not part of any block key.
-            reuse_scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt_id)
+            reuse_scope = ReuseScope(lora_id=_to_uint64(lora_task_id), salt=cache_salt_id)
             to_hash = truncate_sha256_hash_to_int64
             if hash_algo == KV_CACHE_HASH_ALGO_V2:
 
