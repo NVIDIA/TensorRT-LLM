@@ -1685,6 +1685,23 @@ class ResponsesRequest(OpenAIBaseModel):
 
     # doc: end-responses-extra-params
 
+    @field_validator("prompt_token_ids_b64")
+    @classmethod
+    def _check_prompt_token_ids_b64(cls, value: Optional[str]) -> Optional[str]:
+        # Decoded during routing and preprocessing, after validation; a bad
+        # value must be a 400 here rather than an internal error there.
+        if not value:
+            return value
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except ValueError as error:
+            raise ValueError(
+                "prompt_token_ids_b64 is not valid base64") from error
+        if len(raw) % 4:
+            raise ValueError(
+                "prompt_token_ids_b64 is not a buffer of int32 token ids")
+        return value
+
     def relayed_prompt_token_ids(self) -> Optional[List[int]]:
         """The prompt the orchestrator relayed from the context worker, if any."""
         if self.prompt_token_ids is not None:

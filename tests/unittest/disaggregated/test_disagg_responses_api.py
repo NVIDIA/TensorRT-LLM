@@ -28,6 +28,7 @@ import aiohttp
 import numpy as np
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import (
@@ -165,6 +166,19 @@ def test_the_generation_worker_uses_the_relayed_prompt(fields, expected):
     request = ResponsesRequest(model="m", input="hi", **fields)
     assert request.relayed_prompt_token_ids() == expected
     assert request.prompt_token_ids == fields.get("prompt_token_ids")
+
+
+@pytest.mark.parametrize(
+    "encoded, reason",
+    [
+        ("abc", "not valid base64"),
+        ("AQ==!", "not valid base64"),
+        (base64.b64encode(b"\x01\x02\x03").decode("ascii"), "int32"),
+    ],
+)
+def test_a_malformed_relayed_prompt_is_a_validation_error(encoded, reason):
+    with pytest.raises(ValidationError, match=reason):
+        ResponsesRequest(model="m", input="hi", prompt_token_ids_b64=encoded)
 
 
 @pytest.mark.parametrize(
