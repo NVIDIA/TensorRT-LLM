@@ -68,6 +68,8 @@ def _get_unsupported_primts_reason(
     k: torch.Tensor,
     v: torch.Tensor,
     metadata: VSAMetadata,
+    *,
+    sage: bool,
 ) -> str | None:
     if q.shape != k.shape or q.shape != v.shape:
         return "VSA PrimTS requires matching MHA Q/K/V shapes"
@@ -75,6 +77,8 @@ def _get_unsupported_primts_reason(
         return f"VSA PrimTS requires CUDA tensors, got {q.device}"
     if q.dtype not in (torch.float16, torch.bfloat16):
         return f"VSA PrimTS requires FP16 or BF16 tensors, got {q.dtype}"
+    if sage and q.dtype != torch.bfloat16:
+        return f"VSA PrimTS Sage attention requires BF16 tensors, got {q.dtype}"
     batch_size, seq_len, num_heads, head_dim = map(int, q.shape)
     if min(batch_size, seq_len, num_heads, metadata.num_cubes) <= 0:
         return "VSA PrimTS requires positive batch, sequence, head, and cube extents"
@@ -142,9 +146,9 @@ class VSATrtllmAttention(TrtllmAttention):
         use_primts = any(
             isinstance(fmha, PrimsTSBlockSparseFmha) for fmha in self._fmha_manager.fmha_libs
         )
-        unsupported_reason = _get_unsupported_primts_reason(q, k, v, metadata)
-        if self.quant_attention_config is not None:
-            unsupported_reason = "VSA PrimTS does not support quant_attention_config"
+        unsupported_reason = _get_unsupported_primts_reason(
+            q, k, v, metadata, sage=self.quant_attention_config is not None
+        )
         if not use_primts:
             logger.warning_once(
                 "TRTLLM VSA cannot use PrimTS block-sparse attention because the "

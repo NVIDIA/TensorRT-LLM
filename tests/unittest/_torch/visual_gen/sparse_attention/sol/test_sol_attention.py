@@ -931,27 +931,24 @@ def test_sol_public_config_requires_supported_backend() -> None:
 
 
 @_CPU_ONLY
-@pytest.mark.parametrize(
-    ("backend", "quant_recipe"),
-    [
-        ("TRTLLM", {"qk_dtype": "fp8", "q_block_size": 1, "k_block_size": 1, "v_block_size": 1}),
-        ("CUTEDSL", {"qk_dtype": "bf16", "v_dtype": "fp8"}),
-    ],
-    ids=["TRTLLM", "CUTEDSL"],
-)
-def test_sol_and_attention_quantization_are_mutually_exclusive(
-    backend: str, quant_recipe: dict
-) -> None:
-    """A recipe the backend accepts on its own is still rejected next to SOL."""
+def test_sol_and_attention_quantization_compose_only_on_trtllm() -> None:
+    """TRTLLM runs SOL with its Sage recipe; CUTEDSL rejects a recipe it accepts on its own."""
 
     with patch("tensorrt_llm.visual_gen.args.get_sm_version", return_value=100):
-        AttentionConfig(
-            backend=backend, quant_attention_config=QuantAttentionConfig(**quant_recipe)
+        sage = QuantAttentionConfig(qk_dtype="fp8", q_block_size=1, k_block_size=1, v_block_size=1)
+        attention = AttentionConfig(
+            backend="TRTLLM",
+            quant_attention_config=sage,
+            sparse_attention_config=SolAttentionConfig(),
         )
+        assert attention.quant_attention_config is sage
+
+        cutedsl_recipe = QuantAttentionConfig(qk_dtype="bf16", v_dtype="fp8")
+        AttentionConfig(backend="CUTEDSL", quant_attention_config=cutedsl_recipe)
         with pytest.raises(ValidationError, match="SOL and quant_attention_config"):
             AttentionConfig(
-                backend=backend,
-                quant_attention_config=QuantAttentionConfig(**quant_recipe),
+                backend="CUTEDSL",
+                quant_attention_config=cutedsl_recipe,
                 sparse_attention_config=SolAttentionConfig(),
             )
 
