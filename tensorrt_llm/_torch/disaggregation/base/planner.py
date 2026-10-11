@@ -28,12 +28,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, AbstractSet, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.disaggregation.base.backend import TokenRange
+    from tensorrt_llm._torch.disaggregation.base.backend import Chunk, RecvReqInfo
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
 
@@ -103,22 +103,22 @@ class TransferPlanner(ABC):
         self,
         self_ri: "RankInfo",
         peer_ri: "RankInfo",
-        src_block_ids_per_lg: List[np.ndarray],
-        dst_block_ids_per_lg: List[np.ndarray],
-        token_range: "TokenRange",
+        chunk: "Chunk",
+        req_info: "RecvReqInfo",
         prompt_len: int,
-        dst_start_token: Optional[int],
-        excluded_pool_views: AbstractSet[Tuple[int, int]],
     ) -> TransferPlan:
         """Sender side: the bytes this rank writes into ``peer_ri`` for one chunk.
 
-        ``excluded_pool_views`` are ``(layer_group, pool_view)`` pairs the cache
-        manager keeps out of this chunk; the plan writes nothing from them.
+        ``chunk`` is this rank's description of what it holds for the piece (block
+        tables per layer group, token range), ``req_info`` the receiver's description
+        of where it lands (its block tables, a lower bound below which it accepts
+        nothing). Both arrive whole so a planner honors every per-request fact the
+        framework records, present or future, without a signature change.
         """
 
     @abstractmethod
     def receiver_payload_bytes(
-        self, self_ri: "RankInfo", peer_ri: "RankInfo", dst_block_ids_per_lg: List[np.ndarray]
+        self, self_ri: "RankInfo", peer_ri: "RankInfo", req_info: "RecvReqInfo"
     ) -> Optional[int]:
         """Receiver side: bytes beyond the paged blocks that ride the same write.
 

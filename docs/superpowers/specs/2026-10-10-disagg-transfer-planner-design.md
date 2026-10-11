@@ -84,22 +84,31 @@ class TransferPlanner(ABC):
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        src_block_ids_per_lg: list[np.ndarray],
-        dst_block_ids_per_lg: list[np.ndarray],
-        token_range: TokenRange,
+        chunk: Chunk,            # sender's description of the piece (base/backend.py)
+        req_info: RecvReqInfo,   # receiver's description of where it lands (base/backend.py)
         prompt_len: int,
-        dst_start_token: Optional[int],
     ) -> TransferPlan:
         """Sender side. Replaces the body of _build_kv_write_meta."""
 
     @abstractmethod
     def receiver_payload_bytes(
-        self, self_ri: RankInfo, peer_ri: RankInfo, dst_block_ids_per_lg: list[np.ndarray]
+        self, self_ri: RankInfo, peer_ri: RankInfo, req_info: RecvReqInfo
     ) -> Optional[int]:
         """Receiver side, bytes beyond the paged blocks that ride the same write
         (recurrent state today). None = cannot size, receiver disables bounce.
         Replaces _get_mamba_slot + mamba_receiver_payload_bytes."""
 ```
+
+`plan` and `receiver_payload_bytes` take the two request descriptions whole,
+never fields picked out of them. `Chunk` is what the sender holds for the piece
+(block tables per layer group, token range, and whatever per-request facts the
+transceiver records later, e.g. pool views a request excludes); `RecvReqInfo` is
+the receiver's wire message (its block tables, `dst_start_token`, bounce
+address, aux slot). Both live in `base/backend.py`, so the planner package
+depends on protocol types only, never on `native/transfer.py`'s task objects
+(`KVSendTask` carries transfer progress and timers a planner must not touch).
+A new per-request fact is added to one of these two types and every planner
+sees it; the interface does not change and nothing silently stops flowing.
 
 Threading contract is unchanged from today: `plan` is called where
 `_build_kv_write_meta` is called now, `targets` and `receiver_payload_bytes`

@@ -20,7 +20,7 @@ import pytest
 from tensorrt_llm._torch._experimental.modeling_v2.transfers.deepseek_mla_latent import (
     DeepseekMlaLatentTransferPlanner,
 )
-from tensorrt_llm._torch.disaggregation.base import TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, RecvReqInfo, TokenRange
 from tensorrt_llm._torch.disaggregation.base.planner import PeerIncompatibleError, TransferPlan
 from tensorrt_llm._torch.disaggregation.native.default_planner import DefaultTransferPlanner
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
@@ -122,8 +122,24 @@ def _fragments_at_slot_granularity(plan: TransferPlan) -> set:
     return out
 
 
-def _tables(src, dst):
-    return [np.array(src, dtype=np.int64)], [np.array(dst, dtype=np.int64)]
+def _request(src, dst, dst_start_token=None):
+    """Sender-side chunk and receiver-side request for one single-layer-group transfer."""
+    prompt_len = len(src) * TPB
+    chunk = Chunk(
+        block_ids_per_layer_groups=[np.array(src, dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(0, prompt_len),
+        is_last=True,
+    )
+    req_info = RecvReqInfo(
+        sender_req_id=1,
+        instance_name="gen",
+        instance_rank=2,
+        block_ids_per_layer_groups=[np.array(dst, dtype=np.int64)],
+        unique_rid=1,
+        dst_start_token=dst_start_token,
+    )
+    return chunk, req_info, prompt_len
 
 
 @pytest.mark.parametrize(
@@ -140,11 +156,10 @@ def _tables(src, dst):
 )
 def test_plan_matches_default_planner_byte_for_byte(src, dst, dst_start_token):
     target, default, self_ri, peer_ri = _pair()
-    s, d = _tables(src, dst)
-    tr = TokenRange(0, len(src) * TPB)
+    chunk, req_info, prompt_len = _request(src, dst, dst_start_token)
 
-    ours = target.plan(self_ri, peer_ri, s, d, tr, len(src) * TPB, dst_start_token, frozenset())
-    ref = default.plan(self_ri, peer_ri, s, d, tr, len(src) * TPB, dst_start_token, frozenset())
+    ours = target.plan(self_ri, peer_ri, chunk, req_info, prompt_len)
+    ref = default.plan(self_ri, peer_ri, chunk, req_info, prompt_len)
 
     assert _fragments_at_slot_granularity(ours) == _fragments_at_slot_granularity(ref)
     assert int(ours.sizes.sum()) == int(ref.sizes.sum())
@@ -152,8 +167,7 @@ def test_plan_matches_default_planner_byte_for_byte(src, dst, dst_start_token):
 
 def test_contiguous_blocks_merge_into_one_fragment():
     target, _, self_ri, peer_ri = _pair()
-    s, d = _tables([3, 4, 5, 6], [10, 11, 12, 13])
-    plan = target.plan(self_ri, peer_ri, s, d, TokenRange(0, 4 * TPB), 4 * TPB, None, frozenset())
+    plan = target.plan(self_ri, peer_ri, *_request([3, 4, 5, 6], [10, 11, 12, 13]))
     assert plan.sizes.tolist() == [4 * SLOT_BYTES]
 
 

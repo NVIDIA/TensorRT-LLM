@@ -31,11 +31,11 @@ recurrent state.
 
 from __future__ import annotations
 
-from typing import AbstractSet, FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, Optional, Tuple
 
 import numpy as np
 
-from tensorrt_llm._torch.disaggregation.base.backend import TokenRange
+from tensorrt_llm._torch.disaggregation.base.backend import Chunk, RecvReqInfo
 from tensorrt_llm._torch.disaggregation.base.planner import (
     PeerIncompatibleError,
     PeerTargets,
@@ -135,21 +135,19 @@ class DeepseekMlaLatentTransferPlanner(TransferPlanner):
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        src_block_ids_per_lg: List[np.ndarray],
-        dst_block_ids_per_lg: List[np.ndarray],
-        token_range: TokenRange,
+        chunk: Chunk,
+        req_info: RecvReqInfo,
         prompt_len: int,
-        dst_start_token: Optional[int],
-        excluded_pool_views: AbstractSet[Tuple[int, int]],
     ) -> TransferPlan:
-        del token_range, prompt_len  # cp == 1: a partial piece needs no projection
-        if (0, 0) in excluded_pool_views:  # the sole latent pool is layer group 0, view 0
+        del prompt_len  # cp == 1: a partial piece needs no projection
+        if (0, 0) in chunk.excluded_pool_views:  # the sole latent pool is layer group 0, view 0
             return TransferPlan.empty()
         tpb = self._page_table.tokens_per_block
+        dst_start_token = req_info.dst_start_token
         dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
         src_ids, dst_ids = DefaultTransferPlanner._pair_ordinals(
-            np.asarray(src_block_ids_per_lg[0], dtype=np.int64),
-            np.asarray(dst_block_ids_per_lg[0], dtype=np.int64),
+            np.asarray(chunk.block_ids_per_layer_groups[0], dtype=np.int64),
+            np.asarray(req_info.block_ids_per_layer_groups[0], dtype=np.int64),
             dst_start_block=dst_start_block,
         )
         if src_ids.size == 0:
@@ -173,6 +171,6 @@ class DeepseekMlaLatentTransferPlanner(TransferPlanner):
         )
 
     def receiver_payload_bytes(
-        self, self_ri: RankInfo, peer_ri: RankInfo, dst_block_ids_per_lg: List[np.ndarray]
+        self, self_ri: RankInfo, peer_ri: RankInfo, req_info: RecvReqInfo
     ) -> Optional[int]:
         return 0  # no recurrent state rides along with the paged blocks

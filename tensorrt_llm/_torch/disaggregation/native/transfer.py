@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List, Optional, Union
 
-import msgpack
 import numpy as np
 import torch
 
@@ -38,7 +37,7 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import Chunk
+from tensorrt_llm._torch.disaggregation.base import Chunk, RecvReqInfo
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -105,48 +104,6 @@ _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 class _TransferNotSubmittedError(RuntimeError):
     """The sender rejected an operation before the backend could access memory."""
-
-
-@dataclass
-class RecvReqInfo:
-    sender_req_id: int
-    instance_name: str
-    instance_rank: int
-    # Positional pool slots per layer group (see Chunk): entry i is the
-    # receiver's slot for block ordinal i, or -1 where it accepts nothing.
-    block_ids_per_layer_groups: list[np.ndarray]
-    unique_rid: int
-    # Optional extra lower bound (block-aligned token offset) below which the
-    # receiver accepts nothing, on top of the -1 holes already in its table.
-    dst_start_token: Optional[int] = None
-    aux_slot: Optional[int] = None
-    slice_id: Optional[int] = None
-    bounce_dst_base: Optional[int] = None
-
-    def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "slice_id": self.slice_id,
-                "bounce_dst_base": self.bounce_dst_base,
-            }
-        )
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "RecvReqInfo":
-        d = msgpack.unpackb(data, raw=False)
-        d["block_ids_per_layer_groups"] = [
-            np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
-        ]
-        return cls(**d)
 
 
 @dataclass
@@ -1690,16 +1647,7 @@ class Sender(SenderBase):
 
         # Which of this rank's bytes land where on the peer is the model's planner's call;
         # an empty plan still goes out so the peer's expected-writer count settles.
-        plan = self._planner.plan(
-            self_ri,
-            peer_ri,
-            task._chunk.block_ids_per_layer_groups,
-            req_info.block_ids_per_layer_groups,
-            task._chunk.token_range,
-            task._prompt_len,
-            req_info.dst_start_token,
-            task._chunk.excluded_pool_views,
-        )
+        plan = self._planner.plan(self_ri, peer_ri, task._chunk, req_info, task._prompt_len)
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
@@ -3085,9 +3033,7 @@ class Receiver(ReceiverBase):
         )
         # Bytes beyond the paged blocks that ride the same coalesced write
         # (recurrent state today) size the bounce region too; None = unknown.
-        extra_bytes = self._planner.receiver_payload_bytes(
-            self_ri, peer_infos, receiver_req.block_ids_per_layer_groups
-        )
+        extra_bytes = self._planner.receiver_payload_bytes(self_ri, peer_infos, receiver_req)
         if extra_bytes is None:
             allow_bounce = False
             extra_bytes = 0

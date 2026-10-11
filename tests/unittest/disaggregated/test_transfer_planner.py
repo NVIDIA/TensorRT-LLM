@@ -48,12 +48,13 @@ from types import SimpleNamespace  # noqa: E402
 from unittest.mock import Mock  # noqa: E402
 
 from tensorrt_llm import DisaggregatedParams  # noqa: E402
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange  # noqa: E402
-from tensorrt_llm._torch.disaggregation.native.transfer import (  # noqa: E402
-    KVSendTask,
+from tensorrt_llm._torch.disaggregation.base import (  # noqa: E402
+    CacheKind,
+    Chunk,
     RecvReqInfo,
-    Sender,
+    TokenRange,
 )
+from tensorrt_llm._torch.disaggregation.native.transfer import KVSendTask, Sender  # noqa: E402
 
 
 class _ToyPlanner(TransferPlanner):
@@ -72,13 +73,11 @@ class _ToyPlanner(TransferPlanner):
     def targets(self, self_ri, peer_ri, peer_dp_rank):
         return PeerTargets(ranks=list(self._ranks), uniform_writers=True)
 
-    def plan(
-        self, self_ri, peer_ri, src, dst, token_range, prompt_len, dst_start_token, excluded
-    ):
-        self.calls.append((src, dst, token_range, prompt_len, dst_start_token, excluded))
+    def plan(self, self_ri, peer_ri, chunk, req_info, prompt_len):
+        self.calls.append((chunk, req_info, prompt_len))
         return self._plan
 
-    def receiver_payload_bytes(self, self_ri, peer_ri, dst):
+    def receiver_payload_bytes(self, self_ri, peer_ri, req_info):
         return 0
 
 
@@ -141,11 +140,9 @@ def test_build_kv_write_meta_uses_planner_plan():
     assert wm.src_ptrs is plan.src_ptrs and wm.dst_ptrs is plan.dst_ptrs and wm.sizes is plan.sizes
     assert wm.expected_transfers == 2 and task.expected_transfers == 2
     assert wm.dst_device_id == 1 and wm.peer_rank == 3 and wm.peer_endpoint == "tcp://gen:1"
-    ((src, dst, token_range, prompt_len, dst_start, excluded),) = planner.calls
-    assert src is task._chunk.block_ids_per_layer_groups
-    assert dst is req.block_ids_per_layer_groups
-    assert excluded is task._chunk.excluded_pool_views
-    assert (token_range.start, token_range.end, prompt_len, dst_start) == (0, 64, 64, 32)
+    # The planner gets both request descriptions whole, not fields picked out of them.
+    ((chunk, req_info, prompt_len),) = planner.calls
+    assert chunk is task._chunk and req_info is req and prompt_len == 64
 
 
 def test_build_kv_write_meta_empty_plan_still_delivers():
@@ -214,6 +211,9 @@ def test_dispatch_task_payload_none_disables_bounce():
     recv._bounce.reserve.assert_not_called()
     recv._request_sender_data.assert_called_once_with("tcp://s0", b"req")
     assert task.expected_transfers == 1
+    # The receiver hands its request description to the planner whole.
+    (_self_ri, _peer_ri, req_info), _ = planner.receiver_payload_bytes.call_args
+    assert req_info is recv._build_recv_req_info.return_value
 
 
 # --------------------------------------------------------------------------- #

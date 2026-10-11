@@ -29,6 +29,7 @@ from .backend import (
     Fetches,
     Outcome,
     Publishes,
+    RecvReqInfo,
     TokenRange,
 )
 
@@ -43,5 +44,6 @@ __all__ = [
     "Fetches",
     "Outcome",
     "Publishes",
+    "RecvReqInfo",
     "TokenRange",
 ]

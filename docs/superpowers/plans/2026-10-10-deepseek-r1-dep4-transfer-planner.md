@@ -103,3 +103,28 @@ targets from different cores. Implemented instead:
   `KV transfer planned by DeepseekMlaLatentTransferPlanner (planner_id='modeling_v2.deepseek_mla_latent')`,
   no `PeerIncompatibleError`; GSM8K flexible-extract **95.07** against the 94.24 reference, PASSED.
   Logs: `mv2-disagg/twonode/logs/run_20261011T084450Z`.
+
+## Interface hardening (after review)
+
+Reviewing DeepSeek-V4.1 (PR #19727, merged 2026-10-11) against this branch showed
+that `plan()` took a copy of `Chunk`'s field list as positional arguments. main
+added `Chunk.excluded_pool_views` (remote-tail / bounded-replay SWA views the
+generation side rebuilds locally) and filters on it inside the sender's pool
+loop, which this branch moved into `DefaultTransferPlanner.plan`. With the old
+signature that field could not reach the planner, and a textual rebase would
+have merged cleanly while dropping the filter.
+
+`plan(self_ri, peer_ri, chunk, req_info, prompt_len)` and
+`receiver_payload_bytes(self_ri, peer_ri, req_info)` now receive the two request
+descriptions whole. `RecvReqInfo` moved from `native/transfer.py` to
+`base/backend.py` next to `Chunk`, since it is the wire protocol type the planner
+contract depends on. The sender's `KVSendTask` is deliberately not passed: it
+carries transfer progress, counters and timers.
+
+Still to do at rebase time, not here: honor `chunk.excluded_pool_views` in
+`DefaultTransferPlanner.plan` and fold `validate_bounded_replay_compatible` into
+`check_peer`; both land on the planner, not on `transfer.py`.
+
+Verified: 292 unit tests green (planner, chunked transfer, ownership regressions,
+unsubmitted session, peer, modeling_v2 transfers/claims/routing/target
+contract/op bind).

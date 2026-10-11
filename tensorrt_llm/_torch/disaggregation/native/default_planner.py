@@ -25,12 +25,12 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import AbstractSet, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base.backend import TokenRange
+from tensorrt_llm._torch.disaggregation.base.backend import Chunk, RecvReqInfo
 from tensorrt_llm._torch.disaggregation.base.planner import (
     PeerIncompatibleError,
     PeerTargets,
@@ -214,13 +214,14 @@ class DefaultTransferPlanner(TransferPlanner):
         self,
         self_ri: RankInfo,
         peer_ri: RankInfo,
-        src_block_ids_per_lg: List[np.ndarray],
-        dst_block_ids_per_lg: List[np.ndarray],
-        token_range: TokenRange,
+        chunk: Chunk,
+        req_info: RecvReqInfo,
         prompt_len: int,
-        dst_start_token: Optional[int],
-        excluded_pool_views: AbstractSet[Tuple[int, int]],
     ) -> TransferPlan:
+        src_block_ids_per_lg = chunk.block_ids_per_layer_groups
+        dst_block_ids_per_lg = req_info.block_ids_per_layer_groups
+        token_range = chunk.token_range
+        dst_start_token = req_info.dst_start_token
         # Only a piece short of the whole prompt runs the chunk projection below, and that is the
         # part with no answer under CP; a sole piece covering everything takes the untouched path.
         is_partial = token_range.start > 0 or token_range.end < prompt_len
@@ -249,7 +250,7 @@ class DefaultTransferPlanner(TransferPlanner):
         # Send ownership is per pool: replicated pools elect one fan-in
         # owner, sharded pools keep head-duplication routing.
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in excluded_pool_views:
+            if (self_lg, self_pi) in chunk.excluded_pool_views:
                 continue
             if not self.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
@@ -312,10 +313,10 @@ class DefaultTransferPlanner(TransferPlanner):
         )
 
     def receiver_payload_bytes(
-        self, self_ri: RankInfo, peer_ri: RankInfo, dst_block_ids_per_lg: List[np.ndarray]
+        self, self_ri: RankInfo, peer_ri: RankInfo, req_info: RecvReqInfo
     ) -> Optional[int]:
         receiver_pt = self._self_ext_cache.page_table
-        dst_slot = self._get_mamba_slot(receiver_pt, dst_block_ids_per_lg)
+        dst_slot = self._get_mamba_slot(receiver_pt, req_info.block_ids_per_layer_groups)
         if dst_slot is None:
             return 0
         if peer_ri.page_table is None:

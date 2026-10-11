@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Optional, Protocol, Set, Tuple, Union, runtime_checkable
 
+import msgpack
 import numpy as np
 
 # TODO:
@@ -38,6 +39,7 @@ __all__ = [
     "Fetches",
     "Outcome",
     "Publishes",
+    "RecvReqInfo",
     "TokenRange",
 ]
 
@@ -112,6 +114,55 @@ class Chunk:
                 f"{len(self.block_ids_per_layer_groups)} layer groups but "
                 f"{len(self.kind_per_layer_group)} kinds"
             )
+
+
+@dataclass
+class RecvReqInfo:
+    """The receiver's description of one request, sent to the sender over the wire.
+
+    The receiver-side counterpart of :class:`Chunk`: everything the sender's planner may
+    need about where the bytes land. New per-request receiver facts belong here, so they
+    reach the planner without changing its interface.
+    """
+
+    sender_req_id: int
+    instance_name: str
+    instance_rank: int
+    # Positional pool slots per layer group (see Chunk): entry i is the
+    # receiver's slot for block ordinal i, or -1 where it accepts nothing.
+    block_ids_per_layer_groups: list[np.ndarray]
+    unique_rid: int
+    # Optional extra lower bound (block-aligned token offset) below which the
+    # receiver accepts nothing, on top of the -1 holes already in its table.
+    dst_start_token: Optional[int] = None
+    aux_slot: Optional[int] = None
+    slice_id: Optional[int] = None
+    bounce_dst_base: Optional[int] = None
+
+    def to_bytes(self) -> bytes:
+        return msgpack.packb(
+            {
+                "sender_req_id": self.sender_req_id,
+                "instance_name": self.instance_name,
+                "instance_rank": self.instance_rank,
+                "block_ids_per_layer_groups": [
+                    arr.tobytes() for arr in self.block_ids_per_layer_groups
+                ],
+                "unique_rid": self.unique_rid,
+                "dst_start_token": self.dst_start_token,
+                "aux_slot": self.aux_slot,
+                "slice_id": self.slice_id,
+                "bounce_dst_base": self.bounce_dst_base,
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RecvReqInfo":
+        d = msgpack.unpackb(data, raw=False)
+        d["block_ids_per_layer_groups"] = [
+            np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
+        ]
+        return cls(**d)
 
 
 @dataclass
