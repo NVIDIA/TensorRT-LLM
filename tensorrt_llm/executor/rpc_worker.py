@@ -1,7 +1,5 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 from pathlib import Path
+from queue import Queue
 from threading import Event
 from typing import Optional
 
@@ -81,7 +79,8 @@ class RpcWorker(RpcWorkerMixin, BaseWorker):
             None)
         self.shutdown_event = Event()
 
-        self._init_rpc_response_stream()
+        self._response_queue = Queue()
+        self.set_result_queue(self._response_queue)
 
         # Note: We don't create a persistent ThreadPoolExecutor anymore
         # to avoid thread leaks. Instead, we use asyncio.to_thread() which

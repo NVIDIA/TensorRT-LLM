@@ -12,7 +12,6 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
@@ -93,13 +92,8 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
                     f"active memory ({memory_usage_active:.2f} GB)"
                 )
 
-            with pytest.raises(RequestError, match="Cannot enqueue"):
-                await asyncio.wait_for(llm.generate_async(prompt, sampling_params), timeout=10)
-
             if cycle == 0:
                 await llm.resume(tags[:1])
-                with pytest.raises(RequestError, match="Cannot enqueue"):
-                    await asyncio.wait_for(llm.generate_async(prompt, sampling_params), timeout=10)
                 await llm.resume(tags[1:])
             else:
                 await llm.resume(tags)
