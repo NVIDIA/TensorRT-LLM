@@ -148,3 +148,27 @@ def test_router_logits_kernel_matches_router_gemm(num_tokens):
     actual = gates[1].compute_logits(hidden)
     assert actual.dtype == torch.float32 and actual.shape == (num_tokens, cfg.num_experts)
     assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.cpu_only
+def test_bf16_gate_sends_only_bf16_rows_to_router_gemm(monkeypatch):
+    """A bf16 gate runs ``dsv3_router_gemm_op`` on bf16 rows and the fp32 upcast on other rows."""
+    calls = []
+
+    def fake_router_gemm(hidden, weight_t, bias, out_dtype):
+        calls.append((hidden.dtype, weight_t.dtype))
+        return torch.zeros(hidden.shape[0], weight_t.shape[1], dtype=out_dtype)
+
+    monkeypatch.setattr(torch.ops.trtllm, "dsv3_router_gemm_op", fake_router_gemm, raising=False)
+    gate = KimiK3MoEGate(_GateConfig(), logits_gemm_dtype=torch.bfloat16)
+    with torch.no_grad():
+        gate.weight.normal_(0.0, 0.05)
+    hidden = torch.randn(3, gate.gating_dim)
+
+    gate.compute_logits(hidden.to(torch.bfloat16))
+    assert calls == [(torch.bfloat16, torch.bfloat16)]
+
+    logits = gate.compute_logits(hidden)
+    assert len(calls) == 1
+    expected = hidden.double() @ gate.weight.double().t()
+    torch.testing.assert_close(logits, expected.float(), rtol=1e-4, atol=1e-4)
