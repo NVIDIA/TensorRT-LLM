@@ -46,6 +46,8 @@ class TopK(nn.Module):
         decode_implementation: TopKImplementation | None = None,
         compress_ratio: int = 1,
         gvr_self_sampling: bool = True,
+        gvr_deterministic: bool = False,
+        gvr_sorting: str | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -59,6 +61,13 @@ class TopK(nn.Module):
         # Second-level GVR dispatch for CUTE_DSL_GVR: True selects the
         # hint-free self-sampling engine, False the temporal-hint engine.
         self.gvr_self_sampling = gvr_self_sampling
+        # self-sampling GVR only: deterministic selection / order, optional ascending rows
+        self.gvr_deterministic = gvr_deterministic
+        self.gvr_sorting = gvr_sorting
+        # forwarded only when enabled so the default path's calls are unchanged
+        self._gvr_det_kwargs = (
+            {"deterministic": True, "sorting": gvr_sorting} if gvr_deterministic else {}
+        )
         # emission-assisted GVR (opt-in via prepare_gvr_emission): the module
         # owns the closed-loop emission state; only reachable on the temporal
         # (gvr_self_sampling=False) V1 path.
@@ -177,7 +186,9 @@ class TopK(nn.Module):
                 )
 
                 if self._prefill_capturing(scores) and not selfsampling_topk_prefill_ready(
-                    scores, output_indices
+                    scores,
+                    output_indices,
+                    **({"deterministic": True} if self.gvr_deterministic else {}),
                 ):
                     # the engine never JIT-compiles under capture; an engine
                     # missed by warmup takes the exact radix path in the graph
@@ -196,7 +207,9 @@ class TopK(nn.Module):
                     # ks/ke are already in compressed column units; run_prefill
                     # writes the local (column - ks) frame with -1 pad and no
                     # host reads (envelope from scores.shape[1]).
-                    selfsampling_topk_run_prefill(scores, row_starts, row_ends, output_indices)
+                    selfsampling_topk_run_prefill(
+                        scores, row_starts, row_ends, output_indices, **self._gvr_det_kwargs
+                    )
                     return output_indices
             else:
                 # engine hardware-format gate missed (e.g. a non-fp4 layer with
@@ -421,6 +434,7 @@ class TopK(nn.Module):
                     next_n=next_n,
                     compress_ratio=self.compress_ratio,
                     max_seq_len=max_seq_len * self.compress_ratio,
+                    **self._gvr_det_kwargs,
                 )
                 return output_indices
             logger.warning_once(

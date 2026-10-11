@@ -1,17 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 """Self-sampling GVR top-K decode kernels (CuTe DSL, Blackwell sm_100a).
 
 Sample-calibrated threshold ladders for exact single-pass top-K: the kernel
@@ -25,6 +11,13 @@ Four kernel families -- sampling-ladder slab/streaming (main),
 register-resident (reg), cluster streaming (clus), clustered
 register-resident (regclus) -- merged into a single device module;
 collision symbols carry a ``__<family>`` suffix.
+
+Deterministic mode (``det=True`` on every kernel constructor, ``fused_k`` = the top-K on the main
+kernel): the selected set is {score > tau} plus the smallest indices among {score == tau} and the
+output order is a fixed function of the input per route (register families: slot order; main R=1
+and clus: per-warp staging segments in program order; SPLIT merge CTA: bitmap / bitonic
+canonicalizer). Every ``det`` difference sits in a ``cutlass.const_expr(self.det)`` branch; the
+default compiles the original code path.
 """
 
 import contextlib
@@ -44,6 +37,150 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 # `C.` references throughout resolve against this module itself.
 C = sys.modules[__name__]
+
+
+@cute.jit
+def fused_cluster_store(staging, position, value):
+    address = staging.iterator.toint() + position * cutlass.Int32(4)
+    remote = _mapa_shared_cluster_addr(address, cutlass.Int32(0))
+    _st_shared_cluster_i32(remote, value)
+
+
+@cute.jit
+def fused_canonical_store(staging, output, tid, blk: cutlass.Constexpr, fk: cutlass.Constexpr):
+    active = min(fk, blk, 512)
+    items = fk // active
+    log_k = fk.bit_length() - 1  # Python int: hoisted out of the dynamic region below
+    cute.arch.barrier()
+    if tid < cutlass.Int32(active):
+        keys = cute.make_rmem_tensor((items,), cutlass.Uint32)
+        next_keys = cute.make_rmem_tensor((items,), cutlass.Uint32)
+        for item in cutlass.range_constexpr(items):
+            keys[item] = cutlass.Uint32(staging[tid + cutlass.Int32(item * active)])
+        for level in cutlass.range_constexpr(log_k):
+            for step in cutlass.range_constexpr(level + 1):
+                distance = 1 << (level - step)
+                size = 1 << (level + 1)
+                if cutlass.const_expr(distance >= 32 and distance < active):
+                    for item in cutlass.range_constexpr(items):
+                        staging[tid + cutlass.Int32(item * active)] = cutlass.Int32(keys[item])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=active)
+                for item in cutlass.range_constexpr(items):
+                    index = tid + cutlass.Int32(item * active)
+                    other = cutlass.Uint32(0)
+                    if cutlass.const_expr(distance < 32):
+                        other = cutlass.Uint32(
+                            cute.arch.shuffle_sync(
+                                keys[item], (tid & cutlass.Int32(31)) ^ cutlass.Int32(distance)
+                            )
+                        )
+                    elif cutlass.const_expr(distance < active):
+                        other = cutlass.Uint32(staging[index ^ cutlass.Int32(distance)])
+                    else:
+                        other = keys[item ^ (distance // active)]
+                    lower = (index & cutlass.Int32(distance)) == cutlass.Int32(0)
+                    ascending = (index & cutlass.Int32(size)) == cutlass.Int32(0)
+                    value = keys[item]
+                    if lower == ascending:
+                        if cutlass.Uint32(other) < cutlass.Uint32(value):
+                            value = other
+                    else:
+                        if cutlass.Uint32(other) > cutlass.Uint32(value):
+                            value = other
+                    next_keys[item] = value
+                if cutlass.const_expr(distance >= 32 and distance < active):
+                    cute.arch.barrier(barrier_id=1, number_of_threads=active)
+                for item in cutlass.range_constexpr(items):
+                    keys[item] = next_keys[item]
+        for item in cutlass.range_constexpr(items):
+            output[tid + cutlass.Int32(item * active)] = cutlass.Int32(keys[item])
+    cute.arch.barrier()
+
+
+"""Device-helper library shared by the main / reg / clus / regclus families.
+
+Conventions
+-----------
+* Crossing-scan helpers write their scalar outputs into an Int32 smem tensor
+  `s_res` using the slot map RES_B=0, RES_M=1, RES_ABOVE=2, RES_TOT=3,
+  RES_B2=4, RES_B3=5. Slots are written ONLY on a pin.
+* Histograms are Int32 smem tensors: adds/scans are bit-identical mod 2^32,
+  and totals stay below 2^31 by dispatch domain.
+* Warp-0-only helpers (find_cross / scan_cross0 / merge_scan0) contain NO
+  barrier; scan_cross and scan_cross_w contain EXACTLY ONE internal barrier;
+  gather_hint contains EXACTLY TWO. Do not add or drop any.
+* All warp collectives use the full mask FULLM = 0xffffffff.
+"""
+FULLM = 0xFFFFFFFF
+NB = 1024  # register-family base bin count
+SNB = 256  # streaming-path bin count — MUST stay 256
+MAXC = 160  # multi-CTA SPLIT row cap
+GCAP = 16384  # per-row slab capacity in int2
+QUADC = 96  # O(mc^2) rank gate, streaming/reg
+QUADC_CLUS = 288  # clus + gvr_main gate
+IDXB = 22  # packed candidate index bits
+IDXM = (1 << IDXB) - 1
+GVR_WS_OFF_OFF = MAXC * 8  # workspace g_off byte offset
+GVR_WS_BUF_OFF = 2048  # workspace g_buf byte offset
+SENT_LO = -3.0e38
+SENT_HI = 3.0e38
+RES_B = 0
+RES_M = 1
+RES_ABOVE = 2
+RES_TOT = 3
+RES_B2 = 4
+RES_B3 = 5
+
+
+@cute.jit
+def fused_canonical_store_wide(staging, output, tid, blk: cutlass.Constexpr, fk: cutlass.Constexpr):
+    active = min(fk, blk, 1024)  # DET WIDE SORT
+    items = fk // active
+    log_k = fk.bit_length() - 1  # Python int: hoisted out of the dynamic region below
+    cute.arch.barrier()
+    if tid < cutlass.Int32(active):
+        keys = cute.make_rmem_tensor((items,), cutlass.Uint32)
+        next_keys = cute.make_rmem_tensor((items,), cutlass.Uint32)
+        for item in cutlass.range_constexpr(items):
+            keys[item] = cutlass.Uint32(staging[tid + cutlass.Int32(item * active)])
+        for level in cutlass.range_constexpr(log_k):
+            for step in cutlass.range_constexpr(level + 1):
+                distance = 1 << (level - step)
+                size = 1 << (level + 1)
+                if cutlass.const_expr(distance >= 32 and distance < active):
+                    for item in cutlass.range_constexpr(items):
+                        staging[tid + cutlass.Int32(item * active)] = cutlass.Int32(keys[item])
+                    cute.arch.barrier(barrier_id=1, number_of_threads=active)
+                for item in cutlass.range_constexpr(items):
+                    index = tid + cutlass.Int32(item * active)
+                    other = cutlass.Uint32(0)
+                    if cutlass.const_expr(distance < 32):
+                        other = cutlass.Uint32(
+                            cute.arch.shuffle_sync(
+                                keys[item], (tid & cutlass.Int32(31)) ^ cutlass.Int32(distance)
+                            )
+                        )
+                    elif cutlass.const_expr(distance < active):
+                        other = cutlass.Uint32(staging[index ^ cutlass.Int32(distance)])
+                    else:
+                        other = keys[item ^ (distance // active)]
+                    lower = (index & cutlass.Int32(distance)) == cutlass.Int32(0)
+                    ascending = (index & cutlass.Int32(size)) == cutlass.Int32(0)
+                    value = keys[item]
+                    if lower == ascending:
+                        if cutlass.Uint32(other) < cutlass.Uint32(value):
+                            value = other
+                    else:
+                        if cutlass.Uint32(other) > cutlass.Uint32(value):
+                            value = other
+                    next_keys[item] = value
+                if cutlass.const_expr(distance >= 32 and distance < active):
+                    cute.arch.barrier(barrier_id=1, number_of_threads=active)
+                for item in cutlass.range_constexpr(items):
+                    keys[item] = next_keys[item]
+        for item in cutlass.range_constexpr(items):
+            output[tid + cutlass.Int32(item * active)] = cutlass.Int32(keys[item])
+    cute.arch.barrier()
 
 
 # ===========================================================================
@@ -1311,6 +1448,129 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _red_shared_addv(addr, val, *, loc=None, ip=None):
+    """DET WHIST: `red.shared.add.u32 [addr], val` (result unused), addr/val plain Int32."""
+    mlir_llvm.inline_asm(
+        res=None,
+        operands_=[addr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        asm_string="red.relaxed.cta.shared.add.u32 [$0], $1;",
+        constraints="r,r",
+        has_side_effects=True,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_s_u32(saddr_i32, val_u32, *, loc=None, ip=None):
+    """DET VEC: st.shared.u32 [saddr], val (raw address: lets a select pick a trash slot without a branch)."""
+    mlir_llvm.inline_asm(
+        res=None,
+        operands_=[saddr_i32.ir_value(loc=loc, ip=ip), val_u32.ir_value(loc=loc, ip=ip)],
+        asm_string="st.shared.u32 [$0], $1;",
+        constraints="r,r",
+        has_side_effects=True,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _lds_v2_u32(saddr, *, loc=None, ip=None):
+    """DET LEAN: ld.shared.v2.u32 {lo, hi} at a plain Int32 byte address (staged value bits, idx)."""
+    ret = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [saddr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [0])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [1])),
+    )
+
+
+@dsl_user_op
+def _lds_v4_u32(saddr, *, loc=None, ip=None):
+    """DET LBM: ld.shared.v4.u32 at a plain Int32 byte address -> four Int32 words."""
+    ret = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [saddr.ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [0])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [1])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [2])),
+        cutlass.Int32(llvm.extractvalue(T.i32(), ret, [3])),
+    )
+
+
+@dsl_user_op
+def _sts_v4_u32(saddr, a, b, c, d, *, loc=None, ip=None):
+    """DET LBM: st.shared.v4.u32 [saddr], {a, b, c, d}."""
+    mlir_llvm.inline_asm(
+        res=None,
+        operands_=[
+            saddr.ir_value(loc=loc, ip=ip),
+            a.ir_value(loc=loc, ip=ip),
+            b.ir_value(loc=loc, ip=ip),
+            c.ir_value(loc=loc, ip=ip),
+            d.ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="st.shared.v4.u32 [$0], {$1, $2, $3, $4};",
+        constraints="r,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _sts_v4_u32_same(saddr, val, *, loc=None, ip=None):
+    """DET LBM: st.shared.v4.u32 [saddr], {val, val, val, val}."""
+    mlir_llvm.inline_asm(
+        res=None,
+        operands_=[saddr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        asm_string="st.shared.v4.u32 [$0], {$1, $1, $1, $1};",
+        constraints="r,r",
+        has_side_effects=True,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _red_shared_or(addr, val, *, loc=None, ip=None):
+    """DET LBM: `red.shared.or.b32 [addr], val` (result unused), addr/val plain Int32."""
+    mlir_llvm.inline_asm(
+        res=None,
+        operands_=[addr.ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        asm_string="red.relaxed.cta.shared.or.b32 [$0], $1;",
+        constraints="r,r",
+        has_side_effects=True,
+        asm_dialect=mlir_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class GvrMainKernel:
     """gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> — streaming self-sampling GVR."""
 
@@ -1329,7 +1589,16 @@ class GvrMainKernel:
         r_const: int = 1,
         hint_free: bool = False,
         prefill: bool = False,
+        lbm: bool = False,
+        det: bool = False,
+        fused_k: int = 0,
     ) -> None:
+        self.det = bool(det)
+        self.fused_k = int(fused_k) if det else 0  # det: compile-time top-K
+        if cutlass.const_expr(self.det):
+            self.lbm = bool(
+                lbm
+            )  # DET LBM: bitmap code compiled in (host dispatch: n <= LBM_MAX_W * 32 * BLK)
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
         assert kpt in (1, 2, 4, 8) and minb in (1, 2, 4)
@@ -1377,7 +1646,14 @@ class GvrMainKernel:
         # derived constexprs (bit-identical to the CUDA)
         self.hb = nbs
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)
-        self.scpb = (8192 if split else 16384) if blk >= 1024 else (8192 if self.kbig else 4096)
+        if cutlass.const_expr(self.det):
+            self.scpb = (
+                (8192 if split else (20480 if self.fused_k >= 2048 else 16384))
+                if blk >= 1024
+                else (8192 if self.kbig else 4096)
+            )  # DET OVF
+        else:
+            self.scpb = (8192 if split else 16384) if blk >= 1024 else (8192 if self.kbig else 4096)
         self.cmpb = (4096 if self.kbig else 2048) if blk >= 1024 else 1024
         self.shd = not split
         self.vstg = split or blk >= 512
@@ -1486,6 +1762,15 @@ class GvrMainKernel:
         sd_en: cutlass.Int32,
         tsh_en: cutlass.Int32,
     ):
+        xv = cutlass.Float32(
+            0.0
+        )  # DET: typed predeclaration (det branch assigns it; the DSL hoists to None otherwise)
+        bq = cutlass.Int32(
+            0
+        )  # DET: typed predeclaration (det branch assigns it; the DSL hoists to None otherwise)
+        idv = cutlass.Int32(
+            0
+        )  # DET: typed predeclaration (det branch assigns it; the DSL hoists to None otherwise)
         BLK = self.blk
         U = self.u
         NBS = self.nbs
@@ -1495,6 +1780,10 @@ class GvrMainKernel:
         PFD = self.pfd
         NATT = self.natt
         NW = BLK // 32
+        if cutlass.const_expr(self.det):
+            WSEG_CAP = (
+                ((SCPB - ((self.fused_k // 2) if self.vstg else self.fused_k)) // NW) // 32
+            ) * 32  # DET WSEG: per-warp segment (below the staging alias)
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -1503,6 +1792,8 @@ class GvrMainKernel:
         if cutlass.const_expr(self.split):
             part = bx
         lane = tidx & cutlass.Int32(31)
+        if cutlass.const_expr(self.det):
+            wid = tidx >> cutlass.Int32(5)  # DET WSEG
 
         # ================= per-row varlen prologue (varlen mode only) =========
         # Production contract: row r serves request r // next_n with
@@ -1626,6 +1917,18 @@ class GvrMainKernel:
             s_x4 = smem.allocate_tensor(
                 cutlass.Int32, cute.make_ordered_layout((1,), order=(0,)), byte_alignment=4
             )
+        if cutlass.const_expr(self.det):
+            if cutlass.const_expr(
+                not self.split
+            ):  # DET WSEG: per-warp counts [0, NW) and overflow flags [NW, 2NW)
+                s_wcnt = smem.allocate_tensor(
+                    cutlass.Int32,
+                    cute.make_ordered_layout((2 * NW,), order=(0,)),
+                    byte_alignment=16,
+                )
+            s_trash = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((64,), order=(0,)), byte_alignment=16
+            )  # DET VEC/LEAN: trash slots for rejected lanes (per lane)
         s_kmm = smem.allocate_tensor(  # [0]=kmin [1]=kmax
             cutlass.Uint32, cute.make_ordered_layout((2,), order=(0,)), byte_alignment=8
         )
@@ -1646,6 +1949,13 @@ class GvrMainKernel:
             cutlass.Int8, cute.make_ordered_layout((self.dyn_bytes,), order=(0,)), byte_alignment=16
         )
         sbase = blob.iterator.toint()
+        if cutlass.const_expr(self.det):
+            s_lbm = (
+                cute.make_tensor(  # DET LBM: whole blob as Int32 words (bitmap after the last emit)
+                    cute.make_ptr(cutlass.Int32, sbase, cute.AddressSpace.smem, assumed_align=16),
+                    cute.make_layout((self.dyn_bytes // 4,)),
+                )
+            )
         s_cbuf = cute.make_tensor(
             cute.make_ptr(cutlass.Int32, sbase, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((SCPB + 4,)),
@@ -1655,6 +1965,20 @@ class GvrMainKernel:
             cute.make_layout((SCPB + 4,)),
         )
         ck_addr = sbase + cutlass.Int32(self.ck_off)
+        if cutlass.const_expr(self.det):
+            if cutlass.const_expr(
+                (self.cmpb + 1) * 8 >= NW * NBS * 4
+            ):  # DET WHIST32: u32 counters alias the ck64 buffer when it is large enough
+                s_whist = cute.make_tensor(
+                    cute.make_ptr(cutlass.Int32, ck_addr, cute.AddressSpace.smem, assumed_align=16),
+                    cute.make_layout((NW * NBS,)),
+                )
+            else:
+                s_whist = smem.allocate_tensor(
+                    cutlass.Int32,
+                    cute.make_ordered_layout((NW * NBS,), order=(0,)),
+                    byte_alignment=16,
+                )
         s_ck64 = cute.make_tensor(
             cute.make_ptr(cutlass.Uint64, ck_addr, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((CMPB + 1,)),
@@ -1668,7 +1992,15 @@ class GvrMainKernel:
         hb_pin = cutlass.Int32(0)
         cb2_pin = cutlass.Int32(0)
         if cutlass.const_expr(self.vstg):
-            hb_pin = _smem_addr_reg(s_hist.iterator.toint())
+            if cutlass.const_expr(self.det):
+                if cutlass.const_expr(
+                    (not self.split) and self.blk >= 1024
+                ):  # DET WHIST: this warp's histogram base
+                    hb_pin = _smem_addr_reg(s_whist.iterator.toint() + wid * cutlass.Int32(NBS * 4))
+                else:
+                    hb_pin = _smem_addr_reg(s_hist.iterator.toint())
+            else:
+                hb_pin = _smem_addr_reg(s_hist.iterator.toint())
             cb2_pin = _smem_addr_reg(s_cbuf2.iterator.toint())
         # park the stride 4 in the dedicated smem word and load it back —
         # the LDS result is opaque to ptxas, so the walk's stride register
@@ -1708,7 +2040,27 @@ class GvrMainKernel:
             if cutlass.const_expr(self.varlen):
                 prow64 = cutlass.Int64(row // cutlass.Int32(self.next_n))
             p_addr = pre_idx.iterator.toint() + prow64 * cutlass.Int64(k) * cutlass.Int64(4)
-        out_row = out[row, None]
+        if cutlass.const_expr(self.det):
+            alias_res = 0  # DET ALIAS (main): list entries covered by the staging alias
+            if cutlass.const_expr(self.split):
+                out_row = smem.allocate_tensor(
+                    cutlass.Int32,
+                    cute.make_ordered_layout((self.fused_k,), order=(0,)),
+                    byte_alignment=16,
+                )
+            else:
+                alias_res = (self.fused_k // 2) if self.vstg else self.fused_k
+                out_row = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + cutlass.Int32(self.ck_off - self.fused_k * 4),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((self.fused_k,)),
+                )  # DET ALIAS (main)
+        else:
+            out_row = out[row, None]
         ws_addr = ws.iterator.toint()
         gdon_addr = ws_addr  # slab views
         goff_addr = ws_addr + cutlass.Int64(C.GVR_WS_OFF_OFF)
@@ -1751,132 +2103,236 @@ class GvrMainKernel:
         # on the 64-register arms — the PRIME-LATE register loads below are
         # untouched and simply hit L2).  Values are bit-identical to the
         # per-thread derivation this replaces.
-        if cutlass.const_expr(self.varlen):
-            if tidx < cutlass.Int32(32):
-                if short == cutlass.Int32(0):
-                    # ---- aim ladder (cheap mirror) ----
-                    # The ladder scalars steer the sampling rung only —
-                    # exactness is schedule-invariant (retry/degen close every
-                    # miss), so +-1 drift vs the host double form is allowed.
-                    # Serial latency dominates (this chain sits in front of a
-                    # barrier): runtime divides become MUFU.RCP multiplies and
-                    # the isqrt fixup loops collapse to single steps (the f32
-                    # sqrt of an exactly-representable int (6n <= 2^23) is
-                    # within 1 of isqrt, so one correction per side suffices).
-                    # Q (chunk ownership) stays exact — compile-time divisor.
-                    x6 = cutlass.Int32(6) * n
-                    ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
-                    if ri * ri > x6:
-                        ri = ri - cutlass.Int32(1)
-                    if (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
-                        ri = ri + cutlass.Int32(1)
-                    r6 = ri
-                    if x6 - ri * ri > ri:
-                        r6 = ri + cutlass.Int32(1)
-                    aim = aim_base
-                    if r6 > aim:
-                        aim = r6
-                    if cutlass.const_expr(self.r_const > 1):
-                        if aim < amin:
-                            aim = amin
-                    scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
-                    if aim > (scap_c >> cutlass.Int32(1)):
-                        aim = scap_c >> cutlass.Int32(1)
-                    if aim < k:
-                        aim = k
-                    n4w = n >> cutlass.Int32(2)
-                    # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
-                    # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
-                    # (k/big folded into the launch-constant sd_en flag).
-                    gate = cutlass.Int32(0)
-                    if n > scap_c:
-                        gate = cutlass.Int32(1)
-                    if sd_en != cutlass.Int32(0):
-                        if n <= scap_c:
-                            if n > (k << cutlass.Int32(1)):
-                                gate = cutlass.Int32(1)
-                    if n4w < cutlass.Int32(4):
+        if cutlass.const_expr(self.det):
+            if cutlass.const_expr(
+                (not self.split) and self.vstg and self.blk >= 1024
+            ):  # DET WHIST: zero the per-warp histograms
+                for z_ in cutlass.range_constexpr((NW * NBS) // BLK):
+                    s_whist[tidx + cutlass.Int32(z_ * BLK)] = cutlass.Int32(0)
+            if cutlass.const_expr(self.varlen):
+                if tidx < cutlass.Int32(32):
+                    if short == cutlass.Int32(0):
+                        x6 = cutlass.Int32(6) * n
+                        ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
+                        if ri * ri > x6:
+                            ri = ri - cutlass.Int32(1)
+                        if (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
+                            ri = ri + cutlass.Int32(1)
+                        r6 = ri
+                        if x6 - ri * ri > ri:
+                            r6 = ri + cutlass.Int32(1)
+                        aim = aim_base
+                        if r6 > aim:
+                            aim = r6
+                        if cutlass.const_expr(self.r_const > 1):
+                            if aim < amin:
+                                aim = amin
+                        scap_c = cutlass.Int32(
+                            16384 if (BLK >= 1024 and not self.split) else SCPB
+                        )  # DET OVF: SCAP unchanged
+                        if aim > (scap_c >> cutlass.Int32(1)):
+                            aim = scap_c >> cutlass.Int32(1)
+                        if aim < k:
+                            aim = k
+                        n4w = n >> cutlass.Int32(2)
                         gate = cutlass.Int32(0)
-                    if gate != cutlass.Int32(0):
-                        # sel = sfac*n // aim via rcp (sfac*n <= 2^24: f32-exact
-                        # to the last unit; quotient error < 1 => +-1 drift)
-                        sel = cutlass.Int32(
-                            cutlass.Float32(sfac * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
-                        )
-                        if sel < cutlass.Int32(256):
-                            sel = cutlass.Int32(256)
-                        nh = n >> cutlass.Int32(1)
-                        if sel > nh:
-                            sel = nh
-                        pairs = sel >> cutlass.Int32(3)
-                        if pairs < cutlass.Int32(1):
-                            pairs = cutlass.Int32(1)
-                        half = n4w >> cutlass.Int32(1)
-                        if half < cutlass.Int32(1):
-                            half = cutlass.Int32(1)
-                        if pairs > half:
-                            pairs = half
-                        SS2 = cutlass.Int32(
-                            cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(pairs))
-                        )
-                        if SS2 < cutlass.Int32(1):
-                            SS2 = cutlass.Int32(1)
-                        SMP = cutlass.Int32(
-                            cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(SS2))
-                        )
-                        # sample-window guard: the P1 gather indexes up to
-                        # ~SMP*SS2*2 f32x4 lines; keep SMP*SS2 <= half so the
-                        # window never walks past the row (approx error is
-                        # bounded by +1, one decrement closes it)
-                        if SMP * SS2 > half:
-                            SMP = SMP - cutlass.Int32(1)
-                        if SMP < cutlass.Int32(1):
-                            SMP = cutlass.Int32(1)
-                        # TGT/TGT2: i64 products // n -> f32 mul + one rcp(n).
-                        # aim/SMP/k/n are all f32-exact here (<= 2^20); the
-                        # quotients are <= 8*aim ~ 2^16, so the approx error
-                        # stays far below 1 unit — +-1 at worst on the floor.
-                        rn_ = cute.arch.rcp_approx(cutlass.Float32(n))
-                        smp8f = cutlass.Float32(SMP) * cutlass.Float32(8.0)
-                        TGT = cutlass.Int32(cutlass.Float32(aim) * smp8f * rn_)
-                        if TGT < cutlass.Int32(1):
-                            TGT = cutlass.Int32(1)
-                        TGT2 = cutlass.Int32(cutlass.Float32(k) * smp8f * rn_)
-                        if TGT2 < cutlass.Int32(1):
-                            TGT2 = cutlass.Int32(1)
-                if tidx == cutlass.Int32(0):
-                    s_lad[0] = SMP
-                    s_lad[1] = SS2
-                    s_lad[2] = TGT
-                    s_lad[3] = TGT2
-                    if cutlass.const_expr(self.prefill):
-                        s_lead[0] = lead
-            # Register-free L2 hints for the first U-batch of this CTA's own
-            # P3 slice (clamped in-row): the data P3 touches first starts
-            # flowing while warp0 walks the chain. Short rows clamp every
-            # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so clamp within the row's own
-            # window [col0, ke) — n4-1 is the last full in-window float4.
-            if cutlass.const_expr(self.prefill):
-                plim4 = n4 - cutlass.Int32(1)
-                if plim4 < cutlass.Int32(0):
-                    plim4 = cutlass.Int32(0)
-            else:
-                plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
-            for uu in cutlass.range_constexpr(U):
-                # NOTE: names must not collide with the PRIME-LATE block's
-                # i_/ic — the DSL kills inner-scope names at region exit and
-                # a later same-name assignment inside a dynamic `if` trips
-                # "is None prior to this if".
-                pic = c0 + tidx + cutlass.Int32(uu * BLK)
-                if pic >= c1:
-                    pic = plim4
-                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
-            cute.arch.barrier()  # publish s_lad (also covers the smem inits)
-            SMP = s_lad[0]
-            SS2 = s_lad[1]
-            TGT = s_lad[2]
-            TGT2 = s_lad[3]
+                        if n > scap_c:
+                            gate = cutlass.Int32(1)
+                        if sd_en != cutlass.Int32(0):
+                            if n <= scap_c:
+                                if n > (k << cutlass.Int32(1)):
+                                    gate = cutlass.Int32(1)
+                        if n4w < cutlass.Int32(4):
+                            gate = cutlass.Int32(0)
+                        if gate != cutlass.Int32(0):
+                            sel = cutlass.Int32(
+                                cutlass.Float32(sfac * n)
+                                * cute.arch.rcp_approx(cutlass.Float32(aim))
+                            )
+                            if sel < cutlass.Int32(256):
+                                sel = cutlass.Int32(256)
+                            nh = n >> cutlass.Int32(1)
+                            if sel > nh:
+                                sel = nh
+                            pairs = sel >> cutlass.Int32(3)
+                            if pairs < cutlass.Int32(1):
+                                pairs = cutlass.Int32(1)
+                            half = n4w >> cutlass.Int32(1)
+                            if half < cutlass.Int32(1):
+                                half = cutlass.Int32(1)
+                            if pairs > half:
+                                pairs = half
+                            SS2 = cutlass.Int32(
+                                cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(pairs))
+                            )
+                            if SS2 < cutlass.Int32(1):
+                                SS2 = cutlass.Int32(1)
+                            SMP = cutlass.Int32(
+                                cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(SS2))
+                            )
+                            if SMP * SS2 > half:
+                                SMP = SMP - cutlass.Int32(1)
+                            if SMP < cutlass.Int32(1):
+                                SMP = cutlass.Int32(1)
+                            rn_ = cute.arch.rcp_approx(cutlass.Float32(n))
+                            smp8f = cutlass.Float32(SMP) * cutlass.Float32(8.0)
+                            TGT = cutlass.Int32(cutlass.Float32(aim) * smp8f * rn_)
+                            if TGT < cutlass.Int32(1):
+                                TGT = cutlass.Int32(1)
+                            TGT2 = cutlass.Int32(cutlass.Float32(k) * smp8f * rn_)
+                            if TGT2 < cutlass.Int32(1):
+                                TGT2 = cutlass.Int32(1)
+                    if tidx == cutlass.Int32(0):
+                        s_lad[0] = SMP
+                        s_lad[1] = SS2
+                        s_lad[2] = TGT
+                        s_lad[3] = TGT2
+                        if cutlass.const_expr(self.prefill):
+                            s_lead[0] = lead
+                if cutlass.const_expr(self.prefill):
+                    plim4 = n4 - cutlass.Int32(1)
+                    if plim4 < cutlass.Int32(0):
+                        plim4 = cutlass.Int32(0)
+                else:
+                    plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
+                for uu in cutlass.range_constexpr(U):
+                    pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                    if pic >= c1:
+                        pic = plim4
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                cute.arch.barrier()  # publish s_lad (also covers the smem inits)
+                SMP = s_lad[0]
+                SS2 = s_lad[1]
+                TGT = s_lad[2]
+                TGT2 = s_lad[3]
+        else:
+            if cutlass.const_expr(self.varlen):
+                if tidx < cutlass.Int32(32):
+                    if short == cutlass.Int32(0):
+                        # ---- aim ladder (cheap mirror) ----
+                        # The ladder scalars steer the sampling rung only —
+                        # exactness is schedule-invariant (retry/degen close every
+                        # miss), so +-1 drift vs the host double form is allowed.
+                        # Serial latency dominates (this chain sits in front of a
+                        # barrier): runtime divides become MUFU.RCP multiplies and
+                        # the isqrt fixup loops collapse to single steps (the f32
+                        # sqrt of an exactly-representable int (6n <= 2^23) is
+                        # within 1 of isqrt, so one correction per side suffices).
+                        # Q (chunk ownership) stays exact — compile-time divisor.
+                        x6 = cutlass.Int32(6) * n
+                        ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
+                        if ri * ri > x6:
+                            ri = ri - cutlass.Int32(1)
+                        if (ri + cutlass.Int32(1)) * (ri + cutlass.Int32(1)) <= x6:
+                            ri = ri + cutlass.Int32(1)
+                        r6 = ri
+                        if x6 - ri * ri > ri:
+                            r6 = ri + cutlass.Int32(1)
+                        aim = aim_base
+                        if r6 > aim:
+                            aim = r6
+                        if cutlass.const_expr(self.r_const > 1):
+                            if aim < amin:
+                                aim = amin
+                        scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
+                        if aim > (scap_c >> cutlass.Int32(1)):
+                            aim = scap_c >> cutlass.Int32(1)
+                        if aim < k:
+                            aim = k
+                        n4w = n >> cutlass.Int32(2)
+                        # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
+                        # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
+                        # (k/big folded into the launch-constant sd_en flag).
+                        gate = cutlass.Int32(0)
+                        if n > scap_c:
+                            gate = cutlass.Int32(1)
+                        if sd_en != cutlass.Int32(0):
+                            if n <= scap_c:
+                                if n > (k << cutlass.Int32(1)):
+                                    gate = cutlass.Int32(1)
+                        if n4w < cutlass.Int32(4):
+                            gate = cutlass.Int32(0)
+                        if gate != cutlass.Int32(0):
+                            # sel = sfac*n // aim via rcp (sfac*n <= 2^24: f32-exact
+                            # to the last unit; quotient error < 1 => +-1 drift)
+                            sel = cutlass.Int32(
+                                cutlass.Float32(sfac * n)
+                                * cute.arch.rcp_approx(cutlass.Float32(aim))
+                            )
+                            if sel < cutlass.Int32(256):
+                                sel = cutlass.Int32(256)
+                            nh = n >> cutlass.Int32(1)
+                            if sel > nh:
+                                sel = nh
+                            pairs = sel >> cutlass.Int32(3)
+                            if pairs < cutlass.Int32(1):
+                                pairs = cutlass.Int32(1)
+                            half = n4w >> cutlass.Int32(1)
+                            if half < cutlass.Int32(1):
+                                half = cutlass.Int32(1)
+                            if pairs > half:
+                                pairs = half
+                            SS2 = cutlass.Int32(
+                                cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(pairs))
+                            )
+                            if SS2 < cutlass.Int32(1):
+                                SS2 = cutlass.Int32(1)
+                            SMP = cutlass.Int32(
+                                cutlass.Float32(half) * cute.arch.rcp_approx(cutlass.Float32(SS2))
+                            )
+                            # sample-window guard: the P1 gather indexes up to
+                            # ~SMP*SS2*2 f32x4 lines; keep SMP*SS2 <= half so the
+                            # window never walks past the row (approx error is
+                            # bounded by +1, one decrement closes it)
+                            if SMP * SS2 > half:
+                                SMP = SMP - cutlass.Int32(1)
+                            if SMP < cutlass.Int32(1):
+                                SMP = cutlass.Int32(1)
+                            # TGT/TGT2: i64 products // n -> f32 mul + one rcp(n).
+                            # aim/SMP/k/n are all f32-exact here (<= 2^20); the
+                            # quotients are <= 8*aim ~ 2^16, so the approx error
+                            # stays far below 1 unit — +-1 at worst on the floor.
+                            rn_ = cute.arch.rcp_approx(cutlass.Float32(n))
+                            smp8f = cutlass.Float32(SMP) * cutlass.Float32(8.0)
+                            TGT = cutlass.Int32(cutlass.Float32(aim) * smp8f * rn_)
+                            if TGT < cutlass.Int32(1):
+                                TGT = cutlass.Int32(1)
+                            TGT2 = cutlass.Int32(cutlass.Float32(k) * smp8f * rn_)
+                            if TGT2 < cutlass.Int32(1):
+                                TGT2 = cutlass.Int32(1)
+                    if tidx == cutlass.Int32(0):
+                        s_lad[0] = SMP
+                        s_lad[1] = SS2
+                        s_lad[2] = TGT
+                        s_lad[3] = TGT2
+                        if cutlass.const_expr(self.prefill):
+                            s_lead[0] = lead
+                # Register-free L2 hints for the first U-batch of this CTA's own
+                # P3 slice (clamped in-row): the data P3 touches first starts
+                # flowing while warp0 walks the chain. Short rows clamp every
+                # hint to the row's last line — harmless.
+                # prefill: the base is shifted to col0, so clamp within the row's own
+                # window [col0, ke) — n4-1 is the last full in-window float4.
+                if cutlass.const_expr(self.prefill):
+                    plim4 = n4 - cutlass.Int32(1)
+                    if plim4 < cutlass.Int32(0):
+                        plim4 = cutlass.Int32(0)
+                else:
+                    plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
+                for uu in cutlass.range_constexpr(U):
+                    # NOTE: names must not collide with the PRIME-LATE block's
+                    # i_/ic — the DSL kills inner-scope names at region exit and
+                    # a later same-name assignment inside a dynamic `if` trips
+                    # "is None prior to this if".
+                    pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                    if pic >= c1:
+                        pic = plim4
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                cute.arch.barrier()  # publish s_lad (also covers the smem inits)
+                SMP = s_lad[0]
+                SS2 = s_lad[1]
+                TGT = s_lad[2]
+                TGT2 = s_lad[3]
 
         # ============ P1: sample prefetch (hint gather LAZY) =================
         atom128 = C.g2r_atom_f32(128, invariant=True)
@@ -2119,6 +2575,21 @@ class GvrMainKernel:
         valid = cutlass.Int32(0)
         fromg = cutlass.Int32(0)
         alive = cutlass.Int32(1)
+        if cutlass.const_expr(self.det):
+            fs_sort = cutlass.Int32(
+                0
+            )  # DET WSEG: 1 -> an atomic-ordered path ran, sort the staging
+            if cutlass.const_expr(self.split):
+                fs_sort = cutlass.Int32(1)
+            wbase = cutlass.Int32(0)
+            wend = cutlass.Int32(0)
+            wovf = cutlass.Int32(0)
+            wany_ovf = cutlass.Int32(0)
+            wdense = cutlass.Int32(0)  # DET OVF
+            wsegb = wid * cutlass.Int32(WSEG_CAP)  # DET OVF
+            p5_cursor = cutlass.Int32(
+                0
+            )  # DET WSEG hook: 1 -> per-bin cursor emit over the segments (a canonicalizer fixes the order)
 
         fr = [
             cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(max(U - PFD, 1))
@@ -2147,6 +2618,12 @@ class GvrMainKernel:
                                 C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
                     if tidx < cutlass.Int32(NBS):
                         s_hist[tidx] = cutlass.Int32(0)
+                    if cutlass.const_expr(self.det):
+                        if cutlass.const_expr(
+                            (not self.split) and self.vstg and self.blk >= 1024
+                        ):  # DET WHIST: zero the per-warp histograms
+                            for z_ in cutlass.range_constexpr((NW * NBS) // BLK):
+                                s_whist[tidx + cutlass.Int32(z_ * BLK)] = cutlass.Int32(0)
                     if tidx == cutlass.Int32(0):
                         s_scal[0] = cutlass.Int32(0)
                     cute.arch.barrier()  # ---- barrier (retry reset) ----
@@ -2189,6 +2666,14 @@ class GvrMainKernel:
             # _pin_i32: stop NVVM re-deriving the ceil-div bound (ld.param n +
             # shr/sel chain) inside the tile-loop condition region per iter
             nIt = _pin_i32(nIt)
+            if cutlass.const_expr(self.det):
+                wsegb = wid * cutlass.Int32(WSEG_CAP)  # DET OVF
+                wdense = cutlass.Int32(0)
+                wbase = wid * cutlass.Int32(
+                    WSEG_CAP
+                )  # DET WSEG: per-attempt segment base / end / overflow
+                wend = wbase + cutlass.Int32(WSEG_CAP)
+                wovf = cutlass.Int32(0)
 
             it = cutlass.Int32(0)
             while it < nIt:
@@ -2256,10 +2741,28 @@ class GvrMainKernel:
                 cnt = cutlass.Int32(C.popc(M))
                 inc = C.warp_incl_scan_add(cnt, lane)
                 bpos = cutlass.Int32(0)
-                if lane == cutlass.Int32(31):
-                    if inc != cutlass.Int32(0):
-                        bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
-                pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
+                if cutlass.const_expr(self.det):
+                    pos = cutlass.Int32(0)
+                    if cutlass.const_expr(self.split):
+                        if lane == cutlass.Int32(31):
+                            if inc != cutlass.Int32(0):
+                                bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
+                        pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
+                    else:  # DET WSEG: per-warp private segment, program order, no atomic
+                        pos = wbase + (inc - cnt)
+                        wtot_ = cute.arch.shuffle_sync(inc, cutlass.Int32(31))
+                        wbase = wbase + wtot_
+                        if wbase > wend:
+                            wovf = cutlass.Int32(1)
+                        if (
+                            pos + cnt > wend
+                        ):  # a lane whose run crosses the segment end writes the trash slot
+                            pos = cutlass.Int32(SCPB)
+                else:
+                    if lane == cutlass.Int32(31):
+                        if inc != cutlass.Int32(0):
+                            bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
+                    pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
                 # survivor bit-walk, software-pipelined ONE deep;
                 # reload X[idx] — do NOT hold the U float4s (spills)
                 if M != cutlass.Int32(0):
@@ -2294,192 +2797,690 @@ class GvrMainKernel:
                 it = it + cutlass.Int32(1)
             # scalar tail, part 0 only
             i = tidx
-            while i < tailn:
-                x = C.ldg_f32(x_addr, tail0 + i)
-                if x >= TF:
-                    post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                    post = self._emitc(
-                        x, tail0 + i, post, TF, SC, hb_pin, cb2_pin, s_hist, s_cbuf, s_cbuf2
-                    )
-                i = i + cutlass.Int32(BLK)
-            cute.arch.barrier()  # ---- barrier (row pass) ----
-            myn = s_scal[0]
-
-            if cutlass.const_expr(self.split):
-                # ---- SLAB HAND-OFF; exactly ONE attempt ----
-                if tidx == cutlass.Int32(0):
-                    pgo = cute.make_ptr(
-                        cutlass.Int32,
-                        goff_addr + row64 * cutlass.Int64(4),
-                        cute.AddressSpace.gmem,
-                        assumed_align=4,
-                    )
-                    s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
-                cute.arch.barrier()  # ---- barrier (slab offset) ----
-                base = s_scal[3]
-                if myn <= cutlass.Int32(SCPB):  # coalesced publish
+            if cutlass.const_expr(self.det):
+                if cutlass.const_expr(self.split):
                     i = tidx
-                    while i < myn:
-                        p = base + i
-                        if p < cutlass.Int32(GCAP__main):
-                            _st_g_u64(gbuf_row + cutlass.Int64(p) * cutlass.Int64(8), s_cbuf2[i])
-                        i = i + cutlass.Int32(BLK)
-                else:  # overflow re-sweep
-                    if tidx == cutlass.Int32(0):
-                        s_scal[0] = cutlass.Int32(0)
-                    cute.arch.barrier()  # ---- barrier (overflow reset) ----
-                    lo2 = c0 << cutlass.Int32(2)
-                    hi2 = c1 << cutlass.Int32(2)
-                    i = lo2 + tidx
-                    while i < hi2:
-                        x = C.ldg_f32(x_addr, i)
-                        if x >= TF:
-                            pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                            p = base + pq
-                            if p < cutlass.Int32(GCAP__main):
-                                _st_g_u64(
-                                    gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
-                                    (cutlass.Uint64(cutlass.Uint32(i)) << cutlass.Uint64(32))
-                                    | cutlass.Uint64(C.u32_of_f32(x)),
-                                )
-                        i = i + cutlass.Int32(BLK)
-                    i = tidx  # true tail
                     while i < tailn:
                         x = C.ldg_f32(x_addr, tail0 + i)
                         if x >= TF:
-                            pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                            p = base + pq
+                            post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                            post = self._emitc(
+                                x, tail0 + i, post, TF, SC, hb_pin, cb2_pin, s_hist, s_cbuf, s_cbuf2
+                            )
+                        i = i + cutlass.Int32(BLK)
+                else:  # DET WSEG: warp 0 appends the tail (<= 3 elements) to its own segment, ballot-ordered
+                    if wid == cutlass.Int32(0):
+                        ti = cutlass.Int32(0)
+                        tx = cutlass.Float32(_NEG_INF)
+                        tsel = cutlass.Int32(0)
+                        nt = cutlass.Int32(0)
+                        post = cutlass.Int32(0)
+                        while ti < tailn:
+                            tx = cutlass.Float32(_NEG_INF)
+                            tsel = cutlass.Int32(0)
+                            if ti + lane < tailn:
+                                tx = C.ldg_f32(x_addr, tail0 + ti + lane)
+                                if tx >= TF:
+                                    tsel = cutlass.Int32(1)
+                            nt = C.ballot(tsel == cutlass.Int32(1))
+                            if tsel == cutlass.Int32(1):
+                                post = wbase + cutlass.Int32(
+                                    C.popc(nt & cutlass.Int32(cute.arch.lanemask_lt()))
+                                )
+                                if post >= wend:
+                                    post = cutlass.Int32(SCPB)
+                                post = self._emitc(
+                                    tx,
+                                    tail0 + ti + lane,
+                                    post,
+                                    TF,
+                                    SC,
+                                    hb_pin,
+                                    cb2_pin,
+                                    s_hist,
+                                    s_cbuf,
+                                    s_cbuf2,
+                                )
+                            wbase = wbase + cutlass.Int32(C.popc(nt))
+                            if wbase > wend:
+                                wovf = cutlass.Int32(1)
+                            ti = ti + cutlass.Int32(32)
+                    if lane == cutlass.Int32(
+                        0
+                    ):  # publish the warp's count and overflow flag before the row-pass barrier
+                        s_wcnt[wid] = wbase - wid * cutlass.Int32(WSEG_CAP)
+                        s_wcnt[cutlass.Int32(NW) + wid] = wovf
+            else:
+                while i < tailn:
+                    x = C.ldg_f32(x_addr, tail0 + i)
+                    if x >= TF:
+                        post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                        post = self._emitc(
+                            x, tail0 + i, post, TF, SC, hb_pin, cb2_pin, s_hist, s_cbuf, s_cbuf2
+                        )
+                    i = i + cutlass.Int32(BLK)
+            cute.arch.barrier()  # ---- barrier (row pass) ----
+            myn = s_scal[0]
+
+            if cutlass.const_expr(self.det):
+                wany_ovf = cutlass.Int32(0)
+                if cutlass.const_expr(
+                    not self.split
+                ):  # DET WSEG: total = sum of the warp counts, overflow = OR of the flags
+                    myn = cutlass.Int32(0)
+                    wv_ = cutlass.Int32(0)
+                    wo_ = cutlass.Int32(0)
+                    if lane < cutlass.Int32(NW):
+                        wv_ = s_wcnt[lane]
+                        wo_ = s_wcnt[cutlass.Int32(NW) + lane]
+                    myn = cutlass.Int32(
+                        C.warp_add_i32(wv_)
+                    )  # redux.sync.add: one instruction instead of a 5-step scan
+                    wany_ovf = cutlass.Int32(C.ballot(wo_ != cutlass.Int32(0)) != cutlass.Int32(0))
+                wdense = cutlass.Int32(0)
+                if cutlass.const_expr(
+                    (not self.split) and self.vstg and self.blk >= 1024
+                ):  # DET OVF
+                    if wany_ovf != cutlass.Int32(0):
+                        if myn <= cutlass.Int32(SCPB - alias_res):
+                            wdense = cutlass.Int32(1)
+                    if wdense != cutlass.Int32(0):  # CTA-uniform
+                        wi_ = cutlass.Int32(C.warp_incl_scan_add(wv_, lane))
+                        wsegb = cute.arch.shuffle_sync(wi_, wid) - cute.arch.shuffle_sync(wv_, wid)
+                        wbase = wsegb
+                        wend = wsegb + cute.arch.shuffle_sync(wv_, wid)
+                        wovf = cutlass.Int32(0)
+                        z_ = lane
+                        while z_ < cutlass.Int32(NBS):
+                            s_whist[wid * cutlass.Int32(NBS) + z_] = cutlass.Int32(0)
+                            z_ = z_ + cutlass.Int32(32)
+                        cute.arch.barrier()  # ---- barrier (DET OVF reset) ----
+                        if cutlass.const_expr(self.pf):
+                            fullsl = cutlass.Int32(0)
+                            if (c1 - c0) >= cutlass.Int32(BLK * U):
+                                fullsl = cutlass.Int32(1)
+                            if fullsl != cutlass.Int32(0):
+                                for uu in cutlass.range_constexpr(PFD):
+                                    C.ld_g_f32x4(
+                                        atom128, x_addr, c0 + tidx + cutlass.Int32(uu * BLK), pf[uu]
+                                    )
+                            else:
+                                for uu in cutlass.range_constexpr(PFD):
+                                    i_ = c0 + tidx + cutlass.Int32(uu * BLK)
+                                    ic = i_
+                                    if ic >= c1:
+                                        ic = lim4
+                                    C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
+                        it = cutlass.Int32(0)
+                        while it < nIt:
+                            i0 = c0 + it * step + tidx
+                            M = cutlass.Int32(0)
+                            isfull = cutlass.Int32(0)
+                            if it < nFull:
+                                isfull = cutlass.Int32(1)
+                            if isfull != cutlass.Int32(0):  # full body
+                                for uu in cutlass.range_constexpr(PFD, U):
+                                    C.ld_g_f32x4(
+                                        atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                    )
+                                for uu in cutlass.range_constexpr(U):
+                                    if cutlass.const_expr(uu < PFD):
+                                        vv = pf[uu]
+                                    else:
+                                        vv = fr[uu - PFD]
+                                    for q in cutlass.range_constexpr(4):
+                                        M = M | (
+                                            cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
+                                        )
+                            else:  # partial body
+                                for uu in cutlass.range_constexpr(PFD, U):
+                                    i_ = i0 + cutlass.Int32(uu * BLK)
+                                    ic = i_
+                                    if ic >= c1:
+                                        ic = lim4  # clamped address
+                                    C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
+                                for uu in cutlass.range_constexpr(U):
+                                    if cutlass.const_expr(uu < PFD):
+                                        vv = pf[uu]
+                                    else:
+                                        vv = fr[uu - PFD]
+                                    i_ = i0 + cutlass.Int32(uu * BLK)
+                                    okq = cutlass.Int32(0)
+                                    if i_ < c1:
+                                        okq = cutlass.Int32(1)
+                                    if okq != cutlass.Int32(0):  # ok-gated (+inf-pad escape)
+                                        for q in cutlass.range_constexpr(4):
+                                            M = M | (
+                                                cutlass.Int32(vv[q] >= TF)
+                                                << cutlass.Int32(uu * 4 + q)
+                                            )
+                            if cutlass.const_expr(self.prefill):
+                                if i0 == cutlass.Int32(0):
+                                    M = M & (cutlass.Int32(-1) << s_lead[0])
+                            if cutlass.const_expr(self.pf):
+                                hasnext = cutlass.Int32(0)
+                                if it + cutlass.Int32(1) < nIt:
+                                    hasnext = cutlass.Int32(1)
+                                if hasnext != cutlass.Int32(0):
+                                    j0 = i0 + step
+                                    infull = cutlass.Int32(0)  # warp-uniform peel
+                                    if it + cutlass.Int32(1) < nFull:
+                                        infull = cutlass.Int32(1)
+                                    if infull != cutlass.Int32(0):
+                                        for uu in cutlass.range_constexpr(PFD):
+                                            C.ld_g_f32x4(
+                                                atom128,
+                                                x_addr,
+                                                j0 + cutlass.Int32(uu * BLK),
+                                                pf[uu],
+                                            )
+                                    else:
+                                        for uu in cutlass.range_constexpr(PFD):
+                                            j_ = j0 + cutlass.Int32(uu * BLK)
+                                            jc = j_
+                                            if jc >= c1:
+                                                jc = lim4
+                                            C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
+                            cnt = cutlass.Int32(C.popc(M))
+                            inc = C.warp_incl_scan_add(cnt, lane)
+                            bpos = cutlass.Int32(0)
+                            pos = cutlass.Int32(0)
+                            if cutlass.const_expr(self.split):
+                                if lane == cutlass.Int32(31):
+                                    if inc != cutlass.Int32(0):
+                                        bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
+                                pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
+                            else:  # DET WSEG: per-warp private segment, program order, no atomic
+                                pos = wbase + (inc - cnt)
+                                wtot_ = cute.arch.shuffle_sync(inc, cutlass.Int32(31))
+                                wbase = wbase + wtot_
+                                if wbase > wend:
+                                    wovf = cutlass.Int32(1)
+                                if (
+                                    pos + cnt > wend
+                                ):  # a lane whose run crosses the segment end writes the trash slot
+                                    pos = cutlass.Int32(SCPB)
+                            if M != cutlass.Int32(0):
+                                bp = C.ffs_m1(M)
+                                M = M & (M - cutlass.Int32(1))
+                                idx = (
+                                    (i0 + (bp >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                                    << cutlass.Int32(2)
+                                ) + (bp & cutlass.Int32(3))
+                                if cutlass.const_expr(self.vstg and self.blk == 512):
+                                    xv = _ldg_f32_rs(x_addr, idx, x4_pin)
+                                else:
+                                    xv = C.ldg_f32(x_addr, idx)
+                                while M != cutlass.Int32(0):
+                                    bp2 = C.ffs_m1(M)
+                                    M = M & (M - cutlass.Int32(1))
+                                    idx2 = (
+                                        (i0 + (bp2 >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                                        << cutlass.Int32(2)
+                                    ) + (bp2 & cutlass.Int32(3))
+                                    if cutlass.const_expr(self.vstg and self.blk == 512):
+                                        xv2 = _ldg_f32_rs(x_addr, idx2, x4_pin)
+                                    else:
+                                        xv2 = C.ldg_f32(x_addr, idx2)
+                                    pos = self._emitc(
+                                        xv,
+                                        idx,
+                                        pos,
+                                        TF,
+                                        SC,
+                                        hb_pin,
+                                        cb2_pin,
+                                        s_hist,
+                                        s_cbuf,
+                                        s_cbuf2,
+                                    )
+                                    idx = idx2
+                                    xv = xv2
+                                pos = self._emitc(
+                                    xv, idx, pos, TF, SC, hb_pin, cb2_pin, s_hist, s_cbuf, s_cbuf2
+                                )
+                            it = it + cutlass.Int32(1)
+                        i = tidx  # DET WSEG: both tail branches define i
+                        if cutlass.const_expr(self.split):
+                            i = tidx
+                            while i < tailn:
+                                x = C.ldg_f32(x_addr, tail0 + i)
+                                if x >= TF:
+                                    post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                    post = self._emitc(
+                                        x,
+                                        tail0 + i,
+                                        post,
+                                        TF,
+                                        SC,
+                                        hb_pin,
+                                        cb2_pin,
+                                        s_hist,
+                                        s_cbuf,
+                                        s_cbuf2,
+                                    )
+                                i = i + cutlass.Int32(BLK)
+                        else:  # DET WSEG: warp 0 appends the tail (<= 3 elements) to its own segment, ballot-ordered
+                            if wid == cutlass.Int32(0):
+                                ti = cutlass.Int32(0)
+                                tx = cutlass.Float32(_NEG_INF)
+                                tsel = cutlass.Int32(0)
+                                nt = cutlass.Int32(0)
+                                post = cutlass.Int32(0)
+                                while ti < tailn:
+                                    tx = cutlass.Float32(_NEG_INF)
+                                    tsel = cutlass.Int32(0)
+                                    if ti + lane < tailn:
+                                        tx = C.ldg_f32(x_addr, tail0 + ti + lane)
+                                        if tx >= TF:
+                                            tsel = cutlass.Int32(1)
+                                    nt = C.ballot(tsel == cutlass.Int32(1))
+                                    if tsel == cutlass.Int32(1):
+                                        post = wbase + cutlass.Int32(
+                                            C.popc(nt & cutlass.Int32(cute.arch.lanemask_lt()))
+                                        )
+                                        if post >= wend:
+                                            post = cutlass.Int32(SCPB)
+                                        post = self._emitc(
+                                            tx,
+                                            tail0 + ti + lane,
+                                            post,
+                                            TF,
+                                            SC,
+                                            hb_pin,
+                                            cb2_pin,
+                                            s_hist,
+                                            s_cbuf,
+                                            s_cbuf2,
+                                        )
+                                    wbase = wbase + cutlass.Int32(C.popc(nt))
+                                    if wbase > wend:
+                                        wovf = cutlass.Int32(1)
+                                    ti = ti + cutlass.Int32(32)
+                        cute.arch.barrier()  # ---- barrier (DET OVF re-sweep) ----
+                if cutlass.const_expr(
+                    (not self.split) and (not self.split) and self.vstg and self.blk >= 1024
+                ):  # DET WHIST32: CTA histogram = sum of the per-warp u32 histograms
+                    if tidx < cutlass.Int32(NBS):
+                        hs_ = cutlass.Int32(0)
+                        for w_ in cutlass.range_constexpr(NW):
+                            hs_ = hs_ + s_whist[w_ * NBS + tidx]
+                        s_hist[tidx] = hs_
+                    cute.arch.barrier()  # ---- barrier (DET WHIST reduce) ----
+                if cutlass.const_expr(self.split):
+                    if tidx == cutlass.Int32(0):
+                        pgo = cute.make_ptr(
+                            cutlass.Int32,
+                            goff_addr + row64 * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
+                    cute.arch.barrier()  # ---- barrier (slab offset) ----
+                    base = s_scal[3]
+                    if myn <= cutlass.Int32(SCPB):  # coalesced publish
+                        i = tidx
+                        while i < myn:
+                            p = base + i
                             if p < cutlass.Int32(GCAP__main):
                                 _st_g_u64(
-                                    gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
-                                    (
-                                        cutlass.Uint64(cutlass.Uint32(tail0 + i))
-                                        << cutlass.Uint64(32)
-                                    )
-                                    | cutlass.Uint64(C.u32_of_f32(x)),
+                                    gbuf_row + cutlass.Int64(p) * cutlass.Int64(8), s_cbuf2[i]
                                 )
-                        i = i + cutlass.Int32(BLK)
-                cute.arch.barrier()  # ---- barrier (slab publish) ----
-                if tidx == cutlass.Int32(0):  # release + RMW
-                    C.threadfence_gpu()
-                    pdon = cute.make_ptr(
-                        cutlass.Int64,
-                        gdon_addr + row64 * cutlass.Int64(8),
-                        cute.AddressSpace.gmem,
-                        assumed_align=8,
-                    )
-                    s_pk[0] = C.atomic_add_u64_gpu(
-                        pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
-                    )
-                cute.arch.barrier()  # ---- barrier (arrival word) ----
-                pk = s_pk[0]
-                alive = cutlass.Int32(0)  # last-CTA test
-                if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
-                    alive = cutlass.Int32(1)
-                if alive != cutlass.Int32(0):
-                    C.threadfence_gpu()  # acquire
-                    if tidx == cutlass.Int32(0):  # ZERO-RESTORE
-                        _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
-                        _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
-                    total = cutlass.Int32(pk & cutlass.Int64(0xFFFFFFFF)) + myn
-                    if total <= cutlass.Int32(GCAP__main):  # one-pass consume
-                        listN = total
-                        if total > cutlass.Int32(SCPB):
-                            fromg = cutlass.Int32(1)
-                        i = tidx
-                        while i < listN:
-                            gvx, gvy = C._ldcg_v2_i32(
-                                gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
-                            )
-                            if fromg == cutlass.Int32(0):
-                                s_cbuf2[i] = (
-                                    cutlass.Uint64(cutlass.Uint32(gvy)) << cutlass.Uint64(32)
-                                ) | cutlass.Uint64(cutlass.Uint32(gvx))
-                            bq = C.f2s_rz((C.f32_of_i32(gvx) - TF) * SC)
-                            if bq > cutlass.Int32(NBS - 1):
-                                bq = cutlass.Int32(NBS - 1)
-                            # resultless red off the pinned hist base
-                            _red_shared_add1(hb_pin + (bq << cutlass.Int32(2)))
                             i = i + cutlass.Int32(BLK)
-                        cute.arch.barrier()  # ---- barrier (slab histogram) ----
-                        C.scan_cross0(
-                            s_hist,
-                            k,
-                            tidx,
-                            s_res,
-                            cutlass.Int32(0),
-                            cutlass.Int32(0),
-                            s_hist,
-                            nb=NBS,
-                            zero=False,
+                    else:  # overflow re-sweep
+                        if tidx == cutlass.Int32(0):
+                            s_scal[0] = cutlass.Int32(0)
+                        cute.arch.barrier()  # ---- barrier (overflow reset) ----
+                        lo2 = c0 << cutlass.Int32(2)
+                        hi2 = c1 << cutlass.Int32(2)
+                        i = lo2 + tidx
+                        while i < hi2:
+                            x = C.ldg_f32(x_addr, i)
+                            if x >= TF:
+                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                p = base + pq
+                                if p < cutlass.Int32(GCAP__main):
+                                    _st_g_u64(
+                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                        (cutlass.Uint64(cutlass.Uint32(i)) << cutlass.Uint64(32))
+                                        | cutlass.Uint64(C.u32_of_f32(x)),
+                                    )
+                            i = i + cutlass.Int32(BLK)
+                        i = tidx  # true tail
+                        while i < tailn:
+                            x = C.ldg_f32(x_addr, tail0 + i)
+                            if x >= TF:
+                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                p = base + pq
+                                if p < cutlass.Int32(GCAP__main):
+                                    _st_g_u64(
+                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                        (
+                                            cutlass.Uint64(cutlass.Uint32(tail0 + i))
+                                            << cutlass.Uint64(32)
+                                        )
+                                        | cutlass.Uint64(C.u32_of_f32(x)),
+                                    )
+                            i = i + cutlass.Int32(BLK)
+                    cute.arch.barrier()  # ---- barrier (slab publish) ----
+                    if tidx == cutlass.Int32(0):  # release + RMW
+                        C.threadfence_gpu()
+                        pdon = cute.make_ptr(
+                            cutlass.Int64,
+                            gdon_addr + row64 * cutlass.Int64(8),
+                            cute.AddressSpace.gmem,
+                            assumed_align=8,
                         )
-                        cute.arch.barrier()  # ---- barrier (scan publish) ----
-                        if s_res[C.RES_TOT] >= k:
-                            valid = cutlass.Int32(1)
-                            complete = cutlass.Int32(1)
-                            above = s_res[C.RES_ABOVE]
-                            m = s_res[C.RES_M]
-                            need = k - above
-                            B = s_res[C.RES_B]
-                running = cutlass.Int32(0)  # break (NATT==1)
-            else:
-                # ---- non-split verify + rung ladder ----
-                C.scan_cross0(
-                    s_hist,
-                    k,
-                    tidx,
-                    s_res,
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    s_hist,
-                    nb=NBS,
-                    zero=False,
-                )
-                cute.arch.barrier()  # ---- barrier (verify scan) ----
-                tot = s_res[C.RES_TOT]
-                acc = cutlass.Int32(0)
-                if tot >= k:
-                    acc = cutlass.Int32(1)
-                if acc != cutlass.Int32(0):  # accept
-                    valid = cutlass.Int32(1)
-                    complete = cutlass.Int32(0)
-                    if myn <= cutlass.Int32(SCPB):
-                        complete = cutlass.Int32(1)
-                    listN = myn
-                    above = s_res[C.RES_ABOVE]
-                    m = s_res[C.RES_M]
-                    need = k - above
-                    B = s_res[C.RES_B]
-                    running = cutlass.Int32(0)
+                        s_pk[0] = C.atomic_add_u64_gpu(
+                            pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
+                        )
+                    cute.arch.barrier()  # ---- barrier (arrival word) ----
+                    pk = s_pk[0]
+                    alive = cutlass.Int32(0)  # last-CTA test
+                    if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
+                        alive = cutlass.Int32(1)
+                    if alive != cutlass.Int32(0):
+                        C.threadfence_gpu()  # acquire
+                        if tidx == cutlass.Int32(0):  # ZERO-RESTORE
+                            _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
+                            _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
+                        total = cutlass.Int32(pk & cutlass.Int64(0xFFFFFFFF)) + myn
+                        if total <= cutlass.Int32(GCAP__main):  # one-pass consume
+                            listN = total
+                            if total > cutlass.Int32(SCPB - alias_res):  # DET ALIAS
+                                fromg = cutlass.Int32(1)
+                            i = tidx
+                            while i < listN:
+                                gvx, gvy = C._ldcg_v2_i32(
+                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                )
+                                if fromg == cutlass.Int32(0):
+                                    s_cbuf2[i] = (
+                                        cutlass.Uint64(cutlass.Uint32(gvy)) << cutlass.Uint64(32)
+                                    ) | cutlass.Uint64(cutlass.Uint32(gvx))
+                                bq = C.f2s_rz((C.f32_of_i32(gvx) - TF) * SC)
+                                if bq > cutlass.Int32(NBS - 1):
+                                    bq = cutlass.Int32(NBS - 1)
+                                _red_shared_add1(hb_pin + (bq << cutlass.Int32(2)))
+                                i = i + cutlass.Int32(BLK)
+                            cute.arch.barrier()  # ---- barrier (slab histogram) ----
+                            C.scan_cross0(
+                                s_hist,
+                                k,
+                                tidx,
+                                s_res,
+                                cutlass.Int32(0),
+                                cutlass.Int32(0),
+                                s_hist,
+                                nb=NBS,
+                                zero=False,
+                            )
+                            cute.arch.barrier()  # ---- barrier (scan publish) ----
+                            if s_res[C.RES_TOT] >= k:
+                                valid = cutlass.Int32(1)
+                                complete = cutlass.Int32(1)
+                                above = s_res[C.RES_ABOVE]
+                                m = s_res[C.RES_M]
+                                need = k - above
+                                B = s_res[C.RES_B]
+                    running = cutlass.Int32(0)  # break (NATT==1)
                 else:
-                    if att == cutlass.Int32(NATT - 1):  # ladder exhausted
+                    C.scan_cross0(
+                        s_hist,
+                        k,
+                        tidx,
+                        s_res,
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        s_hist,
+                        nb=NBS,
+                        zero=False,
+                    )
+                    cute.arch.barrier()  # ---- barrier (verify scan) ----
+                    tot = s_res[C.RES_TOT]
+                    acc = cutlass.Int32(0)
+                    if tot >= k:
+                        acc = cutlass.Int32(1)
+                    if acc != cutlass.Int32(0):  # accept
+                        valid = cutlass.Int32(1)
+                        complete = cutlass.Int32(0)
+                        if myn <= cutlass.Int32(
+                            SCPB - alias_res
+                        ):  # DET ALIAS: list must stay below the staging alias
+                            complete = cutlass.Int32(1)
+                        if (
+                            wany_ovf != cutlass.Int32(0)
+                        ):  # DET WSEG: a warp segment overflowed -> incomplete list (re-sweep + sort)
+                            if wdense == cutlass.Int32(0):  # DET OVF
+                                complete = cutlass.Int32(0)
+                        listN = myn
+                        above = s_res[C.RES_ABOVE]
+                        m = s_res[C.RES_M]
+                        need = k - above
+                        B = s_res[C.RES_B]
                         running = cutlass.Int32(0)
                     else:
-                        tshtaken = cutlass.Int32(0)  # TSH retry
-                        if cutlass.const_expr(self.shd):
-                            if att == cutlass.Int32(0):
-                                T5 = s_tsh[0]
-                                if T5 > cutlass.Float32(_NEG_INF):
-                                    if T5 < TF:
-                                        T = T5
-                                        tshtaken = cutlass.Int32(1)
-                        if tshtaken != cutlass.Int32(0):
-                            cute.arch.barrier()  # ---- barrier (TSH retry) ----
+                        if att == cutlass.Int32(NATT - 1):  # ladder exhausted
+                            running = cutlass.Int32(0)
                         else:
-                            # LAZY GATHER (sentinel equality flag)
-                            if GMIN == cutlass.Float32(C.SENT_LO):
-                                if cutlass.const_expr(not self.hint_free):
-                                    GMIN, GMAX = C.gather_hint(
-                                        x_addr, p_addr, k, n, tidx, s_wmn, s_wmx, blk=BLK, kpt=KPT
-                                    )
-                            floorhit = cutlass.Int32(1)
-                            if T > GMIN:
-                                floorhit = cutlass.Int32(0)
-                            if floorhit != cutlass.Int32(0):
-                                running = cutlass.Int32(0)
+                            tshtaken = cutlass.Int32(0)  # TSH retry
+                            if cutlass.const_expr(self.shd):
+                                if att == cutlass.Int32(0):
+                                    T5 = s_tsh[0]
+                                    if T5 > cutlass.Float32(_NEG_INF):
+                                        if T5 < TF:
+                                            T = T5
+                                            tshtaken = cutlass.Int32(1)
+                            if tshtaken != cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (TSH retry) ----
                             else:
-                                T = GMIN
-                                cute.arch.barrier()  # ---- barrier (floor retry) ----
+                                if GMIN == cutlass.Float32(C.SENT_LO):
+                                    if cutlass.const_expr(not self.hint_free):
+                                        GMIN, GMAX = C.gather_hint(
+                                            x_addr,
+                                            p_addr,
+                                            k,
+                                            n,
+                                            tidx,
+                                            s_wmn,
+                                            s_wmx,
+                                            blk=BLK,
+                                            kpt=KPT,
+                                        )
+                                floorhit = cutlass.Int32(1)
+                                if T > GMIN:
+                                    floorhit = cutlass.Int32(0)
+                                if floorhit != cutlass.Int32(0):
+                                    running = cutlass.Int32(0)
+                                else:
+                                    T = GMIN
+                                    cute.arch.barrier()  # ---- barrier (floor retry) ----
+            else:
+                if cutlass.const_expr(self.split):
+                    # ---- SLAB HAND-OFF; exactly ONE attempt ----
+                    if tidx == cutlass.Int32(0):
+                        pgo = cute.make_ptr(
+                            cutlass.Int32,
+                            goff_addr + row64 * cutlass.Int64(4),
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
+                    cute.arch.barrier()  # ---- barrier (slab offset) ----
+                    base = s_scal[3]
+                    if myn <= cutlass.Int32(SCPB):  # coalesced publish
+                        i = tidx
+                        while i < myn:
+                            p = base + i
+                            if p < cutlass.Int32(GCAP__main):
+                                _st_g_u64(
+                                    gbuf_row + cutlass.Int64(p) * cutlass.Int64(8), s_cbuf2[i]
+                                )
+                            i = i + cutlass.Int32(BLK)
+                    else:  # overflow re-sweep
+                        if tidx == cutlass.Int32(0):
+                            s_scal[0] = cutlass.Int32(0)
+                        cute.arch.barrier()  # ---- barrier (overflow reset) ----
+                        lo2 = c0 << cutlass.Int32(2)
+                        hi2 = c1 << cutlass.Int32(2)
+                        i = lo2 + tidx
+                        while i < hi2:
+                            x = C.ldg_f32(x_addr, i)
+                            if x >= TF:
+                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                p = base + pq
+                                if p < cutlass.Int32(GCAP__main):
+                                    _st_g_u64(
+                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                        (cutlass.Uint64(cutlass.Uint32(i)) << cutlass.Uint64(32))
+                                        | cutlass.Uint64(C.u32_of_f32(x)),
+                                    )
+                            i = i + cutlass.Int32(BLK)
+                        i = tidx  # true tail
+                        while i < tailn:
+                            x = C.ldg_f32(x_addr, tail0 + i)
+                            if x >= TF:
+                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                p = base + pq
+                                if p < cutlass.Int32(GCAP__main):
+                                    _st_g_u64(
+                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                        (
+                                            cutlass.Uint64(cutlass.Uint32(tail0 + i))
+                                            << cutlass.Uint64(32)
+                                        )
+                                        | cutlass.Uint64(C.u32_of_f32(x)),
+                                    )
+                            i = i + cutlass.Int32(BLK)
+                    cute.arch.barrier()  # ---- barrier (slab publish) ----
+                    if tidx == cutlass.Int32(0):  # release + RMW
+                        C.threadfence_gpu()
+                        pdon = cute.make_ptr(
+                            cutlass.Int64,
+                            gdon_addr + row64 * cutlass.Int64(8),
+                            cute.AddressSpace.gmem,
+                            assumed_align=8,
+                        )
+                        s_pk[0] = C.atomic_add_u64_gpu(
+                            pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
+                        )
+                    cute.arch.barrier()  # ---- barrier (arrival word) ----
+                    pk = s_pk[0]
+                    alive = cutlass.Int32(0)  # last-CTA test
+                    if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
+                        alive = cutlass.Int32(1)
+                    if alive != cutlass.Int32(0):
+                        C.threadfence_gpu()  # acquire
+                        if tidx == cutlass.Int32(0):  # ZERO-RESTORE
+                            _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
+                            _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
+                        total = cutlass.Int32(pk & cutlass.Int64(0xFFFFFFFF)) + myn
+                        if total <= cutlass.Int32(GCAP__main):  # one-pass consume
+                            listN = total
+                            if total > cutlass.Int32(SCPB):
+                                fromg = cutlass.Int32(1)
+                            i = tidx
+                            while i < listN:
+                                gvx, gvy = C._ldcg_v2_i32(
+                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                )
+                                if fromg == cutlass.Int32(0):
+                                    s_cbuf2[i] = (
+                                        cutlass.Uint64(cutlass.Uint32(gvy)) << cutlass.Uint64(32)
+                                    ) | cutlass.Uint64(cutlass.Uint32(gvx))
+                                bq = C.f2s_rz((C.f32_of_i32(gvx) - TF) * SC)
+                                if bq > cutlass.Int32(NBS - 1):
+                                    bq = cutlass.Int32(NBS - 1)
+                                # resultless red off the pinned hist base
+                                _red_shared_add1(hb_pin + (bq << cutlass.Int32(2)))
+                                i = i + cutlass.Int32(BLK)
+                            cute.arch.barrier()  # ---- barrier (slab histogram) ----
+                            C.scan_cross0(
+                                s_hist,
+                                k,
+                                tidx,
+                                s_res,
+                                cutlass.Int32(0),
+                                cutlass.Int32(0),
+                                s_hist,
+                                nb=NBS,
+                                zero=False,
+                            )
+                            cute.arch.barrier()  # ---- barrier (scan publish) ----
+                            if s_res[C.RES_TOT] >= k:
+                                valid = cutlass.Int32(1)
+                                complete = cutlass.Int32(1)
+                                above = s_res[C.RES_ABOVE]
+                                m = s_res[C.RES_M]
+                                need = k - above
+                                B = s_res[C.RES_B]
+                    running = cutlass.Int32(0)  # break (NATT==1)
+                else:
+                    # ---- non-split verify + rung ladder ----
+                    C.scan_cross0(
+                        s_hist,
+                        k,
+                        tidx,
+                        s_res,
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        s_hist,
+                        nb=NBS,
+                        zero=False,
+                    )
+                    cute.arch.barrier()  # ---- barrier (verify scan) ----
+                    tot = s_res[C.RES_TOT]
+                    acc = cutlass.Int32(0)
+                    if tot >= k:
+                        acc = cutlass.Int32(1)
+                    if acc != cutlass.Int32(0):  # accept
+                        valid = cutlass.Int32(1)
+                        complete = cutlass.Int32(0)
+                        if myn <= cutlass.Int32(SCPB):
+                            complete = cutlass.Int32(1)
+                        listN = myn
+                        above = s_res[C.RES_ABOVE]
+                        m = s_res[C.RES_M]
+                        need = k - above
+                        B = s_res[C.RES_B]
+                        running = cutlass.Int32(0)
+                    else:
+                        if att == cutlass.Int32(NATT - 1):  # ladder exhausted
+                            running = cutlass.Int32(0)
+                        else:
+                            tshtaken = cutlass.Int32(0)  # TSH retry
+                            if cutlass.const_expr(self.shd):
+                                if att == cutlass.Int32(0):
+                                    T5 = s_tsh[0]
+                                    if T5 > cutlass.Float32(_NEG_INF):
+                                        if T5 < TF:
+                                            T = T5
+                                            tshtaken = cutlass.Int32(1)
+                            if tshtaken != cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (TSH retry) ----
+                            else:
+                                # LAZY GATHER (sentinel equality flag)
+                                if GMIN == cutlass.Float32(C.SENT_LO):
+                                    if cutlass.const_expr(not self.hint_free):
+                                        GMIN, GMAX = C.gather_hint(
+                                            x_addr,
+                                            p_addr,
+                                            k,
+                                            n,
+                                            tidx,
+                                            s_wmn,
+                                            s_wmx,
+                                            blk=BLK,
+                                            kpt=KPT,
+                                        )
+                                floorhit = cutlass.Int32(1)
+                                if T > GMIN:
+                                    floorhit = cutlass.Int32(0)
+                                if floorhit != cutlass.Int32(0):
+                                    running = cutlass.Int32(0)
+                                else:
+                                    T = GMIN
+                                    cute.arch.barrier()  # ---- barrier (floor retry) ----
             att = att + cutlass.Int32(1)
 
         # ============ classification ============
@@ -2496,6 +3497,16 @@ class GvrMainKernel:
                 degen = cutlass.Int32(1)
             if m > cutlass.Int32(CMPB):
                 degen = cutlass.Int32(1)
+            if cutlass.const_expr(self.det):
+                if cutlass.const_expr(
+                    not self.split
+                ):  # DET WSEG: SPLIT keeps fs_sort a compile-time 1 (foldable epilogue)
+                    if degen != cutlass.Int32(0):  # degenerate rows keep atomics -> sort
+                        fs_sort = cutlass.Int32(1)
+                    if complete == cutlass.Int32(
+                        0
+                    ):  # incomplete list -> re-sweep with atomics -> sort
+                        fs_sort = cutlass.Int32(1)
             mc = cutlass.Int32(0)
             if degen == cutlass.Int32(0):
                 mc = m
@@ -2503,64 +3514,661 @@ class GvrMainKernel:
             if degen == cutlass.Int32(0):
                 # ---- P5 cursor emit ----
                 if complete != cutlass.Int32(0):
-                    i = tidx
-                    while i < listN:
-                        idv = cutlass.Int32(0)
-                        bq = cutlass.Int32(0)
-                        xv = cutlass.Float32(0.0)
-                        if cutlass.const_expr(self.vstg):
-                            vx = cutlass.Int32(0)
-                            vy = cutlass.Int32(0)
-                            if cutlass.const_expr(self.split):
-                                if fromg != cutlass.Int32(0):
-                                    vx, vy = C._ldcg_v2_i32(
-                                        gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                    if cutlass.const_expr(self.det):
+                        if cutlass.const_expr(self.split):
+                            i = tidx
+                            while i < listN:
+                                idv = cutlass.Int32(0)
+                                bq = cutlass.Int32(0)
+                                xv = cutlass.Float32(0.0)
+                                if cutlass.const_expr(self.vstg):
+                                    vx = cutlass.Int32(0)
+                                    vy = cutlass.Int32(0)
+                                    if cutlass.const_expr(self.split):
+                                        if fromg != cutlass.Int32(0):
+                                            vx, vy = C._ldcg_v2_i32(
+                                                gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                            )
+                                        else:
+                                            pk64 = s_cbuf2[i]
+                                            vx = cutlass.Int32(
+                                                cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                    else:
+                                        pk64 = s_cbuf2[i]
+                                        vx = cutlass.Int32(
+                                            cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                        )
+                                        vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                    xv = C.f32_of_i32(vx)
+                                    idv = vy
+                                    bq = C.f2s_rz((xv - TF) * SC)
+                                    if bq > cutlass.Int32(NBS - 1):
+                                        bq = cutlass.Int32(NBS - 1)
+                                else:
+                                    wpk = cutlass.Uint32(s_cbuf[i])
+                                    idv = cutlass.Int32(wpk & cutlass.Uint32(IDXM__main))
+                                    bq = cutlass.Int32(wpk >> cutlass.Uint32(IDXB__main))
+                                if bq >= B:
+                                    p = C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
+                                    if p < lim1:
+                                        if cutlass.const_expr(self.prefill):
+                                            out_row[p] = idv - s_lead[0]
+                                        else:
+                                            out_row[p] = idv
+                                    else:
+                                        if whole == cutlass.Int32(0):
+                                            q2 = p - above
+                                            if q2 < cutlass.Int32(CMPB):
+                                                if cutlass.const_expr(self.vstg):
+                                                    kk = C.fkey(xv)
+                                                else:
+                                                    kk = C.fkey(C.ldg_f32(x_addr, idv))
+                                                s_ck64[q2] = (
+                                                    cutlass.Uint64(kk) << cutlass.Uint64(32)
+                                                ) | cutlass.Uint64(cutlass.Uint32(idv))
+                                i = i + cutlass.Int32(BLK)
+                        else:
+                            i = cutlass.Int32(0)
+                            j = lane
+                            wseg0 = wsegb
+                            wcnt_ = s_wcnt[wid]
+                            idv = cutlass.Int32(0)
+                            bq = cutlass.Int32(0)
+                            xv = cutlass.Float32(0.0)
+                            if p5_cursor != cutlass.Int32(
+                                0
+                            ):  # DET WSEG hook: cursor emit over this warp's segment
+                                wseg0 = wsegb
+                                wcnt_ = s_wcnt[wid]
+                                j = lane
+                                i = wseg0
+                                while j < wcnt_:
+                                    i = wseg0 + j
+                                    idv = cutlass.Int32(0)
+                                    bq = cutlass.Int32(0)
+                                    xv = cutlass.Float32(0.0)
+                                    if cutlass.const_expr(self.vstg):
+                                        vx = cutlass.Int32(0)
+                                        vy = cutlass.Int32(0)
+                                        if cutlass.const_expr(self.split):
+                                            if fromg != cutlass.Int32(0):
+                                                vx, vy = C._ldcg_v2_i32(
+                                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                                )
+                                            else:
+                                                pk64 = s_cbuf2[i]
+                                                vx = cutlass.Int32(
+                                                    cutlass.Uint32(
+                                                        pk64 & cutlass.Uint64(0xFFFFFFFF)
+                                                    )
+                                                )
+                                                vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                        else:
+                                            pk64 = s_cbuf2[i]
+                                            vx = cutlass.Int32(
+                                                cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                        xv = C.f32_of_i32(vx)
+                                        idv = vy
+                                        bq = C.f2s_rz((xv - TF) * SC)
+                                        if bq > cutlass.Int32(NBS - 1):
+                                            bq = cutlass.Int32(NBS - 1)
+                                    else:
+                                        wpk = cutlass.Uint32(s_cbuf[i])
+                                        idv = cutlass.Int32(wpk & cutlass.Uint32(IDXM__main))
+                                        bq = cutlass.Int32(wpk >> cutlass.Uint32(IDXB__main))
+                                    if bq >= B:
+                                        p = C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
+                                        if p < lim1:
+                                            if cutlass.const_expr(self.prefill):
+                                                out_row[p] = idv - s_lead[0]
+                                            else:
+                                                out_row[p] = idv
+                                        else:
+                                            if whole == cutlass.Int32(0):
+                                                q2 = p - above
+                                                if q2 < cutlass.Int32(CMPB):
+                                                    if cutlass.const_expr(self.vstg):
+                                                        kk = C.fkey(xv)
+                                                    else:
+                                                        kk = C.fkey(C.ldg_f32(x_addr, idv))
+                                                    s_ck64[q2] = (
+                                                        cutlass.Uint64(kk) << cutlass.Uint64(32)
+                                                    ) | cutlass.Uint64(cutlass.Uint32(idv))
+                                    j = j + cutlass.Int32(32)
+                            else:
+                                if cutlass.const_expr(self.vstg):  # DET LEAN
+                                    wcnt_ = s_wcnt[wid]
+                                    seg_a = _smem_addr_reg(
+                                        s_cbuf2.iterator.toint()
+                                    ) + wsegb * cutlass.Int32(8)
+                                    wlast_ = cutlass.max(wcnt_ - cutlass.Int32(1), cutlass.Int32(0))
+                                    orow_a = _smem_addr_reg(out_row.iterator.toint())
+                                    ck_a = _smem_addr_reg(s_ck64.iterator.toint())
+                                    trash_a = _smem_addr_reg(s_trash.iterator.toint()) + (
+                                        lane << cutlass.Int32(3)
                                     )
+                                    lt_ = cutlass.Int32(cute.arch.lanemask_lt())
+                                    lead_ = cutlass.Int32(0)
+                                    if cutlass.const_expr(self.prefill):
+                                        lead_ = s_lead[0]
+                                    dc1 = cutlass.Int32(0)
+                                    dc2 = cutlass.Int32(0)
+                                    j0_ = cutlass.Int32(0)
+                                    jj_ = cutlass.Int32(0)
+                                    lo_ = cutlass.Int32(0)
+                                    hi_ = cutlass.Int32(0)
+                                    bq_ = cutlass.Int32(0)
+                                    vv_ = cutlass.Int32(0)
+                                    ac_ = cutlass.Int32(0)
+                                    cr_ = cutlass.Int32(0)
+                                    ma_ = cutlass.Int32(0)
+                                    mc_ = cutlass.Int32(0)
+                                    sl_ = cutlass.Int32(0)
+                                    ad_ = cutlass.Int32(0)
+                                    p1b = cutlass.Int32(0)
+                                    p2b = cutlass.Int32(0)
+                                    xv_ = cutlass.Float32(0.0)
+                                    if cutlass.const_expr(
+                                        self.blk >= 1024
+                                    ):  # DET LEAN+WHIST: counts from the per-warp histogram
+                                        bb_ = lane << cutlass.Int32(3)
+                                        wh_a = (
+                                            _smem_addr_reg(s_whist.iterator.toint())
+                                            + wid * cutlass.Int32(NBS * 4)
+                                            + (lane << cutlass.Int32(5))
+                                        )
+                                        hc0_, hc1_ = _lds_v2_u32(wh_a + cutlass.Int32(0))
+                                        hc2_, hc3_ = _lds_v2_u32(wh_a + cutlass.Int32(8))
+                                        hc4_, hc5_ = _lds_v2_u32(wh_a + cutlass.Int32(16))
+                                        hc6_, hc7_ = _lds_v2_u32(wh_a + cutlass.Int32(24))
+                                        bq_ = bb_ + cutlass.Int32(0)
+                                        dc1 = dc1 + hc0_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc0_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(1)
+                                        dc1 = dc1 + hc1_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc1_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(2)
+                                        dc1 = dc1 + hc2_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc2_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(3)
+                                        dc1 = dc1 + hc3_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc3_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(4)
+                                        dc1 = dc1 + hc4_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc4_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(5)
+                                        dc1 = dc1 + hc5_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc5_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(6)
+                                        dc1 = dc1 + hc6_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc6_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                        bq_ = bb_ + cutlass.Int32(7)
+                                        dc1 = dc1 + hc7_ * (
+                                            cutlass.Int32(bq_ > B)
+                                            | (cutlass.Int32(bq_ == B) & whole)
+                                        )
+                                        dc2 = dc2 + hc7_ * (
+                                            cutlass.Int32(bq_ == B) & (cutlass.Int32(1) - whole)
+                                        )
+                                    else:
+                                        while j0_ < wcnt_:
+                                            jj_ = j0_ + lane
+                                            lo_, hi_ = _lds_v2_u32(
+                                                seg_a
+                                                + (cutlass.min(jj_, wlast_) << cutlass.Int32(3))
+                                            )
+                                            xv_ = C.f32_of_i32(lo_)
+                                            bq_ = cutlass.min(
+                                                C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                            )
+                                            vv_ = cutlass.Int32(jj_ < wcnt_)
+                                            ac_ = (
+                                                cutlass.Int32(bq_ > B)
+                                                | (cutlass.Int32(bq_ == B) & whole)
+                                            ) & vv_
+                                            cr_ = (
+                                                cutlass.Int32(bq_ == B)
+                                                & (cutlass.Int32(1) - whole)
+                                                & vv_
+                                            )
+                                            dc1 = dc1 + ac_
+                                            dc2 = dc2 + cr_
+                                            j0_ = j0_ + cutlass.Int32(32)
+                                    w1_ = cutlass.Int32(C.warp_add_i32(dc1))
+                                    w2_ = cutlass.Int32(C.warp_add_i32(dc2))
+                                    if lane == cutlass.Int32(0):
+                                        s_ws[wid] = cutlass.Uint32(w1_)
+                                        s_wmn[wid] = cutlass.Uint32(w2_)
+                                    cute.arch.barrier()  # DET LEAN: warp totals published
+                                    v1_ = cutlass.Int32(0)
+                                    v2_ = cutlass.Int32(0)
+                                    if lane < cutlass.Int32(NW):
+                                        v1_ = cutlass.Int32(s_ws[lane])
+                                        v2_ = cutlass.Int32(s_wmn[lane])
+                                    i1_, i2_ = C.warp_incl_scan_add2(v1_, v2_, lane)
+                                    p1b = cute.arch.shuffle_sync(i1_, wid) - w1_
+                                    p2b = cute.arch.shuffle_sync(i2_, wid) - w2_
+                                    j0_ = cutlass.Int32(0)
+                                    bacc_ = B - whole
+                                    bcrs_ = B + whole * cutlass.Int32(-1 - B)  # -1 when whole
+                                    ck_a = ck_a + (p2b << cutlass.Int32(3))
+                                    orow_a = orow_a + (p1b << cutlass.Int32(2))
+                                    while (
+                                        j0_ < wcnt_
+                                    ):  # pass 2 (LEAN2): one ballot per class, SEL addresses, no branches
+                                        jj_ = j0_ + lane
+                                        lo_, hi_ = _lds_v2_u32(
+                                            seg_a + (cutlass.min(jj_, wlast_) << cutlass.Int32(3))
+                                        )
+                                        xv_ = C.f32_of_i32(lo_)
+                                        bq_ = cutlass.min(
+                                            C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                        )
+                                        if jj_ >= wcnt_:
+                                            bq_ = cutlass.Int32(-1)
+                                        ma_ = C.ballot(bq_ > bacc_)
+                                        mc_ = C.ballot(bq_ == bcrs_)
+                                        ad_ = trash_a
+                                        if bq_ > bacc_:
+                                            ad_ = orow_a + (
+                                                cutlass.Int32(C.popc(ma_ & lt_)) << cutlass.Int32(2)
+                                            )
+                                        _st_s_u32(ad_, cutlass.Uint32(hi_ - lead_))
+                                        ad_ = trash_a
+                                        if bq_ == bcrs_:
+                                            ad_ = ck_a + (
+                                                cutlass.Int32(C.popc(mc_ & lt_)) << cutlass.Int32(3)
+                                            )
+                                        _st_s_v2_u32(ad_, cutlass.Uint32(hi_), C.fkey(xv_))
+                                        orow_a = orow_a + (
+                                            cutlass.Int32(C.popc(ma_)) << cutlass.Int32(2)
+                                        )
+                                        ck_a = ck_a + (
+                                            cutlass.Int32(C.popc(mc_)) << cutlass.Int32(3)
+                                        )
+                                        j0_ = j0_ + cutlass.Int32(32)
+                                else:
+                                    wseg0 = wsegb
+                                    wcnt_ = s_wcnt[wid]
+                                    dc1 = cutlass.Int32(0)
+                                    dc2 = cutlass.Int32(0)
+                                    i = cutlass.Int32(0)
+                                    idv = cutlass.Int32(0)
+                                    bq = cutlass.Int32(0)
+                                    xv = cutlass.Float32(0.0)
+                                    acc_ = cutlass.Int32(0)
+                                    crs_ = cutlass.Int32(0)
+                                    pk64 = cutlass.Int64(0)
+                                    vx = cutlass.Int32(0)
+                                    wpk = cutlass.Uint32(0)
+                                    ma_ = cutlass.Int32(0)
+                                    mc_ = cutlass.Int32(0)
+                                    sl_ = cutlass.Int32(0)
+                                    q2 = cutlass.Int32(0)
+                                    kk = cutlass.Uint32(0)
+                                    pw_ = cutlass.Int32(0)
+                                    bb_ = cutlass.Int32(0)
+                                    cc_ = cutlass.Int32(0)
+                                    if cutlass.const_expr(
+                                        self.vstg and self.blk >= 1024
+                                    ):  # DET WHIST: counts from the per-warp histogram
+                                        nit_ = (wcnt_ + cutlass.Int32(31)) >> cutlass.Int32(5)
+                                        it_ = cutlass.Int32(0)
+                                        j = lane
+                                        valid_ = cutlass.Int32(0)
+                                        pw_ = s_whist[
+                                            wid * cutlass.Int32(NBS // 2)
+                                            + (lane << cutlass.Int32(2))
+                                            + cutlass.Int32(0)
+                                        ]
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(0)
+                                        cc_ = pw_ & cutlass.Int32(0xFFFF)
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(1)
+                                        cc_ = cutlass.Int32(
+                                            cutlass.Uint32(pw_) >> cutlass.Uint32(16)
+                                        )
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        pw_ = s_whist[
+                                            wid * cutlass.Int32(NBS // 2)
+                                            + (lane << cutlass.Int32(2))
+                                            + cutlass.Int32(1)
+                                        ]
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(2)
+                                        cc_ = pw_ & cutlass.Int32(0xFFFF)
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(3)
+                                        cc_ = cutlass.Int32(
+                                            cutlass.Uint32(pw_) >> cutlass.Uint32(16)
+                                        )
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        pw_ = s_whist[
+                                            wid * cutlass.Int32(NBS // 2)
+                                            + (lane << cutlass.Int32(2))
+                                            + cutlass.Int32(2)
+                                        ]
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(4)
+                                        cc_ = pw_ & cutlass.Int32(0xFFFF)
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(5)
+                                        cc_ = cutlass.Int32(
+                                            cutlass.Uint32(pw_) >> cutlass.Uint32(16)
+                                        )
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        pw_ = s_whist[
+                                            wid * cutlass.Int32(NBS // 2)
+                                            + (lane << cutlass.Int32(2))
+                                            + cutlass.Int32(3)
+                                        ]
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(6)
+                                        cc_ = pw_ & cutlass.Int32(0xFFFF)
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                        bb_ = (lane << cutlass.Int32(3)) + cutlass.Int32(7)
+                                        cc_ = cutlass.Int32(
+                                            cutlass.Uint32(pw_) >> cutlass.Uint32(16)
+                                        )
+                                        if bb_ > B:
+                                            dc1 = dc1 + cc_
+                                        if bb_ == B:
+                                            if whole != cutlass.Int32(0):
+                                                dc1 = dc1 + cc_
+                                            else:
+                                                dc2 = dc2 + cc_
+                                    else:
+                                        nit_ = (wcnt_ + cutlass.Int32(31)) >> cutlass.Int32(
+                                            5
+                                        )  # warp-uniform trip count: ballots need every lane
+                                        it_ = cutlass.Int32(0)
+                                        j = lane
+                                        valid_ = cutlass.Int32(0)
+                                        while (
+                                            it_ < nit_
+                                        ):  # 4 independent iterations per trip: overlaps the shared loads
+                                            for uu_ in cutlass.range_constexpr(1):
+                                                j = (
+                                                    (it_ + cutlass.Int32(uu_)) << cutlass.Int32(5)
+                                                ) + lane
+                                                valid_ = cutlass.Int32(j < wcnt_)
+                                                i = wseg0 + j
+                                                if valid_ == cutlass.Int32(0):
+                                                    i = wseg0
+                                                idv = cutlass.Int32(0)
+                                                bq = cutlass.Int32(0)
+                                                xv = cutlass.Float32(0.0)
+                                                if cutlass.const_expr(self.vstg):
+                                                    pk64 = s_cbuf2[i]
+                                                    vx = cutlass.Int32(
+                                                        cutlass.Uint32(
+                                                            pk64 & cutlass.Uint64(0xFFFFFFFF)
+                                                        )
+                                                    )
+                                                    idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                                    xv = C.f32_of_i32(vx)
+                                                    bq = C.f2s_rz((xv - TF) * SC)
+                                                    if bq > cutlass.Int32(NBS - 1):
+                                                        bq = cutlass.Int32(NBS - 1)
+                                                else:
+                                                    wpk = cutlass.Uint32(s_cbuf[i])
+                                                    idv = cutlass.Int32(
+                                                        wpk & cutlass.Uint32(IDXM__main)
+                                                    )
+                                                    bq = cutlass.Int32(
+                                                        wpk >> cutlass.Uint32(IDXB__main)
+                                                    )
+                                                    xv = cutlass.Float32(0.0)
+                                                acc_ = cutlass.Int32(0)
+                                                crs_ = cutlass.Int32(0)
+                                                if bq >= B:
+                                                    if bq > B:
+                                                        acc_ = cutlass.Int32(1)
+                                                    else:
+                                                        if whole != cutlass.Int32(0):
+                                                            acc_ = cutlass.Int32(1)
+                                                        else:
+                                                            crs_ = cutlass.Int32(1)
+                                                acc_ = acc_ & valid_
+                                                crs_ = crs_ & valid_
+                                                dc1 = dc1 + acc_
+                                                dc2 = dc2 + crs_
+                                            it_ = it_ + cutlass.Int32(1)
+                                    w1_ = C.warp_incl_scan_add(dc1, lane)
+                                    w2_ = C.warp_incl_scan_add(dc2, lane)
+                                    if lane == cutlass.Int32(31):
+                                        s_ws[wid] = cutlass.Uint32(w1_)
+                                        s_wmn[wid] = cutlass.Uint32(w2_)
+                                    cute.arch.barrier()  # DET WSEG: warp totals published
+                                    v1_ = cutlass.Int32(0)
+                                    v2_ = cutlass.Int32(0)
+                                    if lane < cutlass.Int32(NW):
+                                        v1_ = cutlass.Int32(s_ws[lane])
+                                        v2_ = cutlass.Int32(s_wmn[lane])
+                                    i1_, i2_ = C.warp_incl_scan_add2(v1_, v2_, lane)
+                                    p1b = cute.arch.shuffle_sync(i1_, wid) - cute.arch.shuffle_sync(
+                                        v1_, wid
+                                    )
+                                    p2b = cute.arch.shuffle_sync(i2_, wid) - cute.arch.shuffle_sync(
+                                        v2_, wid
+                                    )
+                                    it_ = cutlass.Int32(0)
+                                    while it_ < nit_:
+                                        for uu_ in cutlass.range_constexpr(1):
+                                            j = (
+                                                (it_ + cutlass.Int32(uu_)) << cutlass.Int32(5)
+                                            ) + lane
+                                            valid_ = cutlass.Int32(j < wcnt_)
+                                            i = wseg0 + j
+                                            if valid_ == cutlass.Int32(0):
+                                                i = wseg0
+                                            idv = cutlass.Int32(0)
+                                            bq = cutlass.Int32(0)
+                                            xv = cutlass.Float32(0.0)
+                                            if cutlass.const_expr(self.vstg):
+                                                pk64 = s_cbuf2[i]
+                                                vx = cutlass.Int32(
+                                                    cutlass.Uint32(
+                                                        pk64 & cutlass.Uint64(0xFFFFFFFF)
+                                                    )
+                                                )
+                                                idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                                xv = C.f32_of_i32(vx)
+                                                bq = C.f2s_rz((xv - TF) * SC)
+                                                if bq > cutlass.Int32(NBS - 1):
+                                                    bq = cutlass.Int32(NBS - 1)
+                                            else:
+                                                wpk = cutlass.Uint32(s_cbuf[i])
+                                                idv = cutlass.Int32(
+                                                    wpk & cutlass.Uint32(IDXM__main)
+                                                )
+                                                bq = cutlass.Int32(
+                                                    wpk >> cutlass.Uint32(IDXB__main)
+                                                )
+                                                xv = cutlass.Float32(0.0)
+                                            acc_ = cutlass.Int32(0)
+                                            crs_ = cutlass.Int32(0)
+                                            if bq >= B:
+                                                if bq > B:
+                                                    acc_ = cutlass.Int32(1)
+                                                else:
+                                                    if whole != cutlass.Int32(0):
+                                                        acc_ = cutlass.Int32(1)
+                                                    else:
+                                                        crs_ = cutlass.Int32(1)
+                                            acc_ = acc_ & valid_
+                                            crs_ = crs_ & valid_
+                                            ma_ = C.ballot(acc_ == cutlass.Int32(1))
+                                            mc_ = C.ballot(crs_ == cutlass.Int32(1))
+                                            if acc_ != cutlass.Int32(0):
+                                                sl_ = p1b + cutlass.Int32(
+                                                    C.popc(
+                                                        ma_ & cutlass.Int32(cute.arch.lanemask_lt())
+                                                    )
+                                                )
+                                                if sl_ < lim1:
+                                                    if cutlass.const_expr(
+                                                        self.prefill
+                                                    ):  # local frame (column - ks)
+                                                        out_row[sl_] = idv - s_lead[0]
+                                                    else:
+                                                        out_row[sl_] = idv
+                                            if mc_ != cutlass.Int32(
+                                                0
+                                            ):  # DET WSEG: crossing entries are rare (one bin)
+                                                if crs_ != cutlass.Int32(0):
+                                                    q2 = p2b + cutlass.Int32(
+                                                        C.popc(
+                                                            mc_
+                                                            & cutlass.Int32(cute.arch.lanemask_lt())
+                                                        )
+                                                    )
+                                                    if q2 < cutlass.Int32(CMPB):
+                                                        if cutlass.const_expr(self.vstg):
+                                                            kk = C.fkey(xv)
+                                                        else:
+                                                            kk = C.fkey(C.ldg_f32(x_addr, idv))
+                                                        s_ck64[q2] = (
+                                                            cutlass.Uint64(kk) << cutlass.Uint64(32)
+                                                        ) | cutlass.Uint64(cutlass.Uint32(idv))
+                                            p1b = p1b + cutlass.Int32(C.popc(ma_))
+                                            p2b = p2b + cutlass.Int32(C.popc(mc_))
+                                        it_ = it_ + cutlass.Int32(1)
+                    else:
+                        i = tidx
+                        while i < listN:
+                            idv = cutlass.Int32(0)
+                            bq = cutlass.Int32(0)
+                            xv = cutlass.Float32(0.0)
+                            if cutlass.const_expr(self.vstg):
+                                vx = cutlass.Int32(0)
+                                vy = cutlass.Int32(0)
+                                if cutlass.const_expr(self.split):
+                                    if fromg != cutlass.Int32(0):
+                                        vx, vy = C._ldcg_v2_i32(
+                                            gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                        )
+                                    else:
+                                        pk64 = s_cbuf2[i]
+                                        vx = cutlass.Int32(
+                                            cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                        )
+                                        vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
                                 else:
                                     pk64 = s_cbuf2[i]
                                     vx = cutlass.Int32(
                                         cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
                                     )
                                     vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                xv = C.f32_of_i32(vx)
+                                idv = vy
+                                bq = C.f2s_rz((xv - TF) * SC)
+                                if bq > cutlass.Int32(NBS - 1):
+                                    bq = cutlass.Int32(NBS - 1)
                             else:
-                                pk64 = s_cbuf2[i]
-                                vx = cutlass.Int32(
-                                    cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
-                                )
-                                vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
-                            xv = C.f32_of_i32(vx)
-                            idv = vy
-                            bq = C.f2s_rz((xv - TF) * SC)
-                            if bq > cutlass.Int32(NBS - 1):
-                                bq = cutlass.Int32(NBS - 1)
-                        else:
-                            wpk = cutlass.Uint32(s_cbuf[i])
-                            idv = cutlass.Int32(wpk & cutlass.Uint32(IDXM__main))
-                            bq = cutlass.Int32(wpk >> cutlass.Uint32(IDXB__main))
-                        if bq >= B:
-                            p = C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
-                            if p < lim1:
-                                # prefill: staged idx are in the col0 frame; the
-                                # local output frame is relative to ks = col0+lead.
-                                if cutlass.const_expr(self.prefill):
-                                    out_row[p] = idv - s_lead[0]
+                                wpk = cutlass.Uint32(s_cbuf[i])
+                                idv = cutlass.Int32(wpk & cutlass.Uint32(IDXM__main))
+                                bq = cutlass.Int32(wpk >> cutlass.Uint32(IDXB__main))
+                            if bq >= B:
+                                p = C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
+                                if p < lim1:
+                                    # prefill: staged idx are in the col0 frame; the
+                                    # local output frame is relative to ks = col0+lead.
+                                    if cutlass.const_expr(self.prefill):
+                                        out_row[p] = idv - s_lead[0]
+                                    else:
+                                        out_row[p] = idv
                                 else:
-                                    out_row[p] = idv
-                            else:
-                                if whole == cutlass.Int32(0):
-                                    q2 = p - above
-                                    if q2 < cutlass.Int32(CMPB):
-                                        if cutlass.const_expr(self.vstg):
-                                            kk = C.fkey(xv)
-                                        else:
-                                            kk = C.fkey(C.ldg_f32(x_addr, idv))
-                                        s_ck64[q2] = (
-                                            cutlass.Uint64(kk) << cutlass.Uint64(32)
-                                        ) | cutlass.Uint64(cutlass.Uint32(idv))
-                        i = i + cutlass.Int32(BLK)
+                                    if whole == cutlass.Int32(0):
+                                        q2 = p - above
+                                        if q2 < cutlass.Int32(CMPB):
+                                            if cutlass.const_expr(self.vstg):
+                                                kk = C.fkey(xv)
+                                            else:
+                                                kk = C.fkey(C.ldg_f32(x_addr, idv))
+                                            s_ck64[q2] = (
+                                                cutlass.Uint64(kk) << cutlass.Uint64(32)
+                                            ) | cutlass.Uint64(cutlass.Uint32(idv))
+                            i = i + cutlass.Int32(BLK)
                 else:
-                    # collect overflow: scalar re-sweep, exact tail remap —
-                    # zero extra live registers by design
                     lo2 = c0 << cutlass.Int32(2)
                     hi2 = c1 << cutlass.Int32(2)
                     i0_ = lo2 + tidx
@@ -2607,20 +4215,46 @@ class GvrMainKernel:
                             # re-wrapped SIGNED by the DSL — every u64 compare
                             # must re-assert Uint64 at the USE site.
                             u64v = s_ck64[i]
+                            if cutlass.const_expr(self.det):
+                                u64f = (cutlass.Uint64(u64v) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                    cutlass.Uint64(u64v) & cutlass.Uint64(0xFFFFFFFF)
+                                )
                             r_ = cutlass.Int32(0)
                             jq = cutlass.Int32(0)
                             while jq < mc2:  # ulonglong2 16B reads
                                 vlo, vhi = C._lds_v2_u64(ck_addr + jq * cutlass.Int32(8))
-                                r_ = (
-                                    r_
-                                    + cutlass.Int32(vlo > cutlass.Uint64(u64v))
-                                    + cutlass.Int32(vhi > cutlass.Uint64(u64v))
-                                )
+                                if cutlass.const_expr(self.det):
+                                    vlf = (cutlass.Uint64(vlo) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                        cutlass.Uint64(vlo) & cutlass.Uint64(0xFFFFFFFF)
+                                    )
+                                    vhf = (cutlass.Uint64(vhi) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                        cutlass.Uint64(vhi) & cutlass.Uint64(0xFFFFFFFF)
+                                    )
+                                    r_ = (
+                                        r_
+                                        + cutlass.Int32(cutlass.Uint64(vlf) > cutlass.Uint64(u64f))
+                                        + cutlass.Int32(cutlass.Uint64(vhf) > cutlass.Uint64(u64f))
+                                    )
+                                else:
+                                    r_ = (
+                                        r_
+                                        + cutlass.Int32(vlo > cutlass.Uint64(u64v))
+                                        + cutlass.Int32(vhi > cutlass.Uint64(u64v))
+                                    )
                                 jq = jq + cutlass.Int32(2)
                             if mc2 < mc:  # odd tail
-                                r_ = r_ + cutlass.Int32(
-                                    cutlass.Uint64(s_ck64[mc2]) > cutlass.Uint64(u64v)
-                                )
+                                if cutlass.const_expr(self.det):
+                                    vtl = cutlass.Uint64(s_ck64[mc2])
+                                    vtf = (cutlass.Uint64(vtl) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                        cutlass.Uint64(vtl) & cutlass.Uint64(0xFFFFFFFF)
+                                    )
+                                    r_ = r_ + cutlass.Int32(
+                                        cutlass.Uint64(vtf) > cutlass.Uint64(u64f)
+                                    )
+                                else:
+                                    r_ = r_ + cutlass.Int32(
+                                        cutlass.Uint64(s_ck64[mc2]) > cutlass.Uint64(u64v)
+                                    )
                             if r_ < need:
                                 idv6 = cutlass.Int32(
                                     cutlass.Uint32(
@@ -2632,7 +4266,6 @@ class GvrMainKernel:
                                 out_row[above + r_] = idv6
                             i = i + cutlass.Int32(BLK)
                     else:
-                        # key-space narrowing over ck64
                         if tidx == cutlass.Int32(0):
                             s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                             s_kmm[1] = cutlass.Uint32(0)
@@ -2715,40 +4348,290 @@ class GvrMainKernel:
                             s_scal[2] = cutlass.Int32(0)
                         cute.arch.barrier()  # ---- barrier (emit counters) ----
                         it2 = (mc + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                        it = cutlass.Int32(0)
-                        while it < it2:  # ballot emit
-                            i = it * cutlass.Int32(BLK) + tidx
-                            p1 = cutlass.Int32(0)
-                            p2 = cutlass.Int32(0)
-                            idv = cutlass.Int32(0)
-                            if i < mc:
-                                w64 = s_ck64[i]
-                                iu = cutlass.Int64(cutlass.Uint32(w64 >> cutlass.Uint64(32)))
-                                idv = cutlass.Int32(
-                                    cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                        if cutlass.const_expr(self.det):
+                            det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                                cutlass.Uint32(n) - cutlass.Uint32(1)
+                            )  # ~idx >= 2^32 - n
+                            det_hi = cutlass.Uint32(0xFFFFFFFF)
+                            det_need = needC
+                            det_thr = cutlass.Int64(-1)
+                            det_sh = cutlass.Uint32(0)
+                            det_ph = cutlass.Int32(1)
+                            if needC > cutlass.Int32(0):
+                                if mm > needC:
+                                    det_ph = cutlass.Int32(0)
+                            while det_ph <= cutlass.Int32(1):
+                                if det_ph == cutlass.Int32(0):
+                                    det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                    det_bw = cutlass.Int32(32) - C.clz_i32(
+                                        cutlass.Int32(det_d | cutlass.Uint32(1))
+                                    )
+                                    det_s = det_bw - cutlass.Int32(self.lb)
+                                    if det_s < cutlass.Int32(0):
+                                        det_s = cutlass.Int32(0)
+                                    det_sh = cutlass.Uint32(det_s)
+                                if cutlass.const_expr(self.split):
+                                    it = cutlass.Int32(0)
+                                    while it < it2:  # ballot emit
+                                        i = it * cutlass.Int32(BLK) + tidx
+                                        p1 = cutlass.Int32(0)
+                                        p2 = cutlass.Int32(0)
+                                        idv = cutlass.Int32(0)
+                                        if i < mc:
+                                            w64 = s_ck64[i]
+                                            iu = cutlass.Int64(
+                                                cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                            )
+                                            idv = cutlass.Int32(
+                                                cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            if iu > ethr:
+                                                p1 = cutlass.Int32(1)
+                                            if iu == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    idv
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(NBS - 1):
+                                                                det_b = cutlass.Uint32(NBS - 1)
+                                                            C.atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        p2 = cutlass.Int32(1)
+                                        if det_ph == cutlass.Int32(1):
+                                            if cutlass.const_expr(self.prefill):
+                                                idv = idv - s_lead[0]
+                                            self._ballot_pair_emit(
+                                                p1,
+                                                p2,
+                                                idv,
+                                                above,
+                                                aboveC,
+                                                above + aboveC,
+                                                needC,
+                                                out_row,
+                                                s_scal,
+                                                lane,
+                                            )
+                                        it = it + cutlass.Int32(1)
+                                else:
+                                    dc1 = cutlass.Int32(0)  # DET WSEG: class counts, pass 1
+                                    dc2 = cutlass.Int32(0)
+                                    it = cutlass.Int32(0)
+                                    while it < it2:  # ballot emit
+                                        i = it * cutlass.Int32(BLK) + tidx
+                                        p1 = cutlass.Int32(0)
+                                        p2 = cutlass.Int32(0)
+                                        idv = cutlass.Int32(0)
+                                        if i < mc:
+                                            w64 = s_ck64[i]
+                                            iu = cutlass.Int64(
+                                                cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                            )
+                                            idv = cutlass.Int32(
+                                                cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            if iu > ethr:
+                                                p1 = cutlass.Int32(1)
+                                            if iu == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    idv
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(NBS - 1):
+                                                                det_b = cutlass.Uint32(NBS - 1)
+                                                            C.atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        p2 = cutlass.Int32(1)
+                                        if det_ph == cutlass.Int32(1):
+                                            dc1 = dc1 + p1
+                                            dc2 = dc2 + p2
+                                        it = it + cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(1):
+                                        s1_, s2_ = C.warp_incl_scan_add2(dc1, dc2, lane)
+                                        if lane == cutlass.Int32(31):
+                                            s_ws[wid] = cutlass.Uint32(s1_)
+                                            s_wmn[wid] = cutlass.Uint32(s2_)
+                                        cute.arch.barrier()  # DET WSEG: warp totals published
+                                        v1_ = cutlass.Int32(0)
+                                        v2_ = cutlass.Int32(0)
+                                        if lane < cutlass.Int32(NW):
+                                            v1_ = cutlass.Int32(s_ws[lane])
+                                            v2_ = cutlass.Int32(s_wmn[lane])
+                                        i1_, i2_ = C.warp_incl_scan_add2(v1_, v2_, lane)
+                                        p1e = (
+                                            cute.arch.shuffle_sync(i1_, wid)
+                                            - cute.arch.shuffle_sync(v1_, wid)
+                                            + (s1_ - dc1)
+                                        )
+                                        p2e = (
+                                            cute.arch.shuffle_sync(i2_, wid)
+                                            - cute.arch.shuffle_sync(v2_, wid)
+                                            + (s2_ - dc2)
+                                        )
+                                        it = cutlass.Int32(0)
+                                        while it < it2:
+                                            i = it * cutlass.Int32(BLK) + tidx
+                                            p1 = cutlass.Int32(0)
+                                            p2 = cutlass.Int32(0)
+                                            idv = cutlass.Int32(0)
+                                            if i < mc:
+                                                w64 = s_ck64[i]
+                                                iu = cutlass.Int64(
+                                                    cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                                )
+                                                idv = cutlass.Int32(
+                                                    cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                                )
+                                                if iu > ethr:
+                                                    p1 = cutlass.Int32(1)
+                                                if iu == ethr:
+                                                    det_u = cutlass.Uint32(
+                                                        0xFFFFFFFF
+                                                    ) - cutlass.Uint32(idv)
+                                                    if det_ph == cutlass.Int32(0):
+                                                        if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                            det_lo
+                                                        ):
+                                                            if cutlass.Uint32(
+                                                                det_u
+                                                            ) <= cutlass.Uint32(det_hi):
+                                                                det_b = (
+                                                                    cutlass.Uint32(det_u)
+                                                                    - cutlass.Uint32(det_lo)
+                                                                ) >> cutlass.Uint32(det_sh)
+                                                                if det_b > cutlass.Uint32(NBS - 1):
+                                                                    det_b = cutlass.Uint32(NBS - 1)
+                                                                C.atomic_add_cta(
+                                                                    s_hist.iterator
+                                                                    + cutlass.Int32(det_b),
+                                                                    cutlass.Int32(1),
+                                                                )
+                                                    else:
+                                                        if (
+                                                            cutlass.Int64(cutlass.Uint32(det_u))
+                                                            > det_thr
+                                                        ):
+                                                            p2 = cutlass.Int32(1)
+                                            if cutlass.const_expr(self.prefill):
+                                                idv = idv - s_lead[0]
+                                            if p1 != cutlass.Int32(0):
+                                                if p1e < aboveC:
+                                                    out_row[above + p1e] = idv
+                                                p1e = p1e + cutlass.Int32(1)
+                                            if p2 != cutlass.Int32(0):
+                                                if p2e < needC:
+                                                    out_row[above + aboveC + p2e] = idv
+                                                p2e = p2e + cutlass.Int32(1)
+                                            it = it + cutlass.Int32(1)
+                                if det_ph == cutlass.Int32(0):
+                                    cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                    C.scan_cross0(
+                                        s_hist,
+                                        det_need,
+                                        tidx,
+                                        s_res,
+                                        cutlass.Int32(0),
+                                        cutlass.Int32(0),
+                                        s_hist,
+                                        nb=NBS,
+                                        zero=True,
+                                    )
+                                    cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                    det_need = det_need - s_res[C.RES_ABOVE]
+                                    det_m = s_res[C.RES_M]
+                                    det_bin = s_res[C.RES_B]
+                                    det_nlo = cutlass.Uint32(det_lo) + (
+                                        cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                    )
+                                    if det_bin != cutlass.Int32(NBS - 1):
+                                        det_hi = det_nlo + (
+                                            (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                            - cutlass.Uint32(1)
+                                        )
+                                    det_lo = det_nlo
+                                    if det_need == det_m:
+                                        det_thr = cutlass.Int64(
+                                            cutlass.Uint32(det_lo)
+                                        ) - cutlass.Int64(1)
+                                        det_ph = cutlass.Int32(1)
+                                    elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                        det_thr = cutlass.Int64(
+                                            cutlass.Uint32(det_lo)
+                                        ) - cutlass.Int64(1)
+                                        det_ph = cutlass.Int32(1)
+                                else:
+                                    det_ph = cutlass.Int32(2)
+                        else:
+                            it = cutlass.Int32(0)
+                            while it < it2:  # ballot emit
+                                i = it * cutlass.Int32(BLK) + tidx
+                                p1 = cutlass.Int32(0)
+                                p2 = cutlass.Int32(0)
+                                idv = cutlass.Int32(0)
+                                if i < mc:
+                                    w64 = s_ck64[i]
+                                    iu = cutlass.Int64(cutlass.Uint32(w64 >> cutlass.Uint64(32)))
+                                    idv = cutlass.Int32(
+                                        cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                    )
+                                    if iu > ethr:
+                                        p1 = cutlass.Int32(1)
+                                    if iu == ethr:
+                                        p2 = cutlass.Int32(1)
+                                # staged idx are col0-frame; shift to the ks-relative
+                                # local output frame (p1=p2=0 for i>=mc, so the -lead
+                                # on the idv=0 default is never emitted).
+                                if cutlass.const_expr(self.prefill):
+                                    idv = idv - s_lead[0]
+                                self._ballot_pair_emit(
+                                    p1,
+                                    p2,
+                                    idv,
+                                    above,
+                                    aboveC,
+                                    above + aboveC,
+                                    needC,
+                                    out_row,
+                                    s_scal,
+                                    lane,
                                 )
-                                if iu > ethr:
-                                    p1 = cutlass.Int32(1)
-                                if iu == ethr:
-                                    p2 = cutlass.Int32(1)
-                            # staged idx are col0-frame; shift to the ks-relative
-                            # local output frame (p1=p2=0 for i>=mc, so the -lead
-                            # on the idv=0 default is never emitted).
-                            if cutlass.const_expr(self.prefill):
-                                idv = idv - s_lead[0]
-                            self._ballot_pair_emit(
-                                p1,
-                                p2,
-                                idv,
-                                above,
-                                aboveC,
-                                above + aboveC,
-                                needC,
-                                out_row,
-                                s_scal,
-                                lane,
-                            )
-                            it = it + cutlass.Int32(1)
+                                it = it + cutlass.Int32(1)
             else:
                 dga = cutlass.Int32(0)  # gate: valid && complete
                 if valid != cutlass.Int32(0):
@@ -2756,6 +4639,32 @@ class GvrMainKernel:
                         dga = cutlass.Int32(1)
                 if dga != cutlass.Int32(0):
                     # ---- degen A: narrowing over STAGED candidates ----
+                    if cutlass.const_expr(self.det):
+                        if cutlass.const_expr(
+                            not self.split
+                        ):  # DET WSEG: compact the warp segments into a dense list (rare path)
+                            wc_ = cutlass.Int32(0)
+                            if lane < cutlass.Int32(NW):
+                                wc_ = s_wcnt[lane]
+                            wi_ = C.warp_incl_scan_add(wc_, lane)
+                            wdst_ = cute.arch.shuffle_sync(wi_, wid) - cute.arch.shuffle_sync(
+                                wc_, wid
+                            )
+                            wcnt_ = s_wcnt[wid]
+                            wseg0 = wsegb
+                            cw_ = cutlass.Int32(0)
+                            j = lane
+                            while cw_ < cutlass.Int32(NW):
+                                if wid == cw_:
+                                    j = lane
+                                    while j < wcnt_:
+                                        if cutlass.const_expr(self.vstg):
+                                            s_cbuf2[wdst_ + j] = s_cbuf2[wseg0 + j]
+                                        else:
+                                            s_cbuf[wdst_ + j] = s_cbuf[wseg0 + j]
+                                        j = j + cutlass.Int32(32)
+                                cute.arch.barrier()  # ---- barrier (DET WSEG compaction step) ----
+                                cw_ = cw_ + cutlass.Int32(1)
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
                     above2 = cutlass.Int32(0)
@@ -2858,57 +4767,194 @@ class GvrMainKernel:
                         nA = above2
                         nT = need2
                     it2 = (listN + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                    it = cutlass.Int32(0)
-                    while it < it2:
-                        i = it * cutlass.Int32(BLK) + tidx
-                        p1 = cutlass.Int32(0)
-                        p2 = cutlass.Int32(0)
-                        idv = cutlass.Int32(0)
-                        if i < listN:
-                            uq = cutlass.Uint32(0)
-                            if cutlass.const_expr(self.vstg):
-                                vx = cutlass.Int32(0)
-                                vy = cutlass.Int32(0)
-                                if cutlass.const_expr(self.split):
-                                    if fromg != cutlass.Int32(0):
-                                        vx, vy = C._ldcg_v2_i32(
-                                            gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                    if cutlass.const_expr(self.det):
+                        det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                            cutlass.Uint32(n) - cutlass.Uint32(1)
+                        )  # ~idx >= 2^32 - n
+                        det_hi = cutlass.Uint32(0xFFFFFFFF)
+                        det_need = need2
+                        det_thr = cutlass.Int64(-1)
+                        det_sh = cutlass.Uint32(0)
+                        det_ph = cutlass.Int32(1)
+                        if need2 > cutlass.Int32(0):
+                            if m2 > need2:
+                                det_ph = cutlass.Int32(0)
+                        while det_ph <= cutlass.Int32(1):
+                            if det_ph == cutlass.Int32(0):
+                                det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                det_bw = cutlass.Int32(32) - C.clz_i32(
+                                    cutlass.Int32(det_d | cutlass.Uint32(1))
+                                )
+                                det_s = det_bw - cutlass.Int32(self.lb)
+                                if det_s < cutlass.Int32(0):
+                                    det_s = cutlass.Int32(0)
+                                det_sh = cutlass.Uint32(det_s)
+                            it = cutlass.Int32(0)
+                            while it < it2:
+                                i = it * cutlass.Int32(BLK) + tidx
+                                p1 = cutlass.Int32(0)
+                                p2 = cutlass.Int32(0)
+                                idv = cutlass.Int32(0)
+                                if i < listN:
+                                    uq = cutlass.Uint32(0)
+                                    if cutlass.const_expr(self.vstg):
+                                        vx = cutlass.Int32(0)
+                                        vy = cutlass.Int32(0)
+                                        if cutlass.const_expr(self.split):
+                                            if fromg != cutlass.Int32(0):
+                                                vx, vy = C._ldcg_v2_i32(
+                                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                                )
+                                            else:
+                                                pk64 = s_cbuf2[i]
+                                                vx = cutlass.Int32(
+                                                    cutlass.Uint32(
+                                                        pk64 & cutlass.Uint64(0xFFFFFFFF)
+                                                    )
+                                                )
+                                                vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                        else:
+                                            pk64 = s_cbuf2[i]
+                                            vx = cutlass.Int32(
+                                                cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                        uq = C.fkey_bits(cutlass.Uint32(vx))
+                                        idv = vy
+                                    else:
+                                        idv = cutlass.Int32(
+                                            cutlass.Uint32(s_cbuf[i]) & cutlass.Uint32(IDXM__main)
                                         )
+                                        uq = C.fkey(C.ldg_f32(x_addr, idv))
+                                    iu = cutlass.Int64(uq)
+                                    if iu > ethr:
+                                        p1 = cutlass.Int32(1)
+                                    if tie_m != cutlass.Int32(0):
+                                        if iu == ethr:
+                                            det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(idv)
+                                            if det_ph == cutlass.Int32(0):
+                                                if cutlass.Uint32(det_u) >= cutlass.Uint32(det_lo):
+                                                    if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                        det_hi
+                                                    ):
+                                                        det_b = (
+                                                            cutlass.Uint32(det_u)
+                                                            - cutlass.Uint32(det_lo)
+                                                        ) >> cutlass.Uint32(det_sh)
+                                                        if det_b > cutlass.Uint32(NBS - 1):
+                                                            det_b = cutlass.Uint32(NBS - 1)
+                                                        C.atomic_add_cta(
+                                                            s_hist.iterator + cutlass.Int32(det_b),
+                                                            cutlass.Int32(1),
+                                                        )
+                                            else:
+                                                if cutlass.Int64(cutlass.Uint32(det_u)) > det_thr:
+                                                    p2 = cutlass.Int32(1)
+                                if det_ph == cutlass.Int32(1):
+                                    if cutlass.const_expr(self.prefill):
+                                        idv = idv - s_lead[0]
+                                    self._ballot_pair_emit(
+                                        p1,
+                                        p2,
+                                        idv,
+                                        cutlass.Int32(0),
+                                        nA,
+                                        nA,
+                                        nT,
+                                        out_row,
+                                        s_scal,
+                                        lane,
+                                    )
+                                it = it + cutlass.Int32(1)
+                            if det_ph == cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                C.scan_cross0(
+                                    s_hist,
+                                    det_need,
+                                    tidx,
+                                    s_res,
+                                    cutlass.Int32(0),
+                                    cutlass.Int32(0),
+                                    s_hist,
+                                    nb=NBS,
+                                    zero=True,
+                                )
+                                cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                det_need = det_need - s_res[C.RES_ABOVE]
+                                det_m = s_res[C.RES_M]
+                                det_bin = s_res[C.RES_B]
+                                det_nlo = cutlass.Uint32(det_lo) + (
+                                    cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                )
+                                if det_bin != cutlass.Int32(NBS - 1):
+                                    det_hi = det_nlo + (
+                                        (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                        - cutlass.Uint32(1)
+                                    )
+                                det_lo = det_nlo
+                                if det_need == det_m:
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                                elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                            else:
+                                det_ph = cutlass.Int32(2)
+                    else:
+                        it = cutlass.Int32(0)
+                        while it < it2:
+                            i = it * cutlass.Int32(BLK) + tidx
+                            p1 = cutlass.Int32(0)
+                            p2 = cutlass.Int32(0)
+                            idv = cutlass.Int32(0)
+                            if i < listN:
+                                uq = cutlass.Uint32(0)
+                                if cutlass.const_expr(self.vstg):
+                                    vx = cutlass.Int32(0)
+                                    vy = cutlass.Int32(0)
+                                    if cutlass.const_expr(self.split):
+                                        if fromg != cutlass.Int32(0):
+                                            vx, vy = C._ldcg_v2_i32(
+                                                gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                            )
+                                        else:
+                                            pk64 = s_cbuf2[i]
+                                            vx = cutlass.Int32(
+                                                cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
                                     else:
                                         pk64 = s_cbuf2[i]
                                         vx = cutlass.Int32(
                                             cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
                                         )
                                         vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                                    uq = C.fkey_bits(cutlass.Uint32(vx))
+                                    idv = vy
                                 else:
-                                    pk64 = s_cbuf2[i]
-                                    vx = cutlass.Int32(
-                                        cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF))
+                                    idv = cutlass.Int32(
+                                        cutlass.Uint32(s_cbuf[i]) & cutlass.Uint32(IDXM__main)
                                     )
-                                    vy = cutlass.Int32(pk64 >> cutlass.Uint64(32))
-                                uq = C.fkey_bits(cutlass.Uint32(vx))
-                                idv = vy
-                            else:
-                                idv = cutlass.Int32(
-                                    cutlass.Uint32(s_cbuf[i]) & cutlass.Uint32(IDXM__main)
-                                )
-                                uq = C.fkey(C.ldg_f32(x_addr, idv))
-                            iu = cutlass.Int64(uq)
-                            if iu > ethr:
-                                p1 = cutlass.Int32(1)
-                            if tie_m != cutlass.Int32(0):
-                                if iu == ethr:
-                                    p2 = cutlass.Int32(1)
-                        # staged idx (already >= lead via the P3 M-mask) -> local
-                        # frame; the x_addr re-read above stays in the col0 frame.
-                        if cutlass.const_expr(self.prefill):
-                            idv = idv - s_lead[0]
-                        self._ballot_pair_emit(
-                            p1, p2, idv, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
-                        )
-                        it = it + cutlass.Int32(1)
+                                    uq = C.fkey(C.ldg_f32(x_addr, idv))
+                                iu = cutlass.Int64(uq)
+                                if iu > ethr:
+                                    p1 = cutlass.Int32(1)
+                                if tie_m != cutlass.Int32(0):
+                                    if iu == ethr:
+                                        p2 = cutlass.Int32(1)
+                            # staged idx (already >= lead via the P3 M-mask) -> local
+                            # frame; the x_addr re-read above stays in the col0 frame.
+                            if cutlass.const_expr(self.prefill):
+                                idv = idv - s_lead[0]
+                            self._ballot_pair_emit(
+                                p1, p2, idv, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
+                            )
+                            it = it + cutlass.Int32(1)
                 else:
-                    # ---- degen B: whole-row narrowing ----
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
                     above2 = cutlass.Int32(0)
@@ -2993,24 +5039,157 @@ class GvrMainKernel:
                         nA = above2
                         nT = need2
                     it2 = (n + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                    it = cutlass.Int32(0)
-                    while it < it2:
-                        i = it * cutlass.Int32(BLK) + tidx
-                        p1 = cutlass.Int32(0)
-                        p2 = cutlass.Int32(0)
-                        if i < n:
-                            if i >= lead_db:  # prefill: exclude lead lanes
-                                uq = C.fkey(C.ldg_f32(x_addr, i))
-                                iu = cutlass.Int64(uq)
-                                if iu > ethr:
-                                    p1 = cutlass.Int32(1)
-                                if tie_m != cutlass.Int32(0):
-                                    if iu == ethr:
-                                        p2 = cutlass.Int32(1)
-                        self._ballot_pair_emit(
-                            p1, p2, i - lead_db, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
-                        )
-                        it = it + cutlass.Int32(1)
+                    if cutlass.const_expr(self.det):
+                        det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                            cutlass.Uint32(n) - cutlass.Uint32(1)
+                        )  # ~idx >= 2^32 - n
+                        det_hi = cutlass.Uint32(0xFFFFFFFF)
+                        det_need = need2
+                        det_thr = cutlass.Int64(-1)
+                        det_sh = cutlass.Uint32(0)
+                        det_ph = cutlass.Int32(1)
+                        if need2 > cutlass.Int32(0):
+                            if m2 > need2:
+                                det_ph = cutlass.Int32(0)
+                        if det_ph == cutlass.Int32(0):
+                            if (
+                                m2 == n - lead_db
+                            ):  # every valid position ties: take the first L positions
+                                det_thr = cutlass.Int64(
+                                    cutlass.Uint32(0xFFFFFFFF)
+                                    - cutlass.Uint32(lead_db + need2 - cutlass.Int32(1))
+                                ) - cutlass.Int64(1)
+                                det_ph = cutlass.Int32(1)
+                        while det_ph <= cutlass.Int32(1):
+                            if det_ph == cutlass.Int32(0):
+                                det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                det_bw = cutlass.Int32(32) - C.clz_i32(
+                                    cutlass.Int32(det_d | cutlass.Uint32(1))
+                                )
+                                det_s = det_bw - cutlass.Int32(self.lb)
+                                if det_s < cutlass.Int32(0):
+                                    det_s = cutlass.Int32(0)
+                                det_sh = cutlass.Uint32(det_s)
+                            it = cutlass.Int32(0)
+                            while it < it2:
+                                i = it * cutlass.Int32(BLK) + tidx
+                                p1 = cutlass.Int32(0)
+                                p2 = cutlass.Int32(0)
+                                if i < n:
+                                    if i >= lead_db:  # prefill: exclude lead lanes
+                                        uq = C.fkey(C.ldg_f32(x_addr, i))
+                                        iu = cutlass.Int64(uq)
+                                        if iu > ethr:
+                                            p1 = cutlass.Int32(1)
+                                        if tie_m != cutlass.Int32(0):
+                                            if iu == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    i
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(NBS - 1):
+                                                                det_b = cutlass.Uint32(NBS - 1)
+                                                            C.atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        p2 = cutlass.Int32(1)
+                                if det_ph == cutlass.Int32(1):
+                                    self._ballot_pair_emit(
+                                        p1,
+                                        p2,
+                                        i - lead_db,
+                                        cutlass.Int32(0),
+                                        nA,
+                                        nA,
+                                        nT,
+                                        out_row,
+                                        s_scal,
+                                        lane,
+                                    )
+                                it = it + cutlass.Int32(1)
+                            if det_ph == cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                C.scan_cross0(
+                                    s_hist,
+                                    det_need,
+                                    tidx,
+                                    s_res,
+                                    cutlass.Int32(0),
+                                    cutlass.Int32(0),
+                                    s_hist,
+                                    nb=NBS,
+                                    zero=True,
+                                )
+                                cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                det_need = det_need - s_res[C.RES_ABOVE]
+                                det_m = s_res[C.RES_M]
+                                det_bin = s_res[C.RES_B]
+                                det_nlo = cutlass.Uint32(det_lo) + (
+                                    cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                )
+                                if det_bin != cutlass.Int32(NBS - 1):
+                                    det_hi = det_nlo + (
+                                        (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                        - cutlass.Uint32(1)
+                                    )
+                                det_lo = det_nlo
+                                if det_need == det_m:
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                                elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                            else:
+                                det_ph = cutlass.Int32(2)
+                    else:
+                        it = cutlass.Int32(0)
+                        while it < it2:
+                            i = it * cutlass.Int32(BLK) + tidx
+                            p1 = cutlass.Int32(0)
+                            p2 = cutlass.Int32(0)
+                            if i < n:
+                                if i >= lead_db:  # prefill: exclude lead lanes
+                                    uq = C.fkey(C.ldg_f32(x_addr, i))
+                                    iu = cutlass.Int64(uq)
+                                    if iu > ethr:
+                                        p1 = cutlass.Int32(1)
+                                    if tie_m != cutlass.Int32(0):
+                                        if iu == ethr:
+                                            p2 = cutlass.Int32(1)
+                            self._ballot_pair_emit(
+                                p1,
+                                p2,
+                                i - lead_db,
+                                cutlass.Int32(0),
+                                nA,
+                                nA,
+                                nT,
+                                out_row,
+                                s_scal,
+                                lane,
+                            )
+                            it = it + cutlass.Int32(1)
 
         # ---- varlen short-row epilogue (production heuristicTopKDecode
         # convention): every valid position is in the top-K — emit identity
@@ -3028,6 +5207,207 @@ class GvrMainKernel:
                     while j < k:
                         out_row[j] = cutlass.Int32(-1)
                         j = j + cutlass.Int32(BLK)
+        if cutlass.const_expr(self.det):
+            if short == cutlass.Int32(0):
+                if alive != cutlass.Int32(0):
+                    if cutlass.const_expr(self.split):  # DET WSEG: SPLIT always sorts/canonicalizes
+                        fs_sort = cutlass.Int32(1)
+                    if (fs_sort + p5_cursor) != cutlass.Int32(
+                        0
+                    ):  # DET WSEG/LBM: sort or bitmap; the copy only for segment-ordered rows
+                        lbm_use = cutlass.Int32(0)
+                        if cutlass.const_expr(
+                            self.fused_k >= 2048 and getattr(self, "lbm", True)
+                        ):  # DET LBM: compiled in only for the short-row dispatch
+                            LBM_ITEMS = (self.fused_k + self.blk - 1) // self.blk
+                            LBM_LOG_BLK = self.blk.bit_length() - 1
+                            LBM_WORDS = self.dyn_bytes // 4
+                            lbm_vals = cute.make_rmem_tensor((LBM_ITEMS,), cutlass.Int32)
+                            lbm_nw = (n + cutlass.Int32(31)) >> cutlass.Int32(5)
+                            lbm_logw = cutlass.Int32(32) - C.clz_i32(
+                                (lbm_nw - cutlass.Int32(1)) >> cutlass.Int32(LBM_LOG_BLK)
+                            )
+                            if lbm_logw < cutlass.Int32(2):
+                                lbm_logw = cutlass.Int32(2)
+                            lbm_W = cutlass.Int32(1) << lbm_logw
+                            lbm_G = lbm_W >> cutlass.Int32(2)
+                            lbm_use = cutlass.Int32(0)
+                            if (lbm_W << cutlass.Int32(LBM_LOG_BLK + 1)) <= cutlass.Int32(
+                                LBM_WORDS
+                            ):  # bitmap + prefix table
+                                if lbm_W <= cutlass.Int32(8):
+                                    lbm_use = cutlass.Int32(1)
+                            if cutlass.const_expr(
+                                self.fused_k < 2048 or not getattr(self, "lbm", True)
+                            ):
+                                lbm_use = cutlass.Int32(0)
+                            if lbm_use != cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (DET LBM: every emit into out_row has landed) ----
+                                for item in cutlass.range_constexpr(LBM_ITEMS):
+                                    lbm_vals[item] = cutlass.Int32(-1)
+                                    lbm_dst = tidx + cutlass.Int32(item * self.blk)
+                                    if lbm_dst < cutlass.Int32(self.fused_k):
+                                        lbm_vals[item] = out_row[lbm_dst]
+                                cute.arch.barrier()  # ---- barrier (DET LBM: staged ids in registers, blob dead) ----
+                                lbm_wid = tidx >> cutlass.Int32(5)
+                                lbm_zero = cutlass.Int32(0)
+                                lbm_g = cutlass.Int32(0)
+                                lbm_vec = sbase + (
+                                    tidx << cutlass.Int32(4)
+                                )  # this thread's vector in group 0
+                                while lbm_g < lbm_G:
+                                    _sts_v4_u32_same(
+                                        lbm_vec + (lbm_g << cutlass.Int32(LBM_LOG_BLK + 4)),
+                                        lbm_zero,
+                                    )
+                                    lbm_g = lbm_g + cutlass.Int32(1)
+                                cute.arch.barrier()  # ---- barrier (DET LBM clear) ----
+                                if cutlass.const_expr(not False):
+                                    for item in cutlass.range_constexpr(LBM_ITEMS):
+                                        lbm_v = lbm_vals[item]
+                                        if lbm_v >= cutlass.Int32(0):
+                                            lbm_w = lbm_v >> cutlass.Int32(5)
+                                            lbm_j = lbm_w & (lbm_W - cutlass.Int32(1))
+                                            lbm_t = lbm_w >> lbm_logw
+                                            lbm_a = (
+                                                sbase
+                                                + (
+                                                    (
+                                                        (
+                                                            (lbm_j >> cutlass.Int32(2))
+                                                            << cutlass.Int32(LBM_LOG_BLK)
+                                                        )
+                                                        + lbm_t
+                                                    )
+                                                    << cutlass.Int32(4)
+                                                )
+                                                + ((lbm_j & cutlass.Int32(3)) << cutlass.Int32(2))
+                                            )
+                                            _red_shared_or(
+                                                lbm_a,
+                                                cutlass.Int32(1) << (lbm_v & cutlass.Int32(31)),
+                                            )
+                                cute.arch.barrier()  # ---- barrier (DET LBM set) ----
+                                lbm_tot = cutlass.Int32(0)
+                                lbm_g = cutlass.Int32(0)
+                                lbm_w0 = cutlass.Int32(0)
+                                lbm_w1 = cutlass.Int32(0)
+                                lbm_w2 = cutlass.Int32(0)
+                                lbm_w3 = cutlass.Int32(0)
+                                while lbm_g < lbm_G:
+                                    lbm_w0, lbm_w1, lbm_w2, lbm_w3 = _lds_v4_u32(
+                                        lbm_vec + (lbm_g << cutlass.Int32(LBM_LOG_BLK + 4))
+                                    )
+                                    lbm_tot = (
+                                        lbm_tot
+                                        + cutlass.Int32(C.popc(lbm_w0))
+                                        + cutlass.Int32(C.popc(lbm_w1))
+                                        + cutlass.Int32(C.popc(lbm_w2))
+                                        + cutlass.Int32(C.popc(lbm_w3))
+                                    )
+                                    lbm_g = lbm_g + cutlass.Int32(1)
+                                lbm_inc = C.warp_incl_scan_add(lbm_tot, lane)
+                                if lane == cutlass.Int32(31):
+                                    s_ws[lbm_wid] = cutlass.Uint32(lbm_inc)
+                                cute.arch.barrier()  # ---- barrier (DET LBM warp totals) ----
+                                lbm_v1 = cutlass.Int32(0)
+                                if lane < cutlass.Int32(NW):
+                                    lbm_v1 = cutlass.Int32(s_ws[lane])
+                                lbm_i1 = C.warp_incl_scan_add(lbm_v1, lane)
+                                lbm_pos = (
+                                    cute.arch.shuffle_sync(lbm_i1, lbm_wid)
+                                    - cute.arch.shuffle_sync(lbm_v1, lbm_wid)
+                                    + (lbm_inc - lbm_tot)
+                                )
+                                lbm_run = lbm_pos
+                                lbm_g = cutlass.Int32(0)
+                                lbm_p0 = cutlass.Int32(0)
+                                lbm_p1 = cutlass.Int32(0)
+                                lbm_p2 = cutlass.Int32(0)
+                                lbm_p3 = cutlass.Int32(0)
+                                lbm_pfx = lbm_W << cutlass.Int32(
+                                    LBM_LOG_BLK + 2
+                                )  # byte offset of the prefix table (W*BLK words)
+                                while lbm_g < lbm_G:
+                                    lbm_w0, lbm_w1, lbm_w2, lbm_w3 = _lds_v4_u32(
+                                        lbm_vec + (lbm_g << cutlass.Int32(LBM_LOG_BLK + 4))
+                                    )
+                                    lbm_p0 = lbm_run
+                                    lbm_p1 = lbm_p0 + cutlass.Int32(C.popc(lbm_w0))
+                                    lbm_p2 = lbm_p1 + cutlass.Int32(C.popc(lbm_w1))
+                                    lbm_p3 = lbm_p2 + cutlass.Int32(C.popc(lbm_w2))
+                                    lbm_run = lbm_p3 + cutlass.Int32(C.popc(lbm_w3))
+                                    _sts_v4_u32(
+                                        lbm_vec
+                                        + lbm_pfx
+                                        + (lbm_g << cutlass.Int32(LBM_LOG_BLK + 4)),
+                                        lbm_p0,
+                                        lbm_p1,
+                                        lbm_p2,
+                                        lbm_p3,
+                                    )
+                                    lbm_g = lbm_g + cutlass.Int32(1)
+                                cute.arch.barrier()  # ---- barrier (DET LBM prefix table) ----
+                                if cutlass.const_expr(not False):
+                                    for item in cutlass.range_constexpr(LBM_ITEMS):
+                                        lbm_v = lbm_vals[item]
+                                        if lbm_v >= cutlass.Int32(0):
+                                            lbm_w = lbm_v >> cutlass.Int32(5)
+                                            lbm_j = lbm_w & (lbm_W - cutlass.Int32(1))
+                                            lbm_t = lbm_w >> lbm_logw
+                                            lbm_pw = (
+                                                (
+                                                    (
+                                                        (lbm_j >> cutlass.Int32(2))
+                                                        << cutlass.Int32(LBM_LOG_BLK)
+                                                    )
+                                                    + lbm_t
+                                                )
+                                                << cutlass.Int32(2)
+                                            ) + (lbm_j & cutlass.Int32(3))
+                                            lbm_word = s_lbm[lbm_pw]
+                                            lbm_pos = s_lbm[
+                                                (lbm_W << cutlass.Int32(LBM_LOG_BLK)) + lbm_pw
+                                            ] + cutlass.Int32(
+                                                C.popc(
+                                                    lbm_word
+                                                    & (
+                                                        (
+                                                            cutlass.Int32(1)
+                                                            << (lbm_v & cutlass.Int32(31))
+                                                        )
+                                                        - cutlass.Int32(1)
+                                                    )
+                                                )
+                                            )
+                                            if lbm_pos < cutlass.Int32(self.fused_k):
+                                                out[row, lbm_pos] = lbm_v
+                        if lbm_use == cutlass.Int32(0):
+                            if cutlass.const_expr(
+                                self.split
+                            ):  # DET WIDE SORT: 1024-thread subgroup on the SPLIT merge CTA
+                                fused_canonical_store_wide(
+                                    out_row, out[row, None], tidx, self.blk, self.fused_k
+                                )
+                            else:
+                                fused_canonical_store(
+                                    out_row, out[row, None], tidx, self.blk, self.fused_k
+                                )
+                    else:
+                        cute.arch.barrier()
+                        for item in cutlass.range_constexpr(
+                            (self.fused_k + self.blk - 1) // self.blk
+                        ):
+                            dst = tidx + cutlass.Int32(item * self.blk)
+                            if dst < cutlass.Int32(self.fused_k):
+                                out[row, dst] = out_row[dst]
+            else:
+                if part == cutlass.Int32(0):
+                    cute.arch.barrier()
+                    for item in cutlass.range_constexpr((self.fused_k + self.blk - 1) // self.blk):
+                        dst = tidx + cutlass.Int32(item * self.blk)
+                        if dst < cutlass.Int32(self.fused_k):
+                            out[row, dst] = out_row[dst]
 
     # ------------------------------------------------------------------
     # host launcher (grid dim3(R, b); MINB wall via min_blocks_per_mp)
@@ -3091,9 +5471,123 @@ _COMPILE_CACHE = {}
 
 
 def get_compiled(
-    tpl: tuple, options_extra: str = "", hint_free: bool = False, prefill: bool = False
+    tpl: tuple,
+    options_extra: str = "",
+    hint_free: bool = False,
+    prefill: bool = False,
+    det: bool = False,
+    fused_k: int = 0,
 ) -> Any:
-    """Compile (or fetch) the gvr_main variant for constexpr tuple
+    if det:
+        """DET LBM: per-launch choice between the bitmap-enabled and the plain compile of the same tuple.
+
+        The bitmap code only pays off (and only fits) for n <= LBM_MAX_W * 32 * BLK; compiling it into
+        the long-row variant costs 0.4-1.0 us of instruction-cache pressure on the SPLIT hot loop, so
+        the choice is made on the launch's row-length envelope (ABI slot 4 = n, or slot 5 = npad when the varlen
+        launcher
+        passes n = 0) at dispatch time."""
+        nmax = 8 * 32 * int(tpl[0])
+
+        def dispatch(*args):
+            nn = int(args[4])
+            if nn <= 0:
+                nn = int(args[5])
+            lbm = nn <= nmax
+            return _get_compiled_lbm(tpl, options_extra, hint_free, prefill, lbm, fused_k)(*args)
+
+        return dispatch
+    else:
+        """Compile (or fetch) the gvr_main variant for constexpr tuple
+        tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
+        tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
+        — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
+        machinery in whenever SPLIT and gates it per row at runtime).
+
+        ``prefill`` selects the per-row window mode. It shares the varlen tuple
+        (next_n=1, cr_shift=0) but has a distinct prologue, so it MUST be part of
+        the cache key — otherwise a DSv3.2 decode varlen engine and the prefill
+        engine collide on the same tuple. The prefill compile also retypes the
+        pre_idx ABI slot to a 1-D align-4 fake (it carries 4B-aligned row_ends)."""
+        key = (tuple(tpl), options_extra, bool(hint_free), bool(prefill))
+        hit = _COMPILE_CACHE.get(key)
+        if hit is not None:
+            return hit
+        if prefill:
+            assert len(tpl) == 10, "prefill compile requires the varlen tuple"
+        if len(tpl) == 7:
+            blk, u, minb, nbs, kpt, split, tshg = tpl
+            kern = GvrMainKernel(
+                blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+            )
+        else:
+            blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
+            kern = GvrMainKernel(
+                blk,
+                u,
+                minb,
+                nbs,
+                kpt,
+                bool(split),
+                bool(tshg),
+                varlen=True,
+                next_n=next_n,
+                cr_shift=cr_shift,
+                r_const=r_const,
+                hint_free=bool(hint_free),
+                prefill=bool(prefill),
+            )
+        r0, c0 = cute.sym_int(), cute.sym_int()
+        r1, c1 = cute.sym_int(), cute.sym_int()
+        r2, c2 = cute.sym_int(), cute.sym_int()
+        w0 = cute.sym_int()
+        v0 = cute.sym_int()
+        logits_fake = _crt.make_fake_compact_tensor(
+            cutlass.Float32, (r0, c0), stride_order=(1, 0), assumed_align=16
+        )
+        if prefill:
+            # pre_idx slot carries row_ends [rows] int32 (4B-aligned slices).
+            pre_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (r1,), stride_order=(0,), assumed_align=4
+            )
+        else:
+            pre_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (r1, c1), stride_order=(1, 0), assumed_align=16
+            )
+        out_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (r2, c2), stride_order=(1, 0), assumed_align=16
+        )
+        ws_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (w0,), stride_order=(0,), assumed_align=16
+        )
+        kv_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (v0,), stride_order=(0,), assumed_align=4
+        )
+        fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+        compiled = cute.compile(
+            kern,
+            logits_fake,
+            pre_fake,
+            out_fake,
+            ws_fake,
+            *([cutlass.Int32(0)] * 11),
+            kv_fake,
+            *([cutlass.Int32(0)] * 5),
+            stream=fake_stream,
+            options=("--enable-tvm-ffi " + options_extra).strip(),
+        )
+        _COMPILE_CACHE[key] = compiled
+        return compiled
+
+
+def _get_compiled_lbm(
+    tpl: tuple,
+    options_extra: str = "",
+    hint_free: bool = False,
+    prefill: bool = False,
+    lbm: bool = False,
+    fused_k: int = 0,
+) -> Any:
+    """Deterministic compile (``det=True``) of the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
     — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
@@ -3104,7 +5598,7 @@ def get_compiled(
     the cache key — otherwise a DSv3.2 decode varlen engine and the prefill
     engine collide on the same tuple. The prefill compile also retypes the
     pre_idx ABI slot to a 1-D align-4 fake (it carries 4B-aligned row_ends)."""
-    key = (tuple(tpl), options_extra, bool(hint_free), bool(prefill))
+    key = (tuple(tpl), options_extra, bool(hint_free), bool(prefill), bool(lbm), int(fused_k))
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -3113,7 +5607,17 @@ def get_compiled(
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
         kern = GvrMainKernel(
-            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+            blk,
+            u,
+            minb,
+            nbs,
+            kpt,
+            bool(split),
+            bool(tshg),
+            hint_free=bool(hint_free),
+            lbm=lbm,
+            det=True,
+            fused_k=fused_k,
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3131,6 +5635,9 @@ def get_compiled(
             r_const=r_const,
             hint_free=bool(hint_free),
             prefill=bool(prefill),
+            lbm=lbm,
+            det=True,
+            fused_k=fused_k,
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3141,7 +5648,6 @@ def get_compiled(
         cutlass.Float32, (r0, c0), stride_order=(1, 0), assumed_align=16
     )
     if prefill:
-        # pre_idx slot carries row_ends [rows] int32 (4B-aligned slices).
         pre_fake = _crt.make_fake_compact_tensor(
             cutlass.Int32, (r1,), stride_order=(0,), assumed_align=4
         )
@@ -3460,7 +5966,9 @@ class GvrTopkRegKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        det: bool = False,
     ) -> None:
+        self.det = bool(det)
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
@@ -3519,6 +6027,8 @@ class GvrTopkRegKernel:
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
+        if cutlass.const_expr(self.det):
+            dw = tid >> cutlass.Int32(5)  # DET SLOTS: warp index
 
         # ================= per-row varlen prologue (varlen mode only) =========
         # Production heuristicTopKDecode contract (GvrMainKernel /
@@ -3597,7 +6107,8 @@ class GvrTopkRegKernel:
         quad = cutlass.Int32(0)
         lim1 = cutlass.Int32(0)
         p = cutlass.Int32(0)
-        q2i = cutlass.Int32(0)
+        if cutlass.const_expr(not self.det):
+            q2i = cutlass.Int32(0)
         idx = cutlass.Int32(0)
         m1 = cutlass.Int32(0)
         m2 = cutlass.Int32(0)
@@ -3605,12 +6116,14 @@ class GvrTopkRegKernel:
         t2 = cutlass.Int32(0)
         c1 = cutlass.Int32(0)
         c2 = cutlass.Int32(0)
-        s1 = cutlass.Int32(0)
-        s2 = cutlass.Int32(0)
+        if cutlass.const_expr(not self.det):
+            s1 = cutlass.Int32(0)
+            s2 = cutlass.Int32(0)
         p1 = cutlass.Int32(0)
         p2 = cutlass.Int32(0)
-        wm = cutlass.Int32(0)
-        sdyn = cutlass.Int32(0)
+        if cutlass.const_expr(not self.det):
+            wm = cutlass.Int32(0)
+            sdyn = cutlass.Int32(0)
         nbw = cutlass.Int32(0)
         uq = cutlass.Uint32(0)
         vq = cutlass.Uint32(0)
@@ -3628,10 +6141,12 @@ class GvrTopkRegKernel:
         wt = cutlass.Uint32(0)
         ethr = cutlass.Int64(0)
         u64 = cutlass.Int64(0)
-        LOQ = cutlass.Float32(0.0)
+        if cutlass.const_expr(not self.det):
+            LOQ = cutlass.Float32(0.0)
         HIf = cutlass.Float32(0.0)
         LOf = cutlass.Float32(0.0)
-        qt2 = cutlass.Float32(0.0)
+        if cutlass.const_expr(not self.det):
+            qt2 = cutlass.Float32(0.0)
         qt3 = cutlass.Float32(0.0)
 
         # wrap-scoping additions (varlen whole-body guard): names whose
@@ -3669,6 +6184,10 @@ class GvrTopkRegKernel:
             s_ws = _smem_view(cutlass.Int32, sbase, 16, 32)
             s_wmn = _smem_view(cutlass.Uint32, sbase, 48, 32)
             s_wmx = _smem_view(cutlass.Uint32, sbase, 80, 32)
+            if cutlass.const_expr(self.det):
+                s_dw = _smem_view(
+                    cutlass.Int32, sbase, 16, 64
+                )  # DET SLOTS: per-warp class counts (aliases ws+wmn, idle during emits)
             s_hist = _smem_view(cutlass.Int32, sbase, STATIC_WORDS, self.nbh)
             ck_base = sbase + cutlass.Int32((STATIC_WORDS + self.nbh) * 4)
             ck = cute.make_tensor(
@@ -4060,14 +6579,331 @@ class GvrTopkRegKernel:
                 if state == cutlass.Int32(2):
                     ethr = ethr - cutlass.Int64(1)
                 cute.arch.barrier()  # descent done
-                lml = cutlass.Int32(cute.arch.lanemask_lt())
-                for s in cutlass.range_constexpr(S):
-                    ixv = (
-                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                    ) + cutlass.Int32(s % 4)
+                if cutlass.const_expr(self.det):
+                    det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                        cutlass.Uint32(n) - cutlass.Uint32(1)
+                    )  # ~idx >= 2^32 - n
+                    det_hi = cutlass.Uint32(0xFFFFFFFF)
+                    det_need = needC
+                    det_thr = cutlass.Int64(-1)
+                    det_sh = cutlass.Uint32(0)
+                    det_ph = cutlass.Int32(1)
+                    if needC > cutlass.Int32(0):
+                        if mm > needC:
+                            det_ph = cutlass.Int32(0)
+                    while det_ph <= cutlass.Int32(1):
+                        if det_ph == cutlass.Int32(0):
+                            det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                            det_bw = cutlass.Int32(32) - clz_i32(
+                                cutlass.Int32(det_d | cutlass.Uint32(1))
+                            )
+                            det_s = det_bw - cutlass.Int32(LNBH)
+                            if det_s < cutlass.Int32(0):
+                                det_s = cutlass.Int32(0)
+                            det_sh = cutlass.Uint32(det_s)
+                            for z in cutlass.range_constexpr(self.nbh // self.blk):
+                                s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                            cute.arch.barrier()  # ---- barrier (det level clear) ----
+                        lml = cutlass.Int32(cute.arch.lanemask_lt())
+                        em1 = cutlass.Int32(0)  # DET SLOTS: class masks over the register batch
+                        em2 = cutlass.Int32(0)
+                        for s in cutlass.range_constexpr(S):
+                            ixv = (
+                                (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            u64 = cutlass.Int64(-1)
+                            if ixv < nvec:
+                                u64 = cutlass.Int64(fkey(_val(frags, s)))
+                            q1e = cutlass.Int32(0)
+                            q2e = cutlass.Int32(0)
+                            if u64 > ethr:
+                                q1e = cutlass.Int32(1)
+                            if u64 == ethr:
+                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(ixv)
+                                if det_ph == cutlass.Int32(0):
+                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(det_lo):
+                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(det_hi):
+                                            det_b = (
+                                                cutlass.Uint32(det_u) - cutlass.Uint32(det_lo)
+                                            ) >> cutlass.Uint32(det_sh)
+                                            if det_b > cutlass.Uint32(self.nbh - 1):
+                                                det_b = cutlass.Uint32(self.nbh - 1)
+                                            atomic_add_cta(
+                                                s_hist.iterator + cutlass.Int32(det_b),
+                                                cutlass.Int32(1),
+                                            )
+                                else:
+                                    if cutlass.Int64(cutlass.Uint32(det_u)) > det_thr:
+                                        q2e = cutlass.Int32(1)
+                            if q1e == cutlass.Int32(1):
+                                em1 = em1 | cutlass.Int32(1 << s)
+                            if q2e == cutlass.Int32(1):
+                                em2 = em2 | cutlass.Int32(1 << s)
+                        u64 = cutlass.Int64(-1)
+                        if tid < ntail:
+                            u64 = cutlass.Int64(fkey(tval))
+                        q1e = cutlass.Int32(0)
+                        q2e = cutlass.Int32(0)
+                        if u64 > ethr:
+                            q1e = cutlass.Int32(1)
+                        if u64 == ethr:
+                            det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(tix)
+                            if det_ph == cutlass.Int32(0):
+                                if cutlass.Uint32(det_u) >= cutlass.Uint32(det_lo):
+                                    if cutlass.Uint32(det_u) <= cutlass.Uint32(det_hi):
+                                        det_b = (
+                                            cutlass.Uint32(det_u) - cutlass.Uint32(det_lo)
+                                        ) >> cutlass.Uint32(det_sh)
+                                        if det_b > cutlass.Uint32(self.nbh - 1):
+                                            det_b = cutlass.Uint32(self.nbh - 1)
+                                        atomic_add_cta(
+                                            s_hist.iterator + cutlass.Int32(det_b), cutlass.Int32(1)
+                                        )
+                            else:
+                                if cutlass.Int64(cutlass.Uint32(det_u)) > det_thr:
+                                    q2e = cutlass.Int32(1)
+                        if det_ph == cutlass.Int32(1):
+                            c1 = popc(em1) + q1e
+                            c2 = popc(em2) + q2e
+                            w1 = cutlass.Int32(warp_add_i32(c1))
+                            w2 = cutlass.Int32(warp_add_i32(c2))
+                            x1 = cutlass.Int32(0)
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(0)
+                            )
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(1)
+                            )
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(2)
+                            )
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(3)
+                            )
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(4)
+                            )
+                            if cutlass.const_expr(S + 1 >= 32):
+                                x1 = x1 + (
+                                    popc(
+                                        ballot(
+                                            ((c1 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                            == cutlass.Int32(1)
+                                        )
+                                        & lml
+                                    )
+                                    << cutlass.Int32(5)
+                                )
+                            x2 = cutlass.Int32(0)
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(0)
+                            )
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(1)
+                            )
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(2)
+                            )
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(3)
+                            )
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(4)
+                            )
+                            if cutlass.const_expr(S + 1 >= 32):
+                                x2 = x2 + (
+                                    popc(
+                                        ballot(
+                                            ((c2 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                            == cutlass.Int32(1)
+                                        )
+                                        & lml
+                                    )
+                                    << cutlass.Int32(5)
+                                )
+                            if lane == cutlass.Int32(0):
+                                s_dw[dw] = w1
+                                s_dw[32 + dw] = w2
+                            cute.arch.barrier()  # DET SLOTS: warp totals published
+                            v1 = cutlass.Int32(0)
+                            v2 = cutlass.Int32(0)
+                            if lane < cutlass.Int32(NW):
+                                v1 = s_dw[lane]
+                                v2 = s_dw[32 + lane]
+                            tot1 = cutlass.Int32(warp_add_i32(v1))
+                            tot2 = cutlass.Int32(warp_add_i32(v2))
+                            if lane >= dw:
+                                v1 = cutlass.Int32(0)
+                                v2 = cutlass.Int32(0)
+                            b1 = cutlass.Int32(warp_add_i32(v1))
+                            b2 = cutlass.Int32(warp_add_i32(v2))
+                            p1e = b1 + x1
+                            p2e = b2 + x2
+                            ewm = em1
+                            while ewm != cutlass.Int32(0):
+                                esd = ffs_m1(ewm)
+                                exv = (
+                                    (tid + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                                    << cutlass.Int32(2)
+                                ) + (esd & cutlass.Int32(3))
+                                if p1e < nA:
+                                    out_row[p1e] = exv
+                                p1e = p1e + cutlass.Int32(1)
+                                ewm = ewm & (ewm - cutlass.Int32(1))
+                            if q1e == cutlass.Int32(1):
+                                if p1e < nA:
+                                    out_row[p1e] = tix
+                            ewm = em2
+                            while ewm != cutlass.Int32(0):
+                                esd = ffs_m1(ewm)
+                                exv = (
+                                    (tid + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                                    << cutlass.Int32(2)
+                                ) + (esd & cutlass.Int32(3))
+                                if p2e < nT:
+                                    out_row[nA + p2e] = exv
+                                p2e = p2e + cutlass.Int32(1)
+                                ewm = ewm & (ewm - cutlass.Int32(1))
+                            if q2e == cutlass.Int32(1):
+                                if p2e < nT:
+                                    out_row[nA + p2e] = tix
+                        if det_ph == cutlass.Int32(0):
+                            cute.arch.barrier()  # ---- barrier (det level hist) ----
+                            if cutlass.const_expr(self.nbh > 1024):
+                                scan_cross_w(
+                                    s_hist, s_ws, det_need, tid, s_res, blk=self.blk, nb=self.nbh
+                                )
+                            else:
+                                find_cross(s_hist, det_need, tid, s_res, nb=self.nbh)
+                            cute.arch.barrier()  # ---- barrier (det level scan) ----
+                            det_need = det_need - s_res[RES_ABOVE]
+                            det_m = s_res[RES_M]
+                            det_bin = s_res[RES_B]
+                            det_nlo = cutlass.Uint32(det_lo) + (
+                                cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                            )
+                            if det_bin != cutlass.Int32(self.nbh - 1):
+                                det_hi = det_nlo + (
+                                    (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                    - cutlass.Uint32(1)
+                                )
+                            det_lo = det_nlo
+                            if det_need == det_m:
+                                det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(1)
+                                det_ph = cutlass.Int32(1)
+                            elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(1)
+                                det_ph = cutlass.Int32(1)
+                        else:
+                            det_ph = cutlass.Int32(2)
+                else:
+                    lml = cutlass.Int32(cute.arch.lanemask_lt())
+                    for s in cutlass.range_constexpr(S):
+                        ixv = (
+                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                        ) + cutlass.Int32(s % 4)
+                        u64 = cutlass.Int64(-1)
+                        if ixv < nvec:
+                            u64 = cutlass.Int64(fkey(_val(frags, s)))
+                        q1e = cutlass.Int32(0)
+                        q2e = cutlass.Int32(0)
+                        if u64 > ethr:
+                            q1e = cutlass.Int32(1)
+                        if u64 == ethr:
+                            q2e = cutlass.Int32(1)
+                        n1 = ballot(q1e == cutlass.Int32(1))
+                        n2 = ballot(q2e == cutlass.Int32(1))
+                        b1 = cutlass.Int32(0)
+                        b2 = cutlass.Int32(0)
+                        if lane == cutlass.Int32(0):
+                            if n1 != cutlass.Int32(0):
+                                b1 = atomic_add_cta(s_e12.iterator, popc(n1))
+                            if n2 != cutlass.Int32(0):
+                                b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
+                        b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
+                        b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
+                        p1e = b1 + popc(n1 & lml)
+                        p2e = b2 + popc(n2 & lml)
+                        if q1e == cutlass.Int32(1):
+                            if p1e < nA:
+                                out_row[p1e] = ixv
+                        if q2e == cutlass.Int32(1):
+                            if p2e < nT:
+                                out_row[nA + p2e] = ixv
+                    # tail element
                     u64 = cutlass.Int64(-1)
-                    if ixv < nvec:
-                        u64 = cutlass.Int64(fkey(_val(frags, s)))
+                    if tid < ntail:
+                        u64 = cutlass.Int64(fkey(tval))
                     q1e = cutlass.Int32(0)
                     q2e = cutlass.Int32(0)
                     if u64 > ethr:
@@ -4089,319 +6925,858 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            out_row[p1e] = ixv
+                            out_row[p1e] = tix
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            out_row[nA + p2e] = ixv
-                # tail element
-                u64 = cutlass.Int64(-1)
-                if tid < ntail:
-                    u64 = cutlass.Int64(fkey(tval))
-                q1e = cutlass.Int32(0)
-                q2e = cutlass.Int32(0)
-                if u64 > ethr:
-                    q1e = cutlass.Int32(1)
-                if u64 == ethr:
-                    q2e = cutlass.Int32(1)
-                n1 = ballot(q1e == cutlass.Int32(1))
-                n2 = ballot(q2e == cutlass.Int32(1))
-                b1 = cutlass.Int32(0)
-                b2 = cutlass.Int32(0)
-                if lane == cutlass.Int32(0):
-                    if n1 != cutlass.Int32(0):
-                        b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                    if n2 != cutlass.Int32(0):
-                        b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                p1e = b1 + popc(n1 & lml)
-                p2e = b2 + popc(n2 & lml)
-                if q1e == cutlass.Int32(1):
-                    if p1e < nA:
-                        out_row[p1e] = tix
-                if q2e == cutlass.Int32(1):
-                    if p2e < nT:
-                        out_row[nA + p2e] = tix
-                # (CUDA returns here — everything below is the else-arm)
+                            out_row[nA + p2e] = tix
             else:
-                # ---- emit
-                if cutlass.const_expr(self.cur):
-                    LOQ = cutlass.Float32(Bv)  # int->float cvt
-                    lim1 = above
-                    if whole == cutlass.Int32(1):
-                        lim1 = above + m
-                    for s in cutlass.range_constexpr(S):
-                        if cutlass.const_expr(self.brl):
-                            q = _fmaf__reg(_val(frags, s), SC, CQ)  # bit-identical to classify
+                if cutlass.const_expr(self.det):
+                    if cutlass.const_expr(S <= 4 and self.nbh <= 1024):
+                        HIf = cutlass.Float32(_POS_INF)
+                        LOf = cutlass.Float32(_POS_INF)
+                        if whole == cutlass.Int32(1):
+                            HIf = cutlass.Float32(Bv)
                         else:
-                            q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)  # emit spelling
-                        idx = (
-                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                        ) + cutlass.Int32(s % 4)
+                            if Bv < cutlass.Int32(self.nbh - 1):
+                                HIf = cutlass.Float32(Bv + cutlass.Int32(1))
+                            LOf = cutlass.Float32(Bv)
+                        m1 = cutlass.Int32(0)
+                        m2 = cutlass.Int32(0)
+                        for s in cutlass.range_constexpr(S):
+                            if cutlass.const_expr(self.brl):
+                                q = _fmaf__reg(_val(frags, s), SC, CQ)
+                            else:
+                                q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)
+                            if q >= HIf:
+                                m1 = m1 | cutlass.Int32(1 << s)
+                            else:
+                                if q >= LOf:
+                                    m2 = m2 | cutlass.Int32(1 << s)
+                        if cutlass.const_expr(self.brl):
+                            qt3 = _fmaf__reg(tval, SC, CQ)
+                        else:
+                            qt3 = _fmaf__reg(tval - Tv, SC, OFFf)
+                        t1 = cutlass.Int32(0)
+                        t2 = cutlass.Int32(0)
+                        if qt3 >= HIf:
+                            t1 = cutlass.Int32(1)
+                        else:
+                            if qt3 >= LOf:
+                                t2 = cutlass.Int32(1)
+                        lml = cutlass.Int32(cute.arch.lanemask_lt())
+                        w1 = cutlass.Int32(warp_add_i32(popc(m1) + t1))
+                        w2 = cutlass.Int32(warp_add_i32(popc(m2) + t2))
+                        if lane == cutlass.Int32(0):
+                            s_dw[dw] = w1
+                            s_dw[32 + dw] = w2
+                        cute.arch.barrier()  # DET SLOTS: warp totals published
+                        v1 = cutlass.Int32(0)
+                        v2 = cutlass.Int32(0)
+                        if lane < cutlass.Int32(NW):
+                            v1 = s_dw[lane]
+                            v2 = s_dw[32 + lane]
+                        tot1 = cutlass.Int32(warp_add_i32(v1))
+                        tot2 = cutlass.Int32(warp_add_i32(v2))
+                        if lane >= dw:
+                            v1 = cutlass.Int32(0)
+                            v2 = cutlass.Int32(0)
+                        b1 = cutlass.Int32(warp_add_i32(v1))
+                        b2 = cutlass.Int32(warp_add_i32(v2))
+                        if tid == cutlass.Int32(0):
+                            s_cnt[0] = tot1
+                            s_cnt[1] = tot2
+                        lim1 = above
+                        if whole == cutlass.Int32(1):
+                            lim1 = k
+                        for s in cutlass.range_constexpr(S):
+                            bit1 = (m1 >> cutlass.Int32(s)) & cutlass.Int32(1)
+                            bit2 = (m2 >> cutlass.Int32(s)) & cutlass.Int32(1)
+                            n1 = ballot(bit1 == cutlass.Int32(1))
+                            n2 = ballot(bit2 == cutlass.Int32(1))
+                            idx = (
+                                (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            pp1 = b1 + popc(n1 & lml)
+                            pp2 = b2 + popc(n2 & lml)
+                            if pp1 >= lim1:
+                                bit1 = cutlass.Int32(0)
+                            if pp2 >= cmp_:
+                                bit2 = cutlass.Int32(0)
+                            if bit1 == cutlass.Int32(1):
+                                out_row[pp1] = idx
+                            if bit2 == cutlass.Int32(1):
+                                ck[pp2] = fkey(_val(frags, s))
+                            if bit2 == cutlass.Int32(1):
+                                ci[pp2] = idx
+                            b1 = b1 + popc(n1)
+                            b2 = b2 + popc(n2)
+                        n1 = ballot(t1 == cutlass.Int32(1))
+                        n2 = ballot(t2 == cutlass.Int32(1))
+                        pp1 = b1 + popc(n1 & lml)
+                        pp2 = b2 + popc(n2 & lml)
+                        if pp1 >= lim1:
+                            t1 = cutlass.Int32(0)
+                        if pp2 >= cmp_:
+                            t2 = cutlass.Int32(0)
+                        if t1 == cutlass.Int32(1):
+                            out_row[pp1] = tix
+                        if t2 == cutlass.Int32(1):
+                            ck[pp2] = fkey(tval)
+                        if t2 == cutlass.Int32(1):
+                            ci[pp2] = tix
+
+                    else:
+                        HIf = cutlass.Float32(_POS_INF)
+                        LOf = cutlass.Float32(_POS_INF)
+                        if whole == cutlass.Int32(1):
+                            HIf = cutlass.Float32(Bv)
+                        else:
+                            if Bv < cutlass.Int32(self.nbh - 1):
+                                HIf = cutlass.Float32(Bv + cutlass.Int32(1))
+                            LOf = cutlass.Float32(Bv)
+                        m1 = cutlass.Int32(0)
+                        m2 = cutlass.Int32(0)
+                        for s in cutlass.range_constexpr(S):
+                            if cutlass.const_expr(self.brl):
+                                q = _fmaf__reg(_val(frags, s), SC, CQ)
+                            else:
+                                q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)
+                            if q >= HIf:
+                                m1 = m1 | cutlass.Int32(1 << s)
+                            else:
+                                if q >= LOf:
+                                    m2 = m2 | cutlass.Int32(1 << s)
+                        if cutlass.const_expr(self.brl):
+                            qt3 = _fmaf__reg(tval, SC, CQ)
+                        else:
+                            qt3 = _fmaf__reg(tval - Tv, SC, OFFf)
+                        t1 = cutlass.Int32(0)
+                        t2 = cutlass.Int32(0)
+                        if qt3 >= HIf:
+                            t1 = cutlass.Int32(1)
+                        else:
+                            if qt3 >= LOf:
+                                t2 = cutlass.Int32(1)
+                        lml = cutlass.Int32(cute.arch.lanemask_lt())
+                        c1 = popc(m1) + t1
+                        c2 = popc(m2) + t2
+                        w1 = cutlass.Int32(warp_add_i32(c1))
+                        w2 = cutlass.Int32(warp_add_i32(c2))
+                        x1 = cutlass.Int32(0)
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(0)
+                        )
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(1)
+                        )
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(2)
+                        )
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(3)
+                        )
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(4)
+                        )
+                        if cutlass.const_expr(S + 1 >= 32):
+                            x1 = x1 + (
+                                popc(
+                                    ballot(
+                                        ((c1 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(5)
+                            )
+                        x2 = cutlass.Int32(0)
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(0)
+                        )
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(1)
+                        )
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(2)
+                        )
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(3)
+                        )
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(4)
+                        )
+                        if cutlass.const_expr(S + 1 >= 32):
+                            x2 = x2 + (
+                                popc(
+                                    ballot(
+                                        ((c2 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                        == cutlass.Int32(1)
+                                    )
+                                    & lml
+                                )
+                                << cutlass.Int32(5)
+                            )
+                        if lane == cutlass.Int32(0):
+                            s_dw[dw] = w1
+                            s_dw[32 + dw] = w2
+                        cute.arch.barrier()  # DET SLOTS: warp totals published
+                        v1 = cutlass.Int32(0)
+                        v2 = cutlass.Int32(0)
+                        if lane < cutlass.Int32(NW):
+                            v1 = s_dw[lane]
+                            v2 = s_dw[32 + lane]
+                        tot1 = cutlass.Int32(warp_add_i32(v1))
+                        tot2 = cutlass.Int32(warp_add_i32(v2))
+                        if lane >= dw:
+                            v1 = cutlass.Int32(0)
+                            v2 = cutlass.Int32(0)
+                        b1 = cutlass.Int32(warp_add_i32(v1))
+                        b2 = cutlass.Int32(warp_add_i32(v2))
+                        if tid == cutlass.Int32(0):
+                            s_cnt[0] = tot1
+                            s_cnt[1] = tot2
+                        p1 = b1 + x1
+                        p2 = b2 + x2
+                        lim1 = above
+                        if whole == cutlass.Int32(1):
+                            lim1 = k
+                        ewm = m1
+                        while ewm != cutlass.Int32(0):
+                            esd = ffs_m1(ewm)
+                            idx = (
+                                (tid + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                                << cutlass.Int32(2)
+                            ) + (esd & cutlass.Int32(3))
+                            if p1 < lim1:
+                                out_row[p1] = idx
+                            p1 = p1 + cutlass.Int32(1)
+                            ewm = ewm & (ewm - cutlass.Int32(1))
+                        if t1 == cutlass.Int32(1):
+                            if p1 < lim1:
+                                out_row[p1] = tix
+                            p1 = p1 + cutlass.Int32(1)
+                        if m2 != cutlass.Int32(0):  # static-unrolled
+                            for s in cutlass.range_constexpr(S):
+                                if (m2 & cutlass.Int32(1 << s)) != cutlass.Int32(0):
+                                    idx = (
+                                        (tid + cutlass.Int32((s // 4) * self.blk))
+                                        << cutlass.Int32(2)
+                                    ) + cutlass.Int32(s % 4)
+                                    if p2 < cmp_:
+                                        ck[p2] = fkey(_val(frags, s))
+                                        ci[p2] = idx
+                                    p2 = p2 + cutlass.Int32(1)
+                        if t2 == cutlass.Int32(1):
+                            if p2 < cmp_:
+                                ck[p2] = fkey(tval)
+                                ci[p2] = tix
+                            p2 = p2 + cutlass.Int32(1)
+                    if whole == cutlass.Int32(0):
+                        cute.arch.barrier()  # emit done
+                        mc = s_cnt[1]  # DET SLOTS: emitted crossing count (every template)
+                        if mc > cmp_:
+                            mc = cmp_
+                        quad = cutlass.Int32(0)
+                        if mc >= m:
+                            if mc <= qc:
+                                quad = cutlass.Int32(1)
+                        if quad == cutlass.Int32(1):
+                            i = tid
+                            while i < mc:
+                                uq = cutlass.Uint32(ck[i])
+                                uci = ci[i]  # DET: logical-index tie-break
+                                r = cutlass.Int32(0)
+                                j = cutlass.Int32(0)
+                                while j < mc:
+                                    vq = cutlass.Uint32(ck[j])
+                                    tinc = cutlass.Int32(0)
+                                    if vq > uq:
+                                        tinc = cutlass.Int32(1)
+                                    if vq == uq:
+                                        if ci[j] < uci:
+                                            tinc = cutlass.Int32(1)
+                                    r = r + tinc
+                                    j = j + cutlass.Int32(1)
+                                if r < need:
+                                    out_row[above + r] = uci
+                                i = i + cutlass.Int32(BLK)
+                        else:
+                            if tid == cutlass.Int32(0):
+                                s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
+                                s_kmm[1] = cutlass.Uint32(0)
+                            cute.arch.barrier()  # kmm init
+                            i = tid
+                            while i < mc:
+                                kv = cutlass.Uint32(ck[i])
+                                atomic_min_cta(s_kmm.iterator, kv)
+                                atomic_max_cta(s_kmm.iterator + 1, kv)
+                                i = i + cutlass.Int32(BLK)
+                            cute.arch.barrier()  # key range published
+                            rlo = cutlass.Uint32(s_kmm[0])
+                            rhi = cutlass.Uint32(s_kmm[1])
+                            ethr = cutlass.Int64(rlo)
+                            aboveC = cutlass.Int32(0)
+                            needC = need
+                            mm = mc
+                            lev = cutlass.Int32(0)
+                            done = cutlass.Int32(0)
+                            while done == cutlass.Int32(0):
+                                if needC == mm:
+                                    ethr = cutlass.Int64(rlo) - cutlass.Int64(1)
+                                    aboveC = aboveC + mm
+                                    needC = cutlass.Int32(0)
+                                    done = cutlass.Int32(1)
+                                if done == cutlass.Int32(0):
+                                    if rlo >= rhi:
+                                        ethr = cutlass.Int64(rlo)
+                                        done = cutlass.Int32(1)
+                                    if lev >= cutlass.Int32(6):
+                                        ethr = cutlass.Int64(rlo)
+                                        done = cutlass.Int32(1)
+                                if done == cutlass.Int32(0):
+                                    d2 = rhi - rlo
+                                    b2w = cutlass.Int32(32) - clz_i32(
+                                        cutlass.Int32(d2 | cutlass.Uint32(1))
+                                    )
+                                    sh2 = cutlass.Int32(0)
+                                    if b2w > cutlass.Int32(LNBH):
+                                        sh2 = b2w - cutlass.Int32(LNBH)
+                                    for z in cutlass.range_constexpr(self.nbh // self.blk):
+                                        s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                                    cute.arch.barrier()  # level clear
+                                    i = tid
+                                    while i < mc:
+                                        unar = cutlass.Uint32(ck[i])
+                                        if unar >= rlo:
+                                            if unar <= rhi:
+                                                bnn = (unar - rlo) >> cutlass.Uint32(sh2)
+                                                bnn = _umin_u32(bnn, cutlass.Uint32(self.nbh - 1))
+                                                atomic_add_cta(
+                                                    s_hist.iterator + cutlass.Int32(bnn),
+                                                    cutlass.Int32(1),
+                                                )
+                                        i = i + cutlass.Int32(BLK)
+                                    cute.arch.barrier()  # level hist
+                                    if cutlass.const_expr(self.nbh > 1024):
+                                        scan_cross_w(
+                                            s_hist,
+                                            s_ws,
+                                            needC,
+                                            tid,
+                                            s_res,
+                                            blk=self.blk,
+                                            nb=self.nbh,
+                                        )
+                                    else:
+                                        find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
+                                    cute.arch.barrier()  # level scan
+                                    aboveC = aboveC + s_res[RES_ABOVE]
+                                    needC = needC - s_res[RES_ABOVE]
+                                    mm = s_res[RES_M]
+                                    b_lv = s_res[RES_B]
+                                    nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
+                                    if b_lv != cutlass.Int32(self.nbh - 1):
+                                        rhi = nlo + (
+                                            (cutlass.Uint32(1) << cutlass.Uint32(sh2))
+                                            - cutlass.Uint32(1)
+                                        )
+                                    rlo = nlo
+                                    lev = lev + cutlass.Int32(1)
+                            if tid == cutlass.Int32(0):
+                                s_e12[0] = cutlass.Int32(0)
+                                s_e12[1] = cutlass.Int32(0)
+                            cute.arch.barrier()  # emit counters
+                            lml = cutlass.Int32(cute.arch.lanemask_lt())
+                            it2 = (mc + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
+                            run1 = cutlass.Int32(0)  # DET SLOTS: running class offsets across it
+                            run2 = cutlass.Int32(0)
+                            det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                                cutlass.Uint32(n) - cutlass.Uint32(1)
+                            )  # ~idx >= 2^32 - n
+                            det_hi = cutlass.Uint32(0xFFFFFFFF)
+                            det_need = needC
+                            det_thr = cutlass.Int64(-1)
+                            det_sh = cutlass.Uint32(0)
+                            det_ph = cutlass.Int32(1)
+                            if needC > cutlass.Int32(0):
+                                if mm > needC:
+                                    det_ph = cutlass.Int32(0)
+                            while det_ph <= cutlass.Int32(1):
+                                if det_ph == cutlass.Int32(0):
+                                    det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                    det_bw = cutlass.Int32(32) - clz_i32(
+                                        cutlass.Int32(det_d | cutlass.Uint32(1))
+                                    )
+                                    det_s = det_bw - cutlass.Int32(LNBH)
+                                    if det_s < cutlass.Int32(0):
+                                        det_s = cutlass.Int32(0)
+                                    det_sh = cutlass.Uint32(det_s)
+                                    for z in cutlass.range_constexpr(self.nbh // self.blk):
+                                        s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                                    cute.arch.barrier()  # ---- barrier (det level clear) ----
+                                it = cutlass.Int32(0)
+                                while it < it2:
+                                    i = it * cutlass.Int32(BLK) + tid
+                                    uke = cutlass.Uint32(0)
+                                    idv = cutlass.Int32(0)
+                                    if i < mc:
+                                        uke = cutlass.Uint32(ck[i])
+                                        idv = ci[i]
+                                    q1f = cutlass.Int32(0)
+                                    q2f = cutlass.Int32(0)
+                                    if i < mc:
+                                        if cutlass.Int64(uke) > ethr:
+                                            q1f = cutlass.Int32(1)
+                                        if cutlass.Int64(uke) == ethr:
+                                            det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(idv)
+                                            if det_ph == cutlass.Int32(0):
+                                                if cutlass.Uint32(det_u) >= cutlass.Uint32(det_lo):
+                                                    if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                        det_hi
+                                                    ):
+                                                        det_b = (
+                                                            cutlass.Uint32(det_u)
+                                                            - cutlass.Uint32(det_lo)
+                                                        ) >> cutlass.Uint32(det_sh)
+                                                        if det_b > cutlass.Uint32(self.nbh - 1):
+                                                            det_b = cutlass.Uint32(self.nbh - 1)
+                                                        atomic_add_cta(
+                                                            s_hist.iterator + cutlass.Int32(det_b),
+                                                            cutlass.Int32(1),
+                                                        )
+                                            else:
+                                                if cutlass.Int64(cutlass.Uint32(det_u)) > det_thr:
+                                                    q2f = cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(1):
+                                        n1 = ballot(q1f == cutlass.Int32(1))
+                                        n2 = ballot(q2f == cutlass.Int32(1))
+                                        if lane == cutlass.Int32(0):
+                                            s_dw[dw] = popc(n1)
+                                            s_dw[32 + dw] = popc(n2)
+                                        cute.arch.barrier()  # DET SLOTS: warp totals published
+                                        v1 = cutlass.Int32(0)
+                                        v2 = cutlass.Int32(0)
+                                        if lane < cutlass.Int32(NW):
+                                            v1 = s_dw[lane]
+                                            v2 = s_dw[32 + lane]
+                                        tot1 = cutlass.Int32(warp_add_i32(v1))
+                                        tot2 = cutlass.Int32(warp_add_i32(v2))
+                                        if lane >= dw:
+                                            v1 = cutlass.Int32(0)
+                                            v2 = cutlass.Int32(0)
+                                        b1 = cutlass.Int32(warp_add_i32(v1))
+                                        b2 = cutlass.Int32(warp_add_i32(v2))
+                                        b1 = run1 + b1
+                                        b2 = run2 + b2
+                                        run1 = run1 + tot1
+                                        run2 = run2 + tot2
+                                        if it + cutlass.Int32(1) < it2:
+                                            cute.arch.barrier()  # DET SLOTS: scratch reusable by the next it
+                                        p1e = b1 + popc(n1 & lml)
+                                        p2e = b2 + popc(n2 & lml)
+                                        if q1f == cutlass.Int32(1):
+                                            if p1e < aboveC:
+                                                out_row[above + p1e] = idv
+                                        if q2f == cutlass.Int32(1):
+                                            if p2e < needC:
+                                                out_row[above + aboveC + p2e] = idv
+                                    it = it + cutlass.Int32(1)
+                                if det_ph == cutlass.Int32(0):
+                                    cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                    if cutlass.const_expr(self.nbh > 1024):
+                                        scan_cross_w(
+                                            s_hist,
+                                            s_ws,
+                                            det_need,
+                                            tid,
+                                            s_res,
+                                            blk=self.blk,
+                                            nb=self.nbh,
+                                        )
+                                    else:
+                                        find_cross(s_hist, det_need, tid, s_res, nb=self.nbh)
+                                    cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                    det_need = det_need - s_res[RES_ABOVE]
+                                    det_m = s_res[RES_M]
+                                    det_bin = s_res[RES_B]
+                                    det_nlo = cutlass.Uint32(det_lo) + (
+                                        cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                    )
+                                    if det_bin != cutlass.Int32(self.nbh - 1):
+                                        det_hi = det_nlo + (
+                                            (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                            - cutlass.Uint32(1)
+                                        )
+                                    det_lo = det_nlo
+                                    if det_need == det_m:
+                                        det_thr = cutlass.Int64(
+                                            cutlass.Uint32(det_lo)
+                                        ) - cutlass.Int64(1)
+                                        det_ph = cutlass.Int32(1)
+                                    elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                        det_thr = cutlass.Int64(
+                                            cutlass.Uint32(det_lo)
+                                        ) - cutlass.Int64(1)
+                                        det_ph = cutlass.Int32(1)
+                                else:
+                                    det_ph = cutlass.Int32(2)
+                else:
+                    if cutlass.const_expr(self.cur):
+                        LOQ = cutlass.Float32(Bv)  # int->float cvt
+                        lim1 = above
+                        if whole == cutlass.Int32(1):
+                            lim1 = above + m
+                        for s in cutlass.range_constexpr(S):
+                            if cutlass.const_expr(self.brl):
+                                q = _fmaf__reg(_val(frags, s), SC, CQ)  # bit-identical to classify
+                            else:
+                                q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)  # emit spelling
+                            idx = (
+                                (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            p = cutlass.Int32(0)
+                            if q >= LOQ:
+                                bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
+                                p = atomic_add_cta(
+                                    s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                                )
+                                if p < lim1:
+                                    out_row[p] = idx
+                                else:
+                                    if whole == cutlass.Int32(0):
+                                        q2i = p - above
+                                        if q2i < cmp_:  # escape-made-safe guard
+                                            ck[q2i] = fkey(_val(frags, s))
+                                            ci[q2i] = idx
+                        # tail
+                        if cutlass.const_expr(self.brl):
+                            qt2 = _fmaf__reg(tval, SC, CQ)
+                        else:
+                            qt2 = _fmaf__reg(tval - Tv, SC, OFFf)
                         p = cutlass.Int32(0)
-                        if q >= LOQ:
-                            bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
+                        if qt2 >= LOQ:
+                            bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                             p = atomic_add_cta(
                                 s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
                             )
                             if p < lim1:
-                                out_row[p] = idx
+                                out_row[p] = tix
                             else:
                                 if whole == cutlass.Int32(0):
                                     q2i = p - above
-                                    if q2i < cmp_:  # escape-made-safe guard
-                                        ck[q2i] = fkey(_val(frags, s))
-                                        ci[q2i] = idx
-                    # tail
-                    if cutlass.const_expr(self.brl):
-                        qt2 = _fmaf__reg(tval, SC, CQ)
+                                    if q2i < cmp_:
+                                        ck[q2i] = fkey(tval)
+                                        ci[q2i] = tix
                     else:
-                        qt2 = _fmaf__reg(tval - Tv, SC, OFFf)
-                    p = cutlass.Int32(0)
-                    if qt2 >= LOQ:
-                        bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
-                        p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
-                        if p < lim1:
-                            out_row[p] = tix
+                        # two-mask ballot emit
+                        HIf = cutlass.Float32(_POS_INF)
+                        LOf = cutlass.Float32(_POS_INF)
+                        if whole == cutlass.Int32(1):
+                            HIf = cutlass.Float32(Bv)
                         else:
-                            if whole == cutlass.Int32(0):
-                                q2i = p - above
-                                if q2i < cmp_:
-                                    ck[q2i] = fkey(tval)
-                                    ci[q2i] = tix
-                else:
-                    # two-mask ballot emit
-                    HIf = cutlass.Float32(_POS_INF)
-                    LOf = cutlass.Float32(_POS_INF)
-                    if whole == cutlass.Int32(1):
-                        HIf = cutlass.Float32(Bv)
-                    else:
-                        if Bv < cutlass.Int32(self.nbh - 1):
-                            HIf = cutlass.Float32(Bv + cutlass.Int32(1))
-                        LOf = cutlass.Float32(Bv)
-                    m1 = cutlass.Int32(0)
-                    m2 = cutlass.Int32(0)
-                    for s in cutlass.range_constexpr(S):
-                        if cutlass.const_expr(self.brl):
-                            q = _fmaf__reg(_val(frags, s), SC, CQ)
-                        else:
-                            q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)
-                        if q >= HIf:
-                            m1 = m1 | cutlass.Int32(1 << s)
-                        else:
-                            if q >= LOf:
-                                m2 = m2 | cutlass.Int32(1 << s)
-                    if cutlass.const_expr(self.brl):
-                        qt3 = _fmaf__reg(tval, SC, CQ)
-                    else:
-                        qt3 = _fmaf__reg(tval - Tv, SC, OFFf)
-                    t1 = cutlass.Int32(0)
-                    t2 = cutlass.Int32(0)
-                    if qt3 >= HIf:
-                        t1 = cutlass.Int32(1)
-                    else:
-                        if qt3 >= LOf:
-                            t2 = cutlass.Int32(1)
-                    c1 = popc(m1) + t1
-                    c2 = popc(m2) + t2
-                    s1, s2 = warp_incl_scan_add2(c1, c2, lane)
-                    b1 = cutlass.Int32(0)
-                    b2 = cutlass.Int32(0)
-                    if lane == cutlass.Int32(31):
-                        b1 = atomic_add_cta(s_cnt.iterator, s1)
-                        b2 = atomic_add_cta(s_cnt.iterator + 1, s2)
-                    b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(31))
-                    b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(31))
-                    p1 = b1 + (s1 - c1)
-                    p2 = b2 + (s2 - c2)
-                    lim1 = above
-                    if whole == cutlass.Int32(1):
-                        lim1 = k
-                    wm = m1  # sparse set-bit walk
-                    while wm != cutlass.Int32(0):
-                        sdyn = ffs_m1(wm)
-                        idx = (
-                            (tid + (sdyn >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
-                            << cutlass.Int32(2)
-                        ) + (sdyn & cutlass.Int32(3))
-                        if p1 < lim1:
-                            out_row[p1] = idx
-                        p1 = p1 + cutlass.Int32(1)
-                        wm = wm & (wm - cutlass.Int32(1))
-                    if t1 == cutlass.Int32(1):
-                        if p1 < lim1:
-                            out_row[p1] = tix
-                        p1 = p1 + cutlass.Int32(1)
-                    if m2 != cutlass.Int32(0):  # static-unrolled
+                            if Bv < cutlass.Int32(self.nbh - 1):
+                                HIf = cutlass.Float32(Bv + cutlass.Int32(1))
+                            LOf = cutlass.Float32(Bv)
+                        m1 = cutlass.Int32(0)
+                        m2 = cutlass.Int32(0)
                         for s in cutlass.range_constexpr(S):
-                            if (m2 & cutlass.Int32(1 << s)) != cutlass.Int32(0):
-                                idx = (
-                                    (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                                ) + cutlass.Int32(s % 4)
-                                if p2 < cmp_:
-                                    ck[p2] = fkey(_val(frags, s))
-                                    ci[p2] = idx
-                                p2 = p2 + cutlass.Int32(1)
-                    if t2 == cutlass.Int32(1):
-                        if p2 < cmp_:
-                            ck[p2] = fkey(tval)
-                            ci[p2] = tix
-                        p2 = p2 + cutlass.Int32(1)
+                            if cutlass.const_expr(self.brl):
+                                q = _fmaf__reg(_val(frags, s), SC, CQ)
+                            else:
+                                q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)
+                            if q >= HIf:
+                                m1 = m1 | cutlass.Int32(1 << s)
+                            else:
+                                if q >= LOf:
+                                    m2 = m2 | cutlass.Int32(1 << s)
+                        if cutlass.const_expr(self.brl):
+                            qt3 = _fmaf__reg(tval, SC, CQ)
+                        else:
+                            qt3 = _fmaf__reg(tval - Tv, SC, OFFf)
+                        t1 = cutlass.Int32(0)
+                        t2 = cutlass.Int32(0)
+                        if qt3 >= HIf:
+                            t1 = cutlass.Int32(1)
+                        else:
+                            if qt3 >= LOf:
+                                t2 = cutlass.Int32(1)
+                        c1 = popc(m1) + t1
+                        c2 = popc(m2) + t2
+                        s1, s2 = warp_incl_scan_add2(c1, c2, lane)
+                        b1 = cutlass.Int32(0)
+                        b2 = cutlass.Int32(0)
+                        if lane == cutlass.Int32(31):
+                            b1 = atomic_add_cta(s_cnt.iterator, s1)
+                            b2 = atomic_add_cta(s_cnt.iterator + 1, s2)
+                        b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(31))
+                        b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(31))
+                        p1 = b1 + (s1 - c1)
+                        p2 = b2 + (s2 - c2)
+                        lim1 = above
+                        if whole == cutlass.Int32(1):
+                            lim1 = k
+                        wm = m1  # sparse set-bit walk
+                        while wm != cutlass.Int32(0):
+                            sdyn = ffs_m1(wm)
+                            idx = (
+                                (tid + (sdyn >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                                << cutlass.Int32(2)
+                            ) + (sdyn & cutlass.Int32(3))
+                            if p1 < lim1:
+                                out_row[p1] = idx
+                            p1 = p1 + cutlass.Int32(1)
+                            wm = wm & (wm - cutlass.Int32(1))
+                        if t1 == cutlass.Int32(1):
+                            if p1 < lim1:
+                                out_row[p1] = tix
+                            p1 = p1 + cutlass.Int32(1)
+                        if m2 != cutlass.Int32(0):  # static-unrolled
+                            for s in cutlass.range_constexpr(S):
+                                if (m2 & cutlass.Int32(1 << s)) != cutlass.Int32(0):
+                                    idx = (
+                                        (tid + cutlass.Int32((s // 4) * self.blk))
+                                        << cutlass.Int32(2)
+                                    ) + cutlass.Int32(s % 4)
+                                    if p2 < cmp_:
+                                        ck[p2] = fkey(_val(frags, s))
+                                        ci[p2] = idx
+                                    p2 = p2 + cutlass.Int32(1)
+                        if t2 == cutlass.Int32(1):
+                            if p2 < cmp_:
+                                ck[p2] = fkey(tval)
+                                ci[p2] = tix
+                            p2 = p2 + cutlass.Int32(1)
 
-                # ---- refine (skipped when whole — CUDA returned inside emit)
-                if whole == cutlass.Int32(0):
-                    cute.arch.barrier()  # emit done
-                    if cutlass.const_expr(self.cur):
-                        mc = m
-                        if mc > cmp_:
-                            mc = cmp_
-                    else:
-                        mc = s_cnt[1]
-                        if mc > cmp_:
-                            mc = cmp_
-                    quad = cutlass.Int32(0)
-                    if mc >= m:
-                        if mc <= qc:
-                            quad = cutlass.Int32(1)
-                    if quad == cutlass.Int32(1):
-                        # O(mc^2) index-tie-broken rank
-                        i = tid
-                        while i < mc:
-                            uq = cutlass.Uint32(ck[i])
-                            r = cutlass.Int32(0)
-                            j = cutlass.Int32(0)
-                            while j < mc:
-                                vq = cutlass.Uint32(ck[j])
-                                tinc = cutlass.Int32(0)
-                                if vq > uq:
-                                    tinc = cutlass.Int32(1)
-                                if vq == uq:
-                                    if j < i:
+                    # ---- refine (skipped when whole — CUDA returned inside emit)
+                    if whole == cutlass.Int32(0):
+                        cute.arch.barrier()  # emit done
+                        if cutlass.const_expr(self.cur):
+                            mc = m
+                            if mc > cmp_:
+                                mc = cmp_
+                        else:
+                            mc = s_cnt[1]
+                            if mc > cmp_:
+                                mc = cmp_
+                        quad = cutlass.Int32(0)
+                        if mc >= m:
+                            if mc <= qc:
+                                quad = cutlass.Int32(1)
+                        if quad == cutlass.Int32(1):
+                            # O(mc^2) index-tie-broken rank
+                            i = tid
+                            while i < mc:
+                                uq = cutlass.Uint32(ck[i])
+                                r = cutlass.Int32(0)
+                                j = cutlass.Int32(0)
+                                while j < mc:
+                                    vq = cutlass.Uint32(ck[j])
+                                    tinc = cutlass.Int32(0)
+                                    if vq > uq:
                                         tinc = cutlass.Int32(1)
-                                r = r + tinc
-                                j = j + cutlass.Int32(1)
-                            if r < need:
-                                out_row[above + r] = ci[i]
-                            i = i + cutlass.Int32(BLK)
-                    else:
-                        # ---- fallback: exact key-space narrowing
-                        if tid == cutlass.Int32(0):
-                            s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
-                            s_kmm[1] = cutlass.Uint32(0)
-                        cute.arch.barrier()  # kmm init
-                        i = tid
-                        while i < mc:
-                            kv = cutlass.Uint32(ck[i])
-                            atomic_min_cta(s_kmm.iterator, kv)
-                            atomic_max_cta(s_kmm.iterator + 1, kv)
-                            i = i + cutlass.Int32(BLK)
-                        cute.arch.barrier()  # key range published
-                        rlo = cutlass.Uint32(s_kmm[0])
-                        rhi = cutlass.Uint32(s_kmm[1])
-                        ethr = cutlass.Int64(rlo)
-                        aboveC = cutlass.Int32(0)
-                        needC = need
-                        mm = mc
-                        lev = cutlass.Int32(0)
-                        done = cutlass.Int32(0)
-                        while done == cutlass.Int32(0):
-                            if needC == mm:
-                                ethr = cutlass.Int64(rlo) - cutlass.Int64(1)
-                                aboveC = aboveC + mm
-                                needC = cutlass.Int32(0)
-                                done = cutlass.Int32(1)
-                            if done == cutlass.Int32(0):
-                                if rlo >= rhi:
-                                    ethr = cutlass.Int64(rlo)
+                                    if vq == uq:
+                                        if j < i:
+                                            tinc = cutlass.Int32(1)
+                                    r = r + tinc
+                                    j = j + cutlass.Int32(1)
+                                if r < need:
+                                    out_row[above + r] = ci[i]
+                                i = i + cutlass.Int32(BLK)
+                        else:
+                            # ---- fallback: exact key-space narrowing
+                            if tid == cutlass.Int32(0):
+                                s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
+                                s_kmm[1] = cutlass.Uint32(0)
+                            cute.arch.barrier()  # kmm init
+                            i = tid
+                            while i < mc:
+                                kv = cutlass.Uint32(ck[i])
+                                atomic_min_cta(s_kmm.iterator, kv)
+                                atomic_max_cta(s_kmm.iterator + 1, kv)
+                                i = i + cutlass.Int32(BLK)
+                            cute.arch.barrier()  # key range published
+                            rlo = cutlass.Uint32(s_kmm[0])
+                            rhi = cutlass.Uint32(s_kmm[1])
+                            ethr = cutlass.Int64(rlo)
+                            aboveC = cutlass.Int32(0)
+                            needC = need
+                            mm = mc
+                            lev = cutlass.Int32(0)
+                            done = cutlass.Int32(0)
+                            while done == cutlass.Int32(0):
+                                if needC == mm:
+                                    ethr = cutlass.Int64(rlo) - cutlass.Int64(1)
+                                    aboveC = aboveC + mm
+                                    needC = cutlass.Int32(0)
                                     done = cutlass.Int32(1)
-                                if lev >= cutlass.Int32(6):
-                                    ethr = cutlass.Int64(rlo)
-                                    done = cutlass.Int32(1)
-                            if done == cutlass.Int32(0):
-                                d2 = rhi - rlo
-                                b2w = cutlass.Int32(32) - clz_i32(
-                                    cutlass.Int32(d2 | cutlass.Uint32(1))
-                                )
-                                sh2 = cutlass.Int32(0)
-                                if b2w > cutlass.Int32(LNBH):
-                                    sh2 = b2w - cutlass.Int32(LNBH)
-                                for z in cutlass.range_constexpr(self.nbh // self.blk):
-                                    s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
-                                cute.arch.barrier()  # level clear
-                                i = tid
-                                while i < mc:
-                                    unar = cutlass.Uint32(ck[i])
-                                    if unar >= rlo:
-                                        if unar <= rhi:
-                                            bnn = (unar - rlo) >> cutlass.Uint32(sh2)
-                                            bnn = _umin_u32(bnn, cutlass.Uint32(self.nbh - 1))
-                                            atomic_add_cta(
-                                                s_hist.iterator + cutlass.Int32(bnn),
-                                                cutlass.Int32(1),
-                                            )
-                                    i = i + cutlass.Int32(BLK)
-                                cute.arch.barrier()  # level hist
-                                if cutlass.const_expr(self.nbh > 1024):
-                                    scan_cross_w(
-                                        s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh
+                                if done == cutlass.Int32(0):
+                                    if rlo >= rhi:
+                                        ethr = cutlass.Int64(rlo)
+                                        done = cutlass.Int32(1)
+                                    if lev >= cutlass.Int32(6):
+                                        ethr = cutlass.Int64(rlo)
+                                        done = cutlass.Int32(1)
+                                if done == cutlass.Int32(0):
+                                    d2 = rhi - rlo
+                                    b2w = cutlass.Int32(32) - clz_i32(
+                                        cutlass.Int32(d2 | cutlass.Uint32(1))
                                     )
-                                else:
-                                    find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
-                                cute.arch.barrier()  # level scan
-                                aboveC = aboveC + s_res[RES_ABOVE]
-                                needC = needC - s_res[RES_ABOVE]
-                                mm = s_res[RES_M]
-                                b_lv = s_res[RES_B]
-                                nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
-                                if b_lv != cutlass.Int32(self.nbh - 1):
-                                    rhi = nlo + (
-                                        (cutlass.Uint32(1) << cutlass.Uint32(sh2))
-                                        - cutlass.Uint32(1)
-                                    )
-                                rlo = nlo
-                                lev = lev + cutlass.Int32(1)
-                        # final two-predicate ballot emit
-                        if tid == cutlass.Int32(0):
-                            s_e12[0] = cutlass.Int32(0)
-                            s_e12[1] = cutlass.Int32(0)
-                        cute.arch.barrier()  # emit counters
-                        lml = cutlass.Int32(cute.arch.lanemask_lt())
-                        it2 = (mc + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
-                        it = cutlass.Int32(0)
-                        while it < it2:
-                            i = it * cutlass.Int32(BLK) + tid
-                            uke = cutlass.Uint32(0)
-                            idv = cutlass.Int32(0)
-                            if i < mc:
-                                uke = cutlass.Uint32(ck[i])
-                                idv = ci[i]
-                            q1f = cutlass.Int32(0)
-                            q2f = cutlass.Int32(0)
-                            if i < mc:
-                                if cutlass.Int64(uke) > ethr:
-                                    q1f = cutlass.Int32(1)
-                                if cutlass.Int64(uke) == ethr:
-                                    q2f = cutlass.Int32(1)
-                            n1 = ballot(q1f == cutlass.Int32(1))
-                            n2 = ballot(q2f == cutlass.Int32(1))
-                            b1 = cutlass.Int32(0)
-                            b2 = cutlass.Int32(0)
-                            if lane == cutlass.Int32(0):
-                                if n1 != cutlass.Int32(0):
-                                    b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                                if n2 != cutlass.Int32(0):
-                                    b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                            b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                            b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                            p1e = b1 + popc(n1 & lml)
-                            p2e = b2 + popc(n2 & lml)
-                            if q1f == cutlass.Int32(1):
-                                if p1e < aboveC:
-                                    out_row[above + p1e] = idv
-                            if q2f == cutlass.Int32(1):
-                                if p2e < needC:
-                                    out_row[above + aboveC + p2e] = idv
-                            it = it + cutlass.Int32(1)
+                                    sh2 = cutlass.Int32(0)
+                                    if b2w > cutlass.Int32(LNBH):
+                                        sh2 = b2w - cutlass.Int32(LNBH)
+                                    for z in cutlass.range_constexpr(self.nbh // self.blk):
+                                        s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                                    cute.arch.barrier()  # level clear
+                                    i = tid
+                                    while i < mc:
+                                        unar = cutlass.Uint32(ck[i])
+                                        if unar >= rlo:
+                                            if unar <= rhi:
+                                                bnn = (unar - rlo) >> cutlass.Uint32(sh2)
+                                                bnn = _umin_u32(bnn, cutlass.Uint32(self.nbh - 1))
+                                                atomic_add_cta(
+                                                    s_hist.iterator + cutlass.Int32(bnn),
+                                                    cutlass.Int32(1),
+                                                )
+                                        i = i + cutlass.Int32(BLK)
+                                    cute.arch.barrier()  # level hist
+                                    if cutlass.const_expr(self.nbh > 1024):
+                                        scan_cross_w(
+                                            s_hist,
+                                            s_ws,
+                                            needC,
+                                            tid,
+                                            s_res,
+                                            blk=self.blk,
+                                            nb=self.nbh,
+                                        )
+                                    else:
+                                        find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
+                                    cute.arch.barrier()  # level scan
+                                    aboveC = aboveC + s_res[RES_ABOVE]
+                                    needC = needC - s_res[RES_ABOVE]
+                                    mm = s_res[RES_M]
+                                    b_lv = s_res[RES_B]
+                                    nlo = rlo + (cutlass.Uint32(b_lv) << cutlass.Uint32(sh2))
+                                    if b_lv != cutlass.Int32(self.nbh - 1):
+                                        rhi = nlo + (
+                                            (cutlass.Uint32(1) << cutlass.Uint32(sh2))
+                                            - cutlass.Uint32(1)
+                                        )
+                                    rlo = nlo
+                                    lev = lev + cutlass.Int32(1)
+                            # final two-predicate ballot emit
+                            if tid == cutlass.Int32(0):
+                                s_e12[0] = cutlass.Int32(0)
+                                s_e12[1] = cutlass.Int32(0)
+                            cute.arch.barrier()  # emit counters
+                            lml = cutlass.Int32(cute.arch.lanemask_lt())
+                            it2 = (mc + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
+                            it = cutlass.Int32(0)
+                            while it < it2:
+                                i = it * cutlass.Int32(BLK) + tid
+                                uke = cutlass.Uint32(0)
+                                idv = cutlass.Int32(0)
+                                if i < mc:
+                                    uke = cutlass.Uint32(ck[i])
+                                    idv = ci[i]
+                                q1f = cutlass.Int32(0)
+                                q2f = cutlass.Int32(0)
+                                if i < mc:
+                                    if cutlass.Int64(uke) > ethr:
+                                        q1f = cutlass.Int32(1)
+                                    if cutlass.Int64(uke) == ethr:
+                                        q2f = cutlass.Int32(1)
+                                n1 = ballot(q1f == cutlass.Int32(1))
+                                n2 = ballot(q2f == cutlass.Int32(1))
+                                b1 = cutlass.Int32(0)
+                                b2 = cutlass.Int32(0)
+                                if lane == cutlass.Int32(0):
+                                    if n1 != cutlass.Int32(0):
+                                        b1 = atomic_add_cta(s_e12.iterator, popc(n1))
+                                    if n2 != cutlass.Int32(0):
+                                        b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
+                                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
+                                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
+                                p1e = b1 + popc(n1 & lml)
+                                p2e = b2 + popc(n2 & lml)
+                                if q1f == cutlass.Int32(1):
+                                    if p1e < aboveC:
+                                        out_row[above + p1e] = idv
+                                if q2f == cutlass.Int32(1):
+                                    if p2e < needC:
+                                        out_row[above + aboveC + p2e] = idv
+                                it = it + cutlass.Int32(1)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -4442,10 +7817,19 @@ def get_compiled__reg(
     next_n: int = 1,
     cr_shift: int = 0,
     hint_free: bool = False,
+    det: bool = False,
 ) -> Any:
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), bool(hint_free))
+    key = (
+        tuple(tpl),
+        bool(pdl),
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hint_free),
+        bool(det),
+    )
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -4465,6 +7849,7 @@ def get_compiled__reg(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=hint_free,
+            det=det,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4614,7 +7999,9 @@ class GvrClusKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        det: bool = False,
     ) -> None:
+        self.det = bool(det)
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
@@ -4665,9 +8052,15 @@ class GvrClusKernel:
         ps = pos
         if ps > SCAP:
             ps = SCAP  # trash slot (IMNMX)
-        s_cbuf2[ps] = (cutlass.Uint64(cutlass.Uint32(idx)) << cutlass.Uint64(32)) | cutlass.Uint64(
-            C.u32_of_f32(xv)
-        )
+        if cutlass.const_expr(self.det):
+            s_cbuf2[ps] = (
+                cutlass.Uint64(cutlass.Uint32(idx) | (cutlass.Uint32(bn_u) << cutlass.Uint32(24)))
+                << cutlass.Uint64(32)
+            ) | cutlass.Uint64(C.u32_of_f32(xv))  # CLUS FAST: bin in bits 24..31
+        else:
+            s_cbuf2[ps] = (
+                cutlass.Uint64(cutlass.Uint32(idx)) << cutlass.Uint64(32)
+            ) | cutlass.Uint64(C.u32_of_f32(xv))
         return pos + cutlass.Int32(1)
 
     # ------------------------------------------------------------------
@@ -4831,6 +8224,8 @@ class GvrClusKernel:
         rank = bx
         row = by
         lane = tidx & cutlass.Int32(31)
+        if cutlass.const_expr(self.det):
+            wid = tidx >> cutlass.Int32(5)  # CLUS FAST
 
         # ============ per-row varlen prologue — shared contract lives in ======
         # GvrMainKernel's prologue (per-row n from kv_lens; ladder scalars are
@@ -4987,10 +8382,22 @@ class GvrClusKernel:
         s_tsh = smem.allocate_tensor(
             cutlass.Float32, cute.make_ordered_layout((1,), order=(0,)), byte_alignment=4
         )
+        if cutlass.const_expr(self.det):
+            s_wcnt = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((5 * NW,), order=(0,)), byte_alignment=16
+            )  # CLUS FAST: per-warp counts / class counts / rank-base partials
+            s_prebin = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((NBS,), order=(0,)), byte_alignment=16
+            )  # CLUS FAST: lower-rank counts per bin
         s_kmm = smem.allocate_tensor(  # [0]=kmin [1]=kmax
             cutlass.Uint32, cute.make_ordered_layout((2,), order=(0,)), byte_alignment=8
         )
         sbase = blob.iterator.toint()
+        if cutlass.const_expr(self.det):
+            wcap_ = cutlass.Int32(0)  # CLUS FAST
+            wbase = cutlass.Int32(0)
+            wend = cutlass.Int32(0)
+            wovf = cutlass.Int32(0)
         s_cbuf2 = cute.make_tensor(  # int2 staged as u64
             cute.make_ptr(cutlass.Uint64, sbase, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((self.scap + 4,)),
@@ -5027,6 +8434,8 @@ class GvrClusKernel:
                 s_res[C.RES_B2] = cutlass.Int32(-1)
                 s_res[C.RES_B3] = cutlass.Int32(-1)
                 s_scal[0] = cutlass.Int32(0)  # s_bufn
+                if cutlass.const_expr(self.det):
+                    s_scal[3] = cutlass.Int32(0)  # CLUS FAST: segment overflow
             if tidx < cutlass.Int32(self.hb):  # HB<=BLK
                 s_hist[tidx] = cutlass.Int32(0)
 
@@ -5221,7 +8630,8 @@ class GvrClusKernel:
                 s_tsh[0] = t5
 
             # ============ attempt loop — MUST NOT unroll ===========
-            listN = cutlass.Int32(0)
+            if cutlass.const_expr(not self.det):
+                listN = cutlass.Int32(0)
             above = cutlass.Int32(0)
             m = cutlass.Int32(0)
             need = cutlass.Int32(0)
@@ -5260,6 +8670,8 @@ class GvrClusKernel:
                         s_hist[tidx] = cutlass.Int32(0)
                     if tidx == cutlass.Int32(0):
                         s_scal[0] = cutlass.Int32(0)
+                        if cutlass.const_expr(self.det):
+                            s_scal[3] = cutlass.Int32(0)
                     cute.arch.barrier()  # ---- barrier (retry reset) ----
 
                 TF = T  # window
@@ -5276,115 +8688,274 @@ class GvrClusKernel:
                 # MUFU.RCP spelling: WD >= 1e-30 finite by the wdok clamp;
                 # classify bucketing is SC-invariant for any SC > 0.
                 SC = cute.arch.rcp_approx(WD)
+                if cutlass.const_expr(self.det):
+                    wcap_ = ((SCAP >> cutlass.Int32(5)) >> cutlass.Int32(5)) << cutlass.Int32(
+                        5
+                    )  # CLUS FAST: per-warp segment (runtime SCAP)
+                    wbase = wid * wcap_
+                    wend = wbase + wcap_
+                    wovf = cutlass.Int32(0)
 
                 # ---- P3 row pass over OWNED CHUNKS ----
                 g = rank + cutlass.Int32(0)
-                while g < nCh:
-                    i0 = g * cutlass.Int32(STEPC) + tidx
-                    M = cutlass.Int32(0)
-                    isfull = cutlass.Int32(0)
-                    if g < nFullG:
-                        isfull = cutlass.Int32(1)
-                    if isfull != cutlass.Int32(0):  # full body
-                        for uu in cutlass.range_constexpr(PFD, U):
-                            C.ld_g_f32x4(
-                                atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
-                            )
-                        for uu in cutlass.range_constexpr(U):
-                            if cutlass.const_expr(uu < PFD):
-                                vv = pf[uu]
-                            else:
-                                vv = fr[uu - PFD]
-                            for q in cutlass.range_constexpr(4):
-                                M = M | (cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q))
-                    else:  # partial body
-                        for uu in cutlass.range_constexpr(PFD, U):
-                            i_ = i0 + cutlass.Int32(uu * BLK)
-                            ic = i_
-                            if ic >= n4:
-                                ic = lim4  # clamp in [n, npad)
-                            C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
-                        for uu in cutlass.range_constexpr(U):
-                            if cutlass.const_expr(uu < PFD):
-                                vv = pf[uu]
-                            else:
-                                vv = fr[uu - PFD]
-                            i_ = i0 + cutlass.Int32(uu * BLK)
-                            okq = cutlass.Int32(0)
-                            if i_ < n4:
-                                okq = cutlass.Int32(1)
-                            if okq != cutlass.Int32(0):  # +inf-pad escape, ok-gated
+                if cutlass.const_expr(self.det):
+                    while g < nCh:
+                        i0 = g * cutlass.Int32(STEPC) + tidx
+                        M = cutlass.Int32(0)
+                        isfull = cutlass.Int32(0)
+                        if g < nFullG:
+                            isfull = cutlass.Int32(1)
+                        if isfull != cutlass.Int32(0):  # full body
+                            for uu in cutlass.range_constexpr(PFD, U):
+                                C.ld_g_f32x4(
+                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                )
+                            for uu in cutlass.range_constexpr(U):
+                                if cutlass.const_expr(uu < PFD):
+                                    vv = pf[uu]
+                                else:
+                                    vv = fr[uu - PFD]
                                 for q in cutlass.range_constexpr(4):
                                     M = M | (
                                         cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
                                     )
-                    # ROLL THE PREFETCH FORWARD: next OWNED chunk, issued
-                    # before the reservation and the survivor walk.
-                    g2 = g + cutlass.Int32(CS)
-                    if g2 < nCh:
-                        j0 = g2 * cutlass.Int32(STEPC) + tidx
-                        infull = cutlass.Int32(0)
-                        if g2 < nFullG:
-                            infull = cutlass.Int32(1)
-                        if infull != cutlass.Int32(0):
-                            for uu in cutlass.range_constexpr(PFD):
-                                C.ld_g_f32x4(atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu])
-                        else:
-                            for uu in cutlass.range_constexpr(PFD):
-                                j_ = j0 + cutlass.Int32(uu * BLK)
-                                jc = j_
-                                if jc >= n4:
-                                    jc = lim4
-                                C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
-                    # warp-aggregated slot reservation
-                    cnt = cutlass.Int32(C.popc(M))
-                    inc = C.warp_incl_scan_add(cnt, lane)
-                    bpos = cutlass.Int32(0)
-                    if lane == cutlass.Int32(31):
-                        if inc != cutlass.Int32(0):
-                            bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
-                    pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
-                    # survivor bit-walk, software-pipelined ONE deep;
-                    # reload X[idx] — never hold the U float4s across the walk
-                    if M != cutlass.Int32(0):
-                        bp = C.ffs_m1(M)
-                        M = M & (M - cutlass.Int32(1))
-                        idx = (
-                            (i0 + (bp >> cutlass.Int32(2)) * cutlass.Int32(BLK)) << cutlass.Int32(2)
-                        ) + (bp & cutlass.Int32(3))
-                        xv = C.ldg_f32(x_addr, idx)
-                        while M != cutlass.Int32(0):
-                            bp2 = C.ffs_m1(M)
+                        else:  # partial body
+                            for uu in cutlass.range_constexpr(PFD, U):
+                                i_ = i0 + cutlass.Int32(uu * BLK)
+                                ic = i_
+                                if ic >= n4:
+                                    ic = lim4  # clamp in [n, npad)
+                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
+                            for uu in cutlass.range_constexpr(U):
+                                if cutlass.const_expr(uu < PFD):
+                                    vv = pf[uu]
+                                else:
+                                    vv = fr[uu - PFD]
+                                i_ = i0 + cutlass.Int32(uu * BLK)
+                                okq = cutlass.Int32(0)
+                                if i_ < n4:
+                                    okq = cutlass.Int32(1)
+                                if okq != cutlass.Int32(0):  # +inf-pad escape, ok-gated
+                                    for q in cutlass.range_constexpr(4):
+                                        M = M | (
+                                            cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
+                                        )
+                        g2 = g + cutlass.Int32(CS)
+                        if g2 < nCh:
+                            j0 = g2 * cutlass.Int32(STEPC) + tidx
+                            infull = cutlass.Int32(0)
+                            if g2 < nFullG:
+                                infull = cutlass.Int32(1)
+                            if infull != cutlass.Int32(0):
+                                for uu in cutlass.range_constexpr(PFD):
+                                    C.ld_g_f32x4(
+                                        atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                    )
+                            else:
+                                for uu in cutlass.range_constexpr(PFD):
+                                    j_ = j0 + cutlass.Int32(uu * BLK)
+                                    jc = j_
+                                    if jc >= n4:
+                                        jc = lim4
+                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
+                        cnt = cutlass.Int32(C.popc(M))
+                        inc = C.warp_incl_scan_add(cnt, lane)
+                        pos = wbase + (
+                            inc - cnt
+                        )  # CLUS FAST: per-warp private segment, program order
+                        wtot_ = cute.arch.shuffle_sync(inc, cutlass.Int32(31))
+                        wbase = wbase + wtot_
+                        if wbase > wend:
+                            wovf = cutlass.Int32(1)
+                        if pos + cnt > wend:
+                            pos = SCAP  # trash slot
+                        if M != cutlass.Int32(0):
+                            bp = C.ffs_m1(M)
                             M = M & (M - cutlass.Int32(1))
-                            idx2 = (
-                                (i0 + (bp2 >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                            idx = (
+                                (i0 + (bp >> cutlass.Int32(2)) * cutlass.Int32(BLK))
                                 << cutlass.Int32(2)
-                            ) + (bp2 & cutlass.Int32(3))
-                            xv2 = C.ldg_f32(x_addr, idx2)
+                            ) + (bp & cutlass.Int32(3))
+                            xv = C.ldg_f32(x_addr, idx)
+                            while M != cutlass.Int32(0):
+                                bp2 = C.ffs_m1(M)
+                                M = M & (M - cutlass.Int32(1))
+                                idx2 = (
+                                    (i0 + (bp2 >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                                    << cutlass.Int32(2)
+                                ) + (bp2 & cutlass.Int32(3))
+                                xv2 = C.ldg_f32(x_addr, idx2)
+                                pos = self._emitk(xv, idx, pos, TF, SC, SCAP, s_hist, s_cbuf2)
+                                idx = idx2
+                                xv = xv2
                             pos = self._emitk(xv, idx, pos, TF, SC, SCAP, s_hist, s_cbuf2)
-                            idx = idx2
-                            xv = xv2
-                        pos = self._emitk(xv, idx, pos, TF, SC, SCAP, s_hist, s_cbuf2)
-                    g = g + cutlass.Int32(CS)
-                # rank-0 scalar tail: per-thread atomics, bound-check
-                i = tidx
-                while i < tailn:
-                    x = C.ldg_f32(x_addr, tail0 + i)
-                    if x >= TF:
-                        bq = C.f2s_rz((x - TF) * SC)  # signed form
-                        if bq > cutlass.Int32(NBS - 1):
-                            bq = cutlass.Int32(NBS - 1)
-                        C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
-                        post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                        if post < SCAP:
-                            s_cbuf2[post] = (
-                                cutlass.Uint64(cutlass.Uint32(tail0 + i)) << cutlass.Uint64(32)
-                            ) | cutlass.Uint64(C.u32_of_f32(x))
-                    i = i + cutlass.Int32(BLK)
+                        g = g + cutlass.Int32(CS)
+                    if wid == cutlass.Int32(0):
+                        ti = cutlass.Int32(0)
+                        tx = cutlass.Float32(_NEG_INF__clus)
+                        tsel = cutlass.Int32(0)
+                        nt = cutlass.Int32(0)
+                        post = cutlass.Int32(0)
+                        while ti < tailn:
+                            tx = cutlass.Float32(_NEG_INF__clus)
+                            tsel = cutlass.Int32(0)
+                            if ti + lane < tailn:
+                                tx = C.ldg_f32(x_addr, tail0 + ti + lane)
+                                if tx >= TF:
+                                    tsel = cutlass.Int32(1)
+                            nt = C.ballot(tsel == cutlass.Int32(1))
+                            if tsel == cutlass.Int32(1):
+                                post = wbase + cutlass.Int32(
+                                    C.popc(nt & cutlass.Int32(cute.arch.lanemask_lt()))
+                                )
+                                if post >= wend:
+                                    post = SCAP
+                                post = self._emitk(
+                                    tx, tail0 + ti + lane, post, TF, SC, SCAP, s_hist, s_cbuf2
+                                )
+                            wbase = wbase + cutlass.Int32(C.popc(nt))
+                            if wbase > wend:
+                                wovf = cutlass.Int32(1)
+                            ti = ti + cutlass.Int32(32)
+                    if lane == cutlass.Int32(0):
+                        s_wcnt[wid] = wbase - wid * wcap_
+                        C.atomic_add_cta(s_scal.iterator + 0, wbase - wid * wcap_)
+                        if wovf != cutlass.Int32(0):
+                            C.atomic_add_cta(s_scal.iterator + 3, cutlass.Int32(1))
+                else:
+                    while g < nCh:
+                        i0 = g * cutlass.Int32(STEPC) + tidx
+                        M = cutlass.Int32(0)
+                        isfull = cutlass.Int32(0)
+                        if g < nFullG:
+                            isfull = cutlass.Int32(1)
+                        if isfull != cutlass.Int32(0):  # full body
+                            for uu in cutlass.range_constexpr(PFD, U):
+                                C.ld_g_f32x4(
+                                    atom128, x_addr, i0 + cutlass.Int32(uu * BLK), fr[uu - PFD]
+                                )
+                            for uu in cutlass.range_constexpr(U):
+                                if cutlass.const_expr(uu < PFD):
+                                    vv = pf[uu]
+                                else:
+                                    vv = fr[uu - PFD]
+                                for q in cutlass.range_constexpr(4):
+                                    M = M | (
+                                        cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
+                                    )
+                        else:  # partial body
+                            for uu in cutlass.range_constexpr(PFD, U):
+                                i_ = i0 + cutlass.Int32(uu * BLK)
+                                ic = i_
+                                if ic >= n4:
+                                    ic = lim4  # clamp in [n, npad)
+                                C.ld_g_f32x4(atom128, x_addr, ic, fr[uu - PFD])
+                            for uu in cutlass.range_constexpr(U):
+                                if cutlass.const_expr(uu < PFD):
+                                    vv = pf[uu]
+                                else:
+                                    vv = fr[uu - PFD]
+                                i_ = i0 + cutlass.Int32(uu * BLK)
+                                okq = cutlass.Int32(0)
+                                if i_ < n4:
+                                    okq = cutlass.Int32(1)
+                                if okq != cutlass.Int32(0):  # +inf-pad escape, ok-gated
+                                    for q in cutlass.range_constexpr(4):
+                                        M = M | (
+                                            cutlass.Int32(vv[q] >= TF) << cutlass.Int32(uu * 4 + q)
+                                        )
+                        # ROLL THE PREFETCH FORWARD: next OWNED chunk, issued
+                        # before the reservation and the survivor walk.
+                        g2 = g + cutlass.Int32(CS)
+                        if g2 < nCh:
+                            j0 = g2 * cutlass.Int32(STEPC) + tidx
+                            infull = cutlass.Int32(0)
+                            if g2 < nFullG:
+                                infull = cutlass.Int32(1)
+                            if infull != cutlass.Int32(0):
+                                for uu in cutlass.range_constexpr(PFD):
+                                    C.ld_g_f32x4(
+                                        atom128, x_addr, j0 + cutlass.Int32(uu * BLK), pf[uu]
+                                    )
+                            else:
+                                for uu in cutlass.range_constexpr(PFD):
+                                    j_ = j0 + cutlass.Int32(uu * BLK)
+                                    jc = j_
+                                    if jc >= n4:
+                                        jc = lim4
+                                    C.ld_g_f32x4(atom128, x_addr, jc, pf[uu])
+                        # warp-aggregated slot reservation
+                        cnt = cutlass.Int32(C.popc(M))
+                        inc = C.warp_incl_scan_add(cnt, lane)
+                        bpos = cutlass.Int32(0)
+                        if lane == cutlass.Int32(31):
+                            if inc != cutlass.Int32(0):
+                                bpos = C.atomic_add_cta(s_scal.iterator + 0, inc)
+                        pos = cute.arch.shuffle_sync(bpos, cutlass.Int32(31)) + (inc - cnt)
+                        # survivor bit-walk, software-pipelined ONE deep;
+                        # reload X[idx] — never hold the U float4s across the walk
+                        if M != cutlass.Int32(0):
+                            bp = C.ffs_m1(M)
+                            M = M & (M - cutlass.Int32(1))
+                            idx = (
+                                (i0 + (bp >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                                << cutlass.Int32(2)
+                            ) + (bp & cutlass.Int32(3))
+                            xv = C.ldg_f32(x_addr, idx)
+                            while M != cutlass.Int32(0):
+                                bp2 = C.ffs_m1(M)
+                                M = M & (M - cutlass.Int32(1))
+                                idx2 = (
+                                    (i0 + (bp2 >> cutlass.Int32(2)) * cutlass.Int32(BLK))
+                                    << cutlass.Int32(2)
+                                ) + (bp2 & cutlass.Int32(3))
+                                xv2 = C.ldg_f32(x_addr, idx2)
+                                pos = self._emitk(xv, idx, pos, TF, SC, SCAP, s_hist, s_cbuf2)
+                                idx = idx2
+                                xv = xv2
+                            pos = self._emitk(xv, idx, pos, TF, SC, SCAP, s_hist, s_cbuf2)
+                        g = g + cutlass.Int32(CS)
+                    # rank-0 scalar tail: per-thread atomics, bound-check
+                    i = tidx
+                    while i < tailn:
+                        x = C.ldg_f32(x_addr, tail0 + i)
+                        if x >= TF:
+                            bq = C.f2s_rz((x - TF) * SC)  # signed form
+                            if bq > cutlass.Int32(NBS - 1):
+                                bq = cutlass.Int32(NBS - 1)
+                            C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
+                            post = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                            if post < SCAP:
+                                s_cbuf2[post] = (
+                                    cutlass.Uint64(cutlass.Uint32(tail0 + i)) << cutlass.Uint64(32)
+                                ) | cutlass.Uint64(C.u32_of_f32(x))
+                        i = i + cutlass.Int32(BLK)
 
                 # ---- cluster merge ----
                 C._cluster_sync_aligned()  # ==== clus.sync (merge) ====
                 myn = s_scal[0]
+                if cutlass.const_expr(self.det):
+                    if tidx >= cutlass.Int32(32):
+                        if tidx < cutlass.Int32(32 + NBS // 4):
+                            tb_ = tidx - cutlass.Int32(32)
+                            hoff_ = s_hist.iterator.toint() + tb_ * cutlass.Int32(16)
+                            q0_ = cutlass.Int32(0)
+                            q1_ = cutlass.Int32(0)
+                            q2_ = cutlass.Int32(0)
+                            q3_ = cutlass.Int32(0)
+                            for r_ in cutlass.range_constexpr(CS - 1):
+                                if cutlass.Int32(r_) < rank:
+                                    h0_, h1_, h2_, h3_ = C._ld_shared_cluster_v4_u32(
+                                        C._mapa_shared_cluster_addr(hoff_, cutlass.Int32(r_))
+                                    )
+                                    q0_ = q0_ + h0_
+                                    q1_ = q1_ + h1_
+                                    q2_ = q2_ + h2_
+                                    q3_ = q3_ + h3_
+                            s_prebin[tb_ * cutlass.Int32(4)] = q0_
+                            s_prebin[tb_ * cutlass.Int32(4) + cutlass.Int32(1)] = q1_
+                            s_prebin[tb_ * cutlass.Int32(4) + cutlass.Int32(2)] = q2_
+                            s_prebin[tb_ * cutlass.Int32(4) + cutlass.Int32(3)] = q3_
                 self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res)
                 cute.arch.barrier()  # ---- barrier (merge publish) ----
                 tot = s_res[C.RES_TOT]
@@ -5396,7 +8967,13 @@ class GvrClusKernel:
                     complete = cutlass.Int32(0)
                     if myn <= SCAP:
                         complete = cutlass.Int32(1)
-                    listN = myn
+                    if cutlass.const_expr(self.det):
+                        if s_scal[3] != cutlass.Int32(
+                            0
+                        ):  # CLUS FAST: a warp segment overflowed -> deterministic re-sweep
+                            complete = cutlass.Int32(0)
+                    else:
+                        listN = myn
                     above = s_res[C.RES_ABOVE]
                     m = s_res[C.RES_M]
                     need = k - s_res[C.RES_ABOVE]
@@ -5435,9 +9012,13 @@ class GvrClusKernel:
             if valid != cutlass.Int32(0):
                 if need >= m:
                     whole = cutlass.Int32(1)
-            lim1 = above
-            if whole != cutlass.Int32(0):
-                lim1 = above + m
+            if cutlass.const_expr(self.det):
+                if whole != cutlass.Int32(0):
+                    pass
+            else:
+                lim1 = above
+                if whole != cutlass.Int32(0):
+                    lim1 = above + m
             degen = cutlass.Int32(0)
             if valid == cutlass.Int32(0):
                 degen = cutlass.Int32(1)
@@ -5452,43 +9033,300 @@ class GvrClusKernel:
             if degen == cutlass.Int32(0):
                 if complete != cutlass.Int32(0):
                     # ---- P5 emit from staged cbuf ----
-                    i = tidx
-                    while i < listN:
-                        pk64 = s_cbuf2[i]
-                        vx = cutlass.Int32(cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF)))
-                        idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
-                        xv = C.f32_of_i32(vx)
-                        self._p5_emit(
-                            xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
-                        )
-                        i = i + cutlass.Int32(BLK)
+                    if cutlass.const_expr(self.det):
+                        bacc_ = B - whole
+                        bcrs_ = B + whole * cutlass.Int32(-1 - B)
+                        pv_ = cutlass.Int32(0)
+                        if tidx < cutlass.Int32(NBS):
+                            pv_ = s_prebin[tidx]
+                        pa_ = cutlass.Int32(
+                            C.warp_add_i32(pv_ * cutlass.Int32(tidx > bacc_))
+                        )  # per-warp partial of A_r (warps 0..NBS/32-1)
+                        pc_ = cutlass.Int32(C.warp_add_i32(pv_ * cutlass.Int32(tidx == bcrs_)))
+                        if lane == cutlass.Int32(0):
+                            s_wcnt[cutlass.Int32(3 * NW) + wid] = pa_
+                            s_wcnt[cutlass.Int32(4 * NW) + wid] = pc_
+                        ra_ = cutlass.Int32(0)
+                        rc_ = cutlass.Int32(0)
+                        lt_ = cutlass.Int32(cute.arch.lanemask_lt())
+                        c1_ = cutlass.Int32(0)
+                        c2_ = cutlass.Int32(0)
+                        p1b = cutlass.Int32(0)
+                        p2b = cutlass.Int32(0)
+                        wcnt_ = s_wcnt[wid]
+                        wlast_ = cutlass.max(wcnt_ - cutlass.Int32(1), cutlass.Int32(0))
+                        ne_ = (wcnt_ + cutlass.Int32(31)) >> cutlass.Int32(5)  # entries per lane
+                        seg_a = _smem_addr_reg(s_cbuf2.iterator.toint()) + (
+                            wid * wcap_
+                        ) * cutlass.Int32(8)
+                        i_ = cutlass.Int32(0)
+                        jj_ = cutlass.Int32(0)
+                        lo_ = cutlass.Int32(0)
+                        hi_ = cutlass.Int32(0)
+                        ix_ = cutlass.Int32(0)
+                        bq_ = cutlass.Int32(0)
+                        e1_ = cutlass.Int32(0)
+                        e2_ = cutlass.Int32(0)
+                        t1_ = cutlass.Int32(0)
+                        t2_ = cutlass.Int32(0)
+                        xv_ = cutlass.Float32(0.0)
+                        while i_ < ne_:  # pass 1: per-lane class counts
+                            jj_ = lane * ne_ + i_
+                            lo_, hi_ = _lds_v2_u32(
+                                seg_a + (cutlass.min(jj_, wlast_) << cutlass.Int32(3))
+                            )
+                            bq_ = cutlass.Int32(cutlass.Uint32(hi_) >> cutlass.Uint32(24))
+                            ix_ = hi_ & cutlass.Int32(0xFFFFFF)
+                            if jj_ >= wcnt_:
+                                bq_ = cutlass.Int32(-1)
+                            c1_ = c1_ + cutlass.Int32(bq_ > bacc_)
+                            c2_ = c2_ + cutlass.Int32(bq_ == bcrs_)
+                            i_ = i_ + cutlass.Int32(1)
+                        e1_, e2_ = C.warp_incl_scan_add2(c1_, c2_, lane)
+                        t1_ = cute.arch.shuffle_sync(e1_, cutlass.Int32(31))
+                        t2_ = cute.arch.shuffle_sync(e2_, cutlass.Int32(31))
+                        e1_ = e1_ - c1_
+                        e2_ = e2_ - c2_
+                        c1_ = t1_
+                        c2_ = t2_
+                        if lane == cutlass.Int32(0):
+                            s_wcnt[cutlass.Int32(NW) + wid] = c1_
+                            s_wcnt[cutlass.Int32(2 * NW) + wid] = c2_
+                        cute.arch.barrier()  # ---- barrier (CLUS FAST class counts) ----
+                        v1_ = cutlass.Int32(0)
+                        v2_ = cutlass.Int32(0)
+                        if lane < wid:  # exclusive warp prefix through one redux per class
+                            v1_ = s_wcnt[cutlass.Int32(NW) + lane]
+                            v2_ = s_wcnt[cutlass.Int32(2 * NW) + lane]
+                        if lane < cutlass.Int32(
+                            NW
+                        ):  # rank bases: sum of the per-warp A_r / C_r partials
+                            ra_ = s_wcnt[cutlass.Int32(3 * NW) + lane]
+                            rc_ = s_wcnt[cutlass.Int32(4 * NW) + lane]
+                        ra_ = cutlass.Int32(C.warp_add_i32(ra_))
+                        rc_ = cutlass.Int32(C.warp_add_i32(rc_))
+                        ra_ = ra_ + whole * rc_
+                        p1b = ra_ + cutlass.Int32(C.warp_add_i32(v1_))
+                        p2b = rc_ + cutlass.Int32(C.warp_add_i32(v2_))
+                        p1b = p1b + e1_
+                        p2b = p2b + e2_
+                        i_ = cutlass.Int32(0)
+                        while i_ < ne_:  # pass 2: emit in slice order
+                            jj_ = lane * ne_ + i_
+                            lo_, hi_ = _lds_v2_u32(
+                                seg_a + (cutlass.min(jj_, wlast_) << cutlass.Int32(3))
+                            )
+                            bq_ = cutlass.Int32(cutlass.Uint32(hi_) >> cutlass.Uint32(24))
+                            ix_ = hi_ & cutlass.Int32(0xFFFFFF)
+                            if jj_ >= wcnt_:
+                                bq_ = cutlass.Int32(-1)
+                            if bq_ > bacc_:
+                                out_row[p1b] = ix_
+                                p1b = p1b + cutlass.Int32(1)
+                            if bq_ == bcrs_:
+                                if p2b < CMP:
+                                    xv_ = C.f32_of_i32(lo_)
+                                    C._st_shared_cluster_u64(
+                                        rk64 + p2b * cutlass.Int32(8),
+                                        (cutlass.Uint64(C.fkey(xv_)) << cutlass.Uint64(32))
+                                        | cutlass.Uint64(cutlass.Uint32(ix_)),
+                                    )
+                                p2b = p2b + cutlass.Int32(1)
+                            i_ = i_ + cutlass.Int32(1)
+                    else:
+                        i = tidx
+                        while i < listN:
+                            pk64 = s_cbuf2[i]
+                            vx = cutlass.Int32(cutlass.Uint32(pk64 & cutlass.Uint64(0xFFFFFFFF)))
+                            idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
+                            xv = C.f32_of_i32(vx)
+                            self._p5_emit(
+                                xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                            )
+                            i = i + cutlass.Int32(BLK)
                 else:
-                    # ---- exactness re-sweep: OWNED CHUNKS + rank-0 true tail ----
+                    if cutlass.const_expr(self.det):
+                        bacc_ = B - whole
+                        bcrs_ = B + whole * cutlass.Int32(-1 - B)
+                        pv_ = cutlass.Int32(0)
+                        if tidx < cutlass.Int32(NBS):
+                            pv_ = s_prebin[tidx]
+                        pa_ = cutlass.Int32(
+                            C.warp_add_i32(pv_ * cutlass.Int32(tidx > bacc_))
+                        )  # per-warp partial of A_r (warps 0..NBS/32-1)
+                        pc_ = cutlass.Int32(C.warp_add_i32(pv_ * cutlass.Int32(tidx == bcrs_)))
+                        if lane == cutlass.Int32(0):
+                            s_wcnt[cutlass.Int32(3 * NW) + wid] = pa_
+                            s_wcnt[cutlass.Int32(4 * NW) + wid] = pc_
+                        ra_ = cutlass.Int32(0)
+                        rc_ = cutlass.Int32(0)
+                        lt_ = cutlass.Int32(cute.arch.lanemask_lt())
+                        c1_ = cutlass.Int32(0)
+                        c2_ = cutlass.Int32(0)
+                        p1b = cutlass.Int32(0)
+                        p2b = cutlass.Int32(0)
+                        ib_ = cutlass.Int32(0)
+                        ii_ = cutlass.Int32(0)
+                        bq_ = cutlass.Int32(0)
+                        ma_ = cutlass.Int32(0)
+                        mc_ = cutlass.Int32(0)
+                        sl_ = cutlass.Int32(0)
+                        ti = cutlass.Int32(0)
+                        xv_ = cutlass.Float32(0.0)
                     g = rank + cutlass.Int32(0)
-                    while g < nCh:
-                        lo2 = (g * cutlass.Int32(STEPC)) << cutlass.Int32(2)
-                        e4 = (g + cutlass.Int32(1)) * cutlass.Int32(STEPC)
-                        if e4 > n4:
-                            e4 = n4
-                        hi2 = e4 << cutlass.Int32(2)
-                        i = lo2 + tidx
-                        while i < hi2:
-                            x = C.ldg_f32(x_addr, i)
+                    if cutlass.const_expr(self.det):
+                        while g < nCh:
+                            lo2 = (g * cutlass.Int32(STEPC)) << cutlass.Int32(2)
+                            e4 = (g + cutlass.Int32(1)) * cutlass.Int32(STEPC)
+                            if e4 > n4:
+                                e4 = n4
+                            hi2 = e4 << cutlass.Int32(2)
+                            ib_ = lo2 + (wid << cutlass.Int32(5))
+                            while ib_ < hi2:
+                                ii_ = ib_ + lane
+                                bq_ = cutlass.Int32(-1)
+                                xv_ = cutlass.Float32(0.0)
+                                if ii_ < hi2:
+                                    xv_ = C.ldg_f32(x_addr, ii_)
+                                    if xv_ >= TF:
+                                        bq_ = cutlass.min(
+                                            C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                        )
+                                c1_ = c1_ + cutlass.Int32(C.popc(C.ballot(bq_ > bacc_)))
+                                c2_ = c2_ + cutlass.Int32(C.popc(C.ballot(bq_ == bcrs_)))
+                                ib_ = ib_ + cutlass.Int32(BLK)
+                            g = g + cutlass.Int32(CS)
+                        if wid == cutlass.Int32(0):
+                            ti = cutlass.Int32(0)
+                            while ti < tailn:
+                                ii_ = tail0 + ti + lane
+                                bq_ = cutlass.Int32(-1)
+                                xv_ = cutlass.Float32(0.0)
+                                if ti + lane < tailn:
+                                    xv_ = C.ldg_f32(x_addr, ii_)
+                                    if xv_ >= TF:
+                                        bq_ = cutlass.min(
+                                            C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                        )
+                                c1_ = c1_ + cutlass.Int32(C.popc(C.ballot(bq_ > bacc_)))
+                                c2_ = c2_ + cutlass.Int32(C.popc(C.ballot(bq_ == bcrs_)))
+                                ti = ti + cutlass.Int32(32)
+                        if lane == cutlass.Int32(0):
+                            s_wcnt[cutlass.Int32(NW) + wid] = c1_
+                            s_wcnt[cutlass.Int32(2 * NW) + wid] = c2_
+                        cute.arch.barrier()  # ---- barrier (CLUS FAST class counts) ----
+                        v1_ = cutlass.Int32(0)
+                        v2_ = cutlass.Int32(0)
+                        if lane < wid:  # exclusive warp prefix through one redux per class
+                            v1_ = s_wcnt[cutlass.Int32(NW) + lane]
+                            v2_ = s_wcnt[cutlass.Int32(2 * NW) + lane]
+                        if lane < cutlass.Int32(
+                            NW
+                        ):  # rank bases: sum of the per-warp A_r / C_r partials
+                            ra_ = s_wcnt[cutlass.Int32(3 * NW) + lane]
+                            rc_ = s_wcnt[cutlass.Int32(4 * NW) + lane]
+                        ra_ = cutlass.Int32(C.warp_add_i32(ra_))
+                        rc_ = cutlass.Int32(C.warp_add_i32(rc_))
+                        ra_ = ra_ + whole * rc_
+                        p1b = ra_ + cutlass.Int32(C.warp_add_i32(v1_))
+                        p2b = rc_ + cutlass.Int32(C.warp_add_i32(v2_))
+                        g = rank + cutlass.Int32(0)
+                        while g < nCh:
+                            lo2 = (g * cutlass.Int32(STEPC)) << cutlass.Int32(2)
+                            e4 = (g + cutlass.Int32(1)) * cutlass.Int32(STEPC)
+                            if e4 > n4:
+                                e4 = n4
+                            hi2 = e4 << cutlass.Int32(2)
+                            ib_ = lo2 + (wid << cutlass.Int32(5))
+                            while ib_ < hi2:
+                                ii_ = ib_ + lane
+                                bq_ = cutlass.Int32(-1)
+                                xv_ = cutlass.Float32(0.0)
+                                if ii_ < hi2:
+                                    xv_ = C.ldg_f32(x_addr, ii_)
+                                    if xv_ >= TF:
+                                        bq_ = cutlass.min(
+                                            C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                        )
+                                ma_ = C.ballot(bq_ > bacc_)
+                                mc_ = C.ballot(bq_ == bcrs_)
+                                if bq_ > bacc_:
+                                    out_row[p1b + cutlass.Int32(C.popc(ma_ & lt_))] = ii_
+                                if bq_ == bcrs_:
+                                    sl_ = p2b + cutlass.Int32(C.popc(mc_ & lt_))
+                                    if sl_ < CMP:
+                                        C._st_shared_cluster_u64(
+                                            rk64 + sl_ * cutlass.Int32(8),
+                                            (cutlass.Uint64(C.fkey(xv_)) << cutlass.Uint64(32))
+                                            | cutlass.Uint64(cutlass.Uint32(ii_)),
+                                        )
+                                p1b = p1b + cutlass.Int32(C.popc(ma_))
+                                p2b = p2b + cutlass.Int32(C.popc(mc_))
+                                ib_ = ib_ + cutlass.Int32(BLK)
+                            g = g + cutlass.Int32(CS)
+                        if wid == cutlass.Int32(0):
+                            ti = cutlass.Int32(0)
+                            while ti < tailn:
+                                ii_ = tail0 + ti + lane
+                                bq_ = cutlass.Int32(-1)
+                                xv_ = cutlass.Float32(0.0)
+                                if ti + lane < tailn:
+                                    xv_ = C.ldg_f32(x_addr, ii_)
+                                    if xv_ >= TF:
+                                        bq_ = cutlass.min(
+                                            C.f2s_rz((xv_ - TF) * SC), cutlass.Int32(NBS - 1)
+                                        )
+                                ma_ = C.ballot(bq_ > bacc_)
+                                mc_ = C.ballot(bq_ == bcrs_)
+                                if bq_ > bacc_:
+                                    out_row[p1b + cutlass.Int32(C.popc(ma_ & lt_))] = ii_
+                                if bq_ == bcrs_:
+                                    sl_ = p2b + cutlass.Int32(C.popc(mc_ & lt_))
+                                    if sl_ < CMP:
+                                        C._st_shared_cluster_u64(
+                                            rk64 + sl_ * cutlass.Int32(8),
+                                            (cutlass.Uint64(C.fkey(xv_)) << cutlass.Uint64(32))
+                                            | cutlass.Uint64(cutlass.Uint32(ii_)),
+                                        )
+                                p1b = p1b + cutlass.Int32(C.popc(ma_))
+                                p2b = p2b + cutlass.Int32(C.popc(mc_))
+                                ti = ti + cutlass.Int32(32)
+                    else:
+                        while g < nCh:
+                            lo2 = (g * cutlass.Int32(STEPC)) << cutlass.Int32(2)
+                            e4 = (g + cutlass.Int32(1)) * cutlass.Int32(STEPC)
+                            if e4 > n4:
+                                e4 = n4
+                            hi2 = e4 << cutlass.Int32(2)
+                            i = lo2 + tidx
+                            while i < hi2:
+                                x = C.ldg_f32(x_addr, i)
+                                if x >= TF:
+                                    self._p5_emit(
+                                        x,
+                                        i,
+                                        TF,
+                                        SC,
+                                        B,
+                                        above,
+                                        lim1,
+                                        whole,
+                                        CMP,
+                                        s_mrg,
+                                        out_row,
+                                        rk64,
+                                    )
+                                i = i + cutlass.Int32(BLK)
+                            g = g + cutlass.Int32(CS)
+                        t2 = tidx
+                        while t2 < tailn:
+                            ii = tail0 + t2
+                            x = C.ldg_f32(x_addr, ii)
                             if x >= TF:
                                 self._p5_emit(
-                                    x, i, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                                    x, ii, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
                                 )
-                            i = i + cutlass.Int32(BLK)
-                        g = g + cutlass.Int32(CS)
-                    t2 = tidx
-                    while t2 < tailn:
-                        ii = tail0 + t2
-                        x = C.ldg_f32(x_addr, ii)
-                        if x >= TF:
-                            self._p5_emit(
-                                x, ii, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
-                            )
-                        t2 = t2 + cutlass.Int32(BLK)
+                            t2 = t2 + cutlass.Int32(BLK)
 
             # ============ EXIT RENDEZVOUS ============
             # all DSMEM traffic retired; the ONLY exit rendezvous. rank!=0
@@ -5507,20 +9345,50 @@ class GvrClusKernel:
                                 # re-assert Uint64 at every unsigned compare
                                 # in/after dynamic loops.
                                 u64v = s_ck64[i]
+                                if cutlass.const_expr(self.det):
+                                    u64f = (cutlass.Uint64(u64v) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                        cutlass.Uint64(u64v) & cutlass.Uint64(0xFFFFFFFF)
+                                    )
                                 r_ = cutlass.Int32(0)
                                 jq = cutlass.Int32(0)
                                 while jq < mc2:  # ulonglong2 16B reads
                                     vlo, vhi = C._lds_v2_u64(ck_addr + jq * cutlass.Int32(8))
-                                    r_ = (
-                                        r_
-                                        + cutlass.Int32(vlo > cutlass.Uint64(u64v))
-                                        + cutlass.Int32(vhi > cutlass.Uint64(u64v))
-                                    )
+                                    if cutlass.const_expr(self.det):
+                                        vlf = (cutlass.Uint64(vlo) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                            cutlass.Uint64(vlo) & cutlass.Uint64(0xFFFFFFFF)
+                                        )
+                                        vhf = (cutlass.Uint64(vhi) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                            cutlass.Uint64(vhi) & cutlass.Uint64(0xFFFFFFFF)
+                                        )
+                                        r_ = (
+                                            r_
+                                            + cutlass.Int32(
+                                                cutlass.Uint64(vlf) > cutlass.Uint64(u64f)
+                                            )
+                                            + cutlass.Int32(
+                                                cutlass.Uint64(vhf) > cutlass.Uint64(u64f)
+                                            )
+                                        )
+                                    else:
+                                        r_ = (
+                                            r_
+                                            + cutlass.Int32(vlo > cutlass.Uint64(u64v))
+                                            + cutlass.Int32(vhi > cutlass.Uint64(u64v))
+                                        )
                                     jq = jq + cutlass.Int32(2)
                                 if mc2 < mc:  # odd tail
-                                    r_ = r_ + cutlass.Int32(
-                                        cutlass.Uint64(s_ck64[mc2]) > cutlass.Uint64(u64v)
-                                    )
+                                    if cutlass.const_expr(self.det):
+                                        vtl = cutlass.Uint64(s_ck64[mc2])
+                                        vtf = (cutlass.Uint64(vtl) | cutlass.Uint64(0xFFFFFFFF)) - (
+                                            cutlass.Uint64(vtl) & cutlass.Uint64(0xFFFFFFFF)
+                                        )
+                                        r_ = r_ + cutlass.Int32(
+                                            cutlass.Uint64(vtf) > cutlass.Uint64(u64f)
+                                        )
+                                    else:
+                                        r_ = r_ + cutlass.Int32(
+                                            cutlass.Uint64(s_ck64[mc2]) > cutlass.Uint64(u64v)
+                                        )
                                 if r_ < need:
                                     out_row[above + r_] = cutlass.Int32(
                                         cutlass.Uint32(
@@ -5529,7 +9397,6 @@ class GvrClusKernel:
                                     )
                                 i = i + cutlass.Int32(BLK)
                         else:
-                            # key-space narrowing over ck64c
                             if tidx == cutlass.Int32(0):
                                 s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                                 s_kmm[1] = cutlass.Uint32(0)
@@ -5614,38 +9481,224 @@ class GvrClusKernel:
                                 s_scal[2] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (emit counters) ----
                             it2 = (mc + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                            it = cutlass.Int32(0)
-                            while it < it2:  # ballot emit
-                                i = it * cutlass.Int32(BLK) + tidx
-                                p1 = cutlass.Int32(0)
-                                p2 = cutlass.Int32(0)
-                                idv = cutlass.Int32(0)
-                                if i < mc:
-                                    w64 = s_ck64[i]
-                                    iu = cutlass.Int64(cutlass.Uint32(w64 >> cutlass.Uint64(32)))
-                                    idv = cutlass.Int32(
-                                        cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                            if cutlass.const_expr(self.det):
+                                det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                                    cutlass.Uint32(n) - cutlass.Uint32(1)
+                                )  # ~idx >= 2^32 - n
+                                det_hi = cutlass.Uint32(0xFFFFFFFF)
+                                det_need = needC
+                                det_thr = cutlass.Int64(-1)
+                                det_sh = cutlass.Uint32(0)
+                                det_ph = cutlass.Int32(1)
+                                if needC > cutlass.Int32(0):
+                                    if mm > needC:
+                                        det_ph = cutlass.Int32(0)
+                                while det_ph <= cutlass.Int32(1):
+                                    if det_ph == cutlass.Int32(0):
+                                        det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                        det_bw = cutlass.Int32(32) - C.clz_i32(
+                                            cutlass.Int32(det_d | cutlass.Uint32(1))
+                                        )
+                                        det_s = det_bw - cutlass.Int32(self.lb)
+                                        if det_s < cutlass.Int32(0):
+                                            det_s = cutlass.Int32(0)
+                                        det_sh = cutlass.Uint32(det_s)
+                                    dc1 = cutlass.Int32(0)  # DET CLUS: class counts, pass 1
+                                    dc2 = cutlass.Int32(0)
+                                    it = cutlass.Int32(0)
+                                    while it < it2:  # ballot emit
+                                        i = it * cutlass.Int32(BLK) + tidx
+                                        p1 = cutlass.Int32(0)
+                                        p2 = cutlass.Int32(0)
+                                        idv = cutlass.Int32(0)
+                                        if i < mc:
+                                            w64 = s_ck64[i]
+                                            iu = cutlass.Int64(
+                                                cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                            )
+                                            idv = cutlass.Int32(
+                                                cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                            )
+                                            if iu > ethr:
+                                                p1 = cutlass.Int32(1)
+                                            if iu == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    idv
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(NBS - 1):
+                                                                det_b = cutlass.Uint32(NBS - 1)
+                                                            C.atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        p2 = cutlass.Int32(1)
+                                        if det_ph == cutlass.Int32(1):
+                                            dc1 = dc1 + p1
+                                            dc2 = dc2 + p2
+                                        it = it + cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(1):
+                                        s1_, s2_ = C.warp_incl_scan_add2(dc1, dc2, lane)
+                                        if lane == cutlass.Int32(31):
+                                            s_ws[wid] = s1_
+                                            s_wmn[wid] = cutlass.Uint32(s2_)
+                                        cute.arch.barrier()  # DET CLUS: warp totals published
+                                        v1_ = cutlass.Int32(0)
+                                        v2_ = cutlass.Int32(0)
+                                        if lane < cutlass.Int32(NW):
+                                            v1_ = s_ws[lane]
+                                            v2_ = cutlass.Int32(s_wmn[lane])
+                                        i1_, i2_ = C.warp_incl_scan_add2(v1_, v2_, lane)
+                                        p1e = (
+                                            cute.arch.shuffle_sync(i1_, wid)
+                                            - cute.arch.shuffle_sync(v1_, wid)
+                                            + (s1_ - dc1)
+                                        )
+                                        p2e = (
+                                            cute.arch.shuffle_sync(i2_, wid)
+                                            - cute.arch.shuffle_sync(v2_, wid)
+                                            + (s2_ - dc2)
+                                        )
+                                        it = cutlass.Int32(0)
+                                        while it < it2:
+                                            i = it * cutlass.Int32(BLK) + tidx
+                                            p1 = cutlass.Int32(0)
+                                            p2 = cutlass.Int32(0)
+                                            idv = cutlass.Int32(0)
+                                            if i < mc:
+                                                w64 = s_ck64[i]
+                                                iu = cutlass.Int64(
+                                                    cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                                )
+                                                idv = cutlass.Int32(
+                                                    cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                                )
+                                                if iu > ethr:
+                                                    p1 = cutlass.Int32(1)
+                                                if iu == ethr:
+                                                    det_u = cutlass.Uint32(
+                                                        0xFFFFFFFF
+                                                    ) - cutlass.Uint32(idv)
+                                                    if det_ph == cutlass.Int32(0):
+                                                        if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                            det_lo
+                                                        ):
+                                                            if cutlass.Uint32(
+                                                                det_u
+                                                            ) <= cutlass.Uint32(det_hi):
+                                                                det_b = (
+                                                                    cutlass.Uint32(det_u)
+                                                                    - cutlass.Uint32(det_lo)
+                                                                ) >> cutlass.Uint32(det_sh)
+                                                                if det_b > cutlass.Uint32(NBS - 1):
+                                                                    det_b = cutlass.Uint32(NBS - 1)
+                                                                C.atomic_add_cta(
+                                                                    s_hist.iterator
+                                                                    + cutlass.Int32(det_b),
+                                                                    cutlass.Int32(1),
+                                                                )
+                                                    else:
+                                                        if (
+                                                            cutlass.Int64(cutlass.Uint32(det_u))
+                                                            > det_thr
+                                                        ):
+                                                            p2 = cutlass.Int32(1)
+                                            if p1 != cutlass.Int32(0):
+                                                if p1e < aboveC:
+                                                    out_row[above + p1e] = idv
+                                                p1e = p1e + cutlass.Int32(1)
+                                            if p2 != cutlass.Int32(0):
+                                                if p2e < needC:
+                                                    out_row[above + aboveC + p2e] = idv
+                                                p2e = p2e + cutlass.Int32(1)
+                                            it = it + cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(0):
+                                        cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                        C.scan_cross0(
+                                            s_hist,
+                                            det_need,
+                                            tidx,
+                                            s_res,
+                                            cutlass.Int32(0),
+                                            cutlass.Int32(0),
+                                            s_hist,
+                                            nb=NBS,
+                                            zero=True,
+                                        )
+                                        cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                        det_need = det_need - s_res[C.RES_ABOVE]
+                                        det_m = s_res[C.RES_M]
+                                        det_bin = s_res[C.RES_B]
+                                        det_nlo = cutlass.Uint32(det_lo) + (
+                                            cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                        )
+                                        if det_bin != cutlass.Int32(NBS - 1):
+                                            det_hi = det_nlo + (
+                                                (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                                - cutlass.Uint32(1)
+                                            )
+                                        det_lo = det_nlo
+                                        if det_need == det_m:
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                        elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                    else:
+                                        det_ph = cutlass.Int32(2)
+                            else:
+                                it = cutlass.Int32(0)
+                                while it < it2:  # ballot emit
+                                    i = it * cutlass.Int32(BLK) + tidx
+                                    p1 = cutlass.Int32(0)
+                                    p2 = cutlass.Int32(0)
+                                    idv = cutlass.Int32(0)
+                                    if i < mc:
+                                        w64 = s_ck64[i]
+                                        iu = cutlass.Int64(
+                                            cutlass.Uint32(w64 >> cutlass.Uint64(32))
+                                        )
+                                        idv = cutlass.Int32(
+                                            cutlass.Uint32(w64 & cutlass.Uint64(0xFFFFFFFF))
+                                        )
+                                        if iu > ethr:
+                                            p1 = cutlass.Int32(1)
+                                        if iu == ethr:
+                                            p2 = cutlass.Int32(1)
+                                    self._ballot_pair_emit(
+                                        p1,
+                                        p2,
+                                        idv,
+                                        above,
+                                        aboveC,
+                                        above + aboveC,
+                                        needC,
+                                        out_row,
+                                        s_scal,
+                                        lane,
                                     )
-                                    if iu > ethr:
-                                        p1 = cutlass.Int32(1)
-                                    if iu == ethr:
-                                        p2 = cutlass.Int32(1)
-                                self._ballot_pair_emit(
-                                    p1,
-                                    p2,
-                                    idv,
-                                    above,
-                                    aboveC,
-                                    above + aboveC,
-                                    needC,
-                                    out_row,
-                                    s_scal,
-                                    lane,
-                                )
-                                it = it + cutlass.Int32(1)
+                                    it = it + cutlass.Int32(1)
                 else:
-                    # ---- degen fallback: whole-row key-space narrowing
-                    # (per-level clear + scan_cross w/ ws) ----
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
                     above2 = cutlass.Int32(0)
@@ -5726,23 +9779,201 @@ class GvrClusKernel:
                         nA = above2
                         nT = need2
                     it2 = (n + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                    it = cutlass.Int32(0)
-                    while it < it2:
-                        i = it * cutlass.Int32(BLK) + tidx
-                        p1 = cutlass.Int32(0)
-                        p2 = cutlass.Int32(0)
-                        if i < n:
-                            uq = C.fkey(C.ldg_f32(x_addr, i))
-                            iu = cutlass.Int64(uq)
-                            if iu > ethr:
-                                p1 = cutlass.Int32(1)
-                            if tie_m != cutlass.Int32(0):
-                                if iu == ethr:
-                                    p2 = cutlass.Int32(1)
-                        self._ballot_pair_emit(
-                            p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
-                        )
-                        it = it + cutlass.Int32(1)
+                    if cutlass.const_expr(self.det):
+                        det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                            cutlass.Uint32(n) - cutlass.Uint32(1)
+                        )  # ~idx >= 2^32 - n
+                        det_hi = cutlass.Uint32(0xFFFFFFFF)
+                        det_need = need2
+                        det_thr = cutlass.Int64(-1)
+                        det_sh = cutlass.Uint32(0)
+                        det_ph = cutlass.Int32(1)
+                        if need2 > cutlass.Int32(0):
+                            if m2 > need2:
+                                det_ph = cutlass.Int32(0)
+                        if det_ph == cutlass.Int32(0):
+                            if m2 == n:  # every valid position ties: take the first L positions
+                                det_thr = cutlass.Int64(
+                                    cutlass.Uint32(0xFFFFFFFF)
+                                    - cutlass.Uint32(cutlass.Int32(0) + need2 - cutlass.Int32(1))
+                                ) - cutlass.Int64(1)
+                                det_ph = cutlass.Int32(1)
+                        while det_ph <= cutlass.Int32(1):
+                            if det_ph == cutlass.Int32(0):
+                                det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                det_bw = cutlass.Int32(32) - C.clz_i32(
+                                    cutlass.Int32(det_d | cutlass.Uint32(1))
+                                )
+                                det_s = det_bw - cutlass.Int32(self.lb)
+                                if det_s < cutlass.Int32(0):
+                                    det_s = cutlass.Int32(0)
+                                det_sh = cutlass.Uint32(det_s)
+                                if tidx < cutlass.Int32(NBS):
+                                    s_hist[tidx] = cutlass.Int32(0)
+                                cute.arch.barrier()  # ---- barrier (det level clear) ----
+                            dc1 = cutlass.Int32(0)  # CLUS FAST: class counts, pass 1
+                            dc2 = cutlass.Int32(0)
+                            it = cutlass.Int32(0)
+                            while it < it2:
+                                i = it * cutlass.Int32(BLK) + tidx
+                                p1 = cutlass.Int32(0)
+                                p2 = cutlass.Int32(0)
+                                if i < n:
+                                    uq = C.fkey(C.ldg_f32(x_addr, i))
+                                    iu = cutlass.Int64(uq)
+                                    if iu > ethr:
+                                        p1 = cutlass.Int32(1)
+                                    if tie_m != cutlass.Int32(0):
+                                        if iu == ethr:
+                                            det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(i)
+                                            if det_ph == cutlass.Int32(0):
+                                                if cutlass.Uint32(det_u) >= cutlass.Uint32(det_lo):
+                                                    if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                        det_hi
+                                                    ):
+                                                        det_b = (
+                                                            cutlass.Uint32(det_u)
+                                                            - cutlass.Uint32(det_lo)
+                                                        ) >> cutlass.Uint32(det_sh)
+                                                        if det_b > cutlass.Uint32(NBS - 1):
+                                                            det_b = cutlass.Uint32(NBS - 1)
+                                                        C.atomic_add_cta(
+                                                            s_hist.iterator + cutlass.Int32(det_b),
+                                                            cutlass.Int32(1),
+                                                        )
+                                            else:
+                                                if cutlass.Int64(cutlass.Uint32(det_u)) > det_thr:
+                                                    p2 = cutlass.Int32(1)
+                                if det_ph == cutlass.Int32(1):
+                                    dc1 = dc1 + p1
+                                    dc2 = dc2 + p2
+                                it = it + cutlass.Int32(1)
+                            if det_ph == cutlass.Int32(1):
+                                s1_, s2_ = C.warp_incl_scan_add2(dc1, dc2, lane)
+                                if lane == cutlass.Int32(31):
+                                    s_ws[wid] = s1_
+                                    s_wmn[wid] = cutlass.Uint32(s2_)
+                                cute.arch.barrier()  # DET CLUS: warp totals published
+                                v1_ = cutlass.Int32(0)
+                                v2_ = cutlass.Int32(0)
+                                if lane < cutlass.Int32(NW):
+                                    v1_ = s_ws[lane]
+                                    v2_ = cutlass.Int32(s_wmn[lane])
+                                i1_, i2_ = C.warp_incl_scan_add2(v1_, v2_, lane)
+                                p1e = (
+                                    cute.arch.shuffle_sync(i1_, wid)
+                                    - cute.arch.shuffle_sync(v1_, wid)
+                                    + (s1_ - dc1)
+                                )
+                                p2e = (
+                                    cute.arch.shuffle_sync(i2_, wid)
+                                    - cute.arch.shuffle_sync(v2_, wid)
+                                    + (s2_ - dc2)
+                                )
+                                it = cutlass.Int32(0)
+                                while it < it2:
+                                    i = it * cutlass.Int32(BLK) + tidx
+                                    p1 = cutlass.Int32(0)
+                                    p2 = cutlass.Int32(0)
+                                    if i < n:
+                                        uq = C.fkey(C.ldg_f32(x_addr, i))
+                                        iu = cutlass.Int64(uq)
+                                        if iu > ethr:
+                                            p1 = cutlass.Int32(1)
+                                        if tie_m != cutlass.Int32(0):
+                                            if iu == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    i
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(NBS - 1):
+                                                                det_b = cutlass.Uint32(NBS - 1)
+                                                            C.atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        p2 = cutlass.Int32(1)
+                                    if p1 != cutlass.Int32(0):
+                                        if p1e < nA:
+                                            out_row[p1e] = i
+                                        p1e = p1e + cutlass.Int32(1)
+                                    if p2 != cutlass.Int32(0):
+                                        if p2e < nT:
+                                            out_row[nA + p2e] = i
+                                        p2e = p2e + cutlass.Int32(1)
+                                    it = it + cutlass.Int32(1)
+                            if det_ph == cutlass.Int32(0):
+                                cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                C.scan_cross(
+                                    s_hist,
+                                    s_ws,
+                                    det_need,
+                                    tidx,
+                                    s_res,
+                                    cutlass.Int32(0),
+                                    blk=BLK,
+                                    nb=NBS,
+                                    two=False,
+                                )
+                                cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                det_need = det_need - s_res[C.RES_ABOVE]
+                                det_m = s_res[C.RES_M]
+                                det_bin = s_res[C.RES_B]
+                                det_nlo = cutlass.Uint32(det_lo) + (
+                                    cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                )
+                                if det_bin != cutlass.Int32(NBS - 1):
+                                    det_hi = det_nlo + (
+                                        (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                        - cutlass.Uint32(1)
+                                    )
+                                det_lo = det_nlo
+                                if det_need == det_m:
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                                elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                    det_thr = cutlass.Int64(cutlass.Uint32(det_lo)) - cutlass.Int64(
+                                        1
+                                    )
+                                    det_ph = cutlass.Int32(1)
+                            else:
+                                det_ph = cutlass.Int32(2)
+                    else:
+                        it = cutlass.Int32(0)
+                        while it < it2:
+                            i = it * cutlass.Int32(BLK) + tidx
+                            p1 = cutlass.Int32(0)
+                            p2 = cutlass.Int32(0)
+                            if i < n:
+                                uq = C.fkey(C.ldg_f32(x_addr, i))
+                                iu = cutlass.Int64(uq)
+                                if iu > ethr:
+                                    p1 = cutlass.Int32(1)
+                                if tie_m != cutlass.Int32(0):
+                                    if iu == ethr:
+                                        p2 = cutlass.Int32(1)
+                            self._ballot_pair_emit(
+                                p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
+                            )
+                            it = it + cutlass.Int32(1)
 
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
@@ -5800,6 +10031,7 @@ def get_compiled__clus(
     next_n: int = 1,
     cr_shift: int = 0,
     hint_free: bool = False,
+    det: bool = False,
 ) -> Any:
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -5813,6 +10045,7 @@ def get_compiled__clus(
         int(next_n),
         int(cr_shift),
         bool(hint_free),
+        bool(det),
     )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
@@ -5830,6 +10063,7 @@ def get_compiled__clus(
         next_n=next_n,
         cr_shift=cr_shift,
         hint_free=hint_free,
+        det=det,
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6048,7 +10282,9 @@ class GvrRegClusKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        det: bool = False,
     ) -> None:
+        self.det = bool(det)
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
         self.blk = blk
@@ -6091,6 +10327,8 @@ class GvrRegClusKernel:
         tid, _, _ = cute.arch.thread_idx()
         rank, row, _ = cute.arch.block_idx()  # bx=rank
         lane = tid & cutlass.Int32(31)
+        if cutlass.const_expr(self.det):
+            dw = tid >> cutlass.Int32(5)  # DET SLOTS: warp index
 
         # ============ per-row varlen prologue — shared contract lives in ======
         # GvrMainKernel's prologue (per-row n from kv_lens, clamped to the
@@ -6136,8 +10374,9 @@ class GvrRegClusKernel:
         rnk = cutlass.Int32(0)
         tinc = cutlass.Int32(0)
         mc = cutlass.Int32(0)
-        p = cutlass.Int32(0)
-        q2i = cutlass.Int32(0)
+        if cutlass.const_expr(not self.det):
+            p = cutlass.Int32(0)
+            q2i = cutlass.Int32(0)
         idx = cutlass.Int32(0)
         lim1 = cutlass.Int32(0)
         aboveC = cutlass.Int32(0)
@@ -6183,7 +10422,8 @@ class GvrRegClusKernel:
         bn = cutlass.Uint32(0)
         ethr = cutlass.Int64(0)
         tval = cutlass.Float32(_NEG_INF__regclus)
-        LOQ = cutlass.Float32(0.0)
+        if cutlass.const_expr(not self.det):
+            LOQ = cutlass.Float32(0.0)
         qv = cutlass.Float32(0.0)
 
         if short == cutlass.Int32(0):
@@ -6203,6 +10443,13 @@ class GvrRegClusKernel:
             s_ws = _smem_view__regclus(cutlass.Int32, sbase, 16, 32)
             s_wmn = _smem_view__regclus(cutlass.Uint32, sbase, 48, 32)
             s_wmx = _smem_view__regclus(cutlass.Uint32, sbase, 80, 32)
+            if cutlass.const_expr(self.det):
+                s_dw = _smem_view__regclus(
+                    cutlass.Int32, sbase, 16, 64
+                )  # DET SLOTS: per-warp class counts (aliases ws+wmn)
+                s_dx = _smem_view__regclus(
+                    cutlass.Int32, sbase, 80, 32
+                )  # DET SLOTS: per-warp hoff partials (aliases wmx)
             s_hist = _smem_view__regclus(cutlass.Int32, sbase, W_HIST, NB__regclus)
             s_mrg = _smem_view__regclus(cutlass.Int32, sbase, W_MRG, NB__regclus)
             s_hoff = _smem_view__regclus(cutlass.Int32, sbase, W_HOFF, NB__regclus)
@@ -6351,34 +10598,220 @@ class GvrRegClusKernel:
             if okc == cutlass.Int32(0):
                 whole = cutlass.Int32(0)
                 degen = cutlass.Int32(1)
-            for z in cutlass.range_constexpr(NB__regclus // self.blk):
-                i = tid + cutlass.Int32(z * self.blk)
-                s_mrg[i] = s_mrg[i] + s_hoff[i]  # global cursor
+            if cutlass.const_expr(self.det):
+                dsp = cutlass.Int32(0)
+                for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                    i = tid + cutlass.Int32(z * self.blk)
+                    if i > Bv:
+                        dsp = dsp + s_hoff[i]
+                dsp = cutlass.Int32(warp_add_i32(dsp))
+                if lane == cutlass.Int32(0):
+                    s_dx[dw] = dsp
+            else:
+                for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                    i = tid + cutlass.Int32(z * self.blk)
+                    s_mrg[i] = s_mrg[i] + s_hoff[i]  # global cursor
             cute.arch.barrier()  # cursors published
 
             # ---- P7: register sweep emit (!degen)
-            if degen == cutlass.Int32(0):
-                LOQ = cutlass.Float32(Bv)
-                lim1 = above
+            if cutlass.const_expr(self.det):
+                v1 = cutlass.Int32(0)
+                if lane < cutlass.Int32(NW):
+                    v1 = s_dx[lane]
+                dR1 = cutlass.Int32(warp_add_i32(v1))
+                dR2 = s_hoff[Bv]
                 if whole == cutlass.Int32(1):
-                    lim1 = above + m
-                for s in cutlass.range_constexpr(S):
-                    qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)  # bit-identical
-                    if qv >= LOQ:
-                        bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-                        p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
-                        idx = (
-                            (base4 + tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                        ) + cutlass.Int32(s % 4)
-                        if p < lim1:
-                            out_row[p] = idx
+                    dR1 = dR1 + dR2
+                if degen == cutlass.Int32(0):
+                    HIf = cutlass.Float32(_POS_INF)
+                    LOf = cutlass.Float32(_POS_INF)
+                    if whole == cutlass.Int32(1):
+                        HIf = cutlass.Float32(Bv)
+                    else:
+                        if Bv < cutlass.Int32(NB__regclus - 1):
+                            HIf = cutlass.Float32(Bv + cutlass.Int32(1))
+                        LOf = cutlass.Float32(Bv)
+                    m1 = cutlass.Int32(0)
+                    m2 = cutlass.Int32(0)
+                    for s in cutlass.range_constexpr(S):
+                        qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)  # bit-identical
+                        if qv >= HIf:
+                            m1 = m1 | cutlass.Int32(1 << s)
                         else:
-                            if whole == cutlass.Int32(0):
-                                # crossing overflow -> striped DSMEM slabs; TWO
-                                # separate u32 remote stores (NOT packed)
-                                q2i = p - above
-                                rnk = q2i >> cutlass.Int32(LCMPC)
-                                j = (q2i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
+                            if qv >= LOf:
+                                m2 = m2 | cutlass.Int32(1 << s)
+                    qv = _fmaf__regclus(tval, SC, CQ)  # tail (rank 0 only; -INF elsewhere)
+                    t1 = cutlass.Int32(0)
+                    t2 = cutlass.Int32(0)
+                    if qv >= HIf:
+                        t1 = cutlass.Int32(1)
+                    else:
+                        if qv >= LOf:
+                            t2 = cutlass.Int32(1)
+                    lml = cutlass.Int32(cute.arch.lanemask_lt())
+                    c1 = popc(m1) + t1
+                    c2 = popc(m2) + t2
+                    w1 = cutlass.Int32(warp_add_i32(c1))
+                    w2 = cutlass.Int32(warp_add_i32(c2))
+                    x1 = cutlass.Int32(0)
+                    x1 = x1 + (
+                        popc(
+                            ballot(
+                                ((c1 >> cutlass.Int32(0)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(0)
+                    )
+                    x1 = x1 + (
+                        popc(
+                            ballot(
+                                ((c1 >> cutlass.Int32(1)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(1)
+                    )
+                    x1 = x1 + (
+                        popc(
+                            ballot(
+                                ((c1 >> cutlass.Int32(2)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(2)
+                    )
+                    x1 = x1 + (
+                        popc(
+                            ballot(
+                                ((c1 >> cutlass.Int32(3)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(3)
+                    )
+                    x1 = x1 + (
+                        popc(
+                            ballot(
+                                ((c1 >> cutlass.Int32(4)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(4)
+                    )
+                    if cutlass.const_expr(S + 1 >= 32):
+                        x1 = x1 + (
+                            popc(
+                                ballot(
+                                    ((c1 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(5)
+                        )
+                    x2 = cutlass.Int32(0)
+                    x2 = x2 + (
+                        popc(
+                            ballot(
+                                ((c2 >> cutlass.Int32(0)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(0)
+                    )
+                    x2 = x2 + (
+                        popc(
+                            ballot(
+                                ((c2 >> cutlass.Int32(1)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(1)
+                    )
+                    x2 = x2 + (
+                        popc(
+                            ballot(
+                                ((c2 >> cutlass.Int32(2)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(2)
+                    )
+                    x2 = x2 + (
+                        popc(
+                            ballot(
+                                ((c2 >> cutlass.Int32(3)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(3)
+                    )
+                    x2 = x2 + (
+                        popc(
+                            ballot(
+                                ((c2 >> cutlass.Int32(4)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                            )
+                            & lml
+                        )
+                        << cutlass.Int32(4)
+                    )
+                    if cutlass.const_expr(S + 1 >= 32):
+                        x2 = x2 + (
+                            popc(
+                                ballot(
+                                    ((c2 >> cutlass.Int32(5)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
+                                )
+                                & lml
+                            )
+                            << cutlass.Int32(5)
+                        )
+                    if lane == cutlass.Int32(0):
+                        s_dw[dw] = w1
+                        s_dw[32 + dw] = w2
+                    cute.arch.barrier()  # DET SLOTS: warp totals published
+                    v1 = cutlass.Int32(0)
+                    v2 = cutlass.Int32(0)
+                    if lane < cutlass.Int32(NW):
+                        v1 = s_dw[lane]
+                        v2 = s_dw[32 + lane]
+                    tot1 = cutlass.Int32(warp_add_i32(v1))
+                    tot2 = cutlass.Int32(warp_add_i32(v2))
+                    if lane >= dw:
+                        v1 = cutlass.Int32(0)
+                        v2 = cutlass.Int32(0)
+                    b1 = cutlass.Int32(warp_add_i32(v1))
+                    b2 = cutlass.Int32(warp_add_i32(v2))
+                    p1 = dR1 + b1 + x1
+                    p2 = dR2 + b2 + x2
+                    lim1 = above
+                    if whole == cutlass.Int32(1):
+                        lim1 = above + m
+                    ewm = m1
+                    while ewm != cutlass.Int32(0):
+                        esd = ffs_m1(ewm)
+                        idx = (
+                            ((base4 + tid) + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                            << cutlass.Int32(2)
+                        ) + (esd & cutlass.Int32(3))
+                        if p1 < lim1:
+                            out_row[p1] = idx
+                        p1 = p1 + cutlass.Int32(1)
+                        ewm = ewm & (ewm - cutlass.Int32(1))
+                    if t1 == cutlass.Int32(1):
+                        if p1 < lim1:
+                            out_row[p1] = tix
+                        p1 = p1 + cutlass.Int32(1)
+                    if m2 != cutlass.Int32(0):  # static-unrolled: striped DSMEM slabs
+                        for s in cutlass.range_constexpr(S):
+                            if (m2 & cutlass.Int32(1 << s)) != cutlass.Int32(0):
+                                idx = (
+                                    (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                    << cutlass.Int32(2)
+                                ) + cutlass.Int32(s % 4)
+                                rnk = p2 >> cutlass.Int32(LCMPC)
+                                j = (p2 & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
                                 _st_shared_cluster_i32(
                                     _mapa_shared_cluster_addr(ck_addr + j, rnk),
                                     fkey(_val__regclus(frags, s)),
@@ -6386,22 +10819,64 @@ class GvrRegClusKernel:
                                 _st_shared_cluster_i32(
                                     _mapa_shared_cluster_addr(ci_addr + j, rnk), idx
                                 )
-                # tail element: tval == -INF fails q>=LOQ elsewhere
-                qv = _fmaf__regclus(tval, SC, CQ)
-                if qv >= LOQ:
-                    bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-                    p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
-                    if p < lim1:
-                        out_row[p] = tix
-                    else:
-                        if whole == cutlass.Int32(0):
-                            q2i = p - above
-                            rnk = q2i >> cutlass.Int32(LCMPC)
-                            j = (q2i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
-                            _st_shared_cluster_i32(
-                                _mapa_shared_cluster_addr(ck_addr + j, rnk), fkey(tval)
-                            )
-                            _st_shared_cluster_i32(_mapa_shared_cluster_addr(ci_addr + j, rnk), tix)
+                                p2 = p2 + cutlass.Int32(1)
+                    if t2 == cutlass.Int32(1):
+                        rnk = p2 >> cutlass.Int32(LCMPC)
+                        j = (p2 & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
+                        _st_shared_cluster_i32(
+                            _mapa_shared_cluster_addr(ck_addr + j, rnk), fkey(tval)
+                        )
+                        _st_shared_cluster_i32(_mapa_shared_cluster_addr(ci_addr + j, rnk), tix)
+                        p2 = p2 + cutlass.Int32(1)
+            else:
+                if degen == cutlass.Int32(0):
+                    LOQ = cutlass.Float32(Bv)
+                    lim1 = above
+                    if whole == cutlass.Int32(1):
+                        lim1 = above + m
+                    for s in cutlass.range_constexpr(S):
+                        qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)  # bit-identical
+                        if qv >= LOQ:
+                            bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
+                            p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                            idx = (
+                                (base4 + tid + cutlass.Int32((s // 4) * self.blk))
+                                << cutlass.Int32(2)
+                            ) + cutlass.Int32(s % 4)
+                            if p < lim1:
+                                out_row[p] = idx
+                            else:
+                                if whole == cutlass.Int32(0):
+                                    # crossing overflow -> striped DSMEM slabs; TWO
+                                    # separate u32 remote stores (NOT packed)
+                                    q2i = p - above
+                                    rnk = q2i >> cutlass.Int32(LCMPC)
+                                    j = (q2i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
+                                    _st_shared_cluster_i32(
+                                        _mapa_shared_cluster_addr(ck_addr + j, rnk),
+                                        fkey(_val__regclus(frags, s)),
+                                    )
+                                    _st_shared_cluster_i32(
+                                        _mapa_shared_cluster_addr(ci_addr + j, rnk), idx
+                                    )
+                    # tail element: tval == -INF fails q>=LOQ elsewhere
+                    qv = _fmaf__regclus(tval, SC, CQ)
+                    if qv >= LOQ:
+                        bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
+                        p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                        if p < lim1:
+                            out_row[p] = tix
+                        else:
+                            if whole == cutlass.Int32(0):
+                                q2i = p - above
+                                rnk = q2i >> cutlass.Int32(LCMPC)
+                                j = (q2i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)
+                                _st_shared_cluster_i32(
+                                    _mapa_shared_cluster_addr(ck_addr + j, rnk), fkey(tval)
+                                )
+                                _st_shared_cluster_i32(
+                                    _mapa_shared_cluster_addr(ci_addr + j, rnk), tix
+                                )
 
             # ---- P8: release staging to rank 0
             cute.arch.barrier()
@@ -6420,6 +10895,8 @@ class GvrRegClusKernel:
                             i = tid
                             while i < mc:
                                 uq = cutlass.Uint32(s_ck[i])
+                                if cutlass.const_expr(self.det):
+                                    uci = s_ci[i]  # DET: logical-index tie-break
                                 rnk = cutlass.Int32(0)
                                 j = cutlass.Int32(0)
                                 while j < mc:
@@ -6428,16 +10905,21 @@ class GvrRegClusKernel:
                                     if vq > uq:
                                         tinc = cutlass.Int32(1)
                                     if vq == uq:
-                                        if j < i:
-                                            tinc = cutlass.Int32(1)
+                                        if cutlass.const_expr(self.det):
+                                            if s_ci[j] < uci:
+                                                tinc = cutlass.Int32(1)
+                                        else:
+                                            if j < i:
+                                                tinc = cutlass.Int32(1)
                                     rnk = rnk + tinc
                                     j = j + cutlass.Int32(1)
                                 if rnk < need:
-                                    out_row[above + rnk] = s_ci[i]
+                                    if cutlass.const_expr(self.det):
+                                        out_row[above + rnk] = uci
+                                    else:
+                                        out_row[above + rnk] = s_ci[i]
                                 i = i + cutlass.Int32(BLK)
                         else:
-                            # (2) key-space narrowing over striped DSMEM slabs:
-                            # slot = i & (CMPC-1), rank = i >> LCMPC
                             if tid == cutlass.Int32(0):
                                 s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                                 s_kmm[1] = cutlass.Uint32(0)
@@ -6537,16 +11019,184 @@ class GvrRegClusKernel:
                             # two-predicate ballot emit over the striped slabs
                             lml = cutlass.Int32(cute.arch.lanemask_lt())
                             it2 = (mc + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
-                            it = cutlass.Int32(0)
-                            while it < it2:
-                                i = it * cutlass.Int32(BLK) + tid
-                                uke = cutlass.Uint32(0)
-                                idv = cutlass.Int32(0)
-                                if i < mc:  # predicated remote
-                                    uke = cutlass.Uint32(
-                                        _ld_shared_cluster_i32(
+                            if cutlass.const_expr(self.det):
+                                run1 = cutlass.Int32(0)  # DET SLOTS
+                                run2 = cutlass.Int32(0)
+                                det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                                    cutlass.Uint32(n) - cutlass.Uint32(1)
+                                )  # ~idx >= 2^32 - n
+                                det_hi = cutlass.Uint32(0xFFFFFFFF)
+                                det_need = needC
+                                det_thr = cutlass.Int64(-1)
+                                det_sh = cutlass.Uint32(0)
+                                det_ph = cutlass.Int32(1)
+                                if needC > cutlass.Int32(0):
+                                    if mm > needC:
+                                        det_ph = cutlass.Int32(0)
+                                while det_ph <= cutlass.Int32(1):
+                                    if det_ph == cutlass.Int32(0):
+                                        det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                        det_bw = cutlass.Int32(32) - clz_i32(
+                                            cutlass.Int32(det_d | cutlass.Uint32(1))
+                                        )
+                                        det_s = det_bw - cutlass.Int32(LNB)
+                                        if det_s < cutlass.Int32(0):
+                                            det_s = cutlass.Int32(0)
+                                        det_sh = cutlass.Uint32(det_s)
+                                        for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                            s_hist[tid + cutlass.Int32(z * self.blk)] = (
+                                                cutlass.Int32(0)
+                                            )
+                                        cute.arch.barrier()  # ---- barrier (det level clear) ----
+                                    it = cutlass.Int32(0)
+                                    while it < it2:
+                                        i = it * cutlass.Int32(BLK) + tid
+                                        uke = cutlass.Uint32(0)
+                                        idv = cutlass.Int32(0)
+                                        if i < mc:  # predicated remote
+                                            uke = cutlass.Uint32(
+                                                _ld_shared_cluster_i32(
+                                                    _mapa_shared_cluster_addr(
+                                                        ck_addr
+                                                        + (
+                                                            (i & cutlass.Int32(CMPC - 1))
+                                                            << cutlass.Int32(2)
+                                                        ),
+                                                        i >> cutlass.Int32(LCMPC),
+                                                    )
+                                                )
+                                            )
+                                            idv = _ld_shared_cluster_i32(
+                                                _mapa_shared_cluster_addr(
+                                                    ci_addr
+                                                    + (
+                                                        (i & cutlass.Int32(CMPC - 1))
+                                                        << cutlass.Int32(2)
+                                                    ),
+                                                    i >> cutlass.Int32(LCMPC),
+                                                )
+                                            )
+                                        q1f = cutlass.Int32(0)
+                                        q2f = cutlass.Int32(0)
+                                        if i < mc:
+                                            if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
+                                                q1f = cutlass.Int32(1)
+                                            if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
+                                                det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
+                                                    idv
+                                                )
+                                                if det_ph == cutlass.Int32(0):
+                                                    if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                        det_lo
+                                                    ):
+                                                        if cutlass.Uint32(det_u) <= cutlass.Uint32(
+                                                            det_hi
+                                                        ):
+                                                            det_b = (
+                                                                cutlass.Uint32(det_u)
+                                                                - cutlass.Uint32(det_lo)
+                                                            ) >> cutlass.Uint32(det_sh)
+                                                            if det_b > cutlass.Uint32(
+                                                                NB__regclus - 1
+                                                            ):
+                                                                det_b = cutlass.Uint32(
+                                                                    NB__regclus - 1
+                                                                )
+                                                            atomic_add_cta(
+                                                                s_hist.iterator
+                                                                + cutlass.Int32(det_b),
+                                                                cutlass.Int32(1),
+                                                            )
+                                                else:
+                                                    if (
+                                                        cutlass.Int64(cutlass.Uint32(det_u))
+                                                        > det_thr
+                                                    ):
+                                                        q2f = cutlass.Int32(1)
+                                        if det_ph == cutlass.Int32(1):
+                                            n1 = ballot(q1f == cutlass.Int32(1))
+                                            n2 = ballot(q2f == cutlass.Int32(1))
+                                            if lane == cutlass.Int32(0):
+                                                s_dw[dw] = popc(n1)
+                                                s_dw[32 + dw] = popc(n2)
+                                            cute.arch.barrier()  # DET SLOTS: warp totals published
+                                            v1 = cutlass.Int32(0)
+                                            v2 = cutlass.Int32(0)
+                                            if lane < cutlass.Int32(NW):
+                                                v1 = s_dw[lane]
+                                                v2 = s_dw[32 + lane]
+                                            tot1 = cutlass.Int32(warp_add_i32(v1))
+                                            tot2 = cutlass.Int32(warp_add_i32(v2))
+                                            if lane >= dw:
+                                                v1 = cutlass.Int32(0)
+                                                v2 = cutlass.Int32(0)
+                                            b1 = cutlass.Int32(warp_add_i32(v1))
+                                            b2 = cutlass.Int32(warp_add_i32(v2))
+                                            b1 = run1 + b1
+                                            b2 = run2 + b2
+                                            run1 = run1 + tot1
+                                            run2 = run2 + tot2
+                                            if it + cutlass.Int32(1) < it2:
+                                                cute.arch.barrier()  # DET SLOTS: scratch reusable by the next it
+                                            p1e = b1 + popc(n1 & lml)
+                                            p2e = b2 + popc(n2 & lml)
+                                            if q1f == cutlass.Int32(1):
+                                                if p1e < aboveC:
+                                                    out_row[above + p1e] = idv
+                                            if q2f == cutlass.Int32(1):
+                                                if p2e < needC:
+                                                    out_row[above + aboveC + p2e] = idv
+                                        it = it + cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(0):
+                                        cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                        find_cross(s_hist, det_need, tid, s_res, nb=NB__regclus)
+                                        cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                        det_need = det_need - s_res[RES_ABOVE]
+                                        det_m = s_res[RES_M]
+                                        det_bin = s_res[RES_B]
+                                        det_nlo = cutlass.Uint32(det_lo) + (
+                                            cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                        )
+                                        if det_bin != cutlass.Int32(NB__regclus - 1):
+                                            det_hi = det_nlo + (
+                                                (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                                - cutlass.Uint32(1)
+                                            )
+                                        det_lo = det_nlo
+                                        if det_need == det_m:
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                        elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                    else:
+                                        det_ph = cutlass.Int32(2)
+                            else:
+                                it = cutlass.Int32(0)
+                                while it < it2:
+                                    i = it * cutlass.Int32(BLK) + tid
+                                    uke = cutlass.Uint32(0)
+                                    idv = cutlass.Int32(0)
+                                    if i < mc:  # predicated remote
+                                        uke = cutlass.Uint32(
+                                            _ld_shared_cluster_i32(
+                                                _mapa_shared_cluster_addr(
+                                                    ck_addr
+                                                    + (
+                                                        (i & cutlass.Int32(CMPC - 1))
+                                                        << cutlass.Int32(2)
+                                                    ),
+                                                    i >> cutlass.Int32(LCMPC),
+                                                )
+                                            )
+                                        )
+                                        idv = _ld_shared_cluster_i32(
                                             _mapa_shared_cluster_addr(
-                                                ck_addr
+                                                ci_addr
                                                 + (
                                                     (i & cutlass.Int32(CMPC - 1))
                                                     << cutlass.Int32(2)
@@ -6554,45 +11204,34 @@ class GvrRegClusKernel:
                                                 i >> cutlass.Int32(LCMPC),
                                             )
                                         )
-                                    )
-                                    idv = _ld_shared_cluster_i32(
-                                        _mapa_shared_cluster_addr(
-                                            ci_addr
-                                            + ((i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)),
-                                            i >> cutlass.Int32(LCMPC),
-                                        )
-                                    )
-                                q1f = cutlass.Int32(0)
-                                q2f = cutlass.Int32(0)
-                                if i < mc:
-                                    if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
-                                        q1f = cutlass.Int32(1)
-                                    if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
-                                        q2f = cutlass.Int32(1)
-                                n1 = ballot(q1f == cutlass.Int32(1))
-                                n2 = ballot(q2f == cutlass.Int32(1))
-                                b1 = cutlass.Int32(0)
-                                b2 = cutlass.Int32(0)
-                                if lane == cutlass.Int32(0):
-                                    if n1 != cutlass.Int32(0):
-                                        b1 = atomic_add_cta(s_cnt.iterator, popc(n1))
-                                    if n2 != cutlass.Int32(0):
-                                        b2 = atomic_add_cta(s_cnt.iterator + 1, popc(n2))
-                                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                                p1e = b1 + popc(n1 & lml)
-                                p2e = b2 + popc(n2 & lml)
-                                if q1f == cutlass.Int32(1):
-                                    if p1e < aboveC:
-                                        out_row[above + p1e] = idv
-                                if q2f == cutlass.Int32(1):
-                                    if p2e < needC:
-                                        out_row[above + aboveC + p2e] = idv
-                                it = it + cutlass.Int32(1)
+                                    q1f = cutlass.Int32(0)
+                                    q2f = cutlass.Int32(0)
+                                    if i < mc:
+                                        if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
+                                            q1f = cutlass.Int32(1)
+                                        if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
+                                            q2f = cutlass.Int32(1)
+                                    n1 = ballot(q1f == cutlass.Int32(1))
+                                    n2 = ballot(q2f == cutlass.Int32(1))
+                                    b1 = cutlass.Int32(0)
+                                    b2 = cutlass.Int32(0)
+                                    if lane == cutlass.Int32(0):
+                                        if n1 != cutlass.Int32(0):
+                                            b1 = atomic_add_cta(s_cnt.iterator, popc(n1))
+                                        if n2 != cutlass.Int32(0):
+                                            b2 = atomic_add_cta(s_cnt.iterator + 1, popc(n2))
+                                    b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
+                                    b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
+                                    p1e = b1 + popc(n1 & lml)
+                                    p2e = b2 + popc(n2 & lml)
+                                    if q1f == cutlass.Int32(1):
+                                        if p1e < aboveC:
+                                            out_row[above + p1e] = idv
+                                    if q2f == cutlass.Int32(1):
+                                        if p2e < needC:
+                                            out_row[above + aboveC + p2e] = idv
+                                    it = it + cutlass.Int32(1)
                     else:
-                        # (3) degen safety net: crossing bin larger than the
-                        # whole cluster buffer -> exact whole-row key-space
-                        # narrowing by rank 0 alone, <=8 levels.
                         rlo = cutlass.Uint32(0)
                         rhi = cutlass.Uint32(0xFFFFFFFF)
                         aboveC = cutlass.Int32(0)  # above2
@@ -6669,40 +11308,197 @@ class GvrRegClusKernel:
                             nT = needC
                         lml = cutlass.Int32(cute.arch.lanemask_lt())
                         it2 = (n + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
-                        it = cutlass.Int32(0)
-                        while it < it2:
-                            i = it * cutlass.Int32(BLK) + tid
-                            uke = cutlass.Uint32(0)
-                            if i < n:
-                                uke = fkey(ldg_f32(x_addr, i))
-                            q1f = cutlass.Int32(0)
-                            q2f = cutlass.Int32(0)
-                            if i < n:
-                                if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
-                                    q1f = cutlass.Int32(1)
-                                if tie_m == cutlass.Int32(1):
-                                    if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
-                                        q2f = cutlass.Int32(1)
-                            n1 = ballot(q1f == cutlass.Int32(1))
-                            n2 = ballot(q2f == cutlass.Int32(1))
-                            b1 = cutlass.Int32(0)
-                            b2 = cutlass.Int32(0)
-                            if lane == cutlass.Int32(0):
-                                if n1 != cutlass.Int32(0):
-                                    b1 = atomic_add_cta(s_cnt.iterator, popc(n1))
-                                if n2 != cutlass.Int32(0):
-                                    b2 = atomic_add_cta(s_cnt.iterator + 1, popc(n2))
-                            b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                            b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                            p1e = b1 + popc(n1 & lml)
-                            p2e = b2 + popc(n2 & lml)
-                            if q1f == cutlass.Int32(1):
-                                if p1e < nA:
-                                    out_row[p1e] = i
-                            if q2f == cutlass.Int32(1):
-                                if p2e < nT:
-                                    out_row[nA + p2e] = i
-                            it = it + cutlass.Int32(1)
+                        if cutlass.const_expr(self.det):
+                            run1 = cutlass.Int32(0)  # DET SLOTS
+                            run2 = cutlass.Int32(0)
+                            det_lo = cutlass.Uint32(0xFFFFFFFF) - (
+                                cutlass.Uint32(n) - cutlass.Uint32(1)
+                            )  # ~idx >= 2^32 - n
+                            det_hi = cutlass.Uint32(0xFFFFFFFF)
+                            det_need = needC
+                            det_thr = cutlass.Int64(-1)
+                            det_sh = cutlass.Uint32(0)
+                            det_ph = cutlass.Int32(1)
+                            if needC > cutlass.Int32(0):
+                                if mm > needC:
+                                    det_ph = cutlass.Int32(0)
+                            det_direct = cutlass.Int32(
+                                0
+                            )  # DET SLOTS: all positions tie -> emit [0, L) directly
+                            if det_ph == cutlass.Int32(0):
+                                if mm == n:  # every valid position ties: take the first L positions
+                                    if nA == cutlass.Int32(0):
+                                        det_direct = cutlass.Int32(1)
+                                    det_thr = cutlass.Int64(
+                                        cutlass.Uint32(0xFFFFFFFF)
+                                        - cutlass.Uint32(
+                                            cutlass.Int32(0) + needC - cutlass.Int32(1)
+                                        )
+                                    ) - cutlass.Int64(1)
+                                    det_ph = cutlass.Int32(1)
+                            if det_direct == cutlass.Int32(0):
+                                while det_ph <= cutlass.Int32(1):
+                                    if det_ph == cutlass.Int32(0):
+                                        det_d = cutlass.Uint32(det_hi) - cutlass.Uint32(det_lo)
+                                        det_bw = cutlass.Int32(32) - clz_i32(
+                                            cutlass.Int32(det_d | cutlass.Uint32(1))
+                                        )
+                                        det_s = det_bw - cutlass.Int32(LNB)
+                                        if det_s < cutlass.Int32(0):
+                                            det_s = cutlass.Int32(0)
+                                        det_sh = cutlass.Uint32(det_s)
+                                        for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                            s_hist[tid + cutlass.Int32(z * self.blk)] = (
+                                                cutlass.Int32(0)
+                                            )
+                                        cute.arch.barrier()  # ---- barrier (det level clear) ----
+                                    it = cutlass.Int32(0)
+                                    while it < it2:
+                                        i = it * cutlass.Int32(BLK) + tid
+                                        uke = cutlass.Uint32(0)
+                                        if i < n:
+                                            uke = fkey(ldg_f32(x_addr, i))
+                                        q1f = cutlass.Int32(0)
+                                        q2f = cutlass.Int32(0)
+                                        if i < n:
+                                            if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
+                                                q1f = cutlass.Int32(1)
+                                            if tie_m == cutlass.Int32(1):
+                                                if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
+                                                    det_u = cutlass.Uint32(
+                                                        0xFFFFFFFF
+                                                    ) - cutlass.Uint32(i)
+                                                    if det_ph == cutlass.Int32(0):
+                                                        if cutlass.Uint32(det_u) >= cutlass.Uint32(
+                                                            det_lo
+                                                        ):
+                                                            if cutlass.Uint32(
+                                                                det_u
+                                                            ) <= cutlass.Uint32(det_hi):
+                                                                det_b = (
+                                                                    cutlass.Uint32(det_u)
+                                                                    - cutlass.Uint32(det_lo)
+                                                                ) >> cutlass.Uint32(det_sh)
+                                                                if det_b > cutlass.Uint32(
+                                                                    NB__regclus - 1
+                                                                ):
+                                                                    det_b = cutlass.Uint32(
+                                                                        NB__regclus - 1
+                                                                    )
+                                                                atomic_add_cta(
+                                                                    s_hist.iterator
+                                                                    + cutlass.Int32(det_b),
+                                                                    cutlass.Int32(1),
+                                                                )
+                                                    else:
+                                                        if (
+                                                            cutlass.Int64(cutlass.Uint32(det_u))
+                                                            > det_thr
+                                                        ):
+                                                            q2f = cutlass.Int32(1)
+                                        if det_ph == cutlass.Int32(1):
+                                            n1 = ballot(q1f == cutlass.Int32(1))
+                                            n2 = ballot(q2f == cutlass.Int32(1))
+                                            if lane == cutlass.Int32(0):
+                                                s_dw[dw] = popc(n1)
+                                                s_dw[32 + dw] = popc(n2)
+                                            cute.arch.barrier()  # DET SLOTS: warp totals published
+                                            v1 = cutlass.Int32(0)
+                                            v2 = cutlass.Int32(0)
+                                            if lane < cutlass.Int32(NW):
+                                                v1 = s_dw[lane]
+                                                v2 = s_dw[32 + lane]
+                                            tot1 = cutlass.Int32(warp_add_i32(v1))
+                                            tot2 = cutlass.Int32(warp_add_i32(v2))
+                                            if lane >= dw:
+                                                v1 = cutlass.Int32(0)
+                                                v2 = cutlass.Int32(0)
+                                            b1 = cutlass.Int32(warp_add_i32(v1))
+                                            b2 = cutlass.Int32(warp_add_i32(v2))
+                                            b1 = run1 + b1
+                                            b2 = run2 + b2
+                                            run1 = run1 + tot1
+                                            run2 = run2 + tot2
+                                            if it + cutlass.Int32(1) < it2:
+                                                cute.arch.barrier()  # DET SLOTS: scratch reusable by the next it
+                                            p1e = b1 + popc(n1 & lml)
+                                            p2e = b2 + popc(n2 & lml)
+                                            if q1f == cutlass.Int32(1):
+                                                if p1e < nA:
+                                                    out_row[p1e] = i
+                                            if q2f == cutlass.Int32(1):
+                                                if p2e < nT:
+                                                    out_row[nA + p2e] = i
+                                        it = it + cutlass.Int32(1)
+                                    if det_ph == cutlass.Int32(0):
+                                        cute.arch.barrier()  # ---- barrier (det level hist) ----
+                                        find_cross(s_hist, det_need, tid, s_res, nb=NB__regclus)
+                                        cute.arch.barrier()  # ---- barrier (det level scan) ----
+                                        det_need = det_need - s_res[RES_ABOVE]
+                                        det_m = s_res[RES_M]
+                                        det_bin = s_res[RES_B]
+                                        det_nlo = cutlass.Uint32(det_lo) + (
+                                            cutlass.Uint32(det_bin) << cutlass.Uint32(det_sh)
+                                        )
+                                        if det_bin != cutlass.Int32(NB__regclus - 1):
+                                            det_hi = det_nlo + (
+                                                (cutlass.Uint32(1) << cutlass.Uint32(det_sh))
+                                                - cutlass.Uint32(1)
+                                            )
+                                        det_lo = det_nlo
+                                        if det_need == det_m:
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                        elif cutlass.Uint32(det_lo) >= cutlass.Uint32(det_hi):
+                                            det_thr = cutlass.Int64(
+                                                cutlass.Uint32(det_lo)
+                                            ) - cutlass.Int64(1)
+                                            det_ph = cutlass.Int32(1)
+                                    else:
+                                        det_ph = cutlass.Int32(2)
+
+                            else:
+                                i = tid
+                                while i < nT:
+                                    out_row[nA + i] = i
+                                    i = i + cutlass.Int32(BLK)
+                        else:
+                            it = cutlass.Int32(0)
+                            while it < it2:
+                                i = it * cutlass.Int32(BLK) + tid
+                                uke = cutlass.Uint32(0)
+                                if i < n:
+                                    uke = fkey(ldg_f32(x_addr, i))
+                                q1f = cutlass.Int32(0)
+                                q2f = cutlass.Int32(0)
+                                if i < n:
+                                    if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
+                                        q1f = cutlass.Int32(1)
+                                    if tie_m == cutlass.Int32(1):
+                                        if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
+                                            q2f = cutlass.Int32(1)
+                                n1 = ballot(q1f == cutlass.Int32(1))
+                                n2 = ballot(q2f == cutlass.Int32(1))
+                                b1 = cutlass.Int32(0)
+                                b2 = cutlass.Int32(0)
+                                if lane == cutlass.Int32(0):
+                                    if n1 != cutlass.Int32(0):
+                                        b1 = atomic_add_cta(s_cnt.iterator, popc(n1))
+                                    if n2 != cutlass.Int32(0):
+                                        b2 = atomic_add_cta(s_cnt.iterator + 1, popc(n2))
+                                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
+                                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
+                                p1e = b1 + popc(n1 & lml)
+                                p2e = b2 + popc(n2 & lml)
+                                if q1f == cutlass.Int32(1):
+                                    if p1e < nA:
+                                        out_row[p1e] = i
+                                if q2f == cutlass.Int32(1):
+                                    if p2e < nT:
+                                        out_row[nA + p2e] = i
+                                it = it + cutlass.Int32(1)
 
             # ---- P10: FINAL cluster rendezvous — ALL ranks reach it;
             # keeps peers resident until rank 0 has read their ck/ci.
@@ -6745,9 +11541,18 @@ def get_compiled__regclus(
     next_n: int = 1,
     cr_shift: int = 0,
     hint_free: bool = False,
+    det: bool = False,
 ) -> Any:
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), bool(hint_free))
+    key = (
+        tuple(tpl),
+        bool(pdl),
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        bool(hint_free),
+        bool(det),
+    )
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -6762,6 +11567,7 @@ def get_compiled__regclus(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=hint_free,
+            det=det,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()

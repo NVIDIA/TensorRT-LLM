@@ -330,6 +330,28 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
     assert not top_k.needs_gvr_prior
 
 
+def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
+    runner = _install_fake_selfsampling_runner(monkeypatch)
+    top_k = TopK(
+        2,
+        decode_implementation=TopKImplementation.CUTE_DSL_GVR,
+        compress_ratio=4,
+        gvr_deterministic=True,
+        gvr_sorting="ascending",
+    )
+
+    _run_gvr_v2_decode(top_k)
+
+    _, kwargs = runner.call_args
+    assert kwargs == {
+        "next_n": 1,
+        "compress_ratio": 4,
+        "max_seq_len": 64,
+        "deterministic": True,
+        "sorting": "ascending",
+    }
+
+
 def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
