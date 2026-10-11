@@ -687,12 +687,37 @@ Read the metric named by `optimize.target_metric` from the harness's own
 output, and **state which direction counts as better** next to the first
 number you report.
 
+### Running it: load a skill, do not improvise a submission
+
+You do not write a Slurm script by hand. Load
+**`trtllm-slurm-case-executor`** with the `Skill` tool: it carries one
+template per family, generates the per-rep launchers, submits them inside a
+single allocation, and parses the result into `perf_result.yaml`.
+
+Pick its template by family, and — within perf-sanity — by the folder the
+config YAML lives in rather than the id's prefix. `ctx_only` and
+`gen_only_no_context` carry the `aggr` prefix and read a *disaggregated*
+config, so routing on the prefix picks a template that cannot run them.
+`task.yaml`'s `test_case.resolved` block names the family, and `config` the
+resolved YAML for the family that reads one; hand that path over rather than
+letting a runner search for it.
+
+**If that skill is not installed, stop and report it as a blocker.** Do not
+fall back to a hand-rolled `sbatch`: a bespoke submission differs from the
+measurement this campaign is scored against in ways that are invisible
+afterwards, and a plausible wrong number is worse here than no number.
+
 ### Gates that keep a green run honest
 
 - **Never gate on the exit code.** A pruned or empty test selection runs
   nothing and still exits `0` with every other check passing. Require the
   benchmark log to exist and to report `Successful requests` > 0 before
   you treat a run as a measurement.
+- **Gate on the parsed artifact.** `perf_result.yaml`'s `metric_values`
+  must hold one non-null entry per repetition — check the *count*, since a
+  missing rep leaves a gap rather than shortening the list. The runner's
+  `trigger.sh` exits with its parser's status, so that status is the
+  measurement verdict.
 - A run whose id, commit or cluster differs from the campaign's is not
   this campaign's data, whatever directory it is sitting in. Check those
   before reusing an existing log, and check its timestamp — a stale

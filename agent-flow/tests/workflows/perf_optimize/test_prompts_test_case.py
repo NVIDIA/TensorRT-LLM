@@ -194,3 +194,41 @@ def test_directive_is_empty_for_a_plain_campaign(tmp_path):
         encoding="utf-8",
     )
     assert _workflow_for(task)._measurement_directive() == ""
+
+
+# --------------------------------------------------------------------------- #
+# The CLI wiring
+# --------------------------------------------------------------------------- #
+
+
+def test_the_cli_composes_the_section_for_a_test_case_spec():
+    """The flag has to be passed, or the section is written and never reached.
+
+    ``build_perf_optimize_prompts`` defaults ``include_test_case`` to False, so a
+    caller that validates a ``test_case`` spec and then forgets the flag gets a
+    campaign whose agents read a resolved ``task.yaml`` naming a test case while
+    every prompt still describes the single-server lifecycle. Nothing fails; the
+    run measures the wrong thing. This pins the CLI's own call.
+    """
+    import inspect
+
+    from agent_flow.workflows.perf_optimize import cli
+
+    src = inspect.getsource(cli)
+    assert "include_test_case=has_test_case(task_data)" in src
+
+
+def test_the_section_names_the_runner_skill_and_refuses_to_improvise():
+    """The section must name its runner.
+
+    A fragment that says what to measure but not how leaves an agent to invent an
+    sbatch, whose numbers are not comparable with the campaign's others.
+    """
+    flat = " ".join(TEST_CASE_CAMPAIGN.split())
+    assert "trtllm-slurm-case-executor" in flat
+    assert "do not improvise a submission" in flat
+    assert "stop and report it as a blocker" in flat
+    # The routing trap: prefix is not the router.
+    assert "gen_only_no_context" in flat
+    # The artifact gate, not just the exit-code one.
+    assert "metric_values" in flat

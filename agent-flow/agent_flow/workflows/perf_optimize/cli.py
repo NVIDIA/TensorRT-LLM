@@ -15,6 +15,7 @@ from .state import STATE_FILENAME
 from .task_schema import (
     TaskSchemaError,
     has_slurm_environment,
+    has_test_case,
     kernel_coverage,
     load_and_validate_task_yaml,
     sol_enabled,
@@ -148,6 +149,7 @@ def main(argv: list[str] | None = None) -> None:
         kernel_coverage=kernel_coverage(task_data),
         sol_methodology=methodology.name,
         include_disagg=has_disagg(task_data),
+        include_test_case=has_test_case(task_data),
         include_casebook=casebook_enabled(task_data),
     )
     with PerfOptimizeWorkflow(
