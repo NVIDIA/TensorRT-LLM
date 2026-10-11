@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1332,6 +1332,10 @@ class RefHFModel:
                             index=response_tensor.unsqueeze(-1)).squeeze(-1)
 
                         ref_results.append(ref_logprob_for_tokens)
+                        del response_logprobs, response_tensor
+
+                    # This view retains the entire microbatch's logits storage.
+                    del response_logits
 
                 # Free memory immediately after processing each micro batch
                 del outputs, micro_logits
