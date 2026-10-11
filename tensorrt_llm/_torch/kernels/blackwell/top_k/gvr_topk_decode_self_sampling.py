@@ -1718,8 +1718,7 @@ class GvrMainKernel:
             self.cmpb = 768
         self.shd = not split
         self.vstg = split or blk >= 512
-        # Reserve output bytes within the existing shared-memory budget.
-        # Keep the original sampling capacity; only the survivor slab shrinks.
+        # Output staging shares the survivor budget; sampling uses the full capacity.
         self.sample_scpb = self.scpb
         if self.staged_k > 0:
             item_bytes = 8 if self.vstg else 4
@@ -4321,9 +4320,7 @@ class GvrMainKernel:
                             mc2 = mc & cutlass.Int32(~1)
                             i = tidx
                             while i < mc:
-                                # NOTE: values crossing a dynamic-while region are
-                                # re-wrapped SIGNED by the DSL — every u64 compare
-                                # must re-assert Uint64 at the USE site.
+                                # Recast loop-carried values to Uint64 before comparison.
                                 u64v = s_ck64[i]
                                 if cutlass.const_expr(self.det):
                                     u64f = (cutlass.Uint64(u64v) | cutlass.Uint64(0xFFFFFFFF)) - (
@@ -6153,8 +6150,7 @@ class GvrTopkRegKernel:
     ) -> None:
         self.det = bool(det)
         assert blk in (256, 512, 1024) and 1 <= vpt <= 10
-        # Only the ballot emission path packs four bits per float4 into a
-        # 32-bit mask. Cursor emission visits each fragment independently.
+        # Ballot and deterministic emission pack four bits per float4.
         assert vpt <= 8 or (cur and not deg and not img and not det)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
@@ -6187,8 +6183,7 @@ class GvrTopkRegKernel:
         self.warp_rank = bool(warp_rank) and not self.det
         assert bracket_sample_lanes in (1, 2, 4, 8, 16, 32)
         self.bracket_sample_lanes = bracket_sample_lanes
-        # The first float4 per thread contains the complete K-element prefix.
-        # Keep the rest of the row out of registers until the bracket is ready.
+        # The first float4 per thread covers the prefix used for the bracket.
         self.late_load = (
             not self.det
             and self.hint_free
@@ -6202,8 +6197,6 @@ class GvrTopkRegKernel:
         )
         self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hint_free)
         self.use_img = img and vpt == 1 and (not hint_free)
-        # Retain the same fused bin transform when increasing CTA occupancy
-        # for the small-K resident plan; only the execution resources change.
         self.brl = (
             (minb * blk <= 1024)
             or (vpt == 1)
@@ -6247,7 +6240,7 @@ class GvrTopkRegKernel:
         if cutlass.const_expr(self.det):
             dw = tid >> cutlass.Int32(5)  # DET SLOTS: warp index
 
-        # Overlap physical-row prefetch with the dependent per-row length load.
+        # Prefetch within the physical row before reading its effective length.
         if cutlass.const_expr(
             self.varlen
             and self.hint_free
@@ -6624,9 +6617,9 @@ class GvrTopkRegKernel:
                 lmx = cutlass.Float32(_NEG_INF__reg)
                 for u in cutlass.range_constexpr(VPT):
                     pos4 = tid + cutlass.Int32(u * self.blk)
-                    if (
-                        lane & cutlass.Int32(32 // self.bracket_sample_lanes - 1)
-                    ) == cutlass.Int32(0):
+                    if (lane & cutlass.Int32(32 // self.bracket_sample_lanes - 1)) == cutlass.Int32(
+                        0
+                    ):
                         if pos4 < n4:
                             v = frags[u][0]
                             lmn = fmin_f32(lmn, v)
@@ -6662,8 +6655,7 @@ class GvrTopkRegKernel:
                         if uk > lmax:
                             lmax = uk
 
-            # Reduce all participating sample lanes before publishing warp bounds.
-            # The barrier also publishes the histogram clear.
+            # Reduce participating lanes before publishing warp bounds.
             if cutlass.const_expr(
                 not self.hint_free or self.dense_bracket or self.bracket_sample_lanes > 1
             ):
@@ -6697,7 +6689,6 @@ class GvrTopkRegKernel:
 
             # ---- bin transform constants
             BRL = cutlass.const_expr(self.brl)  # noqa: F841
-            # Use the non-wide bin width with the fused transform on this rung.
             offset_brl = self.brl and not self.zero_offset_brl
             OFFf = cutlass.Float32(1.0 if offset_brl else 0.0)
             recip = 1.0 / float(self.nbh - (2 if offset_brl else 0))
@@ -6719,8 +6710,7 @@ class GvrTopkRegKernel:
             else:
                 CQ = CQ0 + cutlass.Float32(1e-6) * (_fabsf(CQ0) + cutlass.Float32(1.0))
 
-            # The prefix bracket needs only the first fragment. Loading
-            # the remaining row here shortens live ranges across its scans.
+            # Load the remaining fragments after computing the prefix bracket.
             if cutlass.const_expr(self.late_load):
                 if n4 >= cutlass.Int32(self.blk * self.vpt):
                     for late_u in cutlass.range_constexpr(1, VPT):
@@ -6816,9 +6806,7 @@ class GvrTopkRegKernel:
             if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
             if cutlass.const_expr(self.brl):
-                # Negative q saturates into bin 0 during classification but
-                # fails the emit predicate q >= Bv. Rank the full row when
-                # this bucket contains the selection boundary.
+                # Negative q enters bin 0 but fails q >= Bv; use exact full-row selection.
                 if Bv == cutlass.Int32(0):
                     esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
