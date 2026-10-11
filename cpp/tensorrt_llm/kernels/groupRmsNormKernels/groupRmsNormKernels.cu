@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,8 +76,8 @@ LargeBatchWarpsInfo<DType, n> calculateNumWarpsLargeBatch(GroupRMSParams<n> cons
     info.num_warps_to_launch_0 = std::min((uint32_t) 32, warps_needed_0);
     info.num_warps_to_launch_1 = std::min((uint32_t) 32, warps_needed_1);
 
-    // Use the maximum of the two for the final warps to launch
-    info.num_warps_to_launch = std::max(info.num_warps_to_launch_0, info.num_warps_to_launch_1);
+    // Use the maximum of the two, and at least one warp per input since warp i computes input i's rsqrt
+    info.num_warps_to_launch = std::max<uint32_t>({n, info.num_warps_to_launch_0, info.num_warps_to_launch_1});
 
     // Calculate rounds needed for each input
     info.rounds_0 = (warps_needed_0 + info.num_warps_to_launch_0 - 1) / info.num_warps_to_launch_0;
@@ -108,6 +108,7 @@ __global__ void GroupRMSNormBaseKernel(GroupRMSParams<n> params, int rounds)
         smem_input_mask[lane_idx] = 33;
         smem_warp_sum_sqs[lane_idx] = 0.0f;
     }
+    __syncthreads();
     float warp_acc = 0.0f;
     PackedType const* __restrict__ weight_ptr = nullptr;
 
@@ -287,6 +288,7 @@ __global__ void GroupRMSNormKernelLargeBatch(
     {
         smem_rsqrts[warp_idx][lane_idx] = 0.0f;
     }
+    __syncthreads();
 
     const uint32_t round_offset = warp_size * kPackedSize;
 
