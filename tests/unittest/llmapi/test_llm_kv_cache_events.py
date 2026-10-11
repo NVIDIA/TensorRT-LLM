@@ -789,56 +789,56 @@ def test_apply_mm_hashes_multiple_modalities():
 
 def test_mm_keys_in_stored_events():
     """Test that mm_keys field is present in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify mm_keys and cache_salt fields
-    found_stored = False
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            found_stored = True
-            blocks = event["data"]["blocks"]
-            for block in blocks:
-                # mm_keys should always be present (empty list for text-only)
-                assert "mm_keys" in block
-                assert isinstance(block["mm_keys"], list)
-                # For text-only requests, mm_keys should be empty
-                assert block["mm_keys"] == []
-                # cache_salt should be present (None for unsalted requests)
-                assert "cache_salt" in block
-                assert block["cache_salt"] is None
+        # Find stored events and verify mm_keys and cache_salt fields
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                blocks = event["data"]["blocks"]
+                for block in blocks:
+                    # mm_keys should always be present (empty list for text-only)
+                    assert "mm_keys" in block
+                    assert isinstance(block["mm_keys"], list)
+                    # For text-only requests, mm_keys should be empty
+                    assert block["mm_keys"] == []
+                    # cache_salt should be present (None for unsalted requests)
+                    assert "cache_salt" in block
+                    assert block["cache_salt"] is None
 
-    assert found_stored, "No stored events found"
+        assert found_stored, "No stored events found"
 
 
 def test_cache_salt_in_stored_events():
     """Test that cache_salt string is preserved in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt,
-                     sampling_params=sampling_params,
-                     cache_salt="tenant-A")
+        _ = llm.generate(prompt,
+                         sampling_params=sampling_params,
+                         cache_salt="tenant-A")
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify cache_salt field
-    found_stored = False
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            found_stored = True
-            blocks = event["data"]["blocks"]
-            for block in blocks:
-                assert "cache_salt" in block
-                assert block["cache_salt"] == "tenant-A"
+        # Find stored events and verify cache_salt field
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                blocks = event["data"]["blocks"]
+                for block in blocks:
+                    assert "cache_salt" in block
+                    assert block["cache_salt"] == "tenant-A"
 
-    assert found_stored, "No stored events found"
+        assert found_stored, "No stored events found"
 
 
 def test_cache_salt_max_length_validation():
@@ -874,41 +874,43 @@ def test_cache_salt_max_length_validation():
 
 def test_non_ascii_cache_salt_in_stored_events():
     """Test that a non-ASCII cache_salt string is preserved in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
-    salt = "tenant-中文"  # mixed ASCII + Chinese
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
+        salt = "tenant-中文"  # mixed ASCII + Chinese
 
-    _ = llm.generate(prompt, sampling_params=sampling_params, cache_salt=salt)
+        _ = llm.generate(prompt,
+                         sampling_params=sampling_params,
+                         cache_salt=salt)
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    found_stored = False
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            found_stored = True
-            for block in event["data"]["blocks"]:
-                assert block.get("cache_salt") == salt
+        found_stored = False
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                found_stored = True
+                for block in event["data"]["blocks"]:
+                    assert block.get("cache_salt") == salt
 
-    assert found_stored, "No stored events found"
+        assert found_stored, "No stored events found"
 
 
 def test_expected_kv_cache_events():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
-    # created + stored events
-    assert events and len(events) >= 2
-    for event in events:
-        if event:
-            if event["event_id"] == 0:
-                assert event["data"]["type"] == "created"
-            elif event["event_id"] == 1:
-                assert event["data"]["type"] == "stored"
+        events = llm.get_kv_cache_events(5)
+        # created + stored events
+        assert events and len(events) >= 2
+        for event in events:
+            if event:
+                if event["event_id"] == 0:
+                    assert event["data"]["type"] == "created"
+                elif event["event_id"] == 1:
+                    assert event["data"]["type"] == "stored"
 
 
 def test_expected_v2_kv_cache_events():
@@ -944,30 +946,29 @@ def test_expected_v2_kv_cache_events():
 
 
 def test_kv_cache_event_async_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    async def generate():
-        async for output in llm.generate_async(prompt,
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            pass
+        async def generate():
+            async for output in llm.generate_async(
+                    prompt, streaming=True, sampling_params=sampling_params):
+                pass
 
-    events = []
+        events = []
 
-    async def get_events():
-        async for event in llm.get_kv_cache_events_async():
-            events.append(event)
+        async def get_events():
+            async for event in llm.get_kv_cache_events_async():
+                events.append(event)
 
-        assert events
+            assert events
 
-    async def main():
-        await generate()
-        await asyncio.gather(generate(), get_events())
-        await asyncio.gather(generate(), get_events())
+        async def main():
+            await generate()
+            await asyncio.gather(generate(), get_events())
+            await asyncio.gather(generate(), get_events())
 
-    asyncio.run(main())
+        asyncio.run(main())
 
 
 def check_events(llm,
@@ -1058,17 +1059,17 @@ def check_events(llm,
 
 
 def test_llm_kv_events_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6,
-                                     temperature=0.01,
-                                     ignore_eos=True)
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6,
+                                         temperature=0.01,
+                                         ignore_eos=True)
 
-    requests = []
-    for i in range(3):
-        input_tokens = list(range(127 + i))[i:]
-        requests.append(input_tokens)
+        requests = []
+        for i in range(3):
+            input_tokens = list(range(127 + i))[i:]
+            requests.append(input_tokens)
 
-    check_events(llm, requests, sampling_params)
+        check_events(llm, requests, sampling_params)
 
 
 @skip_single_gpu
@@ -1078,6 +1079,7 @@ def test_llm_api_attention_dp_kv_events():
     llm = LLM(model=llama_model_path,
               tensor_parallel_size=2,
               enable_attention_dp=True,
+              enable_lm_head_tp_in_adp=True,
               kv_cache_config=global_kvcache_config,
               enable_autotuner=False)
 
