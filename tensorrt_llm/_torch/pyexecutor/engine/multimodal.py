@@ -237,8 +237,8 @@ def resolve_mm_encoder_output_budget(
 
     It is the minimum capacity of the unified encoder-output cache and is reserved during
     KV-capacity estimation. Optional reuse may make the same cache larger. Admission rejects a
-    request whose outputs that must be resident at once exceed this budget: its largest item
-    with context chunking, its complete embedding without.
+    request whose outputs that must be resident at once exceed this budget: the items in one
+    context chunk unit with chunking, its complete embedding without.
 
     The embedding capacity is validated before the model is consulted, so a processor that
     cannot report one raises regardless of what the model implements.
@@ -347,8 +347,8 @@ class MultimodalItemScheduler:
           ``TensorLRUCache`` larger than (C); it does not create a second pool.
 
         Prefill needs only the items in its current prompt window and releases an item after
-        consuming it, so with context chunking only the largest item must fit (C). Without
-        chunking, admission rejects a request whose complete MM embedding exceeds (C).
+        consuming it, so with context chunking the items in one context chunk unit must fit
+        (C). Without chunking, admission rejects a request whose complete MM embedding exceeds (C).
         """
         if encoder_max_num_tokens is None:
             raise ValueError(

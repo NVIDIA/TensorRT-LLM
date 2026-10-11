@@ -1068,6 +1068,8 @@ class MultimodalScheduler(RequestScheduler):
         active_requests: RequestList,
         paused_request_ids: set[int],
         step: _MultimodalEncoderStep,
+        *,
+        output_capacity_blocked_ids: set[int] | None = None,
     ) -> RequestList:
         """Select the items each proposed context chunk uses and return the runnable contexts.
 
@@ -1110,6 +1112,8 @@ class MultimodalScheduler(RequestScheduler):
                             *acquire_args, active_requests, protected_items, step
                         )
                     if acquire_result is None:
+                        if output_capacity_blocked_ids is not None:
+                            output_capacity_blocked_ids.add(request.py_request_id)
                         unavailable_item = item_idx
                         break
                     acquired_item_indices.append(item_idx)
@@ -1235,6 +1239,7 @@ class MultimodalScheduler(RequestScheduler):
             ]
             proposed_context_requests = context_requests
             selects_whole_requests = self._selects_whole_requests(context_requests)
+            output_capacity_blocked_ids: set[int] = set()
             if selects_whole_requests:
                 self._select_items(context_requests, step)
                 context_requests = [
@@ -1248,19 +1253,31 @@ class MultimodalScheduler(RequestScheduler):
                     active_requests,
                     {request.request_id for request in scheduler_output.paused_requests},
                     step,
+                    output_capacity_blocked_ids=output_capacity_blocked_ids,
                 )
-            if selects_whole_requests:
-                held_bytes, held_keys = self._cache_claims(active_requests)
-                for request in proposed_context_requests:
-                    state = request.py_mm_encoder_state
-                    if (
-                        state is not None
-                        and not any(cache_key is not None for cache_key in state.item_cache_keys)
-                        and request.py_request_id not in step.selected
-                        and self._output_budget_blocks(request, held_bytes, held_keys)
-                    ):
-                        # A cache-capacity wait releases KV; losing an encoder slot does not.
-                        self.scheduler.release_context_admission(request)
+            held_bytes, held_keys = self._cache_claims(active_requests)
+            for request in proposed_context_requests:
+                state = request.py_mm_encoder_state
+                if (
+                    state is None
+                    or not request.is_first_context_chunk
+                    or any(cache_key is not None for cache_key in state.item_cache_keys)
+                    or request.py_request_id in step.selected
+                ):
+                    continue
+                if selects_whole_requests:
+                    output_capacity_blocked = self._output_budget_blocks(
+                        request, held_bytes, held_keys
+                    )
+                else:
+                    output_capacity_blocked = (
+                        request.py_request_id in output_capacity_blocked_ids
+                        and request.context_chunk_size == 0
+                        and request.is_first_context_chunk
+                    )
+                if output_capacity_blocked:
+                    # A cache-capacity wait releases KV; losing an encoder slot does not.
+                    self.scheduler.release_context_admission(request)
             self.encoder_cache.ensure_capacity(step.output_bytes)
             eligible_ids = {request.py_request_id for request in context_requests}
             return scheduler_output._replace(

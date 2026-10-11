@@ -1577,6 +1577,8 @@ def get_mm_items_for_chunk(request: LlmRequest, chunk_start: int,
     chunk_end = min(chunk_end, num_positions)
     row_begin = int(cumsum[chunk_start - 1]) if chunk_start > 0 else 0
     row_end = int(cumsum[chunk_end - 1]) if chunk_end > 0 else 0
+    if row_begin >= row_end:
+        return []
     item_indices = []
     item_end = 0
     for item_idx, length in enumerate(state.embedding_lengths):
