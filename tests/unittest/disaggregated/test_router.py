@@ -636,14 +636,13 @@ def test_router_block_hashes_round_trip_worker_event_hashes(
     hashes the worker's event path publishes for the same request; otherwise
     the first-block mismatch makes ``matched_tokens`` return 0 and
     KV-cache-aware routing silently degrades to load balancing. The v1
-    worker side goes through the real ``KVCacheEventManager`` published-hash
-    code path (``_v1_hash_from_radix_block``) over a radix chain seeded with
-    the worker's ``ReuseScope``.
+    worker side goes through the worker's own C++ event hasher
+    (``KVCacheEventManager._hash_block_key``) with the LoRA id and salt taken
+    from the worker's ``ReuseScope``.
     """
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
         KVCacheManagerV2
-    from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import \
-        KVCacheEventManager
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager
 
     tokens_per_block = 4
     tokens = list(range(1, 34))  # 33 tokens -> 8 blocks (last token dropped)
@@ -664,21 +663,15 @@ def test_router_block_hashes_round_trip_worker_event_hashes(
     worker_v2_64 = [
         truncate_sha256_hash_to_int64(block_key) for _, block_key in chain
     ]
-    # v1 event hashes via the real event-manager code path over a fake radix
-    # chain (block.prev / .tokens / .key; the root carries the ReuseScope).
-    manager = KVCacheEventManager(max_kv_event_entries=64,
-                                  hash_algo=KV_CACHE_HASH_ALGO_V1)
-    prev = SimpleNamespace(reuse_scope=scope)
-    radix_blocks = []
-    for token_block, block_key in chain:
-        block = SimpleNamespace(prev=prev,
-                                tokens=list(token_block),
-                                key=block_key)
-        radix_blocks.append(block)
-        prev = block
-    worker_v1 = [
-        manager._v1_hash_from_radix_block(block) for block in radix_blocks
-    ]
+    # v1 event hashes chained the way the event manager walks a text-token
+    # radix chain: the root's ReuseScope supplies the LoRA id and the salt to
+    # every block, and each block's hash is the next block's parent.
+    worker_v1 = []
+    parent_hash = 0
+    for token_block, _ in chain:
+        parent_hash = KVCacheEventManager._hash_block_key(
+            list(token_block), parent_hash, scope.lora_id, scope.salt)
+        worker_v1.append(parent_hash)
 
     # Router side: derive salt and lora id from the request via the router's
     # own helpers, so this test fails if either derivation diverges again.
