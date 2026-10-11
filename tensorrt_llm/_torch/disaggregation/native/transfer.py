@@ -38,7 +38,6 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
-from tensorrt_llm._torch.disaggregation.base import Chunk
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -61,6 +60,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
 from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
@@ -1744,8 +1744,8 @@ class Sender(SenderBase):
             peer_ri.instance_name, peer_ri.instance_rank
         )
         pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-        src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
+        dst_slot_tables = req_info.block_ids_per_layer_groups
+        src_slot_tables = task._chunk.pool_slot_ids_per_layer_group
 
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Send ownership is per pool: replicated pools elect one fan-in
@@ -1757,26 +1757,26 @@ class Sender(SenderBase):
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
-            src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
+            src_slot_ids = src_slot_tables[self_lg]
+            dst_slot_ids = dst_slot_tables[peer_lg]
 
             # Extract regions: STATE = per-layer ptrs, PAGED = per-block ptrs
             if lg_info.kind == CacheKind.STATE:
-                if src_block_ids.size == 0 or dst_block_ids.size == 0:
+                if src_slot_ids.size == 0 or dst_slot_ids.size == 0:
                     continue
                 if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
                     continue
-                src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
-                dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
+                src_region = extractor.extract_slot(int(src_slot_ids[0]), self_lg, self_pi)
+                dst_region = peer_extractor.extract_slot(int(dst_slot_ids[0]), peer_lg, peer_pi)
             else:
-                src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
-                dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
+                src_slot_ids = np.asarray(src_slot_ids, dtype=np.int64)
+                dst_slot_ids = np.asarray(dst_slot_ids, dtype=np.int64)
                 if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
                     # rejected under helix.
-                    src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
+                    src_slot_ids = src_slot_ids[peer_ri.cp_rank :: peer_ri.cp_size]
                 tpb = extractor.page_table.tokens_per_block
                 dst_start_block = (
                     req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
@@ -1785,13 +1785,13 @@ class Sender(SenderBase):
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
                 # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
-                    src_block_ids, dst_block_ids, dst_start_block=dst_start_block
+                src_slot_ids, dst_slot_ids = Sender._pair_ordinals(
+                    src_slot_ids, dst_slot_ids, dst_start_block=dst_start_block
                 )
-                if src_block_ids.size == 0:
+                if src_slot_ids.size == 0:
                     continue
-                src_region = extractor.extract(src_block_ids, self_lg, self_pi)
-                dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
+                src_region = extractor.extract(src_slot_ids, self_lg, self_pi)
+                dst_region = peer_extractor.extract(dst_slot_ids, peer_lg, peer_pi)
 
             # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
@@ -3125,7 +3125,7 @@ class Receiver(ReceiverBase):
             sender_req_id=sender_req_id,
             instance_name=self_ri.instance_name,
             instance_rank=self_ri.instance_rank,
-            block_ids_per_layer_groups=task._chunk.block_ids_per_layer_groups,
+            block_ids_per_layer_groups=task._chunk.pool_slot_ids_per_layer_group,
             unique_rid=task._unique_rid,
             dst_start_token=None,
             aux_slot=task._aux_slot,

@@ -35,8 +35,9 @@ from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, r
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base import CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -360,7 +361,7 @@ def worker_fn(
                 dtype=np.int64,
             )
             send_kv_slice = Chunk(
-                block_ids_per_layer_groups=[block_ids],
+                pool_slot_ids_per_layer_group=[block_ids],
                 kind_per_layer_group=[CacheKind.PAGED],
                 token_range=TokenRange(start=0, end=ctx_request.prompt_len),
                 is_last=True,
@@ -405,7 +406,7 @@ def worker_fn(
                 dtype=np.int64,
             )
             recv_kv_slice = Chunk(
-                block_ids_per_layer_groups=[block_ids],
+                pool_slot_ids_per_layer_group=[block_ids],
                 kind_per_layer_group=[CacheKind.PAGED],
                 token_range=TokenRange(start=0, end=gen_request.prompt_len),
                 is_last=True,
