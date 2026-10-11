@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import datetime
 import tempfile
@@ -18,6 +21,7 @@ from tensorrt_llm.executor import (DetokenizedGenerationResultBase,
                                    GenerationRequest, GenerationResult,
                                    GenerationResultBase, PostprocWorker)
 from tensorrt_llm.executor.ipc import FusedIpcQueue, ZeroMqQueue
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.llmapi.utils import AsyncQueue
 from tensorrt_llm.sampling_params import SamplingParams
@@ -119,6 +123,73 @@ def test_GenerationResult():
     result._handle_response(create_rsp(44, finished=True))
     assert len(result.outputs[0].token_ids) == 12
     assert result._done
+
+
+def test_context_result_preserves_multimodal_spans() -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm.executor.base_worker import _get_params_for_first_rsp
+
+    request = GenerationRequest(
+        # The first image-token ID is literal text, outside both image spans.
+        prompt_token_ids=[129264, 129264, 129264, 42, 43, 129264],
+        sampling_params=SamplingParams(max_tokens=1),
+        multimodal_params=MultimodalParams(multimodal_input=MultimodalInput(
+            multimodal_hashes=[[0] * 8, [1] * 8],
+            multimodal_positions=[1, 5],
+            multimodal_lengths=[2, 1],
+        )),
+    )
+    request.set_id(42)
+    original = DisaggregatedParams(request_type="context_only",
+                                   disagg_request_id=42)
+    result = GenerationResult(request, disaggregated_params=original)
+    assert original.multimodal_positions is None
+    sampling_params, _, params = _get_params_for_first_rsp(
+        SimpleNamespace(_results={42: result}), 42)
+    result = GenerationResultBase(42, sampling_params)
+    result._disaggregated_params = params
+
+    response = create_rsp(17, finished=True)
+    response.result.context_phase_params = tllm.ContextPhaseParams([17], 42,
+                                                                   None, None,
+                                                                   None, None)
+    result._handle_response(response)
+
+    params = result.outputs[0].disaggregated_params
+    assert params.first_gen_tokens == [17]
+    assert params.disagg_request_id == 42
+    assert params.multimodal_positions == [1, 5]
+    assert params.multimodal_lengths == [2, 1]
+    assert request.prompt_token_ids[0] == 129264
+
+
+def test_context_result_preserves_remote_tail_handoff() -> None:
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
+                                                            LlmResult)
+
+    result = GenerationResultBase(42, SamplingParams(max_tokens=1))
+    result._disaggregated_params = DisaggregatedParams(
+        request_type="context_only", disagg_request_id=42)
+
+    response = create_rsp(17, finished=True)
+    response.result.context_phase_params = tllm.ContextPhaseParams([17], 42,
+                                                                   None, [18],
+                                                                   None, None)
+    py_result = SimpleNamespace(
+        **{name: None
+           for name in LlmResult.py_result_properties})
+    wrapped_result = LlmResult(response.result, py_result, is_final=True)
+    wrapped_result.remote_tail_start = 64
+    result._handle_response(
+        LlmResponse(request_id=42, result=wrapped_result, client_id=42))
+
+    params = result.outputs[0].disaggregated_params
+    assert params.remote_tail_start == 64
+    assert params.first_gen_tokens == []
+    assert params.draft_tokens == []
 
 
 def test_result_timeout_raises():
