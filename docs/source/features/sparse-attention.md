@@ -207,22 +207,23 @@ selector, runtime metadata, cache management, and attention implementation.
 | `rocket` | `RocketSparseAttentionConfig` | Prompt KV eviction, then page-level Top-K selection during decode | TRTLLM or Vanilla | Training-free sparsity for MHA/MQA/GQA models |
 | `dsa` | `DeepSeekSparseAttentionConfig` | Learned token-level indexer followed by sparse MLA | TRTLLM | DeepSeek-V3.2 and compatible model-native DSA architectures |
 | `deepseek_v4` | `DeepSeekV4SparseAttentionConfig` | Sliding-window attention plus compressed sparse or compressed dense history | TRTLLM | DeepSeek-V4 hybrid attention |
+| `csa2` | `CSA2SparseAttentionConfig` | Sliding-window attention plus compressed history with shared KV/index sources | TRTLLM, with hardware-selected Flash helpers | DeepSeek-V4.1 |
 | `minimax_m3` | `MiniMaxM3SparseAttentionConfig` | Learned block selection followed by sparse GQA | Dedicated Triton or packaged block-sparse implementation | MiniMax-M3 sparse layers |
 | `skip_softmax` | `SkipSoftmaxAttentionConfig` | Dynamically skips eligible softmax work inside the FMHA kernel | TRTLLM | Existing full-attention models with calibrated or direct thresholds |
 
-All five configs are supported only by the PyTorch execution backend. The
+These configs are supported only by the PyTorch execution backend. The
 "attention implementation" column refers to the attention kernel/backend used
 inside that execution backend.
 
 ### Capability Comparison
 
-| Capability | RocketKV | DSA | DeepSeek-V4 | MiniMax-M3 | Skip Softmax |
-|---|---:|---:|---:|---:|---:|
-| Sparse prefill computation | No | Yes | Yes | Yes | Yes |
-| Sparse decode computation | Yes | Yes | Yes | Yes | Yes |
-| Reduces retained main KV history | Yes | No | Yes, through model-native compression | No | No |
-| Requires a model-trained selector | No | Yes | Yes | Yes | No |
-| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Blocks | Kernel tiles |
+| Capability | RocketKV | DSA | DeepSeek-V4 | CSA2 | MiniMax-M3 | Skip Softmax |
+|---|---:|---:|---:|---:|---:|---:|
+| Sparse prefill computation | No | Yes | Yes | Yes | Yes | Yes |
+| Sparse decode computation | Yes | Yes | Yes | Yes | Yes | Yes |
+| Reduces retained main KV history | Yes | No | Yes, through model-native compression | Yes, through model-native compression | No | No |
+| Requires a model-trained selector | No | Yes | Yes | Yes | Yes | No |
+| Selection granularity | Token eviction and pages | Tokens | Compressed entries | Compressed entries | Blocks | Kernel tiles |
 
 "No" for RocketKV prefill means that prompt attention is still computed
 densely. RocketKV selects which prompt KV entries to retain, so it reduces cache
@@ -337,6 +338,43 @@ sparse_attention_config:
 See the
 [DeepSeek-V4 example](source:examples/models/core/deepseek_v4/README.md) for
 checkpoint-derived configuration and deployment constraints.
+
+#### DeepSeek-V4.1 CSA2
+
+DeepSeek-V4.1 selects `CSA2SparseAttentionConfig` from its checkpoint. Keep
+checkpoint compression ratios, KV/index source ownership, window and Top-K
+geometry intact; CSA2 is model-native rather than a switch for arbitrary MLA models.
+
+```yaml
+sparse_attention_config:
+  algorithm: csa2
+```
+
+| Constraint | CSA2 support |
+|---|---|
+| Hardware | SM90: FlashMLA BF16; SM100 family: native trtllm-gen; SM120/121: FlashInfer BF16 FA2 |
+| Attention shape | One KV head, 512-dimensional queries/values, 448 non-RoPE and 64 RoPE channels; checkpoint-defined Q heads |
+| Compression | Ratios `0` (SWA only), `1`, `2`; checkpoint-defined shared KV/index sources |
+| KV-cache block size | `128` or `256` tokens |
+| Persistent cache | Fixed E4M3 SWA, NVFP4 main/index records; `dtype` selects compute staging |
+| Staging | BF16; FP8 on native trtllm-gen without packed attention via `dtype: fp8` or `fp8_ds_mla` |
+| Parallelism | TP/EP and attention DP; PP/CP and disabled-layer masks unsupported |
+| Runtime | Chunked prefill, prefix reuse, overlap and CUDA graphs; embedded DSpark linear verification; tree verification unsupported |
+
+Decoder bounded replay is an **approximation enabled by default** for eligible
+CED layouts. It computes a trailing Decoder window while the Encoder produces
+the complete GLOBAL history. Set `TRTLLM_V41_DECODER_BOUNDED_REPLAY=0` before
+starting workers to use full Decoder prefill. Encoder replay is opt-in via
+`TRTLLM_V41_ENCODER_REPLAY=1` and requires Decoder bounded replay; it permits
+eviction and recovery of OPTIONAL Encoder SWA state. Set these consistently
+for all workers. Replay eligibility and output requirements can retain full
+prefill, as described in the [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md).
+
+Validate task accuracy against full prefill on the intended checkpoint before
+deploying bounded replay or optional packed/approximate selector paths. Include
+fresh prompts, reused prefixes, chunk boundaries and speculative verification;
+component tests of cache bytes and graph replay do not establish whole-model
+accuracy or end-to-end disaggregated-serving support.
 
 #### MiniMax-M3 Block-Sparse GQA
 

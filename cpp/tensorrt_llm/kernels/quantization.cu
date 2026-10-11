@@ -136,8 +136,7 @@ template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFScale, int64_t* output, int32_t* SFOuput,
     bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream)
 {
-    // No rows: there is nothing to write, and a grid of zero blocks is an invalid launch.
-    if (m == 0)
+    if (b == 0 || m == 0 || n == 0)
     {
         return;
     }
@@ -203,8 +202,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     static_assert(SF_OUTPUT_VEC_SIZE == 32 || SF_OUTPUT_VEC_SIZE == SF_VEC_SIZE,
         "MXFP8 output SF vector size must be 32 or match the quantization SF vector size.");
 
-    // No rows: there is nothing to write, and a grid of zero blocks is an invalid launch.
-    if (m == 0)
+    if (b == 0 || m == 0 || n == 0)
     {
         return;
     }
