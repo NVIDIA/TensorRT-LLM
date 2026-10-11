@@ -1553,18 +1553,14 @@ class KimiK3MoERuntime(nn.Module):
         situ_beta, situ_linear_beta = _resolve_kimi_situ_betas(cfg)
         dtype = torch.bfloat16
 
-        # Routing scores stay fp32; with attention-DP off the gate GEMM runs
-        # bf16xbf16 with fp32 accumulate/output (checkpoint stores the gate
-        # weight in bf16; saves a per-layer input cast + fp32 splitK pair on
-        # the bs1 decode path). Under attention-DP the legacy upcast-to-fp32
-        # GEMM is kept: the bf16-input min-latency GEMM's different reduction
-        # order flips borderline top-16 picks (GSM8K 96.7 -> 96.1/96.4,
-        # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
-        # at DEP batch sizes. helix_a2a ranks share requests and keep bf16.
-        # KIMI_K3_ROUTER_BF16=1/0 forces either path.
-        _router_bf16 = get_env_flag(
-            "KIMI_K3_ROUTER_BF16", model_config.mapping.tp_group_shares_requests
-        )
+        # Routing scores stay fp32. By default the gate GEMM multiplies the bf16
+        # hidden states by the bf16 checkpoint gate weight with fp32 accumulate
+        # and output, which saves a per-layer input cast and an fp32 split-K
+        # GEMM pair. The other path upcasts both inputs to fp32 (TF32 cuBLAS).
+        # Every product is exact in both paths, so they differ only in
+        # summation order, and the upcast is not more accurate.
+        # KIMI_K3_ROUTER_BF16=0 selects the upcast.
+        _router_bf16 = get_env_flag("KIMI_K3_ROUTER_BF16", True)
         self.gate = KimiK3MoEGate(cfg, logits_gemm_dtype=torch.bfloat16 if _router_bf16 else None)
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
