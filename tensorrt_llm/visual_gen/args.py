@@ -276,15 +276,23 @@ class AttentionConfig(StrictBaseModel):
         if self.quant_attention_config is None or self.sparse_attention_config is None:
             return self
 
-        # VSA and SOL replace the dense attention path on every backend that
-        # serves them and never consume quant_attention_config, so accepting a
-        # quantization recipe would silently ignore user configuration.
+        # VSA and SOL replace the dense attention path. On TRTLLM every call
+        # carries the SageAttention recipe to the attention kernels, which either
+        # apply it or reject the call, so the recipe is never silently dropped.
+        # The other backends never consume quant_attention_config on that path,
+        # so accepting a recipe there would silently ignore user configuration.
         # SkipSoftmax is part of the dense path itself and can compose.
+        if self.backend == "TRTLLM":
+            return self
         algorithm = self.sparse_attention_config.algorithm
         if algorithm == "vsa":
-            raise ValueError("VSA and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "VSA and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         if algorithm == "sol_attn":
-            raise ValueError("SOL and quant_attention_config are mutually exclusive.")
+            raise ValueError(
+                "SOL and quant_attention_config are mutually exclusive except on backend='TRTLLM'."
+            )
         return self
 
 

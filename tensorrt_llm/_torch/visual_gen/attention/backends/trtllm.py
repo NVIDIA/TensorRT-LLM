@@ -395,10 +395,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
         if use_separate_qkv and (k is None or v is None):
             raise ValueError("This TRTLLM attention call requires separate q, k, and v tensors.")
-        if block_sparse_inputs is not None and self.quant_attention_config is not None:
-            raise ValueError(
-                "Generic block-sparse attention does not support quant_attention_config."
-            )
 
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)

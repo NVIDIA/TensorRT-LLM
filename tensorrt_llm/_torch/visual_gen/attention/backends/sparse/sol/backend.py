@@ -363,8 +363,6 @@ class SOLTrtllmAttention(TrtllmAttention):
         if not self.should_use_sparse(forward_args.sparse_attn_phase):
             return None
 
-        if self.quant_attention_config is not None:
-            raise ValueError("SOL sparse execution does not support quant_attention_config")
         if not any(
             isinstance(fmha, PrimsTSBlockSparseFmha) for fmha in self._fmha_manager.fmha_libs
         ):

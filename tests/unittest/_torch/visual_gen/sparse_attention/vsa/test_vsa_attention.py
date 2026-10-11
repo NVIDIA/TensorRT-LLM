@@ -295,7 +295,7 @@ def test_trtllm_vsa_hands_predicted_routes_to_core_via_sparse_backend_args(
     attention._fmha_manager = SimpleNamespace(
         fmha_libs=[object.__new__(vsa_backend.PrimsTSBlockSparseFmha)]
     )
-    monkeypatch.setattr(vsa_backend, "_get_unsupported_primts_reason", lambda *args: None)
+    monkeypatch.setattr(vsa_backend, "_get_unsupported_primts_reason", lambda *args, sage: None)
     q = torch.randn(1, 80, 1, 8)
 
     with set_vsa_forward_context(_make_vsa_metadata()):
