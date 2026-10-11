@@ -5619,9 +5619,14 @@ class PyExecutor:
                                                kv_cache_dtype_byte_size)
 
     def _process_previous_batch(self):
-        self._handle_canceled_requests()
         scheduled_requests = self.previous_batch.scheduled_requests
+        # A request that finishes here may still be in the in-flight next
+        # batch, which writes KV past the committed prefix after commit/close.
+        # This is safe: the radix tree trusts only each page's committed token
+        # count, and the write is enqueued on execution_stream before close()
+        # records the page release that eviction and reuse wait on.
         self._update_v2_generation_resources(scheduled_requests)
+        self._handle_canceled_requests()
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
         finished_requests = self._handle_responses(

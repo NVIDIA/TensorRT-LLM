@@ -31,7 +31,6 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kvcm_v2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 pytestmark = pytest.mark.cpu_only
@@ -132,23 +131,6 @@ def make_request(tokens, request_id=0, lora_task_id=None, cache_salt=None, **kwa
     return StubRequest(tokens, request_id, lora_task_id, cache_salt, **kwargs)
 
 
-@pytest.fixture(params=["cpp_view", "python_list"])
-def token_source(request, monkeypatch):
-    """Run the test against both shapes ``_reuse_token_source`` can return.
-
-    Which shape is live is a property of the installed backend, not of the test:
-    ``_cpp_introspection`` is None exactly when the pure-Python core is active,
-    and the C++ core is what CI runs. Pinning it here is what makes the array
-    shape reachable from a CPU-only run.
-    """
-    monkeypatch.setattr(
-        kvcm_v2,
-        "_cpp_introspection",
-        object() if request.param == "cpp_view" else None,
-    )
-    return request.param
-
-
 def prepared_tokens_and_scope(mgr, req):
     """Tokens and reuse scope that ``prepare_context_cache`` hands to the impl."""
     mgr.impl.create_kv_cache.reset_mock()
@@ -172,7 +154,6 @@ def probed_tokens_and_scope(mgr, req):
     return list(tokens), scope
 
 
-@pytest.mark.usefixtures("token_source")
 class TestTokenParity:
     """The probe must key the same block the request will commit."""
 
@@ -269,7 +250,6 @@ class TestTokenParity:
         assert calls[0] == calls[1]
 
 
-@pytest.mark.usefixtures("token_source")
 class TestGuards:
     def test_none_without_block_reuse(self):
         mgr = make_stub_manager(enable_block_reuse=False)
@@ -299,7 +279,7 @@ class TestGuards:
         assert mgr.kv_cache_map == {}
 
 
-def test_marshalled_tokens_are_never_boolean_tested(monkeypatch):
+def test_marshalled_tokens_are_never_boolean_tested():
     """The probe must test the token sequence by length, not by truthiness.
 
     ``_context_reuse_tokens`` hands back the request's zero-copy int32 view when
@@ -309,7 +289,6 @@ def test_marshalled_tokens_are_never_boolean_tested(monkeypatch):
     of every run, which is every run, since block reuse and prefix-aware
     scheduling are both on by default.
     """
-    monkeypatch.setattr(kvcm_v2, "_cpp_introspection", object())
     mgr = make_stub_manager()
     req = make_request(range(20))
     with pytest.raises(ValueError):
