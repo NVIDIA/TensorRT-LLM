@@ -288,6 +288,70 @@ class TestRouterWriteBack:
         assert request.prompt_token_ids == ids
 
 
+class TestCoordinatorFrontendWriteBack:
+    """A coordinator frontend never fetches /server_info; the coordinator publishes summaries."""
+
+    def _published(self, tokenizer, servers=("server1", "server2")):
+        from tensorrt_llm.serve.render import fingerprint_summary
+
+        summary = fingerprint_summary(_Router.worker_fingerprint(tokenizer))
+        return {name: summary for name in servers}
+
+    def test_a_summary_matches_exactly_like_the_fingerprint_it_came_from(self, tokenizer) -> None:
+        from tensorrt_llm.serve.render import fingerprint_summary, fingerprints_match
+
+        full = _Router.worker_fingerprint(tokenizer)
+        other = {**full, "digest": "a-different-digest"}
+
+        assert fingerprints_match(full, fingerprint_summary(full))
+        assert not fingerprints_match(full, fingerprint_summary(other))
+        assert fingerprint_summary(None) is None
+
+    def test_ids_are_forwarded_when_the_published_fingerprints_match(
+        self, router, tokenizer
+    ) -> None:
+        # The frontend's own _server_info stays empty, as in coordinator mode.
+        router._server_info = {}
+        router.set_published_render_fingerprints(self._published(tokenizer))
+        request = chat_request()
+
+        ids = router._tokenize(request)[0]
+
+        assert request.prompt_token_ids == ids
+
+    def test_ids_are_not_forwarded_when_a_published_fingerprint_differs(
+        self, router, tokenizer
+    ) -> None:
+        published = self._published(tokenizer)
+        published["server2"] = {**published["server2"], "digest": "a-different-digest"}
+        router.set_published_render_fingerprints(published)
+        request = chat_request()
+
+        router._tokenize(request)
+
+        assert request.prompt_token_ids is None
+
+    def test_a_server_the_coordinator_has_not_reported_is_a_mismatch(
+        self, router, tokenizer
+    ) -> None:
+        router.set_published_render_fingerprints(self._published(tokenizer, servers=("server1",)))
+        request = chat_request()
+
+        router._tokenize(request)
+
+        assert request.prompt_token_ids is None
+
+    def test_a_worker_with_no_fingerprint_is_a_mismatch(self, router, tokenizer) -> None:
+        published = self._published(tokenizer)
+        published["server2"] = None  # an older worker
+        router.set_published_render_fingerprints(published)
+        request = chat_request()
+
+        router._tokenize(request)
+
+        assert request.prompt_token_ids is None
+
+
 class TestCountTokens:
     def _client(self, tokenizer, chat_template=None):
         from fastapi import FastAPI

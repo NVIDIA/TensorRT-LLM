@@ -21,11 +21,12 @@ renderer process.
 Supported integration. The render routes are *routing-only rendering* for a consumer
 such as the Dynamo EPP: it reads ``token_ids`` to compute KV-cache block hashes, forwards
 the original request unchanged, and leaves the worker to render it. Such a consumer does
-not use ``schema_version``, ``fingerprint`` or ``tokens_trusted``, so a router built on
-the ids alone must itself decide what to do when ``tokens_trusted`` is false (a named
-``tool_choice``: the ids are a good estimate but not the executed prompt) or when its
-renderer's fingerprint differs from the workers' (``GET /server_info``): the ids are then
-an estimate and routing quality, not correctness, is what is at stake. A consumer that
+not use ``schema_version`` or ``tokens_trusted``, so a router built on the ids alone must
+itself decide what to do when ``tokens_trusted`` is false (a named ``tool_choice``: the ids
+are a good estimate but not the executed prompt) or when the renderer's
+``render_fingerprint`` differs from a worker's (both on ``GET /server_info``, compared once
+when the worker is admitted): the ids are then an estimate and routing quality, not
+correctness, is what is at stake. A consumer that
 wants the worker to execute the ids without rendering uses the worker's existing token-in
 routes (``/v1/completions`` with token ids as the prompt, ``/v1/chat/completions`` with
 ``prompt_token_ids``); there is no separate execution endpoint here.
@@ -126,7 +127,6 @@ class ServingRender:
             raise RenderRequestError(400, str(error)) from error
         return GenerateRequest(
             kind="chat",
-            fingerprint=self.fingerprint(),
             token_ids=rendered.token_ids,
             tokens_trusted=rendered.tokens_trusted,
             untrusted_reason=rendered.untrusted_reason,
@@ -163,7 +163,6 @@ class ServingRender:
             results.append(
                 GenerateRequest(
                     kind="completion",
-                    fingerprint=self.fingerprint(),
                     token_ids=token_ids,
                     request={**body, "prompt": token_ids},
                 )

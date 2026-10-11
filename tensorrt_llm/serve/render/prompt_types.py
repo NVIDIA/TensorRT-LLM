@@ -89,7 +89,8 @@ class GenerateRequest(BaseModel):
     """What a render route returns: the prompt token ids plus what a consumer needs to use them.
 
     ``token_ids`` are the tokens the worker's own chat route would render for the original
-    request, valid when ``fingerprint`` equals the worker's (``GET /server_info``). A
+    request, valid when the renderer's ``render_fingerprint`` equals the worker's (both on
+    ``GET /server_info``; compare them once when a worker is admitted, not per response). A
     routing consumer (the Dynamo EPP) reads ``token_ids`` and forwards the original request
     unchanged.
 
@@ -97,7 +98,7 @@ class GenerateRequest(BaseModel):
     rather than a dedicated endpoint: ``POST /v1/completions`` with ``token_ids`` as the
     prompt, or ``POST /v1/chat/completions`` with the original body plus ``prompt_token_ids``
     (the mechanism the router's write-back already uses). Only ids with ``tokens_trusted``
-    and a matching ``fingerprint`` should be executed that way.
+    and a matching ``render_fingerprint`` should be executed that way.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -105,8 +106,6 @@ class GenerateRequest(BaseModel):
     schema_version: int = GENERATE_REQUEST_SCHEMA_VERSION
     # Which inference route the ``request`` body belongs to.
     kind: Literal["chat", "completion"] = "chat"
-    # Rendering-configuration fingerprint of the renderer that produced the ids.
-    fingerprint: Dict[str, Any]
     token_ids: List[int]
     # False when the ids must not be executed as is (a named tool_choice: the worker adds a
     # forced tool-call prefix); the consumer lets the worker render.

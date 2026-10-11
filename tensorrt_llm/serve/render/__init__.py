@@ -30,7 +30,7 @@ from .chat import (
     render_conversation,
     tokenize_rendered,
 )
-from .fingerprint import compute_fingerprint, fingerprints_match
+from .fingerprint import compute_fingerprint, fingerprint_summary, fingerprints_match
 from .prompt_types import (
     GENERATE_REQUEST_SCHEMA_VERSION,
     GenerateRequest,
@@ -54,6 +54,7 @@ __all__ = [
     "arender_chat",
     "attach_render_routes",
     "compute_fingerprint",
+    "fingerprint_summary",
     "fingerprints_match",
     "harmony_enabled_for",
     "legacy_render_enabled",
